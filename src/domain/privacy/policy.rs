@@ -18,6 +18,8 @@ pub struct Literal<'a> {
 pub struct Snapshot {
     blocks: Option<AhoCorasick>,
     block_sources: Vec<Source>,
+    #[cfg(feature = "secret-vault")]
+    numeric_blocks: std::collections::HashMap<String, Source>,
     allows: Option<AhoCorasick>,
     inline_allow: bool,
     entropy: detector::Entropy,
@@ -53,7 +55,18 @@ impl Snapshot {
             .filter(|value| !value.is_empty())
             .collect();
         let block_sources = blocks.iter().map(|rule| rule.source).collect();
+        #[cfg(feature = "secret-vault")]
+        let numeric_blocks = blocks
+            .iter()
+            .filter_map(|rule| {
+                let number: serde_json::Number = serde_json::from_str(rule.value).ok()?;
+                let canonical = number.to_string();
+                (canonical != rule.value).then_some((canonical, rule.source))
+            })
+            .collect();
         Ok(Self {
+            #[cfg(feature = "secret-vault")]
+            numeric_blocks,
             max_literal_bytes: blocks
                 .iter()
                 .map(|rule| rule.value.len())
@@ -113,6 +126,28 @@ impl Snapshot {
             }
         }
         Batch { findings, complete }
+    }
+
+    /// JSON parsing normalizes numeric spellings before projection. Only numeric data uses
+    /// these aliases; string literals and future policies keep their exact registered values.
+    #[cfg(feature = "secret-vault")]
+    pub(crate) fn scalar_findings(&self, canonical: &str, limit: usize) -> Batch {
+        let mut batch = self.explicit_findings(canonical, limit);
+        if batch.findings.is_empty()
+            && let Some(source) = self.numeric_blocks.get(canonical)
+        {
+            if limit == 0 {
+                batch.complete = false;
+            } else {
+                batch.findings.push(Finding {
+                    start: 0,
+                    end: canonical.len(),
+                    source: *source,
+                    rule: "explicit-block",
+                });
+            }
+        }
+        batch
     }
 
     pub fn scan(&self, text: &str, limit: usize) -> Batch {

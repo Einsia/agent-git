@@ -7,6 +7,8 @@ pub mod crypto;
 pub mod detector;
 #[cfg(feature = "secret-vault")]
 pub mod dictionary;
+#[cfg(feature = "cli")]
+mod hydration;
 #[cfg(feature = "secret-vault")]
 pub mod keys;
 #[cfg(feature = "secret-vault")]

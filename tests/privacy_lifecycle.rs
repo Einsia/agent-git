@@ -277,7 +277,13 @@ impl Worker {
     }
 
     fn call(&mut self, mode: &str, text: &str) -> Value {
-        let bytes = serde_json::to_vec(&json!({"repo":null,"mode":mode,"text":text})).unwrap();
+        self.call_context(mode, text, "")
+    }
+
+    fn call_context(&mut self, mode: &str, text: &str, context: &str) -> Value {
+        let bytes =
+            serde_json::to_vec(&json!({"repo":null,"mode":mode,"text":text,"context":context}))
+                .unwrap();
         let input = self.0.stdin.as_mut().unwrap();
         input
             .write_all(&(bytes.len() as u32).to_be_bytes())
@@ -294,6 +300,94 @@ impl Worker {
         serde_json::from_slice(&bytes).unwrap()
     }
 }
+
+/// A small saved field can expand repeatedly. A paged restore must bound the expanded bytes,
+/// retain unresolved tokens when it reaches that bound, and remain usable for a complete retry.
+#[test]
+fn paged_hydration_bounds_expansion_and_keeps_recovery_tokens() {
+    let device = Device::signed_out("http://127.0.0.1:9");
+    let mut worker = device.worker();
+    let original = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr\n".repeat(1100);
+    let protected = worker.protect(&original);
+    assert_eq!(protected["status"], "complete");
+    let token = protected["content"].as_str().unwrap();
+    assert!(agit::domain::privacy::detector::placeholder::contains_token(token));
+    let input = json!([token, token]).to_string();
+    for (operation, maximum, complete) in [
+        ("bounded", original.len() + 2 * input.len(), false),
+        ("complete", 3 * original.len(), true),
+    ] {
+        let begin = json!({"phase":"begin","operation":operation,"mode":"hydrate_jsonl","bytes":input.len(),"output_limit":maximum}).to_string();
+        let accepted = worker.call_context("hydrate_transfer", &input, &begin);
+        assert_eq!(accepted["consumed"], input.len());
+        let stale = json!({"phase":"read","operation":"another-pass","offset":0}).to_string();
+        let refused = worker.call_context("hydrate_transfer", "", &stale);
+        assert_eq!(refused["status"], "skipped");
+        assert_eq!(refused["content"], "");
+        let read = json!({"phase":"read","operation":operation,"offset":0}).to_string();
+        let restored = worker.call_context("hydrate_transfer", "", &read);
+        let content = restored["content"].as_str().unwrap();
+        assert!(content.len() <= maximum);
+        if complete {
+            assert_eq!(restored["status"], "complete");
+            assert_eq!(
+                serde_json::from_str::<Value>(content).unwrap(),
+                json!([original, original])
+            );
+        } else {
+            assert_eq!(restored["status"], "partial");
+            assert_eq!(restored["reason"], "oversize");
+            assert!(restored["unresolved"].as_u64().unwrap() > 0);
+            assert!(content.contains(token));
+        }
+        let close = json!({"phase":"close","operation":operation}).to_string();
+        assert_eq!(
+            worker.call_context("hydrate_transfer", "", &close)["status"],
+            "complete"
+        );
+    }
+}
+/// A publication transfer uses the frozen dictionary and identity policy across pages. Reloading
+/// the journal would accept later mappings, while dropping used originals would weaken recovery.
+#[test]
+fn paged_publication_keeps_its_frozen_dictionary_and_identity_policy() {
+    let device = Device::signed_out("http://127.0.0.1:9");
+    let mut worker = device.worker();
+    let original = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let protected = worker.protect(original);
+    let token = protected["content"].as_str().unwrap();
+    assert_eq!(
+        worker.call("freeze_hydration", "true")["status"],
+        "complete"
+    );
+    let late = worker.protect("ghp_7Kq9mZ2vR8xT5nW3pL6cB4dF0hJ1sA9eQ7uY");
+    let late = late["content"].as_str().unwrap();
+    let input = json!({"type":"user","uuid":token,"message":{"role":"user","content":[
+        {"type":"text","text":token},{"type":"text","text":late}
+    ]}})
+    .to_string();
+    let begin = json!({"phase":"begin","operation":"publication","mode":"hydrate_frozen_jsonl",
+        "bytes":input.len(),"output_limit":4096})
+    .to_string();
+    assert_eq!(
+        worker.call_context("hydrate_transfer", &input, &begin)["consumed"],
+        input.len()
+    );
+    let read = json!({"phase":"read","operation":"publication","offset":0}).to_string();
+    let restored = worker.call_context("hydrate_transfer", "", &read);
+    assert_eq!(restored["status"], "partial");
+    assert_eq!(restored["unresolved"], 1);
+    let content: Value = serde_json::from_str(restored["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["uuid"], token);
+    assert_eq!(content["message"]["content"][0]["text"], original);
+    assert_eq!(content["message"]["content"][1]["text"], late);
+    let values = worker.call("hydration_values", "");
+    assert_eq!(
+        serde_json::from_str::<Value>(values["content"].as_str().unwrap()).unwrap(),
+        json!([original])
+    );
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.0.kill();

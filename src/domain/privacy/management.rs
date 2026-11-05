@@ -276,7 +276,9 @@ pub fn execute(
                 .context("missing recovery values")?,
         )?;
         for value in values {
-            if projector.dictionary.for_value(&value).is_none() {
+            let token = if let Some(record) = projector.dictionary.for_value(&value) {
+                record.token.clone()
+            } else {
                 let record = Record::new(
                     &projector.store.dictionary_id,
                     &value,
@@ -286,8 +288,28 @@ pub fn execute(
                 projector
                     .store
                     .append(std::slice::from_ref(&record), projector.key.as_ref())?;
+                let token = record.token.clone();
                 projector.dictionary.accept(record)?;
+                token
+            };
+            // Decisions name tokens, but aliases can recover the same literal. Recovery must
+            // respect a local decision on any alias rather than block the preferred token.
+            if decisions.iter().any(|decision| {
+                decision.scope == scope
+                    && projector
+                        .dictionary
+                        .get(&decision.token)
+                        .is_some_and(|record| record.original == value)
+            }) {
+                continue;
             }
+            projector.store.adopt_decision(&Decision {
+                scope: scope.clone(),
+                token,
+                name: "recovered protected value".into(),
+                block: Some(true),
+                allow: None,
+            })?;
         }
         return Ok(json!({"remembered":true}));
     }

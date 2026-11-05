@@ -1523,7 +1523,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     // A publication restores repeated events across worker batches from one retained dictionary.
     use agit::domain::privacy::{
         dictionary::{Label, Origin, Record},
-        keys,
+        keys, management,
         storage::Store,
     };
     let owner = keys::owner(&hub.base, "account-1").unwrap();
@@ -1543,6 +1543,29 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     dictionary
         .append(std::slice::from_ref(&record), None)
         .unwrap();
+    let incidental = "ordinary remembered document label";
+    let allowed = "allowed remembered fixture";
+    let hidden = "hidden protected fixture";
+    let retained = [incidental, allowed, hidden].map(|value| {
+        Record::new(
+            &dictionary.dictionary_id,
+            value,
+            Origin::Heuristic,
+            Label::secret("generic-api-key"),
+        )
+        .unwrap()
+    });
+    dictionary.append(&retained, None).unwrap();
+    dictionary
+        .decide(&management::Decision {
+            scope: management::scope(Some(repo.root())).unwrap(),
+            token: retained[1].token.clone(),
+            name: "allowed fixture".into(),
+            block: None,
+            allow: Some(true),
+        })
+        .unwrap();
+    let projected_secret = "m7Qp4Vn9Rx2Lw8Cs5Tb3Yh6Jd1Fz0Kae";
     repo.git(&["checkout", "-b", "hydrated", &base]).unwrap();
     let mut hydrated_meta = meta::Meta::new(
         format!("agit-{}", "f".repeat(40)),
@@ -1559,12 +1582,20 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         &hydrated_meta.session,
     );
     let padding = transcript::wrap_lines(
-        &json!({"type":"user","message":{"role":"user","content":"padding ".repeat(20_000)}})
-            .to_string(),
+        &json!({"type":"user","message":{"role":"user","content":format!(
+            "{} {incidental}; {allowed}; api_key=\"{projected_secret}\"",
+            "padding ".repeat(20_000)
+        )}})
+        .to_string(),
         "claude-code",
         &hydrated_meta.session,
     );
-    let log = format!("{repeated}{padding}{repeated}");
+    let omitted = transcript::wrap_lines(
+        &json!({"type":"future_record","text":retained[2].token}).to_string(),
+        "claude-code",
+        &hydrated_meta.session,
+    );
+    let log = format!("{repeated}{padding}{repeated}{omitted}");
     let view = repeated.repeat(2);
     write_snapshot(repo.root(), &log, &view).unwrap();
     meta::write(repo.root(), &hydrated_meta).unwrap();
@@ -1598,6 +1629,12 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         storage::envelope_line(&records[0]).repeat(2)
     );
     assert!(restored.protected_values.contains(secret));
+    // Source placeholders remain protected even when their record is omitted publicly. A
+    // dictionary-only or allowed literal appearing in plaintext does not acquire a block.
+    assert!(restored.protected_values.contains(hidden));
+    assert!(restored.protected_values.contains(projected_secret));
+    assert!(!restored.protected_values.contains(incidental));
+    assert!(!restored.protected_values.contains(allowed));
     assert_eq!(
         storage::materialize_worktree(repo.root(), meta::LOG_FILE).unwrap(),
         log

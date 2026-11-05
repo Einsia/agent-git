@@ -238,8 +238,112 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
         assert_eq!(text.contains("diagram.png"), mode == "metadata");
     }
     assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
-    privacy_input_budget::commit_oversized_event(&repo);
     let output = temp.path().join("export.json");
+
+    // A worker refusal must name its cause and leave an existing output untouched.
+    dictionary
+        .block_add(
+            "Blocked numeric fixture",
+            zeroize::Zeroizing::new("72836491".into()),
+            false,
+        )
+        .unwrap();
+    let native = json!({"type":"assistant","message":{"role":"assistant","content":[{
+        "type":"tool_use","id":"blocked-call","name":"Inspect","input":{"value":72836491}
+    }]}});
+    let blocked = transcript::wrap_lines(&format!("{native}\n"), "claude-code", &metadata.session);
+    storage::write_snapshot(repo.root(), &blocked, &blocked).unwrap();
+    repo.git(&["add", "."]).unwrap();
+    repo.git(&["commit", "-m", "Blocked scalar export fixture"])
+        .unwrap();
+    std::fs::write(&output, "KEEP_EXISTING_OUTPUT").unwrap();
+    let refused = run(&[
+        "export",
+        "alice/app@work",
+        "--privacy",
+        "--out",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        !refused.status.success(),
+        "blocked export succeeded: {}",
+        std::fs::read_to_string(&output).unwrap()
+    );
+    assert!(refused.stdout.is_empty());
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(error.contains("unsupported_scalar"), "{error}");
+    assert!(error.contains("numeric or boolean"), "{error}");
+    assert!(!error.contains("72836491"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        "KEEP_EXISTING_OUTPUT"
+    );
+
+    // A publishable native record can exceed one worker frame. Its readable content must
+    // survive protection, while credential bytes must never reach the exported file.
+    let line = "Ordinary report output remains readable.\n";
+    let report = format!(
+        "Report start\n{}api_key=\"{canary}\"\nReport end\n",
+        line.repeat(agit::domain::privacy::projector::MAX_UNIT_BYTES / line.len() + 1)
+    );
+    let native = json!({"type":"assistant","message":{"role":"assistant","content":report}});
+    let large = transcript::wrap_lines(&format!("{native}\n"), "claude-code", &metadata.session);
+    assert!(large.len() > agit::domain::privacy::projector::MAX_UNIT_BYTES);
+    storage::write_snapshot(repo.root(), &large, &large).unwrap();
+    repo.git(&["add", "."]).unwrap();
+    repo.git(&["commit", "-m", "Large native export fixture"])
+        .unwrap();
+    let exported = run(&[
+        "export",
+        "alice/app@work",
+        "--privacy",
+        "--out",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let exported = std::fs::read_to_string(&output).unwrap();
+    assert!(!exported.contains(canary));
+    let exported: serde_json::Value = serde_json::from_str(exported.trim()).unwrap();
+    let content = &exported["message"]["content"];
+    let text = content
+        .as_str()
+        .or_else(|| content[0]["text"].as_str())
+        .unwrap();
+    let tokens: Vec<_> = agit::domain::privacy::projector::tokens(text).collect();
+    assert_eq!(tokens.len(), 1);
+    assert!(
+        text.replace(tokens[0].2, canary) == report,
+        "export changed surrounding report text"
+    );
+    assert_eq!(
+        storage::materialize_worktree(repo.root(), meta::LOG_FILE).unwrap(),
+        large
+    );
+
+    // Saved placeholders require frozen hydration before publication, including in large events.
+    let protected =
+        transcript::wrap_lines(&format!("{exported}\n"), "claude-code", &metadata.session);
+    storage::write_snapshot(repo.root(), &protected, &protected).unwrap();
+    repo.git(&["add", "."]).unwrap();
+    repo.git(&["commit", "-m", "Protected large export fixture"])
+        .unwrap();
+    let repeated = run(&["export", "alice/app@work", "--privacy"]);
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert!(
+        repeated == exported,
+        "re-export changed protected native content"
+    );
+
+    privacy_input_budget::commit_oversized_event(&repo);
     std::fs::write(&output, "KEEP_EXISTING_OUTPUT").unwrap();
     let refused = run(&[
         "export",

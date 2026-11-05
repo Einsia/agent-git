@@ -75,6 +75,83 @@ fn resume_keeps_a_settled_prefix_resumable_after_later_repository_records() {
     assert_eq!(fs::read(&lab.live).unwrap(), expected_live);
 }
 
+/// Native records may exceed one privacy IPC frame. Resume must restore the entire value and
+/// its escaped tool arguments, rather than silently installing a mapped placeholder as data.
+#[test]
+fn resume_restores_large_tool_values_and_exact_encoded_arguments() {
+    let lab = Lab::new();
+    let secret = "synthetic credential with \"quotes\" and a\nline break";
+    lab.register_secret("large-native-value", secret);
+    let report = format!(
+        "{}\n{secret}\nComplete build report",
+        "Ordinary build output remains readable.\n".repeat(240_000)
+    );
+    let arguments = format!(
+        "{{  \"credential\" : {}, \"path\" : \"relative/path\" }}",
+        serde_json::to_string(secret).unwrap()
+    );
+    let records = [
+        json!({"type":"user","message":{"role":"user","content":"Inspect the large report"}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"large-call","name":"Read","input":{"payload":arguments}}],"stop_reason":"tool_use"}}),
+        json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"large-call","content":report}]}}),
+        json!({"type":"assistant","message":{"role":"assistant","content":"Report inspected","stop_reason":"end_turn"}}),
+    ];
+    let native = lab.live.parent().unwrap().join(format!("{LATER}.jsonl"));
+    let text = records
+        .iter()
+        .map(|record| {
+            let mut record = record.clone();
+            record["sessionId"] = LATER.into();
+            record["cwd"] = lab.work.display().to_string().into();
+            format!("{record}\n")
+        })
+        .collect::<String>();
+    assert!(text.len() > agit::domain::privacy::projector::MAX_UNIT_BYTES);
+    fs::write(&native, text).unwrap();
+    lab.run(&["import", LATER, "--into", "alice/qa@large", "--independent"]);
+    lab.run(&["fork", "alice/qa@large", "-b", "large-copy"]);
+    let resumed = lab.output(&[
+        "resume",
+        "alice/qa@large-copy",
+        "--as",
+        "claude-code",
+        "--no-launch",
+    ]);
+    assert!(resumed.status.success(), "{resumed:?}");
+    let installed = fs::read_dir(lab.store.join("store/claude-code"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let link: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+            (link["branch"] == "large-copy").then(|| entry.path().file_stem().unwrap().to_owned())
+        })
+        .unwrap();
+    let installed =
+        fs::read_to_string(native.with_file_name(installed).with_extension("jsonl")).unwrap();
+    let restored: Vec<serde_json::Value> = installed
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let blocks: Vec<_> = restored
+        .iter()
+        .filter_map(|record| record["message"]["content"].as_array())
+        .flatten()
+        .collect();
+    let call = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_use")
+        .unwrap();
+    let result = blocks
+        .iter()
+        .find(|block| block["type"] == "tool_result")
+        .unwrap();
+    assert_eq!(call["input"]["payload"], arguments);
+    assert_eq!(call["id"], result["tool_use_id"]);
+    assert_eq!(result["content"], report);
+    assert!(!String::from_utf8_lossy(&resumed.stderr).contains("placeholder"));
+}
+
 struct Lab {
     _dir: tempfile::TempDir,
     home: PathBuf,

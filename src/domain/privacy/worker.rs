@@ -453,6 +453,7 @@ fn hydration_projector(repo: Option<&Path>) -> crate::Result<Projector> {
         key: None,
         complete,
         missing,
+        hydration_growth: Default::default(),
     })
 }
 
@@ -460,11 +461,257 @@ fn hydrate(request: &Request) -> crate::Result<Outcome> {
     Ok(hydration_projector(request.repo.as_deref())?.transform(&request.text, request.mode))
 }
 
+struct HydrationTransfer {
+    operation: String,
+    repo: Option<PathBuf>,
+    /// Ordinary restoration owns a dictionary; publication uses the retained frozen dictionary.
+    projector: Option<Projector>,
+    mode: Mode,
+    bytes: usize,
+    output_limit: usize,
+    input: Zeroizing<String>,
+    output: Option<HydratedOutput>,
+    read: usize,
+}
+
+struct HydratedOutput {
+    report: Outcome,
+    file: std::fs::File,
+    bytes: usize,
+}
+
+thread_local! {
+    static HYDRATION_TRANSFER: std::cell::RefCell<Option<HydrationTransfer>> = const { std::cell::RefCell::new(None) };
+}
+
+fn hydrate_transfer(request: &Request) -> crate::Result<Outcome> {
+    use super::hydration::{CHUNK_BYTES, Command};
+    use super::projector::Status;
+    use crate::domain::storage::{MAX_EVENT_BYTES, MAX_MATERIALIZED_BYTES};
+    use std::io::{Seek, SeekFrom};
+    let command: Command = serde_json::from_str(&request.context)?;
+    let mut reply = Outcome {
+        content: String::new(),
+        status: Status::Complete,
+        replacements: 0,
+        unresolved: 0,
+        consumed: None,
+        unprocessed: 0,
+        omitted: 0,
+        reason: None,
+    };
+    HYDRATION_TRANSFER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match command {
+            Command::Begin {
+                operation,
+                mode,
+                bytes,
+                output_limit,
+            } => {
+                ensure!(
+                    matches!(
+                        mode,
+                        Mode::HydrateText
+                            | Mode::HydrateJsonl
+                            | Mode::HydrateEnvelopes
+                            | Mode::HydrateFrozenJsonl
+                    ) && bytes <= MAX_EVENT_BYTES
+                        && output_limit >= bytes
+                        && output_limit <= MAX_MATERIALIZED_BYTES
+                        && request.text.len() <= CHUNK_BYTES
+                        && request.text.len() <= bytes
+                        && operation.len() <= 64,
+                    "invalid hydration transfer input"
+                );
+                let reusable = slot.as_ref().is_some_and(|transfer| {
+                    transfer.operation == operation
+                        && transfer.repo == request.repo
+                        && transfer
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| transfer.read == output.bytes)
+                });
+                if !reusable {
+                    *slot = None;
+                    *slot = Some(HydrationTransfer {
+                        operation,
+                        repo: request.repo.clone(),
+                        projector: if matches!(mode, Mode::HydrateFrozenJsonl) {
+                            FROZEN_HYDRATION.with(|frozen| {
+                                ensure!(
+                                    frozen
+                                        .borrow()
+                                        .as_ref()
+                                        .is_some_and(|frozen| frozen.repo == request.repo),
+                                    "publication dictionary is not frozen for this repository"
+                                );
+                                Ok::<_, anyhow::Error>(())
+                            })?;
+                            None
+                        } else {
+                            Some(hydration_projector(request.repo.as_deref())?)
+                        },
+                        mode,
+                        bytes,
+                        output_limit,
+                        input: Zeroizing::new(String::new()),
+                        output: None,
+                        read: 0,
+                    });
+                }
+                let transfer = slot.as_mut().expect("hydration transfer initialized");
+                transfer.output = None;
+                transfer.input.zeroize();
+                transfer.input.push_str(&request.text);
+                transfer.mode = mode;
+                transfer.bytes = bytes;
+                transfer.output_limit = output_limit;
+                transfer.read = 0;
+                reply.consumed = Some(transfer.input.len());
+            }
+            Command::Append { operation, offset } => {
+                let transfer = slot.as_mut().context("hydration transfer is not open")?;
+                ensure!(
+                    transfer.operation == operation
+                        && transfer.repo == request.repo
+                        && transfer.output.is_none()
+                        && transfer.input.len() == offset
+                        && request.text.len() <= CHUNK_BYTES
+                        && offset
+                            .checked_add(request.text.len())
+                            .is_some_and(|bytes| bytes <= transfer.bytes),
+                    "hydration transfer input changed"
+                );
+                transfer.input.push_str(&request.text);
+                reply.consumed = Some(transfer.input.len());
+            }
+            Command::Read { operation, offset } => {
+                let transfer = slot.as_mut().context("hydration transfer is not open")?;
+                ensure!(
+                    transfer.operation == operation
+                        && transfer.repo == request.repo
+                        && request.text.is_empty()
+                        && transfer.input.len() == transfer.bytes
+                        && offset == transfer.read,
+                    "hydration transfer output changed"
+                );
+                if transfer.output.is_none() {
+                    // An anonymous file disappears when the worker closes or dies. Serialization
+                    // never needs a second event-sized plaintext buffer or a named recovery file.
+                    let mut writer = super::hydration::Writer {
+                        inner: std::io::BufWriter::new(tempfile::tempfile()?),
+                        bytes: 0,
+                        maximum: transfer.output_limit,
+                        overflowed: false,
+                    };
+                    let restored = if matches!(transfer.mode, Mode::HydrateFrozenJsonl) {
+                        FROZEN_HYDRATION.with(|frozen| {
+                            let mut frozen = frozen.borrow_mut();
+                            let frozen = frozen
+                                .as_mut()
+                                .context("publication dictionary is not frozen")?;
+                            ensure!(
+                                frozen.repo == request.repo,
+                                "publication dictionary belongs to another repository"
+                            );
+                            frozen.remember_values(&transfer.input);
+                            frozen.projector.hydrate_event(
+                                &transfer.input,
+                                transfer.mode,
+                                Some(frozen.preserve_protocol_ids),
+                                transfer.output_limit,
+                                &mut writer,
+                            )
+                        })
+                    } else {
+                        transfer
+                            .projector
+                            .as_mut()
+                            .context("hydration dictionary is missing")?
+                            .hydrate_event(
+                                &transfer.input,
+                                transfer.mode,
+                                None,
+                                transfer.output_limit,
+                                &mut writer,
+                            )
+                    };
+                    let overflowed = writer.overflowed;
+                    let mut bytes = writer.bytes;
+                    let mut file = writer
+                        .inner
+                        .into_inner()
+                        .map_err(|error| error.into_error())?;
+                    let report = if overflowed {
+                        file.set_len(0)?;
+                        file.rewind()?;
+                        file.write_all(transfer.input.as_bytes())?;
+                        bytes = transfer.input.len();
+                        Outcome {
+                            content: String::new(),
+                            status: Status::Partial,
+                            replacements: 0,
+                            unresolved: super::projector::tokens(&transfer.input).count(),
+                            consumed: None,
+                            unprocessed: 0,
+                            omitted: 0,
+                            reason: Some(super::projector::Reason::Oversize),
+                        }
+                    } else {
+                        restored?
+                    };
+                    transfer.output = Some(HydratedOutput {
+                        report,
+                        file,
+                        bytes,
+                    });
+                }
+                let output = transfer.output.as_mut().expect("hydration output prepared");
+                let mut bytes = vec![0; CHUNK_BYTES.min(output.bytes - offset)];
+                output.file.seek(SeekFrom::Start(offset as u64))?;
+                output.file.read_exact(&mut bytes)?;
+                if let Err(error) = std::str::from_utf8(&bytes) {
+                    ensure!(error.error_len().is_none(), "hydrated event is not UTF-8");
+                    bytes.truncate(error.valid_up_to());
+                }
+                reply.content = String::from_utf8(bytes)?;
+                reply.status = output.report.status;
+                reply.replacements = output.report.replacements;
+                reply.unresolved = output.report.unresolved;
+                reply.reason = output.report.reason;
+                reply.consumed = Some(output.bytes);
+                transfer.read += reply.content.len();
+            }
+            Command::Close { operation } => {
+                ensure!(
+                    slot.as_ref()
+                        .is_none_or(|transfer| transfer.operation == operation
+                            && transfer.repo == request.repo),
+                    "hydration transfer belongs to another operation"
+                );
+                *slot = None;
+            }
+        }
+        Ok(reply)
+    })
+}
+
 struct FrozenHydration {
     repo: Option<PathBuf>,
     preserve_protocol_ids: bool,
     projector: Projector,
     used_values: std::collections::BTreeSet<String>,
+}
+
+impl FrozenHydration {
+    fn remember_values(&mut self, text: &str) {
+        for (_, _, token) in super::projector::tokens(text) {
+            if let Some(record) = self.projector.dictionary.get(token) {
+                self.used_values.insert(record.original.clone());
+            }
+        }
+    }
 }
 
 impl Drop for FrozenHydration {
@@ -502,11 +749,7 @@ fn frozen_hydration(request: &Request) -> crate::Result<Outcome> {
                 "publication dictionary belongs to another repository"
             );
             if matches!(request.mode, Mode::HydrateFrozenJsonl) {
-                for (_, _, token) in super::projector::tokens(&request.text) {
-                    if let Some(record) = frozen.projector.dictionary.get(token) {
-                        frozen.used_values.insert(record.original.clone());
-                    }
-                }
+                frozen.remember_values(&request.text);
                 return Ok(frozen
                     .projector
                     .hydrate_frozen(&request.text, frozen.preserve_protocol_ids));
@@ -590,6 +833,10 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         request.context.len() + request.text.len() <= super::projector::MAX_UNIT_BYTES,
         "privacy input exceeds its byte budget"
     );
+    if matches!(request.mode, Mode::HydrateTransfer) {
+        return hydrate_transfer(request);
+    }
+    HYDRATION_TRANSFER.with(|slot| *slot.borrow_mut() = None);
     if matches!(
         request.mode,
         Mode::FreezeHydration | Mode::HydrateFrozenJsonl | Mode::HydrationValues
@@ -792,6 +1039,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                 .then_some(super::projector::Reason::DeviceRules)
                 .or((!legacy_whole || !global_whole)
                     .then_some(super::projector::Reason::LegacyRules)),
+            hydration_growth: Default::default(),
         };
         projector.policy =
             management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?

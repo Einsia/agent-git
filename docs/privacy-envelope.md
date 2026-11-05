@@ -105,6 +105,11 @@ retain one restored identity while LOG and VIEW preserve their order and multipl
 `protected_values` contains only literals used in this
 snapshot, allowing later local settlement to protect recovered values without importing the
 source dictionary's key, rule names or allowances.
+These literals come from restored source placeholders and actual public replacements; an
+incidental value remembered in the dictionary does not become a protection rule. Recovery
+inherits repository protection for these literals while preserving existing repository decisions
+for the same value, including decisions attached to another placeholder alias. A plain fork of
+authorized originals applies this protection before writing its new snapshot.
 
 Input budgets bound snapshot sequences and metadata before selection and encoding. The final
 serialized original layer must fit within 64 MiB minus the authentication tag. The canonical JSON

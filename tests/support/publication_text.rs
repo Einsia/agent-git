@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 pub const SECRET: &str = "PRIVATE_VALUE\n\"quoted\"";
+pub const CREDENTIAL: &str = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
 
 pub fn replacement() -> ReplacementRule {
     ReplacementRule {
@@ -59,11 +60,13 @@ pub fn records(workspace: &Path) -> Vec<Value> {
         ]}}),
         json!({"type":"assistant","message":{"role":"assistant","content":[
             {"type":"tool_use","id":"fixture-shell","name":"Bash","input":{"command":"SHELL_COMMAND"}},
-            {"type":"tool_use","id":"fixture-mcp","name":"mcp__files__read_file","input":{"path":workspace.join("src/main.rs")}}
+            {"type":"tool_use","id":"fixture-mcp","name":"mcp__files__read_file","input":{"path":workspace.join("src/main.rs"),"api_key":CREDENTIAL,"reference":CREDENTIAL,
+                "api_keys":[CREDENTIAL,[CREDENTIAL],{"label":CREDENTIAL},42,true],"references":[CREDENTIAL]}}
         ]}}),
         json!({"type":"user","message":{"role":"user","content":[
             {"type":"tool_result","tool_use_id":"fixture-shell","content":"PRIVATE_SHELL_RESULT"},
-            {"type":"tool_result","tool_use_id":"fixture-mcp","content":"PRIVATE_MCP_RESULT"}
+            {"type":"tool_result","tool_use_id":"fixture-mcp","content":{"label":"PRIVATE_MCP_RESULT","password":CREDENTIAL,"reference":CREDENTIAL,
+                "passwords":[CREDENTIAL],"references":[CREDENTIAL]}}
         ]}}),
     ]
 }
@@ -106,6 +109,31 @@ pub fn assert_public(public: &Value, workspace: &Path) {
         assert!(!text.contains(marker), "private content escaped: {marker}");
     }
     let records = storage::parse_envelopes(log).unwrap();
+    // The credential field supplies the evidence; the same opaque bytes in a reference stay.
+    // Scanning only detached scalar values loses that distinction after original hydration.
+    let mcp = records
+        .iter()
+        .flat_map(|record| record.content["message"]["content"].as_array().unwrap())
+        .find(|block| block["name"] == "mcp__files__read_file")
+        .unwrap();
+    assert!(
+        agit::domain::privacy::detector::placeholder::contains_token(
+            mcp["input"]["api_key"].as_str().unwrap()
+        )
+    );
+    assert_eq!(mcp["input"]["reference"], CREDENTIAL);
+    for value in [
+        &mcp["input"]["api_keys"][0],
+        &mcp["input"]["api_keys"][1][0],
+    ] {
+        assert!(
+            agit::domain::privacy::detector::placeholder::contains_token(value.as_str().unwrap())
+        );
+    }
+    assert_eq!(mcp["input"]["api_keys"][2]["label"], CREDENTIAL);
+    assert_eq!(mcp["input"]["api_keys"][3], 42);
+    assert_eq!(mcp["input"]["api_keys"][4], true);
+    assert_eq!(mcp["input"]["references"], json!([CREDENTIAL]));
     let result = |marker: &str| {
         records
             .iter()
@@ -119,6 +147,19 @@ pub fn assert_public(public: &Value, workspace: &Path) {
             .unwrap_or_else(|| panic!("missing structured result: {marker}"))
     };
     let structured = result("STRUCTURED_STDOUT");
+    let mcp_result = result("PRIVATE_MCP_RESULT");
+    assert!(
+        agit::domain::privacy::detector::placeholder::contains_token(
+            mcp_result["password"].as_str().unwrap()
+        )
+    );
+    assert_eq!(mcp_result["reference"], CREDENTIAL);
+    assert!(
+        agit::domain::privacy::detector::placeholder::contains_token(
+            mcp_result["passwords"][0].as_str().unwrap()
+        )
+    );
+    assert_eq!(mcp_result["references"], json!([CREDENTIAL]));
     assert_eq!(structured["exit_code"], 0);
     assert_eq!(structured["nested"]["secret"], "MASKED_VALUE");
     assert_eq!(structured["nested"]["path"], "<workspace>/src/main.rs");
