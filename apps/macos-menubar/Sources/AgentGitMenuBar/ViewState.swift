@@ -15,9 +15,15 @@ final class Measured: ObservableObject {
 }
 
 final class EnrollForm: ObservableObject {
-    @Published var path: String?
-    @Published var repository = ""
+    /// A refusal, and the move it offers, are about the folder and repository tried; changing
+    /// either drops them, so a move is never offered for a folder it was not refused for.
+    @Published var path: String? { didSet { if path != oldValue { refusal = nil } } }
+    @Published var repository = "" { didSet { if repository != oldValue { refusal = nil } } }
     @Published var createPrivate = true
     @Published var includeHistory = false
     @Published var finderProblem: String?
+    /// The folder being turned on, while it runs.
+    @Published var running: String?
+    /// Why the last try did not turn the folder on.
+    @Published var refusal: Failure?
 }

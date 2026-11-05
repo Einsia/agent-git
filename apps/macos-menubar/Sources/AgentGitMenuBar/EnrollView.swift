@@ -6,7 +6,14 @@ import SwiftUI
 struct EnrollView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var form = EnrollForm()
+    /// The window stays open while a folder is turned on, and a refusal shows here with the fields
+    /// still filled; it closes once the folder is on.
+    @StateObject private var form: EnrollForm
+
+    /// `form` is given only to show a state for a check; the app starts from an empty one.
+    init(form: EnrollForm = EnrollForm()) {
+        _form = StateObject(wrappedValue: form)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -29,6 +36,8 @@ struct EnrollView: View {
                     Button("Use Finder's window") { useFinder() }
                     Button("Choose…") { choose() }
                 }
+                // The form stays as it was while a try runs, so its answer is about what is shown.
+                .disabled(form.running != nil)
                 if let problem = form.finderProblem {
                     Text(problem).font(.system(size: 11)).foregroundStyle(.secondary)
                 }
@@ -45,30 +54,72 @@ struct EnrollView: View {
                 Toggle("Also upload conversations that already ran in this folder", isOn: $form.includeHistory)
             }
             .font(.system(size: 12))
+            .disabled(form.running != nil)
 
             if !model.signedIn {
                 Text("Sign in first: uploads need your AgentGit account.")
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
             }
+            if let refusal = form.refusal {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(refusal.title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
+                    ReasonText(text: refusal.reason)
+                    if let move = refusal.move, let path = form.path {
+                        Button("Move to \(move.to)…") {
+                            form.refusal = nil
+                            form.running = path
+                            model.move(
+                                path, move, includeHistory: form.includeHistory,
+                                createPrivate: form.createPrivate && ownRepository
+                            ) { on in
+                                form.running = nil
+                                if on == true { return dismiss() }
+                                if on == false { refuse(path, move.to) }
+                            }
+                        }
+                        .controlSize(.small)
+                        .disabled(form.running != nil)
+                    }
+                }
+            }
 
             HStack {
+                if let running = form.running, let step = model.busy[running] {
+                    ProgressView().controlSize(.small)
+                    Text(step).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                }
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("Turn on uploads…") {
                     guard let path = form.path else { return }
+                    let repository = form.repository.trimmingCharacters(in: .whitespaces)
+                    form.refusal = nil
+                    form.running = path
                     model.enroll(
-                        path: path, repository: form.repository.trimmingCharacters(in: .whitespaces),
-                        includeHistory: form.includeHistory, createPrivate: form.createPrivate && ownRepository)
-                    dismiss()
+                        path: path, repository: repository,
+                        includeHistory: form.includeHistory, createPrivate: form.createPrivate && ownRepository
+                    ) { on in
+                        form.running = nil
+                        if on == true { return dismiss() }
+                        // Cancelled in the question: back to the form as it was.
+                        if on == false { refuse(path, repository) }
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(form.path == nil || !validRepository || !model.signedIn)
+                .disabled(form.path == nil || !validRepository || !model.signedIn || form.running != nil)
             }
         }
         .padding(20)
         .frame(width: 480)
+    }
+
+    /// Shows the refusal of a try for `path` into `repository`, only while the form still shows
+    /// those: a refusal, and the move it offers, belong to the folder and repository tried.
+    private func refuse(_ path: String, _ repository: String) {
+        guard form.path == path, form.repository.trimmingCharacters(in: .whitespaces) == repository else { return }
+        form.refusal = model.failed[path]
     }
 
     private var parts: [String] {

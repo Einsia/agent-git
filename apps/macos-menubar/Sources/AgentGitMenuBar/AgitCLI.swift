@@ -11,10 +11,22 @@ struct CLIResult {
     let value: Data?
     /// stderr diagnostics with level `error`, in order.
     let errors: [String]
+    /// The first error with the hint and continuation lines agit printed under it, which often
+    /// hold the next step.
+    var explanation: [String] = []
+    /// The envelope's `refusal`: a code the app may act on, and the sentence agit wrote for the
+    /// person. The codes are an open set; an unknown one is shown by its text.
+    var refusalCode: String?
+    var refusalText: String?
+    /// The refusal's other string fields, such as the repositories a move is between.
+    var refusalFields: [String: String] = [:]
 
-    /// The first error, or a generic sentence when agit gave none.
+    /// Why the command failed, in agit's words: the refusal's sentence when agit gave one, else
+    /// its error lines, else a plain sentence. An exit code means nothing to the person reading it.
     var reason: String {
-        errors.first ?? "agit stopped with exit code \(exitCode)"
+        if let refusalText, !refusalText.isEmpty { return refusalText }
+        if !explanation.isEmpty { return explanation.joined(separator: "\n") }
+        return errors.first ?? "agit stopped without saying why."
     }
 
     func decode<T: Decodable>(_ type: T.Type) throws -> T {
@@ -190,22 +202,33 @@ struct AgitCLI {
     func run(_ arguments: [String], timeout: TimeInterval = 60) async throws -> CLIResult {
         let (data, status) = try await launch(["--json", "--no-color"] + arguments, timeout: timeout)
         guard let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw CLIError.unreadable("exit code \(status)")
+            throw CLIError.unreadable("it was not the JSON this app reads")
         }
         let result = document["result"] as? [String: Any]
         let value = result?["value"].flatMap {
             try? JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed])
         }
         let diagnostics = (document["diagnostics"] as? [String: Any])?["stderr"] as? [[String: Any]] ?? []
-        let errors = diagnostics
-            .filter { ($0["level"] as? String) == "error" }
-            .compactMap { $0["message"] as? String }
+        let rows = diagnostics.map { ($0["level"] as? String ?? "", $0["message"] as? String ?? "") }
+        let errors = rows.filter { $0.0 == "error" }.map(\.1)
+        var explanation: [String] = []
+        if let first = rows.firstIndex(where: { $0.0 == "error" }) {
+            explanation.append(rows[first].1)
+            for row in rows[(first + 1)...] {
+                guard row.0 == "hint" || row.0 == "info" else { break }
+                explanation.append(row.1)
+            }
+        }
         return CLIResult(
             ok: document["ok"] as? Bool ?? false,
             exitCode: document["exit_code"] as? Int ?? Int(status),
             kind: result?["kind"] as? String,
             value: value,
-            errors: errors
+            errors: errors,
+            explanation: explanation,
+            refusalCode: (document["refusal"] as? [String: Any])?["code"] as? String,
+            refusalText: (document["refusal"] as? [String: Any])?["text"] as? String,
+            refusalFields: ((document["refusal"] as? [String: Any]) ?? [:]).compactMapValues { $0 as? String }
         )
     }
 
