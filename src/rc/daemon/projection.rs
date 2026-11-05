@@ -577,7 +577,7 @@ impl Daemon {
             .as_deref()
             .ok_or_else(|| source_sessions::unavailable("native binding is unavailable"))?;
         let thread = context
-            .locate_ready(native, &self.mirror.roots(&caller.workspace_id))
+            .locate_ready(native, &self.roots_for(caller))
             .map_err(source_sessions::locate_failed)?;
         if self
             .roster

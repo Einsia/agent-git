@@ -103,6 +103,7 @@ pub(crate) mod native_inbox;
 pub(crate) mod native_queue;
 mod native_settings;
 pub(crate) mod navigation;
+pub(crate) mod operator_changes;
 pub mod outbound;
 pub mod peers;
 pub mod policy;

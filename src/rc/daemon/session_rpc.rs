@@ -135,6 +135,11 @@ impl Daemon {
             method::TURN_START | method::TURN_STEER | method::SESSION_ENQUEUE
         ) {
             crate::rc::harness::CodexUnconfined::check(&live.info.runtime, caller_is_owner)?;
+            let cwd = self
+                .roster
+                .get(&session_id)
+                .map(|entry| PathBuf::from(&entry.cwd));
+            self.refuse_home_folder_at(&caller, cwd.as_deref(), super::HOME_SESSION)?;
         }
         if matches!(f.method(), method::TURN_START | method::TURN_STEER)
             && let Some(error) = self.lease_refusal(&session_id)

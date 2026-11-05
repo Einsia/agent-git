@@ -2184,6 +2184,65 @@ pub(crate) fn watch_stream_id(workspace_id: &str, session_id: &str) -> String {
     format!("agit-watch-{workspace_id}-{session_id}")
 }
 
+/// Why a non-owner can't send to a session working in a folder the workspace binds only through a
+/// root at or above the owner's home directory.
+const HOME_SESSION: &str =
+    "This session works in the owner's home folder, so only the owner can send to it.";
+/// The same for starting a session there.
+const HOME_PROJECT: &str =
+    "This project is the owner's home folder, so only the owner can start a session in it.";
+
+impl Daemon {
+    /// The caller's workspace roots as this caller may use them: all of them for the owner; for
+    /// anyone else, none at or above the home directory, nor any under such a root.
+    fn roots_for(&self, caller: &crate::protocol::CallerClaim) -> policy::CanonicalRoots {
+        self.mirror
+            .roots(&caller.workspace_id)
+            .for_caller(caller.is_owner())
+    }
+
+    /// Refuses a non-owner at `cwd` when the workspace reaches it only through a root at or above
+    /// the home directory, with `text`. A folder outside every bound root is left to the check
+    /// that follows, as before.
+    fn refuse_home_folder(
+        &self,
+        caller: &crate::protocol::CallerClaim,
+        cwd: &std::path::Path,
+        text: &'static str,
+    ) -> Result<(), RpcError> {
+        self.refuse_home_folder_at(caller, Some(cwd), text)
+    }
+
+    /// [`Self::refuse_home_folder`] where the folder may be unknown, which counts as the home
+    /// folder whenever the workspace binds one.
+    fn refuse_home_folder_at(
+        &self,
+        caller: &crate::protocol::CallerClaim,
+        cwd: Option<&std::path::Path>,
+        text: &'static str,
+    ) -> Result<(), RpcError> {
+        if caller.is_owner() {
+            return Ok(());
+        }
+        let roots = self.mirror.roots(&caller.workspace_id);
+        let confining = self.roots_for(caller);
+        let home = match cwd {
+            Some(cwd) => policy::is_within(cwd, &roots) && !policy::is_within(cwd, &confining),
+            None => roots != confining,
+        };
+        if !home {
+            return Ok(());
+        }
+        let mut error = RpcError::new(ErrorCode::Forbidden, text);
+        error.data = Some(serde_json::json!({
+            "outcome": "not_sent",
+            "retryable": false,
+            "reason": "home_folder"
+        }));
+        Err(error)
+    }
+}
+
 /// Whether this frame may **read** a given session.
 fn require_same_workspace(
     caller: &crate::protocol::CallerClaim,

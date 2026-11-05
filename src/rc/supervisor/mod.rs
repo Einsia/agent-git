@@ -1352,7 +1352,24 @@ fn danger_disarm_after_mode_result(
         .flatten()
 }
 
+/// Why a command the owner granted goes back to the owner.
+const GRANT_WITHHELD: &str = "An operator approved a file change in this workspace, so granted \
+    commands now need the owner's approval until the owner grants them again.";
+
 impl Session {
+    /// The commands the owner granted operators, as they apply here: none, once the workspace
+    /// holds a file change an operator approved. The owner answers as before.
+    fn operator_heads(
+        &self,
+        confinement: &crate::rc::Confinement,
+    ) -> std::collections::BTreeSet<String> {
+        if crate::rc::operator_changes::recorded(&self.info.workspace_id) {
+            Default::default()
+        } else {
+            confinement.operator_heads.clone()
+        }
+    }
+
     pub(crate) fn shared_executor(&self) -> bool {
         self.driver.shared_executor()
     }
@@ -2795,14 +2812,19 @@ impl Session {
                             // heartbeat and deciding costs a few path comparisons, which is not
                             // worth a cache that errs outward.
                             let conf = self.confinement.borrow().clone();
-                            let needs_owner = crate::rc::policy::approval_owner_reason(
-                                &pending.tool,
-                                &pending.input,
-                                &conf.roots,
-                                &self.cwd,
-                                &conf.operator_heads,
-                            )
-                            .is_some();
+                            let reason = |heads| {
+                                crate::rc::policy::approval_owner_reason(
+                                    &pending.tool,
+                                    &pending.input,
+                                    &conf.roots,
+                                    &self.cwd,
+                                    heads,
+                                )
+                            };
+                            let heads = self.operator_heads(&conf);
+                            let needs_owner = reason(&heads).is_some();
+                            let grant_withheld =
+                                needs_owner && reason(&conf.operator_heads).is_none();
                             // **This gate stops only "allow".**
                             //
                             // A refusal is a brake, and a brake needs no permission — the
@@ -2835,7 +2857,11 @@ impl Session {
                                 // Put it back: it is still waiting for an answer.
                                 self.pending.insert(response.approval_id.clone(), pending);
                                 reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
-                                    message: "this approval reaches past what an operator may green-light, so only the owner may allow it".into(),
+                                    message: if grant_withheld {
+                                        GRANT_WITHHELD.into()
+                                    } else {
+                                        "this approval reaches past what an operator may green-light, so only the owner may allow it".into()
+                                    },
                                     retained: true,
                                 }));
                                 continue;
@@ -2892,6 +2918,20 @@ impl Session {
                             let expected_mode = changes_session_mode
                                 .then_some(pending.suggested_permission_mode)
                                 .flatten();
+                            // Recorded before the change goes ahead: a restart must not forget it.
+                            if !caller_is_owner
+                                && response.decision == crate::protocol::ApprovalDecision::Allow
+                                && crate::rc::policy::changes_files(&pending.tool)
+                                && crate::rc::operator_changes::record(&self.info.workspace_id)
+                                    .is_err()
+                            {
+                                self.pending.insert(response.approval_id.clone(), pending);
+                                reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
+                                    message: "this change could not be recorded, so it was not approved; try again".into(),
+                                    retained: true,
+                                }));
+                                continue;
+                            }
                             let mut outcome = self.driver.answer_approval(&response).await;
                             match &mut outcome {
                                 ApprovalOutcome::Applied { effective_mode }
@@ -3501,7 +3541,7 @@ impl Session {
                     // daemon, its own process cwd has nothing to do with the session, and a
                     // comparison computed from that base is wrong.
                     &self.cwd,
-                    &conf.operator_heads,
+                    &self.operator_heads(&conf),
                 )
                 .or_else(|| {
                     (!self.driver.permission_mode_known())

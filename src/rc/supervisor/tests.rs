@@ -3530,3 +3530,182 @@ async fn a_codex_session_refuses_a_non_owner_turn_at_delivery() {
     );
     session.driver.shutdown().await.unwrap();
 }
+
+/// A command the owner granted operators stops applying to them once an operator has approved a
+/// file change in the workspace: it goes to the owner, who can still allow it, in every session of
+/// that workspace and across a daemon restart, until the owner grants a command again. Another
+/// workspace is untouched. Before the change the grant works as it always did.
+#[cfg(unix)]
+#[test]
+fn a_grant_stops_covering_operators_once_one_approves_a_file_change_in_the_workspace() {
+    use crate::protocol::{ApprovalDecision, ApprovalScope};
+
+    /// Answers `approvals` in order, each `(tool, input, by the owner)`, in one daemon's lifetime,
+    /// in session `session_id` of `workspace`.
+    async fn answer(
+        (workspace, session_id): (&str, &str),
+        root: &std::path::Path,
+        written: &std::path::Path,
+        approvals: Vec<(&str, serde_json::Value, bool)>,
+    ) -> Vec<ApprovalOutcome> {
+        let mut driver =
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_recording(written);
+        driver.set_test_mode(PermissionMode::Default);
+        let ids: Vec<String> = (0..approvals.len()).map(|at| format!("a{at}")).collect();
+        for id in &ids {
+            driver.add_test_approval(id, None);
+        }
+        let mut session = harness_test_session(
+            AnyDriver::ClaudeCode(Box::new(driver)),
+            "claude-code",
+            SessionStatus::AwaitingApproval,
+        );
+        session.cwd = root.to_path_buf();
+        session.info.workspace_id = workspace.into();
+        session.info.session_id = session_id.into();
+        let (binding, confinement) = tokio::sync::watch::channel(crate::rc::Confinement {
+            roots: crate::rc::policy::CanonicalRoots::from_verified(vec![root.to_path_buf()]),
+            operator_heads: ["cargo".to_string()].into(),
+        });
+        session.confinement = confinement;
+        let (commands, mut command_rx) = mpsc::channel(approvals.len());
+        let mut receipts = Vec::new();
+        for (id, (tool, input, owner)) in ids.iter().zip(approvals) {
+            session.pending.insert(
+                id.clone(),
+                PendingApproval {
+                    tool: tool.into(),
+                    input,
+                    suggested_permission_mode: None,
+                    unseen: false,
+                },
+            );
+            let (ticket, receipt) = crate::rc::ticket::ticket();
+            receipts.push(receipt);
+            commands
+                .send(Command::Approve {
+                    response: ApprovalResponse {
+                        approval_id: id.clone(),
+                        session_id: session_id.into(),
+                        decision: ApprovalDecision::Allow,
+                        scope: ApprovalScope::Once,
+                        message: None,
+                        answers: None,
+                        by: Some("someone".into()),
+                    },
+                    caller_is_owner: owner,
+                    danger: DangerAuthorization::NotRequired,
+                    reply: ticket.with_control_ceiling(owner),
+                })
+                .await
+                .unwrap();
+        }
+        drop(commands);
+        session.run_inner(&mut command_rx).await;
+        drop(binding);
+        let mut outcomes = Vec::new();
+        for receipt in &mut receipts {
+            outcomes.push(
+                receipt
+                    .wait(std::time::Duration::from_secs(5))
+                    .await
+                    .expect("settled")
+                    .expect("ticket stays open")
+                    .expect("typed outcome"),
+            );
+        }
+        outcomes
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let folder = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(folder.path()).unwrap();
+    let written = root.join("written.jsonl");
+    let granted = || serde_json::json!({"command": "cargo test"});
+    let write = serde_json::json!({"file_path": root.join("build.rs"), "content": "x"});
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let withheld = |outcome: &ApprovalOutcome| {
+        matches!(
+            outcome,
+            ApprovalOutcome::ExplicitRefusal { message, retained: true } if message == GRANT_WITHHELD
+        )
+    };
+    crate::rc::with_agit_home(home.path(), || {
+        runtime.block_on(async {
+            let outcomes = answer(
+                ("workspace-a", "session-1"),
+                &root,
+                &written,
+                vec![
+                    ("Bash", granted(), false),
+                    ("Write", write, false),
+                    ("Bash", granted(), false),
+                    ("Bash", granted(), true),
+                ],
+            )
+            .await;
+            assert!(
+                matches!(outcomes[0], ApprovalOutcome::Applied { .. }),
+                "{outcomes:?}"
+            );
+            assert!(
+                matches!(outcomes[1], ApprovalOutcome::Applied { .. }),
+                "{outcomes:?}"
+            );
+            assert!(withheld(&outcomes[2]), "{outcomes:?}");
+            assert!(
+                matches!(outcomes[3], ApprovalOutcome::Applied { .. }),
+                "{outcomes:?}"
+            );
+
+            // The daemon restarts: a new supervisor over the same session, and another session.
+            for session in ["session-1", "session-2"] {
+                let outcomes = answer(
+                    ("workspace-a", session),
+                    &root,
+                    &written,
+                    vec![("Bash", granted(), false), ("Bash", granted(), true)],
+                )
+                .await;
+                assert!(withheld(&outcomes[0]), "{session}: {outcomes:?}");
+                assert!(
+                    matches!(outcomes[1], ApprovalOutcome::Applied { .. }),
+                    "{session}: {outcomes:?}"
+                );
+            }
+            // Another workspace's grant still applies.
+            let outcomes = answer(
+                ("workspace-b", "session-3"),
+                &root,
+                &written,
+                vec![("Bash", granted(), false)],
+            )
+            .await;
+            assert!(
+                matches!(outcomes[0], ApprovalOutcome::Applied { .. }),
+                "{outcomes:?}"
+            );
+            // The owner grants a command again: it applies once more.
+            crate::commands::rc::grant(crate::commands::rc::GrantArgs {
+                workspace: "workspace-a".into(),
+                command: "cargo".into(),
+            })
+            .unwrap();
+            assert!(!crate::rc::operator_changes::recorded("workspace-a"));
+            let outcomes = answer(
+                ("workspace-a", "session-2"),
+                &root,
+                &written,
+                vec![("Bash", granted(), false)],
+            )
+            .await;
+            assert!(
+                matches!(outcomes[0], ApprovalOutcome::Applied { .. }),
+                "{outcomes:?}"
+            );
+        })
+    });
+}

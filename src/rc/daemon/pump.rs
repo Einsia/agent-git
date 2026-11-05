@@ -674,7 +674,7 @@ impl Daemon {
                                             request.validate_message().map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
                                             let source_roots = {
                                                 let state = daemon.lock().await;
-                                                state.mirror.roots(&request.workspace_id)
+                                                state.inbox_roots(&frame)?
                                             };
                                             let (local, source) = tokio::task::spawn_blocking(move || {
                                                 if request.session_id.starts_with("local-") {

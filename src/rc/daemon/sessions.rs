@@ -116,12 +116,13 @@ impl Daemon {
         workspace_id: &str,
         purpose: LocalSessionScan,
     ) -> Vec<LocalSession> {
-        self.local_session_scan(workspace_id).scan(purpose)
+        self.local_session_scan(self.mirror.roots(workspace_id))
+            .scan(purpose)
     }
 
-    pub(super) fn local_session_scan(&self, workspace_id: &str) -> LocalSessionSnapshot {
+    pub(super) fn local_session_scan(&self, roots: policy::CanonicalRoots) -> LocalSessionSnapshot {
         LocalSessionSnapshot {
-            roots: self.mirror.roots(workspace_id),
+            roots,
             supervised: self
                 .sessions
                 .values()
@@ -143,7 +144,7 @@ impl Daemon {
                 "workspace is not bound on this machine",
             ));
         }
-        Ok(self.local_session_scan(&caller.workspace_id))
+        Ok(self.local_session_scan(self.roots_for(&caller)))
     }
 
     /// [`Self::finish_session_list`], logging where this list spent its time.
@@ -191,9 +192,7 @@ impl Daemon {
     ) -> Result<serde_json::Value, RpcError> {
         let caller = caller_scope(frame)?;
         require_role(&caller, frame.method())?;
-        if !self.mirror.has_workspace(&caller.workspace_id)
-            || self.mirror.roots(&caller.workspace_id) != *roots
-        {
+        if !self.mirror.has_workspace(&caller.workspace_id) || self.roots_for(&caller) != *roots {
             return Err(RpcError::new(
                 ErrorCode::WorkspaceNotFound,
                 "workspace folders changed during discovery; refresh the list",
@@ -282,7 +281,7 @@ impl Daemon {
                 updated_at: row.modified_at.clone(),
             }));
         }
-        let snapshot = self.local_session_scan(&caller.workspace_id);
+        let snapshot = self.local_session_scan(self.roots_for(&caller));
         let local = local
             .into_iter()
             .filter(|item| !snapshot.supervised.contains(&item.runtime_session_id))
@@ -541,6 +540,11 @@ impl Daemon {
             if p.prompt.is_some() {
                 crate::rc::harness::CodexUnconfined::check(&entry.runtime, caller.is_owner())?;
             }
+            self.refuse_home_folder(
+                caller,
+                std::path::Path::new(&entry.cwd),
+                super::HOME_SESSION,
+            )?;
             // Resuming a session that **ever** ran without approvals is owner-only too: its
             // context may still hold what was read at that time with nobody reviewing it.
             //
@@ -580,7 +584,7 @@ impl Daemon {
                 ));
             }
             require_active_runtime(&entry.runtime, &entry.thread_id)?;
-            let roots = self.mirror.roots(&p.workspace_id);
+            let roots = self.roots_for(caller);
             let cwd = policy::require_within(std::path::Path::new(&entry.cwd), &roots)
                 .map_err(|e| {
                     RpcError::new(ErrorCode::PathNotAllowed, e.to_string()).with_hint(
@@ -808,7 +812,8 @@ impl Daemon {
             likely_active: _,
         } = local;
         require_active_runtime(&runtime, &p.session_id)?;
-        let roots = self.mirror.roots(&p.workspace_id);
+        self.refuse_home_folder(caller, &cwd, super::HOME_SESSION)?;
+        let roots = self.roots_for(caller);
         let cwd = policy::require_within(&cwd, &roots).map_err(|e| {
             RpcError::new(ErrorCode::PathNotAllowed, e.to_string()).with_hint(
                 "that session's working directory is outside this workspace's bound folders",
@@ -965,6 +970,11 @@ impl Daemon {
         })
     }
 
+    /// The roots a native message's source conversation is looked up under: the caller's.
+    pub(super) fn inbox_roots(&self, frame: &Frame) -> Result<policy::CanonicalRoots, RpcError> {
+        Ok(self.roots_for(&caller_scope(frame)?))
+    }
+
     pub(super) fn prepare_native_inbox(
         &self,
         frame: &Frame,
@@ -1021,11 +1031,11 @@ impl Daemon {
                 }
             }
             watch
-                .validate(&self.mirror.roots(&request.workspace_id))
+                .validate(&self.roots_for(&caller))
                 .map_err(unavailable)?;
             let thread = watch
                 .context
-                .locate(&watch.native_id, &self.mirror.roots(&request.workspace_id))
+                .locate(&watch.native_id, &self.roots_for(&caller))
                 .map_err(unavailable)?;
             // A non-owner is judged only by the mode the index records now; one that cannot be
             // read now, or only from the rollout's history, is refused.
@@ -1075,6 +1085,7 @@ impl Daemon {
                 .ok_or_else(|| {
                     RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
                 })?;
+            self.refuse_home_folder(&caller, Path::new(&local.cwd), super::HOME_SESSION)?;
             // A Claude Code session receives messages only through the process that runs it.
             let claude = match local.runtime.as_str() {
                 "codex" => None,
@@ -1094,7 +1105,7 @@ impl Daemon {
                     ));
                 }
             };
-            let roots = self.mirror.roots(&request.workspace_id);
+            let roots = self.roots_for(&caller);
             let cwd = policy::require_within(Path::new(&local.cwd), &roots)
                 .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
             // The message drives the process where it runs, which must lie inside the workspace too.
@@ -1321,7 +1332,8 @@ impl Daemon {
                     "that project is not bound in this workspace",
                 )
             })?;
-        let roots = self.mirror.roots(&p.workspace_id);
+        self.refuse_home_folder(caller, &cwd, super::HOME_PROJECT)?;
+        let roots = self.roots_for(caller);
         let cwd = policy::require_within(&cwd, &roots)
             .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))?;
         // The daemon mutex keeps the checked binding and the prepared launch path consistent.
