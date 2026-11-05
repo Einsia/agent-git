@@ -4412,31 +4412,19 @@ mod tests {
         }
     }
 
+    /// How many loose objects `repo` holds.
+    fn loose_objects(repo: &Repo) -> usize {
+        let counts = repo.git(&["count-objects", "-v"]).unwrap();
+        counts
+            .lines()
+            .find_map(|line| line.strip_prefix("count: "))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
-    fn owned_tree_apply_large_batch_finishes_without_a_pipe_protocol() {
-        const CHILD: &str = "AGIT_NATIVE_TREE_TEST_CHILD";
-        const TEST: &str = "commands::plumbing::tests::owned_tree_apply_large_batch_finishes_without_a_pipe_protocol";
-        if std::env::var_os(CHILD).is_none() {
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture"])
-                .env(CHILD, "1")
-                .spawn()
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success(), "bulk tree subprocess failed: {status}");
-                    break;
-                }
-                if std::time::Instant::now() > deadline {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    panic!("bulk tree construction did not finish before the deadline");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            return;
-        }
+    fn owned_tree_apply_large_batch_writes_each_object_once() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repo::init(directory.path()).unwrap();
         repo.git(&["commit", "--allow-empty", "-m", "base"])
@@ -4451,7 +4439,10 @@ mod tests {
                 )
             })
             .collect();
+        let before = loose_objects(&repo);
         let tree = tree_apply_owned(&repo, &head, edits).unwrap();
+        // One blob per event, the events tree and the root tree.
+        assert_eq!(loose_objects(&repo) - before, count + 2);
         assert_eq!(repo.ls_tree_result(&tree).unwrap().len(), count);
         assert_eq!(cat_blob(&repo, &tree, "events/00004e1f"), b"event 19999\n");
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
