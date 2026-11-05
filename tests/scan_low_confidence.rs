@@ -66,6 +66,10 @@ fn fixture(tmp: &Path) -> PathBuf {
 }
 
 fn scan(home: &Path, flags: &[&str]) -> (String, String) {
+    scan_with_status(home, flags, 0)
+}
+
+fn scan_with_status(home: &Path, flags: &[&str], expected: i32) -> (String, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
     command
         .args(["scan", TARGET, "--secrets"])
@@ -87,8 +91,39 @@ fn scan(home: &Path, flags: &[&str]) -> (String, String) {
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     );
-    assert!(out.status.success(), "{flags:?}\n{stdout}\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(expected),
+        "{flags:?}\n{stdout}\n{stderr}"
+    );
     (stdout, stderr)
+}
+
+/// A finding in Agent history reaches the scan's output with the history advice, and the allow
+/// hint is offered only for a value the person knows is theirs and not a credential. A scan that
+/// kept the bare "not a credential?" hint would invite allowing someone else's value.
+#[test]
+fn history_findings_advise_not_publishing_and_allow_only_ones_own_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fixture(tmp.path());
+    let repo = Repo::open(home.join("repos/alice/app")).unwrap();
+    repo.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Quoted credential: AKIA4X7QZ2M5RT6VW3JH",
+    ])
+    .unwrap();
+
+    let (stdout, stderr) = scan_with_status(&home, &[], 7);
+    let text = format!("{stdout}{stderr}");
+    for advice in [
+        "don't publish this branch",
+        "only if you know the value is yours and it is not a credential: `agit secrets allow",
+    ] {
+        assert!(text.contains(advice), "missing {advice}: {text}");
+    }
+    assert!(!text.contains("· not a credential?"), "{text}");
 }
 
 fn preview(value: &str) -> String {

@@ -431,7 +431,7 @@ pub fn hint_secret_hit_remedies<'a>(hits: impl IntoIterator<Item = &'a secrets::
     }
     if registered {
         crate::ui::hint(
-            "· registered-secret rules ignore inline annotations: remove the value, allow the exact value locally, or review local rule labels with `agit secrets list`",
+            "· registered-secret rules ignore inline annotations: remove the value or review local rule labels with `agit secrets list`",
         );
     }
     hint_secret_remedies(sources);
@@ -448,9 +448,9 @@ fn remedy_hint(r: SecretRemedy) -> String {
             secrets::INLINE_PRAGMA
         ),
         // Deleting or reverting is the natural reaction and it removes the value from the VIEW
-        // only: the object stays reachable and every push still sends it, so a real credential
-        // has to be revoked where it was issued.
-        SecretRemedy::AgentHistory => "· some findings are in Agent history (blob, commit or tag objects), which AgentGit never rewrites. `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW, but LOG and Git history keep it and push still sends it: revoke and rotate a real credential".to_string(),
+        // only: the object stays reachable and a copy may already be on the Hub, so a real
+        // credential has to be revoked where it was issued.
+        SecretRemedy::AgentHistory => "· some findings are in Agent history (blob, commit or tag objects), which AgentGit never rewrites. What the Hub already holds stays, and a push sends files, tag messages and low-confidence values as they are, so don't publish this branch until you've checked them. If a value is a credential, whoever it belongs to should revoke and rotate it; if it isn't yours, tell its owner. To continue the work publicly, start a new session. `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW; LOG and Git history keep it".to_string(),
     }
 }
 
@@ -1231,9 +1231,10 @@ mod tests {
     }
 
     /// The history advice must not contradict the agit rules every Agent repo carries ("Never
-    /// rebase or force-push AgentGit history"). Advice naming `--amend`, `rebase` or
-    /// `filter-repo` would send a user to break the session they are reviewing; advice that drops
-    /// "push still sends it" lets a revert pass for a fix.
+    /// rebase or force-push AgentGit history"), and it says what to do instead. Advice naming
+    /// `--amend`, `rebase` or `filter-repo` would send a user to break the session they are
+    /// reviewing; advice that drops "LOG and Git history keep it" lets a revert pass for a fix; advice
+    /// without "don't publish" and "a new session" leaves publishing the branch as the next step.
     #[test]
     fn the_history_advice_never_names_a_rewrite() {
         let advice = super::remedy_hint(SecretRemedy::AgentHistory);
@@ -1241,7 +1242,9 @@ mod tests {
             assert!(!advice.contains(rewrite), "{rewrite}: {advice}");
         }
         assert!(advice.contains("agit revert"), "{advice}");
-        assert!(advice.contains("push still sends it"), "{advice}");
+        assert!(advice.contains("LOG and Git history keep it"), "{advice}");
+        assert!(advice.contains("don't publish this branch"), "{advice}");
+        assert!(advice.contains("start a new session"), "{advice}");
     }
 }
 
