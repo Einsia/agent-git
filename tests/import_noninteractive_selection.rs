@@ -1675,7 +1675,13 @@ fn device_policy_precedence_applies_during_import() {
     assert!(log.contains("\u{2039}secret:"));
 }
 
-/// Creator authority survives link-only adoption and later committers while observations are protected.
+/// Creator authority survives link-only adoption and later committers while observations are
+/// protected. A live turn's commit message carries registered values only as placeholders, in
+/// its subject and in its milestone line alike, because plain publication sends that message as
+/// written. A subject cut from the raw prompt before protection puts a fragment of the value on
+/// the branch that no rule matches any more, and a subject cut inside a placeholder shows half of
+/// it; a pass over the finished message that rewrote protected text would make the message's
+/// milestone differ from the meta's.
 #[test]
 fn imported_and_live_metadata_remain_publishable() {
     use std::io::Write;
@@ -1835,7 +1841,8 @@ fn imported_and_live_metadata_remain_publishable() {
 
     let mut file = fs::OpenOptions::new().append(true).open(source).unwrap();
     for value in [
-        serde_json::json!({"type":"user", "sessionId":lab.sources[0].0, "cwd":lab.work, "uuid":"metadata-user-next", "message":{"role":"user", "content":"Continue the fixture"}}),
+        // The registered value crosses the place where the subject is cut.
+        serde_json::json!({"type":"user", "sessionId":lab.sources[0].0, "cwd":lab.work, "uuid":"metadata-user-next", "message":{"role":"user", "content":format!("Continue the fixture and keep the origin value {secret} out of every subject")}}),
         serde_json::json!({"type":"assistant", "sessionId":lab.sources[0].0, "cwd":lab.work, "uuid":"metadata-assistant-next", "message":{"role":"assistant", "content":"Fixture complete"}}),
     ] {
         writeln!(file, "{value}").unwrap();
@@ -1867,7 +1874,36 @@ fn imported_and_live_metadata_remain_publishable() {
     );
     assert!(!metadata.contains(milestone_secret));
     assert_eq!(snapshot.turn, Some(2));
-    assert!(snapshot.milestone.unwrap().contains("\u{2039}secret:"));
+    let protected_milestone = snapshot.milestone.clone().unwrap();
+    assert!(protected_milestone.contains("\u{2039}secret:"));
+    let message = target_git(
+        &lab,
+        &repo,
+        &[
+            "log",
+            "-1",
+            "--format=%B",
+            "--grep=^milestone: ",
+            "metadata",
+        ],
+    );
+    let (subject, milestone_line) = (
+        message.lines().next().unwrap(),
+        message
+            .lines()
+            .find_map(|line| line.strip_prefix("milestone: "))
+            .unwrap(),
+    );
+    // The subject stops before the placeholder its cut would split.
+    assert_eq!(
+        subject, "Continue the fixture and keep the origin value…",
+        "{message}"
+    );
+    // The pass over the whole message leaves the protected milestone as the meta holds it.
+    assert_eq!(milestone_line, protected_milestone, "{message}");
+    for fragment in [&secret[..10], &milestone_secret[..10]] {
+        assert!(!message.contains(fragment), "{message}");
+    }
     assert_eq!(
         snapshot.cwd_state.as_ref().unwrap().head.as_deref(),
         Some(source_head.trim())
