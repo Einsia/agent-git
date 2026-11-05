@@ -555,26 +555,38 @@ impl Daemon {
                                 let _ = out_tx.send(Frame::error_response(id, RpcError::new(ErrorCode::SessionBusy, "session discovery is busy; retry shortly")));
                                 continue;
                             }
+                            let include_local = frame.params_as::<SessionList>().is_ok_and(|params| params.include_local);
+                            let mut timing = ListTiming::start(include_local);
                             let prepared = {
                                 let g = frame_lock(&d).await;
+                                timing.lock_prepare = crate::rc::diagnostics::elapsed_ms(timing.started);
                                 if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
-                                g.prepare_session_list(&frame)
+                                let preparing = std::time::Instant::now();
+                                let prepared = g.prepare_session_list(&frame);
+                                timing.prepare = crate::rc::diagnostics::elapsed_ms(preparing);
+                                prepared
                             };
                             match prepared {
                                 Ok(snapshot) => {
                                     let d = d.clone();
                                     let out = out_tx.clone();
                                     let roots = snapshot.roots.clone();
-                                    let include_local = frame.params_as::<SessionList>().is_ok_and(|params| params.include_local);
                                     let departure = (frame.authority.clone(), id.clone(), out_tx.clone());
                                     session_rpc_tasks.spawn(unless_departed(departure.0, departure.1, departure.2, async move {
+                                        let scanning = std::time::Instant::now();
                                         let scanned = tokio::task::spawn_blocking(move || {
-                                            if include_local { snapshot.scan(LocalSessionScan::Listing) } else { vec![] }
+                                            if include_local { snapshot.scan_timed(LocalSessionScan::Listing) } else { (vec![], ScanTimes::default()) }
                                         }).await;
+                                        timing.scan = crate::rc::diagnostics::elapsed_ms(scanning);
+                                        let locking = std::time::Instant::now();
                                         let mut g = frame_lock(&d).await;
+                                        timing.lock_finish = crate::rc::diagnostics::elapsed_ms(locking);
                                         if !connection_epoch_is_current(&g.settlement, epoch) { return; }
                                         let result = scanned.map_err(|_| RpcError::new(ErrorCode::Internal, "session discovery worker failed"))
-                                            .and_then(|local| g.finish_session_list(&frame, &roots, local));
+                                            .and_then(|(local, times)| {
+                                                timing.scan_times = times;
+                                                g.finish_session_list_timed(&frame, &roots, local, timing)
+                                            });
                                         let response = match result {
                                             Ok(value) => Frame::response(id, value),
                                             Err(error) => Frame::error_response(id, error),

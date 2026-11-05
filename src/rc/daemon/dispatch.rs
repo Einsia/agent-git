@@ -358,14 +358,21 @@ impl Daemon {
                     workspace_id: String::new(),
                     include_local: false,
                 });
+                let mut timing = ListTiming::start(p.include_local);
+                let prepared = std::time::Instant::now();
                 let snapshot = self.prepare_session_list(f)?;
+                timing.prepare = crate::rc::diagnostics::elapsed_ms(prepared);
                 let roots = snapshot.roots.clone();
+                let scanned = std::time::Instant::now();
                 let local = if p.include_local {
-                    snapshot.scan(LocalSessionScan::Listing)
+                    let (local, times) = snapshot.scan_timed(LocalSessionScan::Listing);
+                    timing.scan_times = times;
+                    local
                 } else {
                     vec![]
                 };
-                self.finish_session_list(f, &roots, local)
+                timing.scan = crate::rc::diagnostics::elapsed_ms(scanned);
+                self.finish_session_list_timed(f, &roots, local, timing)
             }
 
             #[cfg(test)]
@@ -951,5 +958,71 @@ mod tests {
                 &serde_json::json!(false)
             )
         );
+    }
+
+    /// A `session.list` logs where its time went: its phases, the rows it found and whether it
+    /// scanned this computer, as numbers and the one id `executor.dispatch` pairs with the client.
+    /// One log entry per list; nothing of the sessions themselves.
+    #[tokio::test]
+    async fn a_session_list_logs_where_its_time_went() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::dispatch::tests::a_session_list_logs_where_its_time_went",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", root.path());
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        const ID: &str = "session-list-timing-1";
+        crate::rc::diagnostics::test_events(ID, 0);
+        let mut d = watching_daemon();
+        d.mirror.bind("ws-a", "project", &project).unwrap();
+        let (frames, _frames_rx) = mpsc::channel(8);
+        let mut list = viewer_subscribe("unused", 0);
+        list.method = Some(method::SESSION_LIST.into());
+        list.params = Some(serde_json::json!({"workspace_id":"ws-a", "include_local":true}));
+        list.id = Some(crate::protocol::RequestId::Str(ID.into()));
+        d.dispatch(&list, &frames).await.unwrap();
+
+        let events = crate::rc::diagnostics::test_events(ID, 1);
+        let logged: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "session.list_timing")
+            .map(|event| event["metadata"].as_object().unwrap())
+            .collect();
+        assert_eq!(logged.len(), 1, "{events:?}");
+        let event = logged[0];
+        let mut keys: Vec<_> = event.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "enumerate_ms",
+                "executor_request_id",
+                "finish_ms",
+                "gist_ms",
+                "include_local",
+                "labels_ms",
+                "local_rows",
+                "lock_finish_ms",
+                "lock_prepare_ms",
+                "prepare_ms",
+                "scan_ms",
+                "session_rows",
+                "total_ms"
+            ]
+        );
+        assert_eq!(event["executor_request_id"], ID);
+        assert_eq!(event["include_local"], true);
+        for (key, value) in event {
+            assert!(
+                key == "executor_request_id" || key == "include_local" || value.is_u64(),
+                "{key}: {value}"
+            );
+        }
     }
 }

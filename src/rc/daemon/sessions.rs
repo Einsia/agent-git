@@ -146,6 +146,43 @@ impl Daemon {
         Ok(self.local_session_scan(&caller.workspace_id))
     }
 
+    /// [`Self::finish_session_list`], logging where this list spent its time.
+    pub(super) fn finish_session_list_timed(
+        &mut self,
+        frame: &Frame,
+        roots: &policy::CanonicalRoots,
+        local: Vec<LocalSession>,
+        timing: ListTiming,
+    ) -> Result<serde_json::Value, RpcError> {
+        let local_rows = local.len();
+        let finishing = std::time::Instant::now();
+        let result = self.finish_session_list(frame, roots, local);
+        let session_rows = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value["sessions"].as_array())
+            .map_or(0, Vec::len);
+        crate::rc::diagnostics::event(
+            "session.list_timing",
+            serde_json::json!({
+                "executor_request_id": crate::rc::diagnostics::rpc_id(frame.id.as_ref()),
+                "include_local": timing.include_local,
+                "local_rows": local_rows,
+                "session_rows": session_rows,
+                "lock_prepare_ms": timing.lock_prepare,
+                "prepare_ms": timing.prepare,
+                "scan_ms": timing.scan,
+                "enumerate_ms": timing.scan_times.enumerate,
+                "gist_ms": timing.scan_times.gist,
+                "labels_ms": timing.scan_times.labels,
+                "lock_finish_ms": timing.lock_finish,
+                "finish_ms": crate::rc::diagnostics::elapsed_ms(finishing),
+                "total_ms": crate::rc::diagnostics::elapsed_ms(timing.started),
+            }),
+        );
+        result
+    }
+
     pub(super) fn finish_session_list(
         &mut self,
         frame: &Frame,
@@ -1747,9 +1784,15 @@ pub(super) fn take_list_labels(info: &mut SessionInfo, row: &LocalSession) {
 
 impl LocalSessionSnapshot {
     pub(super) fn scan(self, purpose: LocalSessionScan) -> Vec<LocalSession> {
+        self.scan_timed(purpose).0
+    }
+
+    pub(super) fn scan_timed(self, purpose: LocalSessionScan) -> (Vec<LocalSession>, ScanTimes) {
+        let started = std::time::Instant::now();
+        let mut times = ScanTimes::default();
         let roots = self.roots;
         if roots.is_empty() {
-            return vec![];
+            return (vec![], times);
         }
         let store = crate::domain::store::Store::open().ok().flatten();
         let mut out: Vec<LocalSession> = vec![];
@@ -1849,7 +1892,9 @@ impl LocalSessionSnapshot {
             });
         }
 
-        finish_local_sessions(out, purpose, local_gist_preview)
+        times.enumerate = crate::rc::diagnostics::elapsed_ms(started);
+        let sessions = finish_local_sessions_timed(out, purpose, local_gist_preview, &mut times);
+        (sessions, times)
     }
 }
 
