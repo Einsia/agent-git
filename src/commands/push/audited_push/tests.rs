@@ -146,6 +146,7 @@ fn intent() -> Intent {
         explicit_repository: false,
         source_identity: None,
         action: Action::Existing(remote),
+        visibility_asked: false,
     }
 }
 

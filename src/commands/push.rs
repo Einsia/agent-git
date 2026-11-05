@@ -986,6 +986,9 @@ fn ask_visibility(agent: &str) -> crate::Result<Option<bool>> {
         "{} isn’t on the hub yet — this first push settles who can read it.",
         ui::bold(agent)
     );
+    if ui::prompt::can_ask() {
+        super::repo::tell_public_reach(true);
+    }
     ui::prompt::confirm("make the published content readable by anyone?", false)
 }
 

@@ -565,6 +565,9 @@ struct Intent {
     explicit_repository: bool,
     source_identity: Option<RemoteIdentity>,
     action: Action,
+    /// The person answered the first-publication visibility question, which already said what
+    /// being public means; the creation question does not say it again.
+    visibility_asked: bool,
 }
 
 impl Intent {
@@ -629,6 +632,7 @@ impl Intent {
             !write_denied,
             "the selected account cannot publish to this repository; cross-repository publication requires preserved source authority"
         );
+        let mut visibility_asked = false;
         let (owner, visibility, url, action) = if let Some(remote) = source {
             verify_agent_location(&hub, &checkout.owner, &checkout.name, &remote)?;
             if pinned_destination {
@@ -652,7 +656,11 @@ impl Intent {
             }
             let public = match wanted_visibility(args, repo).value() {
                 Some(public) => public,
-                None => first_visibility(None, ask_visibility(&checkout.name)?),
+                None => {
+                    let answer = ask_visibility(&checkout.name)?;
+                    visibility_asked = answer.is_some();
+                    first_visibility(None, answer)
+                }
             };
             (
                 checkout.owner.clone(),
@@ -692,6 +700,7 @@ impl Intent {
             explicit_repository,
             source_identity: identity::read(repo)?,
             action,
+            visibility_asked,
         };
         intent.verify_account(client)?;
         Ok(intent)
