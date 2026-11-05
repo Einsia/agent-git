@@ -70,9 +70,7 @@ pub(super) fn newest_logs() -> Vec<PathBuf> {
 #[cfg(test)]
 pub(crate) fn test_events(id: &str, expected: usize) -> Vec<Value> {
     let log = DAEMON_LOG.get_or_init(|| {
-        let directory =
-            std::env::temp_dir().join(format!("agit-daemon-log-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = tempfile::tempdir().unwrap().keep();
         Log::open_in(&directory, "test", FILE_BYTES, WRITE_RETRY).unwrap()
     });
     let deadline = Instant::now() + Duration::from_secs(5);
