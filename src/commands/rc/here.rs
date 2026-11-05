@@ -1,7 +1,12 @@
 //! `agit rc start --here`: make this computer reachable through Cloud on the Hub the person
-//! signed in to, and say plainly when it is not. It publishes nothing and touches no repository.
+//! signed in to, and say plainly when it is not. Once it is online, and after one question, it
+//! binds the folder as a project of this computer's workspace there, so the sessions started in it
+//! from then on upload to a new private repository of the person's. It uploads nothing that is
+//! already there.
 
 use crate::rc::control::{CloudLine, CloudPresence};
+use anyhow::Result;
+use std::path::Path;
 
 /// How long `--here` waits for this computer's presence on the Hub.
 pub(super) const PRESENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -132,10 +137,7 @@ pub(super) fn outcome_line(hub: &str, outcome: &Outcome) -> String {
         "Check `agit rc cloud status --hub {hub}`, then `agit rc stop` and `agit rc start --here`."
     );
     match outcome {
-        Outcome::Online => format!(
-            "Online on {hub}. Next: on {hub}/workspaces add this folder as a project (private), \
-             then DM your link code to the bot."
-        ),
+        Outcome::Online => format!("Online on {hub}."),
         // The wrong Hub leads, on a line of its own, so it cannot be read past.
         Outcome::NotOnline { class, elsewhere } if !elsewhere.is_empty() => format!(
             "This computer is online on {}, not on {hub}.\n({class}) {retry}",
@@ -146,6 +148,148 @@ pub(super) fn outcome_line(hub: &str, outcome: &Outcome) -> String {
             "Can't tell whether this computer is online on {hub}: the agit background service \
              running now is older. Run `agit rc stop`, then `agit rc start --here`."
         ),
+    }
+}
+
+/// The step on the website for a folder `--here` did not bind.
+pub(super) fn website_step(hub: &str) -> String {
+    format!(
+        "Next: on {hub}/workspaces add this folder as a project (private), then DM your link code \
+         to the bot."
+    )
+}
+
+/// What `--here` knows about the folder before it asks anything.
+pub(super) struct FolderState {
+    /// A workspace of this computer binds it as a project already.
+    pub bound: bool,
+    /// This computer holds its sessions in a repository of an earlier project.
+    pub earlier_project: bool,
+    /// Someone at a terminal can answer, and `--yes` did not try to.
+    pub can_ask: bool,
+}
+
+/// Why `--here` binds nothing for `folder`, before it asks the Hub anything: the line, and whether
+/// that is a refusal. `None` when it may go on.
+pub(super) fn before_binding(
+    hub: &str,
+    folder: &Path,
+    state: &FolderState,
+) -> Option<(String, bool)> {
+    let folder = crate::ui::tilde(folder);
+    if state.bound {
+        return Some((
+            format!("{folder} is already a project on {hub}. Next: DM your link code to the bot."),
+            false,
+        ));
+    }
+    if state.earlier_project {
+        return Some((
+            format!(
+                "{folder} holds sessions of an earlier project on this computer, so --here binds \
+                 nothing. To upload them, run `agit save` in it; to add the folder as a project, \
+                 use {hub}/workspaces."
+            ),
+            true,
+        ));
+    }
+    if !state.can_ask {
+        return Some((
+            format!(
+                "Nothing was bound: --here asks one question first, and there was no terminal to \
+                 ask it in. Add the folder as a project on {hub}/workspaces (private), or run \
+                 `agit rc start --here` in a terminal."
+            ),
+            false,
+        ));
+    }
+    None
+}
+
+/// This computer as the Hub knows it.
+pub(super) struct Device {
+    pub id: String,
+    /// The name the Hub shows for it, which its workspace is named after.
+    pub display_name: String,
+}
+
+/// The one question `--here` asks before it binds `folder` to the new private repository
+/// `repository`.
+pub(super) fn question(hub: &str, folder: &Path, repository: &str) -> String {
+    let folder = crate::ui::tilde(folder);
+    format!(
+        "Sessions started from now on in {folder} from the web or the relay upload to {repository} \
+         (new, private: only its members can read it); a terminal session does once you open it \
+         on the web.\n\
+         Sessions already in {folder} stay on this computer until you save them (`agit save`).\n\
+         To stop the uploads: `agit off {folder}`.\n\
+         Turning off Cloud access (`agit rc cloud inbound --hub {hub} --enabled false`) stops the \
+         relay reaching this computer, not the uploads.\n\
+         Add {folder} as a project?"
+    )
+}
+
+/// How binding the folder ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Bind {
+    /// The folder is a project, and its new sessions upload to `repository`.
+    Bound { repository: String },
+    /// The Hub offered no new private repository of the person's; the website step remains.
+    NoNewRepository,
+    /// The person said no.
+    Declined,
+}
+
+/// Binds `folder` as a project of this computer's workspace on the Hub `client` serves, to the new
+/// private repository the Hub suggests in the person's own namespace (`username`), once `ask`
+/// says yes to [`question`]. A repository that already exists, one of another owner, or none
+/// binds nothing. Right after the yes and before the bind, the conversations `held` lists, the
+/// ones the folder holds now, are recorded to stay out of its uploads (`rc::folder_cutoff`).
+pub(super) fn bind_folder(
+    client: &crate::hub::Client,
+    hub: &str,
+    folder: &Path,
+    device: &Device,
+    username: &str,
+    held: impl FnOnce() -> Result<Vec<String>>,
+    ask: impl FnOnce(&str) -> Result<bool>,
+) -> Result<Bind> {
+    use crate::hub::workspaces::FolderBind;
+    let local_path = folder.to_string_lossy();
+    let workspace = client.device_workspace(&device.id, &device.display_name)?;
+    let suggested = match client.bind_folder(&workspace.id, &local_path, None)? {
+        FolderBind::Choice { suggested } => suggested,
+        FolderBind::Bound(_) => anyhow::bail!("the Hub bound the folder without a choice"),
+    };
+    let Some((owner, name)) = suggested
+        .as_deref()
+        .and_then(|suggested| suggested.split_once('/'))
+        .filter(|(owner, _)| *owner == username)
+    else {
+        return Ok(Bind::NoNewRepository);
+    };
+    let repository = format!("{owner}/{name}");
+    if !absent(client.get_agent_unredirected(owner, name))? {
+        return Ok(Bind::NoNewRepository);
+    }
+    if !ask(&question(hub, folder, &repository))? {
+        return Ok(Bind::Declined);
+    }
+    crate::rc::folder_cutoff::record(folder, held()?)?;
+    match client.bind_folder(&workspace.id, &local_path, Some(&repository))? {
+        FolderBind::Bound(_) => Ok(Bind::Bound { repository }),
+        FolderBind::Choice { .. } => anyhow::bail!("the Hub asked again which repository to use"),
+    }
+}
+
+/// Whether a repository lookup found nothing there: a 404. Any other failure leaves it unknown.
+fn absent<T>(lookup: Result<T>) -> Result<bool> {
+    match lookup {
+        Ok(_) => Ok(false),
+        Err(error) => match error.downcast_ref::<crate::hub::client::ApiError>() {
+            Some(api) if api.status == 404 => Ok(true),
+            _ => Err(error),
+        },
     }
 }
 
@@ -422,5 +566,196 @@ mod tests {
             },
             "AGIT_HUB_URL alone, no sign-in anywhere: nothing to warn about, no Cloud access"
         );
+    }
+
+    mod binding {
+        use super::super::*;
+        use crate::hub::workspaces::test_hub::{TestHome, client, serve};
+
+        const WORKSPACE: (u16, &str) = (200, r#"{"id":"ws-1","name":"Ada's laptop"}"#);
+        const NOT_FOUND: (u16, &str) = (404, r#"{"error":"not found","kind":"not_found"}"#);
+
+        fn choice(suggested: &str) -> String {
+            format!(
+                r#"{{"error":"choose","kind":"repository_choice","fix":[],"candidates":["acme/work"],"suggested":"{suggested}","unavailable":[],"audiences":{{}}}}"#
+            )
+        }
+
+        /// What a run of [`bind_folder`] came to: its outcome, the question asked, the requests
+        /// the Hub saw, and whether the folder's earlier conversation stays out afterwards.
+        type Run = (Result<Bind>, Option<String>, Vec<(String, String)>, bool);
+
+        fn device() -> Device {
+            Device {
+                id: "dev-9".into(),
+                display_name: "Ada's laptop".into(),
+            }
+        }
+
+        /// Runs [`bind_folder`] for a new folder against `script`, answering the question with
+        /// `yes`. Returns the outcome (or error), the question asked, the requests the Hub saw,
+        /// and whether the folder's earlier conversation stays out afterwards.
+        fn run(script: Vec<(u16, &str)>, yes: bool) -> Run {
+            let _home = TestHome::new();
+            let folder = tempfile::tempdir().unwrap();
+            let folder = folder.path().canonicalize().unwrap();
+            let (base, hub) = serve(script);
+            let mut asked = None;
+            let outcome = bind_folder(
+                &client(&base),
+                "https://hub.example",
+                &folder,
+                &device(),
+                "ada",
+                || Ok(vec!["claude-code:before".to_owned()]),
+                |question| {
+                    asked = Some(question.to_owned());
+                    Ok(yes)
+                },
+            );
+            drop(client(&base));
+            // The stub waits for every scripted request; one the flow did not make is not waited
+            // for.
+            let seen = hub.join().unwrap();
+            let kept_out = crate::rc::folder_cutoff::leaves_out(&folder, "claude-code", "before");
+            (outcome, asked, seen, kept_out)
+        }
+
+        /// On a yes, `--here` names the workspace like the device, asks the Hub's choice, checks
+        /// that the suggested name is free, records the conversations the folder holds, and only
+        /// then binds with that repository. The record is in place even when the bind fails.
+        #[test]
+        fn here_records_what_the_folder_holds_before_it_binds() {
+            let chosen = choice("ada/work");
+            let (outcome, asked, seen, kept_out) = run(
+                vec![
+                    WORKSPACE,
+                    (409, &chosen),
+                    NOT_FOUND,
+                    (500, r#"{"error":"boom","kind":"internal"}"#),
+                ],
+                true,
+            );
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert!(asked.unwrap().contains("ada/work"));
+            assert_eq!(seen.len(), 4);
+            assert!(
+                seen[0]
+                    .0
+                    .starts_with("PUT /api/peer/devices/dev-9/workspace ")
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&seen[0].1).unwrap(),
+                serde_json::json!({"name": "Ada's laptop"}),
+                "the workspace is named like its device"
+            );
+            assert!(
+                seen[2].0.starts_with("GET /api/agents/ada/work "),
+                "{}",
+                seen[2].0
+            );
+            assert!(seen[3].0.starts_with("POST /api/workspaces/ws-1/projects "));
+            let sent: serde_json::Value = serde_json::from_str(&seen[3].1).unwrap();
+            assert_eq!(sent["repository"], "ada/work");
+            assert!(kept_out, "recorded before the bind");
+
+            let chosen = choice("ada/work");
+            let (outcome, _, seen, kept_out) = run(
+                vec![
+                    WORKSPACE,
+                    (409, &chosen),
+                    NOT_FOUND,
+                    (201, r#"{"id":"p-1"}"#),
+                ],
+                true,
+            );
+            assert_eq!(
+                outcome.unwrap(),
+                Bind::Bound {
+                    repository: "ada/work".into()
+                }
+            );
+            assert_eq!(seen.len(), 4);
+            assert!(kept_out);
+        }
+
+        /// A no binds nothing and records nothing.
+        #[test]
+        fn here_binds_nothing_when_the_person_says_no() {
+            let chosen = choice("ada/work");
+            let (outcome, asked, seen, kept_out) =
+                run(vec![WORKSPACE, (409, &chosen), NOT_FOUND], false);
+            assert_eq!(outcome.unwrap(), Bind::Declined);
+            assert!(asked.is_some());
+            assert_eq!(seen.len(), 3, "no bind with a repository");
+            assert!(!kept_out);
+        }
+
+        /// `--here` takes only the new repository the Hub suggests in the person's own namespace:
+        /// never one of another owner, never a candidate (an existing repository, possibly an
+        /// organization's), and never a suggested name that exists by now. Nothing is asked,
+        /// recorded or bound then.
+        #[test]
+        fn here_takes_only_a_new_repository_of_its_own() {
+            let other = choice("acme/work-sessions");
+            let (outcome, asked, seen, _) = run(vec![WORKSPACE, (409, &other)], true);
+            assert_eq!(outcome.unwrap(), Bind::NoNewRepository);
+            assert!(asked.is_none());
+            assert_eq!(seen.len(), 2);
+
+            let none = r#"{"error":"choose","kind":"repository_choice","fix":[],"candidates":["acme/work"],"unavailable":[],"audiences":{}}"#;
+            let (outcome, asked, _, _) = run(vec![WORKSPACE, (409, none)], true);
+            assert_eq!(outcome.unwrap(), Bind::NoNewRepository);
+            assert!(asked.is_none());
+
+            let chosen = choice("ada/work");
+            let existing = r#"{"agent_id":"r-1","owner":"ada","name":"work","clone_url":"https://hub.example/ada/work.git","visibility":"private"}"#;
+            let (outcome, asked, seen, kept_out) =
+                run(vec![WORKSPACE, (409, &chosen), (200, existing)], true);
+            assert_eq!(outcome.unwrap(), Bind::NoNewRepository);
+            assert!(asked.is_none(), "an existing name is never offered");
+            assert_eq!(seen.len(), 3);
+            assert!(!kept_out);
+        }
+
+        /// The question names the new repository and who can read it, what uploads from now on
+        /// and what doesn't, how to stop the uploads, and that turning Cloud access off doesn't.
+        #[test]
+        fn here_asks_what_it_starts_and_how_to_stop() {
+            let folder = Path::new("/work/app");
+            let asked = question("https://hub.example", folder, "ada/app");
+            for expected in [
+                "ada/app (new, private: only its members can read it)",
+                "Sessions started from now on in /work/app from the web or the relay upload to",
+                "a terminal session does once you open it on the web",
+                "Sessions already in /work/app stay on this computer until you save them",
+                "To stop the uploads: `agit off /work/app`",
+                "`agit rc cloud inbound --hub https://hub.example --enabled false`",
+                "not the uploads",
+            ] {
+                assert!(asked.contains(expected), "{expected:?} in {asked}");
+            }
+        }
+
+        /// Without someone at a terminal to answer (no terminal, or `--yes`), `--here` binds
+        /// nothing; nor for a folder that is a project already, or one whose sessions this
+        /// computer holds for an earlier project, which it refuses.
+        #[test]
+        fn here_binds_nothing_it_was_not_asked_to() {
+            let hub = "https://hub.example";
+            let folder = Path::new("/work/app");
+            let state = |bound, earlier_project, can_ask| FolderState {
+                bound,
+                earlier_project,
+                can_ask,
+            };
+            assert!(before_binding(hub, folder, &state(false, false, true)).is_none());
+            let (line, refused) = before_binding(hub, folder, &state(false, false, false)).unwrap();
+            assert!(!refused && line.starts_with("Nothing was bound"), "{line}");
+            let (line, refused) = before_binding(hub, folder, &state(false, true, true)).unwrap();
+            assert!(refused && line.contains("`agit save`"), "{line}");
+            let (line, refused) = before_binding(hub, folder, &state(true, false, true)).unwrap();
+            assert!(!refused && line.contains("already a project"), "{line}");
+        }
     }
 }

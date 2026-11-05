@@ -930,6 +930,98 @@ pub(crate) fn left_out_in(folder: &Path, sessions: &[FolderSession]) -> usize {
         .count()
 }
 
+/// Every conversation `root` holds that anything on this computer could later take in, as
+/// `runtime:session-id`: those the runtimes' own stores show, whether or not their program is on
+/// this PATH, and those of every Codex home registered with the background service, archived ones
+/// included, since unarchiving brings them back. What is left out here would count as new once
+/// uploads are on, so a store that can't be read in full is an error, never a shorter list.
+pub(crate) fn held_sessions(root: &Path) -> Result<Vec<String>> {
+    let unreadable = || {
+        format!(
+            "cannot list every conversation in {}, so its uploads were not turned on",
+            ui::tilde(root)
+        )
+    };
+    let mut held = std::collections::BTreeSet::new();
+    for runtime in ["claude-code", "codex"] {
+        let adapter = adapter::get(runtime)?;
+        for session in adapter.every_session().with_context(unreadable)? {
+            let cwd = session
+                .cwd
+                .clone()
+                .or_else(|| crate::tui::screens::selector::recorded_cwd(&session.path))
+                .and_then(|cwd| PathBuf::from(cwd).canonicalize().ok());
+            if cwd.is_none_or(|cwd| cwd.starts_with(root)) {
+                held.insert(format!("{runtime}:{}", session.id));
+            }
+        }
+    }
+    for adapter in adapter::all() {
+        if !adapter.installable() {
+            continue;
+        }
+        for session in adapter
+            .workspace_sessions_for(root, false)
+            .with_context(unreadable)?
+        {
+            held.insert(format!("{}:{}", session.runtime, session.id));
+        }
+    }
+    let roots = crate::rc::policy::CanonicalRoots::from_untrusted([root.to_owned()]);
+    let registry = crate::rc::runtime_sources::Registry::open().with_context(unreadable)?;
+    // The default Codex home is read as a source too, as the background service reads it: a
+    // runtime's own list falls back quietly when its index is unreadable, and this must not.
+    registry.enroll_default().with_context(unreadable)?;
+    let mut homes = vec![adapter::codex::codex_home().with_context(unreadable)?];
+    for source in registry.list().with_context(unreadable)? {
+        if !source.enabled {
+            continue;
+        }
+        homes.push(source.home.clone());
+        // A home no session has run in yet holds nothing: configuration alone, with no index and
+        // no sessions folder. Listing calls that unreliable, which is right for a catalog that
+        // deletes what it stops seeing, but here it would stop a folder over a store that is
+        // merely empty. A home that is gone, or a folder that can't be read, still refuses.
+        let unused = adapter::codex_index::lacks_index(&source.home).with_context(unreadable)?
+            && std::fs::symlink_metadata(source.home.join("sessions"))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if unused {
+            continue;
+        }
+        let context =
+            crate::rc::runtime_context::RuntimeContext::resolve(&registry, &source.source_id)
+                .with_context(unreadable)?;
+        let mut cursor = None;
+        loop {
+            let page = context
+                .list_page(&roots, cursor.as_deref(), 500)
+                .with_context(unreadable)?;
+            anyhow::ensure!(page.reliable, unreadable());
+            held.extend(
+                page.rows
+                    .iter()
+                    .map(|row| format!("{}:{}", row.runtime, row.native_session_id)),
+            );
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    for home in homes {
+        for (id, cwd) in adapter::codex_index::hidden_threads_in(&home).with_context(unreadable)? {
+            let within = cwd.is_none_or(|cwd| {
+                let cwd = PathBuf::from(cwd);
+                cwd.canonicalize().unwrap_or(cwd).starts_with(root)
+            });
+            if within {
+                held.insert(format!("codex:{id}"));
+            }
+        }
+    }
+    Ok(held.into_iter().collect())
+}
+
 /// Every Claude Code and Codex conversation modified since `since`, newest first.
 pub(crate) fn sessions_since(since: std::time::SystemTime) -> Result<Vec<FolderSession>> {
     sessions_where(|_, modified| modified >= since)

@@ -206,7 +206,9 @@ pub struct StartArgs {
     #[arg(long, value_name = "name")]
     pub name: Option<String>,
     /// Make this computer reachable through Cloud on the Hub you signed in to, wait until it is
-    /// online there, and say what to do next. Publishes nothing.
+    /// online there, then, if you say yes, add the current folder as a project there: sessions
+    /// started in it from then on upload to a new private repository of yours. Uploads nothing
+    /// that is already here.
     #[arg(long)]
     pub here: bool,
 }
@@ -782,13 +784,12 @@ fn start(args: StartArgs) -> CmdResult {
             },
         );
         let line = here::outcome_line(&origin, &outcome);
-        return Ok(if outcome == here::Outcome::Online {
-            ui::success(&line);
-            ExitCode::Ok
-        } else {
+        if outcome != here::Outcome::Online {
             ui::error(&line);
-            ExitCode::Precondition
-        });
+            return Ok(ExitCode::Precondition);
+        }
+        ui::success(&line);
+        return here_folder(&origin);
     }
     if control::running_pid().is_some() || args.detach {
         crate::rc::local::ensure_daemon()?;
@@ -796,6 +797,65 @@ fn start(args: StartArgs) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
     crate::rc::local::start_foreground()?;
+    Ok(ExitCode::Ok)
+}
+
+/// `--here`'s step for the current folder once this computer is online on `hub`.
+fn here_folder(hub: &str) -> CmdResult {
+    use anyhow::Context as _;
+    let folder = match crate::rc::policy::require_bindable_dir(&std::env::current_dir()?) {
+        Ok(folder) => folder,
+        Err(error) => {
+            ui::error(&format!("{error}: nothing was bound."));
+            return Ok(ExitCode::Precondition);
+        }
+    };
+    let state = here::FolderState {
+        bound: crate::rc::mirror::Mirror::load()
+            .all_roots()
+            .iter()
+            .any(|root| folder.starts_with(root)),
+        earlier_project: !crate::rc::local_repository::covering(&folder)?.is_empty(),
+        can_ask: std::env::var_os("AGIT_YES").is_none() && ui::prompt::may_prompt(),
+    };
+    if let Some((line, refused)) = here::before_binding(hub, &folder, &state) {
+        if refused {
+            ui::error(&line);
+            return Ok(ExitCode::Precondition);
+        }
+        println!("{line}");
+        return Ok(ExitCode::Ok);
+    }
+    let enrollment = crate::rc::cloud::store::load(hub)?
+        .context("this computer has no enrollment on the Hub")?;
+    let device = here::Device {
+        id: enrollment.credential.device.id.clone(),
+        display_name: enrollment.credential.device.display_name.clone(),
+    };
+    let client = crate::hub::Client::for_stored_hub(hub);
+    let username = client
+        .credential_username()
+        .context("not signed in to the Hub")?;
+    let held = || super::front::held_sessions(&folder);
+    let ask = |question: &str| Ok(ui::prompt::confirm(question, false)? == Some(true));
+    match here::bind_folder(&client, hub, &folder, &device, &username, held, ask)? {
+        here::Bind::Bound { repository } => {
+            ui::success(&format!(
+                "{} is a project of {} on {hub}: its new sessions upload to {repository}.",
+                ui::tilde(&folder),
+                device.display_name
+            ));
+            println!("Next: DM your link code to the bot.");
+        }
+        here::Bind::NoNewRepository => {
+            println!("The Hub offered no new private repository of yours for this folder.");
+            println!("{}", here::website_step(hub));
+        }
+        here::Bind::Declined => {
+            println!("Nothing was bound; nothing was uploaded.");
+            println!("{}", here::website_step(hub));
+        }
+    }
     Ok(ExitCode::Ok)
 }
 

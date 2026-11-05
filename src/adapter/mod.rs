@@ -889,6 +889,13 @@ pub trait Adapter {
         self.all_sessions()
     }
 
+    /// [`Self::all_sessions`] for a caller that must not take a store it can't read for a shorter
+    /// list: deciding what already exists, where a session left out would count as new. Listings
+    /// use [`Self::all_sessions`] and show what they can.
+    fn every_session(&self) -> Result<Vec<SessionRef>> {
+        self.all_sessions()
+    }
+
     fn parse(&self, text: &str) -> Result<Session>;
 
     /// Parse from a **path**.

@@ -372,7 +372,12 @@ fn publication_allowed(job: &Job) -> bool {
     job.session()
         .and_then(|lineage| {
             let repo = crate::rc::capture::require(&lineage)?;
-            crate::rc::supervisor::archive_recovery::publication_target(&repo, &lineage)
+            crate::rc::supervisor::archive_recovery::publication_target(
+                &repo,
+                &lineage,
+                &job.runtime,
+                &job.native,
+            )
         })
         .is_ok()
 }
@@ -516,6 +521,17 @@ impl Schedule {
             Class::Waits(Waiting::PushDisabled) => {
                 eprintln!(
                     "agitd: completed turn archive is committed locally and waits for automatic publication to be turned on ({}, turn {})",
+                    job.logical, job.turn_id
+                );
+                Some(Park {
+                    claim: evidence.claim,
+                    until: Until::PushEnabled { checked: now },
+                })
+            }
+            // Rechecked like a wait for automatic publication: saving the conversation ends it.
+            Class::Waits(Waiting::HeldBack) => {
+                eprintln!(
+                    "agitd: completed turn archive is committed locally and stays on this computer until it is saved ({}, turn {})",
                     job.logical, job.turn_id
                 );
                 Some(Park {

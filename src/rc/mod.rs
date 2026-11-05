@@ -80,6 +80,8 @@ mod control_protocol;
 pub mod daemon;
 mod diagnostics;
 mod endpoint;
+/// The conversations a folder held when `agit rc start --here` bound it.
+pub(crate) mod folder_cutoff;
 pub mod grants;
 pub mod harness;
 pub mod identity;
@@ -138,7 +140,7 @@ pub(crate) fn select_plain_authority() {
     LOCAL_AUTHORITY.store(false, std::sync::atomic::Ordering::Release);
 }
 
-const LOCAL_NAMESPACE: &str = "desktop-rc";
+pub(crate) const LOCAL_NAMESPACE: &str = "desktop-rc";
 
 /// The selected daemon namespace.
 pub fn rc_dir() -> crate::Result<PathBuf> {

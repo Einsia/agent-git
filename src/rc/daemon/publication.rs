@@ -260,9 +260,12 @@ impl Prepared {
         };
         let path = repo_path.clone();
         let target = destination.clone();
+        let (native, runtime) = (self.native.clone(), self.runtime.clone());
         let readiness = tokio::task::spawn_blocking(move || -> crate::Result<_> {
             let repo = Repo::open(&path).context("publication repository is missing")?;
-            if !crate::commands::auto_push::publication_allowed(&repo, &target.repository)? {
+            if !crate::commands::auto_push::publication_allowed(&repo, &target.repository)?
+                || crate::rc::folder_cutoff::holds_back(&repo, &runtime, &native)
+            {
                 return Ok(Some(crate::protocol::PublicationReason::PushDisabled));
             }
             if !crate::commands::push::automatic_publication_consent(

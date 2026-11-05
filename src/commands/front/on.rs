@@ -41,7 +41,14 @@ fn current_or(dir: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn turn_on(args: OnArgs) -> CmdResult {
-    let root = super::folder(&current_or(args.dir)?)?;
+    let dir = current_or(args.dir)?;
+    if args.repo.is_none() {
+        let lifted = turn_on_bound_folders(&dir, super::held_sessions)?;
+        if !lifted.is_empty() {
+            return report_bound_on(&lifted);
+        }
+    }
+    let root = super::folder(&dir)?;
     let mut again = String::from("agit on");
     if let Some(repo) = &args.repo {
         again.push_str(&format!(" --repo {repo}"));
@@ -526,9 +533,75 @@ fn codex_state(hooks: Option<crate::commands::setup::CodexHooks>) -> RuntimeStat
     }
 }
 
+/// Turns back on the folders holding `dir` that the website binds as projects of this computer
+/// and `agit off` turned off. The conversations each holds now stay out of its uploads until the
+/// person saves them (`rc::folder_cutoff`), as they did when it was first turned on: only those
+/// started from now on upload. `held` lists a folder's conversations (`runtime:session-id`).
+/// Returns each folder and the repository it uploads to.
+fn turn_on_bound_folders(
+    dir: &Path,
+    held: impl Fn(&Path) -> Result<Vec<String>>,
+) -> Result<Vec<(PathBuf, Option<String>)>> {
+    let mut lifted = Vec::new();
+    for (folder, repo) in crate::rc::local_repository::covering(dir)? {
+        if !repo.uploads_turned_off()? {
+            continue;
+        }
+        crate::rc::folder_cutoff::record(&folder, held(&folder)?)?;
+        repo.turn_uploads_off(false)?;
+        let destination = crate::rc::local_repository::publication::Destination::load(&repo)?;
+        if destination.is_some() {
+            repo.set_auto_push(Some(true))?;
+        }
+        lifted.push((
+            folder,
+            destination.map(|destination| destination.repository),
+        ));
+    }
+    Ok(lifted)
+}
+
+fn report_bound_on(lifted: &[(PathBuf, Option<String>)]) -> CmdResult {
+    for (folder, repository) in lifted {
+        if crate::commands::json::is_capturing() {
+            println!(
+                "{}",
+                serde_json::json!({"folder": folder, "on": true, "repository": repository})
+            );
+            continue;
+        }
+        ui::success(&format!("{} is on", ui::tilde(folder)));
+        match repository {
+            Some(repository) => println!(
+                "  sessions started from now on here upload to {repository}; the ones already here stay on this computer until you save them (`agit save`)"
+            ),
+            None => println!(
+                "  sessions started from now on here upload once the website binds this folder again; the ones already here stay on this computer until you save them (`agit save`)"
+            ),
+        }
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// Turns off the folders holding `dir` that the website binds as projects of this computer: their
+/// new sessions no longer upload, whatever binds them again, until `agit on`. Returns the folders
+/// turned off by this call.
+fn turn_off_bound_folders(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut turned = Vec::new();
+    for (folder, repo) in crate::rc::local_repository::covering(dir)? {
+        if !repo.uploads_turned_off()? {
+            repo.turn_uploads_off(true)?;
+            turned.push(folder);
+        }
+    }
+    Ok(turned)
+}
+
 fn turn_off(args: OffArgs) -> CmdResult {
-    let root = super::folder(&current_or(args.dir)?)?;
+    let dir = current_or(args.dir)?;
+    let root = super::folder(&dir)?;
     let folder = ui::tilde(&root);
+    let bound = turn_off_bound_folders(&dir)?;
     match crate::commands::project::uploads_automatically(&root) {
         Some(true) => {
             // A git worktree its main checkout covers is turned off on its own; the main checkout
@@ -557,6 +630,18 @@ fn turn_off(args: OffArgs) -> CmdResult {
             }
             Ok(ExitCode::Ok)
         }
+        _ if !bound.is_empty() => {
+            for folder in &bound {
+                if crate::commands::json::is_capturing() {
+                    println!("{}", serde_json::json!({"folder": folder, "on": false}));
+                } else {
+                    ui::success(&format!("{} is off", ui::tilde(folder)));
+                    println!("  new sessions here are no longer uploaded; nothing was deleted");
+                    println!("  to turn it back on: {}", ui::accent("agit on"));
+                }
+            }
+            Ok(ExitCode::Ok)
+        }
         // In a folder that doesn't upload by itself, off is the person's no to turning it on: it is
         // recorded, so nothing suggests it there again, and nothing else changes.
         _ => {
@@ -579,6 +664,237 @@ fn turn_off(args: OffArgs) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeState, codex_state};
+
+    /// `agit off` in a folder the website binds as a project stops its uploads, whatever turns
+    /// its repository's automatic upload back on, and keeps out the conversations it held when it
+    /// was turned on. `agit on` lifts that, and keeps out every conversation the folder holds by
+    /// then, the ones that ran while it was off included: only those started afterwards upload.
+    #[test]
+    fn a_website_bound_folder_turned_off_and_on_uploads_only_what_starts_after() {
+        if crate::rc::in_isolated_test(
+            "commands::front::on::tests::a_website_bound_folder_turned_off_and_on_uploads_only_what_starts_after",
+        ) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let folder = home.path().join("app");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let repository =
+            crate::rc::local_repository::ensure_repository("project", &folder).unwrap();
+        let repo = crate::rc::local_repository::require(
+            &crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .unwrap(),
+        )
+        .unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        let uploads = || crate::commands::auto_push::publication_allowed(&repo, "ada/app").unwrap();
+        let out =
+            |native: &str| crate::rc::folder_cutoff::leaves_out(&folder, "claude-code", native);
+        assert!(uploads());
+        crate::rc::folder_cutoff::record(&folder, ["claude-code:before".to_owned()]).unwrap();
+
+        assert_eq!(
+            super::turn_off_bound_folders(&folder.join(".")).unwrap(),
+            vec![folder.clone()]
+        );
+        assert!(!uploads(), "off stops the uploads");
+        repo.set_auto_push(Some(true)).unwrap();
+        assert!(
+            !uploads(),
+            "and a repair of the repository's own setting doesn't lift it"
+        );
+        assert!(out("before"), "off keeps the record");
+        assert!(
+            super::turn_off_bound_folders(&folder).unwrap().is_empty(),
+            "already off"
+        );
+
+        // A conversation runs while the folder is off; then it is turned on.
+        let lifted = super::turn_on_bound_folders(&folder, |_| {
+            Ok(vec![
+                "claude-code:before".to_owned(),
+                "claude-code:while-off".to_owned(),
+            ])
+        })
+        .unwrap();
+        assert_eq!(lifted, vec![(folder.clone(), None)]);
+        assert!(!repo.uploads_turned_off().unwrap());
+        assert!(uploads(), "on lifts it");
+        assert!(
+            out("before") && out("while-off"),
+            "what ran before on stays out"
+        );
+        assert!(!out("after"), "a conversation started after on uploads");
+        assert!(
+            super::turn_on_bound_folders(&folder, |_| unreachable!())
+                .unwrap()
+                .is_empty(),
+            "a folder that is on is left as it is"
+        );
+    }
+
+    /// What a folder holds is read from every source the background service can read, not only
+    /// this process's Codex home: a conversation in another registered home is held, and would
+    /// otherwise count as new once uploads are on. So is one every list leaves out but that can
+    /// come back: an archived one, and one with no rollout yet. One of another folder is not. A
+    /// source that can't be read refuses, rather than giving a shorter list.
+    #[test]
+    fn a_folder_holds_the_conversations_of_every_registered_source() {
+        if crate::rc::in_isolated_test(
+            "commands::front::on::tests::a_folder_holds_the_conversations_of_every_registered_source",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        unsafe {
+            std::env::set_var("HOME", root.join("home"));
+            std::env::set_var("AGIT_HOME", root.join("agit"));
+        }
+        // The default Codex home has configuration and no session yet: an empty store, which
+        // refuses nothing.
+        std::fs::create_dir_all(root.join("home/.codex")).unwrap();
+        std::fs::write(root.join("home/.codex/config.toml"), "").unwrap();
+        let project = root.join("project");
+        let other = root.join("other-codex");
+        for directory in [&project, &other] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let transcript = other.join("thread.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let database = rusqlite::Connection::open(other.join("state_1.sqlite")).unwrap();
+        database.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, model TEXT, reasoning_effort TEXT, approval_mode TEXT, sandbox_policy TEXT)").unwrap();
+        database.execute("INSERT INTO threads VALUES ('elsewhere',?1,?2,'question','cli',123,0,'m','high','never','{\"type\":\"read-only\"}')", rusqlite::params![transcript.to_str().unwrap(), project.to_str().unwrap()]).unwrap();
+        for (id, path, cwd, archived) in [
+            ("archived", transcript.to_str(), project.to_str(), 1),
+            ("no-rollout", None, project.to_str(), 0),
+            ("another-folder", transcript.to_str(), other.to_str(), 1),
+        ] {
+            database.execute("INSERT INTO threads VALUES (?1,?2,?3,'question','cli',123,?4,'m','high','never','{\"type\":\"read-only\"}')", rusqlite::params![id, path, cwd, archived]).unwrap();
+        }
+        drop(database);
+        crate::rc::runtime_sources::Registry::open()
+            .unwrap()
+            .register(&other, None, None, None)
+            .unwrap();
+        let held = super::super::held_sessions(&project).unwrap();
+        for id in ["codex:elsewhere", "codex:archived", "codex:no-rollout"] {
+            assert!(held.contains(&id.to_owned()), "{id}: {held:?}");
+        }
+        assert!(
+            !held.contains(&"codex:another-folder".to_owned()),
+            "{held:?}"
+        );
+
+        let refuses = || {
+            let refused = super::super::held_sessions(&project).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("its uploads were not turned on"),
+                "{refused:#}"
+            );
+        };
+        // The same empty Codex home with a `sessions` that can't be read is no longer empty.
+        let sessions = root.join("home/.codex/sessions");
+        std::fs::write(&sessions, "").unwrap();
+        refuses();
+        std::fs::remove_file(&sessions).unwrap();
+
+        // A Claude Code store that isn't there is empty; one behind something that isn't a folder
+        // can't be read, and refuses.
+        let claude = root.join("home/.claude");
+        std::fs::write(&claude, "").unwrap();
+        refuses();
+        std::fs::remove_file(&claude).unwrap();
+        // So does a project folder that can be listed but not followed.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(claude.join("projects")).unwrap();
+            let looped = claude.join("projects/looped");
+            std::os::unix::fs::symlink(&looped, &looped).unwrap();
+            refuses();
+            std::fs::remove_file(&looped).unwrap();
+        }
+        super::super::held_sessions(&project).unwrap();
+
+        std::fs::remove_dir_all(&other).unwrap();
+        refuses();
+    }
+
+    /// A conversation recorded while the folder was off is not published after `agit on`: the
+    /// recovery of its queued turns holds it back as the capture does, until the person saves it.
+    /// One started after `agit on` publishes.
+    #[test]
+    fn recovery_publishes_nothing_of_what_ran_while_the_folder_was_off() {
+        if crate::rc::in_isolated_test(
+            "commands::front::on::tests::recovery_publishes_nothing_of_what_ran_while_the_folder_was_off",
+        ) {
+            return;
+        }
+        use crate::rc::supervisor::archive_recovery::{Waiting, publication_target};
+        let home = tempfile::tempdir().unwrap();
+        let hub = "http://127.0.0.1:9";
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path().join("agit"));
+            std::env::set_var("AGIT_HUB_URL", hub);
+        }
+        crate::rc::select_local_authority();
+        let folder = home.path().join("app");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        let repository =
+            crate::rc::local_repository::ensure_repository("project", &folder).unwrap();
+        let lineage =
+            crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .unwrap();
+        let repo = crate::rc::local_repository::require(&lineage).unwrap();
+        crate::rc::local_repository::publication::Selection::prepare(
+            &repo,
+            Some("owner/project"),
+            hub,
+        )
+        .unwrap()
+        .unwrap()
+        .bind(
+            &repo,
+            &crate::hub::identity::RemoteIdentity::new(hub, "00000000-0000-0000-0000-000000000002")
+                .unwrap(),
+        )
+        .unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        let recovery = |native: &str| publication_target(&repo, &lineage, "codex", native);
+
+        super::turn_off_bound_folders(&folder).unwrap();
+        let waits = |native: &str| {
+            recovery(native)
+                .unwrap_err()
+                .downcast_ref::<Waiting>()
+                .copied()
+        };
+        assert_eq!(waits("while-off"), Some(Waiting::PushDisabled));
+
+        let lifted =
+            super::turn_on_bound_folders(&folder, |_| Ok(vec!["codex:while-off".into()])).unwrap();
+        assert_eq!(lifted, vec![(folder.clone(), Some("owner/project".into()))]);
+        assert_eq!(
+            waits("while-off"),
+            Some(Waiting::HeldBack),
+            "recovery publishes nothing of what ran while off"
+        );
+        assert_eq!(recovery("after").unwrap().repository, "owner/project");
+
+        crate::rc::folder_cutoff::admit(&folder, "codex", "while-off").unwrap();
+        assert_eq!(
+            recovery("while-off").unwrap().repository,
+            "owner/project",
+            "saved by the person, it publishes"
+        );
+    }
+
     use crate::commands::setup::CodexHooks;
 
     /// A folder is on for Codex only in name while Codex holds AgentGit's hooks for review: nothing
