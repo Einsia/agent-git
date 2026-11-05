@@ -77,6 +77,7 @@ pub(super) fn harness_test_session_with_channels(
         publication_incarnation: None,
         info: SessionInfo {
             interrupt_fenced: None,
+            interrupted: None,
             lease: None,
             publication: None,
             session_id: "session-turn-test".into(),
@@ -128,6 +129,9 @@ pub(super) fn harness_test_session_with_channels(
         local_settlement: None,
         settlement_due: false,
         stop_requested: false,
+        stopping_turn: None,
+        // A stand-in runtime that never answers an interrupt holds a test's stop for this long.
+        stop_turn_grace: std::time::Duration::from_millis(100),
         completed_boundary: None,
         settlement_child: None,
         queued_initial_turn: None,
@@ -3529,6 +3533,84 @@ async fn a_codex_session_refuses_a_non_owner_turn_at_delivery() {
             .is_some()
     );
     session.driver.shutdown().await.unwrap();
+}
+
+/// A daemon stop interrupts the turn its own runtime is running and ends only once that turn has
+/// closed the way a person's interrupt closes it: the turn's interrupted end goes out and the
+/// runtime is asked once. A runtime that exits on the interrupt without ending the turn still
+/// leaves a turn the stop cut, never one that ended on its own, which would be receipted and
+/// archived as if nobody had stopped it. A supervisor that ends at once leaves the runtime to be
+/// killed mid-tool, and the conversation ends in a call whose result never comes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
+    for (case, answer) in [
+        // Answers an interrupt with the record Claude Code writes for one.
+        (
+            "answers",
+            r#"printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'"#,
+        ),
+        ("exits", "exit 0"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("written");
+        let script = format!(
+            r#"while IFS= read -r line; do printf '%s\n' "$line" >> '{}'; case "$line" in *'"subtype":"interrupt"'*) {answer};; esac; done"#,
+            written.display()
+        );
+        let mut driver =
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_running(&script);
+        driver.set_test_current_turn("turn-cut");
+        let (mut session, mut out, _notes) = harness_test_session_with_channels(
+            AnyDriver::ClaudeCode(Box::new(driver)),
+            "claude-code",
+            SessionStatus::Running,
+        );
+        // Longer than the test waits: ending by the grace instead of by the turn's end fails it.
+        session.stop_turn_grace = std::time::Duration::from_secs(60);
+        let (commands, mut command_rx) = mpsc::channel(4);
+        let worker = tokio::spawn(async move {
+            session.run_inner(&mut command_rx).await;
+            session
+        });
+        commands.send(Command::Shutdown).await.unwrap();
+        drop(commands);
+
+        let mut ended = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{case}: the stop waits for the interrupted turn, not for the grace"
+            );
+            if let Ok(Some(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), out.recv()).await
+                && frame.method() == method::TURN_COMPLETED
+            {
+                ended = Some(frame.params_as::<crate::protocol::TurnCompleted>().unwrap());
+            }
+        }
+        while let Ok(frame) = out.try_recv() {
+            if frame.method() == method::TURN_COMPLETED {
+                ended = Some(frame.params_as::<crate::protocol::TurnCompleted>().unwrap());
+            }
+        }
+        let mut session = worker.await.unwrap();
+        assert!(session.stop_requested, "{case}");
+        if case == "answers" {
+            let ended = ended.expect("the cut turn announces its end");
+            assert_eq!(ended.turn_id, "turn-cut");
+            assert_eq!(ended.outcome, PTurnOutcome::Interrupted);
+            assert_eq!(session.info.status, SessionStatus::Ended);
+        }
+        let _ = session.driver.shutdown().await;
+        let interrupts = std::fs::read_to_string(&written)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains(r#""subtype":"interrupt""#))
+            .count();
+        assert_eq!(interrupts, 1, "{case}");
+    }
 }
 
 /// A command the owner granted operators stops applying to them once an operator has approved a

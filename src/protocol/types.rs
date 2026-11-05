@@ -769,11 +769,32 @@ pub struct LeaseView {
     pub since: String,
 }
 
+/// A conversation whose last turn was cut because agit stopped on this computer. It continues
+/// with the next message, like any conversation that is not running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interruption {
+    /// When the turn was cut (RFC 3339).
+    pub at: String,
+    pub cause: InterruptionCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptionCause {
+    /// agit stopped on purpose: `agit rc local stop`, a service manager, a restart.
+    Stopped,
+    /// agit ended without stopping the turn; the next start closed it.
+    Crashed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// This attached controller accepts stops fenced to the original native turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt_fenced: Option<bool>,
+    /// Set on a conversation that is not running when its last turn was cut by agit stopping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<Interruption>,
     /// Which process writes this Claude Code conversation, and why the web may not send now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseView>,

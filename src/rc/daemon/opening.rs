@@ -838,6 +838,12 @@ impl Daemon {
         let started_process = session.started_process();
         let runtime_thread_id = session.runtime_thread_id().or(spec.resume_from);
         let task = tokio::spawn(session.run(cmd_rx));
+        // Running again, the conversation is no longer the one a stop interrupted.
+        if self.roster.interrupted.remove(&session_id).is_some()
+            && let Err(error) = self.roster.save()
+        {
+            eprintln!("agitd: a resumed conversation is still recorded as interrupted: {error:#}");
+        }
         self.sessions.insert(
             session_id.clone(),
             Live {
@@ -975,6 +981,7 @@ mod tests {
         let cwd = state.mirror.bind("ws", "project", dir.path()).unwrap();
         let info = SessionInfo {
             interrupt_fenced: None,
+            interrupted: None,
             lease: None,
             publication: None,
             session_id: "agit-opening".into(),

@@ -20,6 +20,7 @@ pub(super) fn rpc_test_live(
         generation,
         info: SessionInfo {
             interrupt_fenced: None,
+            interrupted: None,
             lease: None,
             publication: None,
             session_id: session_id.into(),

@@ -245,6 +245,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                 let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
                 let info = SessionInfo {
                     interrupt_fenced: None,
+                    interrupted: None,
                     lease: None,
                     publication: None,
                     session_id: "session-1".into(),

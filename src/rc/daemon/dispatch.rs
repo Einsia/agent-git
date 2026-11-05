@@ -489,8 +489,11 @@ impl Daemon {
                                 ErrorCode::SessionBusy,
                                 "this conversation is not running; resume it to continue",
                             );
-                            error.data =
-                                Some(serde_json::json!({"retryable": true, "reason": "dormant"}));
+                            let mut data = serde_json::json!({"retryable": true, "reason": "dormant"});
+                            if let Some(interrupted) = self.roster.interrupted.get(&p.session_id) {
+                                data["interrupted"] = serde_json::json!(interrupted);
+                            }
+                            error.data = Some(data);
                             error
                         } else {
                             no_such_session(&p.session_id)
@@ -781,6 +784,7 @@ mod tests {
         WatchLive {
             info: SessionInfo {
                 interrupt_fenced: None,
+                interrupted: None,
                 lease: None,
                 publication: None,
                 session_id: stream.into(),
