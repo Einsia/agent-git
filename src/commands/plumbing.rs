@@ -259,21 +259,80 @@ pub fn tree_apply_owned(
     if base_tree.is_empty() || !base_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
         anyhow::bail!("git rev-parse returned an invalid tree object id");
     }
-    let objects = objects?;
+    // Every new object is written as Git writes a loose object (see `write_loose_object`), not by
+    // the store's own writer, which renames a still-open temporary file from another directory.
+    // Blobs go straight to disk; the trees the editor builds are kept in memory until it is done.
+    let mut objects = objects?.with_object_memory();
+    let directory = objects.objects.store_ref().path().to_owned();
     let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
-    let mut editor = objects.edit_tree(base_id)?;
-    for (path, content) in edits {
-        match content {
-            Some(bytes) => {
-                let id = objects.write_blob(&bytes)?.detach();
-                editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
-            }
-            None => {
-                editor.remove_leaf(path.as_str())?;
+    let tree = {
+        let mut editor = objects.edit_tree(base_id)?;
+        for (path, content) in edits {
+            match content {
+                Some(bytes) => {
+                    let kind = gix::object::Kind::Blob;
+                    let id = gix::objs::compute_hash(objects.object_hash(), kind, &bytes)?;
+                    if !objects.has_object(id) {
+                        write_loose_object(&directory, &id, kind, &bytes)?;
+                    }
+                    editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
+                }
+                None => {
+                    editor.remove_leaf(path.as_str())?;
+                }
             }
         }
+        editor.write()?.detach()
+    };
+    let trees = objects.objects.take_object_memory().unwrap_or_default();
+    for (id, (kind, data)) in trees.iter() {
+        if !objects.has_object(id) {
+            write_loose_object(&directory, id, *kind, data)?;
+        }
     }
-    Ok(editor.write()?.to_string())
+    Ok(tree.to_string())
+}
+
+/// Writes one object into the loose store under `directory` as Git does: compressed into a
+/// temporary file in the object's own fan-out directory, closed, then linked to its name, or
+/// renamed where the filesystem has no links. A file is never renamed while it is still open,
+/// nor moved between directories; some network filesystems refuse either, and a writer that does
+/// both cannot record a turn there.
+fn write_loose_object(
+    directory: &std::path::Path,
+    id: &gix::oid,
+    kind: gix::object::Kind,
+    data: &[u8],
+) -> Result<()> {
+    let hex = id.to_string();
+    let fan_out = directory.join(&hex[..2]);
+    let path = fan_out.join(&hex[2..]);
+    if let Err(error) = std::fs::create_dir(&fan_out)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err(error.into());
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tmp_obj_");
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o444));
+    let mut compressed = flate2::write::ZlibEncoder::new(
+        builder.tempfile_in(&fan_out)?,
+        flate2::Compression::default(),
+    );
+    compressed.write_all(&gix::objs::encode::loose_header(kind, data.len() as u64))?;
+    compressed.write_all(data)?;
+    let temporary = compressed.finish()?.into_temp_path();
+    match std::fs::hard_link(&temporary, &path) {
+        Ok(()) => Ok(()),
+        // An object of the same id has the same content.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) => match temporary.persist_noclobber(&path) {
+            Ok(()) => Ok(()),
+            Err(_) if path.exists() => Ok(()),
+            Err(error) => Err(error.error.into()),
+        },
+    }
 }
 
 /// The repository's object database, read with replacements ignored: the same no-replacement
@@ -4546,6 +4605,47 @@ mod tests {
         assert_eq!(cat_blob(&repo, &tree, "binary"), vec![0, 255, 10]);
         let empty = tree_apply_owned(&repo, &tree, vec![("binary".into(), None)]).unwrap();
         assert!(repo.ls_tree_result(&empty).unwrap().is_empty());
+    }
+
+    /// Every object an edit adds is written inside its own fan-out directory: nothing is created in
+    /// the object directory itself, so no temporary file moves between directories on its way to
+    /// its name, which some network filesystems refuse while the file is still open. The object
+    /// directory is made read-only above fan-out directories that stay writable, so a writer that
+    /// stages its temporary files in the object directory, as the store's own writer does, fails
+    /// here; both a blob and the trees above it are written. A writer that renamed a still-open
+    /// file within its fan-out directory would pass; the writer links a closed file instead.
+    #[cfg(unix)]
+    #[test]
+    fn owned_tree_apply_writes_each_object_within_its_fan_out_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        repo.git(&["commit", "--allow-empty", "-m", "base"])
+            .unwrap();
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let objects = repo.root().join(".git").join("objects");
+        for byte in 0..=u8::MAX {
+            std::fs::create_dir_all(objects.join(format!("{byte:02x}"))).unwrap();
+        }
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let tree = tree_apply_owned(
+            &repo,
+            &head,
+            vec![("events/a/new".into(), Some(b"new event\n".to_vec()))],
+        );
+        std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tree = tree.unwrap();
+        assert_eq!(cat_blob(&repo, &tree, "events/a/new"), b"new event\n");
+        assert!(repo.git(&["fsck", "--no-dangling"]).is_ok());
+        let staged = walkdir::WalkDir::new(&objects)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("tmp_obj_"))
+            .count();
+        assert_eq!(staged, 0);
     }
 
     #[test]

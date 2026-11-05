@@ -2060,8 +2060,8 @@ fn write_event_once(root: &Path, id: &str, bytes: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .with_context(|| format!("cannot sync temporary event for {id}"))?;
-    match temporary.persist_noclobber(&path) {
-        Ok(_) => Ok(()),
+    match temporary.into_temp_path().persist_noclobber(&path) {
+        Ok(()) => Ok(()),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_regular_file_or_missing(&path)?;
             let existing = read_bytes_capped(&path, MAX_EVENT_BYTES)?;
@@ -2102,6 +2102,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
             .sync_all()
             .with_context(|| format!("cannot sync temporary file for {}", path.display()))?;
         temporary
+            .into_temp_path()
             .persist(path)
             .map_err(|error| error.error)
             .with_context(|| format!("cannot publish {}", path.display()))?;
