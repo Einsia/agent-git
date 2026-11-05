@@ -46,18 +46,29 @@ impl Daemon {
             .freeze()
             .map_err(|reason| RestartRefusal::Busy(vec![reason]))?;
         let mut blockers = Vec::new();
-        if self.sessions.values().any(|live| {
-            !live.shared_executor
-                || live.info.status != SessionStatus::Idle
-                || live.runtime_thread_id.is_none()
-                || live.tx.capacity() != COMMAND_QUEUE_CAPACITY
-                || live.rpc_guard_sensitive
-                || live.pending_mode.is_some()
-                || !live.confirmed_turn_guards.is_empty()
-                || live.inflight_turn_guard.is_some()
-                || live.ended
-        }) {
-            blockers.push("supervised work cannot be detached safely".into());
+        // Each blocking session is named, by id only, so whoever waits for the restart can tell
+        // which conversation to close.
+        let held: Vec<&str> = self
+            .sessions
+            .iter()
+            .filter(|(_, live)| {
+                !live.shared_executor
+                    || live.info.status != SessionStatus::Idle
+                    || live.runtime_thread_id.is_none()
+                    || live.tx.capacity() != COMMAND_QUEUE_CAPACITY
+                    || live.rpc_guard_sensitive
+                    || live.pending_mode.is_some()
+                    || !live.confirmed_turn_guards.is_empty()
+                    || live.inflight_turn_guard.is_some()
+                    || live.ended
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if !held.is_empty() {
+            blockers.push(format!(
+                "supervised work cannot be detached safely: {}",
+                held.join(", ")
+            ));
         }
         if !self.opening_sessions.is_empty() {
             blockers.push("session launches are still reserved".into());
@@ -133,10 +144,15 @@ mod tests {
             "a deferred restart leaves admission open"
         );
         state.sessions.get_mut("active").unwrap().info.status = SessionStatus::Idle;
-        assert!(matches!(
-            state.prepare_safe_stop(&request, &admission, false, || false),
-            Err(RestartRefusal::Busy(_))
-        ));
+        // The refusal names the session that holds it, so the person can tell which to close.
+        match state.prepare_safe_stop(&request, &admission, false, || false) {
+            Err(RestartRefusal::Busy(blockers)) => assert!(
+                blockers.iter().any(|blocker| blocker.ends_with(": active")),
+                "{blockers:?}"
+            ),
+            Err(other) => panic!("{other:?}"),
+            Ok(_) => panic!("an idle unshared session let the restart through"),
+        }
         state.sessions.clear();
         state.opening_sessions.insert(
             "opening".into(),

@@ -17,6 +17,75 @@ const POLL: Duration = Duration::from_millis(50);
 const UPGRADE_RETRY: Duration = Duration::from_secs(5);
 const REQUIRED: &[&str] = &["peer-control-v1", "history-v2"];
 
+/// What a waiting upgrade watcher last heard: the installed version it would start and why the
+/// running daemon still refuses to hand over. It lives only while the watcher that wrote it holds
+/// the watch lock, so a record left by a watcher that ended says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUpgrade {
+    pub version: String,
+    /// Seconds since the Unix epoch when the watcher first heard this reason.
+    pub since: u64,
+    pub waiting_for: String,
+    /// The running daemon cannot hand over by itself: it has to be stopped and started again by
+    /// hand, however long the watcher waits.
+    #[serde(default)]
+    pub by_hand: bool,
+}
+
+/// Why a running daemon too old to negotiate a safe restart refuses one; a wait for either never
+/// ends by itself.
+const PREDATES_SAFE_RESTART: &str = "the running daemon predates safe restart negotiation";
+const LACKS_SAFE_RESTART: &str = "the running daemon does not support safe restart";
+
+/// Whether a deferral's reason is one only a restart by hand resolves.
+fn needs_restart_by_hand(message: &str) -> bool {
+    message.starts_with(PREDATES_SAFE_RESTART) || message.starts_with(LACKS_SAFE_RESTART)
+}
+
+fn pending_path() -> crate::Result<PathBuf> {
+    Ok(super::rc_dir()?.join("upgrade-pending.json"))
+}
+
+/// The upgrade a running watcher waits to make, if one does.
+pub fn pending_upgrade() -> Option<PendingUpgrade> {
+    let dir = super::rc_dir().ok()?;
+    let lock = File::open(dir.join("upgrade-watch.lock")).ok()?;
+    match fs2::FileExt::try_lock_shared(&lock) {
+        // Nobody holds the watch lock, so no watcher waits; the record is a leftover.
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&lock);
+            None
+        }
+        Err(error) if crate::infra::local_state::is_contended(&error) => {
+            serde_json::from_slice(&std::fs::read(pending_path().ok()?).ok()?).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// Removes the watcher's record when the watcher stops waiting, whichever way it returns.
+struct PendingRecord;
+
+impl PendingRecord {
+    fn write(pending: &PendingUpgrade) -> crate::Result<()> {
+        use std::io::Write as _;
+        let path = pending_path()?;
+        let mut file =
+            tempfile::NamedTempFile::new_in(path.parent().context("rc directory has no parent")?)?;
+        file.write_all(&serde_json::to_vec(pending)?)?;
+        file.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+impl Drop for PendingRecord {
+    fn drop(&mut self) {
+        if let Ok(path) = pending_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeTarget {
     pid: u32,
@@ -215,14 +284,14 @@ fn ready(requirements: &Requirements<'_>) -> crate::Result<()> {
 
 fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Outcome> {
     let Some(identity) = &status.identity else {
-        return legacy_deferred("the running daemon predates safe restart negotiation");
+        return legacy_deferred(PREDATES_SAFE_RESTART);
     };
     if !identity
         .rpc_features
         .iter()
         .any(|feature| feature == "safe-restart-v1")
     {
-        return legacy_deferred("the running daemon does not support safe restart");
+        return legacy_deferred(LACKS_SAFE_RESTART);
     }
     match control::ask(&Request::StopIfIdle {
         instance_id: identity.instance_id.clone(),
@@ -451,6 +520,8 @@ pub fn watch_upgrade(mut target: UpgradeTarget) -> crate::Result<()> {
     fs2::FileExt::lock_exclusive(&file)?;
     let digest = sha2::Sha256::digest(std::fs::read(&target.executable)?);
     let mut last_error = None;
+    let _record = PendingRecord;
+    let mut waiting: Option<PendingUpgrade> = None;
     loop {
         std::thread::sleep(UPGRADE_RETRY);
         if target
@@ -498,7 +569,27 @@ pub fn watch_upgrade(mut target: UpgradeTarget) -> crate::Result<()> {
                 return Ok(());
             }
             Ok(Outcome::Unchanged | Outcome::Absent) => return Ok(()),
-            Ok(Outcome::Deferred { .. }) => {}
+            // Each new reason is logged once and recorded for `rc local status`: a watcher that
+            // waits without saying why looks the same as one that is stuck.
+            Ok(Outcome::Deferred { message, .. }) => {
+                if waiting
+                    .as_ref()
+                    .is_none_or(|waiting| waiting.waiting_for != message)
+                {
+                    eprintln!("Local daemon upgrade waits: {message}");
+                    let since = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_secs());
+                    let pending = PendingUpgrade {
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        since,
+                        by_hand: needs_restart_by_hand(&message),
+                        waiting_for: message,
+                    };
+                    let _ = PendingRecord::write(&pending);
+                    waiting = Some(pending);
+                }
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 if last_error.as_ref() != Some(&message) {
@@ -750,6 +841,62 @@ pub fn report(outcome: &Outcome) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `rc local status` names an upgrade only while a watcher waits for it. The record says what
+    /// the watcher last heard; once the watcher no longer holds the watch lock, the record is a
+    /// leftover and names nothing, so a crashed watcher cannot leave a stale "waiting" behind.
+    #[test]
+    fn a_pending_upgrade_is_named_only_while_its_watcher_holds_the_watch_lock() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::with_agit_home(home.path(), || {
+            let dir = super::super::rc_dir().unwrap();
+            let pending = PendingUpgrade {
+                version: "9.9.9".into(),
+                since: 1,
+                waiting_for: "supervised work cannot be detached safely: agit-a".into(),
+                by_hand: false,
+            };
+            let record = PendingRecord;
+            PendingRecord::write(&pending).unwrap();
+            assert_eq!(pending_upgrade(), None, "no watcher has run");
+            let lock = File::create(dir.join("upgrade-watch.lock")).unwrap();
+            assert_eq!(pending_upgrade(), None, "no watcher holds the lock");
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            assert_eq!(pending_upgrade(), Some(pending));
+            fs2::FileExt::unlock(&lock).unwrap();
+            assert_eq!(
+                pending_upgrade(),
+                None,
+                "a record a watcher left when it ended is not a wait"
+            );
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            drop(record);
+            assert_eq!(
+                pending_upgrade(),
+                None,
+                "a finished watcher leaves no record"
+            );
+        });
+    }
+
+    /// A daemon too old to negotiate a safe restart is told as needing a restart by hand, and a
+    /// wait for sessions is not. A record that called every wait temporary would leave the person
+    /// waiting for an update that never comes.
+    #[test]
+    fn a_daemon_too_old_to_hand_over_is_told_as_needing_a_restart_by_hand() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::with_agit_home(home.path(), || {
+            for reason in [PREDATES_SAFE_RESTART, LACKS_SAFE_RESTART] {
+                let Outcome::Deferred { message, .. } = legacy_deferred(reason).unwrap() else {
+                    panic!("a legacy daemon's refusal is a deferral");
+                };
+                assert!(needs_restart_by_hand(&message), "{message}");
+            }
+        });
+        assert!(!needs_restart_by_hand(
+            "supervised work cannot be detached safely: agit-a"
+        ));
+    }
 
     #[cfg(unix)]
     #[test]

@@ -113,6 +113,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var hookProblem: String?
     @Published private(set) var listUnsupported = false
     @Published private(set) var incomplete = false
+    /// An installed agit that waits for the running one to hand over, with why.
+    @Published private(set) var pendingUpgrade: LocalDaemonStatus.PendingUpgrade?
     @Published private(set) var refreshing = false
     @Published private(set) var lastRefresh: Date?
     /// Folder path → what the app is running there right now.
@@ -310,6 +312,8 @@ final class AppModel: ObservableObject {
             // A program that no longer starts is looked for again, instead of being retried as
             // if it were only slow.
             if case .failure(let error) = who, case .notFound? = error as? CLIError { self.cli = AgitCLI.locate() }
+            let daemon = try? await cli.run(["rc", "local", "status"], timeout: 10)
+            pendingUpgrade = (try? daemon?.decode(LocalDaemonStatus.self))??.pendingUpgrade
             lastRefresh = Date()
             if cli.stamp != versionStamp { await readVersion(cli) }
             await repairHooks(cli)

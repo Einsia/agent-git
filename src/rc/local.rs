@@ -175,6 +175,13 @@ pub fn run(args: Args) -> crate::commands::CmdResult {
                     ),
                 }
             })?;
+            let mut reply = serde_json::to_value(&reply)?;
+            if let Some(reply) = reply.as_object_mut() {
+                reply.insert(
+                    "pending_upgrade".into(),
+                    serde_json::to_value(super::lifecycle::pending_upgrade())?,
+                );
+            }
             println!("{}", serde_json::to_string(&reply)?);
         }
         Action::Stop => println!(
