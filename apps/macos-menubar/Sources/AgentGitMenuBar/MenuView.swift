@@ -33,6 +33,8 @@ struct MenuView: View {
         }
         .frame(width: 380)
         .task { await model.refresh() }
+        .onAppear { model.menuOpen = true }
+        .onDisappear { model.menuOpen = false }
     }
 
     private var header: some View {
@@ -63,10 +65,12 @@ struct MenuView: View {
 
     private var accountLine: String {
         guard let whoami = model.whoami, let account = whoami.account else {
-            return model.cli == nil ? "agit is not set up" : "Not signed in"
+            if model.cli == nil { return "agit is not set up" }
+            return model.whoamiProblem == nil ? "Not signed in" : "Sign-in not checked"
         }
         let hub = Words.host(whoami.hub ?? "")
-        let checked = model.lastRefresh.map { " · checked \(Words.ago($0))" } ?? ""
+        // The time of the last check that answered, not of the last attempt.
+        let checked = model.whoamiChecked.map { " · checked \(Words.ago($0))" } ?? ""
         return "\(account) on \(hub)\(checked)"
     }
 
@@ -102,9 +106,12 @@ struct MenuView: View {
     private var footer: some View {
         HStack(spacing: 14) {
             Button("What agit can do") { show("guide") }
-            if !model.paused.isEmpty && !model.folders.contains(where: \.isOn) {
+            // Resume stays offered while any folder this app paused is still paused, even when
+            // others already upload again.
+            if !model.paused.isEmpty {
                 Button("Resume syncing") { model.resumeAll() }
-            } else if model.folders.contains(where: \.isOn) {
+            }
+            if model.folders.contains(where: \.isOn) {
                 Button("Pause syncing") { model.pauseAll() }
             }
             Spacer()
@@ -164,12 +171,7 @@ private struct ProblemRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(problem.title).font(.system(size: 12, weight: .semibold))
                 if let detail = problem.detail {
-                    Text(detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(4)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    ReasonText(text: detail, tint: .secondary)
                 }
                 fix
             }
@@ -194,6 +196,10 @@ private struct ProblemRow: View {
                 .disabled(model.busy[path] != nil)
         case .chooseCLI:
             Button("Choose the agit program…") { model.chooseCLI() }
+        case .checkAgain:
+            Button("Check again") { model.checkAgain() }.disabled(model.refreshing)
+        case .dismiss(let key):
+            Button("Dismiss") { model.dismiss(key) }
         case .none:
             EmptyView()
         }
@@ -256,7 +262,7 @@ private struct FolderRow: View {
                     .toggleStyle(.switch)
                     .controlSize(.mini)
                     .labelsHidden()
-                    .disabled(model.busy[folder.folder] != nil)
+                    .disabled(model.busy[folder.folder] != nil || model.cli == nil)
                     .help(folder.isOn
                         ? "Stop uploading this folder's conversations"
                         : folder.blocked
@@ -296,14 +302,16 @@ private struct FolderRow: View {
                 }
                 .padding(.leading, 18)
             }
-            if let reason = model.failed[folder.folder], model.busy[folder.folder] == nil {
+            if let failure = model.failed[folder.folder], model.busy[folder.folder] == nil {
                 // A refusal is shown where the person clicked, with its reason and next step.
-                Text(Words.reasonFirst(reason))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-                    .padding(.leading, 18)
+                VStack(alignment: .leading, spacing: 4) {
+                    ReasonText(text: failure.reason)
+                    if let move = failure.move {
+                        Button("Move to \(move.to)…") { model.move(folder.folder, move) }
+                            .controlSize(.small)
+                    }
+                }
+                .padding(.leading, 18)
             } else if !folder.isOn && !folder.blocked && folder.sessionsHere > 0
                         && model.busy[folder.folder] == nil {
                 Text("Uploads are off here. Claude Code and Codex keep these conversations; turn this on and agit saves and uploads the new ones after each turn.")
@@ -419,14 +427,32 @@ private struct UploadRow: View {
                         .foregroundStyle(.secondary)
                 }
                 if let reason = event.reason, !event.ok {
-                    Text(Words.reasonFirst(reason))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
+                    ReasonText(text: reason, tint: .secondary)
                 }
             }
         }
+    }
+}
+
+/// A reason in agit's words, its first line in `tint` and the hint and continuation lines under it
+/// in secondary text.
+struct ReasonText: View {
+    let text: String
+    var tint: Color = .orange
+
+    var body: some View {
+        let lines = Words.reasonLines(text)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(lines.reason)
+                .font(.system(size: 11))
+                .foregroundStyle(tint)
+            ForEach(Array(lines.details.enumerated()), id: \.offset) { _, detail in
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .textSelection(.enabled)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }

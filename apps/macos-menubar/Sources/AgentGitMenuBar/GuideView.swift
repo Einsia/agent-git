@@ -97,8 +97,9 @@ struct GuideView: View {
 }
 
 private struct CommandLine: View {
-    @EnvironmentObject private var model: AppModel
     let command: String
+    /// Shown beside the button that copied, for a moment: the menu's notice is not in view here.
+    @StateObject private var copied = Flag(false)
 
     var body: some View {
         HStack {
@@ -107,9 +108,19 @@ private struct CommandLine: View {
                 .textSelection(.enabled)
                 .lineLimit(2)
             Spacer()
-            Button { model.copy(command, what: "the command") } label: { Image(systemName: "doc.on.doc") }
-                .buttonStyle(.borderless)
-                .help("Copy")
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(command, forType: .string)
+                copied.on = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    copied.on = false
+                }
+            } label: {
+                Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help(copied.on ? "Copied" : "Copy")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)

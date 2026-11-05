@@ -138,6 +138,25 @@ enum Words {
         }
     }
 
+    /// A reason as the person reads it: agit's first line as the reason, and the hint and
+    /// continuation lines under it as the details, each trimmed and starting with a capital.
+    /// A detail that tells the reader to run or change a command is left out: it is written for a
+    /// terminal, and the person here clicked a button.
+    static func reasonLines(_ text: String) -> (reason: String, details: [String]) {
+        let lines = reasonFirst(text)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { capitalized($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.isEmpty }
+        let details = lines.dropFirst().filter { !$0.contains("`") }
+        return (lines.first ?? capitalized(text), Array(details))
+    }
+
+    /// The product's name stays as it is written, lowercase.
+    private static func capitalized(_ line: String) -> String {
+        guard let first = line.first, !line.hasPrefix("agit") else { return line }
+        return first.uppercased() + line.dropFirst()
+    }
+
     /// An error with git's own summary of a refused push left out, so the reason comes first:
     /// that summary names only the URL, and cut to a few lines it hides why.
     static func reasonFirst(_ text: String) -> String {

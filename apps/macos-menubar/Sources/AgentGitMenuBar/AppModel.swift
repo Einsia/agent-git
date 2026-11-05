@@ -18,12 +18,31 @@ enum Health {
 
 /// Something the user has to act on, in plain words, with the one action that fixes it.
 struct Problem: Identifiable, Equatable {
-    enum Fix: Equatable { case signIn, retry(String), allowAutoUpload(String), chooseCLI, none }
+    enum Fix: Equatable {
+        case signIn, retry(String), allowAutoUpload(String), chooseCLI, checkAgain, dismiss(String), none
+    }
 
     let id: String
     let title: String
     let detail: String?
     let fix: Fix
+}
+
+/// An action that did not work: what it was, in words that name where, and agit's reason.
+struct Failure: Equatable {
+    let title: String
+    let reason: String
+    /// The move agit's refusal names, when it refused because the folder already saves or
+    /// uploads to another repository: the app offers it.
+    var move: Move? = nil
+}
+
+/// A folder's move from the repository it goes to now to another one.
+struct Move: Equatable {
+    let from: String
+    let to: String
+    /// Whether the folder uploads to `from` now (its project does), or only saves to it.
+    let uploads: Bool
 }
 
 /// What `agit setup --hooks --installed-only` reports.
@@ -82,17 +101,28 @@ final class AppModel: ObservableObject {
     @Published private(set) var version: String?
     @Published private(set) var whoami: Whoami?
     @Published private(set) var signedOutReason: String?
+    /// Why the last sign-in check gave no answer, while it gives none.
+    @Published private(set) var whoamiProblem: String?
+    /// When agit last answered who is signed in.
+    @Published private(set) var whoamiChecked: Date?
     @Published private(set) var folders: [Folder] = []
     @Published private(set) var listProblem: String?
+    /// When agit last listed the folders, so a list that could not be read again says how old it is.
+    @Published private(set) var listed: Date?
+    /// Why agit's hooks are still not repaired, until a repair finishes.
+    @Published private(set) var hookProblem: String?
     @Published private(set) var listUnsupported = false
     @Published private(set) var incomplete = false
     @Published private(set) var refreshing = false
     @Published private(set) var lastRefresh: Date?
     /// Folder path → what the app is running there right now.
     @Published private(set) var busy: [String: String] = [:]
-    /// Why the last action on a folder failed, shown on that folder's row until an action there
-    /// succeeds: a refusal shown only at the top of the menu is easy to miss.
-    @Published private(set) var failed: [String: String] = [:]
+    /// Why the last action on a folder (or on sign-in, or the program choice) failed. It stays,
+    /// at the top of the menu and on that folder's row, until an action there succeeds or the
+    /// person dismisses it; no other action's result clears it.
+    @Published private(set) var failed: [String: Failure] = [:]
+    /// Whether the menu's panel is open; a failure while it is closed is also notified.
+    var menuOpen = false
     /// The exit code of the last command run for each folder, nil when it gave no answer.
     private var lastExit: [String: Int] = [:]
     @Published private(set) var history: [UploadEvent] = []
@@ -152,10 +182,39 @@ final class AppModel: ObservableObject {
                 fix: .chooseCLI))
             return problems
         }
+        for (key, failure) in failed.sorted(by: { $0.key < $1.key }) {
+            // A folder's failure is pinned here short; its reason is on the folder's row, once.
+            let onRow = folders.contains { $0.folder == key }
+            problems.append(Problem(
+                id: "failed:\(key)", title: failure.title, detail: onRow ? nil : failure.reason, fix: .dismiss(key)))
+        }
+        if let chosen = defaults.string(forKey: AgitCLI.pathKey), let cli, chosen != cli.executable.path {
+            // An explicit choice that cannot run is never passed over without saying so.
+            problems.append(Problem(
+                id: "chosen-cli", title: "The agit program you chose can't be run",
+                detail: "\(Words.tilde(chosen)) is not a program this Mac can start, so the app uses "
+                    + "\(Words.tilde(cli.executable.path)) instead.",
+                fix: .chooseCLI))
+        }
+        // The latest check's failure is shown even when an earlier one said "signed out": that
+        // state may be out of date, and only Check again can tell.
+        if let whoamiProblem {
+            problems.append(Problem(
+                id: "whoami", title: "Could not check your sign-in",
+                detail: whoamiProblem, fix: .checkAgain))
+        }
         if let signedOutReason {
             problems.append(Problem(
                 id: "sign-in", title: "Sign in so conversations can upload",
                 detail: signedOutReason, fix: .signIn))
+        }
+        if let hookProblem {
+            problems.append(Problem(
+                id: "hooks", title: "Conversations may not be saved",
+                detail: hookProblem.contains("agit doctor")
+                    ? hookProblem
+                    : "\(hookProblem) Running agit doctor in a terminal shows what is wrong.",
+                fix: .checkAgain))
         }
         if listUnsupported {
             // No released agit may list folders yet, so this names the release that does rather
@@ -166,7 +225,10 @@ final class AppModel: ObservableObject {
                     + "agit \(AgitCLI.listingVersion).",
                 fix: .chooseCLI))
         } else if let listProblem {
-            problems.append(Problem(id: "list", title: "Could not read agit's folders", detail: listProblem, fix: .none))
+            let age = folders.isEmpty ? "" : listed.map { " The folders below are as agit listed them \(Words.ago($0))." } ?? ""
+            let reason = age.isEmpty || listProblem.hasSuffix(".") ? listProblem : listProblem + "."
+            problems.append(Problem(
+                id: "list", title: "Could not read agit's folders", detail: reason + age, fix: .chooseCLI))
         }
         for folder in folders where folder.failing {
             problems.append(Problem(
@@ -227,29 +289,37 @@ final class AppModel: ObservableObject {
             // A reader found for an earlier chosen agit is not kept for a new one, which may list.
             if listerChosenFor != cli.stamp { lister = nil }
             let listing = lister ?? cli
-            async let whoamiResult = try? cli.run(["whoami"], timeout: 20)
-            async let listResult = try? listing.run(["project", "list"], timeout: 120)
+            async let whoamiResult = Self.attempt { try await cli.run(["whoami"], timeout: 20) }
+            async let listResult = Self.attempt { try await listing.run(["project", "list"], timeout: 120) }
             var (who, list) = await (whoamiResult, listResult)
             // A reader that no longer starts or lists is dropped, and the chosen agit is asked
             // first again: keeping it would retry a moved or deleted program on every poll.
-            if lister != nil, list == nil || list?.kind == "parse_error" {
+            if lister != nil, (try? list.get()) == nil || (try? list.get())?.kind == "parse_error" {
                 lister = nil
-                list = try? await cli.run(["project", "list"], timeout: 120)
+                list = await Self.attempt { try await cli.run(["project", "list"], timeout: 120) }
             }
-            if list?.kind == "parse_error" {
+            if (try? list.get())?.kind == "parse_error" {
                 if let found = await listingAlternative(to: cli) {
                     listerChosenFor = cli.stamp
                     lister = found.cli
-                    list = found.result
+                    list = .success(found.result)
                 }
             }
             applyWhoami(who)
             applyList(list)
+            // A program that no longer starts is looked for again, instead of being retried as
+            // if it were only slow.
+            if case .failure(let error) = who, case .notFound? = error as? CLIError { self.cli = AgitCLI.locate() }
             lastRefresh = Date()
             if cli.stamp != versionStamp { await readVersion(cli) }
             await repairHooks(cli)
             await offerPermissionHook(cli)
         } while refreshAgain
+    }
+
+    /// `work`'s answer, or the error it stopped with, which says more than a missing answer.
+    private static func attempt(_ work: () async throws -> CLIResult) async -> Result<CLIResult, Error> {
+        do { return .success(try await work()) } catch { return .failure(error) }
     }
 
     /// An installed agit that lists folders, with its answer, for a chosen agit that predates the
@@ -295,8 +365,13 @@ final class AppModel: ObservableObject {
         guard defaults.string(forKey: Self.hooksRepairedKey) != key else { return }
         if let tried = repairTried, Date().timeIntervalSince(tried) < Self.repairRetry { return }
         repairTried = Date()
-        guard let result = try? await cli.run(["setup", "--hooks", "--installed-only"], timeout: 60)
-        else { return }
+        let result: CLIResult
+        do {
+            result = try await cli.run(["setup", "--hooks", "--installed-only"], timeout: 60)
+        } catch {
+            hookProblem = "agit could not check its hooks: \(error.localizedDescription)"
+            return
+        }
         let repaired = (try? result.decode(HookRepair.self))?.hookFilesRepaired ?? 0
         if repaired > 0 && result.ok {
             notifier.post(
@@ -308,11 +383,15 @@ final class AppModel: ObservableObject {
             notifier.post(
                 key: "hooks-partly-repaired",
                 title: "Some conversations still cannot be saved",
-                body: "AgentGit repaired some of its hooks, but not all of them. \(result.reason)")
+                body: "AgentGit repaired some of its hooks, but not all of them. \(Notifier.firstLine(result.reason))")
         }
         if result.ok {
             defaults.set(key, forKey: Self.hooksRepairedKey)
             repairTried = nil
+            hookProblem = nil
+        } else {
+            // Until a repair finishes, a hook that cannot start keeps conversations from saving.
+            hookProblem = result.reason
         }
     }
 
@@ -347,7 +426,7 @@ final class AppModel: ObservableObject {
             notifier.post(
                 key: "permission-hook",
                 title: "AgentGit could not add the permission hook",
-                body: "\(reason) Running agit setup in a terminal adds it.")
+                body: "\(Notifier.firstLine(reason)) Running agit setup in a terminal adds it.")
         }
     }
 
@@ -369,14 +448,27 @@ final class AppModel: ObservableObject {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
-    private func applyWhoami(_ result: CLIResult?) {
-        guard let result else { return }
+    private func applyWhoami(_ answer: Result<CLIResult, Error>) {
+        let result: CLIResult
+        switch answer {
+        case .failure(let error):
+            whoamiProblem = error.localizedDescription
+            return
+        case .success(let answered): result = answered
+        }
         if result.ok, let value = try? result.decode(Whoami.self) {
             whoami = value
+            whoamiChecked = Date()
+            whoamiProblem = nil
             signedOutReason = value.signedIn ? nil : "Your sign-in to \(Words.host(value.hub ?? "the Hub")) expired."
         } else if result.exitCode == 5 {
             whoami = nil
+            whoamiChecked = Date()
+            whoamiProblem = nil
             signedOutReason = result.reason
+        } else {
+            whoamiProblem = result.reason
+            return
         }
         let nowSignedIn = signedOutReason == nil
         if wasSignedIn == true && !nowSignedIn {
@@ -388,10 +480,13 @@ final class AppModel: ObservableObject {
         wasSignedIn = nowSignedIn
     }
 
-    private func applyList(_ result: CLIResult?) {
-        guard let result else {
-            listProblem = CLIError.timedOut.errorDescription
+    private func applyList(_ answer: Result<CLIResult, Error>) {
+        let result: CLIResult
+        switch answer {
+        case .failure(let error):
+            listProblem = error.localizedDescription
             return
+        case .success(let answered): result = answered
         }
         guard result.ok else {
             listUnsupported = result.kind == "parse_error"
@@ -402,6 +497,7 @@ final class AppModel: ObservableObject {
             let list = try result.decode(ProjectList.self)
             listUnsupported = false
             listProblem = nil
+            listed = Date()
             incomplete = list.incomplete
             folders = list.folders.sorted { ($0.isOn ? 0 : 1, $0.name) < ($1.isOn ? 0 : 1, $1.name) }
             observe(list.folders)
@@ -428,9 +524,9 @@ final class AppModel: ObservableObject {
             }
             if !last.ok && folder.isOn {
                 notifier.post(
-                    key: "upload:\(folder.folder):\(last.error ?? "")",
+                    key: Notifier.key("upload", folder.folder, last.error ?? ""),
                     title: "Upload refused in \(folder.name)",
-                    body: last.error ?? "agit could not upload the last conversation.")
+                    body: last.error.map(Notifier.firstLine) ?? "agit could not upload the last conversation.")
             }
         }
     }
@@ -439,7 +535,8 @@ final class AppModel: ObservableObject {
 
     /// Uploads the folder's eligible conversations again under its recorded policy.
     func retry(_ path: String) {
-        perform(path, "Retrying uploads in \((path as NSString).lastPathComponent)…") { cli in
+        let name = (path as NSString).lastPathComponent
+        perform(path, "Retrying uploads in \(name)…", failure: "Uploads in \(name) stopped") { cli in
             try await cli.run(["--yes", "project", "sync", path], timeout: 1800)
         } done: { _ in "Retry finished." }
     }
@@ -450,8 +547,27 @@ final class AppModel: ObservableObject {
     func turnOn(_ folder: Folder) {
         let path = folder.folder
         let repository = folder.repository
-        ask(path, repository, includeHistory: false) { [weak self] consent in
+        ask(path, repository, includeHistory: false, otherwise: { _ in }) { [weak self] consent in
             self?.bind(path, repository: repository, history: false, publicConsent: consent)
+        }
+    }
+
+    /// Moves `path` from the repository it goes to now to `move.to`, after one question that
+    /// names both; it is the bind agit refused, run with `--rebind`, after creating the target as
+    /// Add a folder would. `finished` is as for `enroll`.
+    func move(
+        _ path: String, _ move: Move, includeHistory: Bool = false, createPrivate: Bool = false,
+        finished: ((Bool?) -> Void)? = nil
+    ) {
+        let name = (path as NSString).lastPathComponent
+        ask(path, move.to, includeHistory: includeHistory, moving: move, otherwise: { checkFailed in
+            finished?(checkFailed ? false : nil)
+        }) { [weak self] consent in
+            guard let self else { return }
+            if createPrivate { self.createIfOwn(path, move.to) }
+            self.bind(
+                path, repository: move.to, history: includeHistory, publicConsent: consent, moving: move,
+                said: "\(name) now uploads its new conversations to \(move.to).", then: { finished?($0) })
         }
     }
 
@@ -459,33 +575,43 @@ final class AppModel: ObservableObject {
     /// whether that yes was given in the public words. Whether `repository` is public is read
     /// first, so the dialog for a public one says so; its yes is passed to agit as the person's
     /// consent for exactly that repository. A check that fails asks nothing: the bind would refuse
-    /// the same way, and the reason shows on the folder's row.
+    /// the same way, and the reason shows on the folder's row. `otherwise` runs when nothing is
+    /// turned on, with whether the check failed (else the person cancelled). A failure already
+    /// shown stays through the check and a cancel: only the action succeeding, or a dismiss,
+    /// clears it.
     private func ask(
-        _ path: String, _ repository: String, includeHistory: Bool,
-        _ next: @escaping (Bool) -> Void
+        _ path: String, _ repository: String, includeHistory: Bool, moving: Move? = nil,
+        otherwise: @escaping (Bool) -> Void, _ next: @escaping (Bool) -> Void
     ) {
-        failed[path] = nil
-        probe(path, repository) { [weak self] audience in
-            guard let self, let audience else { return }
+        probe(path, repository, rebind: moving != nil) { [weak self] audience in
+            guard let self, let audience else { return otherwise(true) }
             if audience == "public" {
-                if self.confirmPublic(path: path, repository: repository, includeHistory: includeHistory) {
-                    next(true)
+                if self.confirmPublic(
+                    path: path, repository: repository, includeHistory: includeHistory, moving: moving) {
+                    return next(true)
                 }
-            } else if self.confirmUpload(folders: [(path, repository)], includeHistory: includeHistory) {
-                next(false)
+            } else if self.confirmUpload(
+                folders: [(path, repository)], includeHistory: includeHistory, moving: moving) {
+                return next(false)
             }
+            otherwise(false)
         }
     }
 
     /// Reads `repository`'s audience the way a dry-run bind of `path` reports it, in that folder's
     /// queue, and hands `next` "public", "private", "" when agit could not read it, or nil when the
     /// check itself failed.
-    private func probe(_ path: String, _ repository: String, _ next: @escaping (String?) -> Void) {
+    private func probe(
+        _ path: String, _ repository: String, rebind: Bool = false, _ next: @escaping (String?) -> Void
+    ) {
         var audience = ""
-        perform(path, "Checking \(repository)…") { cli in
+        let name = (path as NSString).lastPathComponent
+        perform(
+            path, "Checking \(repository)…", failure: "Uploads in \(name) did not turn on", clears: false
+        ) { cli in
             try await cli.run(
                 ["project", "bind", path, "--repo", repository, "--history", "none",
-                 "--auto-upload", "--dry-run"],
+                 "--auto-upload", "--dry-run"] + (rebind ? ["--rebind"] : []),
                 timeout: 120)
         } done: { result in
             audience = Self.audience(result)
@@ -513,6 +639,7 @@ final class AppModel: ObservableObject {
     func turnOff(_ folder: Folder, then: ((Bool) -> Void)? = nil) {
         perform(
             folder.folder, "Turning off uploads in \(folder.name)…",
+            failure: "Uploads in \(folder.name) did not turn off",
             { cli in try await cli.run(["project", "unbind", folder.folder]) },
             done: { _ in "\(folder.name) no longer uploads. Its saved history is kept." },
             then: then)
@@ -530,37 +657,59 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Each folder that does not resume keeps its reason on its row and stays paused, so Resume
+    /// stays offered for it; once all have answered, one line says how many resumed.
     func resumeAll() {
         let targets = paused.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
         guard !targets.isEmpty, confirmUpload(folders: targets, includeHistory: false) else { return }
+        var answered = 0
+        var refused: [String] = []
         for (path, repository) in targets {
             bind(path, repository: repository, history: false) { [weak self] ok in
-                guard ok, let self else { return }
-                self.paused.removeValue(forKey: path)
-                self.defaults.set(self.paused, forKey: Self.pausedKey)
+                guard let self else { return }
+                answered += 1
+                if ok {
+                    self.paused.removeValue(forKey: path)
+                    self.defaults.set(self.paused, forKey: Self.pausedKey)
+                } else {
+                    refused.append((path as NSString).lastPathComponent)
+                }
+                guard answered == targets.count, targets.count > 1 else { return }
+                let resumed = targets.count - refused.count
+                self.notice = refused.isEmpty
+                    ? "\(resumed) folders upload automatically again."
+                    : "\(resumed) of \(targets.count) folders upload again; \(refused.joined(separator: ", ")) did not, and says why above."
             }
         }
     }
 
     /// Enrolls a folder the user picked. A missing repository is created private, never public.
-    func enroll(path: String, repository: String, includeHistory: Bool, createPrivate: Bool) {
-        let parts = repository.split(separator: "/", maxSplits: 1).map(String.init)
-        let ownName = parts.count == 2 && parts[0] == whoami?.account
+    /// `finished` says whether uploads are on there now, or nil when the person cancelled.
+    func enroll(
+        path: String, repository: String, includeHistory: Bool, createPrivate: Bool,
+        finished: @escaping (Bool?) -> Void
+    ) {
         let name = (path as NSString).lastPathComponent
-        ask(path, repository, includeHistory: includeHistory) { [weak self] consent in
+        ask(path, repository, includeHistory: includeHistory, otherwise: { checkFailed in
+            finished(checkFailed ? false : nil)
+        }) { [weak self] consent in
             guard let self else { return }
-            if createPrivate && ownName {
-                self.perform(path, "Creating \(repository)…") { cli in
-                    // An existing repository refuses creation; the bind after it reports any real
-                    // problem.
-                    _ = try? await cli.run(["--yes", "repo", "create", parts[1], "--private"], timeout: 120)
-                    return CLIResult(ok: true, exitCode: 0, kind: nil, value: nil, errors: [])
-                } done: { _ in "" }
-            }
+            if createPrivate { self.createIfOwn(path, repository) }
             self.bind(
                 path, repository: repository, history: includeHistory, publicConsent: consent,
-                said: "\(name) now uploads its new conversations to \(repository).")
+                said: "\(name) now uploads its new conversations to \(repository).", then: { finished($0) })
         }
+    }
+
+    /// Creates `repository` private when it is the person's own name, in `path`'s queue before its
+    /// bind. An existing repository refuses creation; the bind after it reports any real problem.
+    private func createIfOwn(_ path: String, _ repository: String) {
+        let parts = repository.split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2, parts[0] == whoami?.account else { return }
+        perform(path, "Creating \(repository)…", failure: "\(repository) was not created", clears: false) { cli in
+            _ = try? await cli.run(["--yes", "repo", "create", parts[1], "--private"], timeout: 120)
+            return CLIResult(ok: true, exitCode: 0, kind: nil, value: nil, errors: [])
+        } done: { _ in "" }
     }
 
     /// Turns uploads on in `path`. A bind made without the public consent that agit refuses as
@@ -569,20 +718,22 @@ final class AppModel: ObservableObject {
     /// in the public words, and nothing uploads before that yes.
     private func bind(
         _ path: String, repository: String, history: Bool, publicConsent: Bool = false,
-        said: String? = nil, then: ((Bool) -> Void)? = nil
+        moving: Move? = nil, said: String? = nil, then: ((Bool) -> Void)? = nil
     ) {
         let name = (path as NSString).lastPathComponent
         let off = autoPushOff(repository)
         let consent = publicConsent ? ["--public-consent", repository] : []
+        // `config` takes only the public consent; `--rebind` is the bind's own.
+        let rebinding = moving == nil ? [] : ["--rebind"]
         perform(
-            path, "Turning on uploads in \(name)…",
+            path, "Turning on uploads in \(name)…", failure: "Uploads in \(name) did not turn on",
             { cli in
                 if off, let refused = try await Self.allowAutoPush(cli, repository, consent) {
                     return refused
                 }
                 return try await cli.run(
                     ["--yes", "project", "bind", path, "--repo", repository,
-                     "--history", history ? "all" : "none", "--auto-upload"] + consent,
+                     "--history", history ? "all" : "none", "--auto-upload"] + consent + rebinding,
                     timeout: history ? 3600 : 600)
             },
             done: { _ in said ?? "\(name) uploads automatically again." },
@@ -592,26 +743,31 @@ final class AppModel: ObservableObject {
                     return
                 }
                 let refusal = self.failed[path]
-                self.probe(path, repository) { [weak self] audience in
+                self.probe(path, repository, rebind: moving != nil) { [weak self] audience in
                     guard let self else { return }
                     guard audience == "public" else {
                         self.failed[path] = refusal
                         then?(false)
                         return
                     }
-                    guard self.confirmPublic(path: path, repository: repository, includeHistory: history) else {
+                    guard self.confirmPublic(
+                        path: path, repository: repository, includeHistory: history, moving: moving)
+                    else {
                         then?(false)
                         return
                     }
                     self.bind(
                         path, repository: repository, history: history, publicConsent: true,
-                        said: said, then: then)
+                        moving: moving, said: said, then: then)
                 }
             })
     }
 
     func signIn() {
-        perform("sign-in", "Waiting for you to approve the sign-in in your browser…") { cli in
+        perform(
+            "sign-in", "Waiting for you to approve the sign-in in your browser…",
+            failure: "Sign-in did not finish"
+        ) { cli in
             let start = try await cli.run(["login"], timeout: 60)
             guard let value = start.value,
                   let handoff = try? JSONDecoder.agit.decode(LoginHandoff.self, from: value),
@@ -630,10 +786,36 @@ final class AppModel: ObservableObject {
         panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        defaults.set(url.path, forKey: AgitCLI.pathKey)
-        cli = AgitCLI.locate()
-        lister = nil
+        // The choice is kept only once it answers as agit does; otherwise the program in use stays.
+        let candidate = AgitCLI(executable: url)
+        Task {
+            let version = FileManager.default.isExecutableFile(atPath: url.path) ? await candidate.version() : nil
+            guard let version, version.hasPrefix("agit ") else {
+                failed["choose-cli"] = Failure(
+                    title: "\(url.lastPathComponent) is not an agit program",
+                    reason: "It did not answer as agit does, so the app keeps using "
+                        + (cli.map { Words.tilde($0.executable.path) } ?? "no agit") + ".")
+                return
+            }
+            failed["choose-cli"] = nil
+            defaults.set(url.path, forKey: AgitCLI.pathKey)
+            cli = AgitCLI.locate()
+            lister = nil
+            notice = "The app now runs \(version) at \(Words.tilde(url.path))."
+            await refresh()
+        }
+    }
+
+    /// Checks again now, the hook repair included, which otherwise waits `repairRetry` between
+    /// tries: a button that asks again must not wait for that.
+    func checkAgain() {
+        repairTried = nil
         Task { await refresh() }
+    }
+
+    /// Clears a failure the person has read.
+    func dismiss(_ key: String) {
+        failed[key] = nil
     }
 
     func open(_ link: String?) {
@@ -655,6 +837,10 @@ final class AppModel: ObservableObject {
 
     private struct Job {
         let description: String
+        /// What did not happen, if the job fails, naming where.
+        let failure: String
+        /// Whether its success resolves the key's failure: a check before the action does not.
+        let clears: Bool
         let work: (AgitCLI) async throws -> CLIResult
         let done: (CLIResult) -> String
         let then: ((Bool) -> Void)?
@@ -665,11 +851,13 @@ final class AppModel: ObservableObject {
     private func perform(
         _ key: String,
         _ description: String,
+        failure: String,
+        clears: Bool = true,
         _ work: @escaping (AgitCLI) async throws -> CLIResult,
         done: @escaping (CLIResult) -> String,
         then: ((Bool) -> Void)? = nil
     ) {
-        let job = Job(description: description, work: work, done: done, then: then)
+        let job = Job(description: description, failure: failure, clears: clears, work: work, done: done, then: then)
         if busy[key] != nil {
             waiting[key, default: []].append(job)
         } else {
@@ -679,6 +867,7 @@ final class AppModel: ObservableObject {
 
     private func start(_ job: Job, _ key: String) {
         guard let cli else {
+            fail(key, job, CLIError.notFound.errorDescription ?? "agit was not found.")
             job.then?(false)
             return
         }
@@ -694,14 +883,12 @@ final class AppModel: ObservableObject {
                 if result.ok {
                     let said = job.done(result)
                     if !said.isEmpty { notice = said }
-                    failed[key] = nil
+                    if job.clears { failed[key] = nil }
                 } else {
-                    notice = result.reason
-                    failed[key] = result.reason
+                    fail(key, job, result.reason, Self.move(result))
                 }
             } catch {
-                notice = error.localizedDescription
-                failed[key] = error.localizedDescription
+                fail(key, job, error.localizedDescription)
             }
             job.then?(ok)
             if let next = waiting[key]?.first {
@@ -712,6 +899,29 @@ final class AppModel: ObservableObject {
                 busy.removeValue(forKey: key)
             }
             await refresh()
+        }
+    }
+
+    /// Keeps `reason` as the failure of `key` until an action there succeeds or the person
+    /// dismisses it, and posts it when the menu is closed, where it could not be seen.
+    private func fail(_ key: String, _ job: Job, _ reason: String, _ move: Move? = nil) {
+        failed[key] = Failure(title: job.failure, reason: reason, move: move)
+        if !menuOpen {
+            notifier.post(
+                key: Notifier.key("failed", key, reason), title: job.failure, body: Words.reasonLines(reason).reason)
+        }
+    }
+
+    /// The move a refusal offers: agit refused because the folder already uploads to another
+    /// repository, and running the bind with `--rebind` moves it.
+    private static func move(_ result: CLIResult) -> Move? {
+        guard let to = result.refusalFields["repository"] else { return nil }
+        switch result.refusalCode {
+        case "folder_bound_elsewhere":
+            return result.refusalFields["bound_to"].map { Move(from: $0, to: to, uploads: false) }
+        case "project_assigned_elsewhere":
+            return result.refusalFields["assigned_to"].map { Move(from: $0, to: to, uploads: true) }
+        default: return nil
         }
     }
 
@@ -732,7 +942,9 @@ final class AppModel: ObservableObject {
 
     /// The question for a public destination. Cancel stays the default; only "Upload publicly"
     /// says yes, and that yes is the person's consent agit is given for exactly `repository`.
-    private func confirmPublic(path: String, repository: String, includeHistory: Bool) -> Bool {
+    private func confirmPublic(
+        path: String, repository: String, includeHistory: Bool, moving: Move? = nil
+    ) -> Bool {
         let alert = NSAlert()
         let hub = Words.host(whoami?.hub ?? "the Hub")
         let account = whoami?.account ?? "your account"
@@ -753,8 +965,10 @@ final class AppModel: ObservableObject {
             From now on, new Claude Code and Codex conversations in \(Words.tilde(path)) upload after \
             each turn\(held), and so does every conversation this Mac saves in \(repository).
             """
-        alert.messageText = "Upload conversations from \(name) to a public repository?"
-        alert.informativeText = """
+        alert.messageText = moving == nil
+            ? "Upload conversations from \(name) to a public repository?"
+            : "Move \(name) to a public repository?"
+        alert.informativeText = Self.moving(path, moving) + """
         Where: \(repository) on \(hub) as \(account).
 
         \(repository) is public: anyone can read these conversations, without signing in.
@@ -770,11 +984,27 @@ final class AppModel: ObservableObject {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
+    /// The paragraph a move's question starts with, or nothing when nothing moves.
+    /// A folder that is only bound saves its conversations to the repository and does not
+    /// upload them, so the question says which of the two it does now.
+    private static func moving(_ path: String, _ move: Move?) -> String {
+        guard let move else { return "" }
+        let now = move.uploads ? "upload to" : "are saved to"
+        return """
+        New conversations in \(Words.tilde(path)) \(now) \(move.from) now. After the move they go \
+        to \(move.to) instead; what is already in \(move.from) stays there.
+
+
+        """
+    }
+
     /// Publication needs a yes from the user every time it is turned on; nothing here uploads
     /// silently. A repository whose `push.auto` is off on this Mac was turned off on purpose, so
     /// the question names that setting, how much it releases, and who can read it, and Cancel is
     /// the default answer.
-    private func confirmUpload(folders targets: [(String, String)], includeHistory: Bool) -> Bool {
+    private func confirmUpload(
+        folders targets: [(String, String)], includeHistory: Bool, moving: Move? = nil
+    ) -> Bool {
         let alert = NSAlert()
         let hub = Words.host(whoami?.hub ?? "the Hub")
         let account = whoami?.account ?? "your account"
@@ -789,7 +1019,7 @@ final class AppModel: ObservableObject {
                 : waiting == 1
                     ? ", including 1 already saved here that has not been uploaded"
                     : ", including \(waiting) already saved here that have not been uploaded"
-            alert.informativeText = """
+            alert.informativeText = Self.moving(path, moving) + """
             Automatic upload (push.auto) is off for \(repository) on this Mac. Turning it on \
             uploads every conversation this Mac saves in \(repository), from \(Words.tilde(path)) \
             and anywhere else, after each turn\(release).
@@ -798,11 +1028,12 @@ final class AppModel: ObservableObject {
             read them; agit checks every upload for secrets first.
             """
         } else if targets.count == 1, let (path, repository) = targets.first {
-            alert.messageText = "Upload conversations from \((path as NSString).lastPathComponent)?"
+            let name = (path as NSString).lastPathComponent
+            alert.messageText = moving == nil ? "Upload conversations from \(name)?" : "Move \(name) to \(repository)?"
             let which = includeHistory
                 ? "Claude Code and Codex conversations that already ran in \(Words.tilde(path)), and every new one there,"
                 : "New Claude Code and Codex conversations in \(Words.tilde(path))"
-            alert.informativeText = """
+            alert.informativeText = Self.moving(path, moving) + """
             \(which) will upload to \(repository) on \(hub) as \(account) after each turn.
 
             This also turns on automatic upload for every conversation this Mac saves in \
