@@ -502,9 +502,10 @@ fn land(args: LandArgs) -> CmdResult {
         super::import::create_main_file_line(&repo, owner, &lk)?;
     }
     let created = materialize_branch(&repo, &args.branch)?;
+    let created_tip = created.then(|| created_tip(&repo, &args.branch)).flatten();
     super::migration::finish_external_history_update(&repo, history_update)?;
     if created {
-        super::import::declare_session_line(&repo, &args.branch, &lk)?;
+        declare_or_remove(&repo, &args.branch, &lk, created_tip.as_deref())?;
     }
 
     crate::domain::link::write(&store, &lk)?;
@@ -561,15 +562,54 @@ fn land_local(args: LandArgs) -> CmdResult {
             super::import::create_main_file_line(&repo, lineage.owner(), &link)?;
         }
         let created = materialize_branch(&repo, &args.branch)?;
+        let created_tip = created.then(|| created_tip(&repo, &args.branch)).flatten();
         super::migration::finish_external_history_update(&repo, history_update)?;
         if created {
-            super::import::declare_session_line(&repo, &args.branch, &link)?;
+            declare_or_remove(&repo, &args.branch, &link, created_tip.as_deref())?;
         }
     } else if let Some(recovery) = history_update {
         recovery.clear()?;
     }
     crate::domain::link::write(&store, &link)?;
     Ok(ExitCode::Ok)
+}
+
+/// The tip `branch` was just created at, if it points at a commit yet.
+fn created_tip(repo: &crate::domain::repo::Repo, branch: &str) -> Option<String> {
+    repo.git_opt(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("refs/heads/{branch}"),
+    ])
+    .map(|tip| tip.trim().to_owned())
+}
+
+/// Declares `branch`, which this landing just created, a session line. When the declaration
+/// fails, a privacy wait among other reasons, the branch is removed again at the tip it was
+/// created at, before any link names it. Otherwise the next landing would find a branch it didn't
+/// create, leave it undeclared, and every turn after would be refused as a file line's.
+fn declare_or_remove(
+    repo: &crate::domain::repo::Repo,
+    branch: &str,
+    link: &crate::domain::link::Link,
+    created_tip: Option<&str>,
+) -> crate::Result<()> {
+    let Err(error) = super::import::declare_session_line(repo, branch, link) else {
+        return Ok(());
+    };
+    let Some(tip) = created_tip else {
+        return Err(error);
+    };
+    let head_ref = format!("refs/heads/{branch}");
+    if let Err(cleanup) = repo.git(&["update-ref", "-d", &head_ref, tip]) {
+        return Err(error.context(format!(
+            "session line declaration failed and branch `{branch}` could not be removed with its expected tip: {cleanup:#}"
+        )));
+    }
+    Err(error.context(format!(
+        "session line declaration failed; branch `{branch}` was removed before retry"
+    )))
 }
 
 /// Makes the branch the hub allocated exist locally. `true` means this call actually created it

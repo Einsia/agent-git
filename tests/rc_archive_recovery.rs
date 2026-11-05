@@ -268,13 +268,19 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
 /// deadline; every other start runs the real worker. The commit then waits for the privacy
 /// check, which the daemon must retry.
 fn slow_first_archive_worker(root: &Path) -> std::path::PathBuf {
+    slow_first_worker(root, "--from-supervisor", "archive-worker-missed")
+}
+
+/// A privacy worker whose first start by a process whose arguments hold `parent` misses its
+/// start-up deadline, leaving `missed` in `root`; every other start runs the real worker.
+fn slow_first_worker(root: &Path, parent: &str, missed: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let worker = root.join("bin/slow-worker");
     std::fs::write(
         &worker,
         format!(
-            "#!/bin/sh\ncase \"$(ps -o args= -p $PPID)\" in *--from-supervisor*) if mkdir '{}' 2>/dev/null; then sleep 15; exit 1; fi;; esac\nexec '{}' \"$@\"\n",
-            root.join("archive-worker-missed").display(),
+            "#!/bin/sh\ncase \"$(ps -o args= -p $PPID)\" in *'{parent}'*) if mkdir '{}' 2>/dev/null; then sleep 15; exit 1; fi;; esac\nexec '{}' \"$@\"\n",
+            root.join(missed).display(),
             env!("CARGO_BIN_EXE_agit"),
         ),
     )
@@ -514,5 +520,146 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
                 .path()
                 .extension()
                 .is_some_and(|ext| ext == "json"))
+    );
+}
+
+/// A new observed conversation whose first landing waited for the privacy check (its worker
+/// missed its start-up) is landed again, declared a session line, and its finished turn
+/// archived. A landing that left the branch it created behind undeclared would have every
+/// archive commit refused as a file line's, for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_landing_that_waited_for_the_privacy_check_lands_again_and_archives() {
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let cwd = root.join("workspace");
+    let home = root.join("agit-home");
+    let runtime_home = root.join("runtime-home");
+    for path in [&cwd, &home, &runtime_home] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    startup_cache::seed(&home);
+    install_claude(&root);
+    let worker = slow_first_worker(&root, "rc land", "landing-worker-missed");
+    let daemon = |args: &[&str]| {
+        let mut command = command(&root, args);
+        command
+            .env("AGIT_TEST_ARCHIVE_RETRY_MS", "1000")
+            .env("AGIT_TEST_PRIVACY_WORKER", &worker);
+        command
+    };
+    let native = "00000000-0000-0000-0000-000000000033";
+    let transcript_dir = runtime_home
+        .join(".claude/projects")
+        .join(agit::adapter::claude_code::slug_for(&cwd));
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    let rows = [
+        json!({"type":"user","sessionId":native,"uuid":"u1","cwd":cwd,"message":{"role":"user","content":"Inspect turn 1"}}),
+        json!({"type":"assistant","sessionId":native,"uuid":"a1","parentUuid":"u1","cwd":cwd,"message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Observed answer 1"}]}}),
+    ];
+    std::fs::write(
+        transcript_dir.join(format!("{native}.jsonl")),
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let _stop = Stop(&root);
+    assert!(
+        daemon(&["rc", "local", "start", "--detach"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut bridge = tokio::process::Command::from(command(&root, &["rc", "local", "bridge"]))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = bridge.stdin.take().unwrap();
+    let mut lines = BufReader::new(bridge.stdout.take().unwrap()).lines();
+    let mut logical = String::new();
+    for (id, method, params) in [
+        (
+            "bind",
+            "project.bind",
+            json!({"workspace_id":"local-owner","project_id":"observed-project","local_path":cwd}),
+        ),
+        (
+            "watch",
+            "session.watch",
+            json!({"workspace_id":"local-owner","session_id":native}),
+        ),
+    ] {
+        input
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let row: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                if row["id"] == id {
+                    break row;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+        if id == "watch" {
+            logical = reply["result"]["archive_session"]["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        }
+    }
+    drop(input);
+    tokio::time::timeout(Duration::from_secs(10), bridge.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let saved: Value = std::fs::read(home.join("desktop-rc/sessions.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        if let Some(lineage) = saved["sessions"][&logical]["agit_session"].as_str() {
+            let (slug, branch) = lineage.split_once('@').unwrap();
+            let repo = home.join("repos").join(slug);
+            let head = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", &format!("refs/heads/{branch}")])
+                .output()
+                .unwrap();
+            if head.status.success() {
+                let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+                if let Ok((_, view)) = agit::domain::storage::materialize_pair_at(&repo, &head)
+                    && view.contains("Observed answer 1")
+                {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn of a conversation whose first landing waited did not enter its archive\n{}",
+            daemon_output(&home.join("desktop-rc"))
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        root.join("landing-worker-missed").exists(),
+        "the first landing met a worker that missed its start-up"
     );
 }
