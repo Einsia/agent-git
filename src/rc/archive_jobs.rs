@@ -300,9 +300,57 @@ impl Job {
             return Ok(false);
         };
         let meta: meta::Meta = serde_json::from_str(&text)?;
-        Ok(meta.baseline_bytes.is_some_and(|bytes| bytes >= end)
-            && meta.runtime == self.runtime
-            && meta.line == meta::Line::Session)
+        if meta.runtime != self.runtime || meta.line != meta::Line::Session {
+            return Ok(false);
+        }
+        let Some(baseline) = meta.baseline_bytes else {
+            return Ok(false);
+        };
+        if baseline >= end {
+            return Ok(true);
+        }
+        // A job's recorded end can lie past where settlement cuts its turn, and settlement's
+        // cut decides: the archive commit stops there. The end is read again from the job's own
+        // prefix, by the rule settlement cuts with, where the job's transcript holds `end`.
+        if end != self.prefix_bytes {
+            return Ok(false);
+        }
+        Ok(self
+            .settled_end()?
+            .is_some_and(|settled| baseline >= settled))
+    }
+
+    /// Where settlement ends the last turn of this job's prefix, read from the prefix after
+    /// checking it against the job's hash: `None` when it can't be read whole, has changed, holds
+    /// no ended turn, or holds the start of another one past it.
+    fn settled_end(&self) -> crate::Result<Option<u64>> {
+        let mut bytes = Vec::new();
+        let read = fs::File::open(&self.transcript)
+            .and_then(|file| file.take(self.prefix_bytes).read_to_end(&mut bytes));
+        if read.is_err()
+            || bytes.len() as u64 != self.prefix_bytes
+            || format!("{:x}", Sha256::digest(&bytes)) != self.prefix_hash
+        {
+            return Ok(None);
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(None);
+        };
+        // Only Claude Code's turn end is read again: the end its jobs record can lie past the
+        // reply. Past settlement's end the prefix may hold nothing that begins or continues a
+        // turn, as settlement itself judges it: no later execution ended there, and nothing
+        // there awaits a reply. Otherwise a turn the archive doesn't hold would count as covered.
+        if self.runtime != "claude-code" {
+            return Ok(None);
+        }
+        let Some(end) = completed_end(&self.runtime, &self.native, &self.transcript, text)? else {
+            return Ok(None);
+        };
+        let ended = crate::adapter::claude_code::ended_turn_boundary(text).unwrap_or(0) as u64;
+        if ended > end || crate::adapter::claude_code::awaits_reply(text) {
+            return Ok(None);
+        }
+        Ok(Some(end))
     }
 
     pub(crate) fn remove(&self) -> crate::Result<()> {
@@ -388,6 +436,27 @@ pub(crate) fn publication_confirmed(
         }
     }
     Ok(())
+}
+
+/// Where the last turn of `text`, a prefix of the native transcript `transcript` of the
+/// conversation `native` of `runtime`, ended, as settlement cuts it: the runtime's own turn end,
+/// or for Claude Code a completion receipt past it.
+pub(crate) fn completed_end(
+    runtime: &str,
+    native: &str,
+    transcript: &Path,
+    text: &str,
+) -> crate::Result<Option<u64>> {
+    let boundary = crate::commands::commit::completed_native_boundary(runtime, text)?;
+    #[cfg(unix)]
+    if runtime == "claude-code" {
+        let completed =
+            crate::rc::native_claude::completion::boundaries(native, transcript, text.as_bytes())?;
+        return Ok(boundary.max(completed.last().map(|end| *end as u64)));
+    }
+    #[cfg(not(unix))]
+    let _ = (native, transcript);
+    Ok(boundary)
 }
 
 /// The SHA-256 of a carrier's first `bytes`, which must end on a record boundary.
@@ -510,6 +579,60 @@ pub(crate) mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// A job's turn end is read again from its prefix only where nothing past settlement's end
+    /// begins or continues a turn. After a reply and the Stop hooks' summary the end is the
+    /// reply; with a next turn's request and tool output after them, the next turn is open, and
+    /// there is no shorter end: an archive of the first turn doesn't cover the job. A reading
+    /// without that check counts such a job covered, and its open turn loses its retry.
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_end_is_read_again_only_when_no_turn_follows_it() {
+        let root = tempfile::tempdir().unwrap();
+        super::super::with_agit_home(&root.path().join("agit"), || {
+            let lineage = AgitSession::parse(
+                "alice/project@conversation",
+                "00000000-0000-0000-0000-000000000001",
+            )
+            .unwrap();
+            let line = |record: serde_json::Value| format!("{record}\n");
+            let replied = [
+                line(serde_json::json!({"type":"user","uuid":"u1","sessionId":"s","message":{"role":"user","content":"inspect the project"}})),
+                line(serde_json::json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"inspection completed"}]}})),
+            ]
+            .concat();
+            let hook = line(
+                serde_json::json!({"type":"system","subtype":"stop_hook_summary","uuid":"h1","parentUuid":"a1","sessionId":"s","hookCount":1,"hookErrors":["hook output"]}),
+            );
+            let next = [
+                line(serde_json::json!({"type":"user","uuid":"u2","parentUuid":"h1","sessionId":"s","message":{"role":"user","content":"now fix it"}})),
+                line(serde_json::json!({"type":"assistant","uuid":"a2","parentUuid":"u2","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"Bash","input":{"command":"true"}}]}})),
+                line(serde_json::json!({"type":"user","uuid":"r2","parentUuid":"a2","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":"ok"}]}})),
+            ]
+            .concat();
+            let job_for = |name: &str, text: &str| {
+                let path = root.path().join(format!("{name}.jsonl"));
+                fs::write(&path, text).unwrap();
+                Job::capture(
+                    "logical-one",
+                    "native-one",
+                    "claude-code",
+                    None,
+                    root.path(),
+                    &lineage,
+                    name,
+                    &path,
+                    text.len() as u64,
+                    None,
+                )
+                .unwrap()
+            };
+            let closed = job_for("closed", &format!("{replied}{hook}"));
+            assert_eq!(closed.settled_end().unwrap(), Some(replied.len() as u64));
+            let open = job_for("open", &format!("{replied}{hook}{next}"));
+            assert_eq!(open.settled_end().unwrap(), None);
+        });
     }
 
     /// Restart and replay retain the original completed prefix even when a later turn arrives.

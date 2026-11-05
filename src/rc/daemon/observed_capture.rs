@@ -346,18 +346,8 @@ fn capture_boundary(
         return pending();
     };
     let text = std::str::from_utf8(&bytes[..=end])?;
-    let boundary = crate::commands::commit::completed_native_boundary(&entry.runtime, text)?;
-    #[cfg(unix)]
-    let boundary = if entry.runtime == "claude-code" {
-        let completed = crate::rc::native_claude::completion::boundaries(
-            &entry.thread_id,
-            &path,
-            text.as_bytes(),
-        )?;
-        boundary.max(completed.last().map(|end| *end as u64))
-    } else {
-        boundary
-    };
+    let boundary =
+        crate::rc::archive_jobs::completed_end(&entry.runtime, &entry.thread_id, &path, text)?;
     let Some(boundary) = boundary else {
         return pending();
     };
