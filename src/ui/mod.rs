@@ -261,10 +261,43 @@ pub fn spinner(msg: &str) -> indicatif::ProgressBar {
     pb
 }
 
+/// Someone else's text made inert for this terminal: control and bidi-override characters become
+/// spaces, and the length is bounded, with "…" where it is cut. Printed raw, an escape sequence in
+/// it can rewrite the line or set the clipboard, and a bidi override can change how the text reads.
+pub fn printable(value: &str) -> String {
+    const SHOWN: usize = 512;
+    let mut shown: String = value
+        .chars()
+        .take(SHOWN)
+        .map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if value.chars().nth(SHOWN).is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn untrusted_text_cannot_inject_terminal_controls_or_unbounded_text() {
+        assert_eq!(printable("file\n\u{1b}[31m\u{202e}txt"), "file  [31m txt");
+        let cut = printable(&"界".repeat(600));
+        assert_eq!(cut.chars().count(), 513);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(!printable(&"界".repeat(512)).ends_with('…'));
+    }
 
     #[test]
     fn truncate_counts_chars_not_bytes() {
