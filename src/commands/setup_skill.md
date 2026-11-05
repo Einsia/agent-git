@@ -427,8 +427,10 @@ Workspace bindings remain descriptive repo routes for creation and status. Nativ
 - One user turn normally becomes one AgentGit commit. When a phase genuinely completes (working feature and passing tests), settle it:
 
   ```bash
-  agit commit <owner/repo>@<branch> --milestone "short phase summary" --tag ms-short --code
+  agit commit <owner/repo>@<branch> --milestone "short phase summary" --code
   ```
+
+  Run it from inside the turn that completes the phase: the milestone waits on the session and goes on this turn when the turn is saved. With nothing new left to save, it names the last saved turn. Add `--tag <name>` only when the user asks for a tag. A tag on a session turn takes no `-m`; `agit push` publishes it on the turn's public commit, or names it and says why not.
 
 - Memory flows by itself between the runtime's memory directory and the session branch (materialized at `new`/`resume`, collected at every `agit commit`). `main` only moves when you distill: at a milestone run `agit memory status`, then `agit distill` (or `agit memory distill <file>…`) to carry the facts worth sharing into `main`; `commit --milestone` and `push` remind you when files are pending.
 - Do not run two branches of the same Agent repo in parallel in one directory; identity follows the process, not directory guesses.

@@ -127,6 +127,22 @@ pub struct Link {
     pub merge_archive: Option<MergeArchiveRole>,
     /// The user dismissed this unclaimed session from the naming inbox.
     pub naming_ignored: bool,
+    /// A milestone or tag asked for while the turn it names had not been saved yet. The
+    /// settlement that lands that turn records it and clears it.
+    pub pending_milestone: Option<PendingMilestone>,
+}
+
+/// A milestone request waiting for its turn. The summary is stored only as the privacy check
+/// protected it, so nothing raw waits on disk; the tag name passed the same check when it was
+/// asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingMilestone {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// The transcript's length when it was asked for: the turn it names ends at or after it.
+    pub from_bytes: u64,
 }
 
 /// Local raw bytes are bound to an immutable settled tip; the digest never enters Git objects.
@@ -170,6 +186,8 @@ struct Body {
     merge_archive: Option<MergeArchiveRole>,
     #[serde(default, skip_serializing_if = "is_false")]
     naming_ignored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_milestone: Option<PendingMilestone>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -196,6 +214,7 @@ impl Link {
             superseded_by: None,
             merge_archive: None,
             naming_ignored: false,
+            pending_milestone: None,
         }
     }
 
@@ -232,6 +251,7 @@ impl Link {
             superseded_by: self.superseded_by.clone(),
             merge_archive: self.merge_archive.clone(),
             naming_ignored: self.naming_ignored,
+            pending_milestone: self.pending_milestone.clone(),
         }
     }
 
@@ -587,6 +607,7 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         superseded_by: body.superseded_by,
         merge_archive: body.merge_archive,
         naming_ignored: body.naming_ignored,
+        pending_milestone: body.pending_milestone,
     }
 }
 

@@ -51,12 +51,14 @@ use std::process::{Command, Stdio};
 mod frozen;
 pub mod inspection_summary;
 mod ref_read;
+mod tag_fetch;
 pub use crate::domain::secrets::publication::InspectionFailure;
 pub use frozen::{
     AdvertisementUnread, BlockedContentInspection, BlockedInspection, CapturedPublication,
     CompleteContentInspection, CompleteInspection, ContentInspection, FrozenPublication,
     InspectionReport, PreparedPayloadAvailability, PreparedPublication, PublicationInspection,
 };
+pub use tag_fetch::TagFetch;
 mod frozen_lfs_stage;
 pub use frozen_lfs_stage::{LfsStagingError, LfsStagingFailure, StagedLfsPayloads};
 mod publication_report;
@@ -1290,14 +1292,19 @@ pub fn clone(
 /// Presentation flags belong beside the known command, never beside a matching operand.
 fn with_progress<'a>(args: &[&'a str], tty: bool, quiet: bool) -> Vec<&'a str> {
     let mut full: Vec<&'a str> = args.to_vec();
+    // Options to Git itself (`-c name=value`) come before the subcommand.
+    let mut command = 0;
+    while full.get(command) == Some(&"-c") {
+        command += 2;
+    }
     if matches!(
-        args.first().copied(),
+        full.get(command).copied(),
         Some("fetch" | "clone" | "push" | "pull")
     ) {
         if quiet {
-            full.insert(1, "--quiet");
+            full.insert(command + 1, "--quiet");
         } else if tty {
-            full.insert(1, "--progress");
+            full.insert(command + 1, "--progress");
         }
     }
     full

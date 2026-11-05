@@ -96,11 +96,10 @@ pub fn run(args: Args) -> CmdResult {
                 return Ok(super::terminal_error_code(&e, ExitCode::Precondition));
             }
         };
-    let out = crate::hub::git::run_for_remote(
-        &repo,
-        &["fetch", "origin", "--prune", "--tags"],
-        &identity,
-    )?;
+    let fetch =
+        crate::hub::git::TagFetch::prepare(&repo, &["fetch", "origin", "--prune", "--tags"]);
+    let out = crate::hub::git::run_for_remote(&repo, &fetch.args(), &identity)?;
+    fetch.report();
     if !out.ok() {
         if crate::domain::repo::integrity::reports_damage(&out.stderr) {
             ui::error(&crate::domain::repo::integrity::damaged_store_message(

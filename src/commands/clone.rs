@@ -413,11 +413,10 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         // Fast-forward only. Divergence does no text merge — that interleaves two sessions' lines
         // and breaks the message chain, producing a syntactically valid but semantically corrupt
         // transcript.
-        let out = match crate::hub::git::run_for_remote(
-            &store,
-            &["fetch", "origin", "--tags"],
-            &plan.identity,
-        ) {
+        let fetch = crate::hub::git::TagFetch::prepare(&store, &["fetch", "origin", "--tags"]);
+        let fetched = crate::hub::git::run_for_remote(&store, &fetch.args(), &plan.identity);
+        fetch.report();
+        let out = match fetched {
             Ok(out) => out,
             Err(error) => return local_transport_failure(error),
         };

@@ -4041,6 +4041,351 @@ fn an_upload_the_privacy_check_holds_back_shows_in_status_until_it_lands() {
     assert_eq!(waits(&run(&["status", "--json"])), json!([]));
 }
 
+/// A milestone and a tag asked for while a turn is still running reach the Hub with that turn,
+/// even when an earlier turn lands first: the milestone in the public commit's meta and message,
+/// the tag on the public commit the turn was published as. With nothing new to save, a milestone
+/// names the last saved turn as its own commit. A tag whose turn is in no part of an upload, or on
+/// a published branch the push leaves out, is named with why, is never sent, and the push never
+/// reads as up to date while it is missing; a tag the Hub already holds is not named, and one
+/// added later to a published turn of the pushed branch goes on that turn's public commit. A
+/// milestone asked for while the privacy check cannot run is reported as not recorded, never
+/// dropped in silence, and lands when the same command runs again. Tag names are held to the
+/// branch-name check and session tags take no message. After the push the local tag still names
+/// the local commit, and `agit fetch` and `agit pull` take the Hub's tags around it. An
+/// implementation that dropped a request made mid-turn, put it on the earlier turn, tagged the
+/// local commit, refused the push over a rewritten tag, sent the tagged turn's branch for the
+/// tag's sake, reported "already up to date", or fetched every tag (refusing to clobber the local
+/// one) would each fail a step here.
+#[test]
+fn a_milestone_and_tag_reach_the_hub_with_their_turn() {
+    const OPENING: &str = "11111111-0000-4000-8000-0000000000a1";
+    const ASIDE: &str = "11111111-0000-4000-8000-0000000000a2";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    let codex_home = temp.path().join("codex");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", &codex_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let sessions = codex_home.join("sessions/2026/11/05");
+    fs::create_dir_all(&sessions).unwrap();
+    let rollout = |id: &str| {
+        let path = sessions.join(format!("rollout-2026-11-05T00-00-00-{id}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                json!({"type":"session_meta", "payload":{"id":id, "cwd":work, "timestamp":"2026-11-05T00:00:00Z"}})
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let append = |path: &Path, records: &[serde_json::Value]| {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        for record in records {
+            writeln!(file, "{record}").unwrap();
+        }
+    };
+    let prompt = |text: &str| json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text","text":text}]}});
+    let reply = [
+        json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"The phase is complete."}]}}),
+        json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+    ];
+    let source = rollout(OPENING);
+    append(&source, &[prompt("Start the wiki check")]);
+    append(&source, &reply);
+    assert_success(&run(&[
+        "import",
+        OPENING,
+        "--from",
+        "codex",
+        "--into",
+        "alice/app@talk",
+        "--independent",
+    ]));
+    let tip = || git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+    let opening = tip();
+
+    // Asked for from inside the running turn, with an earlier turn still unsaved: the earlier
+    // turn lands without it, and the request waits for the running one.
+    append(&source, &[prompt("Collect the wiki pages")]);
+    append(&source, &reply);
+    append(&source, &[prompt("Verify the wiki against the release")]);
+    let asked = run(&[
+        "commit",
+        "alice/app@talk",
+        "--milestone",
+        "Verified the wiki",
+        "--tag",
+        "ms-verified",
+    ]);
+    assert_success(&asked);
+    assert!(
+        String::from_utf8_lossy(&asked.stdout).contains("goes on it when it is saved"),
+        "{asked:?}"
+    );
+    let collected = tip();
+    assert_ne!(collected, opening);
+    assert!(!git(repo.root(), &["log", "-1", "--format=%B", &collected]).contains("milestone:"));
+    assert!(!repo.has_tag("ms-verified"));
+    append(&source, &reply);
+    assert_success(&run(&["commit", "alice/app@talk"]));
+    let verified = tip();
+    assert_ne!(verified, collected);
+    assert!(
+        git(repo.root(), &["log", "-1", "--format=%B", &verified])
+            .contains("milestone: Verified the wiki")
+    );
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "ms-verified^{commit}"]),
+        verified
+    );
+
+    // Refused before anything lands: a key-shaped tag name, and a message on a session tag.
+    append(&source, &[prompt("One more check")]);
+    append(&source, &reply);
+    let key_shaped = run(&[
+        "commit",
+        "alice/app@talk",
+        "--tag",
+        "fix-ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+    ]);
+    assert!(!key_shaped.status.success(), "{key_shaped:?}");
+    assert!(
+        String::from_utf8_lossy(&key_shaped.stderr).contains("plain name"),
+        "{key_shaped:?}"
+    );
+    assert_eq!(tip(), verified);
+    let annotated = run(&["tag", "-m", "Reviewed", "ms-noted", "alice/app@talk"]);
+    assert!(!annotated.status.success(), "{annotated:?}");
+    assert!(!repo.has_tag("ms-noted"));
+    assert_success(&run(&["commit", "alice/app@talk"]));
+
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(&remote, &["rev-parse", "refs/tags/ms-verified"]);
+    assert_ne!(
+        published, verified,
+        "the tag names the turn's public commit"
+    );
+    git(
+        &remote,
+        &["merge-base", "--is-ancestor", &published, "refs/heads/talk"],
+    );
+    let public_meta: serde_json::Value = serde_json::from_str(&git(
+        &remote,
+        &["show", "refs/tags/ms-verified:session/meta.json"],
+    ))
+    .unwrap();
+    assert_eq!(public_meta["milestone"], "Verified the wiki");
+    assert_eq!(public_meta["turn"], 3);
+    // The local tag keeps naming the turn's local commit, the Hub's its published copy, and
+    // fetching the Hub's tags leaves the local one as it is instead of failing on it.
+    for command in [&["fetch", "alice/app"][..], &["pull", "alice/app@main"][..]] {
+        assert_success(&run(command));
+        assert_eq!(
+            git(repo.root(), &["rev-parse", "refs/tags/ms-verified"]),
+            verified
+        );
+    }
+    assert!(
+        git(&remote, &["log", "-1", "--format=%B", &published])
+            .contains("milestone: Verified the wiki")
+    );
+
+    // Nothing new to save: the milestone names the last saved turn as its own commit.
+    let before = tip();
+    assert_success(&run(&[
+        "commit",
+        "alice/app@talk",
+        "--milestone",
+        "Reviewed the release notes",
+        "--tag",
+        "ms-reviewed",
+    ]));
+    assert_ne!(tip(), before);
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "ms-reviewed^{commit}"]),
+        tip()
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let named = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/tags/ms-reviewed"]), named);
+    assert!(
+        git(&remote, &["log", "-1", "--format=%B", &named])
+            .contains("milestone: Reviewed the release notes")
+    );
+
+    // A tag on a turn whose branch is in no part of this upload stays here, named each time.
+    let aside = rollout(ASIDE);
+    append(&aside, &[prompt("Draft the aside")]);
+    append(&aside, &reply);
+    assert_success(&run(&[
+        "import",
+        ASIDE,
+        "--from",
+        "codex",
+        "--into",
+        "alice/app@aside",
+        "--independent",
+    ]));
+    assert_success(&run(&["tag", "ms-aside", "alice/app@aside"]));
+    let refs_before = git(
+        &remote,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    for _ in 0..2 {
+        let pushed = run(&["--yes", "push", "alice/app@talk"]);
+        assert_success(&pushed);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&pushed.stdout),
+            String::from_utf8_lossy(&pushed.stderr)
+        );
+        assert!(said.contains("tag ms-aside is not uploaded"), "{said}");
+        // Tags the Hub already holds on their public commits are not named.
+        assert!(!said.contains("tag ms-verified"), "{said}");
+        assert!(!said.contains("tag ms-reviewed"), "{said}");
+        assert!(!said.contains("already up to date"), "{said}");
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            refs_before
+        );
+    }
+
+    // A tag added later to a published turn of the branch being pushed goes on its public commit.
+    assert_success(&run(&["tag", "ms-talk-late", "alice/app@talk"]));
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/tags/ms-talk-late"]),
+        git(&remote, &["rev-parse", "refs/heads/talk"])
+    );
+
+    // Once that branch is published, a tag added to its turn rides only with that branch: a push
+    // of another branch names it instead of reading as up to date.
+    assert_success(&run(&["--yes", "push", "alice/app@aside"]));
+    git(&remote, &["rev-parse", "refs/tags/ms-aside"]);
+    assert_success(&run(&["tag", "ms-aside-late", "alice/app@aside"]));
+    let pushed = run(&["--yes", "push", "alice/app@talk"]);
+    assert_success(&pushed);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&pushed.stdout),
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    assert!(
+        said.contains(
+            "tag ms-aside-late is not uploaded: its turn is on a branch this push doesn't include"
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("already up to date"), "{said}");
+    for published in ["ms-verified", "ms-aside", "ms-talk-late"] {
+        assert!(!said.contains(&format!("tag {published} ")), "{said}");
+    }
+    assert!(!git(&remote, &["tag", "--list", "ms-aside-late"]).contains("ms-aside-late"));
+    assert_success(&run(&["--yes", "push", "alice/app@aside"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/tags/ms-aside-late"]),
+        git(&remote, &["rev-parse", "refs/tags/ms-aside"])
+    );
+
+    // A settlement that lands no turn because the privacy check cannot run says the milestone
+    // was not recorded rather than losing it, and the same command lands it once the check runs.
+    // A plain file where the privacy directory belongs keeps the worker from processing anything.
+    let privacy = home.join("privacy");
+    let set_aside = home.join("privacy.aside");
+    let existed = privacy.exists();
+    if existed {
+        fs::rename(&privacy, &set_aside).unwrap();
+    }
+    fs::write(&privacy, "not a directory").unwrap();
+    append(&source, &[prompt("Check the release notes once more")]);
+    append(&source, &reply);
+    let before = tip();
+    let blocked = run(&["commit", "alice/app@talk", "--milestone", "Checked twice"]);
+    fs::remove_file(&privacy).unwrap();
+    if existed {
+        fs::rename(&set_aside, &privacy).unwrap();
+    }
+    assert!(!blocked.status.success(), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("the milestone was not recorded"),
+        "{blocked:?}"
+    );
+    assert_eq!(tip(), before);
+    assert_success(&run(&[
+        "commit",
+        "alice/app@talk",
+        "--milestone",
+        "Checked twice",
+    ]));
+    assert_ne!(tip(), before);
+    assert!(
+        git(repo.root(), &["log", "-1", "--format=%B", &tip()])
+            .contains("milestone: Checked twice")
+    );
+}
+
 /// A session whose new history is more than one publication to this Hub can carry is published in
 /// parts within one push: each part declares no more new turns than the Hub admits per request,
 /// the parts together declare every new turn once, and the branch and every turn's version tag

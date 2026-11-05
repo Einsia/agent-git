@@ -740,10 +740,14 @@ fn fetch_quiet(owner: &str, name: &str) -> bool {
     if crate::hub::identity::verify_slug(&repo, &client, owner, name).is_err() {
         return false;
     }
-    match crate::hub::git::run(&repo, &["fetch", "origin", "--tags", "--prune"]) {
+    let fetch =
+        crate::hub::git::TagFetch::prepare(&repo, &["fetch", "origin", "--tags", "--prune"]);
+    let fetched = match crate::hub::git::run(&repo, &fetch.args()) {
         Ok(o) => o.ok(),
         Err(_) => false,
-    }
+    };
+    fetch.report();
+    fetched
 }
 
 #[cfg(test)]

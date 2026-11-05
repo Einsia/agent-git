@@ -1376,15 +1376,20 @@ impl ProjectedHistory {
             Ok(())
         })?;
         imports.finish(&repo, &source)?;
-        retain_tags(
+        let mut left_out_tags = Vec::new();
+        // Session tags the destination already holds on their turns' public commits.
+        let mut on_hub = BTreeMap::new();
+        let moved = retain_tags(
             &source,
             &source_plan,
             &repo,
             &candidates,
             ledger.withheld(),
+            redactor,
             &mut references,
+            &mut left_out_tags,
         )?;
-        let carried = carry_tags(
+        let mut carried = carry_tags(
             &source,
             &source_plan,
             &repo,
@@ -1393,7 +1398,35 @@ impl ProjectedHistory {
             branches,
             &selected.remote,
             &held,
+            redactor,
             &mut references,
+            &mut on_hub,
+            &mut left_out_tags,
+        )?;
+        carried.extend(moved);
+        let handled = source_plan
+            .tags()
+            .iter()
+            .map(|tag| tag.name().to_owned())
+            .chain(
+                left_out_tags
+                    .iter()
+                    .map(|tag| format!("refs/tags/{}", tag.name)),
+            )
+            .collect::<BTreeSet<_>>();
+        place_unreached_tags(
+            &source,
+            &repo,
+            &parent,
+            &ledger,
+            &candidates,
+            &selected.remote,
+            &handled,
+            redactor,
+            &mut references,
+            &mut carried,
+            &mut on_hub,
+            &mut left_out_tags,
         )?;
         // A previously accepted alias wins when the same public object is reached on another branch.
         snapshots.retain(|commit, _| !preserved.contains(commit));
@@ -1433,6 +1466,21 @@ impl ProjectedHistory {
             &public_boundary,
             &carried,
         )?;
+        // The plan keeps a carried tag only when a branch it sends reaches it: a tag on a
+        // published turn of a branch outside this push is named here, so nothing claims it went.
+        let planned = plan
+            .tags()
+            .iter()
+            .map(|tag| (tag.name().to_owned(), tag.oid().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        for name in &carried {
+            if !planned.contains_key(name) && !name.starts_with("refs/tags/agit-") {
+                left_out_tags.push(LeftOutTag::new(name, TagLeftOut::OtherBranch));
+            }
+        }
+        let mut published = planned;
+        published.extend(on_hub);
+        let published_tags = published_elsewhere(&source, &published)?;
         source_plan.verify(&source, branches)?;
         preparing.finish();
         super::schedule_compaction(&root);
@@ -1448,7 +1496,15 @@ impl ProjectedHistory {
             accepted_ledger: ledger,
             candidates,
             held_boundary,
-            source_tags,
+            // A publication that leaves a local tag out never vouches for the local tags, so the
+            // next push asks again and names the tag again instead of reporting nothing to do.
+            source_tags: if left_out_tags.is_empty() {
+                source_tags
+            } else {
+                String::new()
+            },
+            left_out_tags,
+            published_tags,
             session_manifest: manifest,
             #[cfg(test)]
             preparations,
@@ -2562,14 +2618,19 @@ fn read_commit_trees(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retain_tags(
     source: &Repo,
     plan: &PublicationPlan,
     destination: &Repo,
     candidates: &BTreeMap<String, accepted::Candidate>,
     withheld: &BTreeSet<String>,
+    redactor: &Redactor,
     references: &mut BTreeMap<String, String>,
-) -> Result<()> {
+    left_out: &mut Vec<LeftOutTag>,
+) -> Result<BTreeSet<String>> {
+    // Tags moved onto a public commit, which the public plan may hold below its boundary.
+    let mut moved = BTreeSet::new();
     for tag in plan
         .tags()
         .iter()
@@ -2590,16 +2651,25 @@ fn retain_tags(
             .values()
             .filter_map(|candidate| candidate.mappings.get(&commit))
             .collect::<Vec<_>>();
+        if !mappings.is_empty() && mappings.iter().all(|entry| entry.public == commit) {
+            insert_tag(references, tag.name(), tag.oid())?;
+            continue;
+        }
         ensure!(
-            !mappings.is_empty() && mappings.iter().all(|entry| entry.public == commit),
+            !mappings.is_empty() && mappings.iter().all(|entry| entry.plain),
             "custom tag {} points to rewritten publication history; remove it from the source or recreate it on the accepted public commit",
             tag.name()
         );
-        if let Some(previous) = references.insert(tag.name().to_owned(), tag.oid().to_owned()) {
-            ensure!(
-                previous == tag.oid(),
-                "custom tag conflicts with a generated version tag"
-            );
+        let publics = mappings
+            .iter()
+            .map(|entry| entry.public.as_str())
+            .collect::<BTreeSet<_>>();
+        match session_tag_target(tag.name(), tag.oid(), &commit, &publics, redactor)? {
+            Ok(public) => {
+                insert_tag(references, tag.name(), &public)?;
+                moved.insert(tag.name().to_owned());
+            }
+            Err(reason) => left_out.push(LeftOutTag::new(tag.name(), reason)),
         }
     }
     for oid in plan.tag_objects() {
@@ -2609,7 +2679,7 @@ fn retain_tags(
             "publication tag changed object identity"
         );
     }
-    Ok(())
+    Ok(moved)
 }
 
 /// The session candidate cache in `bytes`, at this build's version. A cache from another version,
@@ -2667,7 +2737,10 @@ fn carry_tags(
     branches: &[String],
     remote: &RemoteRefs,
     held: &BTreeSet<String>,
+    redactor: &Redactor,
     references: &mut BTreeMap<String, String>,
+    on_hub: &mut BTreeMap<String, String>,
+    left_out: &mut Vec<LeftOutTag>,
 ) -> Result<BTreeSet<String>> {
     let lacks = |name: &str, oid: &str| {
         !ledger.withheld().contains(name)
@@ -2691,11 +2764,45 @@ fn carry_tags(
         }
     }
     for (tag, commit, objects) in plan.tags_below_boundary(source, |name, oid| !lacks(name, oid))? {
-        ensure!(
-            held.contains(&commit),
-            "custom tag {} points to rewritten publication history; remove it from the source or recreate it on the accepted public commit",
-            tag.name()
-        );
+        if !held.contains(&commit) {
+            // A turn plain publication rewrote: its tag goes on the public commit the
+            // destination accepted for it, which the accepted ledger names.
+            let entries = branches
+                .iter()
+                .filter_map(|branch| ledger.get(branch, &commit).map(|entry| (branch, entry)))
+                .collect::<Vec<_>>();
+            ensure!(
+                !entries.is_empty() && entries.iter().all(|(_, entry)| entry.plain),
+                "custom tag {} points to rewritten publication history; remove it from the source or recreate it on the accepted public commit",
+                tag.name()
+            );
+            let publics = entries
+                .iter()
+                .map(|(_, entry)| entry.public.as_str())
+                .collect::<BTreeSet<_>>();
+            match session_tag_target(tag.name(), tag.oid(), &commit, &publics, redactor)? {
+                Ok(public) if remote.refs.get(tag.name()) == Some(&public) => {
+                    on_hub.insert(tag.name().to_owned(), public);
+                }
+                Ok(public) => {
+                    let (branch, entry) = entries
+                        .iter()
+                        .find(|(_, entry)| entry.public == public)
+                        .copied()
+                        .context("an accepted public commit has no mapping")?;
+                    let retained = entry.object_source(source, parent, branch)?;
+                    crate::commands::plumbing::import_commit_graph(
+                        destination,
+                        &retained,
+                        &public,
+                    )?;
+                    insert_tag(references, tag.name(), &public)?;
+                    carried.insert(tag.name().to_owned());
+                }
+                Err(reason) => left_out.push(LeftOutTag::new(tag.name(), reason)),
+            }
+            continue;
+        }
         crate::commands::plumbing::import_commit_graph(destination, source, &commit)?;
         for oid in &objects {
             let bytes = read(source, &["cat-file", "tag", oid], MAX_COMMIT)?;
@@ -2704,15 +2811,227 @@ fn carry_tags(
                 "publication tag changed object identity"
             );
         }
-        if let Some(previous) = references.insert(tag.name().to_owned(), tag.oid().to_owned()) {
-            ensure!(
-                previous == tag.oid(),
-                "custom tag conflicts with a generated version tag"
-            );
-        }
+        insert_tag(references, tag.name(), tag.oid())?;
         carried.insert(tag.name().to_owned());
     }
     Ok(carried)
+}
+
+/// A local tag a publication does not send, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeftOutTag {
+    /// The tag's name without `refs/tags/`.
+    pub name: String,
+    pub reason: TagLeftOut,
+}
+
+impl LeftOutTag {
+    fn new(reference: &str, reason: TagLeftOut) -> Self {
+        Self {
+            name: reference
+                .strip_prefix("refs/tags/")
+                .unwrap_or(reference)
+                .to_owned(),
+            reason,
+        }
+    }
+}
+
+/// Why a tag on a session turn is not sent. A tag is only ever published on a commit the same
+/// publication sends or the destination already holds; it never makes a commit go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TagLeftOut {
+    /// An annotated tag object names the local commit and carries a message nothing protects.
+    Annotated,
+    /// Its name holds text the privacy check would change.
+    Name,
+    /// Its turn was published as more than one public commit.
+    Ambiguous,
+    /// Its turn is not part of this upload and not on the Hub.
+    NotSent,
+    /// Its turn is on the Hub, on a branch this upload does not send.
+    OtherBranch,
+}
+
+impl TagLeftOut {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Annotated => {
+                "it has a message; a tag on a session turn is published only without one (`agit tag NAME TARGET`)"
+            }
+            Self::Name => {
+                "its name holds text the privacy check would change; tag the turn again under a plain name"
+            }
+            Self::Ambiguous => {
+                "its turn was published more than once; tag the published commit you mean"
+            }
+            Self::NotSent => {
+                "its turn is not part of this upload and not on the Hub; push the branch it is on"
+            }
+            Self::OtherBranch => {
+                "its turn is on a branch this push doesn't include; push that branch to send the tag"
+            }
+        }
+    }
+}
+
+/// The public commit a tag on a session turn is published on: the one commit `publics` names,
+/// when the tag is lightweight and its name is published as it is.
+fn session_tag_target(
+    name: &str,
+    oid: &str,
+    commit: &str,
+    publics: &BTreeSet<&str>,
+    redactor: &Redactor,
+) -> Result<std::result::Result<String, TagLeftOut>> {
+    let mut each = publics.iter();
+    let (Some(public), None) = (each.next(), each.next()) else {
+        return Ok(Err(TagLeftOut::Ambiguous));
+    };
+    if oid != commit {
+        return Ok(Err(TagLeftOut::Annotated));
+    }
+    if !redactor.publishes_unchanged(name.strip_prefix("refs/tags/").unwrap_or(name))? {
+        return Ok(Err(TagLeftOut::Name));
+    }
+    Ok(Ok((*public).to_owned()))
+}
+
+/// The tags this publication sends on another commit than the one the same local tag names: a
+/// tag on a turn plain publication rewrote. Version tags are named by their public commit and
+/// have no local counterpart.
+fn published_elsewhere(
+    source: &Repo,
+    references: &BTreeMap<String, String>,
+) -> Result<Vec<crate::domain::privacy_receipt::PublishedTag>> {
+    let listing = source.git(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/tags/",
+    ])?;
+    let local = listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(oid, name)| (name, oid))
+        .collect::<BTreeMap<_, _>>();
+    Ok(references
+        .iter()
+        .filter(|(name, _)| name.starts_with("refs/tags/") && !name.starts_with("refs/tags/agit-"))
+        .filter_map(|(name, public)| {
+            let here = *local.get(name.as_str())?;
+            (here != public).then(|| crate::domain::privacy_receipt::PublishedTag {
+                name: name.trim_start_matches("refs/tags/").to_owned(),
+                local: here.to_owned(),
+                public: public.clone(),
+            })
+        })
+        .collect())
+}
+
+fn insert_tag(references: &mut BTreeMap<String, String>, name: &str, oid: &str) -> Result<()> {
+    if let Some(previous) = references.insert(name.to_owned(), oid.to_owned()) {
+        ensure!(
+            previous == oid,
+            "custom tag conflicts with a generated version tag"
+        );
+    }
+    Ok(())
+}
+
+/// Tags on session turns no branch of this publication reaches: one put on a turn's public commit
+/// itself, or on a turn of a branch this upload leaves out. A tag whose public commit this
+/// publication sends, or the destination already holds, is published there; any other is named
+/// with why it stays here. Tags on other history are not this publication's to send.
+#[allow(clippy::too_many_arguments)]
+fn place_unreached_tags(
+    source: &Repo,
+    destination: &Repo,
+    parent: &std::path::Path,
+    ledger: &accepted::Ledger,
+    candidates: &BTreeMap<String, accepted::Candidate>,
+    remote: &RemoteRefs,
+    handled: &BTreeSet<String>,
+    redactor: &Redactor,
+    references: &mut BTreeMap<String, String>,
+    carried: &mut BTreeSet<String>,
+    on_hub: &mut BTreeMap<String, String>,
+    left_out: &mut Vec<LeftOutTag>,
+) -> Result<()> {
+    let sending = candidates
+        .values()
+        .flat_map(|candidate| candidate.mappings.values())
+        .map(|entry| entry.public.as_str())
+        .collect::<BTreeSet<_>>();
+    let listing = source.git(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/tags/",
+    ])?;
+    for (oid, name) in listing.lines().filter_map(|line| line.split_once(' ')) {
+        if handled.contains(name)
+            || references.contains_key(name)
+            || name.starts_with("refs/tags/agit-")
+            || ledger.withheld().contains(name)
+            || remote.refs.get(name).is_some_and(|current| current == oid)
+        {
+            continue;
+        }
+        let Some(commit) =
+            source.git_opt(&["rev-parse", "--verify", "-q", &format!("{oid}^{{commit}}")])
+        else {
+            continue;
+        };
+        let commit = commit.trim().to_owned();
+        let on_session_line = matches!(
+            crate::domain::meta::read_at_ref_result(source, &commit),
+            Ok(Some(metadata)) if metadata.is_session_line()
+        );
+        if !on_session_line {
+            continue;
+        }
+        let accepted = ledger
+            .every_accepted_by_branch()
+            .filter(|(_, entry)| entry.plain && (entry.public == commit || entry.source == commit))
+            .collect::<Vec<_>>();
+        let publics = if sending.contains(commit.as_str()) {
+            BTreeSet::from([commit.as_str()])
+        } else {
+            accepted
+                .iter()
+                .map(|(_, entry)| entry.public.as_str())
+                .collect()
+        };
+        if publics.is_empty() {
+            left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent));
+            continue;
+        }
+        match session_tag_target(name, oid, &commit, &publics, redactor)? {
+            Ok(public) if remote.refs.get(name) == Some(&public) => {
+                on_hub.insert(name.to_owned(), public);
+            }
+            Ok(public) if sending.contains(public.as_str()) => {
+                insert_tag(references, name, &public)?;
+                carried.insert(name.to_owned());
+            }
+            // An accepted turn's public commit is on the destination; whether this push's
+            // branches reach it, and so take the tag, the final plan decides.
+            Ok(public) => match accepted.iter().find(|(_, entry)| entry.public == public) {
+                Some(&(branch, entry)) => {
+                    let retained = entry.object_source(source, parent, branch)?;
+                    crate::commands::plumbing::import_commit_graph(
+                        destination,
+                        &retained,
+                        &public,
+                    )?;
+                    insert_tag(references, name, &public)?;
+                    carried.insert(name.to_owned());
+                }
+                None => left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent)),
+            },
+            Err(reason) => left_out.push(LeftOutTag::new(name, reason)),
+        }
+    }
+    Ok(())
 }
 
 fn retain_session_mapping(
@@ -3514,6 +3833,7 @@ mod tests {
             git(&store, &["init", "-q"]);
             let destination = Repo::at(&store);
             let mut references = BTreeMap::new();
+            let mut left_out = Vec::new();
             let carried = carry_tags(
                 &source,
                 &plan,
@@ -3523,9 +3843,13 @@ mod tests {
                 &["main".into()],
                 &remote,
                 &held,
+                &Redactor::new(Default::default()),
                 &mut references,
+                &mut BTreeMap::new(),
+                &mut left_out,
             )
             .unwrap();
+            assert!(left_out.is_empty(), "{left_out:?}");
             (carried, references, destination)
         };
 

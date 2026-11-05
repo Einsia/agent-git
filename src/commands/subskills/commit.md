@@ -21,8 +21,8 @@ agit commit [target] [options] [-- <path>...]
 |---|---|
 | `[target]` | Explicit owner/repo@branch or adopted native session ID; omitted targets and `@` require `AGIT_SESSION` |
 | `[-- <path>...]` | Limit a code commit or a file-line commit to these paths |
-| `--milestone <summary>` | Mark a completed phase with a short summary |
-| `--tag <name>` | Tag the commit |
+| `--milestone <summary>` | Mark a completed phase with a short summary. Given while the turn is running, it goes on that turn when the turn is saved; with nothing new to save, it names the last saved turn |
+| `--tag <name>` | Tag the milestone's turn, only when the user asks for a tag; `agit push` publishes it on the turn's public commit |
 | `--code` | Also commit the code repo of the current directory (run it from the checkout you edited) and cross-link both commits; stages tracked changes and what is already staged, refuses while the checkout has untracked files (`git add` yours first); outside Git, warn and settle the session turn without the code side commit |
 | `-m, --message <message>` | Message for a file-only commit; new turns usually derive their message from the transcript |
 | `-n, --name <agent>` | Legacy native-ID compatibility: choose the repo name within the link's recorded owner; an ownerless link must be explicitly imported first |
@@ -37,7 +37,8 @@ on `main`. A native session ID must already have an explicit adoption claim.
 
 ```bash
 agit commit szh/p1@fix-auth --json
-agit commit szh/p1@fix-auth --milestone "Phase one passed tests" --tag ms-auth
+agit commit szh/p1@fix-auth --milestone "Phase one passed tests"
+agit commit szh/p1@fix-auth --milestone "Phase one passed tests" --tag ms-auth   # the user asked for a tag
 agit commit szh/p1@fix-auth --code -- src/auth.rs       # also commit the code repo, scoped to one path
 agit commit <owner/repo>@main -m "docs: add README" -- README.md
 agit commit <session-id> -n photo -b fix-auth           # requires a recorded repository owner

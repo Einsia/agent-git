@@ -246,6 +246,16 @@ impl Ledger {
             .flat_map(|state| state.accepted.values())
     }
 
+    /// Every accepted mapping with the branch that accepted it.
+    pub fn every_accepted_by_branch(&self) -> impl Iterator<Item = (&str, &Mapping)> {
+        self.branches.iter().flat_map(|(branch, state)| {
+            state
+                .accepted
+                .values()
+                .map(move |entry| (branch.as_str(), entry))
+        })
+    }
+
     /// The mappings this branch has accepted.
     pub fn accepted(&self, branch: &str) -> impl Iterator<Item = &Mapping> {
         self.branches
