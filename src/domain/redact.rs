@@ -220,6 +220,9 @@ impl std::fmt::Display for Withheld {
                 Some(Reason::SpawnFailed) => "the privacy worker could not start",
                 Some(Reason::ProtocolError) => "the privacy worker returned an invalid response",
                 Some(Reason::FindingsCap) => "the privacy scan exceeded its findings limit",
+                Some(Reason::UnheldPlaceholders) => {
+                    "it holds placeholders this computer never made, so they stay as they are"
+                }
                 None => "the worker did not report a reason",
             };
             write!(
@@ -1420,9 +1423,13 @@ fn replaced_values(
         .into_iter()
         .map(Zeroizing::new)
         .collect();
+    // A placeholder the original already holds is text, not a value protection replaced.
+    let literal: Vec<&str> = crate::domain::privacy::projector::tokens(original)
+        .map(|(_, _, token)| token)
+        .collect();
     let mut distinct: Vec<&str> = Vec::new();
     for (_, _, token) in crate::domain::privacy::projector::tokens(protected) {
-        if !distinct.contains(&token) {
+        if !distinct.contains(&token) && !literal.contains(&token) {
             distinct.push(token);
         }
     }

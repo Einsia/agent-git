@@ -75,6 +75,10 @@ pub enum Reason {
     LegacyRules,
     /// A blocked JSON scalar cannot be restored by the established string mapping format.
     UnsupportedScalar,
+    /// Hydration left placeholders as they are that this device's dictionary, loaded whole, never
+    /// held; every placeholder it holds was restored. Such a placeholder is text the person saw,
+    /// from wherever it was made, and nothing on this device restores it.
+    UnheldPlaceholders,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1379,8 +1383,11 @@ impl Projector {
             reason: None,
         };
         let mut cursor = 0;
+        let mut held = 0;
         for (start, end, token) in tokens(text) {
-            let record = self.dictionary.get(token).filter(|record| {
+            let known = self.dictionary.get(token);
+            held += usize::from(known.is_some());
+            let record = known.filter(|record| {
                 if let Some(remaining) = self.hydration_growth.get() {
                     let available = remaining
                         .checked_add(end - start)
@@ -1401,6 +1408,7 @@ impl Projector {
                 outcome.content.push_str(&text[cursor..start]);
                 outcome.content.push_str(&record.original);
                 outcome.replacements += 1;
+                held -= 1;
                 cursor = end;
             } else {
                 outcome.unresolved += 1;
@@ -1409,7 +1417,13 @@ impl Projector {
         outcome.content.push_str(&text[cursor..]);
         if outcome.unresolved > 0 || !self.complete {
             outcome.status = Status::Partial;
-            outcome.reason = outcome.reason.or(self.missing);
+            // `held` counts placeholders the dictionary holds but this pass could not restore.
+            let unheld_only = self.complete && held == 0 && outcome.reason.is_none();
+            outcome.reason = outcome.reason.or(if unheld_only {
+                Some(Reason::UnheldPlaceholders)
+            } else {
+                self.missing
+            });
         }
         outcome
     }
@@ -1825,6 +1839,59 @@ mod tests {
             serde_json::from_str::<Value>(&allowed.content).unwrap(),
             record
         );
+    }
+
+    /// Hydration names a placeholder this device's whole dictionary never held, which a caller
+    /// may keep as text the person saw, apart from one this device made and cannot restore now. A
+    /// dictionary not loaded whole cannot say which a placeholder it does not show is, so then
+    /// nothing is named unheld. A projector that called every unresolved placeholder unheld would
+    /// let a caller keep, as text, one whose original it only failed to read.
+    #[test]
+    fn only_a_whole_dictionary_names_a_placeholder_unheld() {
+        let root = tempfile::tempdir().unwrap();
+        // Longer than its placeholder, so restoring it grows the text.
+        let value = "otter-quay-ledger-heron-meadow-5512-cedar-branch-petal-river-0042";
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &[super::super::policy::Literal {
+                    value,
+                    source: Source::RepositoryUser,
+                }],
+                &[],
+                false,
+            )
+            .unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+            hydration_growth: Default::default(),
+        };
+        let own = projector.transform(&format!("key {value}"), Mode::ProtectText);
+        assert!(tokens(&own.content).next().is_some(), "{}", own.content);
+        let foreign = crate::domain::privacy::detector::placeholder::typed_token(
+            "secret",
+            "aws-access-token",
+        )
+        .unwrap();
+        let text = format!("{} and {foreign}", own.content);
+
+        let restored = projector.transform(&text, Mode::HydrateText);
+        assert_eq!(restored.content, format!("key {value} and {foreign}"));
+        assert!(restored.status == Status::Partial);
+        assert_eq!(restored.reason, Some(Reason::UnheldPlaceholders));
+
+        // A placeholder this device holds but cannot restore within the budget is not unheld.
+        projector.hydration_growth.set(Some(0));
+        let unrestored = projector.transform(&text, Mode::HydrateText);
+        assert_eq!(unrestored.reason, Some(Reason::Oversize));
+        projector.hydration_growth.set(None);
+
+        projector.complete = false;
+        projector.missing = Some(Reason::LegacyRules);
+        let partial = projector.transform(&text, Mode::HydrateText);
+        assert_eq!(partial.reason, Some(Reason::LegacyRules));
     }
 
     /// A blocked scalar cannot be persisted using string-only placeholders. Native controls
