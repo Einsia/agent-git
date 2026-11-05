@@ -191,10 +191,8 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         // nothing.
         match agit::tui::should_enter() {
             agit::tui::Verdict::Enter => {
-                if !skip_update
-                    && let Some(exe) = commands::upgrade::maybe_startup_nudge("resume", cli.json)
-                {
-                    return commands::upgrade::restart_after_upgrade(&exe, &raw_args);
+                if !skip_update {
+                    commands::upgrade::maybe_startup_nudge("resume");
                 }
                 if let Some(code) = prepare_startup(cli.directory.as_deref(), Startup::Migrate) {
                     return code;
@@ -247,11 +245,8 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         );
     }
     // Admitted commands report updates outside JSON capture, keeping notices on process stderr.
-    if !skip_update
-        && startup.allows_nudge()
-        && let Some(exe) = commands::upgrade::maybe_startup_nudge(command_name, json)
-    {
-        return commands::upgrade::restart_after_upgrade(&exe, &raw_args);
+    if !skip_update && startup.allows_nudge() {
+        commands::upgrade::maybe_startup_nudge(command_name);
     }
     // A hook's output reaches its runtime, and hooks run where setup already happened. The command
     // shows the notice itself once it has passed its checks, so a refused one says nothing.

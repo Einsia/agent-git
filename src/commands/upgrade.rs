@@ -31,7 +31,7 @@ use crate::hub::client::Client;
 use crate::{ExitCode, ui};
 use anyhow::{Context as _, Result, bail};
 use clap::Args as ClapArgs;
-use std::io::{IsTerminal as _, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -548,23 +548,14 @@ fn save_cache(latest: &str) {
     let _ = std::fs::write(p, serde_json::to_string(&body).unwrap());
 }
 
-/// Check for an update at a user-facing CLI startup.
-///
-/// Notices precede JSON capture so they remain on stderr instead of entering the envelope.
-/// Only a human terminal may block for an update decision; unattended calls only print a hint.
-pub fn maybe_startup_nudge(command: &str, json: bool) -> Option<PathBuf> {
+/// Check for an update at a user-facing CLI startup. The result is one line on stderr, printed
+/// before JSON capture so it stays out of the envelope. An ordinary command never waits on it:
+/// only `agit upgrade` installs.
+pub fn maybe_startup_nudge(command: &str) {
     let quiet = std::env::var_os("AGIT_QUIET").is_some();
-    if !startup_nudge_allowed(command, quiet) {
-        return None;
+    if startup_nudge_allowed(command, quiet) {
+        maybe_nudge_with_timeout(std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS));
     }
-    let interactive = !json
-        && std::env::var_os("CI").is_none()
-        && std::io::stderr().is_terminal()
-        && matches!(crate::tui::should_enter(), crate::tui::Verdict::Enter);
-    maybe_nudge_with_timeout(
-        std::time::Duration::from_secs(NUDGE_TIMEOUT_SECS),
-        interactive,
-    )
 }
 
 fn startup_nudge_allowed(command: &str, quiet: bool) -> bool {
@@ -575,9 +566,9 @@ fn startup_nudge_allowed(command: &str, quiet: bool) -> bool {
         )
 }
 
-fn maybe_nudge_with_timeout(timeout: std::time::Duration, interactive: bool) -> Option<PathBuf> {
+fn maybe_nudge_with_timeout(timeout: std::time::Duration) {
     if !crate::infra::config::is_production_release() {
-        return None;
+        return;
     }
 
     let now = SystemTime::now()
@@ -588,82 +579,29 @@ fn maybe_nudge_with_timeout(timeout: std::time::Duration, interactive: bool) -> 
     if let Some(c) = &cached
         && now.saturating_sub(c.checked_at) < NUDGE_INTERVAL_SECS
     {
-        return nudge_with(&c.latest, interactive);
+        nudge_with(&c.latest);
+        return;
     }
     // A failed ask (old hub, upstream down) still stamps the time: otherwise every eligible
     // startup sends another request, and "one failure costs a day" must not become "one failure
     // costs every invocation".
     let Ok(latest) = Client::from_env_with_timeout(timeout).cli_version() else {
         save_cache("");
-        return None;
+        return;
     };
     save_cache(&latest.version);
-    nudge_with(&latest.version, interactive)
+    nudge_with(&latest.version);
 }
 
-fn nudge_with(latest: &str, interactive: bool) -> Option<PathBuf> {
+/// The hint names no version: `latest` can be a day old, and a number from it would be wrong as
+/// soon as a newer release exists. `agit upgrade --check` asks the Hub and reports the real one.
+fn nudge_with(latest: &str) {
     if !latest.is_empty() && compare(env!("CARGO_PKG_VERSION"), latest) == Ordering::Less {
-        let message = ui::dim(&format!("agit {latest} is available — use `agit upgrade`"));
-        eprintln!("{message}");
-        if interactive
-            && ui::prompt::confirm("Update agit now?", false)
-                .ok()
-                .flatten()
-                == Some(true)
-        {
-            let exe = match std::env::current_exe() {
-                Ok(exe) => exe,
-                Err(error) => {
-                    ui::warning(&format!("cannot locate the running CLI: {error}"));
-                    return None;
-                }
-            };
-            if let Err(error) = startup_upgrade(&exe) {
-                ui::warning(&format!("{error:#}"));
-                ui::hint("run `agit upgrade` to retry; continuing the requested command.");
-            }
-            // Even a failed skill refresh can follow binary replacement. Continuing the loaded
-            // image would expose a deleted executable path or overwrite the installed skill bundle.
-            return Some(exe);
-        }
+        eprintln!(
+            "{}",
+            ui::dim("A newer version of agit is available; `agit upgrade` installs it.")
+        );
     }
-    None
-}
-
-/// Re-enter through the saved installation path before the original command touches storage.
-/// The restart marker suppresses only the repeated startup check, preserving arguments and streams.
-pub fn restart_after_upgrade(exe: &Path, argv: &[std::ffi::OsString]) -> i32 {
-    let mut command = std::process::Command::new(exe);
-    command.args(argv.iter().skip(1)).env(RESTART_ENV, "1");
-    crate::telemetry::configure_restart(&mut command);
-    #[cfg(unix)]
-    let error = {
-        use std::os::unix::process::CommandExt as _;
-        command.exec()
-    };
-    #[cfg(not(unix))]
-    let error = match command.status() {
-        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
-        Err(error) => error,
-    };
-    ui::error(&format!("cannot continue with the installed CLI: {error}"));
-    ui::hint("run the original command again.");
-    ExitCode::Precondition.as_i32()
-}
-
-/// The upgrade child owns replacement and skill refresh; its output must stay off command stdout.
-fn startup_upgrade(exe: &Path) -> Result<()> {
-    let status = std::process::Command::new(exe)
-        .args(["--no-tui", "upgrade"])
-        .env("AGIT_TELEMETRY_DEFER", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::io::stderr())
-        .status()
-        .context("could not start `agit upgrade`")?;
-    if !status.success() {
-        bail!("`agit upgrade` did not complete successfully");
-    }
-    Ok(())
 }
 
 #[cfg(test)]

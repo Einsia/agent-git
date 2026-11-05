@@ -26,9 +26,11 @@ static RUN: Mutex<Option<Run>> = Mutex::new(None);
 static ONLINE: AtomicBool = AtomicBool::new(false);
 static LAST_WORKER: AtomicI64 = AtomicI64::new(0);
 
+/// A CLI that installed this one through its startup prompt execs it with this set, so its
+/// invocation continues here instead of emitting a second start.
 pub const RESTART_ENV: &str = "AGIT_INTERNAL_TELEMETRY_RESTART";
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Restart {
     invocation_id: uuid::Uuid,
@@ -510,26 +512,6 @@ fn user_initiated(seed: &Seed, admitted: bool) -> bool {
             Some("bare") => seed.properties.get("prompt_capable") == Some(&json!(true)),
             Some(_) => true,
         }
-}
-
-/// A replacement process continues the invocation; it must not emit another start or lose prompts.
-pub fn configure_restart(command: &mut std::process::Command) {
-    command.env_remove(RESTART_ENV);
-    let restart = RUN.lock().ok().and_then(|run| {
-        let run = run.as_ref()?;
-        Some(Restart {
-            invocation_id: uuid::Uuid::parse_str(
-                run.seed.properties.get("invocation_id")?.as_str()?,
-            )
-            .ok()?,
-            prompt_shown: run.seed.properties.get("prompt_shown") == Some(&json!(true)),
-            started_event: run.started_event,
-            elapsed_ms: run.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-        })
-    });
-    if let Some(restart) = restart.and_then(|restart| serde_json::to_string(&restart).ok()) {
-        command.env(RESTART_ENV, restart);
-    }
 }
 
 pub fn finish(code: i32) {
