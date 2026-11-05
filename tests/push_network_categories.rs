@@ -667,6 +667,9 @@ fn a_member_first_push_creates_only_where_the_organization_lets_it() {
     }
 }
 
+/// An organization repository is created private unless `--public` asks otherwise, a refused
+/// creation is never retried as public, and only a public creation says that the repository may
+/// appear on the Hub homepage and in recommendations.
 #[test]
 fn organization_creation_preserves_private_defaults_and_never_retries_as_public() {
     for mode in ["human", "quiet", "json1", "json2"] {
@@ -700,6 +703,14 @@ fn organization_creation_preserves_private_defaults_and_never_retries_as_public(
                 let output = lab.push_with_visibility("team/qa", mode, false, visibility);
                 server.finish();
                 assert_failure(&output, mode, 6);
+                if mode == "human" {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert_eq!(
+                        stdout.contains("Once public, this repository may appear on the Hub homepage and in recommendations."),
+                        public,
+                        "{visibility:?}: {stdout}"
+                    );
+                }
                 assert_eq!(lab.state(), before, "{mode}/{visibility:?}/{rejection}");
                 assert_eq!(lab.git(&path, &["show-ref"]), refs);
                 assert!(!lab.home.join("repos/alice/qa").exists());

@@ -129,8 +129,14 @@ pub(super) fn run(
             );
         }
     }
+    let becomes_public = matches!(intent.action, Action::Create)
+        && intent.visibility == "public"
+        && !intent.visibility_asked;
     let delivery_confirmed = if intent.explicit_hub && !args.dry_run && !args.audit {
         reading.finish();
+        if becomes_public {
+            crate::commands::repo::tell_public_reach(!yes.answers());
+        }
         let prompt = format!(
             "Deliver branches {} as plain sessions to {repository} on {} ({}) and switch this checkout's Hub binding after upload?",
             branches.join(", "),
@@ -177,7 +183,11 @@ pub(super) fn run(
             "Create the {} repository {repository} on {} to prepare its session publication preview?",
             intent.visibility, intent.hub
         );
-        let confirmed = if automatic || delivery_confirmed || yes.answers() {
+        let answered = automatic || delivery_confirmed || yes.answers();
+        if becomes_public && !delivery_confirmed {
+            crate::commands::repo::tell_public_reach(!answered);
+        }
+        let confirmed = if answered {
             true
         } else {
             ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {

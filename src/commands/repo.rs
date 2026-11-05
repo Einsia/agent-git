@@ -245,6 +245,9 @@ fn create(target: &str, private: bool, public: bool) -> CmdResult {
                 "created {owner}/{name} ({})",
                 if private { "private" } else { "public" },
             ));
+            if !private {
+                ui::info(format_args!("  {PUBLIC_REACH}"));
+            }
             println!("  next:");
             if in_org {
                 println!(
@@ -544,6 +547,22 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
     }
 }
 
+/// Told wherever a repository is about to become public, and once a command has made one public
+/// without asking: what being public means beyond who may read it.
+pub(crate) const PUBLIC_REACH: &str =
+    "Once public, this repository may appear on the Hub homepage and in recommendations.";
+
+/// Says [`PUBLIC_REACH`] where making a repository public is decided: beside the question when a
+/// person is about to be asked, so quiet output never drops it from a question, and as an
+/// ordinary notice when the answer was given ahead.
+pub(crate) fn tell_public_reach(asking: bool) {
+    if asking {
+        eprintln!("{PUBLIC_REACH}");
+    } else {
+        ui::info(PUBLIC_REACH);
+    }
+}
+
 /// `expected_agent_id` is carried the whole way: the scan and the publication that follows must
 /// land on the **same** immutable identity. A server-side scan and a human confirmation sit in
 /// between, and `owner/name` can be deleted and rebuilt under the same name in that window; a
@@ -598,6 +617,7 @@ fn set_public_visibility(
         );
     }
     println!("  confirmation expires at {}", prepared.expires_at);
+    println!("  {PUBLIC_REACH}");
 
     match ui::prompt::input(
         &format!(
