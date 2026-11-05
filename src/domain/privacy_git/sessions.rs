@@ -667,27 +667,67 @@ fn opening_request(
     let limit = super::super::storage::MAX_MATERIALIZED_BYTES;
     let (log, _) =
         super::super::storage::materialize_pair_local(source.root(), head, limit, limit)?;
-    // The stored request has its protected values replaced already; the name may have been made
-    // from the original, so it is compared with the request as publication restores it.
     let native = zeroize::Zeroizing::new(crate::domain::transcript::unwrap_strict(&log)?);
-    let native = if crate::domain::privacy::projector::tokens(&native)
-        .next()
-        .is_some()
-    {
-        let preserve = super::super::storage::parse_envelopes(&log)?
+    let adapter = crate::adapter::get(&metadata.runtime)?;
+    let first = |native: &str| -> Result<Option<String>> {
+        Ok(adapter
+            .parse(native)?
+            .events
             .iter()
-            .any(|record| crate::domain::privacy::projector::has_wrapped_carrier(&record.content));
-        crate::domain::privacy::service::PublicationHydrator::new(source.root(), preserve)?
-            .jsonl(&native)?
-    } else {
-        native
+            .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
+            .and_then(|event| event.text.clone()))
     };
-    let session = crate::adapter::get(&metadata.runtime)?.parse(&native)?;
-    Ok(session
-        .events
+    // A record that wraps a whole encoded field in one placeholder can hide the request until it
+    // is restored, so such a session is restored whole before its request is read.
+    if super::super::storage::parse_envelopes(&log)?
         .iter()
-        .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
-        .and_then(|event| event.text.clone()))
+        .any(|record| crate::domain::privacy::projector::has_wrapped_carrier(&record.content))
+    {
+        let restored =
+            crate::domain::privacy::service::PublicationHydrator::new(source.root(), true)?
+                .jsonl(&native)?;
+        return first(&restored);
+    }
+    let Some(request) = first(&native)? else {
+        return Ok(None);
+    };
+    opening_request_restored(source, &request).map(Some)
+}
+
+/// The opening `request` as the name was made from it. The stored request has its protected
+/// values replaced already, and the name may have been made from an original, so each placeholder
+/// this computer made is restored. One its dictionary, loaded whole, never held is text the person
+/// saw and stays as it is: the name was made from that same text. While the dictionary cannot be
+/// read whole, a placeholder it does not show may still be one this computer made, so nothing is
+/// published. Only the request is read, so a placeholder elsewhere in the session never stops it.
+fn opening_request_restored(source: &Repo, request: &str) -> Result<String> {
+    use crate::domain::privacy::{
+        projector::{Mode, Reason, Status},
+        service,
+    };
+    if crate::domain::privacy::projector::tokens(request)
+        .next()
+        .is_none()
+    {
+        return Ok(request.to_owned());
+    }
+    let restored = service::transform(Some(source.root()), request, Mode::HydrateText);
+    if restored.status == Status::Complete
+        || (restored.status == Status::Partial
+            && restored.reason == Some(Reason::UnheldPlaceholders))
+    {
+        return Ok(restored.content);
+    }
+    // The push names the steps that end the wait after this, from `pending::steps`.
+    let unreadable = matches!(
+        restored.reason,
+        Some(Reason::DeviceRules | Reason::LegacyRules)
+    );
+    Err(anyhow::Error::new(service::Pending::of(&restored)).context(if unreadable {
+        "this conversation's first message holds a placeholder this computer can't read, so it stays here for now and nothing was uploaded"
+    } else {
+        "the privacy check of this conversation's first message did not finish, so it stays here for now and nothing was uploaded"
+    }))
 }
 
 impl ProjectedHistory {

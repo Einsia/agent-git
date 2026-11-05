@@ -3902,6 +3902,106 @@ fn plain_publication_carries_only_conversation_records() {
     }
 }
 
+/// A conversation whose first message quotes a placeholder this computer never made publishes
+/// under the branch name made from that message: the placeholder is text the person saw, and the
+/// name was made from the same text. One quoted in a later record, a tool result here, never
+/// stops it either, since only the first message names the branch. A push that restored the
+/// whole session before reading its first message, or that refused every placeholder it could not
+/// restore, would keep such a conversation on this computer for good.
+#[test]
+fn a_first_message_quoting_a_placeholder_made_elsewhere_publishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let elsewhere =
+        agit::domain::privacy::detector::placeholder::typed_token("secret", "aws-access-token")
+            .unwrap();
+    repo.git(&["checkout", "-B", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let records = [
+        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","message":{"role":"user","content":format!("why does the log show {elsewhere}?")}}),
+        json!({"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"s","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/work/ci.log"}}]}}),
+        json!({"type":"user","uuid":"u3","parentUuid":"u2","sessionId":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":format!("deploy key {elsewhere}")}]}}),
+        json!({"type":"assistant","uuid":"u4","parentUuid":"u3","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"It is a placeholder."}]}}),
+    ];
+    let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+    let log = transcript::wrap_lines(&text, "claude-code", &session.session);
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("talk").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let tip = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    let (published, _) = storage::materialize_pair_at(&remote, &tip).unwrap();
+    assert_eq!(
+        published.matches(elsewhere.as_str()).count(),
+        2,
+        "{published}"
+    );
+}
+
 /// An automatic upload the privacy check holds back sends nothing, and `agit status` says so: the
 /// target, the reason, and, for a reason waiting does not end, the step that ends it. The note
 /// stays until the Hub acknowledges that target. Here the device cannot read its older secret

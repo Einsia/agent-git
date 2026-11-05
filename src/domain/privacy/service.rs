@@ -570,6 +570,7 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
         Some(Reason::DeviceRules) => "device_rules",
         Some(Reason::LegacyRules) => "legacy_rules",
         Some(Reason::UnsupportedScalar) => "unsupported_scalar",
+        Some(Reason::UnheldPlaceholders) => "unheld_placeholders",
         None => "unknown",
     }
 }
