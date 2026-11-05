@@ -125,7 +125,7 @@ impl Daemon {
 
             method::FS_READ_FILE => {
                 let p: FsReadFile = f.params_as()?;
-                let roots = self.mirror.roots(&p.workspace_id);
+                let roots = self.roots_for(&caller);
                 let path =
                     policy::require_within(std::path::Path::new(&p.path), &roots).map_err(|e| {
                         RpcError::new(ErrorCode::PathNotAllowed, e.to_string()).with_hint(

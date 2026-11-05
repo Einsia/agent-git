@@ -78,6 +78,33 @@ impl CanonicalRoots {
         )
     }
 
+    /// The roots as a caller may use them: all of them for the owner, and only the confining ones
+    /// for anyone else.
+    pub(crate) fn for_caller(self, caller_is_owner: bool) -> Self {
+        if caller_is_owner {
+            self
+        } else {
+            self.confining()
+        }
+    }
+
+    /// The roots that still confine anything. One at or above the home directory doesn't, so
+    /// nothing under it counts as confined, including what another root under it would cover. The
+    /// owner's work is not affected: this decides what anyone else may reach through them.
+    pub(crate) fn confining(&self) -> Self {
+        let homes = account_homes();
+        let wide: Vec<&PathBuf> = self
+            .iter()
+            .filter(|root| reaches_a_home(root, &homes))
+            .collect();
+        Self(
+            self.iter()
+                .filter(|root| !wide.iter().any(|at| resolves_under(root, at)))
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// Build from paths that were returned by [`require_bindable_dir`].
     ///
     /// Kept crate-private so a wire path cannot label itself canonical. This deliberately does
@@ -123,6 +150,89 @@ fn within(resolved: &Path, roots: &CanonicalRoots) -> bool {
     roots
         .iter()
         .any(|r| resolved == r || resolved.starts_with(r))
+}
+
+/// The canonical home directories of the account this process runs as: the one the system has on
+/// record, and each the environment names if it says otherwise. Empty when none resolves.
+fn account_homes() -> Vec<PathBuf> {
+    let named = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from);
+    recorded_home()
+        .into_iter()
+        .chain(named)
+        .filter_map(|home| std::fs::canonicalize(home).ok())
+        .collect()
+}
+
+#[cfg(windows)]
+fn recorded_home() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath};
+    let mut path = std::ptr::null_mut();
+    let status =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, 0, std::ptr::null_mut(), &mut path) };
+    let home = (status >= 0 && !path.is_null()).then(|| unsafe {
+        let length = (0..).take_while(|&at| *path.add(at) != 0).count();
+        PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+            path, length,
+        )))
+    });
+    unsafe { CoTaskMemFree(path.cast()) };
+    home
+}
+
+#[cfg(unix)]
+fn recorded_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 1 << 16];
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut record,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || record.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())))
+}
+
+/// Is `root` one of `homes` or an ancestor of one? A root that can't be resolved, or a question
+/// with no home to compare against, counts as yes. Names compare as the control surfaces do; the
+/// file's identity catches a second name canonicalizing leaves alone, such as the
+/// `/System/Volumes/Data` spelling of `/Users` on macOS.
+fn reaches_a_home(root: &Path, homes: &[PathBuf]) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return true;
+    };
+    homes.is_empty()
+        || homes.iter().any(|home| {
+            resolves_under(home, &root) || home.ancestors().any(|above| is_same_file(above, &root))
+        })
+}
+
+#[cfg(unix)]
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_same_file(_: &Path, _: &Path) -> bool {
+    false
 }
 
 /// Is `target` under the user's home directory? Used for `fs.readDirectory`
@@ -775,6 +885,11 @@ fn resolves_under(target: &Path, at: &Path) -> bool {
 /// whose command name is on the built-in short list or on the owner's granted list
 /// ([`crate::rc::grants`]), whose arguments are each validated, and which carries no shell
 /// metacharacter outside quotes. Everything else goes back to the owner.
+/// Whether approving `tool` changes files: the tools an operator can let write into the workspace.
+pub(crate) fn changes_files(tool: &str) -> bool {
+    matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+}
+
 pub fn approval_owner_reason(
     tool: &str,
     input: &serde_json::Value,
@@ -810,6 +925,7 @@ pub fn approval_owner_reason(
 
     // With no allowlist there is no "inside" to speak of; the same holds when the session
     // itself is not in the workspace.
+    let roots = &roots.confining();
     if roots.is_empty() || !is_within(cwd, roots) {
         return Some(Unprovable);
     }
@@ -6283,5 +6399,81 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), home2.path().join("AgentGit")).unwrap();
         assert!(prepare_hub_named_folder(home2.path(), "~/AgentGit/acme/app", None).is_err());
         assert!(!outside.path().join("acme").exists());
+    }
+
+    /// A project bound at the home directory confines nothing for an operator: reading a dot-file
+    /// and writing a startup file there both ask the owner. The same two in a folder that is
+    /// not the home directory are still the operator's to answer.
+    #[test]
+    fn a_root_at_the_home_directory_leaves_every_approval_to_the_owner() {
+        use std::collections::BTreeSet;
+        let ask = |tool: &str, path: &Path, root: &Path| {
+            let input = match tool {
+                "Read" => serde_json::json!({"file_path": path}),
+                _ => serde_json::json!({"file_path": path, "content": "x"}),
+            };
+            approval_owner_reason(
+                tool,
+                &input,
+                &CanonicalRoots::from_verified(vec![root.to_path_buf()]),
+                root,
+                &BTreeSet::new(),
+            )
+        };
+        let folder = tempfile::tempdir().unwrap();
+        let normal = std::fs::canonicalize(folder.path()).unwrap();
+        assert_eq!(ask("Read", &normal.join(".zshenv"), &normal), None);
+        assert_eq!(ask("Write", &normal.join(".zshrc"), &normal), None);
+
+        let homes = account_homes();
+        assert!(!homes.is_empty());
+        for home in &homes {
+            assert!(ask("Read", &home.join(".zshenv"), home).is_some());
+            assert!(ask("Write", &home.join(".zshrc"), home).is_some());
+            // Its ancestors the same, and a folder below it while the home directory is bound too.
+            if let Some(above) = home.parent() {
+                assert!(ask("Read", &home.join(".zshenv"), above).is_some());
+            }
+        }
+        let home = &homes[0];
+        let both = CanonicalRoots::from_verified(vec![home.clone(), normal.clone()]);
+        assert_eq!(
+            both.confining().len(),
+            usize::from(!normal.starts_with(home))
+        );
+    }
+
+    /// Whichever way a root spells the home directory, it is the home directory; a folder below
+    /// it, or one that merely starts the same, is not. A root that can't be resolved, or having no
+    /// home to compare with, counts as too wide.
+    #[test]
+    fn a_root_reaches_the_home_directory_however_it_is_spelled() {
+        let folder = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(folder.path()).unwrap();
+        let home = top.join("Users").join("Someone");
+        std::fs::create_dir_all(home.join("project")).unwrap();
+        std::fs::create_dir_all(top.join("Users").join("Someone-else")).unwrap();
+        let homes = [home.clone()];
+
+        assert!(reaches_a_home(&home, &homes));
+        assert!(reaches_a_home(&top.join("Users"), &homes));
+        assert!(reaches_a_home(Path::new("/"), &homes));
+        assert!(reaches_a_home(&home.join("project").join(".."), &homes));
+        #[cfg(unix)]
+        {
+            let link = top.join("link");
+            std::os::unix::fs::symlink(&home, &link).unwrap();
+            assert!(reaches_a_home(&link, &homes));
+        }
+        assert!(resolves_under(&home, &top.join("users").join("SOMEONE")));
+
+        assert!(!reaches_a_home(&home.join("project"), &homes));
+        assert!(!reaches_a_home(
+            &top.join("Users").join("Someone-else"),
+            &homes
+        ));
+
+        assert!(reaches_a_home(&top.join("gone"), &homes));
+        assert!(reaches_a_home(&home.join("project"), &[]));
     }
 }

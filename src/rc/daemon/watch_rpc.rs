@@ -86,6 +86,11 @@ impl PreparedWatch {
 }
 
 impl WatchScan {
+    #[cfg(test)]
+    pub(super) fn roots(&self) -> &policy::CanonicalRoots {
+        &self.snapshot.roots
+    }
+
     pub(super) fn run(self) -> Result<PreparedWatch, RpcError> {
         let Self {
             request,
@@ -316,7 +321,7 @@ impl Daemon {
         }
         Ok(WatchScan {
             request,
-            snapshot: self.local_session_scan(&caller.workspace_id),
+            snapshot: self.local_session_scan(self.roots_for(&caller)),
             owner: caller.is_owner(),
         })
     }
@@ -355,9 +360,7 @@ impl Daemon {
                 "watch preparation belongs to another request",
             ));
         }
-        if !self.mirror.has_workspace(&caller.workspace_id)
-            || self.mirror.roots(&caller.workspace_id) != roots
-        {
+        if !self.mirror.has_workspace(&caller.workspace_id) || self.roots_for(&caller) != roots {
             return Err(RpcError::new(
                 ErrorCode::WorkspaceNotFound,
                 "workspace folders changed while opening this session; refresh the list",
@@ -546,6 +549,7 @@ impl Daemon {
                 let stream = watch_id.clone();
                 let rt = runtime.clone();
                 let workspace = caller.workspace_id.clone();
+                let owner = caller.is_owner();
                 let thread = p.session_id.clone();
                 let handle = tokio::spawn(async move {
                     // Read from the start of the window instead of reading from the
@@ -593,7 +597,9 @@ impl Daemon {
                             let mut next = watch.clone();
                             let workspace = workspace.clone();
                             let followed = tokio::task::spawn_blocking(move || {
-                                let roots = crate::rc::mirror::Mirror::load().roots(&workspace);
+                                let roots = crate::rc::mirror::Mirror::load()
+                                    .roots(&workspace)
+                                    .for_caller(owner);
                                 next.follow(&roots).map(|moved| (moved, next))
                             })
                             .await;

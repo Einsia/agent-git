@@ -31,7 +31,7 @@ impl Daemon {
                 "workspace is not bound on this machine",
             ));
         }
-        let workspace_roots = self.mirror.roots(&caller.workspace_id);
+        let workspace_roots = self.roots_for(&caller);
         let (request, named_workspace, project) = match frame.method() {
             method::SESSION_CATALOG_LIST => {
                 let request: ListRequest = frame.params_as()?;
@@ -56,16 +56,24 @@ impl Daemon {
             ));
         }
         let roots = match project {
-            Some(id) => policy::CanonicalRoots::from_verified(vec![
-                self.mirror
+            Some(id) => {
+                let path = self
+                    .mirror
                     .project_path(&caller.workspace_id, &id)
                     .ok_or_else(|| {
                         RpcError::new(
                             ErrorCode::WorkspaceNotFound,
                             "project is not bound in this workspace",
                         )
-                    })?,
-            ]),
+                    })?;
+                // A project the caller's roots don't reach lists nothing to that caller.
+                policy::CanonicalRoots::from_verified(
+                    policy::is_within(&path, &workspace_roots)
+                        .then_some(path)
+                        .into_iter()
+                        .collect(),
+                )
+            }
             None => workspace_roots.clone(),
         };
         Ok(Prepared {
@@ -82,9 +90,7 @@ impl Daemon {
     ) -> Result<(), RpcError> {
         let caller = caller_scope(frame)?;
         require_role(&caller, frame.method())?;
-        if !self.mirror.has_workspace(&caller.workspace_id)
-            || self.mirror.roots(&caller.workspace_id) != *roots
-        {
+        if !self.mirror.has_workspace(&caller.workspace_id) || self.roots_for(&caller) != *roots {
             return Err(RpcError::new(
                 ErrorCode::WorkspaceNotFound,
                 "workspace folders changed during discovery; refresh the catalog",
@@ -95,6 +101,11 @@ impl Daemon {
 }
 
 impl Prepared {
+    #[cfg(test)]
+    pub(super) fn roots(&self) -> (&policy::CanonicalRoots, &policy::CanonicalRoots) {
+        (&self.workspace_roots, &self.roots)
+    }
+
     pub(super) async fn execute(
         self,
         daemon: Arc<Mutex<Daemon>>,

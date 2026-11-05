@@ -265,7 +265,7 @@ pub fn run(args: Args) -> CmdResult {
 /// machine, and there is no stronger proof of ownership; going through the hub would mean a
 /// second authorization scheme for "is this request really from the owner", which is exactly the
 /// problem this feature avoids.
-fn grant(args: GrantArgs) -> CmdResult {
+pub(crate) fn grant(args: GrantArgs) -> CmdResult {
     if !crate::rc::grants::is_bare_command_name(&args.command) {
         ui::error(&format!(
             "`{}` is not a bare command name — grant `git`, not a path or a command line",
@@ -291,6 +291,21 @@ fn grant(args: GrantArgs) -> CmdResult {
         "operators of {} can now answer `{}` themselves",
         args.workspace, args.command
     ));
+    // A grant covers the repository as it stands now, including what an operator changed.
+    match crate::rc::operator_changes::clear(&args.workspace) {
+        Ok(false) => {}
+        Ok(true) => ui::success(
+            "Operators can run your granted commands in this workspace again; an operator's file \
+             change had paused them.",
+        ),
+        Err(error) => {
+            ui::error(&format!(
+                "an operator's file change still pauses your granted commands in this workspace, \
+                 since it could not be cleared: {error:#}"
+            ));
+            return Ok(ExitCode::Precondition);
+        }
+    }
     ui::hint("it applies to sessions already running — the daemon re-reads this on every approval");
     Ok(ExitCode::Ok)
 }

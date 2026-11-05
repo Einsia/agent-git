@@ -1269,3 +1269,206 @@ fn shared_native_settings_are_generation_fenced_and_durably_dangerous() {
             });
     });
 }
+
+/// A project bound at the home directory confines nothing for a non-owner, wherever the bound
+/// roots are used: the file preview refuses a dot-file there, neither the local session list, the
+/// catalog nor a watch reaches it, and no session starts, resumes, is taken over or gets a message
+/// there. The owner gets each as before. A child process, so the home directory can be a folder of the test's own.
+#[test]
+fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
+    const NAME: &str =
+        "rc::daemon::tests::guards::a_project_bound_at_the_home_directory_is_the_owners_alone";
+    if std::env::var_os("AGIT_HOME_ROOT_TEST").is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("AGIT_HOME_ROOT_TEST", "1")
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "{output:?}"
+        );
+        return;
+    }
+    let home = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
+    std::fs::write(home.join(".zshenv"), "CANARY-HOME-ROOT-5d1e").unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut live =
+                rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+            live.info.runtime = "claude-code".into();
+            let mut roster = Roster::default();
+            roster
+                .record(
+                    "session-a",
+                    serde_json::from_value(serde_json::json!({
+                        "runtime": "claude-code",
+                        "thread_id": "native-a",
+                        "cwd": home,
+                        "workspace_id": "ws-a",
+                        "project_id": "home",
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            roster
+                .record(
+                    "session-b",
+                    serde_json::from_value(serde_json::json!({
+                        "runtime": "claude-code",
+                        "thread_id": "native-b",
+                        "cwd": home,
+                        "workspace_id": "ws-a",
+                        "project_id": "home",
+                        "ever_dangerous": false,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let daemon = rpc_test_daemon([("session-a".into(), live)].into(), roster);
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "home", &home).unwrap();
+            let (frames, _frames_rx) = mpsc::channel(4);
+            let native = uuid::Uuid::new_v4().to_string();
+            let home_folder = |error: &RpcError| {
+                error
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["reason"] == "home_folder")
+            };
+            for role in ["operator", "owner"] {
+                let owner = role == "owner";
+                let mut read = Frame::request(
+                    method::FS_READ_FILE,
+                    serde_json::json!({"workspace_id": "ws-a", "path": home.join(".zshenv")}),
+                );
+                read.caller = Some(claim(role, "ws-a"));
+                let preview = state.dispatch(&read, &frames).await;
+                assert_eq!(preview.is_ok(), owner, "{role}: {preview:?}");
+
+                let list = frame_with(
+                    Some(claim(role, "ws-a")),
+                    serde_json::json!({"workspace_id": "ws-a", "include_local": true}),
+                );
+                let roots = state.prepare_session_list(&list).unwrap().roots;
+                assert_eq!(roots.is_empty(), !owner, "{role}");
+
+                let start: SessionStart = serde_json::from_value(serde_json::json!({
+                    "workspace_id": "ws-a", "project_id": "home", "runtime": "claude-code",
+                }))
+                .unwrap();
+                let started = state
+                    .prepare_start_session(
+                        start,
+                        &claim(role, "ws-a"),
+                        &frames,
+                        &Default::default(),
+                    )
+                    .err();
+                assert_eq!(started.as_ref().is_some_and(home_folder), !owner, "{role}");
+
+                for params in [
+                    serde_json::json!({"workspace_id": "ws-a"}),
+                    serde_json::json!({"workspace_id": "ws-a", "project_id": "home"}),
+                ] {
+                    let mut catalog = Frame::request(method::SESSION_CATALOG_LIST, params);
+                    catalog.caller = Some(claim(role, "ws-a"));
+                    let catalog = state.prepare_catalog(&catalog).unwrap();
+                    let (workspace, listed) = catalog.roots();
+                    assert_eq!(
+                        (workspace.is_empty(), listed.is_empty()),
+                        (!owner, !owner),
+                        "{role}"
+                    );
+                }
+
+                let mut watch = Frame::request(
+                    method::SESSION_WATCH,
+                    serde_json::json!({"workspace_id": "ws-a", "session_id": "native-b"}),
+                );
+                watch.caller = Some(claim(role, "ws-a"));
+                let watch = state.prepare_watch_scan(&watch).unwrap();
+                assert_eq!(watch.roots().is_empty(), !owner, "{role}");
+
+                let resume: SessionResume = serde_json::from_value(serde_json::json!({
+                    "workspace_id": "ws-a", "session_id": "session-b", "prompt": "hello",
+                }))
+                .unwrap();
+                let resumed = state
+                    .prepare_resume_session(
+                        resume,
+                        &claim(role, "ws-a"),
+                        &frames,
+                        &Default::default(),
+                    )
+                    .err();
+                assert_eq!(
+                    resumed.as_ref().is_some_and(home_folder),
+                    !owner,
+                    "{role}: {resumed:?}"
+                );
+
+                let resume: SessionResume = serde_json::from_value(serde_json::json!({
+                    "workspace_id": "ws-a", "session_id": "native-c", "prompt": "hello",
+                }))
+                .unwrap();
+                let located = LocatedLocal {
+                    title: None,
+                    gist: None,
+                    labels_withheld: None,
+                    runtime: "claude-code".into(),
+                    cwd: home.clone(),
+                    project_id: Some("home".into()),
+                    likely_active: false,
+                };
+                let taken = state
+                    .prepare_local_takeover(located, resume, &claim(role, "ws-a"), &frames)
+                    .err();
+                assert_eq!(
+                    taken.as_ref().is_some_and(home_folder),
+                    !owner,
+                    "{role}: {taken:?}"
+                );
+
+                let mut enqueue = Frame::request(
+                    method::SESSION_ENQUEUE,
+                    serde_json::json!({
+                        "workspace_id": "ws-a", "session_id": native,
+                        "client_msg_id": uuid::Uuid::new_v4().to_string(), "message": "hello",
+                    }),
+                );
+                enqueue.caller = Some(claim(role, "ws-a"));
+                let local = LocalSession {
+                    title: None,
+                    labels_withheld: None,
+                    runtime_session_id: native.clone(),
+                    runtime: "claude-code".into(),
+                    cwd: home.to_string_lossy().into(),
+                    modified_at: "now".into(),
+                    gist: None,
+                    adopted: false,
+                    agent: None,
+                    likely_active: false,
+                };
+                let queued = state.prepare_native_inbox(&enqueue, Some(local)).err();
+                assert_eq!(
+                    queued.as_ref().is_some_and(home_folder),
+                    !owner,
+                    "{role}: {queued:?}"
+                );
+
+                let mut turn = rpc_turn_frame("session-a");
+                turn.caller = Some(claim(role, "ws-a"));
+                let sent = state.prepare_session_rpc(&turn).err();
+                assert_eq!(sent.as_ref().is_some_and(home_folder), !owner, "{role}");
+            }
+        });
+}

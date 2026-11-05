@@ -93,7 +93,7 @@ impl Daemon {
         }
         .key()
         .map_err(unavailable)?;
-        let roots = self.mirror.roots(&p.workspace_id);
+        let roots = self.roots_for(caller);
         let thread = context
             .locate_ready(native, &roots)
             .map_err(locate_failed)?;
@@ -578,6 +578,163 @@ mod tests {
             .unwrap()
             .register(&home, None, None, None)
             .unwrap()
+    }
+
+    /// A conversation in a project bound at the home directory is the owner's alone: a non-owner
+    /// neither opens it nor finds it to message, and once the owner runs it a non-owner neither
+    /// reads its settings nor sends it a turn, while the owner does each as before. A child
+    /// process, so the home directory can be a folder of the test's own.
+    #[test]
+    fn a_source_conversation_in_the_home_directory_is_the_owners_alone() {
+        const NAME: &str = "rc::daemon::source_sessions::tests::a_source_conversation_in_the_home_directory_is_the_owners_alone";
+        if std::env::var_os("AGIT_HOME_ROOT_TEST").is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("AGIT_HOME_ROOT_TEST", "1")
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{output:?}"
+            );
+            return;
+        }
+        let project = std::fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        crate::rc::with_agit_home(root.path(), || {
+            let native = uuid::Uuid::new_v4().to_string();
+            let source = source_conversation(
+                root.path(),
+                &project,
+                &native,
+                &[("on-request", "workspace-write")],
+                ("on-request", "workspace-write"),
+            );
+            crate::rc::runtime_catalog::Catalog::open()
+                .unwrap()
+                .reconcile(&policy::CanonicalRoots::from_untrusted([project.clone()]))
+                .unwrap();
+            let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let mut state = daemon.try_lock().unwrap();
+            state.opts.local_owner = true;
+            state.mirror.bind("ws", "project", &project).unwrap();
+            let (frames, _) = mpsc::channel(16);
+            let claim = |role: &str| crate::protocol::CallerClaim {
+                account_id: Some("member".into()),
+                username: None,
+                role: role.into(),
+                workspace_id: "ws".into(),
+            };
+            let reason = |error: RpcError| {
+                error
+                    .data
+                    .and_then(|data| data["reason"].as_str().map(str::to_owned))
+            };
+            let mut opened = None;
+            for role in ["operator", "owner"] {
+                let owner = role == "owner";
+                // Opening it.
+                let opening = state.prepare_source_resume(
+                    SessionResume {
+                        project_id: None,
+                        workspace_id: "ws".into(),
+                        session_id: source.session_ref(&native),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: false,
+                    },
+                    &claim(role),
+                    &frames,
+                    (&source.source_id, &native),
+                    None,
+                    &Default::default(),
+                );
+                assert_eq!(
+                    opening.is_ok(),
+                    owner,
+                    "{role}: {:?}",
+                    opening.as_ref().err()
+                );
+                if let Ok(SessionOpening::Launch(spawn, _)) = opening {
+                    opened = Some(spawn.info);
+                }
+                state.opening_sessions.clear();
+
+                // Finding it to message: an operator's message to Codex stops before it either way.
+                let mut message = Frame::request(
+                    method::SESSION_ENQUEUE,
+                    serde_json::json!({"workspace_id":"ws","session_id":source.session_ref(&native),
+                        "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
+                );
+                message.caller = Some(claim(role));
+                let found = super::super::source_watch::SourceWatch::resolve(
+                    &source.session_ref(&native),
+                    &state.inbox_roots(&message).unwrap(),
+                )
+                .ok()
+                .flatten();
+                assert_eq!(found.is_some(), owner, "{role}");
+                let watch = super::super::source_watch::SourceWatch::resolve(
+                    &source.session_ref(&native),
+                    &state.mirror.roots("ws"),
+                )
+                .unwrap()
+                .unwrap();
+                let sent = state
+                    .prepare_inbox_target(&message, None, Some(watch))
+                    .err()
+                    .and_then(reason);
+                if owner {
+                    assert_ne!(sent.as_deref(), Some("codex_unconfined"));
+                } else {
+                    assert_eq!(sent.as_deref(), Some("codex_unconfined"));
+                }
+            }
+
+            // The owner runs it.
+            let info = opened.expect("the owner opens it");
+            let (tx, _rx) = mpsc::channel(8);
+            let mut live = super::super::tests::rpc_test_live(
+                &info.session_id,
+                1,
+                tx,
+                crate::protocol::PermissionMode::Default,
+            );
+            live.info = info.clone();
+            live.runtime_thread_id = Some(native.clone());
+            state.sessions.insert(info.session_id.clone(), live);
+            for role in ["operator", "owner"] {
+                let owner = role == "owner";
+                let mut read = Frame::request(
+                    method::SESSION_PERMISSIONS,
+                    serde_json::json!({"session_id": info.session_id}),
+                );
+                read.caller = Some(claim(role));
+                let (out, _out_rx) = mpsc::channel(4);
+                let settings = runtime.block_on(state.dispatch(&read, &out));
+                assert_eq!(settings.is_ok(), owner, "{role}: {settings:?}");
+                let mut turn = Frame::request(
+                    method::TURN_START,
+                    serde_json::json!({"session_id": info.session_id, "message": "hello",
+                        "client_msg_id": "turn"}),
+                );
+                turn.caller = Some(claim(role));
+                let sent = state.prepare_session_rpc(&turn).map(drop);
+                assert_eq!(sent.is_ok(), owner, "{role}: {:?}", sent.err());
+            }
+        });
     }
 
     /// Pins that a source-scoped Codex conversation is judged by its rollout's whole history and
