@@ -23,9 +23,11 @@
 //! * the target must be a session-line branch head (historic points and tags go through `fork`,
 //!   the file line through `new`);
 //! * unsealed (`agit branch seal` leaves only forking and viewing);
-//! * not behind its published tip: a local branch `origin/<branch>` is strictly ahead of is
-//!   fast-forwarded first, and one that diverged from it is refused with the merge and fork
-//!   steps named (resume compares with the last fetch; it does not fetch);
+//! * not behind its published tip: `agit resume` reads the branch's tip on its Hub first and
+//!   fetches that branch when the tip moved, a local branch `origin/<branch>` is strictly ahead of
+//!   is fast-forwarded, and one that diverged from it is refused with the merge and fork steps
+//!   named. A Hub that cannot be read is said once, and the local copy continues; a branch only
+//!   the Hub has becomes the local branch when this sign-in may write it;
 //! * an omitted branch is not guessed: a tty enters the picker (one activity order across sources), a
 //!   non-tty lists the candidates and exits 8.
 
@@ -79,13 +81,23 @@ pub struct Resumed {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    run_when_ready(args, || ())
+    run_when_ready(args, HubCheck::Needed, || ())
+}
+
+/// Whether the caller has already fetched the repository from its Hub.
+pub(crate) enum HubCheck {
+    Needed,
+    Done,
 }
 
 /// [`run`], calling `ready` once every precondition has passed and the session is about to be
 /// printed or launched; what `ready` returns is kept until the launch returns. A refused or
 /// cancelled resume never calls it.
-pub(crate) fn run_when_ready<T>(args: Args, ready: impl FnOnce() -> T) -> CmdResult {
+pub(crate) fn run_when_ready<T>(
+    args: Args,
+    hub_check: HubCheck,
+    ready: impl FnOnce() -> T,
+) -> CmdResult {
     let cwd_now = std::env::current_dir()?;
 
     // No argument + someone sitting at a terminal = hand over to the resident Sessions screen.
@@ -132,6 +144,19 @@ pub(crate) fn run_when_ready<T>(args: Args, ready: impl FnOnce() -> T) -> CmdRes
             _ => super::echo::Source::Mixed,
         })
         .unwrap_or(super::echo::Source::Interactive);
+    let looked = match hub_check {
+        HubCheck::Needed => look_at_hub(&repo, &slug, &branch),
+        HubCheck::Done => Looked::Checked,
+    };
+    if let Looked::Unreachable(error) = &looked {
+        ui::warning(&format!("could not check the Hub for newer turns: {error}"));
+        ui::hint(&format!(
+            "continuing from this computer's copy of `{branch}`; turns pushed from elsewhere since its last fetch are not in it"
+        ));
+    }
+    if let Some(code) = take_published_branch(&repo, &slug, &branch, &args, looked)? {
+        return Ok(code);
+    }
     match resume_branch_for(&repo, &slug, &branch, &args, None, Some(source))? {
         Some(res) => {
             let _ready = ready();
@@ -139,6 +164,177 @@ pub(crate) fn run_when_ready<T>(args: Args, ready: impl FnOnce() -> T) -> CmdRes
         }
         None => Ok(ExitCode::Precondition),
     }
+}
+
+/// What looking at the Hub found before a branch is judged.
+enum Looked {
+    /// The repository has no Hub: no origin, or this machine's `local/` namespace.
+    Unpublished,
+    /// `origin/<branch>` holds the Hub's tip.
+    Checked,
+    /// The Hub has no such branch.
+    Absent,
+    Unreachable(String),
+}
+
+/// How long each read of the Hub waits before resume continues from this computer's copy.
+/// Resume starts a conversation the person is waiting on, and an unreachable address otherwise
+/// holds the connection until the kernel gives up.
+const HUB_LOOK: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Brings `origin/<branch>` to the Hub's tip, so the branch is judged against what was published
+/// rather than against whatever an earlier fetch brought down. Judged against the last fetch, a
+/// collaborator's pushed turns are missing from the continued session without a word, and a
+/// branch only they created reads as missing.
+///
+/// The Hub's tip is read first and the branch fetched only when it moved, without tags: the Hub
+/// advertises every ref of the repository on each read, and a fetch of a repository with a turn
+/// tag per commit would also bring down every tag.
+fn look_at_hub(repo: &Repo, slug: &str, branch: &str) -> Looked {
+    let Ok((owner, name)) = super::parse_slug(slug) else {
+        return Looked::Unpublished;
+    };
+    let Some(url) = repo.remote("origin").filter(|_| owner != "local") else {
+        return Looked::Unpublished;
+    };
+    let client = crate::hub::Client::from_env_with_timeout(HUB_LOOK);
+    let identity =
+        match crate::hub::identity::resolve_transport_target(repo, &client, &owner, &name) {
+            Ok(identity) => identity,
+            Err(error) => return Looked::Unreachable(hub_cause(&error, slug)),
+        };
+    // A checkout pinned to another repository publishes elsewhere: its origin is not `slug`'s,
+    // and nothing is read from it in `slug`'s name.
+    if crate::hub::identity::read(repo)
+        .ok()
+        .flatten()
+        .is_some_and(|pinned| pinned != identity)
+    {
+        return Looked::Unreachable(format!(
+            "this checkout uploads to another repository than {slug}"
+        ));
+    }
+    let read = |args: &[&str]| crate::hub::git::capture_for_remote(repo, args, &identity, HUB_LOOK);
+    let published = format!("refs/heads/{branch}");
+    let tracking = format!("refs/remotes/origin/{branch}");
+    let suffix = format!("\t{published}");
+    let tip = match read(&["ls-remote", "--heads", &url, &published]) {
+        Ok(list) => list
+            .lines()
+            .find_map(|line| line.strip_suffix(suffix.as_str()))
+            .map(str::to_owned),
+        Err(error) => return Looked::Unreachable(error.to_string()),
+    };
+    let Some(tip) = tip else {
+        return Looked::Absent;
+    };
+    let known = repo.git_opt(&["rev-parse", "--verify", "--quiet", &tracking]);
+    if known.as_deref().map(str::trim) == Some(tip.as_str()) {
+        return Looked::Checked;
+    }
+    match read(&[
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        "origin",
+        &format!("+{published}:{tracking}"),
+    ]) {
+        Ok(_) => Looked::Checked,
+        Err(error) => Looked::Unreachable(error.to_string()),
+    }
+}
+
+/// Why the Hub's record of the repository was not read, in a fixed sentence: the Hub's own
+/// wording and addresses stay out of it.
+fn hub_cause(error: &anyhow::Error, slug: &str) -> String {
+    let status = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::hub::client::ApiError>())
+        .map(|api| api.status);
+    match status {
+        Some(404) => format!("it has no repository {slug}"),
+        Some(401 | 403) => "it refused this sign-in".into(),
+        Some(status) => format!("it answered HTTP {status}"),
+        None => "it could not be reached".into(),
+    }
+}
+
+/// A branch this computer lacks but the Hub has becomes the local branch at the published tip
+/// when this sign-in may write it, so it continues like any other. One it may not write is
+/// refused with the command that continues it as a new branch of the person's own; one the Hub
+/// lacks too is refused with what was checked. `None` lets the resume go on.
+fn take_published_branch(
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    args: &Args,
+    looked: Looked,
+) -> crate::Result<Option<ExitCode>> {
+    if repo.has_ref(&format!("refs/heads/{branch}")) {
+        return Ok(None);
+    }
+    let published = format!("refs/remotes/origin/{branch}");
+    if matches!(looked, Looked::Absent) || !repo.has_ref(&published) {
+        ui::error(&match looked {
+            Looked::Checked | Looked::Absent => {
+                format!("{slug} has no branch `{branch}`, here or on the Hub.")
+            }
+            Looked::Unpublished => format!("{slug} has no branch `{branch}`."),
+            Looked::Unreachable(_) => format!(
+                "{slug} has no branch `{branch}` on this computer, and the Hub could not be checked."
+            ),
+        });
+        return Ok(Some(ExitCode::Precondition));
+    }
+    let (owner, name) = super::parse_slug(slug)?;
+    let client = crate::hub::Client::from_env_with_timeout(HUB_LOOK);
+    let access = match super::run::write_access(&client, &owner, &name) {
+        Ok(access) => access,
+        Err(error) => {
+            ui::error(&format!(
+                "`{branch}` is on the Hub but not on this computer, and the Hub did not confirm that this sign-in may write to {slug}: {}",
+                hub_cause(&error, slug)
+            ));
+            ui::hint("run this again once the Hub answers; nothing was changed");
+            return Ok(Some(super::terminal_error_code(&error, ExitCode::Network)));
+        }
+    };
+    if !super::run::continuable(&access) {
+        let mut command = vec!["run".to_owned(), format!("{slug}@{branch}")];
+        if let Some(runtime) = &args.as_runtime {
+            command.extend(["--as".to_owned(), runtime.clone()]);
+        }
+        if let Some(dir) = &args.cwd {
+            command.extend(["--cwd".to_owned(), dir.to_string_lossy().into_owned()]);
+        }
+        ui::error(&format!(
+            "`{branch}` is on the Hub but not on this computer, and this sign-in cannot write to {slug}."
+        ));
+        let shown = command
+            .iter()
+            .map(|arg| recovery_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        ui::hint_with_fix(
+            &format!("continue it as a new branch of your own: `agit {shown}`"),
+            || {
+                let command = command.iter().map(String::as_str).collect::<Vec<_>>();
+                super::fix::FixCommand::current(&command, false)
+            },
+        );
+        return Ok(Some(ExitCode::Precondition));
+    }
+    repo.git(&["branch", branch, &published])?;
+    let tip = repo.git(&["rev-parse", "--short=9", &published])?;
+    let from = match looked {
+        Looked::Unreachable(_) => "the copy last fetched from the Hub",
+        Looked::Checked | Looked::Absent | Looked::Unpublished => "the Hub",
+    };
+    ui::info(format_args!(
+        "continuing `{branch}` from {from}, at its published tip {}",
+        tip.trim()
+    ));
+    Ok(None)
 }
 
 /// The result of [`resolve_branch`]: a resolved branch, or a refusal whose reason is already
