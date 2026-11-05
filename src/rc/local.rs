@@ -197,6 +197,7 @@ fn rpc_path() -> crate::Result<PathBuf> {
 }
 
 pub fn start_foreground() -> crate::Result<()> {
+    let _guard = super::daemon_guard::install();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -233,8 +234,8 @@ pub(super) fn spawn_daemon() -> crate::Result<()> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let log = tempfile::Builder::new()
-        .prefix("agitd-")
-        .suffix(".log")
+        .prefix(super::daemon_guard::LOG_PREFIX)
+        .suffix(super::daemon_guard::LOG_SUFFIX)
         .tempfile_in(super::rc_dir()?)?;
     let (log, path) = log.keep()?;
     eprintln!("agitd: startup diagnostics: {}", path.display());
