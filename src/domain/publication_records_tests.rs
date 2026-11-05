@@ -486,7 +486,7 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
         (
             "opencode",
             json!({"id":"msg_3","kind":"session_message","type":"user","data":{"text":"x"}}),
-            RuntimeContext,
+            Conversation,
         ),
         (
             "hermes",
@@ -581,8 +581,9 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
     );
     assert_stable("cursor", &wrapped);
 
-    // An OpenCode part takes its role from the message header before it: the assistant's text is
-    // published, the user's is not.
+    // An OpenCode part takes its role from the message header before it: the assistant's text and
+    // the person's unmarked text are published, a part of a message whose header is missing is
+    // not.
     let mut session = Classifier::default();
     let header = |id: &str, role: &str| json!({"id":id,"kind":"message","session_id":"ses","time_created":1,"data":{"role":role}});
     let text = |id: &str, message: &str, words: &str| json!({"id":id,"kind":"part","message_id":message,"data":{"type":"text","text":words}});
@@ -592,6 +593,10 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
     );
     assert_eq!(
         session.class("opencode", &text("p1", "m1", "fix the bug")),
+        Conversation
+    );
+    assert_eq!(
+        session.class("opencode", &text("p0", "m0", "fix the bug")),
         RuntimeContext
     );
     assert_eq!(
@@ -888,7 +893,7 @@ fn cursor_notices_inside_the_wrapper_are_not_published() {
 }
 
 /// OpenCode's other storage shape keeps a whole message on one row: an assistant row keeps its
-/// text, reasoning and tool items, a user row carries no mark of who wrote it.
+/// text, reasoning and tool items, a user row its text without its attached files.
 #[test]
 fn opencode_single_row_messages_follow_the_same_rule() {
     let reply = json!({"id":"msg_v4","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":9,
@@ -906,7 +911,8 @@ fn opencode_single_row_messages_follow_the_same_rule() {
     assert_stable("opencode", &reply);
     let user = json!({"id":"msg_v3","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,
         "data":{"text":"fix it"}});
-    assert_eq!(published("opencode", &user), None);
+    assert_eq!(published("opencode", &user).unwrap(), user);
+    assert_stable("opencode", &user);
     let other = json!({"id":"msg_v5","kind":"session_message","type":"agent-switch","data":{"agent":AGENTS_MD}});
     assert_eq!(published("opencode", &other), None);
 }
@@ -938,6 +944,16 @@ fn the_ordered_judgement_of_kinds_matches_what_publication_keeps() {
                 "opencode",
                 json!({"id":"p7","kind":"part","message_id":"m2","data":{"type":"tool","tool":"read"}}),
             ),
+            ("opencode", header("m5", "user")),
+            (
+                "opencode",
+                json!({"id":"p8","kind":"part","message_id":"m5","data":{"type":"text","synthetic":true,"text":AGENTS_MD}}),
+            ),
+            (
+                "opencode",
+                json!({"id":"p9","kind":"part","message_id":"m5","data":{"type":"file","mime":"text/plain","filename":"a.md","url":"file:///work/a.md"}}),
+            ),
+            ("opencode", text("p10", "m5")),
         ],
         claude_transcript()
             .into_iter()
@@ -1230,4 +1246,204 @@ fn codex_text_parts_of_a_tool_result_are_published_as_text() {
     assert!(!kept.to_string().contains(AGENTS_MD));
     assert!(!kept.to_string().contains("canary"));
     assert_stable("claude-code", &record);
+}
+
+/// OpenCode 1.19.4 writes what it adds to the person's turn as text parts marked `synthetic`, and
+/// what the person typed as an unmarked text part. Of the person's message only that typed text
+/// is published, without injected elements; marked parts, parts with any other field and attached
+/// files are not, nor a v2 user row's files.
+#[test]
+fn opencode_publishes_only_the_text_the_person_typed() {
+    use RecordClass::*;
+    let mut session = Classifier::default();
+    let header = json!({"id":"m1","kind":"message","session_id":"ses","time_created":1,
+        "data":{"role":"user","agent":"build","model":{"providerID":"p","modelID":"m"},"time":{"created":1}}});
+    assert!(session.published("opencode", &header).is_some());
+    let part = |id: &str, data: Value| json!({"id":id,"kind":"part","session_id":"ses","message_id":"m1","time_created":1,"data":data});
+    // `opencode run -f README.md`: the read call and the file body as marked text, the file
+    // itself as an unmarked file part, then the typed prompt.
+    let withheld = [
+        part(
+            "p1",
+            json!({"type":"text","synthetic":true,"text":"Called the Read tool with the following input: {\"filePath\":\"/Users/canary/README.md\"}"}),
+        ),
+        part(
+            "p2",
+            json!({"type":"text","synthetic":true,"text":format!("<path>/Users/canary/README.md</path>\n<content>{AGENTS_MD}</content>")}),
+        ),
+        part(
+            "p3",
+            json!({"type":"file","mime":"text/plain","filename":"README.md","url":"file:///Users/canary/README.md"}),
+        ),
+        // `-f shot.png`: the image's file part is marked.
+        part(
+            "p4",
+            json!({"type":"file","synthetic":true,"mime":"image/png","filename":"shot.png","url":"data:image/png;base64,AAAA"}),
+        ),
+        // A mark of either value, or any field nobody knows, withholds the part.
+        part(
+            "p5",
+            json!({"type":"text","synthetic":false,"text":"maybe typed"}),
+        ),
+        part(
+            "p6",
+            json!({"type":"text","ignored":true,"text":"maybe typed"}),
+        ),
+        part(
+            "p7",
+            json!({"type":"text","text":"maybe typed","metadata":{"plugin":"x"}}),
+        ),
+        // Nothing typed is left once the injected element is removed.
+        part(
+            "p8",
+            json!({"type":"text","text":format!("<system-reminder>{MEMORY_MD}</system-reminder>")}),
+        ),
+    ];
+    for record in &withheld {
+        assert_eq!(session.published("opencode", record), None, "{record}");
+    }
+    let typed = part(
+        "p9",
+        json!({"type":"text","text":"\"summarize the readme\""}),
+    );
+    assert_eq!(session.published("opencode", &typed).unwrap(), typed);
+    let reminded = part(
+        "p10",
+        json!({"type":"text","text":format!("explain this <system-reminder>{MEMORY_MD}</system-reminder>")}),
+    );
+    assert_eq!(
+        session.published("opencode", &reminded).unwrap()["data"]["text"],
+        "explain this"
+    );
+    let mut kinds = Classifier::default();
+    kinds.class("opencode", &header);
+    assert_eq!(kinds.class("opencode", &typed), Conversation);
+    assert_eq!(kinds.class("opencode", &reminded), RuntimeContext);
+    for record in &withheld {
+        assert_eq!(kinds.class("opencode", record), RuntimeContext, "{record}");
+    }
+
+    // The v2 layout: a user row holds what was sent and its attached files.
+    let row = json!({"id":"msg_v8","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,
+        "time_created":2,"data":{"time":{"created":2},"text":"look at this file",
+        "files":[{"uri":"file:///Users/canary/notes.md","mime":"text/markdown","name":"notes.md"}]}});
+    let kept = published("opencode", &row).unwrap();
+    assert_eq!(
+        kept["data"],
+        json!({"time":{"created":2},"text":"look at this file"})
+    );
+    assert!(!kept.to_string().contains("canary"));
+    assert_stable("opencode", &row);
+    let flagged = json!({"id":"msg_v9","kind":"session_message","type":"user","seq":9,
+        "data":{"text":"maybe typed","synthetic":true}});
+    assert_eq!(published("opencode", &flagged), None);
+    let system = json!({"id":"msg_v1","kind":"session_message","type":"system","seq":1,"data":{"text":AGENTS_MD}});
+    assert_eq!(published("opencode", &system), None);
+}
+
+/// Claude Code 2.1.311 writes a pasted image and its caption as the person's typed record: one
+/// text part with the `[Image #N]` placeholder and the caption, then the image. A companion
+/// record the runtime writes after it names the pasted file and is not published.
+#[test]
+fn a_pasted_image_caption_is_published_from_the_typed_record() {
+    let typed = json!({"parentUuid":"p0","isSidechain":false,"promptId":"q1","type":"user",
+        "message":{"role":"user","content":[
+            {"type":"text","text":"[Image #1] Here is the screenshot I mentioned."},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMAGE"}}]},
+        "uuid":"u1","timestamp":"t","imagePasteIds":[1],"permissionMode":"default",
+        "origin":{"kind":"human"},"promptSource":"typed","turnOrigin":"human",
+        "turnPosition":{"promptIndex":1,"turnIndex":1},"userType":"external","entrypoint":"cli",
+        "cwd":"/work","sessionId":"s","version":"2.1.311","gitBranch":"main"});
+    let kept = published("claude-code", &typed).unwrap();
+    assert_eq!(
+        kept["message"]["content"],
+        json!([{"type":"text","text":"[Image #1] Here is the screenshot I mentioned."},
+               {"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMAGE"}}])
+    );
+    assert_stable("claude-code", &typed);
+    let companion = json!({"parentUuid":"u1","isSidechain":false,"promptId":"q1","type":"user",
+        "message":{"role":"user","content":[
+            {"type":"text","text":"[Image: source: /Users/canary/Desktop/screenshot.png]"}]},
+        "isMeta":true,"turnCompanion":true,"uuid":"u2","timestamp":"t","userType":"external",
+        "entrypoint":"cli","cwd":"/work","sessionId":"s","version":"2.1.311","gitBranch":"main"});
+    assert_eq!(published("claude-code", &companion), None);
+    assert_eq!(
+        record_class("claude-code", &companion),
+        RecordClass::RuntimeContext
+    );
+}
+
+#[test]
+fn codex_tool_outputs_strip_injected_elements() {
+    // Codex tool output text follows the block rule of Claude tool results: an environment block
+    // and a reminder both go, the tool's own words stay; parts other than text are dropped.
+    let injected = format!(
+        "<environment_context>{AGENTS_MD}</environment_context>\n<system-reminder>{MEMORY_MD}</system-reminder>"
+    );
+    for kind in [
+        "function_call_output",
+        "custom_tool_call_output",
+        "local_shell_call_output",
+    ] {
+        let text_parts = |text: &str| {
+            ["text", "input_text", "output_text"].map(|kind| json!({"type":kind,"text":text}))
+        };
+        let text = format!("build passed\n{injected}");
+        let mut parts = Vec::from(text_parts(&text));
+        parts.extend([
+            json!({"type":"output_text","text":injected}),
+            json!({"type":"image","data":AGENTS_MD}),
+            json!({"type":"input_image","image_url":AGENTS_MD}),
+            json!({"type":"nested","content":AGENTS_MD}),
+        ]);
+        for (output, expected) in [
+            (json!(text), json!("build passed")),
+            (json!(injected), json!("")),
+            (json!(parts), json!(text_parts("build passed"))),
+        ] {
+            let record = codex(
+                "response_item",
+                json!({"type":kind,"call_id":"call-1","output":output}),
+            );
+            let mut expected_record = record.clone();
+            expected_record["payload"]["output"] = expected;
+            let kept = published("codex", &record);
+            assert_eq!(kept, Some(expected_record), "{kind}");
+            let kept = kept.unwrap().to_string();
+            assert!(
+                !kept.contains(AGENTS_MD) && !kept.contains(MEMORY_MD),
+                "{kept}"
+            );
+            assert_eq!(class("codex", &record), RecordClass::RuntimeContext);
+            assert_stable("codex", &record);
+        }
+    }
+}
+
+/// A tool output that is neither text nor parts, a structured result or a scalar, goes through the
+/// one rule for Claude and Codex alike: it is kept as it is, for protection to mask its credential
+/// fields and keep its references.
+#[test]
+fn a_tool_output_of_another_shape_follows_one_rule_for_claude_and_codex() {
+    for output in [
+        json!({"output":"STRUCTURED_STDOUT","metadata":{"exit_code":0}}),
+        json!({"text":"NESTED_TEXT"}),
+        json!(42),
+        json!(true),
+        Value::Null,
+    ] {
+        let record = codex(
+            "response_item",
+            json!({"type":"function_call_output","call_id":"call-1","output":output}),
+        );
+        let kept = published("codex", &record).unwrap();
+        assert_eq!(kept["payload"]["output"], output, "{record}");
+        assert_eq!(kept["payload"]["call_id"], "call-1");
+        assert_stable("codex", &record);
+        let result = json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_1","content":output}]}});
+        let kept = published("claude-code", &result).unwrap();
+        assert_eq!(kept["message"]["content"][0]["content"], output, "{result}");
+        assert_stable("claude-code", &result);
+    }
 }
