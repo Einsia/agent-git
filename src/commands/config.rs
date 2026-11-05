@@ -59,7 +59,8 @@ pub struct Args {
     #[arg(long)]
     pub global: bool,
     /// The person's consent, given in agit's menu bar, to upload automatically into this public
-    /// repository. It must name the `--repo` repository and counts only outside an agent session.
+    /// repository. It must name the `--repo` repository; from inside an agent session it is an
+    /// unattended answer, like `--yes`.
     #[arg(long, value_name = "OWNER/REPO", requires = "repo", hide = true)]
     pub public_consent: Option<String>,
 }

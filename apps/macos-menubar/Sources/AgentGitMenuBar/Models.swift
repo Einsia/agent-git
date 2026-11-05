@@ -30,6 +30,17 @@ struct ProjectList: Decodable {
     let hub: String
     let folders: [Folder]
     let incomplete: Bool
+    /// Public automatic uploads switched on with nobody at a terminal or in this app, such as by
+    /// an agent; absent from an agit that predates the record.
+    let publicSwitchedOnUnattended: [UnattendedSwitchOn]?
+}
+
+struct UnattendedSwitchOn: Decodable, Equatable {
+    let repository: String
+    /// Seconds since the Unix epoch.
+    let at: Double
+
+    var key: String { "\(repository)@\(Int(at))" }
 }
 
 struct Folder: Decodable, Identifiable, Equatable {

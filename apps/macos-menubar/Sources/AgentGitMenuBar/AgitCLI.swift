@@ -253,6 +253,10 @@ struct AgitCLI {
         // session, and would make a click here count as an agent's rather than the person's.
         for name in Self.sessionVariables { environment.removeValue(forKey: name) }
         environment["AGIT_TUI"] = "0"
+        // Every action here follows this app's own question, which for a repository it did not
+        // know to be public was not the public one: agit then asks for the public consent
+        // instead of taking `--yes` as the answer.
+        environment["AGIT_MENUBAR_ASKED"] = "1"
         process.environment = environment
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         process.standardInput = FileHandle.nullDevice
