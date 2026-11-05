@@ -208,3 +208,41 @@ enum Words {
         return relative.localizedString(for: date, relativeTo: Date())
     }
 }
+
+/// `agit rc local status --json`: only the upgrade a watcher waits to make is read.
+struct LocalDaemonStatus: Decodable {
+    let pendingUpgrade: PendingUpgrade?
+
+    struct PendingUpgrade: Decodable, Equatable {
+        let version: String
+        let waitingFor: String
+        /// The running version cannot hand over by itself; absent from an agit that predates it.
+        let byHand: Bool?
+
+        /// The conversations that keep the old version running, when the daemon names them.
+        var heldBy: [String] {
+            guard let range = waitingFor.range(of: "cannot be detached safely: ") else { return [] }
+            return waitingFor[range.upperBound...]
+                .split(separator: ";").first
+                .map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } } ?? []
+        }
+
+        /// One calm line for the menu: what waits, and what lets it go through.
+        var line: String {
+            if byHand == true {
+                return "agit \(version) is installed, but the remote-control service running now is too old to hand over by itself: it has to be stopped and started again before the update takes effect."
+            }
+            let held = heldBy.count
+            if held > 0 {
+                let them = held == 1 ? "1 open conversation started from the web keeps" : "\(held) open conversations started from the web keep"
+                return "agit \(version) is installed and waits to take over: \(them) the old version running. Closing \(held == 1 ? "it" : "them") lets the update finish."
+            }
+            // An older running version says only that such conversations hold it, without names.
+            if waitingFor.contains("cannot be detached safely") {
+                return "agit \(version) is installed and waits to take over: open conversations started from the web keep the old version running. Closing them lets the update finish."
+            }
+            return "agit \(version) is installed and takes over once the running version has finished its current work."
+        }
+    }
+}
+

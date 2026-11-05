@@ -91,6 +91,12 @@ struct MenuView: View {
             }
         }
         ForEach(model.folders) { FolderRow(folder: $0) }
+        if let pending = model.pendingUpgrade {
+            Text(pending.line)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         if model.incomplete {
             Text("Some of agit's records could not be read; this list may be missing a folder.")
                 .font(.system(size: 11))
