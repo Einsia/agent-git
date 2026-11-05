@@ -1,4 +1,5 @@
-//! Startup updates must leave command data intact and require a human before installation.
+//! A startup update check must leave command data intact and never stop a command; only `agit
+//! upgrade` installs.
 
 use serde_json::{Value, json};
 use std::fs;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const NOTICE: &str = "agit 999.0.0 is available";
+const NOTICE: &str = "A newer version of agit is available";
 
 struct Lab {
     root: tempfile::TempDir,
@@ -35,7 +36,11 @@ impl Lab {
     }
 
     fn command(&self, args: &[&str], hub: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        self.command_of(env!("CARGO_BIN_EXE_agit").as_ref(), args, hub)
+    }
+
+    fn command_of(&self, executable: &std::path::Path, args: &[&str], hub: &str) -> Command {
+        let mut command = Command::new(executable);
         command
             .args(args)
             .env_clear()
@@ -61,7 +66,8 @@ fn assert_notice(output: &Output) {
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches(NOTICE).count(), 1, "{output:?}");
-    assert!(!stderr.contains("Update agit now?"), "{output:?}");
+    // The check's answer can be a day old, so a number from it could already be wrong.
+    assert!(!stderr.contains("999.0.0"), "{output:?}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains(NOTICE));
 }
 
@@ -233,20 +239,16 @@ mod terminal {
 
     struct Terminal {
         child: Box<dyn portable_pty::Child + Send + Sync>,
-        writer: Box<dyn Write + Send>,
+        // Held open and never written: a command that read stdin would wait here forever.
+        _stdin: Box<dyn Write + Send>,
         chunks: std::sync::mpsc::Receiver<Vec<u8>>,
         output: String,
     }
 
     impl Terminal {
-        fn start(
-            lab: &Lab,
-            executable: &std::path::Path,
-            args: &[&str],
-            env: &[(&str, &str)],
-        ) -> Self {
+        fn start(lab: &Lab, args: &[&str], env: &[(&str, &str)]) -> Self {
             let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-            let mut builder = CommandBuilder::new(executable);
+            let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
             builder.args(args);
             builder.env_clear();
             builder.env("PATH", std::env::var_os("PATH").unwrap_or_default());
@@ -263,7 +265,7 @@ mod terminal {
                 builder.env(key, value);
             }
             let mut reader = pair.master.try_clone_reader().unwrap();
-            let writer = pair.master.take_writer().unwrap();
+            let stdin = pair.master.take_writer().unwrap();
             let child = pair.slave.spawn_command(builder).unwrap();
             drop(pair.slave);
             let (sender, chunks) = std::sync::mpsc::channel();
@@ -278,38 +280,30 @@ mod terminal {
             });
             Self {
                 child,
-                writer,
+                _stdin: stdin,
                 chunks,
                 output: String::new(),
             }
         }
 
-        fn read_until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
+        fn finish(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 while let Ok(chunk) = self.chunks.try_recv() {
                     self.output.push_str(&String::from_utf8_lossy(&chunk));
                     assert!(self.output.len() < 1024 * 1024);
                 }
-                if done(self) {
-                    return;
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    assert!(status.success(), "{}", self.output);
+                    break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "terminal timed out: {}",
+                    "the command waited on its terminal: {}",
                     self.output
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-        }
-
-        fn finish(&mut self) {
-            self.read_until(|terminal| {
-                terminal.child.try_wait().unwrap().is_some_and(|status| {
-                    assert!(status.success(), "{}", terminal.output);
-                    true
-                })
-            });
             while let Ok(chunk) = self.chunks.recv_timeout(Duration::from_millis(100)) {
                 self.output.push_str(&String::from_utf8_lossy(&chunk));
             }
@@ -323,8 +317,52 @@ mod terminal {
         }
     }
 
-    fn upgrade_fixture(lab: &Lab, replacement: &[u8]) -> (Hub, PathBuf) {
-        lab.cache("999.0.0");
+    /// An ordinary command on a terminal, with an update available, shows the hint and runs,
+    /// reading nothing from stdin. A prompt would hold the command until someone answered: here
+    /// nobody does, so it hits the deadline.
+    /// Nor may it install anything, whatever the mode it runs in.
+    #[test]
+    fn a_command_on_a_terminal_never_waits_for_an_update_or_installs_one() {
+        if !agit::infra::config::is_production_release() {
+            return;
+        }
+        for (extra, env) in [
+            (vec![], vec![]),
+            (vec!["--json"], vec![]),
+            (vec!["--json", "--tui"], vec![]),
+            (vec!["--yes"], vec![]),
+            (vec!["--no-tui"], vec![]),
+            (vec![], vec![("CI", "1")]),
+            (vec![], vec![("AGIT_SESSION", "fixture/repo@branch")]),
+            (vec![], vec![("CODEX_SESSION_ID", "fixture")]),
+        ] {
+            let lab = Lab::new();
+            lab.cache("999.0.0");
+            let mut args = vec!["config", "hub.url"];
+            args.extend(extra);
+            let mut terminal = Terminal::start(&lab, &args, &env);
+            terminal.finish();
+            assert!(terminal.output.contains(NOTICE), "{}", terminal.output);
+            assert!(
+                terminal.output.contains("http://127.0.0.1:1"),
+                "{}",
+                terminal.output
+            );
+            assert!(!terminal.output.contains("999.0.0"), "{}", terminal.output);
+            assert!(!terminal.output.contains("upgraded to"));
+        }
+    }
+
+    /// `agit upgrade` replaces the running executable with the package's and refreshes the Skill
+    /// and hooks through the new one, in that order. A refresh by the old image would put the old
+    /// bundle back over the new executable.
+    #[test]
+    fn explicit_upgrade_installs_and_refreshes_through_the_new_executable() {
+        if !agit::infra::config::is_production_release() {
+            return;
+        }
+        let lab = Lab::new();
+        let replacement = "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$AGIT_HOME/refreshed\"\n";
         let package = lab.root.path().join("package/bin");
         fs::create_dir_all(&package).unwrap();
         fs::write(package.join("agit"), replacement).unwrap();
@@ -343,9 +381,8 @@ mod terminal {
         let hub = Hub::new(200, Some(fs::read(&tgz).unwrap()));
         let executable = lab.root.path().join("agit-bin");
         // A child process makes the copy. Written here, the copy's writable descriptor passes to
-        // any child a sibling test forks meanwhile and stays open until that child execs; running
-        // a file open for writing fails (ETXTBSY), and portable-pty's spawn turns that failure into
-        // an abort on the terminal instead of an error.
+        // any child a sibling test forks meanwhile and stays open until that child execs, and
+        // running a file open for writing fails (ETXTBSY).
         assert!(
             Command::new("cp")
                 .arg(env!("CARGO_BIN_EXE_agit"))
@@ -354,296 +391,21 @@ mod terminal {
                 .unwrap()
                 .success()
         );
-        (hub, executable)
-    }
-
-    #[test]
-    fn human_terminal_waits_and_declining_or_enter_continues_the_command() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        for answer in [b"n\r".as_slice(), b"\r".as_slice()] {
-            let lab = Lab::new();
-            lab.cache("999.0.0");
-            let mut terminal = Terminal::start(
-                &lab,
-                env!("CARGO_BIN_EXE_agit").as_ref(),
-                &["config", "hub.url"],
-                &[],
-            );
-            terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-            assert!(terminal.child.try_wait().unwrap().is_none());
-            assert!(!terminal.output.contains("http://127.0.0.1:1"));
-            assert!(
-                terminal.output.contains("y/n") || terminal.output.contains("y/N"),
-                "{}",
-                terminal.output
-            );
-            terminal.writer.write_all(answer).unwrap();
-            terminal.writer.flush().unwrap();
-            terminal.finish();
-            assert!(terminal.output.contains("http://127.0.0.1:1"));
-            assert!(!terminal.output.contains("upgraded to"));
-        }
-    }
-
-    #[test]
-    fn unattended_terminal_modes_never_wait_or_install() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        for (extra, env) in [
-            (vec!["--json"], vec![]),
-            (vec!["--json", "--tui"], vec![]),
-            (vec!["--yes"], vec![]),
-            (vec!["--no-tui"], vec![]),
-            (vec![], vec![("CI", "1")]),
-            (vec![], vec![("AGIT_SESSION", "fixture/repo@branch")]),
-            (vec![], vec![("CODEX_SESSION_ID", "fixture")]),
-        ] {
-            let lab = Lab::new();
-            lab.cache("999.0.0");
-            let mut args = vec!["config", "hub.url"];
-            args.extend(extra);
-            let mut terminal =
-                Terminal::start(&lab, env!("CARGO_BIN_EXE_agit").as_ref(), &args, &env);
-            terminal.finish();
-            assert!(terminal.output.contains(NOTICE), "{}", terminal.output);
-            assert!(
-                !terminal.output.contains("Update agit now?"),
-                "{}",
-                terminal.output
-            );
-            assert!(!terminal.output.contains("upgraded to"));
-        }
-    }
-
-    #[test]
-    fn accepting_restarts_the_copied_cli_with_original_arguments_and_directory() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        let lab = Lab::new();
-        let replacement = "#!/bin/sh\nif [ \"$1\" = --no-tui ]; then\n  printf '%s\\n' \"$@\" >> \"$AGIT_HOME/refreshed\"\nelse\n  printf '%s\\n' \"$@\" > \"$AGIT_HOME/continued\"\n  pwd > \"$AGIT_HOME/continued-cwd\"\n  printf '%s\\n' \"$AGIT_HUB_URL\"\nfi\n";
-        let (hub, executable) = upgrade_fixture(&lab, replacement.as_bytes());
-        fs::create_dir(lab.root.path().join("nested directory")).unwrap();
-        let args = ["-C", "nested directory", "config", "hub.url"];
-        let mut terminal = Terminal::start(
-            &lab,
-            &executable,
-            &args,
-            &[
-                ("AGIT_HUB_URL", &hub.base),
-                ("AGIT_NPM_REGISTRY", &hub.base),
-            ],
-        );
-        terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-        assert!(terminal.child.try_wait().unwrap().is_none());
-        assert!(!lab.store.join("refreshed").exists());
-        terminal.writer.write_all(b"y\r").unwrap();
-        terminal.writer.flush().unwrap();
-        terminal.finish();
+        let output = lab
+            .command_of(&executable, &["--no-tui", "upgrade"], &hub.base)
+            .env("AGIT_NPM_REGISTRY", &hub.base)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         assert!(
-            terminal.output.contains("upgraded to 999.0.0"),
-            "{}",
-            terminal.output
+            String::from_utf8_lossy(&output.stdout).contains("upgraded to 999.0.0")
+                || String::from_utf8_lossy(&output.stderr).contains("upgraded to 999.0.0"),
+            "{output:?}"
         );
-        assert!(terminal.output.contains(&hub.base));
         assert_eq!(fs::read_to_string(&executable).unwrap(), replacement);
         assert_eq!(
             fs::read_to_string(lab.store.join("refreshed")).unwrap(),
             "--no-tui\n--quiet\nsetup\n--skill\n--installed-only\n--no-tui\n--quiet\nsetup\n--new-runtimes\n"
         );
-        assert_eq!(
-            fs::read_to_string(lab.store.join("continued")).unwrap(),
-            format!("{}\n", args.join("\n"))
-        );
-        assert_eq!(
-            PathBuf::from(
-                fs::read_to_string(lab.store.join("continued-cwd"))
-                    .unwrap()
-                    .trim()
-            )
-            .canonicalize()
-            .unwrap(),
-            lab.root.path().canonicalize().unwrap()
-        );
-    }
-
-    #[test]
-    fn restarted_setup_and_daemon_use_the_installed_executable_and_skill_bundle() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        let build = tempfile::tempdir().unwrap();
-        let replacement = build.path().join("replacement");
-        assert!(
-            Command::new("rustc")
-                .arg("--edition=2024")
-                .arg("-Dwarnings")
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/upgraded_cli.rs"
-                ))
-                .arg("-o")
-                .arg(&replacement)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let bytes = fs::read(replacement).unwrap();
-        for fail_refresh in [false, true] {
-            for args in [
-                vec!["setup", "--skill"],
-                vec!["setup", "--hooks"],
-                vec!["rc", "start", "--detach"],
-            ] {
-                let lab = Lab::new();
-                let (hub, executable) = upgrade_fixture(&lab, &bytes);
-                let mut env = vec![
-                    ("AGIT_HUB_URL", hub.base.as_str()),
-                    ("AGIT_NPM_REGISTRY", hub.base.as_str()),
-                ];
-                if fail_refresh {
-                    env.push(("FIXTURE_REFRESH_FAILURE", "1"));
-                }
-                let mut terminal = Terminal::start(&lab, &executable, &args, &env);
-                terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-                terminal.writer.write_all(b"y\r").unwrap();
-                terminal.writer.flush().unwrap();
-                terminal.finish();
-                assert_eq!(
-                    fs::read_to_string(lab.store.join("continued")).unwrap(),
-                    args.join("\n")
-                );
-                let installed = executable.canonicalize().unwrap();
-                for file in [
-                    Some("continued-exe"),
-                    if args[0] == "rc" {
-                        Some("daemon-exe")
-                    } else if args[1] == "--hooks" {
-                        Some("hook-exe")
-                    } else {
-                        None
-                    },
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    assert_eq!(
-                        PathBuf::from(fs::read_to_string(lab.store.join(file)).unwrap())
-                            .canonicalize()
-                            .unwrap(),
-                        installed
-                    );
-                }
-                assert_eq!(
-                    fs::read_to_string(lab.root.path().join(".codex/skills/agit/SKILL.md"))
-                        .unwrap(),
-                    "new fixture skill\n"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn accepted_updates_preserve_one_telemetry_invocation_and_its_prompt() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        for installed in [true, false] {
-            let lab = Lab::new();
-            let (hub, executable) = if installed {
-                upgrade_fixture(&lab, b"#!/bin/sh\nexec \"$FIXTURE_REAL_CLI\" \"$@\"\n")
-            } else {
-                lab.cache("999.0.0");
-                (
-                    Hub::new(503, None),
-                    PathBuf::from(env!("CARGO_BIN_EXE_agit")),
-                )
-            };
-            fs::create_dir_all(lab.store.join("telemetry")).unwrap();
-            fs::write(
-                lab.store.join("telemetry/preferences.json"),
-                json!({"preference":"enabled", "generation":1, "device_id":uuid::Uuid::new_v4()})
-                    .to_string(),
-            )
-            .unwrap();
-            let mut terminal = Terminal::start(
-                &lab,
-                &executable,
-                &["config", "hub.url"],
-                &[
-                    ("AGIT_HUB_URL", &hub.base),
-                    ("AGIT_NPM_REGISTRY", &hub.base),
-                    ("AGIT_TELEMETRY_HOST", "http://127.0.0.1:9"),
-                    ("AGIT_TELEMETRY_KEY", "synthetic_project"),
-                    ("AGIT_TELEMETRY_DEFER", "0"),
-                    ("FIXTURE_REAL_CLI", env!("CARGO_BIN_EXE_agit")),
-                ],
-            );
-            terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-            terminal.writer.write_all(b"y\r").unwrap();
-            terminal.writer.flush().unwrap();
-            terminal.finish();
-            assert_eq!(
-                terminal.output.contains("upgraded to 999.0.0"),
-                installed,
-                "{}",
-                terminal.output
-            );
-            let queue: Value =
-                serde_json::from_slice(&fs::read(lab.store.join("telemetry/queue.json")).unwrap())
-                    .unwrap();
-            let events: Vec<_> = queue["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| &entry["event"])
-                .filter(|event| {
-                    event["properties"]["command"] == "config"
-                        && matches!(
-                            event["event"].as_str(),
-                            Some("cli_command_started" | "cli_command_finished")
-                        )
-                })
-                .collect();
-            assert_eq!(events.len(), 2, "{events:?}");
-            assert_eq!(events[0]["event"], "cli_command_started");
-            assert_eq!(events[1]["event"], "cli_command_finished");
-            assert_eq!(
-                events[0]["properties"]["invocation_id"],
-                events[1]["properties"]["invocation_id"]
-            );
-            assert_eq!(events[1]["properties"]["prompt_shown"], true);
-            assert_eq!(events[1]["properties"]["exit_code"], 0);
-        }
-    }
-
-    #[test]
-    fn failed_upgrade_still_runs_the_requested_command() {
-        if !agit::infra::config::is_production_release() {
-            return;
-        }
-        let lab = Lab::new();
-        lab.cache("999.0.0");
-        let hub = Hub::new(503, None);
-        let mut terminal = Terminal::start(
-            &lab,
-            env!("CARGO_BIN_EXE_agit").as_ref(),
-            &["config", "hub.url"],
-            &[("AGIT_HUB_URL", &hub.base)],
-        );
-        terminal.read_until(|terminal| terminal.output.contains("Update agit now?"));
-        terminal.writer.write_all(b"y\r").unwrap();
-        terminal.writer.flush().unwrap();
-        terminal.finish();
-        assert!(terminal.output.contains("continuing the requested command"));
-        assert!(
-            terminal.output.trim_end().ends_with(&hub.base),
-            "{}",
-            terminal.output
-        );
-        assert_eq!(hub.requests.load(Ordering::SeqCst), 1);
     }
 }

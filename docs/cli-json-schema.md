@@ -11,8 +11,8 @@ online URL.
 
 Startup update notices can appear on process stderr before the JSON envelope is captured.
 They are separate from command diagnostics in `diagnostics.stderr`, never alter stdout or
-the command exit status, and never prompt or install in JSON mode. `--quiet` suppresses
-the startup update check and notice.
+the command exit status, and never prompt or install. `--quiet` suppresses the startup
+update check and notice.
 
 ## Envelope
 
