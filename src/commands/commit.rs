@@ -2550,6 +2550,24 @@ fn settle_bytes(
     let branch_ref = format!("refs/heads/{branch}");
     let settlement_tip = optional_branch_commit(repo, &branch_ref)?;
     let has_head = settlement_tip.is_some();
+    // A milestone or tag named in this command replaces one waiting on the link. Without one, the
+    // waiting request rides along and lands with the first turn that ends at or after the point
+    // where it was asked for.
+    let explicit_request = opts.milestone.is_some() || opts.tag.is_some();
+    let mut opts = opts;
+    if let Some(tag) = opts.tag.as_deref()
+        && let Some(code) = super::tag::refuse_session_tag(repo, tag)?
+    {
+        return Ok(code);
+    }
+    let pending_from = match &lk.pending_milestone {
+        Some(pending) if !explicit_request && opts.milestone_turn.is_none() => {
+            opts.milestone = pending.summary.clone();
+            opts.tag = pending.tag.clone();
+            Some(usize::try_from(pending.from_bytes).unwrap_or(usize::MAX))
+        }
+        _ => None,
+    };
     if materialized_mode
         && let Some(source_tip) = lk.materialized_from.as_deref()
         && settlement_tip.as_deref() != Some(source_tip)
@@ -2877,6 +2895,22 @@ fn settle_bytes(
     } else {
         one_commit_per_turn(new_chunks)
     };
+    let tail = region.rsplit('\n').find(|l| !l.is_empty()).unwrap_or("");
+    let half_written = !tail.is_empty() && serde_json::from_str::<serde_json::Value>(tail).is_err();
+    let turn_running = in_flight.is_some() || half_written;
+    // A milestone or tag named now belongs to the turn running now, or with none running to the
+    // last turn this settlement would land, even when the privacy budget lands only the turns
+    // before it: the request is pinned to that point, and waits on the link until a turn
+    // ending at or after it lands.
+    let request_from = if explicit_request && opts.milestone_turn.is_none() {
+        if turn_running {
+            Some(bytes.len())
+        } else {
+            new_chunks.last().map(|c| region_start + c.end_byte)
+        }
+    } else {
+        pending_from
+    };
 
     if new_chunks.is_empty() {
         // A named milestone turn is a request this settlement must fulfil; landing nothing is
@@ -2886,6 +2920,41 @@ fn settle_bytes(
                 "turn #{wanted} is not among the turns this settlement lands: there is nothing new to settle"
             ));
             return Ok(ExitCode::Usage);
+        }
+        if explicit_request && opts.message.is_none() {
+            let saved = head_meta
+                .as_ref()
+                .filter(|metadata| metadata.is_session_line())
+                .and_then(|metadata| metadata.turn);
+            return match (saved, settlement_tip.as_deref()) {
+                (Some(turn), Some(tip)) if !turn_running => {
+                    let named = NamedTurn {
+                        tip,
+                        turn,
+                        metadata: head_meta.as_ref().expect("a saved turn has metadata"),
+                        owner,
+                    };
+                    name_saved_turn(
+                        store,
+                        repo,
+                        branch,
+                        lk,
+                        &link_disk_at_entry,
+                        &opts,
+                        named,
+                        quiet,
+                    )
+                }
+                _ => wait_for_turn(
+                    store,
+                    repo,
+                    lk,
+                    &link_disk_at_entry,
+                    &opts,
+                    bytes.len(),
+                    quiet,
+                ),
+            };
         }
         if opts.message.is_none()
             && recovered.is_none()
@@ -3036,6 +3105,39 @@ fn settle_bytes(
         .count();
     let unsettled = new_chunks.len() - settled;
     if settled == 0 {
+        // No turn lands now, so a milestone or tag named in this command waits on the link for
+        // the turn it names, its summary protected as wait_for_turn protects it. When even that
+        // protection cannot run, the command says the milestone was not recorded.
+        if explicit_request && let Some(from) = request_from {
+            let summary = match &opts.milestone {
+                Some(summary) => match privacy::protect_for_commit(
+                    Some(repo.root()),
+                    summary,
+                    PrivacyMode::ProtectText,
+                ) {
+                    Ok(protected) => Some(protected),
+                    Err(_) => return milestone_unprotected(quiet),
+                },
+                None => None,
+            };
+            lk.pending_milestone = Some(link::PendingMilestone {
+                summary,
+                tag: opts.tag.clone(),
+                from_bytes: from as u64,
+            });
+            if !write_link_unless_moved(store, &lk, &link_disk_at_entry)? {
+                ui::error(
+                    "the session link changed while this command ran; the milestone was not recorded",
+                );
+                ui::hint("run the same command again");
+                return Ok(ExitCode::Precondition);
+            }
+            if !quiet {
+                ui::info(format_args!(
+                    "the turn this milestone names hasn't been saved yet; it goes on it when it is saved"
+                ));
+            }
+        }
         return privacy_pending(
             &lk,
             quiet,
@@ -3178,10 +3280,15 @@ fn settle_bytes(
             }
         })
     };
-    // Several native completions can share one user turn; the milestone goes on the last.
-    let milestone_index = match opts.milestone_turn {
-        None => total.checked_sub(1),
-        Some(wanted) => {
+    // Several native completions can share one user turn; the milestone goes on the last. A
+    // request goes on the first turn ending at or after the point it was asked for; when none
+    // of the turns landing now reaches it, it waits on the link.
+    let milestone_index = match (opts.milestone_turn, request_from) {
+        (None, Some(from)) => new_chunks
+            .iter()
+            .position(|c| region_start + c.end_byte >= from),
+        (None, None) => total.checked_sub(1),
+        (Some(wanted), _) => {
             let found = new_chunks
                 .iter()
                 .enumerate()
@@ -3203,6 +3310,7 @@ fn settle_bytes(
     };
     crate::telemetry::runtime(&lk.source);
     let mut last_sha = String::new();
+    let mut milestone_sha = None;
     // Every branch, including an unborn one, is settled without touching the real index/worktree:
     // build every turn as an unreachable object chain first, then move the ref once with the
     // frozen old-tip expectation. In particular, two first writers both expect the ref to be
@@ -3477,6 +3585,9 @@ fn settle_bytes(
             authored_at,
         )?;
         pending_parent = Some(last_sha.clone());
+        if milestone_here {
+            milestone_sha = Some(last_sha.clone());
+        }
         let protected_subject = protected_message
             .lines()
             .next()
@@ -3556,6 +3667,23 @@ fn settle_bytes(
     // rerouted mid-settlement must not be flattened by a whole-file write of the old watermark.
     // The turns themselves already landed on the branch under an expected-old CAS, so skipping
     // the watermark advance costs at most a rescan of the already-committed prefix next time.
+    match (&milestone_sha, request_from) {
+        (Some(_), _) => lk.pending_milestone = None,
+        (None, Some(from)) if explicit_request => {
+            lk.pending_milestone = Some(link::PendingMilestone {
+                summary: observations.milestone.clone(),
+                tag: opts.tag.clone(),
+                from_bytes: from as u64,
+            });
+            if !quiet {
+                ui::info(format_args!(
+                    "the turn this milestone names hasn't been saved yet; it goes on it when it is saved"
+                ));
+            }
+        }
+        // A request that waited keeps waiting until its turn lands.
+        _ => {}
+    }
     let link_disk_now = std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
     // No link on disk = no claim to flatten, so a first settlement persists as usual.
     if link_disk_now.is_none() || link_disk_now == link_disk_at_entry {
@@ -3566,9 +3694,10 @@ fn settle_bytes(
         );
     }
 
-    // --tag goes on the last chunk. It is a user tag; the PRD has no per-commit machine tag.
-    if let Some(t) = &opts.tag {
-        repo.git(&["tag", t, &last_sha])?;
+    // --tag goes on the milestone's turn. It is a user tag; the PRD has no per-commit machine
+    // tag. A waiting tag whose turn has not landed keeps waiting with its milestone.
+    if let (Some(t), Some(sha)) = (&opts.tag, &milestone_sha) {
+        repo.git(&["tag", t, sha])?;
         if !quiet {
             ui::success(&format!("tagged {t}"));
         }
@@ -3625,6 +3754,170 @@ fn settle_bytes(
     }
     record_supervisor_result(&last_sha)?;
     Ok(ExitCode::Ok)
+}
+
+/// The branch's last saved turn, which a milestone asked for while nothing new is left to settle
+/// names.
+struct NamedTurn<'a> {
+    tip: &'a str,
+    turn: u32,
+    metadata: &'a Meta,
+    owner: &'a str,
+}
+
+/// Names the last saved turn: a milestone lands as one commit on the session line whose meta is
+/// the turn's own with the protected summary added, and a tag goes on that commit, or on the
+/// turn's commit when no summary was given.
+#[allow(clippy::too_many_arguments)]
+fn name_saved_turn(
+    store: &Store,
+    repo: &Repo,
+    branch: &str,
+    mut lk: Link,
+    link_disk_at_entry: &Option<Vec<u8>>,
+    opts: &SettleOpts,
+    named: NamedTurn<'_>,
+    quiet: bool,
+) -> CmdResult {
+    use crate::domain::privacy::{projector::Mode as PrivacyMode, service as privacy};
+    let NamedTurn {
+        tip,
+        turn,
+        metadata,
+        owner,
+    } = named;
+    let mut target = tip.to_owned();
+    if let Some(summary) = &opts.milestone {
+        let mut metadata = metadata.clone();
+        metadata.committer_account = credentials::current_account()?;
+        metadata.kind = Kind::File;
+        metadata.milestone = Some(summary.clone());
+        if privacy::protect_metadata(repo.root(), &mut metadata).is_err() {
+            return milestone_unprotected(quiet);
+        }
+        let protected = metadata.milestone.clone().unwrap_or_default();
+        let message = format!("agit: milestone for turn #{turn}\n\nmilestone: {protected}");
+        let Ok(message) =
+            privacy::protect_for_commit(Some(repo.root()), &message, PrivacyMode::ProtectText)
+        else {
+            return milestone_unprotected(quiet);
+        };
+        let tree = super::plumbing::tree_apply_owned(
+            repo,
+            tip,
+            vec![
+                (
+                    meta::FILE.into(),
+                    Some(meta::to_text(&metadata)?.into_bytes()),
+                ),
+                ("privacy/envelope.json".into(), None),
+            ],
+        )?;
+        record_supervisor_prepared()?;
+        let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+        let commit =
+            super::plumbing::commit_tree_as(repo, &tree, &[tip], &message, (owner, &email))?;
+        maybe_interleave_publication(repo, branch);
+        super::plumbing::update_branch_cas_and_refresh(repo, branch, &commit, tip, false)?;
+        if lk.materialized_from.is_some() {
+            lk.materialized_from = Some(commit.clone());
+        }
+        record_supervisor_result(&commit)?;
+        if !quiet {
+            ui::success(&format!("turn #{turn} is named: {protected}"));
+        }
+        target = commit;
+    }
+    if let Some(tag) = &opts.tag {
+        repo.git(&["tag", tag, &target])?;
+        if !quiet {
+            ui::success(&format!("tagged {tag}"));
+        }
+    }
+    let moved = lk.materialized_from.as_deref() == Some(target.as_str()) && target != tip;
+    if (lk.pending_milestone.take().is_some() || moved)
+        && !write_link_unless_moved(store, &lk, link_disk_at_entry)?
+        && !quiet
+    {
+        ui::warning(
+            "the session link was re-routed while this command ran — leaving the new claim in place",
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// Keeps a milestone or tag asked for while its turn is still running on the link, with the
+/// summary protected, for the settlement that lands that turn.
+fn wait_for_turn(
+    store: &Store,
+    repo: &Repo,
+    mut lk: Link,
+    link_disk_at_entry: &Option<Vec<u8>>,
+    opts: &SettleOpts,
+    transcript_bytes: usize,
+    quiet: bool,
+) -> CmdResult {
+    use crate::domain::privacy::{projector::Mode as PrivacyMode, service as privacy};
+    let summary = match &opts.milestone {
+        Some(summary) => {
+            match privacy::protect_for_commit(Some(repo.root()), summary, PrivacyMode::ProtectText)
+            {
+                Ok(protected) => Some(protected),
+                Err(_) => return milestone_unprotected(quiet),
+            }
+        }
+        None => None,
+    };
+    lk.pending_milestone = Some(link::PendingMilestone {
+        summary: summary.clone(),
+        tag: opts.tag.clone(),
+        from_bytes: transcript_bytes as u64,
+    });
+    if !write_link_unless_moved(store, &lk, link_disk_at_entry)? {
+        ui::error(
+            "the session link changed while this command ran; the milestone was not recorded",
+        );
+        ui::hint("run the same command again");
+        return Ok(ExitCode::Precondition);
+    }
+    if !quiet {
+        let what = match (&summary, &opts.tag) {
+            (Some(summary), Some(tag)) => format!("the milestone \"{summary}\" and the tag {tag}"),
+            (Some(summary), None) => format!("the milestone \"{summary}\""),
+            (None, Some(tag)) => format!("the tag {tag}"),
+            (None, None) => unreachable!("only a named milestone or tag waits"),
+        };
+        ui::info(format_args!(
+            "this turn hasn't been saved yet; {what} goes on it when it is saved"
+        ));
+        ui::hint(
+            "the turn is saved when it ends, or by the next `agit commit`; nothing else to do",
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+fn milestone_unprotected(quiet: bool) -> CmdResult {
+    if !quiet {
+        ui::error("the privacy check could not run, so the milestone was not recorded");
+        ui::hint("run the same command again; `agit doctor` if it keeps failing");
+    }
+    Ok(ExitCode::Precondition)
+}
+
+/// Writes the link while the disk still holds what it held when the command started, so a claim
+/// rerouted in the meantime is never flattened. Returns whether it wrote.
+fn write_link_unless_moved(
+    store: &Store,
+    lk: &Link,
+    link_disk_at_entry: &Option<Vec<u8>>,
+) -> crate::Result<bool> {
+    let current = std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
+    if current.is_none() || current == *link_disk_at_entry {
+        link::write(store, lk)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// A `-m` file commit: it touches shared files only (the three session files are excluded), and

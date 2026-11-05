@@ -86,6 +86,10 @@ pub struct ProjectedHistory {
     /// [`super::privacy_receipt::tag_listing`] of the source's tags, read before `source` was
     /// frozen.
     source_tags: String,
+    /// Local tags on session turns this publication does not send, each with why.
+    left_out_tags: Vec<sessions::LeftOutTag>,
+    /// The tags this publication sends on another commit than the local tag of the same name.
+    published_tags: Vec<super::privacy_receipt::PublishedTag>,
     session_manifest: super::session_privacy::SessionPublicationManifest,
     #[cfg(test)]
     preparations: usize,
@@ -122,6 +126,17 @@ impl ProjectedHistory {
     /// [`super::privacy_receipt::save_acknowledged_tags`].
     pub(crate) fn source_tags(&self) -> &str {
         &self.source_tags
+    }
+
+    /// Local tags on session turns this publication leaves out, with why.
+    pub(crate) fn left_out_tags(&self) -> &[sessions::LeftOutTag] {
+        &self.left_out_tags
+    }
+
+    /// The tags this publication sends on another commit than the local tag of the same name; see
+    /// [`super::privacy_receipt::record_published_tags`].
+    pub(crate) fn published_tags(&self) -> &[super::privacy_receipt::PublishedTag] {
+        &self.published_tags
     }
 
     pub fn session_manifest(&self) -> &super::session_privacy::SessionPublicationManifest {

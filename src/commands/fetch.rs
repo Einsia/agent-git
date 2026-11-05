@@ -249,11 +249,9 @@ fn fetch_context() -> CmdResult {
 fn do_fetch(repo: &Repo, owner: &str, name: &str) -> crate::Result<()> {
     let client = crate::hub::Client::from_env();
     let identity = identity::resolve_transport_target(repo, &client, owner, name)?;
-    let out = crate::hub::git::run_for_remote(
-        repo,
-        &["fetch", "origin", "--prune", "--tags"],
-        &identity,
-    )?;
+    let fetch = crate::hub::git::TagFetch::prepare(repo, &["fetch", "origin", "--prune", "--tags"]);
+    let out = crate::hub::git::run_for_remote(repo, &fetch.args(), &identity)?;
+    fetch.report();
     if !out.ok() {
         if crate::domain::repo::integrity::reports_damage(&out.stderr) {
             anyhow::bail!(

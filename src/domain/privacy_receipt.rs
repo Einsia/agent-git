@@ -14,6 +14,10 @@ pub const SUPERVISOR_RESULT_ENV: &str = "AGIT_RC_SUPERVISOR_PUSH_RESULT";
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 /// Where [`save_acknowledged_tags`] keeps a branch's tag listing, beside its receipt.
 const ACKNOWLEDGED_TAGS: &str = "agit/privacy-published-tags";
+/// Where [`record_published_tags`] keeps the session tags published under another commit.
+const PUBLISHED_SESSION_TAGS: &str = "agit/privacy-published-session-tags.json";
+/// A repository can hold thousands of such tags; each entry is a name and two object ids.
+const MAX_PUBLISHED_SESSION_TAGS_BYTES: usize = 16 * 1024 * 1024;
 
 pub mod outbox;
 
@@ -360,6 +364,112 @@ pub(crate) fn acknowledged_tags(repo: &Repo, branch: &str, source: &str) -> Resu
     let record: AcknowledgedTags =
         serde_json::from_slice(&storage::read_bytes_capped(&path, MAX_RECEIPT_BYTES)?)?;
     Ok((record.branch == branch && record.source == source).then_some(record.tags))
+}
+
+/// A session tag a publication sent on another commit than the one it names here: the tag stays
+/// on the turn's local commit, and the Hub's tag of the same name is on the public commit that
+/// turn was published as. Only the name and the two commit ids are kept.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublishedTag {
+    /// The tag's name without `refs/tags/`.
+    pub name: String,
+    pub local: String,
+    pub public: String,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishedTags {
+    tags: Vec<PublishedTag>,
+}
+
+fn published_tags_path(repo: &Repo) -> Result<PathBuf> {
+    Ok(repo.common_dir()?.join(PUBLISHED_SESSION_TAGS))
+}
+
+fn read_published_tags(repo: &Repo) -> Result<Vec<PublishedTag>> {
+    let path = published_tags_path(repo)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_file(),
+            "the published session tag record is not a regular file"
+        ),
+    }
+    let record: PublishedTags = serde_json::from_slice(&storage::read_bytes_capped(
+        &path,
+        MAX_PUBLISHED_SESSION_TAGS_BYTES,
+    )?)?;
+    Ok(record.tags)
+}
+
+/// Each local tag and the object it names now.
+fn local_tags(repo: &Repo) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut tags = std::collections::BTreeMap::new();
+    repo.git_stream_split_inspection(
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname:strip=2)",
+            "refs/tags",
+        ],
+        b'\n',
+        crate::infra::local_git::Deadline::new(),
+        |line| {
+            if !line.is_empty() {
+                let line = std::str::from_utf8(line).context("tag listing is not valid UTF-8")?;
+                let (oid, name) = line.split_once(' ').context("tag listing is malformed")?;
+                tags.insert(name.to_owned(), oid.to_owned());
+            }
+            Ok(())
+        },
+    )?;
+    Ok(tags)
+}
+
+/// Keep only the entries whose local tag still names the local commit they recorded: a tag deleted
+/// or moved here since is an ordinary tag again.
+fn prune_published_tags(repo: &Repo, tags: &mut Vec<PublishedTag>) -> Result<bool> {
+    let local = local_tags(repo)?;
+    let before = tags.len();
+    tags.retain(|tag| local.get(&tag.name) == Some(&tag.local));
+    Ok(tags.len() != before)
+}
+
+/// Record the session tags a publication just sent under another commit, once its receipt is
+/// saved, and drop the entries no local tag matches any more.
+pub(crate) fn record_published_tags(repo: &Repo, sent: &[PublishedTag]) -> Result<()> {
+    if sent.is_empty() {
+        return Ok(());
+    }
+    // An unreadable record only loses earlier entries, whose tags then fetch as they did before.
+    let mut tags = read_published_tags(repo).unwrap_or_default();
+    tags.retain(|tag| !sent.iter().any(|new| new.name == tag.name));
+    tags.extend(sent.iter().cloned());
+    prune_published_tags(repo, &mut tags)?;
+    tags.sort_by(|left, right| left.name.cmp(&right.name));
+    persist(
+        &published_tags_path(repo)?,
+        &serde_json::to_vec(&PublishedTags { tags })?,
+    )
+}
+
+/// The local tags that still name the local commit of a turn a publication sent under another
+/// commit. A fetch of the Hub's tags leaves these out; every other tag fetches as it always has.
+/// Entries no local tag matches any more are pruned on the way.
+pub(crate) fn tags_published_elsewhere(repo: &Repo) -> Result<Vec<String>> {
+    let mut tags = read_published_tags(repo)?;
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    if prune_published_tags(repo, &mut tags)? {
+        persist(
+            &published_tags_path(repo)?,
+            &serde_json::to_vec(&PublishedTags { tags: tags.clone() })?,
+        )?;
+    }
+    Ok(tags.into_iter().map(|tag| tag.name).collect())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

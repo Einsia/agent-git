@@ -71,11 +71,12 @@ pub(super) fn repair(slug: &str) -> CmdResult {
 fn refetch(repo: &Repo, owner: &str, name: &str) -> anyhow::Result<()> {
     let client = crate::hub::Client::from_env();
     let identity = identity::resolve_transport_target(repo, &client, owner, name)?;
-    let out = crate::hub::git::run_for_remote(
+    let fetch = crate::hub::git::TagFetch::prepare(
         repo,
         &["fetch", "--refetch", "--prune", "origin", "--tags"],
-        &identity,
-    )?;
+    );
+    let out = crate::hub::git::run_for_remote(repo, &fetch.args(), &identity)?;
+    fetch.report();
     anyhow::ensure!(out.ok(), "{}", out.stderr.trim());
     Ok(())
 }

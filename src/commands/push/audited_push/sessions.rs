@@ -468,6 +468,8 @@ pub(super) fn run(
     };
     let mut finishing = false;
     let mut published = 0usize;
+    // The tags the last prepared part left out, named once the push ends.
+    let mut left_out_tags = Vec::new();
     let mut repo = repo;
     loop {
         let part = published + 1;
@@ -611,6 +613,8 @@ pub(super) fn run(
             }
         };
         inspecting.finish();
+        left_out_tags.clear();
+        left_out_tags.extend_from_slice(projected.left_out_tags());
         let status = ui::publication::stage("Checking publication status");
         let synchronized = (!in_parts || finishing)
             && !args.dry_run
@@ -650,7 +654,15 @@ pub(super) fn run(
                 reply.complete(&repo, candidate)?;
             }
             checking.finish();
-            ui::info(format_args!("{repository}: already up to date."));
+            record_published_tags(&repo, &projected);
+            // A local tag the Hub lacks means the repository is not up to date, even with
+            // nothing to send.
+            if left_out_tags.is_empty() {
+                ui::info(format_args!("{repository}: already up to date."));
+            } else {
+                ui::info(format_args!("{repository}: nothing new to upload."));
+                report_left_out_tags(&left_out_tags);
+            }
             return Ok(ExitCode::Ok);
         }
         let displayed = intent.json();
@@ -1119,6 +1131,7 @@ pub(super) fn run(
                 projected.source_tags(),
             )?;
         }
+        record_published_tags(&repo, &projected);
         if let (Some(reply), Some(candidate)) = (supervisor.take(), supervised) {
             reply.complete(&repo, candidate)?;
         }
@@ -1181,7 +1194,33 @@ pub(super) fn run(
     } else {
         ui::success(&format!("Published reviewed sessions to {repository}."));
     }
+    report_left_out_tags(&left_out_tags);
     Ok(ExitCode::Ok)
+}
+
+/// Records the session tags the Hub holds on another commit than the local tag of the same name,
+/// so a fetch of the Hub's tags leaves them out instead of refusing to clobber them. The
+/// publication has landed by now, so a record that cannot be written is a warning, not a failure.
+fn record_published_tags(repo: &Repo, projected: &ProjectedHistory) {
+    if let Err(error) =
+        crate::domain::privacy_receipt::record_published_tags(repo, projected.published_tags())
+    {
+        ui::warning(&format!(
+            "the session tags published on their turns' public commits could not be recorded ({error:#}); a later fetch may refuse to overwrite them locally"
+        ));
+    }
+}
+
+/// Names each local tag the publication did not send, with why, so a push never reads as having
+/// carried a tag it left here.
+fn report_left_out_tags(tags: &[crate::domain::privacy_git::sessions::LeftOutTag]) {
+    for tag in tags {
+        ui::warning(&format!(
+            "tag {} is not uploaded: {}",
+            tag.name,
+            tag.reason.describe()
+        ));
+    }
 }
 
 /// Who answers the question of whether reviewed sessions publish. `Some(true)` publishes without
