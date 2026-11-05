@@ -174,6 +174,9 @@ pub(super) fn after_settlement(
         }
     }
     let target = format!("{slug}@{branch}");
+    // A settlement detached from the runtime has no terminal to tell the outcome on, so it is
+    // recorded for the end of the session to tell.
+    let upload = super::upload_outcome::start(slug, branch, &after);
     // A child process isolates the noninteractive publish policy and its JSON output from the
     // settlement caller. It uses the ordinary identity, access, visibility and secret gates.
     let outcome = std::env::current_exe().and_then(|executable| {
@@ -191,6 +194,16 @@ pub(super) fn after_settlement(
         }
         command.output()
     });
+    if let Some(upload) = upload {
+        upload.finish(match &outcome {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(super::project::UploadFailure::reported(
+                output.status.code(),
+                &failure_reason(&output.stdout).map_or_else(String::new, |(reason, _)| reason),
+            )),
+            Err(_) => Err(super::project::UploadFailure::Other),
+        });
+    }
     match outcome {
         Ok(output) if output.status.success() => {
             if !quiet {

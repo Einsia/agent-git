@@ -964,7 +964,9 @@ fn settle(runtime: Option<&str>, await_reply: bool) -> CmdResult {
     if super::commit::delegated_settlement(true)?.is_some() {
         return Ok(ExitCode::Ok);
     }
-    match settle_inner(runtime, await_reply) {
+    let settled = settle_inner(runtime, await_reply);
+    super::upload_outcome::landed();
+    match settled {
         Err(error) if super::commit::archive::is_failure(&error) => {
             crate::ui::error(&format!("{error:#}"));
             Ok(super::terminal_error_code(&error, ExitCode::Failure))
@@ -1042,6 +1044,9 @@ fn settle_event(
     if archive_store.is_none() && side_conversation(rt, &ev) {
         return Ok(());
     }
+    if await_reply {
+        super::upload_outcome::settling_from_environment(rt, &ev.session_id);
+    }
     let (store, archive_required) = match archive_store {
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
@@ -1057,7 +1062,7 @@ fn settle_event(
         } else if tail_awaits_reply(transcript, prompt)
             && concerns_settlement(&store, rt, &ev)
             && let Some(payload) = payload
-            && spawn_awaiting_settlement(runtime, payload).is_ok()
+            && spawn_awaiting_settlement(runtime, payload, (rt, &ev.session_id)).is_ok()
         {
             return Ok(());
         }
@@ -1204,13 +1209,23 @@ fn concerns_settlement(store: &Store, runtime: &str, ev: &Event) -> bool {
 }
 
 /// Hands the Stop to a detached `agit hooks settle --await-reply` that holds no pipe of the
-/// runtime, so the turn ends at once and the settlement outlives a runtime that exits.
-fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::Result<()> {
+/// runtime, so the turn ends at once and the settlement outlives a runtime that exits. For a
+/// runtime agit launched, the settlement of `conversation` (runtime and session) is marked first,
+/// so the end of that runtime can tell the turn is still being saved.
+fn spawn_awaiting_settlement(
+    runtime: Option<&str>,
+    payload: &str,
+    conversation: (&str, &str),
+) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut command = crate::infra::background::command(std::env::current_exe()?);
     command.args(["hooks", "settle", "--await-reply"]);
     if let Some(runtime) = runtime {
         command.args(["--runtime", runtime]);
+    }
+    let marker = super::upload_outcome::settling_marker(conversation.0, conversation.1);
+    if marker.is_some() {
+        command.env(super::upload_outcome::SETTLING_ENV, "1");
     }
     command
         .stdin(std::process::Stdio::piped())
@@ -1219,6 +1234,9 @@ fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::R
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn()?;
+    let marked = marker
+        .as_deref()
+        .filter(|marker| super::upload_outcome::mark_settling(marker, child.id()));
     let written = child
         .stdin
         .take()
@@ -1226,6 +1244,9 @@ fn spawn_awaiting_settlement(runtime: Option<&str>, payload: &str) -> std::io::R
     if written.is_err() {
         // A child that read part of the payload settles nothing; this Stop settles inline.
         let _ = child.kill();
+        if let Some(marker) = marked {
+            super::upload_outcome::unmark(marker);
+        }
     }
     written
 }

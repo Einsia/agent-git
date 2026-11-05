@@ -1018,15 +1018,8 @@ impl BranchLock {
 }
 
 pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock> {
-    use sha2::Digest as _;
-
     let repository = lock_repository(store, slug, false)?;
-    let mut digest = sha2::Sha256::new();
-    digest.update(slug.as_bytes());
-    digest.update([0]);
-    digest.update(branch.as_bytes());
-    let dir = store.root().join(".locks").join("branches");
-    let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
+    let (dir, path) = branch_lock_path(store, slug, branch);
     let file = open_lock_file(&dir, &path)?;
     crate::infra::local_state::lock_patiently(&file, &path, "the branch lock", true)?;
     Ok(BranchLock {
@@ -1035,6 +1028,35 @@ pub fn lock_branch(store: &Store, slug: &str, branch: &str) -> Result<BranchLock
         #[cfg(any(feature = "cli", test))]
         route: (store.root().to_owned(), slug.to_owned(), branch.to_owned()),
     })
+}
+
+fn branch_lock_path(store: &Store, slug: &str, branch: &str) -> (PathBuf, PathBuf) {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    digest.update(slug.as_bytes());
+    digest.update([0]);
+    digest.update(branch.as_bytes());
+    let dir = store.root().join(".locks").join("branches");
+    let path = dir.join(format!("{}.lock", hex::encode(digest.finalize())));
+    (dir, path)
+}
+
+/// Whether another process holds the branch lock of `slug@branch` now, as a settlement or an
+/// import of the branch does while it writes a turn. The probe creates nothing, and the lock it
+/// takes to look is let go at once.
+pub fn branch_busy(store: &Store, slug: &str, branch: &str) -> bool {
+    let (_, path) = branch_lock_path(store, slug, branch);
+    let Ok(file) = std::fs::File::open(&path) else {
+        return false;
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            let _ = fs2::FileExt::unlock(&file);
+            false
+        }
+        Err(error) => crate::infra::local_state::is_contended(&error),
+    }
 }
 
 /// Repository moves exclude every branch writer, including branches created during promotion.

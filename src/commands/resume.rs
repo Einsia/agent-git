@@ -74,6 +74,8 @@ pub struct Resumed {
     pub cmd: Option<String>,
     /// Whether the cross-runtime conversion was lossy.
     pub lossy: bool,
+    /// The repository and branch the runtime records into.
+    pub session: (String, String),
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -895,6 +897,7 @@ pub(crate) fn prepared_archive_resume(
                 branch,
             )),
             lossy: false,
+            session: (slug.to_owned(), branch.to_owned()),
         });
     }
     prepared_resume(
@@ -1175,6 +1178,7 @@ fn resume_branch_for(
             return Ok(Some(Resumed {
                 cmd: Some(cmd),
                 lossy: false,
+                session: (slug.to_owned(), branch.to_owned()),
             }));
         }
     }
@@ -1988,6 +1992,7 @@ fn prepared_resume(
         return Some(Resumed {
             cmd: Some(cmd),
             lossy: false,
+            session: (slug.to_owned(), branch.to_owned()),
         });
     }
     if runtime == "opencode" {
@@ -2010,6 +2015,7 @@ fn prepared_resume(
                 branch,
             )),
             lossy: false,
+            session: (slug.to_owned(), branch.to_owned()),
         });
     }
     if runtime != "claude-desktop" {
@@ -2039,6 +2045,7 @@ fn prepared_resume(
     Some(Resumed {
         cmd: None,
         lossy: false,
+        session: (slug.to_owned(), branch.to_owned()),
     })
 }
 
@@ -2366,7 +2373,11 @@ fn materialize_and_resume(
         }
     };
     report_environment_notice(to, system_prompt);
-    Ok(Resumed { cmd, lossy })
+    Ok(Resumed {
+        cmd,
+        lossy,
+        session: (slug.to_owned(), branch.to_owned()),
+    })
 }
 
 /// Injects `AGIT_SESSION` into the launch command.
@@ -2406,6 +2417,8 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
                 println!("\n  {}", ui::accent(&cmd));
                 return Ok(ExitCode::Ok);
             }
+            let (slug, branch) = &res.session;
+            let launch = super::upload_outcome::launching(slug, branch);
             let started = std::time::Instant::now();
             let status = std::process::Command::new("sh")
                 .arg("-c")
@@ -2418,6 +2431,10 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
                 None,
             );
             let status = status.map_err(|e| anyhow::anyhow!("couldn’t launch: {e}"))?;
+            // The runtime is gone, so this reaches the person's terminal and never the model.
+            if let Some(line) = launch.and_then(|launch| launch.ended()) {
+                ui::info(line);
+            }
             Ok(match status.code() {
                 Some(0) | None => ExitCode::Ok,
                 Some(_) => ExitCode::Precondition,

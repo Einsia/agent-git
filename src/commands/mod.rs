@@ -57,6 +57,7 @@ pub mod commit;
 pub mod file;
 pub mod memory;
 pub mod tag;
+pub(crate) mod upload_outcome;
 
 // Inspection
 pub mod activity;

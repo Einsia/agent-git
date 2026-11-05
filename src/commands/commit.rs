@@ -2044,6 +2044,7 @@ fn settle(
     let before = super::auto_push::branch_tip(repo_dir, branch);
     let quiet = opts.quiet;
     let result = settle_local(store, repo_dir, slug, branch, lk, owner, opts);
+    super::upload_outcome::landed();
     if matches!(result, Ok(ExitCode::Ok)) && std::env::var_os("AGIT_LOCAL_AGENT_ID").is_none() {
         super::auto_push::after_settlement(repo_dir, slug, branch, before.as_deref(), quiet);
     }
