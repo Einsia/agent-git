@@ -16,6 +16,20 @@ const PRIVACY_RECHECK: Duration = Duration::from_secs(30 * 60);
 /// on reads it this often rather than every cycle.
 const PUSH_RECHECK: Duration = Duration::from_secs(60);
 
+/// `delay`, or, in a debug build whose `AGIT_TEST_ARCHIVE_RETRY_MS` names a shorter one, that:
+/// a test that runs the daemon waits for a retry in milliseconds rather than in the minutes a
+/// slow machine can otherwise run into. A release build ignores the variable.
+pub(super) fn retry_delay(delay: Duration) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("AGIT_TEST_ARCHIVE_RETRY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return delay.min(Duration::from_millis(millis));
+    }
+    delay
+}
+
 pub(super) struct Worker(Vec<tokio::task::JoinHandle<()>>);
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -406,7 +420,7 @@ impl Park {
         let recheck = wait
             .as_ref()
             .is_none_or(|wait| wait.refused_bytes.is_none())
-            .then(|| now + PRIVACY_RECHECK);
+            .then(|| now + retry_delay(PRIVACY_RECHECK));
         Self {
             claim,
             until: Until::Privacy { wait, recheck },
@@ -556,6 +570,7 @@ impl Schedule {
         let delay = first
             .saturating_mul(1 << retry.failures.saturating_sub(1).min(16))
             .min(longest);
+        let delay = retry_delay(delay);
         retry.at = now + delay;
         if class != Class::Yielded {
             eprintln!(

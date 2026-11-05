@@ -264,8 +264,59 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
     }
 }
 
+/// A privacy worker for the daemon whose first start by an archive commit misses its start-up
+/// deadline; every other start runs the real worker. The commit then waits for the privacy
+/// check, which the daemon must retry.
+fn slow_first_archive_worker(root: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let worker = root.join("bin/slow-worker");
+    std::fs::write(
+        &worker,
+        format!(
+            "#!/bin/sh\ncase \"$(ps -o args= -p $PPID)\" in *--from-supervisor*) if mkdir '{}' 2>/dev/null; then sleep 15; exit 1; fi;; esac\nexec '{}' \"$@\"\n",
+            root.join("archive-worker-missed").display(),
+            env!("CARGO_BIN_EXE_agit"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    worker
+}
+
+/// What the daemon wrote about itself: its startup output (`agitd-*.log`, where it reports a
+/// capture or archive that stays pending) and its diagnostics (`diagnostics-*.jsonl`).
+fn daemon_output(rc: &Path) -> String {
+    let mut files: Vec<_> = std::fs::read_dir(rc)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    (name.starts_with("agitd-") && name.ends_with(".log"))
+                        || (name.starts_with("diagnostics-") && name.ends_with(".jsonl"))
+                })
+        })
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .map(|path| {
+            format!(
+                "--- {}\n{}",
+                path.display(),
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|error| format!("unreadable: {error}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Watching retains per-turn collection after viewers disconnect and the daemon restarts.
-/// Native input stays outside the daemon, and failed publication retains archive jobs.
+/// Native input stays outside the daemon, failed publication retains archive jobs, and an
+/// archive commit that waited for a privacy worker missing its start-up is tried again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     use serde_json::{Value, json};
@@ -280,6 +331,16 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     }
     startup_cache::seed(&home);
     install_claude(&root);
+    let worker = slow_first_archive_worker(&root);
+    // The daemon retries within a second, so a failure it backs off from can't outlast the wait
+    // below however slow the machine.
+    let daemon = |args: &[&str]| {
+        let mut command = command(&root, args);
+        command
+            .env("AGIT_TEST_ARCHIVE_RETRY_MS", "1000")
+            .env("AGIT_TEST_PRIVACY_WORKER", &worker);
+        command
+    };
     let native = "00000000-0000-0000-0000-000000000013";
     let transcript_dir = runtime_home
         .join(".claude/projects")
@@ -295,7 +356,7 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     let first = turn(1);
     std::fs::write(&transcript, &first).unwrap();
     let _stop = Stop(&root);
-    let started = command(&root, &["rc", "local", "start", "--detach"])
+    let started = daemon(&["rc", "local", "start", "--detach"])
         .output()
         .unwrap();
     assert!(
@@ -376,7 +437,7 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
             );
             std::fs::write(&transcript, format!("{first}{}", turn(2))).unwrap();
             assert!(
-                command(&root, &["rc", "local", "start", "--detach"])
+                daemon(&["rc", "local", "start", "--detach"])
                     .output()
                     .unwrap()
                     .status
@@ -420,11 +481,16 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
             }
             assert!(
                 Instant::now() < deadline,
-                "observed completed turn did not enter its canonical archive"
+                "observed completed turn {number} did not enter its canonical archive\n{}",
+                daemon_output(&home.join("desktop-rc"))
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+    assert!(
+        root.join("archive-worker-missed").exists(),
+        "the first archive commit met a worker that missed its start-up"
+    );
     let status = command(&root, &["rc", "status", "--json"])
         .output()
         .unwrap();

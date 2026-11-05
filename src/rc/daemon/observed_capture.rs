@@ -222,10 +222,12 @@ impl Collector {
         });
         delay.failures = delay.failures.saturating_add(1);
         delay.until = now
-            + DELAYS
-                .0
-                .saturating_mul(1 << (delay.failures - 1).min(16))
-                .min(DELAYS.1);
+            + super::archive_recovery::retry_delay(
+                DELAYS
+                    .0
+                    .saturating_mul(1 << (delay.failures - 1).min(16))
+                    .min(DELAYS.1),
+            );
     }
 }
 
