@@ -18,9 +18,11 @@ were already published encrypted.
    evidence of opacity, not of a credential, so it is reported and replaced only on request.
 3. **Short typed placeholders** that never enter protocol fields.
 4. **Replacement happens at capture and commit**, incrementally, before Git objects exist.
-   Push verifies integrity and transports objects. It never scans and never refuses.
-5. **The Hub re-checks after accepting a push**, without blocking it. A session with a
-   high-confidence hit is held back from public surfaces and its owner is told.
+   A push passes every record and commit message it adds through the same protection again,
+   so a rule added since capture applies, and it sends nothing while that protection cannot
+   complete. A line the Hub already holds stays as it was published.
+5. **Protection is the client's**, at capture and again at push for what each push adds. The
+   Hub does not re-check published records.
 6. **Reversible restore stays account-scoped.** The account dictionary keeps its role; the
    account key gains KMS protection; the owner can reveal placeholders in the browser, and
    everyone else only ever receives placeholders.
@@ -125,12 +127,14 @@ any reader, and replacing it would break the runtime on resume.
 ## 6 Where work happens
 
 Capture, import and commit call the existing privacy facade before object creation, with the
-same bounded worker and the same fail-open contract: a skipped or partial scan publishes what
-it could not protect, and the server re-check (section 7) is the backstop.
+same bounded worker. It is fail-closed: content protection did not finish is not committed, and
+the operation waits.
 
-Push verifies object integrity, registers new sessions as plain and transports objects. It
-does not scan, does not rewrite objects, and has no privacy refusal. Dictionary
-synchronization is scheduled independently, as before.
+Push verifies object integrity, registers new sessions as plain and transports objects. Before
+it does, every record and commit message it adds passes the privacy facade again, and one that
+protection changes goes out in its protected form; a line the Hub already holds is not checked
+again. A push whose protection does not complete sends nothing, and `agit status` shows why.
+Dictionary synchronization is scheduled independently, as before.
 
 A session registered as `session_owner_v2` by an older client continues as plain. A registered
 mode is otherwise immutable, so the Hub accepts exactly one transition, from `session_owner_v2`
@@ -139,23 +143,12 @@ registers that revision and publishes a plain snapshot whose parents are the acc
 commits. Earlier encrypted snapshots stay encrypted and readable. Another account cannot change
 the mode of a session it does not own; its client reports that and publishes the rest.
 
-## 7 Server re-check
+## 7 No server re-check
 
-After a push is accepted, the Hub scans the newly published plain session snapshots with the
-high tier of the same detector (the backend links this crate's detector). It never runs inside
-the receive request and it never rejects a push.
-
-A hit marks the session *suspected credential* with the rule kinds and the commit that carried
-them. A suspected session is left out of search results, translation, and the repository
-session lists shown to readers without write access. Its owner is notified: the owner's alert
-list and the session page show it to repository writers, and an email is sent when the Hub has
-mail delivery configured. Writers keep seeing the session so they can fix it. A direct link
-keeps working, because immutable reads are served to shared caches where a per-reader decision
-would leak; rendering the hit spans masked is the step that covers direct readers.
-
-The flag clears when a later snapshot of the session no longer contains a hit. A writer can
-dismiss it after review; the dismissal lasts until a later snapshot carries more findings.
-Legacy encrypted snapshots are not re-checked: readers only ever saw their sanitized projection.
+The Hub does not scan published records. Protection is the client's: capture protects what it
+records, and a push protects what it adds under the rules of that day. A line the Hub already
+holds stays as it was published, so a value no rule knew then stays in that line and in older
+commits, and `agit scan` shows it to anyone who asks.
 
 ## 8 Restore and reveal
 
@@ -197,8 +190,8 @@ snapshot the server accepted is always readable by the browser.
 
 ## 11 Compatibility and rollout
 
-- The backend ships first: plain revision for encrypted sessions, re-check, KMS wrapping and
-  published limits. The CLI follows; the web reveal follows the KMS change.
+- The backend ships first: plain revision for encrypted sessions, KMS wrapping and published
+  limits. The CLI follows; the web reveal follows the KMS change.
 - Responses keep `encryption_enabled` for 0.2.13 and 0.2.14 clients, and the receipt-less
   receive path stays for released clients.
 - The Hub keeps accepting `session_owner_v2` receipts from released clients. Removing that

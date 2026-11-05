@@ -687,7 +687,8 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             }
             crate::domain::secret_filter::VaultStore::open_default()?.matcher()
         })();
-        complete &= global.is_ok();
+        let global_whole = global.is_ok();
+        complete &= global_whole;
         let global = global.unwrap_or_default();
         let legacy = request
             .repo
@@ -789,7 +790,8 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             complete,
             missing: (!device_whole)
                 .then_some(super::projector::Reason::DeviceRules)
-                .or((!legacy_whole).then_some(super::projector::Reason::LegacyRules)),
+                .or((!legacy_whole || !global_whole)
+                    .then_some(super::projector::Reason::LegacyRules)),
         };
         projector.policy =
             management::compile(&projector, request.repo.as_deref(), &blocks, &allows)?

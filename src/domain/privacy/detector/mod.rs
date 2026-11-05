@@ -963,7 +963,7 @@ pub fn scan(text: &str, limit: usize) -> Batch {
 }
 
 /// Provider signatures, private keys and credential assignments: the findings that are
-/// replaced automatically and that the Hub re-checks after publication.
+/// replaced automatically.
 pub fn scan_high_confidence(text: &str, limit: usize) -> Batch {
     scan_filtered(text, limit, Entropy::Exclude, |_, _| true)
 }

@@ -694,6 +694,7 @@ impl Redactor {
             scan.complete,
             "the privacy check for `{name}` could not complete; retrying the push usually works"
         );
+        let mut pending = None;
         for attempt in 0..2 {
             let protected = crate::domain::privacy::service::transform(
                 self.repo.as_deref(),
@@ -703,12 +704,15 @@ impl Redactor {
             if crate::domain::privacy::service::passed(&protected) {
                 return Ok(protected.content == name);
             }
+            pending = Some(crate::domain::privacy::service::Pending::of(&protected));
             if attempt == 0 {
                 crate::domain::privacy::service::wait_for_retry();
             }
         }
-        anyhow::bail!(
-            "the privacy check for `{name}` could not run; retrying the push usually works (`agit doctor` if it keeps failing)"
+        Err(
+            anyhow::Error::new(pending.expect("an attempt ran")).context(format!(
+                "the privacy check for `{name}` could not run, so nothing was published"
+            )),
         )
     }
 
@@ -746,10 +750,14 @@ impl Redactor {
             prompt,
             crate::domain::privacy::projector::Mode::ProtectText,
         );
-        anyhow::ensure!(
-            crate::domain::privacy::service::passed(&protected),
-            "the privacy check for `{name}` could not run; retrying the push usually works (`agit doctor` if it keeps failing)"
-        );
+        if !crate::domain::privacy::service::passed(&protected) {
+            return Err(
+                anyhow::Error::new(crate::domain::privacy::service::Pending::of(&protected))
+                    .context(format!(
+                        "the privacy check for `{name}` could not run, so nothing was published"
+                    )),
+            );
+        }
         let pieces = replaced_values(prompt, &protected.content, |tokens| {
             restore_all(tokens, |text| {
                 let restored = crate::domain::privacy::service::transform(

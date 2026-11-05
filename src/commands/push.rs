@@ -115,7 +115,35 @@ pub fn run_automatic(args: Args) -> CmdResult {
     run(args)
 }
 
-pub fn run(mut args: Args) -> CmdResult {
+/// A push of `owner/repo@branch` that the privacy check holds back sends nothing and leaves a note
+/// `agit status` shows, with what ends the wait, until the Hub acknowledges that target's branch:
+/// an automatic upload has nobody watching it. Its exit is a policy refusal, which is how an
+/// upload's failure is classed as a privacy check that did not complete.
+pub fn run(args: Args) -> CmdResult {
+    use crate::domain::privacy::{pending, service};
+    let target = args.agent.clone().filter(|target| target.contains('@'));
+    let result = publish(args);
+    let (Some(target), Err(error)) = (target, &result) else {
+        return result;
+    };
+    let Some(waiting) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<service::Pending>())
+    else {
+        return result;
+    };
+    let reason = service::reason_name(waiting.reason);
+    pending::upload::record(&target, reason);
+    super::fix::register_terminal_error(error);
+    ui::error(&super::terminal_error_message(error));
+    for hint in pending::steps(reason).unwrap_or_else(|| vec!["the next upload tries again".into()])
+    {
+        ui::hint(&hint);
+    }
+    Ok(ExitCode::Policy)
+}
+
+fn publish(mut args: Args) -> CmdResult {
     if args.audit && !ui::prompt::can_ask() {
         ui::error(
             "push --audit requires a person at an interactive terminal (not an agent session) for review and final confirmation",

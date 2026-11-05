@@ -81,7 +81,7 @@ are sent, so a large record never holds a session back:
 | settle: metadata, milestone, message | that settlement waits; nothing is committed | same | same | same | same | same | same | as settle |
 | import | as settle; import reports how many turns are pending, and the next settle drains them | same | same | same | same | same | same | as settle |
 | push preparation: branch name | in-process detectors, then the worker for registered values: one retry after back-off, then a retryable refusal; never published unchecked | same | same | same | refused, retryable | same | same | the next push |
-| push preparation: plain publication | publishes only committed turns, which already passed (rows above); no transform runs | – | – | – | – | – | – | – |
+| push preparation: plain publication | every record and commit message the push adds passes protection again; a line the Hub already holds does not. Any reason refuses with nothing sent, and `agit status` shows the target, the reason and what ends the wait until a push of it lands | same | same | same | same | same | same | the next push |
 | memory (collection, distill) | file withheld, retried next sync; never routes around `passed()` | same | same | same | same | same | same; `not_utf8` is withheld as well | the next sync or settle |
 | share / export (S) | refused for that record, retryable; never falls back to `PrivacyPolicy::default()` | same | same | same | same | same | same | the user runs it again |
 

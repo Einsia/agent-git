@@ -1386,16 +1386,17 @@ fn privacy_pending(
             warn_refused_record(Some(target), *bytes as u64, turns);
             return Ok(ExitCode::Ok);
         }
-        ui::warning(&format!(
-            "privacy check pending ({reason}): {turns} turn{plural} stay unsettled; the next settlement tries again"
-        ));
-        if reason == "device_rules" {
-            for hint in
-                crate::domain::privacy::service::unreadable_rule_hints().unwrap_or_else(|_| {
-                    vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
-                })
-            {
-                ui::hint(&hint);
+        match crate::domain::privacy::pending::steps(reason) {
+            None => ui::warning(&format!(
+                "privacy check pending ({reason}): {turns} turn{plural} stay unsettled; the next settlement tries again"
+            )),
+            Some(steps) => {
+                ui::warning(&format!(
+                    "privacy check pending ({reason}): {turns} turn{plural} stay unsettled"
+                ));
+                for step in steps {
+                    ui::hint(&step);
+                }
             }
         }
     }
@@ -3594,11 +3595,20 @@ fn settle_bytes(
         }
         // A refused record was named above, and settling again meets it again.
         if unsettled > 0 && refused_record.is_none() {
+            let reason = privacy::reason_name(protected_increment.reason);
+            let steps = crate::domain::privacy::pending::steps(reason);
             ui::warning(&format!(
-                "privacy check pending ({}): {unsettled} later turn{} stay unsettled; the next settlement tries again",
-                privacy::reason_name(protected_increment.reason),
-                if unsettled == 1 { "" } else { "s" }
+                "privacy check pending ({reason}): {unsettled} later turn{} stay unsettled{}",
+                if unsettled == 1 { "" } else { "s" },
+                if steps.is_none() {
+                    "; the next settlement tries again"
+                } else {
+                    ""
+                }
             ));
+            for step in steps.into_iter().flatten() {
+                ui::hint(&step);
+            }
         }
         if fresh {
             ui::info(format_args!(
