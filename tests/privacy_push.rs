@@ -3422,6 +3422,9 @@ fn plain_publication_carries_only_conversation_records() {
     const REQUEST_BLOB: &str = "CANARY-API-REQUEST-BLOB-BODY-2e90";
     const REQUEST: &str = "CANARY-API-REQUEST-BODY-7b14";
     const FILE_DELTA: &str = "CANARY-FILE-HISTORY-DELTA-CONTENT-d3c8";
+    const CODEX_TURN_CONTEXT: &str = "CANARY-CODEX-TURN-CONTEXT-INSTRUCTIONS-5e21";
+    const CODEX_WORLD_STATE: &str = "CANARY-CODEX-WORLD-STATE-9b07";
+    const CODEX_SETTINGS: &str = "CANARY-CODEX-THREAD-SETTINGS-APPLIED-3f6a";
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -3560,6 +3563,10 @@ fn plain_publication_carries_only_conversation_records() {
             json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":GLOBAL_AGENTS_MD}]}}),
             json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":agents}]}}),
             json!({"timestamp":"t","type":"world_state","payload":{"agents_md":AGENTS_MD}}),
+            // Codex 0.166 writes these around every turn; each can hold instruction text.
+            json!({"timestamp":"t","type":"event_msg","payload":{"type":"thread_settings_applied","thread_id":"thread","thread_settings":{"developer_instructions":CODEX_SETTINGS}}}),
+            json!({"timestamp":"t","type":"turn_context","payload":{"cwd":"/work","model":"m","user_instructions":CODEX_TURN_CONTEXT,"developer_instructions":CODEX_TURN_CONTEXT}}),
+            json!({"timestamp":"t","type":"world_state","payload":{"state":CODEX_WORLD_STATE}}),
             json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("<user_instructions>\n{OLD_CODEX}\n</user_instructions>")}]}}),
             json!({"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"fix the parser"}}),
             json!({"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixed."}]}}),
@@ -3660,6 +3667,9 @@ fn plain_publication_carries_only_conversation_records() {
         MEMORY_MD,
         AGENTS_MD,
         GLOBAL_AGENTS_MD,
+        CODEX_TURN_CONTEXT,
+        CODEX_WORLD_STATE,
+        CODEX_SETTINGS,
         SR_USER,
         SR_TOOL,
         OLD_CODEX,

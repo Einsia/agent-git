@@ -355,9 +355,16 @@ pub fn judge_tail<'a>(
         .iter()
         .find(|record| adapter.record_class(record) == RecordClass::Unknown)
     {
-        let named: String = unknown["type"]
-            .as_str()
-            .unwrap_or("(none)")
+        // A record whose kind is its payload's type is named by both, as `event_msg/<type>`.
+        let kind = match (
+            unknown["type"].as_str(),
+            unknown["payload"]["type"].as_str(),
+        ) {
+            (Some(kind), Some(payload)) => format!("{kind}/{payload}"),
+            (Some(kind), None) => kind.to_owned(),
+            (None, _) => "(none)".to_owned(),
+        };
+        let named: String = kind
             .chars()
             .filter(|c| c.is_ascii_graphic())
             .take(NAMED_TYPE)

@@ -738,7 +738,10 @@ fn a_refusal_for_good_is_told_by_its_reason_and_not_offered_again() {
         "me/qa",
     );
     assert!(
-        recovery.ends_with(&format!("run `agit upgrade`, then `{retry}`")),
+        recovery.ends_with(&format!(
+            "{} `{retry}`",
+            crate::commands::push::upgrade_first()
+        )),
         "{recovery}"
     );
     assert!(

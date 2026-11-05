@@ -410,7 +410,7 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
         {
             return format!(
                 "{stopped}; {done}; {} `{retry}`",
-                crate::commands::push::UPGRADE_FIRST
+                crate::commands::push::upgrade_first()
             );
         }
         return format!(

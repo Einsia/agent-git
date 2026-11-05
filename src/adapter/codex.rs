@@ -940,16 +940,36 @@ impl Adapter for Codex {
             .collect())
     }
 
-    fn is_runtime_bookkeeping(&self, record: &serde_json::Value) -> bool {
+    /// Codex records by what they can hold. Metadata is only the pure counters: token counts and
+    /// token usage. Content is every other record this build reads, which settlement judges
+    /// through the projection: the session header, a compaction, a response item of any payload
+    /// type (the parser counts a payload it cannot read as dropped), a turn's context and the
+    /// world state (both can carry instruction text and paths), and the events below. An event
+    /// of any other payload type, or a record type that is new, may carry a turn this build
+    /// cannot read, so it is Unknown and never judged settled.
+    fn record_class(&self, record: &serde_json::Value) -> super::RecordClass {
+        use super::RecordClass::{Content, Metadata, Unknown};
         match record["type"].as_str() {
-            Some("event_msg") => matches!(
-                record["payload"]["type"].as_str(),
-                Some("thread_settings_applied" | "token_count")
-            ),
-            // A turn's context and the world state are written around turns and carry no
-            // prompt, reply or tool activity of their own.
-            Some("token_usage_record" | "turn_context" | "world_state") => true,
-            _ => false,
+            Some("token_usage_record") => Metadata,
+            Some(
+                "session_meta" | "compacted" | "response_item" | "turn_context" | "world_state",
+            ) => Content,
+            Some("event_msg") => match record["payload"]["type"].as_str() {
+                Some("token_count") => Metadata,
+                Some(
+                    "thread_settings_applied"
+                    | "task_started"
+                    | "task_complete"
+                    | "turn_aborted"
+                    | "item_completed"
+                    | "user_message"
+                    | "agent_message"
+                    | "patch_apply_end"
+                    | "context_compacted",
+                ) => Content,
+                _ => Unknown,
+            },
+            _ => Unknown,
         }
     }
 
@@ -3479,27 +3499,44 @@ mod tests {
 mod bookkeeping_tests {
     use super::*;
 
-    /// Settings and usage records are bookkeeping; anything carrying or framing a turn is not,
-    /// and neither is a record of unknown shape.
+    /// Only the pure counters are metadata. Every record kind this build reads, including a
+    /// turn's context, the world state and applied settings, which can carry instruction text,
+    /// is content judged through the projection; an event of a payload type this build has not
+    /// seen, and a record of unknown shape, are unknown. A classification that called the
+    /// context or the settings metadata would leave their text behind without the projection
+    /// looking; one that called the events settlement reads unknown refuses every merge of a
+    /// Codex session whose next turn has started.
     #[test]
-    fn only_settings_and_usage_records_are_bookkeeping() {
+    fn only_counters_are_metadata_and_new_events_are_unknown() {
+        use crate::adapter::{Adapter as _, RecordClass};
         let codex = Codex;
+        let class = |record: serde_json::Value| codex.record_class(&record);
         for record in [
-            serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}}),
             serde_json::json!({"type":"token_usage_record","payload":{}}),
-            serde_json::json!({"type":"turn_context","payload":{"cwd":"/w","model":"m"}}),
-            serde_json::json!({"type":"world_state","payload":{}}),
         ] {
-            assert!(codex.is_runtime_bookkeeping(&record), "{record}");
+            assert_eq!(class(record.clone()), RecordClass::Metadata, "{record}");
         }
         for record in [
-            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hi"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+            serde_json::json!({"type":"turn_context","payload":{"cwd":"/w","model":"m"}}),
+            serde_json::json!({"type":"world_state","payload":{}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed"}}),
             serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"hi"}}),
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"a-later-payload"}}),
+        ] {
+            assert_eq!(class(record.clone()), RecordClass::Content, "{record}");
+        }
+        for record in [
+            serde_json::json!({"type":"event_msg","payload":{"type":"a_later_event"}}),
+            serde_json::json!({"type":"event_msg","payload":{}}),
+            serde_json::json!({"type":"a_later_record","payload":{}}),
             serde_json::json!({"unsettled":true}),
         ] {
-            assert!(!codex.is_runtime_bookkeeping(&record), "{record}");
+            assert_eq!(class(record.clone()), RecordClass::Unknown, "{record}");
         }
     }
 }

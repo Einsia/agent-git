@@ -1675,13 +1675,14 @@ fn tail_is_bookkeeping(committed_log: &str, snap: &meta::Meta, link: &Link) -> c
 }
 
 /// Why a claim whose tail holds a record of a type this build does not know is not left
-/// behind, and what to do: the type is all it names of the record.
+/// behind, and what to do: the type is all it names of the record. Nothing was changed, so the
+/// session's turns are where they were.
 fn unknown_record(link: &Link, kind: &str) -> String {
     format!(
-        "the {} session {} ends with a record of type `{kind}` this version of agit does not know, so it cannot tell whether it is a turn; {} retry",
+        "the {} session {} ends with a record of type `{kind}` this version of agit does not know, so it cannot tell whether it is a turn; nothing was changed and its turns stay saved on this computer. {} retry",
         link.source,
         link::short(&link.session_id),
-        super::push::UPGRADE_FIRST
+        super::push::upgrade_first()
     )
 }
 

@@ -19,6 +19,7 @@ use std::{
 };
 
 const SID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+const CODEX_SID: &str = "aaaaaaaa-0000-4000-8000-0000000c0de5";
 
 /// A turn's stop and exit, in the order Claude Code writes them.
 const EXIT: &[&str] = &[
@@ -368,7 +369,7 @@ fn exit_records_leave_a_merge_free(version: &str, capture: &str, records: usize)
     assert!(!merged.status.success(), "{version}: {text}");
     for expected in [
         "record of type `a-record-from-a-later-claude-code-versio`",
-        "run `agit upgrade`, then retry",
+        upgrade_step(),
     ] {
         assert!(text.contains(expected), "{version}: {expected:?} in {text}");
     }
@@ -385,6 +386,53 @@ fn exit_records_leave_a_merge_free(version: &str, capture: &str, records: usize)
         "{version}: {text}"
     );
     assert!(!text.contains(CANARY), "{version}: {text}");
+}
+
+/// The start of a Codex turn after the last settled one, as Codex 0.166 writes it before the
+/// prompt (applied settings, the turn's start, its context), leaves `agit commit` nothing to
+/// settle, so a merge into the branch proceeds. An event of a payload type this build has not
+/// seen is refused by that name, says nothing changed, and names an upgrade step this install
+/// can take, showing nothing else of the record. A classification that took the events
+/// settlement reads for unknown ones would refuse the first merge as `event_msg`; one that let
+/// an unseen event pass would leave a turn this build cannot read behind.
+#[test]
+fn a_started_codex_turn_leaves_a_merge_free_and_a_new_event_is_named() {
+    let lab = Lab::codex();
+    lab.append(&lab.codex_turn_start(3));
+    let commit = lab.output(&["commit", "alice/qa@work"]);
+    let text = combined(&commit);
+    assert!(text.contains("nothing new since"), "{text}");
+    let merged = lab.merge();
+    let text = combined(&merged);
+    assert!(merged.status.success(), "{text}");
+    assert!(lab.repo().join(".git/AGIT_MERGE_TX").exists(), "{text}");
+
+    const CANARY: &str = "CANARY-LATER-CODEX-EVENT-BODY-7d20";
+    let lab = Lab::codex();
+    let unknown = json!({"timestamp":"2026-11-05T06:34:16.000Z", "type":"event_msg",
+        "payload":{"type":"a_later_codex_event", "body":CANARY}});
+    lab.append(&format!("{}{unknown}\n", lab.codex_turn_start(3)));
+    let merged = lab.merge();
+    let text = combined(&merged);
+    assert!(!merged.status.success(), "{text}");
+    for expected in [
+        "record of type `event_msg/a_later_codex_event`",
+        "nothing was changed and its turns stay saved on this computer",
+        upgrade_step(),
+    ] {
+        assert!(text.contains(expected), "{expected:?} in {text}");
+    }
+    assert!(!text.contains(CANARY), "{text}");
+}
+
+/// What a refusal a newer agit resolves asks first, in this build's channel: only a production
+/// build upgrades itself.
+fn upgrade_step() -> &'static str {
+    if agit::infra::config::is_production_release() {
+        "run `agit upgrade`, then retry"
+    } else {
+        "install a newer agit from the GitLab pipeline that built this one"
+    }
 }
 
 fn combined(output: &Output) -> String {
@@ -461,6 +509,99 @@ impl Lab {
         fs::write(&lab.live, format!("{}{}", lab.turn(1), lab.turn(2))).unwrap();
         lab.run(&["import", SID, "--into", "alice/qa@work", "--independent"]);
         lab
+    }
+
+    /// A Codex session of two settled turns, in the record shape Codex 0.166 writes.
+    fn codex() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let store = dir.path().join("agit");
+        let work = dir.path().join("work");
+        let sessions = home.join(".codex/sessions/2026/11/05");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(store.join("credentials")).unwrap();
+        fs::write(
+            store.join("credentials/127.0.0.1_1.json"),
+            json!({
+                "username": "alice", "email": null,
+                "hub": "http://127.0.0.1:1", "access_token": "synthetic",
+                "access_expires_at": "2099-01-01T00:00:00Z",
+                "refresh_token": "synthetic", "refresh_expires_at": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lab = Self {
+            live: sessions.join(format!("rollout-2026-11-05T00-00-00-{CODEX_SID}.jsonl")),
+            _dir: dir,
+            home,
+            store,
+            work,
+        };
+        lab.run(&["config", "secrets.keystore", "file"]);
+        lab.run(&["init", "qa"]);
+        let header = json!({"timestamp":"2026-11-05T06:34:16.000Z", "type":"session_meta",
+            "payload":{"id":CODEX_SID, "cwd":lab.work, "timestamp":"2026-11-05T06:34:16.000Z",
+                "cli_version":"0.166.0"}});
+        fs::write(
+            &lab.live,
+            format!("{header}\n{}{}", lab.codex_turn(1), lab.codex_turn(2)),
+        )
+        .unwrap();
+        lab.run(&[
+            "import",
+            CODEX_SID,
+            "--from",
+            "codex",
+            "--into",
+            "alice/qa@work",
+            "--independent",
+        ]);
+        lab
+    }
+
+    /// What Codex writes as a turn starts, before its prompt: applied settings, the turn's
+    /// start and its context.
+    fn codex_turn_start(&self, n: usize) -> String {
+        let at = "2026-11-05T06:34:16.000Z";
+        [
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"thread_settings_applied",
+                "thread_id":CODEX_SID, "thread_settings":{}}}),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"task_started",
+                "turn_id":format!("t{n}"), "root_turn_id":format!("t{n}"), "started_at":0,
+                "model_context_window":1, "collaboration_mode_kind":"default", "turn_attribution":{}}}),
+            json!({"timestamp":at, "type":"turn_context", "payload":{"cwd":self.work, "model":"m"}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect()
+    }
+
+    /// A whole Codex turn, record kinds in the order Codex 0.166 writes them, synthetic values.
+    fn codex_turn(&self, n: usize) -> String {
+        let at = "2026-11-05T06:34:16.000Z";
+        let rest = [
+            json!({"timestamp":at, "type":"response_item", "payload":{"type":"message", "role":"user",
+                "content":[{"type":"input_text", "text":format!("synthetic prompt {n}")}]}}),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"item_completed",
+                "thread_id":CODEX_SID, "turn_id":format!("t{n}"), "item":{"type":"user_message"},
+                "started_at_ms":0, "completed_at_ms":0}}),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"item_completed",
+                "thread_id":CODEX_SID, "turn_id":format!("t{n}"), "item":{"type":"agent_message"},
+                "started_at_ms":0, "completed_at_ms":0}}),
+            json!({"timestamp":at, "type":"response_item", "payload":{"type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":format!("synthetic answer {n}")}]}}),
+            json!({"timestamp":at, "type":"token_usage_record", "payload":{}}),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"token_count",
+                "info":null, "rate_limits":null}}),
+            json!({"timestamp":at, "type":"event_msg", "payload":{"type":"task_complete",
+                "turn_id":format!("t{n}"), "root_turn_id":format!("t{n}"),
+                "last_agent_message":format!("synthetic answer {n}"), "started_at":0,
+                "completed_at":0, "duration_ms":1, "time_to_first_token_ms":1}}),
+        ];
+        let rest: String = rest.iter().map(|record| format!("{record}\n")).collect();
+        format!("{}{rest}", self.codex_turn_start(n))
     }
 
     fn command(&self) -> Command {
