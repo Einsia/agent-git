@@ -575,9 +575,19 @@ pub(crate) const BUILDS_ON_WITHDRAWN: &str = "builds on a session withdrawn on t
 /// refusal. Project capture reads it as [`OVERSIZED`] is, and offers no retry for it.
 pub(crate) const REFUSED_AGAIN: &str = "the Hub refuses it again until that changes";
 
-/// How a push the Hub refused for this agit's version says what to do, read as [`REFUSED_AGAIN`]
-/// is.
-pub(crate) const UPGRADE_FIRST: &str = "run `agit upgrade`, then";
+/// How a refusal that a newer agit resolves says what to do first, read as [`REFUSED_AGAIN`] is.
+/// Only a production build upgrades itself; any other channel is pointed at where its builds
+/// come from, so no message names a command that cannot run in this install.
+pub(crate) fn upgrade_first() -> &'static str {
+    if crate::infra::config::is_production_release() {
+        UPGRADE_FIRST
+    } else {
+        UPGRADE_FIRST_ELSEWHERE
+    }
+}
+
+const UPGRADE_FIRST: &str = "run `agit upgrade`, then";
+const UPGRADE_FIRST_ELSEWHERE: &str = "install a newer agit from the GitLab pipeline that built this one (this channel does not upgrade itself), then";
 
 /// What the Hub says when an encrypted publication carries a Claude Code record its public
 /// projection does not support yet.
@@ -611,6 +621,7 @@ pub(crate) fn refused_for_good(message: &str) -> bool {
     [
         REFUSED_AGAIN,
         UPGRADE_FIRST,
+        UPGRADE_FIRST_ELSEWHERE,
         OVERSIZED,
         BUILDS_ON_WITHDRAWN,
         ENCRYPTED_REFUSED,
