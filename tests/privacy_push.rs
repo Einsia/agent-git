@@ -4697,6 +4697,233 @@ fn a_branch_the_hub_refuses_for_good_stays_out_of_automatic_pushes() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/big"]), after);
 }
 
+/// The end of a session agit launched says, in one line, what became of the turns that launch
+/// saved: uploaded, failed and why, or not uploaded and why, and nothing when it saved none. The
+/// turns are counted from the launch rather than from the start of the conversation, and a failure
+/// is told in its fixed class, never in the Hub's words. The upload runs in the settlement of each
+/// turn, a process with no terminal of its own, so an end line that guessed from the settings
+/// would call a failed upload uploading, one that counted the branch's turns would claim the turns
+/// of earlier launches, one that read only the branch would call a turn whose settlement still
+/// waits for its reply never saved, and one that trusted a leftover marker would keep saying a turn
+/// is being saved after its settlement died.
+#[cfg(unix)]
+#[test]
+fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const SID: &str = "dddddddd-0000-4000-8000-000000000004";
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let projects = temp
+        .path()
+        .join(".claude/projects")
+        .join(agit::domain::store::slug_for(&work));
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = projects.join(format!("{SID}.jsonl"));
+    let turn = |n: usize| {
+        let cwd = work.to_string_lossy();
+        format!(
+            "{}\n{}\n",
+            json!({"type":"user","sessionId":SID,"cwd":cwd,"uuid":format!("u{n}"),
+                "timestamp":format!("2026-11-02T00:00:{n:02}.000Z"),
+                "message":{"role":"user","content":format!("synthetic prompt {n}")}}),
+            json!({"type":"assistant","sessionId":SID,"cwd":cwd,"uuid":format!("a{n}"),
+                "timestamp":format!("2026-11-02T00:00:{n:02}.500Z"),
+                "message":{"role":"assistant","stop_reason":"end_turn",
+                    "content":[{"type":"text","text":format!("synthetic answer {n}")}]}}),
+        )
+    };
+    // The runtime agit launches adds the turn it is handed and settles it as Claude Code's Stop
+    // hook does, then exits.
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let next = temp.path().join("next-turn");
+    fs::write(
+        bin.join("claude"),
+        "#!/bin/sh\nif [ -s \"$AGIT_TEST_NEXT\" ]; then\n  cat \"$AGIT_TEST_NEXT\" >> \"$AGIT_TEST_TRANSCRIPT\"\n  : > \"$AGIT_TEST_NEXT\"\n  printf '%s' \"$AGIT_TEST_STOP\" | \"$AGIT_TEST_BIN\" hooks settle --runtime claude-code\nfi\n",
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = vec![bin.clone()];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(path).unwrap();
+    let stop =
+        json!({"session_id":SID,"cwd":work,"transcript_path":transcript,"hook_event_name":"Stop"});
+    let agit = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        let output = command
+            .current_dir(&work)
+            .env("PATH", &path)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_YES", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("AGIT_SECRETS_KEYSTORE", "file")
+            .env("AGIT_TEST_NEXT", &next)
+            .env("AGIT_TEST_TRANSCRIPT", &transcript)
+            .env("AGIT_TEST_STOP", stop.to_string())
+            .env("AGIT_TEST_BIN", env!("CARGO_BIN_EXE_agit"))
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    agit(&["push", "alice/app@main"]);
+    let main = git(&remote, &["rev-parse", "refs/heads/main"]);
+    fs::write(&transcript, format!("{}{}", turn(1), turn(2))).unwrap();
+    agit(&[
+        "import",
+        SID,
+        "--from",
+        "claude-code",
+        "--into",
+        "alice/app@work",
+        "--independent",
+    ]);
+    // Each launch adds what it is handed, at most one turn; its end line is the one line agit
+    // writes after it.
+    let launch = |added: String| {
+        fs::write(&next, added).unwrap();
+        let output = agit(&["resume", "alice/app@work"]);
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("agit: "))
+            .map(str::to_owned)
+            .collect();
+        assert!(lines.len() <= 1, "{output}");
+        lines.into_iter().next()
+    };
+
+    assert_eq!(
+        launch(turn(3)).as_deref(),
+        Some("agit: saved 1 turn of this conversation and uploaded it to alice/app.")
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+    assert_eq!(launch(String::new()), None);
+
+    // The Hub refuses the upload as one past its event-entry limit.
+    *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/main".into(), main, None)];
+    *hub.refuse_with.lock().unwrap() = Some(
+        "ERR HTTP 422 provenance_rejected: refs/heads/publication: session/meta.json unreadable (reserved event topology exceeds the per-push limit of 4 entries)\n",
+    );
+    assert_eq!(
+        launch(turn(4)).as_deref(),
+        Some(
+            "agit: saved 1 turn of this conversation on this computer; the upload to alice/app failed: the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again."
+        )
+    );
+    let previews = hub.previews.lock().unwrap().len();
+    assert_eq!(
+        launch(turn(5)).as_deref(),
+        Some(
+            "agit: saved 1 turn of this conversation on this computer; not uploaded: the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again."
+        )
+    );
+    assert_eq!(hub.previews.lock().unwrap().len(), previews);
+
+    agit(&["config", "--repo", "alice/app", "push.auto", "false"]);
+    assert_eq!(
+        launch(turn(6)).as_deref(),
+        Some(
+            "agit: saved 1 turn of this conversation on this computer; not uploaded: automatic upload is off for this repository."
+        )
+    );
+
+    // The last turn's reply is written after its Stop, so its settlement waits for the reply apart
+    // from the runtime, which ends first. Until the turn is on its branch, the end says it is
+    // still being saved.
+    let last = turn(7);
+    let (prompt, reply) = last.split_once('\n').unwrap();
+    let before = git(repo.root(), &["rev-parse", "refs/heads/work"]);
+    assert_eq!(
+        launch(format!("{prompt}\n")).as_deref(),
+        Some("agit: the last turn of this conversation is still being saved.")
+    );
+    let settling: Vec<_> = fs::read_dir(home.join("projects/uploads/settling"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(settling.len(), 1, "{settling:?}");
+    let marker = &settling[0];
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(reply.as_bytes())
+        .unwrap();
+    // The settlement removes its marker once the turn is on its branch; it runs apart from this
+    // process, so the wait for it is bounded.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!marker.exists(), "the settlement kept its marker");
+    assert_ne!(git(repo.root(), &["rev-parse", "refs/heads/work"]), before);
+
+    // A settlement that ended without removing its marker, as one that crashed does, leaves the
+    // end saying nothing about a turn being saved, and its marker goes.
+    let mut ended = Command::new("true").spawn().unwrap();
+    let pid = ended.id();
+    ended.wait().unwrap();
+    fs::write(marker, json!({ "pid": pid }).to_string()).unwrap();
+    assert_eq!(launch(String::new()), None);
+    assert!(!marker.exists());
+}
+
 /// A conversation from a folder that doesn't upload by itself is not uploaded by an automatic
 /// push, whichever path recorded its branch and whatever the checkout's own setting says; the
 /// person's own push still uploads it. A client that judged only the checkout's setting would

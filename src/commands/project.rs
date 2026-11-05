@@ -1076,25 +1076,35 @@ pub(crate) enum UploadFailure {
 
 impl UploadFailure {
     fn of(error: &anyhow::Error, project: &Project) -> Self {
-        let failed = error
+        let reported = error
             .chain()
-            .find_map(|cause| cause.downcast_ref::<ChildFailed>());
-        if failed.is_some_and(|failed| failed.message.contains(super::push::OVERSIZED)) {
+            .find_map(|cause| cause.downcast_ref::<ChildFailed>())
+            .map_or(Self::Other, |failed| {
+                Self::reported(failed.exit_code, &failed.message)
+            });
+        if reported == Self::Other && sign_in(project) == SignIn::Absent {
+            return Self::SignedOut;
+        }
+        reported
+    }
+
+    /// The class of a failed `agit push` child, from its exit status and the error it reported.
+    pub(crate) fn reported(exit_code: Option<i32>, message: &str) -> Self {
+        if message.contains(super::push::OVERSIZED) {
             return Self::TooLarge;
         }
-        if failed.is_some_and(|failed| failed.message.contains(super::push::BUILDS_ON_WITHDRAWN)) {
+        if message.contains(super::push::BUILDS_ON_WITHDRAWN) {
             return Self::BuildsOnWithdrawn;
         }
         // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
         // name to rename is refused before the Hub is asked.
-        if failed.is_some_and(|failed| super::push::refused_for_good(&failed.message)) {
+        if super::push::refused_for_good(message) {
             return Self::Refused;
         }
-        match failed.and_then(|failed| failed.exit_code) {
+        match exit_code {
             Some(code) if code == ExitCode::Auth.as_i32() => Self::SignedOut,
             Some(code) if code == ExitCode::Network.as_i32() => Self::Hub,
             Some(code) if code == ExitCode::Policy.as_i32() => Self::PrivacyIncomplete,
-            _ if sign_in(project) == SignIn::Absent => Self::SignedOut,
             _ => Self::Other,
         }
     }
@@ -1308,6 +1318,7 @@ fn sync_one(
     let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
     import_capture(project, candidate, &branch, opens)?;
+    landed();
     // The session is claimed, but no turn of it is complete yet; the Stop that completes one
     // uploads it.
     if !has_turns(&checkout(project)?, &branch) {
@@ -1337,13 +1348,25 @@ fn sync_one(
         "--quiet",
         &format!("refs/heads/{branch}^{{commit}}"),
     ]);
-    if project.auto_upload {
-        retry_stale(|| automatic_push(&target, &candidate.cwd))?;
+    let upload = head
+        .as_deref()
+        .and_then(|head| super::upload_outcome::start(&project.repository, &branch, head));
+    let pushed = if project.auto_upload {
+        retry_stale(|| automatic_push(&target, &candidate.cwd))
     } else {
         // The person asked for this save: their push.
         let args = vec!["push".into(), target, "--yes".into()];
-        retry_stale(|| child(&args, &candidate.cwd, false))?;
+        retry_stale(|| child(&args, &candidate.cwd, false))
+    };
+    if let Some(upload) = upload {
+        upload.finish(
+            pushed
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| UploadFailure::of(error, project)),
+        );
     }
+    pushed?;
     // A publication does not move the local view of the Hub's branches; fetching does, so local
     // status and links can tell that this branch is on the Hub.
     let _ = child(
@@ -1513,6 +1536,7 @@ pub fn run(args: Args) -> CmdResult {
             let _repository = repository_lock(&project.repository)?;
             project.enabled = false;
             save(&project)?;
+            super::upload_outcome::forget(&project.repository, None)?;
             println!("Project capture stopped. Session history is unchanged.");
             restore_auto_push(&mut project)?;
             Ok(ExitCode::Ok)
@@ -2511,15 +2535,93 @@ fn markers(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Removes one marker before its capture, so a Stop during that capture queues the session again.
-fn take_pending(root: &Path) -> Result<Option<Candidate>> {
+/// The session is marked as being captured before its marker goes, so it shows as still to save
+/// at every moment until its capture ends.
+fn take_pending(root: &Path) -> Result<Option<(Candidate, Capturing)>> {
     for path in markers(root)? {
         let bytes = fs::read(&path)?;
+        let Ok(candidate) = serde_json::from_slice::<Candidate>(&bytes) else {
+            fs::remove_file(&path)?;
+            continue;
+        };
+        let capturing = Capturing::mark(root, &candidate);
         fs::remove_file(&path)?;
-        if let Ok(candidate) = serde_json::from_slice(&bytes) {
-            return Ok(Some(candidate));
-        }
+        return Ok(Some((candidate, capturing)));
     }
     Ok(None)
+}
+
+/// The session a project's worker is capturing, and that worker's process id, so a record left by
+/// a worker that ended mid-capture is told apart from one still capturing.
+#[derive(Serialize, Deserialize)]
+struct CapturingRecord {
+    session: String,
+    pid: u32,
+}
+
+/// Marks a session as being captured until its turn lands on its branch here, or until dropped.
+struct Capturing(Option<PathBuf>);
+
+/// The mark of the capture this process runs now. It is released as soon as the capture's turn
+/// is on its branch, before the upload: the upload may take long, and the end of a session that
+/// waited for it would call a saved turn still being saved.
+static CAPTURING: std::sync::Mutex<Option<Capturing>> = std::sync::Mutex::new(None);
+
+/// Releases the mark of this process's running capture, its turn being on its branch now.
+fn landed() {
+    let mark = CAPTURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    drop(mark);
+}
+
+impl Capturing {
+    fn path(root: &Path) -> Result<PathBuf> {
+        Ok(state_path(root)?.with_extension("capturing"))
+    }
+
+    fn mark(root: &Path, candidate: &Candidate) -> Self {
+        let record = CapturingRecord {
+            session: hash(&key(&candidate.runtime, &candidate.session_id)),
+            pid: std::process::id(),
+        };
+        let written = Self::path(root).ok().filter(|path| {
+            serde_json::to_vec(&record).is_ok_and(|bytes| {
+                tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))
+                    .and_then(|mut file| file.write_all(&bytes).map(|()| file))
+                    .is_ok_and(|file| file.persist(path).is_ok())
+            })
+        });
+        Self(written)
+    }
+}
+
+impl Drop for Capturing {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Whether the project that saves the folder at `cwd` has `runtime`'s `session` still to save:
+/// queued for its worker, or being captured by a worker that is still running. A Stop in such a
+/// folder hands the turn to the worker and returns, so until the worker is done nothing else shows
+/// that the turn is not saved yet.
+pub(crate) fn capture_pending(runtime: &str, session: &str, cwd: &Path) -> bool {
+    let Ok(Some((project, _))) = governing(cwd) else {
+        return false;
+    };
+    let name = hash(&key(runtime, session));
+    if pending_dir(&project.root).is_ok_and(|pending| pending.join(&name).exists()) {
+        return true;
+    }
+    Capturing::path(&project.root)
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<CapturingRecord>(&bytes).ok())
+        .is_some_and(|record| record.session == name && super::upload_outcome::alive(record.pid))
 }
 
 /// At most one worker captures a project. `None` means another worker holds it and will see
@@ -2559,12 +2661,17 @@ fn drain(root: &Path) -> Result<()> {
                 }
             }
         }
-        while let Some(candidate) = take_pending(root)? {
+        while let Some((candidate, capturing)) = take_pending(root)? {
+            *CAPTURING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
             let Some(project) = read(root)? else {
+                landed();
                 return Ok(());
             };
             // A failure is recorded in the project's last result; the remaining sessions go on.
             let _ = capture_candidate(project, candidate, false, true);
+            landed();
         }
         drop(worker);
         if markers(root)?.is_empty() && !catch_up_requested(root)? {
@@ -3464,6 +3571,7 @@ fn drop_command(target: Option<&str>) -> CmdResult {
         Withholding::Dropped,
         true,
     )?;
+    super::upload_outcome::forget(repository, Some(branch))?;
     println!("{target} will not be uploaded from this computer; its local history stays.");
     ui::hint("a copy already pushed to the Hub stays there until you remove it on the Hub");
     Ok(ExitCode::Ok)
@@ -3867,16 +3975,46 @@ pub(crate) fn registration_scope(cwd: &Path) -> bool {
 }
 
 pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<bool> {
-    if withheld(slug, branch)?.is_some()
-        || refused_as_withdrawn(repo, branch)?
-        || refused_as_oversized(repo, branch)?
-    {
-        return Ok(true);
+    Ok(auto_push_blocker(repo, slug, branch)?.is_some())
+}
+
+/// Why automatic pushes leave a branch out, in fixed words that carry nothing of the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Blocker {
+    Withheld(Withholding),
+    Withdrawn,
+    Oversized,
+    /// The project of the folder the conversation started in is paused or does not upload.
+    ProjectOff,
+}
+
+impl Blocker {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Withheld(Withholding::Dropped) => "you stopped uploading it from this computer",
+            Self::Withheld(reason) => reason.describe(),
+            Self::Withdrawn => UploadFailure::BuildsOnWithdrawn.describe(),
+            Self::Oversized => UploadFailure::TooLarge.describe(),
+            Self::ProjectOff => "automatic upload is off for the folder it started in",
+        }
+    }
+}
+
+/// [`blocks_auto_push`], with the reason.
+pub(crate) fn auto_push_blocker(repo: &Repo, slug: &str, branch: &str) -> Result<Option<Blocker>> {
+    if let Some(reason) = withheld(slug, branch)? {
+        return Ok(Some(Blocker::Withheld(reason)));
+    }
+    if refused_as_withdrawn(repo, branch)? {
+        return Ok(Some(Blocker::Withdrawn));
+    }
+    if refused_as_oversized(repo, branch)? {
+        return Ok(Some(Blocker::Oversized));
     }
     let meta = crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))?
         .context("cannot verify project policy without branch metadata")?;
     if meta.is_file_line() {
-        return Ok(false);
+        return Ok(None);
     }
     let hydrated = crate::domain::privacy::service::transform(
         Some(repo.root()),
@@ -3887,16 +4025,19 @@ pub(crate) fn blocks_auto_push(repo: &Repo, slug: &str, branch: &str) -> Result<
         .next()
         .is_some()
     {
-        return Ok(false);
+        return Ok(None);
     }
     let cwd = hydrated.content;
     let cwd = Path::new(&cwd)
         .canonicalize()
         .context("cannot resolve the session directory to verify project policy")?;
     let Some((project, _)) = governing(&cwd)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(project.repository == slug && (!project.enabled || !project.auto_upload))
+    Ok(
+        (project.repository == slug && (!project.enabled || !project.auto_upload))
+            .then_some(Blocker::ProjectOff),
+    )
 }
 
 /// Whether the folder the conversation of `slug@branch` ran in keeps it from this upload: it leaves
@@ -5854,6 +5995,56 @@ mod tests {
         fs::create_dir_all(binding.parent().unwrap()).unwrap();
         fs::write(&binding, b"not a binding").unwrap();
         assert_eq!(sole(&src, &src).unwrap(), None);
+    }
+
+    /// A turn a Stop hands to the project's worker is still to save until the worker has captured
+    /// it: queued, then marked while captured, with no moment between the two where it shows as
+    /// saved. The end of a launched session reads this to say its last turn is still being saved;
+    /// a check of the branch lock alone would miss a turn waiting behind another session's upload.
+    /// A mark left by a worker that ended mid-capture does not count.
+    #[test]
+    fn a_turn_handed_to_the_project_worker_is_pending_until_captured() {
+        if !isolated("a_turn_handed_to_the_project_worker_is_pending_until_captured") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let folder = project(work.path());
+        save(&folder).unwrap();
+        let candidate = Candidate {
+            runtime: "claude-code".into(),
+            session_id: "dddddddd-0000-4000-8000-000000000005".into(),
+            cwd: folder.root.clone(),
+        };
+        let pending = || capture_pending(&candidate.runtime, &candidate.session_id, &folder.root);
+        assert!(!pending());
+        enqueue(&folder.root, &candidate).unwrap();
+        assert!(pending(), "a queued turn is pending");
+        let (taken, capturing) = take_pending(&folder.root).unwrap().unwrap();
+        assert_eq!(taken.session_id, candidate.session_id);
+        assert!(markers(&folder.root).unwrap().is_empty());
+        assert!(pending(), "a turn being captured is pending");
+        *CAPTURING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+        landed();
+        assert!(
+            !pending(),
+            "a turn on its branch is not, whatever its upload still does"
+        );
+
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let pid = ended.id();
+        ended.wait().unwrap();
+        fs::write(
+            Capturing::path(&folder.root).unwrap(),
+            serde_json::to_vec(&CapturingRecord {
+                session: hash(&key(&candidate.runtime, &candidate.session_id)),
+                pid,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!pending(), "an ended worker's mark is not pending");
     }
 
     /// A capture queued before its directory was bound on its own is skipped, so the parent
