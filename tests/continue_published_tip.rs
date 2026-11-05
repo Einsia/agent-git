@@ -8,13 +8,16 @@ mod lab_env;
 use agit::domain::{link, meta, repo::Repo, storage, store, transcript};
 use lab_env::LabEnv;
 use serde_json::json;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const NATIVE: &str = "cccccccc-0000-4000-8000-000000000003";
 
-/// `local/qa` with branch `work` checked out and `origin/work` at the published tip, two
-/// settled turns of one session.
+/// An agent repository `<owner>/qa` with branch `work` checked out, and the runtime's home.
 struct Lab {
     temporary: tempfile::TempDir,
     home: PathBuf,
@@ -22,16 +25,87 @@ struct Lab {
     repo: Repo,
     session: String,
     published: String,
+    hub: Option<Hub>,
+}
+
+/// A Hub that answers only for `alice/qa`, whose clone address is a local repository.
+struct Hub {
+    url: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Hub {
+    fn new(clone_url: &Path) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let agent = json!({
+            "agent_id": "aaaaaaaa-0000-4000-8000-000000000183",
+            "owner": "alice", "name": "qa", "visibility": "private", "clone_url": clone_url,
+        })
+        .to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                }
+                let _ = if request.starts_with(b"GET /api/agents/alice/qa ") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{agent}",
+                        agent.len()
+                    )
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                };
+            }
+        });
+        Self {
+            url,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for Hub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl Lab {
-    fn new() -> Self {
+    /// `<owner>/qa` with two settled turns of one session on `work`, and no remote yet.
+    fn at(owner: &str) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join("agit");
         let work = temporary.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         let work = work.canonicalize().unwrap();
-        let repo = Repo::init(&home.join("repos/local/qa")).unwrap();
+        let repo = Repo::init(&home.join("repos").join(owner).join("qa")).unwrap();
         repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
         repo.git(&["symbolic-ref", "HEAD", "refs/heads/work"])
             .unwrap();
@@ -42,11 +116,18 @@ impl Lab {
             repo,
             session: format!("agit-{}", "a".repeat(40)),
             published: String::new(),
+            hub: None,
         };
         lab.turn(1, "Turn 1.");
         lab.published = lab.turn(2, "Published turn 2.");
+        lab
+    }
+
+    /// `local/qa` with `origin/work` at the published tip, two settled turns of one session.
+    fn new() -> Self {
+        let lab = Self::at("local");
         // A closed port: nothing in these runs may need the Hub.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        let closed = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
@@ -61,6 +142,45 @@ impl Lab {
         lab.repo
             .git(&["update-ref", "refs/remotes/origin/work", &lab.published])
             .unwrap();
+        lab
+    }
+
+    /// `alice/qa`, signed in as alice, after a collaborator published the second turn: the Hub
+    /// has it, while this computer has only the first turn and has not fetched since. With
+    /// `only_on_hub`, this computer has no `work` branch at all.
+    fn published_by_a_collaborator(only_on_hub: bool) -> Self {
+        let mut lab = Self::at("alice");
+        let origin = lab.temporary.path().join("hub/alice/qa.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        lab.repo
+            .git(&["init", "--bare", "--quiet", origin.to_str().unwrap()])
+            .unwrap();
+        lab.repo
+            .git(&["push", "--quiet", origin.to_str().unwrap(), "work:work"])
+            .unwrap();
+        lab.repo
+            .git(&["remote", "add", "origin", origin.to_str().unwrap()])
+            .unwrap();
+        lab.repo.git(&["reset", "--hard", "HEAD~1"]).unwrap();
+        if only_on_hub {
+            lab.repo
+                .git(&["checkout", "--quiet", "-b", "other"])
+                .unwrap();
+            lab.repo.git(&["branch", "-D", "work"]).unwrap();
+        }
+        let hub = Hub::new(&origin);
+        let port = hub.url.rsplit(':').next().unwrap().to_owned();
+        let credentials = lab.home.join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        std::fs::write(
+            credentials.join(format!("127.0.0.1_{port}.json")),
+            json!({"username": "alice", "hub": hub.url, "access_token": "test-only",
+                "refresh_token": "test-only", "access_expires_at": "2100-01-01T00:00:00Z",
+                "refresh_expires_at": "2100-01-01T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        lab.hub = Some(hub);
         lab
     }
 
@@ -186,6 +306,9 @@ impl Lab {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .current_dir(&self.work);
+        if let Some(hub) = &self.hub {
+            command.env("AGIT_HUB_URL", &hub.url);
+        }
         #[cfg(windows)]
         {
             for name in ["SystemRoot", "WINDIR", "TEMP", "TMP", "ComSpec"] {
@@ -320,6 +443,35 @@ fn a_native_session_of_the_stale_head_is_not_reused_after_the_fast_forward() {
         assert!(
             lab.materialized().contains("Published turn 2."),
             "{args:?}: the session handed to the runtime lacks the published turn"
+        );
+    }
+}
+
+/// A collaborator's turn reaches resume through the Hub: with the local branch behind, and with
+/// the branch only on the Hub, resume fetches it, says so, and continues from the published tip
+/// with that turn in the session. A resume judged against the last fetch continues the first
+/// turn alone in the first case and finds no branch in the second.
+#[test]
+fn resume_continues_a_collaborators_turn_it_fetches_from_the_hub() {
+    for only_on_hub in [false, true] {
+        let lab = Lab::published_by_a_collaborator(only_on_hub);
+        let output = lab.agit(&["resume", "alice/qa@work", "--no-launch"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{only_on_hub}: {stdout} {stderr}");
+        let said = if only_on_hub {
+            "continuing `work` from the Hub, at its published tip"
+        } else {
+            "fast-forwarded `work` +1 to the published tip"
+        };
+        assert!(
+            format!("{stdout}{stderr}").contains(said),
+            "{only_on_hub}: {stdout} {stderr}"
+        );
+        assert_eq!(lab.head(), lab.published, "{only_on_hub}");
+        assert!(
+            lab.materialized().contains("Published turn 2."),
+            "{only_on_hub}: the session handed to the runtime lacks the collaborator's turn"
         );
     }
 }

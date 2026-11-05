@@ -844,6 +844,22 @@ pub fn run_for_remote(
     run_for_identity(Some(repo.root()), args, identity)
 }
 
+/// [`run_for_remote`] for a read that must finish within `timeout`, taking its stdout, with why
+/// it did not in a fixed sentence that names no secret: the same causes a branch-list read
+/// reports.
+pub fn capture_for_remote(
+    repo: &Repo,
+    args: &[&str],
+    identity: &super::identity::RemoteIdentity,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, AdvertisementUnread> {
+    let setup = |_| AdvertisementUnread::refused("the Git transport could not be prepared");
+    super::identity::verify_transport_target(repo, identity).map_err(setup)?;
+    let transport = TransportIdentity::new(Some(repo.root()), args, identity).map_err(setup)?;
+    ref_read::capture_within(repo.root(), args, Some(&transport), timeout)
+        .map_err(|failure| AdvertisementUnread::from_read(failure, timeout))
+}
+
 /// Explicit acceptance belongs only to this push and its validated immutable destination.
 pub fn push_for_remote(
     repo: &Repo,

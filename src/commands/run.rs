@@ -304,25 +304,15 @@ pub fn run(args: Args) -> CmdResult {
     // push / import): conflating a timeout with "read-only" opens an extra branch beside the
     // original line on the user's behalf.
     let access = if is_branch_head && !args.mine {
-        match crate::infra::credentials::current_user() {
-            Some(me) => Some(super::writability(&me, &owner, &name)?),
-            // With no sign-in there is no identity a grant could name: only this machine's
-            // `local/` namespace counts as your own.
-            None if owner == "local" => Some(super::Writability::Mine),
-            None => Some(super::Writability::ReadOnly),
-        }
+        Some(write_access(
+            &crate::hub::Client::from_env(),
+            &owner,
+            &name,
+        )?)
     } else {
         None
     };
-    // Continuable = the shapes whose first push can land on the original line: your own, the
-    // ones the hub allows, and the ones the hub does not have yet in an org that lets you create
-    // them (push creates it under the org) — the same set of answers push / import accept.
-    let can_continue = matches!(
-        access,
-        Some(
-            super::Writability::Mine | super::Writability::Granted | super::Writability::Creatable
-        )
-    );
+    let can_continue = access.as_ref().is_some_and(continuable);
 
     if can_continue {
         // Resume continues a local branch: a head known only from `origin` becomes the local
@@ -370,6 +360,7 @@ pub fn run(args: Args) -> CmdResult {
                 no_launch: args.no_launch,
                 force: false,
             },
+            super::resume::HubCheck::Done,
             move || receipt.map(|(client, receipt)| reuse::send(client, receipt)),
         );
     }
@@ -711,6 +702,31 @@ fn upstream_on(repo: &Repo, hub: &str) -> Option<(String, String)> {
     crate::domain::repo::valid_name(&name).ok()?;
     let expected = format!("{hub}/{owner}/{name}");
     (remote == expected || remote == format!("{expected}.git")).then_some((owner, name))
+}
+
+/// What the Hub lets this sign-in do with a session branch of `owner/name`. With no sign-in there
+/// is no identity a grant could name: only this machine's `local/` namespace counts as your own.
+pub(super) fn write_access(
+    client: &crate::hub::Client,
+    owner: &str,
+    name: &str,
+) -> crate::Result<super::Writability> {
+    Ok(match crate::infra::credentials::current_user() {
+        Some(me) => super::writability_with(client, &me, owner, name)?,
+        None if owner == "local" => super::Writability::Mine,
+        None => super::Writability::ReadOnly,
+    })
+}
+
+/// Whether a branch may be continued in place: the shapes whose first push can land on the
+/// original line are your own, the ones the Hub allows, and the ones the Hub does not have yet in
+/// an org that lets you create them (push creates it under the org) — the same set of answers
+/// push and import accept.
+pub(super) fn continuable(access: &super::Writability) -> bool {
+    matches!(
+        access,
+        super::Writability::Mine | super::Writability::Granted | super::Writability::Creatable
+    )
 }
 
 fn fetch_quiet(owner: &str, name: &str) -> bool {

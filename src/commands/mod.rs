@@ -305,10 +305,20 @@ pub enum Writability {
 /// `import` land a version locally and makes `push` offer to copy the repo — both decide for the
 /// user on a question that has no answer.
 pub fn writability(me: &str, owner: &str, name: &str) -> Result<Writability> {
+    writability_with(&crate::hub::Client::from_env(), me, owner, name)
+}
+
+/// [`writability`] asked through `client`, so a caller that must not wait long on the Hub bounds
+/// every request; a request that runs out of time is an error like any other network failure.
+pub(crate) fn writability_with(
+    client: &crate::hub::Client,
+    me: &str,
+    owner: &str,
+    name: &str,
+) -> Result<Writability> {
     if owner == me {
         return Ok(Writability::Mine);
     }
-    let client = crate::hub::Client::from_env();
     if !client.has_token() {
         if login::is_waiting(client.base()) {
             anyhow::bail!(
@@ -752,6 +762,54 @@ fn same_hub(remote_url: &str, hub: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A write-access question asked through a bounded client gives up when the Hub stops
+    /// answering after it has named the repository, and the timeout is an error rather than an
+    /// answer. A check that builds its own unbounded client waits out the idle timeout instead,
+    /// and one that reads the failure as an answer continues a branch it may not write.
+    #[test]
+    fn a_write_access_question_through_a_bounded_client_fails_closed_in_time() {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut header = String::new();
+                while reader.read_line(&mut header).unwrap_or(0) > 0 && header != "\r\n" {
+                    header.clear();
+                }
+                if request.starts_with("GET /api/agents/alice/qa ") {
+                    let body = r#"{"agent_id":"aaaaaaaa-0000-4000-8000-000000000183","owner":"alice","name":"qa","visibility":"private","clone_url":"x"}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                } else {
+                    held.push(stream);
+                }
+            }
+        });
+        let client = crate::hub::Client::for_hub_with_token_and_timeout(
+            &hub,
+            "test-only",
+            std::time::Duration::from_secs(1),
+        );
+        let started = std::time::Instant::now();
+        let answer = super::writability_with(&client, "bob", "alice", "qa");
+        let error = format!("{:#}", answer.unwrap_err());
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
     /// A push probe has exactly three answers; any other status code is not an answer. An
     /// implementation reading a 5xx as "no permission" offers to copy the repo whenever the hub
     /// wobbles.

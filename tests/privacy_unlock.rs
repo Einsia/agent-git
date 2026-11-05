@@ -597,6 +597,14 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
                     }
                     _ => (200, key_response.clone()),
                 }
+            } else if path.contains(".git/info/refs") {
+                // This Hub serves no Git: a resume that reads the branch's published tip first
+                // is told the Hub is unavailable and continues from the local copy.
+                assert!(authenticated);
+                (
+                    503,
+                    json!({"kind":"repository_unavailable","error":"no Git service here"}),
+                )
             } else {
                 assert!(
                     authenticated,
