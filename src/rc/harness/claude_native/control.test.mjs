@@ -486,10 +486,11 @@ test("a prompt typed before the daemon first answers waits for that answer", asy
   assert.deepEqual(second.sent, ["my question"], "a terminal nothing holds back types at once");
 });
 
-// The rule: a hold never lets a prompt through on an error. Claude Code passes a prompt whose
-// hook throws, so every way the daemon check can fail must end in the prompt being held.
-test("a_hold_never_passes_a_prompt_when_the_check_errors: the registration hangs, throws, or times out", async () => {
+// The rule: only a definite answer holds a prompt. However the daemon check fails to answer, what
+// the person typed goes ahead: it must never be lost to an answer nobody has.
+test("an answer agit could not get never holds a prompt", async () => {
   const events = { exitCode: 0, stdout: JSON.stringify({ events: [] }) };
+  const unknown = { exitCode: 0, stdout: JSON.stringify({ lease: { known: false } }) };
   const failures = {
     // A daemon that accepts and never answers: the registration never returns.
     hangs: () => new Promise(() => {}),
@@ -498,6 +499,10 @@ test("a_hold_never_passes_a_prompt_when_the_check_errors: the registration hangs
     // Claude Code aborts a process.run past its budget, after the prompt began waiting.
     "times out": () => new Promise((_, reject) =>
       setTimeout(() => reject(new Error("still running after 5000ms")), 2500)),
+    // The command ran and failed: a refused registration, or a daemon past its bound.
+    "fails": async () => ({ exitCode: 1, stdout: "" }),
+    // The command ran and has no answer to give.
+    "says it does not know": async () => unknown,
   };
   for (const [failure, run] of Object.entries(failures)) {
     const f = await fixture();
@@ -505,9 +510,39 @@ test("a_hold_never_passes_a_prompt_when_the_check_errors: the registration hangs
     await f.fire("session.start");
     const { sent, downstream } = typing();
     const answer = await f.fire("prompt.submit", typed, downstream);
-    assert.match(answer?.drop ?? "", /Checking with agit/, `the registration ${failure}`);
-    assert.deepEqual(sent, [], `the registration ${failure}: the prompt was not sent`);
+    assert.equal(answer?.drop, undefined, `the check ${failure}`);
+    assert.deepEqual(sent, ["my question"], `the check ${failure}: the prompt was sent`);
   }
+
+  // The check itself breaks before it can ask.
+  const f = await fixture();
+  await f.fire("session.start");
+  f.api.session.id = async () => { throw new Error("no session"); };
+  const { sent, downstream } = typing();
+  assert.equal((await f.fire("prompt.submit", typed, downstream))?.drop, undefined);
+  assert.deepEqual(sent, ["my question"]);
+});
+
+// Claude Code's reported folder follows a `cd`, while the session stays registered with the folder
+// it started in: this is the same conversation, and a new one is told apart by its id.
+test("a cd in the terminal is not a new conversation", async () => {
+  const f = await fixture();
+  await f.fire("session.start");
+  await f.poll();
+  const registrations = () => f.hooksRun.filter(name => name === "native-control").length;
+  const before = registrations();
+  assert.ok(before > 0);
+  f.api.session.cwd = async () => "/project/sub";
+  await later(5000, () => f.poll());
+  assert.equal(registrations(), before, "it does not register again from the new folder");
+  const { sent, downstream } = typing();
+  await later(5001, () => f.fire("prompt.submit", typed, downstream));
+  assert.deepEqual(sent, ["my question"]);
+  assert.deepEqual(statuses(f).filter(status => /Checking with agit/.test(status ?? "")), []);
+
+  f.setSession("b");
+  await later(10000, () => f.poll());
+  assert.ok(registrations() > before, "another conversation registers, whatever its folder");
 });
 
 const olderBranch = "This terminal continues an older branch of this conversation, without the "
@@ -635,25 +670,19 @@ test("the plugin registers no slash command", async () => {
 });
 
 // After a stale hold, the person reloads: a new terminal process. If the daemon is unreachable
-// then, nothing says this terminal is behind, so the bounded hold applies and the terminal can
-// write once it passes. agit puts nothing on the conversation's message chain on the way: it
+// then, nothing says this terminal is behind, so nothing holds it. agit puts nothing on the conversation's message chain on the way: it
 // registers no command and submits no prompt of its own; a held prompt is only refused.
-test("a reload with the daemon unreachable becomes writable after the release window, and agit adds nothing to the conversation", async () => {
+test("a reload with the daemon unreachable stays writable, says so, and agit adds nothing to the conversation", async () => {
   const f = await fixture();
   const registered = [];
   f.api.command = { register: async value => { registered.push(value); return {}; } };
   f.setLeaseFails(true);
   await f.fire("session.start");
   const { sent, downstream } = typing();
-  assert.match((await later(1000, () => f.fire("prompt.submit", typed, downstream))).drop,
-    /Checking with agit/);
-  await later(20000, () => f.poll());
-  assert.match((await later(20001, () => f.fire("prompt.submit", typed, downstream))).drop,
-    /Checking with agit/);
+  await later(1000, () => f.fire("prompt.submit", typed, downstream));
+  assert.deepEqual(sent, ["my question"], "nothing definite holds it");
   await later(40000, () => f.poll());
-  assert.match(statuses(f).at(-1), /could not confirm/);
-  await later(40001, () => f.fire("prompt.submit", typed, downstream));
-  assert.deepEqual(sent, ["my question"], "writable after the release window");
+  assert.match(statuses(f).at(-1), /couldn't check/);
 
   assert.deepEqual(registered, [], "agit registers no slash command");
   assert.ok(!f.hooks.has("command.run"), "agit answers no slash command");
@@ -695,7 +724,7 @@ test("a lease query that fails keeps the hold, surfaced and bounded, never stuck
 
   // Still unreachable long after: the hold ends and the status says why.
   await later(40000, () => f.poll());
-  assert.match(statuses(f).at(-1), /could not confirm/);
+  assert.match(statuses(f).at(-1), /couldn't check/);
   await later(41000, () => f.fire("prompt.submit", typed, downstream));
   assert.deepEqual(sent, ["my question"]);
 });

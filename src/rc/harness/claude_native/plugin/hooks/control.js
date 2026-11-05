@@ -63,7 +63,7 @@ const LEASE_RECHECK_MS = 2000;
 // agit can no longer reach protects nothing. A stale history is not such a wait: nothing but
 // resuming the conversation again brings it up to date, so no timer releases it.
 const LEASE_UNKNOWN_MS = 30000;
-// How long a prompt waits for the daemon's first answer before it is held as unknown.
+// How long a prompt waits for the daemon's first answer before it goes ahead without one.
 const LEASE_FIRST_ANSWER_MS = 2000;
 // How long a terminal waits for its first record before it asks for the lease without naming its
 // branch, which holds it back as stale.
@@ -76,8 +76,8 @@ const CHECKING = "Checking with agit whether another process still writes this c
 // 30 s (LEASE_UNKNOWN_MS).
 const NOT_WRITER = "Not sent yet: another process still writes this conversation. Your input "
   + "waits here until that process ends or hands the conversation to this terminal.";
-const UNREACHABLE = "agit could not confirm that no other process writes this conversation; "
-  + "your input is no longer held.";
+const UNREACHABLE = "agit couldn't check whether another process writes this conversation, so "
+  + "your input is sent as usual.";
 const STALE = (session) => "This terminal continues an older branch of this conversation, without "
   + `the turn sent from the web. Exit and run \`claude --resume ${session}\` now, before typing `
   + "here: a message typed in this terminal keeps it on an older branch of the conversation.";
@@ -225,7 +225,10 @@ async function reportWriterLeaf($) {
 async function current($) {
   const [session, cwd] = await Promise.all([$.session.id(), $.session.cwd()]);
   if (ending && session === identity?.session) return null;
-  if (!identity || session !== identity.session || cwd !== identity.cwd) rotate(session, cwd);
+  // A conversation is its session. A `cd` moves the working folder Claude Code reports, while the
+  // session stays registered with the folder it started in: this process goes on speaking for it
+  // from there, or every registration would be refused as another folder's.
+  if (!identity || session !== identity.session) rotate(session, cwd);
   return identity;
 }
 
@@ -499,15 +502,16 @@ export function registerControl(on) {
     return result;
   });
   on("prompt.submit", async ($, e, next) => {
-    // While the conversation's writer is elsewhere, this terminal continues an older branch, or
-    // the daemon has not yet said which, no prompt may continue the conversation here: the
-    // person's stays in the box with the reason (Claude Code keeps a dropped prompt), and web
-    // input this plugin carries is reported as not sent. Slash commands run in the terminal
-    // itself. Claude Code passes a prompt whose hook throws, so a failure here holds it instead.
-    // On an older branch the person may continue knowingly: the same message submitted again
-    // at this prompt goes through as typed, and nothing else is added.
+    // While the conversation's writer is elsewhere, or this terminal continues an older branch,
+    // no prompt may continue the conversation here: the person's stays in the box with the reason
+    // (Claude Code keeps a dropped prompt), and web input this plugin carries is reported as not
+    // sent. Slash commands run in the terminal itself. Only such a definite answer holds a
+    // prompt: one that agit couldn't get, whatever the reason, goes ahead, because what a person
+    // typed must never be lost to an answer nobody has. On an older branch the person may continue
+    // knowingly: the same message submitted again at this prompt goes through as typed, and
+    // nothing else is added.
     if (ending || e.command || supervised) return next(e);
-    let reason = CHECKING;
+    let reason = null;
     try {
       const target = await current($);
       if (target && !lease.known) {
@@ -515,6 +519,7 @@ export function registerControl(on) {
           new Promise(resolve => setTimeout(resolve, LEASE_FIRST_ANSWER_MS))]);
       }
       reason = holding();
+      if (reason === CHECKING) reason = null;
       if (reason && lease.stale && !lease.continued && e.origin?.kind === "composer") {
         if (lease.offered === e.text) {
           lease.continued = true;
@@ -528,8 +533,8 @@ export function registerControl(on) {
       if (reason) lease.typed = true;
       showHold($);
     } catch {
-      // The reason stays CHECKING: whether another process writes is not known.
-      if (lease) lease.typed = true;
+      // Whether another process writes is not known, so the prompt goes ahead.
+      reason = null;
     }
     return reason ? { drop: reason } : next(e);
   });
