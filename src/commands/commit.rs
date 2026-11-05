@@ -1189,8 +1189,9 @@ struct Chunk {
     end_byte: usize,
     /// Native completions can share a user turn without changing its public ordinal.
     user_turn: Option<u32>,
-    /// The first line of the user prompt (truncated to 72).
-    gist: String,
+    /// The text of the turn's first user prompt. The commit subject is cut from it only after the
+    /// whole prompt is protected.
+    prompt: String,
     events: usize,
     dropped: usize,
     /// When the turn's last timestamped native event happened, in Unix seconds.
@@ -1510,15 +1511,14 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
             .filter_map(native_time)
             .max();
         chunks.push(end_byte.map(|e| {
-            let gist = chain
-                .turns
-                .get(i)
-                .map(|t| t.gist.clone())
-                .unwrap_or_default();
+            let members: Vec<_> = g.iter().map(|&j| &ir.events[j]).collect();
+            let prompt = crate::domain::turn::prompt_of(&members)
+                .unwrap_or_default()
+                .to_owned();
             Chunk {
                 end_byte: e,
                 user_turn: None,
-                gist,
+                prompt,
                 events,
                 dropped,
                 ended_at,
@@ -1543,7 +1543,7 @@ fn turn_chunks(region: &str, ir: &Session, open: &[OpenCall]) -> Vec<Chunk> {
         out.push(Chunk {
             end_byte: c.end_byte,
             user_turn: None,
-            gist: c.gist.clone(),
+            prompt: c.prompt.clone(),
             events: c.events,
             dropped: c.dropped,
             ended_at: c.ended_at,
@@ -1663,7 +1663,7 @@ fn completed_turn_chunks(
             completed.push(Chunk {
                 end_byte,
                 user_turn: Some(0),
-                gist: String::new(),
+                prompt: String::new(),
                 events: 0,
                 dropped: 0,
                 ended_at: ended_within(covered, end_byte),
@@ -1701,7 +1701,7 @@ fn completed_turn_chunks(
             completed.push(Chunk {
                 end_byte,
                 user_turn: Some(index as u32 + 1),
-                gist: chunk.gist.clone(),
+                prompt: chunk.prompt.clone(),
                 events: chunk.events,
                 dropped: chunk.dropped,
                 ended_at: ended_within(covered, end_byte),
@@ -3372,17 +3372,32 @@ fn settle_bytes(
                 }
             };
         }
-        let subject = {
-            let one = c.gist.split_whitespace().collect::<Vec<_>>().join(" ");
-            let s: String = one.chars().take(72).collect();
-            if s.is_empty() {
-                format!("agit: turn #{turn_no}")
-            } else {
-                s
+        // The message is assembled from protected parts: the subject is cut from the protected
+        // prompt, the milestone line is the protected milestone, and the code line is a commit
+        // id. Plain publication sends this message as written. The pass over the assembled
+        // message is a backstop for a part added without protection; it cannot repair a cut
+        // through a raw value, which is why the prompt is protected before the subject is cut.
+        let prompt = if c.prompt.trim().is_empty() {
+            String::new()
+        } else {
+            match privacy::protect_for_commit(
+                Some(repo.root()),
+                &c.prompt,
+                PrivacyMode::ProtectText,
+            ) {
+                Ok(prompt) => prompt,
+                Err(pending) => {
+                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
+                }
             }
         };
-        let mut msg = subject.clone();
-        if milestone_here && let Some(m) = &opts.milestone {
+        let subject = crate::domain::turn::gist_of(&prompt);
+        let mut msg = if subject.is_empty() {
+            format!("agit: turn #{turn_no}")
+        } else {
+            subject
+        };
+        if let Some(m) = &snap.milestone {
             msg.push_str(&format!("\n\nmilestone: {m}"));
         }
         if i + 1 == total
@@ -3464,7 +3479,7 @@ fn settle_bytes(
         let protected_subject = protected_message
             .lines()
             .next()
-            .unwrap_or(&subject)
+            .unwrap_or_default()
             .to_owned();
         landed.push((turn_no, protected_subject, last_sha.clone()));
     }

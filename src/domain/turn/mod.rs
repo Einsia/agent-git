@@ -282,6 +282,30 @@ pub fn groups_of(session: &Session) -> Vec<Vec<usize>> {
     groups
 }
 
+/// The text of a turn's first user prompt, which its gist summarizes.
+pub fn prompt_of<'a>(events: &[&'a Event]) -> Option<&'a str> {
+    events
+        .iter()
+        .find(|e| e.kind == EventKind::UserPrompt)
+        .and_then(|e| e.text.as_deref())
+}
+
+/// The one-line summary of a prompt: its words on one line, cut after the first sixty
+/// characters, or before a placeholder the cut would split, so the summary never shows half of
+/// one. A caller that publishes the summary protects the whole prompt first and cuts the
+/// protected text, because a cut through a value leaves a fragment no rule matches any more.
+pub fn gist_of(prompt: &str) -> String {
+    let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some((cut, _)) = one_line.char_indices().nth(60) else {
+        return one_line;
+    };
+    let kept = crate::domain::privacy::detector::placeholder::token_segments(&one_line)
+        .take_while(|(start, _, _)| *start < cut)
+        .find_map(|(start, end, _)| (end > cut).then_some(start))
+        .map_or(&one_line[..cut], |start| one_line[..start].trim_end());
+    format!("{kept}…")
+}
+
 /// Cut turns out of the IR and compute the chain.
 pub fn chain_of(session: &Session) -> Chain {
     let mut turns = vec![];
@@ -291,20 +315,7 @@ pub fn chain_of(session: &Session) -> Chain {
         let g: Vec<&Event> = idx.iter().map(|&j| &session.events[j]).collect();
         let hash = turn_hash(parent.as_deref(), &normalize(&g));
 
-        let gist = g
-            .iter()
-            .find(|e| e.kind == EventKind::UserPrompt)
-            .and_then(|e| e.text.as_deref())
-            .map(|t| {
-                let one_line = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                let s: String = one_line.chars().take(60).collect();
-                if one_line.chars().count() > 60 {
-                    format!("{s}…")
-                } else {
-                    s
-                }
-            })
-            .unwrap_or_default();
+        let gist = prompt_of(&g).map(gist_of).unwrap_or_default();
 
         turns.push(Turn {
             index: i + 1,
