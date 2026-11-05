@@ -8,6 +8,59 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.41] - 2026-11-06
+
+### Added
+
+- When a session that `agit run`, `agit resume` or `agit fork` started ends, agit says in one line how many turns it
+  saved and whether they were uploaded, are still uploading, or why not.
+- The Hub can ask a computer to make and bind a new ~/AgentGit/<organization>/<repository> folder for a project.
+- `agit rc start --here` can add the folder as a project after one question, so sessions started there from then on
+  upload to a new private repository; `agit off` now also stops the uploads of a folder added on the website.
+
+### Changed
+
+- When an installed agit waits for the running remote-control daemon to hand over, `agit rc local status` and the menu
+  bar say what it waits for.
+- Automatic upload into a public repository can be turned on with `--yes`, by an agent too; the menu bar then tells you
+  once that it was turned on and where to turn it off.
+- Commands no longer stop to ask about an update. They show a one-line hint and run; `agit upgrade` installs it.
+- Commands you granted with `agit rc grant` stop applying to operators once an operator approves a file change in that
+  workspace; granting again restores them. In a workspace bound at or above the home folder, only the owner can preview
+  files, see local sessions or send messages, and its approvals go to the owner.
+- `agit push` protects each record and commit message it adds the same way saving a turn does today, leaves what the Hub
+  already holds as it is, and `agit status` shows an upload the privacy check is holding back.
+- When a command makes a repository public, agit says that a public repository may appear on the Hub homepage and in
+  recommendations.
+
+### Fixed
+
+- In the menu bar, an action that fails stays in view with agit's full reason until you dismiss it or it succeeds, and
+  is notified when the menu is closed; Add a folder stays open until the folder is on.
+- Recording a session no longer fails on filesystems that refuse to rename an open file, such as BeeGFS.
+- Claude Code no longer loses a prompt when agit can't get an answer on whether another process writes the conversation.
+- A saved turn's commit message now uses the same protected text as the turn itself, for its subject and for its
+  milestone line.
+- The background service no longer exits without a trace when a client or child process goes away while it's writing to
+  them.
+- When agit cannot read a repository's branch list from the Hub, the error now says why (for example that it did not
+  answer in time) instead of reporting broken publication history, and a slow answer is retried rather than stopping the
+  upload.
+- `agit distill` says before asking, not after, when a memory file stays on this computer because your allowlist doesn't
+  include it, and both it and `agit memory status` name the command that allows it.
+- A merge or runtime switch of a Codex session whose next turn has just started is no longer refused; a record type agit
+  doesn't know is named, and the refusal says the turns stay saved on this computer and gives an upgrade step that works
+  in this install.
+- `agit resume` checks the Hub for the branch before continuing it, so a teammate's pushed turns are included and a
+  branch that exists only on the Hub can be continued if you can write to it; when the Hub can't be reached it says so
+  and continues from this computer's copy.
+- A new conversation whose first save waited for a slow privacy check is saved normally on the next try.
+- Values that look like credentials stay replaced in more places a session is published from, and source references such
+  as file paths and variable names are no longer replaced by mistake.
+- `agit distill` no longer puts back a file the session never changed over a teammate's newer version; changes to
+  different lines are merged, and changes to the same line stop with both versions shown until you choose
+  (`--take-mine`).
+
 ## [0.2.40] - 2026-11-05
 
 ### Added
