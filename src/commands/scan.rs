@@ -290,11 +290,11 @@ pub fn run(args: Args) -> CmdResult {
             ));
         }
         ui::hint(
-            "· this scan is advisory: `agit push` does not scan or block, and publishes these values as they are",
+            "· this scan is advisory: `agit push` does not run it or stop on its findings. A push replaces what today's rules recognize in the session records and commit messages it adds; files and tag messages go out as they are",
         );
         match &records {
             Some(_) => ui::hint(&format!(
-                "· not a credential? `agit secrets allow <record> --repo {}`, then scan again",
+                "· only if you know the value is yours and it is not a credential: `agit secrets allow <record> --repo {}`, then scan again",
                 repo.root().display()
             )),
             None => ui::hint(
