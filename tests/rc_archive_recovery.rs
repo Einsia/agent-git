@@ -663,3 +663,204 @@ async fn a_landing_that_waited_for_the_privacy_check_lands_again_and_archives() 
         "the first landing met a worker that missed its start-up"
     );
 }
+
+/// A job an earlier build queued with its end past the reply, after the `stop_hook_summary`
+/// Claude Code writes once its Stop hooks return, finishes: its turn ends where settlement ends
+/// it, at the reply, and the archive commit that stops there covers it. The hook record, here
+/// with a hook's error output, is not archived and stays in the transcript past the archived
+/// end. A coverage check that compared the recorded end alone retried the job for as long as the
+/// conversation stayed idle.
+#[test]
+fn a_job_queued_past_the_reply_finishes_at_settlements_end_of_the_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let cwd = root.join("workspace");
+    let home = root.join("agit-home");
+    let rc = home.join("desktop-rc");
+    let runtime_home = root.join("runtime-home");
+    for path in [&cwd, &rc, &runtime_home] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    startup_cache::seed(&home);
+    let machine = "00000000-0000-0000-0000-000000000041";
+    let repository_id = "00000000-0000-0000-0000-000000000042";
+    let native = "00000000-0000-0000-0000-000000000043";
+    let branch = "conversation";
+    let slug = "desktop-fixture/project";
+    let lineage = format!("{slug}@{branch}");
+    let repo = home.join("repos").join(slug);
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(rc.join("identity.json"), serde_json::json!({
+        "machine_fingerprint":machine,"display_name":"fixture","created_at":"2026-01-01T00:00:00Z"
+    }).to_string()).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "agit.desktopIdentity", repository_id]);
+    git(&[
+        "config",
+        "agit.desktopAuthority",
+        &format!("local:{machine}"),
+    ]);
+    git(&["config", "agit.autoPush", "false"]);
+    let transcript_dir = runtime_home
+        .join(".claude/projects")
+        .join(agit::adapter::claude_code::slug_for(&cwd));
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    let transcript = transcript_dir.join(format!("{native}.jsonl"));
+    let hook_output = "hook-error-output-that-stays-local";
+    // The shape of a stuck conversation: the reply, then the Stop hooks' summary, then records
+    // with no time.
+    let reply = [
+        serde_json::json!({"type":"user","sessionId":native,"uuid":"u","cwd":cwd,"message":{"role":"user","content":"inspect the project"}}),
+        serde_json::json!({"type":"assistant","sessionId":native,"uuid":"f","parentUuid":"u","message":{"role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"inspection completed"}]}}),
+    ];
+    let hook = serde_json::json!({"type":"system","subtype":"stop_hook_summary","sessionId":native,"uuid":"h","parentUuid":"f","cwd":cwd,"hookCount":1,"hookInfos":[{"command":"check"}],"hookErrors":[hook_output],"preventedContinuation":false,"stopReason":"","hasOutput":true,"level":"suggestion","isSidechain":false});
+    let after = [
+        serde_json::json!({"type":"last-prompt","lastPrompt":"inspect the project","sessionId":native}),
+        serde_json::json!({"type":"cost-state","sessionId":native,"totalCostUSD":0.001}),
+    ];
+    let line = |record: &serde_json::Value| format!("{record}\n");
+    let replied: String = reply.iter().map(line).collect();
+    let queued = format!("{replied}{}", line(&hook));
+    let text = format!("{queued}{}", after.iter().map(line).collect::<String>());
+    std::fs::write(&transcript, &text).unwrap();
+    let landed = command(
+        &root,
+        &[
+            "rc",
+            "land",
+            "--local-owner",
+            "--slug",
+            slug,
+            "--agent-id",
+            repository_id,
+            "--branch",
+            branch,
+            "--runtime",
+            "claude-code",
+            "--session",
+            native,
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(
+        landed.status.success(),
+        "landing: {}",
+        String::from_utf8_lossy(&landed.stderr)
+    );
+    let capture = serde_json::json!({"kind":"device_local","agent_id":repository_id});
+    // Queued as an earlier build did: its end after the hook summary.
+    let job = serde_json::json!({
+        "version":1,"logical":"logical-fixture","native":native,"runtime":"claude-code","native_source":null,
+        "cwd":cwd,"lineage":lineage,"repository_id":repository_id,"capture":capture,"turn_id":"turn-one",
+        "transcript":transcript,"prefix_bytes":queued.len(),"prefix_hash":format!("{:x}",Sha256::digest(queued.as_bytes())),
+        "required_bytes":queued.len(),"archive_handoff":null
+    });
+    let coordinates = serde_json::json!([
+        "logical-fixture",
+        "claude-code",
+        null,
+        native,
+        lineage,
+        repository_id,
+        "turn-one"
+    ]);
+    let filename = format!(
+        "{:x}.json",
+        Sha256::digest(serde_json::to_vec(&coordinates).unwrap())
+    );
+    let jobs = rc.join("pending-archives");
+    std::fs::create_dir_all(&jobs).unwrap();
+    std::fs::write(jobs.join(filename), job.to_string()).unwrap();
+    std::fs::write(
+        rc.join("workspaces.json"),
+        serde_json::json!({"workspaces":{"local-owner":{"project":cwd}}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(rc.join("sessions.json"), serde_json::json!({
+        "captures":{"logical-fixture":capture},"sessions":{"logical-fixture":{
+            "runtime":"claude-code","thread_id":native,"cwd":cwd,"workspace_id":"local-owner",
+            "agit_session":lineage,"expected_agent_id":repository_id,"prior_threads":[],"ever_dangerous":false
+        }}
+    }).to_string()).unwrap();
+    let before = git(&["rev-parse", &format!("refs/heads/{branch}")]);
+    let _stop = Stop(&root);
+    let mut started = command(&root, &["rc", "local", "start", "--detach"]);
+    started.env("AGIT_TEST_ARCHIVE_RETRY_MS", "1000");
+    let started = started.output().unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    // The first attempt's outcome: the job is settled and goes on to publication, which this
+    // repository has turned off, or it is reported as not covered.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let reported = loop {
+        let lines: Vec<String> = daemon_output(&rc)
+            .lines()
+            .filter(|line| {
+                line.starts_with("agitd: completed turn archive")
+                    && line.contains("logical-fixture")
+            })
+            .map(str::to_owned)
+            .collect();
+        if !lines.is_empty() {
+            break lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued job was never attempted\n{}",
+            daemon_output(&rc)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        !reported
+            .iter()
+            .any(|line| line.contains("does not cover the completed native turn")),
+        "{reported:#?}"
+    );
+    let head = git(&["rev-parse", &format!("refs/heads/{branch}")]);
+    assert_ne!(head, before, "{reported:#?}");
+    let (log, view) = agit::domain::storage::materialize_pair_at(&repo, &head).unwrap();
+    assert!(log.contains("inspection completed"));
+    assert!(
+        !log.contains(hook_output) && !view.contains(hook_output),
+        "the hook record is not archived"
+    );
+    let meta: serde_json::Value = serde_json::from_str(&git(&[
+        "show",
+        &format!("{head}:{}", agit::domain::meta::FILE),
+    ]))
+    .unwrap();
+    assert_eq!(
+        meta["baseline_bytes"],
+        replied.len(),
+        "settlement ends the turn at the reply"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&transcript).unwrap(),
+        text,
+        "the hook record stays in the transcript past the archived end"
+    );
+}
