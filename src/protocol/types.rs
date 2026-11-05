@@ -273,6 +273,9 @@ pub struct ProjectBind {
     pub workspace_id: String,
     pub project_id: String,
     pub local_path: String,
+    /// The folder is the Hub-named `~/AgentGit/<org>/<repo>`, made here if it's missing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1486,6 +1489,28 @@ pub struct ApprovalResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bind without `create` reads as it always did; with it, the device advertises that it
+    /// understands the flag.
+    #[test]
+    fn project_bind_creates_only_when_asked() {
+        let plain: ProjectBind = serde_json::from_value(serde_json::json!({
+            "workspace_id": "ws", "project_id": "p", "local_path": "/work/app"
+        }))
+        .unwrap();
+        assert!(!plain.create);
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({"workspace_id":"ws","project_id":"p","local_path":"/work/app"})
+        );
+        let create: ProjectBind = serde_json::from_value(serde_json::json!({
+            "workspace_id": "ws", "project_id": "p", "local_path": "~/AgentGit/acme/app", "create": true
+        }))
+        .unwrap();
+        assert!(create.create);
+        #[cfg(feature = "rc")]
+        assert!(crate::rc::build_identity::RPC_FEATURES.contains(&"project_bind_create"));
+    }
 
     #[test]
     fn an_approval_decision_requires_its_session_route_on_the_wire() {

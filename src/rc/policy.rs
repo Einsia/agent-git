@@ -212,6 +212,81 @@ pub fn require_bindable_dir(target: &Path) -> Result<PathBuf, PolicyError> {
     Ok(c)
 }
 
+/// The folder a Hub-named bind creates: `~/AgentGit/<org>/<repo>` under `home`, made if missing.
+///
+/// Every component under the home is checked as it is made or found: a real directory, never a
+/// symlink, so nothing resolves outside `~/AgentGit`. The repository folder must be new, empty, or
+/// `bound`, the folder this project is already bound to. Returns the folder, which still goes
+/// through [`require_bindable_dir`] when it is bound.
+pub fn prepare_hub_named_folder(
+    home: &Path,
+    local_path: &str,
+    bound: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let named = local_path
+        .strip_prefix("~/")
+        .ok_or_else(|| format!("{local_path} is not a folder under ~/{HUB_NAMED_ROOT}"))?;
+    let parts: Vec<&str> = named.split('/').collect();
+    // One plain name each: no separator, no drive or verbatim prefix (`C:` replaces the home
+    // when a Windows path is joined), nothing that isn't a single normal component.
+    let valid = |part: &str| {
+        !part.contains(['\\', '\0', ':'])
+            && matches!(
+                Path::new(part).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(name)] if *name == std::ffi::OsStr::new(part)
+            )
+    };
+    if parts.len() != 3 || parts[0] != HUB_NAMED_ROOT || !parts.iter().all(|part| valid(part)) {
+        return Err(format!(
+            "{local_path} is not a folder named ~/{HUB_NAMED_ROOT}/<organization>/<repository>"
+        ));
+    }
+    let home = std::fs::canonicalize(home).map_err(|e| format!("the home folder: {e}"))?;
+    let mut dir = home.clone();
+    let mut created = false;
+    for part in &parts {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => created = false,
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a plain folder, so nothing is created or bound there",
+                    dir.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                created = true;
+            }
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        }
+    }
+    let resolved = std::fs::canonicalize(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if !resolved.starts_with(home.join(HUB_NAMED_ROOT)) {
+        return Err(format!(
+            "{} resolves outside ~/{HUB_NAMED_ROOT}",
+            dir.display()
+        ));
+    }
+    let already = bound
+        .and_then(|bound| std::fs::canonicalize(bound).ok())
+        .is_some_and(|bound| bound == resolved);
+    if !created && !already {
+        let mut entries =
+            std::fs::read_dir(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+        if entries.next().is_some() {
+            return Err(format!(
+                "{} already holds files and isn't this project's folder, so it isn't bound",
+                resolved.display()
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+/// The folder under the home that Hub-named project folders live in.
+pub const HUB_NAMED_ROOT: &str = "AgentGit";
+
 /// Is a path one of the unbindable roots on the list?
 ///
 /// # Why it compares **twice**
@@ -6121,5 +6196,92 @@ mod tests {
                 "a spelling that does not resolve must not fold into /Users as a root"
             );
         }
+    }
+
+    /// A Hub-named folder is made under `~/AgentGit` and handed back resolved; a second bind of
+    /// the same, now non-empty folder for its own project is fine.
+    #[test]
+    fn a_hub_named_folder_is_made_under_agentgit() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = prepare_hub_named_folder(home.path(), "~/AgentGit/acme/app", None).unwrap();
+        let expected = std::fs::canonicalize(home.path())
+            .unwrap()
+            .join("AgentGit/acme/app");
+        assert_eq!(dir, expected);
+        assert!(dir.is_dir());
+        // An existing empty folder of that name is fine too.
+        assert_eq!(
+            prepare_hub_named_folder(home.path(), "~/AgentGit/acme/app", None).unwrap(),
+            expected
+        );
+        std::fs::write(dir.join("notes.md"), "kept").unwrap();
+        assert_eq!(
+            prepare_hub_named_folder(home.path(), "~/AgentGit/acme/app", Some(&dir)).unwrap(),
+            expected
+        );
+    }
+
+    /// Only `~/AgentGit/<org>/<repo>` itself: no other place, no escape, and no folder that
+    /// already holds someone's files.
+    #[test]
+    fn a_hub_named_folder_refuses_any_other_place() {
+        let home = tempfile::tempdir().unwrap();
+        for path in [
+            "/tmp/acme/app",
+            "~/Documents/acme/app",
+            "~/AgentGit/acme",
+            "~/AgentGit/acme/app/extra",
+            "~/AgentGit/../acme/app",
+            "~/AgentGit/acme/..",
+            "~/AgentGit/./app",
+            "~/AgentGit//app",
+            "~/AgentGit/C:/app",
+            "~/AgentGit/acme/C:",
+            "~/AgentGit/acme/C:app",
+        ] {
+            assert!(
+                prepare_hub_named_folder(home.path(), path, None).is_err(),
+                "{path}"
+            );
+        }
+        assert!(!home.path().join("acme").exists());
+        // ~/AgentGit is a file, not a folder.
+        let file_home = tempfile::tempdir().unwrap();
+        std::fs::write(file_home.path().join("AgentGit"), "not a folder").unwrap();
+        assert!(prepare_hub_named_folder(file_home.path(), "~/AgentGit/acme/app", None).is_err());
+        // A folder of that name that already holds files, bound to nothing here.
+        let taken = home.path().join("AgentGit/acme/taken");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("private.txt"), "theirs").unwrap();
+        let refused =
+            prepare_hub_named_folder(home.path(), "~/AgentGit/acme/taken", None).unwrap_err();
+        assert!(refused.contains("already holds files"), "{refused}");
+        let other = home.path().join("AgentGit/acme/other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(
+            prepare_hub_named_folder(home.path(), "~/AgentGit/acme/taken", Some(&other)).is_err()
+        );
+    }
+
+    /// A symlink anywhere on the way, pointing out of `~/AgentGit`, is refused, and nothing is made
+    /// where it points.
+    #[cfg(unix)]
+    #[test]
+    fn a_hub_named_folder_refuses_a_symlink_on_the_way() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("AgentGit")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.path().join("AgentGit/acme")).unwrap();
+        assert!(prepare_hub_named_folder(home.path(), "~/AgentGit/acme/app", None).is_err());
+        assert!(!outside.path().join("app").exists());
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("AgentGit/org")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join("AgentGit/org/app")).unwrap();
+        assert!(prepare_hub_named_folder(home.path(), "~/AgentGit/org/app", None).is_err());
+        // ~/AgentGit itself a symlink out.
+        let home2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), home2.path().join("AgentGit")).unwrap();
+        assert!(prepare_hub_named_folder(home2.path(), "~/AgentGit/acme/app", None).is_err());
+        assert!(!outside.path().join("acme").exists());
     }
 }

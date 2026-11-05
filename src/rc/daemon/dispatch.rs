@@ -70,7 +70,16 @@ impl Daemon {
 
             method::PROJECT_BIND => {
                 let p: ProjectBind = f.params_as()?;
-                let path = PathBuf::from(&p.local_path);
+                let path = if p.create {
+                    let home = crate::infra::config::user_home().ok_or_else(|| {
+                        RpcError::new(ErrorCode::PathNotAllowed, "this machine has no home folder")
+                    })?;
+                    let bound = self.mirror.project_path(&p.workspace_id, &p.project_id);
+                    policy::prepare_hub_named_folder(&home, &p.local_path, bound.as_deref())
+                        .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e))?
+                } else {
+                    PathBuf::from(&p.local_path)
+                };
                 // Only binding widens project access; browsing a parent does not authorize it.
                 let dir = self
                     .mirror

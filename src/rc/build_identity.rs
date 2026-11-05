@@ -21,6 +21,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "native-claude-control-v1",
     "codex-turn-interrupt-fence-v1",
     "project-publication-bind-v1",
+    "project_bind_create",
     "source-catalog-v1",
     "source-catalog-resolve-v1",
     "source-catalog-delta-v1",
