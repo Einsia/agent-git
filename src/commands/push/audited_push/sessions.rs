@@ -249,9 +249,13 @@ pub(super) fn run(
         !(person_only && automatic),
         "{repository} is public and you write to it as a member of its organization; automatic upload does not publish there, push it yourself"
     );
-    let mut remote =
-        crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
-            .context("cannot establish accepted publication history")?;
+    let mut remote = crate::hub::git::FrozenPublication::read_advertised_refs(
+        &repo,
+        &intent.url,
+        &identity,
+        crate::hub::git::PUBLICATION_REF_READ,
+    )
+    .map_err(|cause| crate::commands::push::branch_list_unread(&repository, cause))?;
     let implicit_main = !args.all && !branches.iter().any(|branch| branch == "main");
     // A branch the Hub refused as withdrawn stays in this checkout and out of later
     // publications, or every push would meet the same refusal. Naming it asks again, since the
@@ -1103,9 +1107,13 @@ pub(super) fn run(
         }
         // The next part is planned from what the Hub now holds, not from the first plan.
         let previous = cuts.first().cloned();
-        remote =
-            crate::hub::git::FrozenPublication::advertised_refs_for(&repo, &intent.url, &identity)
-                .context("cannot establish accepted publication history")?;
+        remote = crate::hub::git::FrozenPublication::read_advertised_refs(
+            &repo,
+            &intent.url,
+            &identity,
+            crate::hub::git::PUBLICATION_REF_READ,
+        )
+        .map_err(|cause| crate::commands::push::branch_list_unread(&repository, cause))?;
         if cuts.len() > 1 {
             (cuts, _) = plan_parts(&repo, &remote, &part_branches[0])
                 .map_err(|error| inconsistent(error, unsent_outcome(&target, published, total)))?;
