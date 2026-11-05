@@ -69,7 +69,20 @@ fn to_json<T: Serialize>(v: &T) -> String {
 
 /// The content address of `content`. The single implementation point of a frozen algorithm.
 pub fn object_hash(content: &serde_json::Value) -> String {
-    hex::encode(Sha256::digest(to_json(content).as_bytes()))[..40].to_string()
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, content)
+        .unwrap_or_else(|error| unreachable!("serialization cannot fail here: {error}"));
+    hex::encode(writer.0.finalize())[..40].to_string()
 }
 
 /// Wrap live transcript text into envelope text: one envelope per parseable line, `\n`-terminated.
@@ -325,6 +338,15 @@ mod tests {
         // `arbitrary_precision` is added, `1e0` is kept verbatim and this fails at once.
         let v: Value = serde_json::from_str(r#"{"n":1e0}"#).unwrap();
         assert_eq!(to_json(&v), r#"{"n":1.0}"#);
+        for value in [
+            v,
+            json!({"text":"quotes \" and\ncontrols", "values":[null,true,1.25]}),
+        ] {
+            assert_eq!(
+                object_hash(&value),
+                hex::encode(Sha256::digest(to_json(&value).as_bytes()))[..40]
+            );
+        }
     }
 
     // ── wire shape ─────────────────────────────────────────────────────

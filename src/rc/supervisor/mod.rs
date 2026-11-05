@@ -1397,6 +1397,7 @@ impl Session {
                             | Reason::FindingsCap
                             | Reason::DeviceRules
                             | Reason::LegacyRules
+                            | Reason::UnsupportedScalar
                     )
                 ) || unshown.incomplete > PARTIAL_POLICY_RETRIES
                 {

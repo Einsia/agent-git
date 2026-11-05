@@ -37,6 +37,8 @@ pub enum Mode {
     FreezeHydration,
     HydrateFrozenJsonl,
     HydrationValues,
+    /// Bounded input and output pages for ordinary native restoration.
+    HydrateTransfer,
     /// Load the dictionary and the policy for a repository, under the start-up deadline, so
     /// that later requests spend their budget on content only.
     Prepare,
@@ -71,6 +73,8 @@ pub enum Reason {
     /// A legacy secret dictionary, the repository's or this computer's, could not be read whole,
     /// so a value it blocks could pass unreplaced.
     LegacyRules,
+    /// A blocked JSON scalar cannot be restored by the established string mapping format.
+    UnsupportedScalar,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,6 +206,8 @@ pub struct Projector {
     /// Why the loaded policy is incomplete, when the loader knows: reported in place of the
     /// generic [`Reason::SourceIncomplete`].
     pub missing: Option<Reason>,
+    /// Remaining expansion for a complete native event carried through bounded IPC pages.
+    pub hydration_growth: std::cell::Cell<Option<usize>>,
 }
 
 /// Recognition validates bounded token syntax before treating any text as opaque. Decoded
@@ -316,6 +322,65 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
 }
 
 impl Projector {
+    #[cfg(feature = "cli")]
+    pub(crate) fn hydrate_event(
+        &mut self,
+        text: &str,
+        mode: Mode,
+        preserve_protocol_ids: Option<bool>,
+        maximum: usize,
+        output: &mut impl std::io::Write,
+    ) -> crate::Result<Outcome> {
+        self.hydration_growth
+            .set(Some(maximum.saturating_sub(text.len())));
+        let result = (|| {
+            let mut outcome = Outcome {
+                content: String::new(),
+                status: Status::Complete,
+                replacements: 0,
+                unresolved: 0,
+                consumed: None,
+                unprocessed: 0,
+                omitted: 0,
+                reason: None,
+            };
+            if matches!(mode, Mode::HydrateText) {
+                outcome = self.hydrate(text);
+                output.write_all(outcome.content.as_bytes())?;
+                outcome.content = String::new();
+                return Ok(outcome);
+            }
+            let body = text.strip_suffix('\n').unwrap_or(text);
+            if matches!(mode, Mode::HydrateEnvelopes) {
+                let mut envelope = crate::domain::storage::parse_envelope_line(text)?;
+                let preserve_ids =
+                    preserve_protocol_ids.unwrap_or_else(|| has_wrapped_carrier(&envelope.content));
+                self.record(&mut envelope.content, true, &mut outcome, preserve_ids);
+                envelope.object_hash = crate::domain::transcript::object_hash(&envelope.content);
+                serde_json::to_writer(&mut *output, &envelope)?;
+            } else if let Ok(mut value) = serde_json::from_str::<Value>(body) {
+                let preserve_ids =
+                    preserve_protocol_ids.unwrap_or_else(|| has_wrapped_carrier(&value));
+                self.record(&mut value, true, &mut outcome, preserve_ids);
+                if outcome.replacements > 0 {
+                    serde_json::to_writer(&mut *output, &value)?;
+                } else {
+                    output.write_all(body.as_bytes())?;
+                }
+            } else {
+                outcome = self.hydrate(body);
+                output.write_all(outcome.content.as_bytes())?;
+                outcome.content = String::new();
+            }
+            if text.ends_with('\n') {
+                output.write_all(b"\n")?;
+            }
+            Ok(outcome)
+        })();
+        self.hydration_growth.set(None);
+        result
+    }
+
     pub fn transform(&mut self, text: &str, mode: Mode) -> Outcome {
         self.transform_in("", text, mode)
     }
@@ -780,7 +845,7 @@ impl Projector {
                 }
                 Value::Array(values) => values
                     .iter()
-                    .find_map(|value| find(projector, value, None, false, keys_only)),
+                    .find_map(|value| find(projector, value, field, false, keys_only)),
                 Value::String(text)
                     if !keys_only && !media_payload(source && field == Some("data"), text) =>
                 {
@@ -840,10 +905,27 @@ impl Projector {
         outcome: &mut Outcome,
         context: KeyContext,
     ) {
+        self.data_keys_inner(
+            value,
+            hydrate,
+            outcome,
+            context,
+            matches!(context, KeyContext::Data | KeyContext::Content),
+        );
+    }
+
+    fn data_keys_inner(
+        &mut self,
+        value: &mut Value,
+        hydrate: bool,
+        outcome: &mut Outcome,
+        context: KeyContext,
+        scalars: bool,
+    ) {
         match value {
             Value::Array(values) => {
                 for value in values {
-                    self.data_keys(value, hydrate, outcome, context);
+                    self.data_keys_inner(value, hydrate, outcome, context, scalars);
                 }
             }
             Value::Object(values) => {
@@ -919,10 +1001,42 @@ impl Projector {
                         }
                         _ => KeyContext::Data,
                     };
-                    self.data_keys(value, hydrate, outcome, nested);
+                    let payload = matches!(
+                        name.as_str(),
+                        "input" | "arguments" | "output" | "content" | "structuredContent"
+                    );
+                    self.data_keys_inner(
+                        value,
+                        hydrate,
+                        outcome,
+                        nested,
+                        scalars
+                            && !matches!(nested, KeyContext::Source)
+                            && (!schema.contains(&name.as_str()) || payload),
+                    );
                 }
             }
+            Value::Number(_) | Value::Bool(_) if scalars && !hydrate => {
+                self.protect_scalar(value, outcome);
+            }
             _ => {}
+        }
+    }
+
+    /// Only explicit literals classify non-string data. Native schema values never enter this
+    /// path; replacing control flags or counters would change the runtime's interpretation.
+    fn protect_scalar(&mut self, value: &mut Value, outcome: &mut Outcome) {
+        let original = value.to_string();
+        let batch = self.policy.scalar_findings(&original, MAX_FINDINGS);
+        if !self.complete || !batch.complete {
+            outcome.status = Status::Partial;
+            outcome.reason = self.missing.or(Some(Reason::SourceIncomplete));
+        }
+        if !batch.findings.is_empty() {
+            // A string placeholder cannot restore a JSON scalar's type on existing readers.
+            // Refuse capture instead of publishing the value or silently changing its type.
+            outcome.status = Status::Partial;
+            outcome.reason = Some(Reason::UnsupportedScalar);
         }
     }
 
@@ -954,7 +1068,7 @@ impl Projector {
             }
             Value::Array(values) => {
                 for value in values {
-                    self.value(value, hydrate, outcome, None, false, false);
+                    self.value(value, hydrate, outcome, field, false, false);
                 }
             }
             Value::Object(values) => {
@@ -1266,10 +1380,24 @@ impl Projector {
         };
         let mut cursor = 0;
         for (start, end, token) in tokens(text) {
-            if let Some(record) = self.dictionary.get(token).filter(|record| {
-                outcome.content.len() + start - cursor + record.original.len() + text.len() - end
-                    <= MAX_UNIT_BYTES
-            }) {
+            let record = self.dictionary.get(token).filter(|record| {
+                if let Some(remaining) = self.hydration_growth.get() {
+                    let available = remaining
+                        .checked_add(end - start)
+                        .and_then(|room| room.checked_sub(record.original.len()));
+                    let Some(available) = available else {
+                        outcome.reason = Some(Reason::Oversize);
+                        return false;
+                    };
+                    self.hydration_growth.set(Some(available));
+                    true
+                } else {
+                    outcome.content.len() + start - cursor + record.original.len() + text.len()
+                        - end
+                        <= MAX_UNIT_BYTES
+                }
+            });
+            if let Some(record) = record {
                 outcome.content.push_str(&text[cursor..start]);
                 outcome.content.push_str(&record.original);
                 outcome.replacements += 1;
@@ -1281,7 +1409,7 @@ impl Projector {
         outcome.content.push_str(&text[cursor..]);
         if outcome.unresolved > 0 || !self.complete {
             outcome.status = Status::Partial;
-            outcome.reason = self.missing;
+            outcome.reason = outcome.reason.or(self.missing);
         }
         outcome
     }
@@ -1305,6 +1433,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let quoted = "quoted \" private value\nwith \\ escapes";
@@ -1421,6 +1550,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let calls = json!([{"id":id,"function":{"name":"read","arguments":{"id":id}}}]);
@@ -1464,6 +1594,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let secret = "registered-private-value";
@@ -1568,6 +1699,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let first = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let second = "call_n8Rp2Va6Jx4Bt9Ls3Wq7Mc1Z";
@@ -1648,7 +1780,8 @@ mod tests {
     /// A credential-named field's whole decoded value is one finding, punctuation included,
     /// unless the user allowed that value. A field context fed to the detector as an unquoted
     /// assignment would end the value at `;` and publish the rest; a whole-value rule that
-    /// ignored allows would override the user's decision.
+    /// ignored allows would override the user's decision. Lists retain their field's context,
+    /// but object members establish their own context instead of inheriting a list's name.
     #[test]
     fn credential_named_fields_replace_their_whole_decoded_value() {
         let root = tempfile::tempdir().unwrap();
@@ -1659,23 +1792,92 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let password = "c7Zq4xR2mNv8LpT3;mNv8L\"pT3!wYb6Ks1Hd9Fg5Jt0";
-        let record = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{"passwd":password,"file_path":"/tmp/c7Zq4xR2.cfg"}}]}});
+        let opaque = "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe";
+        let record = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{
+            "passwd":password,"passwords":[password],"file_path":"/tmp/c7Zq4xR2.cfg",
+            "api_keys":[opaque,[opaque],{"label":opaque},42,true],"references":[opaque]
+        }}]}});
         let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
         for piece in ["c7Zq4xR2mNv8LpT3", "mNv8L", "pT3!wYb6"] {
             assert!(!protected.content.contains(piece), "{}", protected.content);
         }
         assert!(protected.content.contains("/tmp/c7Zq4xR2.cfg"));
+        let value: Value = serde_json::from_str(&protected.content).unwrap();
+        let input = &value["message"]["content"][0]["input"];
+        assert!(whole_token(input["passwords"][0].as_str().unwrap()));
+        assert!(whole_token(input["api_keys"][0].as_str().unwrap()));
+        assert!(whole_token(input["api_keys"][1][0].as_str().unwrap()));
+        assert_eq!(input["api_keys"][2]["label"], opaque);
+        assert_eq!(input["api_keys"][3], 42);
+        assert_eq!(input["api_keys"][4], true);
+        assert_eq!(input["references"], json!([opaque]));
         let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
         assert_eq!(
             serde_json::from_str::<Value>(&restored.content).unwrap(),
             record
         );
-        projector.policy = Snapshot::compile(&[], &[password], false).unwrap();
+        projector.policy = Snapshot::compile(&[], &[password, opaque], false).unwrap();
         let allowed = projector.transform(&record.to_string(), Mode::ProtectJsonl);
         assert_eq!(
             serde_json::from_str::<Value>(&allowed.content).unwrap(),
+            record
+        );
+    }
+
+    /// A blocked scalar cannot be persisted using string-only placeholders. Native controls
+    /// remain untouched, and encoded JSON can use an existing whole-carrier mapping.
+    #[test]
+    fn blocked_data_scalars_refuse_capture_without_changing_native_controls() {
+        let root = tempfile::tempdir().unwrap();
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &["72836491", "false", "1.2300"].map(|value| super::super::policy::Literal {
+                    value,
+                    source: Source::RepositoryUser,
+                }),
+                &[],
+                false,
+            )
+            .unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+            hydration_growth: Default::default(),
+        };
+        for scalar in [json!(72836491), json!(false), json!(1.23)] {
+            let record = json!({"type":"assistant","uuid":"72836491","isMeta":false,
+                "message":{"role":"assistant","usage":{"input_tokens":72836491},
+                "content":[{"type":"tool_use","id":"call","name":"Inspect","input":{"value":[scalar]}}]}});
+            let refused = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert!(refused.status == Status::Partial);
+            assert_eq!(refused.reason, Some(Reason::UnsupportedScalar));
+            assert_eq!(
+                serde_json::from_str::<Value>(&refused.content).unwrap(),
+                record
+            );
+        }
+        let record = json!({"type":"assistant","uuid":"72836491","isMeta":false,
+            "message":{"role":"assistant","usage":{"input_tokens":72836491},"content":"ordinary text"}});
+        let accepted = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        assert!(accepted.status == Status::Complete);
+        assert_eq!(
+            serde_json::from_str::<Value>(&accepted.content).unwrap(),
+            record
+        );
+        let encoded = r#"{ "number" : 72836491, "flag" : false }"#;
+        let record = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":encoded}});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        assert!(protected.status == Status::Complete);
+        assert!(!protected.content.contains("72836491"));
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        assert!(restored.status == Status::Complete);
+        assert_eq!(
+            serde_json::from_str::<Value>(&restored.content).unwrap(),
             record
         );
     }
@@ -1712,6 +1914,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         // Unicode is fixture data exercising decoded JSON member names.
         let data = json!({private: "first", "message": [{"type":"assistant","message":{private: "second"}}]});
@@ -1730,8 +1933,11 @@ mod tests {
             serde_json::to_string(escaped).unwrap()
         );
         let argument_value = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":value_encoded}});
+        let array_encoded =
+            r#"{ "api_keys" : [["\u00637Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0"]], "ordinary" : 7 }"#;
+        let argument_array = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":array_encoded}});
         let ordinary_text = format!(
-            "{{ \"ordinary\" : 7, \"note\" : {} }}",
+            "{{ \"ordinary\" : 7, \"note\" : {}, \"references\" : [\"\\u00637Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0\"] }}",
             json!("quoted \" benign")
         );
         let ordinary = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":ordinary_text}});
@@ -1748,6 +1954,7 @@ mod tests {
             &mimic,
             &arguments,
             &argument_value,
+            &argument_array,
             &ordinary,
             &unescaped,
             &nested,
@@ -1759,7 +1966,8 @@ mod tests {
             if original == &native {
                 assert!(projected["message"]["content"][0]["input"].is_object());
             }
-            if original == &arguments || original == &argument_value {
+            if original == &arguments || original == &argument_value || original == &argument_array
+            {
                 assert!(whole_token(
                     projected["payload"]["arguments"].as_str().unwrap()
                 ));
@@ -1816,6 +2024,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let secret = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         let legacy = Record {
@@ -1877,6 +2086,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let data = format!("iVBORw0KGgo{}{run}{}", "A".repeat(300), "B".repeat(300));
         let record = json!({"type":"user","message":{"role":"user","content":[
@@ -1963,6 +2173,7 @@ mod tests {
             key: None,
             complete: true,
             missing: None,
+            hydration_growth: Default::default(),
         };
         let id = "call_x7Qp9Ls2Vn4Rm8Tc6Yz3Ba1W";
         let fixtures = [
@@ -2281,6 +2492,7 @@ mod tests {
             key: None,
             complete: false,
             missing: Some(Reason::LegacyRules),
+            hydration_growth: Default::default(),
         };
         let restored =
             projector.transform("{\"text\":\"plain\"}\nplain line\n", Mode::HydrateJsonl);

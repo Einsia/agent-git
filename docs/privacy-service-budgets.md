@@ -15,6 +15,12 @@ to input it did not protect in full.
   own retry.
 - **Durable.** Settlement, import, push preparation, memory collection and share or export get a
   budget of seconds that grows with the input.
+  Privacy publication protects decoded fields under this budget, including `export --privacy`.
+  A refused export reports the worker's reason and leaves an existing output file untouched.
+  Local fallback applies the same repository and mandatory policy; a worker failure cannot
+  switch publication to default rules.
+- **Restoration.** Ordinary hydration uses the durable cap because a small placeholder can
+  expand into a large original. Live callers retain their live budget.
 - **Deadlines.** A deadline is a normal outcome. The caller stops sending at a batch boundary;
   the worker finishes the request it holds, and its late reply is recognized by its request id
   and discarded. Only a failure to spawn the worker or a malformed reply ends the worker and
@@ -38,16 +44,35 @@ to input it did not protect in full.
 | `findings_cap` | reserved: a field whose scan cannot finish is now replaced whole (below) |
 | `device_rules` | a rule this device registered under another account or Hub could not be read |
 | `legacy_rules` | the repository's legacy secret dictionary could not be read whole |
+| `unsupported_scalar` | a numeric or boolean data value matches a blocked literal and cannot use a string-only recovery mapping |
 
 `source_incomplete`, `device_rules` and `legacy_rules` content is handled like unprocessed input,
 because a value the user blocked may be left in it, and push publishes the branch as stored. For
 `device_rules`, settlement, `agit status` and `agit doctor` name the account and Hub of the
 unreadable rules: signing in to that account once caches its key and makes them readable again.
+Blocked numeric and boolean data values refuse capture with an explanation; change the data to
+a string or review the rule before retrying. Encoded JSON strings can use the existing
+whole-carrier mapping, preserving their exact scalar types without a storage format change.
+Native control flags and counters retain their schema semantics.
+
+RC history reports unavailable repository protection and unreadable device or legacy rules as
+`privacy_rules_unavailable`, with `retryable: false` and `restart: false`. Its message asks the
+user to restore repository and rule access. A blocked scalar reports `privacy_value_unsupported`
+with the same flags. Worker contention and deadlines remain transient.
 
 ## Units larger than one request
 
 A request to the worker carries at most `MAX_UNIT_BYTES`. Larger units are divided before they
 are sent, so a large record never holds a session back:
+
+- **Ordinary restoration** sends saved events and receives their originals in bounded pages.
+  The worker applies native schema and encoded-carrier rules to the complete event, using one
+  dictionary snapshot for the hydration pass. Input follows `MAX_EVENT_BYTES`; expanded output
+  follows the remaining `MAX_MATERIALIZED_BYTES` budget. Serialization uses an anonymous
+  temporary file that disappears when closed, including when the worker exits, without a named
+  plaintext recovery file. Missing mappings or expansion beyond the budget leave unresolved
+  placeholders and a partial outcome. Frozen publication hydration also pages oversized events,
+  using its retained dictionary, protocol identity policy and set of protected originals.
 
 - **Media is opaque.** A base64 media payload, the `data` of a base64 source or a
   `data:…;base64,` URI, is never scanned or replaced, in any mode: encoded bytes carry no readable
@@ -58,6 +83,13 @@ are sent, so a large record never holds a session back:
   line keeps its bytes unless something in it was replaced. A line that is still too large with
   every such string set aside, because it holds only short strings, is `oversize`: it cannot be
   divided, and its turn is refused by size rather than left pending.
+  Encoded JSON strings retain the native projector's decoded-field check. If fitting a record
+  would require removing such a carrier, the record is refused as `oversize`: plain-text
+  windows cannot establish that escaped field names and values were inspected. Media remains
+  opaque under its existing schema rules.
+- **Recovered fork envelopes** apply that JSONL protection to native content and recompute the
+  envelope's content address before storage. An indivisible record is refused with a size
+  explanation; repeating the same input is not presented as a remedy.
 - **Text too large for one request** (a memory file, a long string from such a line) is
   protected window by window. Every window carries the text before it as context, so a rule
   whose name or keyword ended the previous window still recognizes its value. A window ends

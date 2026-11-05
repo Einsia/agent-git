@@ -391,17 +391,6 @@ impl SessionProjection {
     }
 }
 
-fn contains_value(value: &Value, secret: &str) -> bool {
-    match value {
-        Value::String(value) => value.contains(secret),
-        Value::Array(values) => values.iter().any(|value| contains_value(value, secret)),
-        Value::Object(values) => values
-            .iter()
-            .any(|(key, value)| key.contains(secret) || contains_value(value, secret)),
-        _ => false,
-    }
-}
-
 pub(crate) fn public_inspection_text(
     mut public: Value,
     log: &str,
@@ -489,17 +478,9 @@ pub fn project_frozen_with_sources(
             return Ok(projection);
         }
     }
-    // Default projection has no filesystem policy dependencies; original records remain in the envelope.
-    let policy = PrivacyPolicy::default();
-    project_session(
-        &policy,
-        &mut PathAliasStore::default(),
-        branch,
-        log,
-        view,
-        metadata,
-        &Redactor::new(Default::default()),
-    )
+    // A worker budget cannot weaken repository or mandatory policy. Local evaluation keeps the
+    // same authority and exposes a persistent refusal instead of publishing under defaults.
+    project_frozen_local(repo, branch, log, view, metadata, additional)
 }
 
 fn project_frozen_local(
@@ -728,12 +709,10 @@ pub fn project_session(
             .filter(|(alias, _)| projector.used_aliases.contains(alias))
             .collect(),
     )?;
-    private.protected_values = redactor.publication_values_matching(|secret| {
-        contains_value(&private.metadata, secret)
-            || records
-                .iter()
-                .any(|record| contains_value(&record.content, secret))
-    })?;
+    // Recovery inherits actual replacements, not every remembered value that happens to occur
+    // in the original. Frozen hydration separately retains protected values hidden by policy.
+    private.protected_values =
+        redactor.publication_values_in(&[&public_log, &public_metadata.to_string()])?;
     private.validate_metadata()?;
     Ok(SessionProjection {
         source_log: Zeroizing::new(log.to_owned()),
@@ -1428,6 +1407,16 @@ impl Projector<'_> {
         context: ContentContext,
         original_attachment: bool,
     ) -> Result<Value> {
+        self.project_content_field(value, context, original_attachment, None)
+    }
+
+    fn project_content_field(
+        &mut self,
+        value: &Value,
+        context: ContentContext,
+        original_attachment: bool,
+        field: Option<&str>,
+    ) -> Result<Value> {
         if !original_attachment && is_attachment(value, context) {
             return self.attachment(value);
         }
@@ -1435,7 +1424,14 @@ impl Projector<'_> {
             Value::Array(values) => Ok(Value::Array(
                 values
                     .iter()
-                    .map(|v| self.project_content(v, ContentContext::Json, original_attachment))
+                    .map(|v| {
+                        self.project_content_field(
+                            v,
+                            ContentContext::Json,
+                            original_attachment,
+                            field,
+                        )
+                    })
                     .collect::<Result<_>>()?,
             )),
             Value::Object(fields) => {
@@ -1447,7 +1443,12 @@ impl Projector<'_> {
                         } else if matches!(key.as_str(), "attachment" | "attachments") {
                             self.attachment_values(child)?
                         } else {
-                            self.project_content(child, ContentContext::Json, original_attachment)?
+                            self.project_content_field(
+                                child,
+                                ContentContext::Json,
+                                original_attachment,
+                                Some(key),
+                            )?
                         };
                     let key = if original_attachment {
                         key.clone()
@@ -1464,7 +1465,7 @@ impl Projector<'_> {
                 }
                 Ok(Value::Object(output))
             }
-            _ => self.rewrite(value),
+            _ => self.rewrite_field(value, field),
         }
     }
 
@@ -1595,8 +1596,26 @@ impl Projector<'_> {
     }
 
     fn rewrite(&mut self, value: &Value) -> Result<Value> {
+        self.rewrite_field(value, None)
+    }
+
+    fn rewrite_field(&mut self, value: &Value, field: Option<&str>) -> Result<Value> {
         let rewritten = self.rewrite_inner(value)?;
-        let checked = self.redactor.try_scrub_json(&rewritten)?;
+        // A scalar keeps its credential field's context. The array keeps payload member names
+        // out of the native record's top-level schema, where identifiers are preserved.
+        let input = match field {
+            Some(field) => json!([{field:rewritten}]),
+            None => rewritten,
+        };
+        let mut checked = self.redactor.try_scrub_json_durable(&input)?;
+        if field.is_some() {
+            checked.value = checked.value[0]
+                .as_object()
+                .filter(|fields| fields.len() == 1)
+                .and_then(|fields| fields.values().next())
+                .cloned()
+                .context("protected field must retain its value")?;
+        }
         if self.reporting {
             self.report.secret_matches += checked.secrets;
             self.note(

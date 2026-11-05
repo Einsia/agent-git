@@ -163,7 +163,7 @@ impl PrivateLayer {
     #[cfg(feature = "cli")]
     pub(crate) fn import_protection(&self, repo: &super::repo::Repo) -> Result<()> {
         self.validate()?;
-        let _ = super::privacy::service::manage(
+        super::privacy::service::manage(
             Some(repo.root()),
             super::privacy::management::Command {
                 action: "remember".into(),
@@ -172,7 +172,8 @@ impl PrivateLayer {
                 name: None,
                 secret: Some(serde_json::to_string(&self.protected_values)?),
             },
-        );
+        )
+        .context("could not inherit recovered secret protection; retry before storing originals")?;
         Ok(())
     }
 

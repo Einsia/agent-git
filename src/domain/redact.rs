@@ -197,6 +197,44 @@ impl Withheld {
     }
 }
 
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "cli")]
+        {
+            use crate::domain::privacy::{projector::Reason, service::reason_name};
+            let detail = match self.reason {
+                Some(Reason::Deadline) => "the processing deadline expired",
+                Some(Reason::Oversize) => {
+                    "the content cannot be safely divided within the size limit"
+                }
+                Some(Reason::UnsupportedScalar) => {
+                    "a blocked numeric or boolean data value cannot use string-only recovery; use a string value or review the privacy rule"
+                }
+                Some(Reason::DeviceRules | Reason::LegacyRules | Reason::SourceIncomplete) => {
+                    "privacy rules could not be fully loaded; restore access to the rules"
+                }
+                Some(Reason::LockBusy | Reason::StoreBusy) => {
+                    "the privacy worker or dictionary is unavailable"
+                }
+                Some(Reason::Backoff) => "the privacy worker is waiting after a failure",
+                Some(Reason::SpawnFailed) => "the privacy worker could not start",
+                Some(Reason::ProtocolError) => "the privacy worker returned an invalid response",
+                Some(Reason::FindingsCap) => "the privacy scan exceeded its findings limit",
+                None => "the worker did not report a reason",
+            };
+            write!(
+                f,
+                "privacy check failed ({}): {detail}",
+                reason_name(self.reason)
+            )
+        }
+        #[cfg(not(feature = "cli"))]
+        write!(f, "privacy check did not complete")
+    }
+}
+
+impl std::error::Error for Withheld {}
+
 /// The device-local persona: "who this machine is", read out of the environment.
 #[derive(Debug, Clone, Default)]
 pub struct Persona {
@@ -373,6 +411,17 @@ impl Redactor {
             .map_err(|_| anyhow::anyhow!("privacy check pending; the value was not protected"))
     }
 
+    /// Publication must finish protection before writing output. Its processing allowance grows
+    /// with the input, and a refusal retains the worker's reason without exposing its content.
+    #[cfg(feature = "cli")]
+    pub(crate) fn try_scrub_json_durable(
+        &self,
+        value: &serde_json::Value,
+    ) -> crate::Result<JsonReport> {
+        self.protect_json_with_budget(value, true)
+            .map_err(anyhow::Error::new)
+    }
+
     #[cfg(feature = "rc")]
     pub(crate) fn for_device_control(mut self) -> Self {
         self.preserve_device_identity = true;
@@ -404,37 +453,36 @@ impl Redactor {
         }
     }
     #[cfg(feature = "secret-vault")]
-    fn dictionary_query(&self, action: &str) -> Option<serde_json::Value> {
+    pub(crate) fn publication_values_in(
+        &self,
+        texts: &[&str],
+    ) -> crate::Result<std::collections::BTreeSet<String>> {
+        let tokens = texts
+            .iter()
+            .flat_map(|text| crate::domain::privacy::projector::tokens(text))
+            .map(|(_, _, token)| token)
+            .collect::<std::collections::BTreeSet<_>>();
+        if tokens.is_empty() {
+            return Ok(Default::default());
+        }
         #[cfg(feature = "cli")]
-        return crate::domain::privacy::service::manage(
-            self.repo.as_deref(),
-            crate::domain::privacy::management::Command {
-                action: action.into(),
-                global: self.repo.is_none(),
-                id: None,
-                name: None,
-                secret: None,
-            },
-        )
-        .ok();
+        {
+            let values = crate::domain::privacy::service::manage(
+                self.repo.as_deref(),
+                crate::domain::privacy::management::Command {
+                    action: "used_values".into(),
+                    global: self.repo.is_none(),
+                    id: None,
+                    name: None,
+                    secret: Some(tokens.into_iter().collect::<Vec<_>>().join("\n")),
+                },
+            )?;
+            Ok(serde_json::from_value(values)?)
+        }
         #[cfg(not(feature = "cli"))]
         {
-            let _ = action;
-            None
+            Ok(Default::default())
         }
-    }
-    #[cfg(feature = "secret-vault")]
-    pub(crate) fn publication_values_matching(
-        &self,
-        used: impl Fn(&str) -> bool,
-    ) -> crate::Result<std::collections::BTreeSet<String>> {
-        Ok(self
-            .dictionary_query("values")
-            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|value| used(value))
-            .collect())
     }
 
     #[cfg(feature = "rc")]
@@ -908,12 +956,26 @@ impl Redactor {
 
     /// The value with every string protected, or why its privacy check did not complete.
     pub(crate) fn protect_json(&self, value: &serde_json::Value) -> Result<JsonReport, Withheld> {
+        self.protect_json_with_budget(value, false)
+    }
+
+    fn protect_json_with_budget(
+        &self,
+        value: &serde_json::Value,
+        durable: bool,
+    ) -> Result<JsonReport, Withheld> {
         #[cfg(all(test, feature = "rc"))]
         if let Some(withheld) = withheld_live(&value.to_string()) {
             return Err(withheld);
         }
         #[cfg(feature = "cli")]
-        let protected = crate::domain::privacy::service::transform_live(
+        let transform = if durable {
+            crate::domain::privacy::service::transform
+        } else {
+            crate::domain::privacy::service::transform_live
+        };
+        #[cfg(feature = "cli")]
+        let protected = transform(
             self.repo.as_deref(),
             &value.to_string(),
             crate::domain::privacy::projector::Mode::ProtectJsonl,
@@ -924,7 +986,11 @@ impl Redactor {
         }
         #[cfg(feature = "cli")]
         let mut value: serde_json::Value =
-            serde_json::from_str(&protected.content).map_err(|_| Withheld { reason: None })?;
+            serde_json::from_str(&protected.content).map_err(|_| Withheld {
+                reason: Some(crate::domain::privacy::projector::Reason::ProtocolError),
+            })?;
+        #[cfg(not(feature = "cli"))]
+        let _ = durable;
         #[cfg(not(feature = "cli"))]
         let mut value = value.clone();
         let mut totals = JsonTotals::default();

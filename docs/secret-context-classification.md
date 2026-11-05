@@ -32,11 +32,18 @@ closing quote is ambiguous with a lifetime or label unless it forms a plain
 quoted phrase; otherwise the classifier withholds syntax exemptions for that
 carrier instead of guessing its lexical state.
 
-Only entropy-only findings are excluded by these ranges. Provider patterns,
-explicitly registered secrets and credential-field discovery remain independent.
-A declaration name can be preserved while a credential in its initializer is
-still protected. There is no exemption for all CamelCase names, all strings with
-slashes, all source files or already-published history.
+These identifier ranges exclude only entropy findings. Credential assignments
+separately preserve unquoted references with verified source roles: declarations
+must begin their statement and their right-hand values must have a source-reference shape;
+type annotations require a reference-shaped terminal type name in a closed typed or executable
+source scope. Qualified paths keep their namespace segments, including module names with underscores.
+An unclosed snippet cannot exempt a following password, and a declaration keyword cannot exempt
+an opaque random value.
+Shell declaration prefixes and standalone annotations that are also
+valid YAML retain credential inspection. Provider patterns, explicitly registered
+secrets and quoted credential values remain protected independently. There is no
+exemption for all CamelCase names, all strings with slashes, all source files or
+already-published history.
 
 This is a conservative lexical classifier, not a complete parser for every
 language. Unsupported or ambiguous syntax retains entropy inspection. The token

@@ -3,6 +3,13 @@
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
+/// Protection context failures require repairing local repository access or rules.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "History privacy rules are unavailable; restore access to the linked Agent repository and its privacy rules before reloading history"
+)]
+pub(crate) struct Unavailable;
+
 pub(crate) fn native_repository(
     runtime: &str,
     native: &str,
@@ -152,7 +159,7 @@ pub(crate) fn for_native(
 ) -> crate::Result<crate::domain::redact::Redactor> {
     // Unadopted previews redact matches in place without requiring a publication repository.
     let redactor = crate::domain::redact::Redactor::try_this_machine()?.for_device_control();
-    match native_repository(runtime, native, cwd).ok().flatten() {
+    match native_repository(runtime, native, cwd)? {
         Some(root) => Ok(redactor
             .with_repository(&root)?
             .with_native_context(runtime, native, cwd, &root)),

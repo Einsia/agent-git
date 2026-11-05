@@ -206,6 +206,11 @@ impl Target<'_> {
     }
 
     fn redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
+        self.resolve_redactor()
+            .context(super::protection::Unavailable)
+    }
+
+    fn resolve_redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
         if self.context.is_none() {
             return super::protection::for_native(
                 self.runtime,
@@ -255,10 +260,7 @@ impl Target<'_> {
                     self.runtime,
                     &key,
                     std::path::Path::new(self.cwd),
-                )
-                .ok()
-                .flatten()
-                {
+                )? {
                     Some(root) => Ok(redactor.with_repository(&root)?.with_native_context(
                         self.runtime,
                         self.native,
@@ -309,11 +311,23 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     use crate::protocol::{ErrorCode, RpcError};
     let mut reason = None;
     let mut privacy = None;
+    let protection = error
+        .downcast_ref::<super::protection::Unavailable>()
+        .is_some();
     let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
+        _ if protection => ("privacy_rules_unavailable", false, false),
         Some(Failure::Missing) => ("source_missing", false, true),
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
         Some(Failure::Unsupported) => ("unsupported", false, false),
         Some(Failure::Busy) => ("busy", true, false),
+        Some(Failure::Withheld("unsupported_scalar")) => {
+            privacy = Some("unsupported_scalar");
+            ("privacy_value_unsupported", false, false)
+        }
+        Some(Failure::Withheld(withheld @ ("device_rules" | "legacy_rules"))) => {
+            privacy = Some(*withheld);
+            ("privacy_rules_unavailable", false, false)
+        }
         Some(Failure::Withheld(withheld)) => {
             reason = Some("privacy_check_pending");
             privacy = Some(*withheld);
@@ -365,7 +379,13 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     // Native paths and parser excerpts are not part of the remote error contract.
     let mut result = RpcError::new(
         ErrorCode::RuntimeUnavailable,
-        format!("History read failed ({kind})"),
+        if kind == "privacy_rules_unavailable" {
+            super::protection::Unavailable.to_string()
+        } else if kind == "privacy_value_unsupported" {
+            "History contains a blocked numeric or boolean data value; use a string value or review the privacy rule before reloading history".into()
+        } else {
+            format!("History read failed ({kind})")
+        },
     );
     let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
     if let Some(reason) = reason {
@@ -1091,6 +1111,19 @@ mod tests {
         assert_eq!(
             flags(super::super::policy::PolicyError::OutsideAllowlist("/outside".into()).into()),
             ("path_not_allowed".to_owned(), false, false, None)
+        );
+        let unavailable = anyhow::anyhow!("private path or parser excerpt")
+            .context(super::super::protection::Unavailable);
+        let response = rpc_error(unavailable);
+        assert!(response.message.contains("restore access"));
+        assert!(!response.message.contains("private path"));
+        assert_eq!(response.data.as_ref().unwrap()["retryable"], false);
+        assert_eq!(response.data.as_ref().unwrap()["restart"], false);
+        assert_eq!(
+            flags(
+                anyhow::anyhow!("private details").context(super::super::protection::Unavailable)
+            ),
+            ("privacy_rules_unavailable".to_owned(), false, false, None)
         );
         assert_eq!(
             flags(Failure::Missing.into()),

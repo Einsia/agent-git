@@ -15,6 +15,7 @@
 
 use super::CmdResult;
 use crate::domain::meta;
+use crate::domain::privacy::{projector::Mode, service as privacy};
 use crate::domain::refs::{self, RefSpec};
 use crate::domain::repo::Repo;
 use crate::domain::session_privacy::{ForkContext, ForkOrigin, SessionPrivacy};
@@ -220,6 +221,7 @@ pub fn fork_branch(
         }
         None => None,
     };
+    let recovered_originals = original.is_some();
     let (log, view) = if let Some(layer) = original {
         layer.import_protection(repo)?;
         snap = serde_json::from_value(layer.metadata.clone())?;
@@ -267,6 +269,16 @@ pub fn fork_branch(
     snap.kind = meta::Kind::File;
     // The source is named only by `source_ref`, which a publication keeps or withholds by rule.
     snap.milestone = Some("fork".into());
+    // Authorized originals become a new plain snapshot, so they cross the durable capture
+    // boundary before Git storage. Already stored context retains its existing protection.
+    let (log, view) = if recovered_originals {
+        let log = privacy::protect_for_commit(Some(repo.root()), &log, Mode::ProtectEnvelopes)?;
+        let view = privacy::protect_for_commit(Some(repo.root()), &view, Mode::ProtectEnvelopes)?;
+        privacy::protect_metadata(repo.root(), &mut snap)?;
+        (zeroize::Zeroizing::new(log), zeroize::Zeroizing::new(view))
+    } else {
+        (log, view)
+    };
     snap.layout = meta::LayoutVersion::CURRENT;
     let snap_text = meta::to_text(&snap)?;
 

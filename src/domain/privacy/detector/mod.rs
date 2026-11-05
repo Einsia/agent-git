@@ -524,6 +524,7 @@ pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
     let Some(pattern) = CREDENTIAL_ASSIGNMENT.as_ref() else {
         return Vec::new();
     };
+    let references = std::cell::OnceCell::new();
     pattern
         .captures_iter(text)
         .filter(|captures| {
@@ -547,6 +548,13 @@ pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
             })
         })
         .filter(|(value, shape)| assigned_credential(value.as_str(), *shape))
+        .filter(|(value, shape)| {
+            matches!(shape, Shape::Quoted)
+                || !references
+                    .get_or_init(|| syntax::credential_reference_regions(text))
+                    .iter()
+                    .any(|&(start, end)| start <= value.start() && value.end() <= end)
+        })
         .map(|(value, _)| (value.start(), value.end()))
         .collect()
 }
@@ -604,14 +612,22 @@ const DECLARATIONS: [&str; 7] = ["const", "let", "var", "val", "final", "mut", "
 /// whitespace on both sides. Shell, `.env`, INI and YAML assignments, including shell
 /// `local NAME=…` and YAML flow mappings, are not, whatever follows the value.
 fn code_context(text: &str, name: regex::Match<'_>, value: regex::Match<'_>) -> bool {
-    let line = text[..name.start()]
-        .rsplit(['\n', '\r'])
-        .next()
-        .unwrap_or_default();
-    let declared = line
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .rfind(|word| !word.is_empty())
-        .is_some_and(|word| line.trim_end().ends_with(word) && DECLARATIONS.contains(&word));
+    let line = syntax::statement_prefix(&text[..name.start()])
+        .replace("\\\r\n", "")
+        .replace("\\\n", "");
+    if line.split_whitespace().any(|word| {
+        matches!(
+            word,
+            "export" | "local" | "readonly" | "declare" | "typeset" | "env"
+        )
+    }) {
+        return false;
+    }
+    let declared = line.ends_with(char::is_whitespace)
+        && line
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .rfind(|word| !word.is_empty())
+            .is_some_and(|word| line.trim_end().ends_with(word) && DECLARATIONS.contains(&word));
     let between = &text[name.end()..value.start()];
     let spaced = between.starts_with([' ', '\t'])
         && between.trim_start().starts_with('=')
@@ -984,6 +1000,113 @@ pub(crate) fn scan_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credential-named source bindings and annotations retain their referenced code. The same
+    /// spelling in configuration or a quoted initializer remains a credential candidate, and
+    /// source syntax never exempts provider signatures or explicitly registered literals.
+    #[test]
+    fn credential_assignments_distinguish_source_references_from_data() {
+        for text in [
+            "interface Auth { password: PasswordFieldComponent; }",
+            "struct Auth { credential: HubCredential, }",
+            "struct Auth { pub credential: HubCredential, }",
+            "struct Auth { credential: secret_store::HubCredential, }",
+            "fn new(credential: secret_store::HubCredential)",
+            "fn new(credential: HubCredential, origin: Origin) -> Self {",
+            "async function doThing(password: PasswordFieldComponent) {}",
+            "fn main() { let password: PasswordFieldComponent; }",
+            "const password=PasswordFieldComponent;",
+            "const \\\npassword=PasswordFieldComponent;",
+            "const\\\n password = PasswordFieldComponent;",
+            "const token = OAuth2AuthenticationToken;",
+            "let mut token=OAuth2AuthenticationToken;",
+            "match key { \"secrets.keystore\" => config::SecretKeystore::parse(v).is_some(), }",
+            "let relay = super::Relay { credentials: super::Credentials {} };",
+        ] {
+            assert!(scan_high_confidence(text, 32).findings.is_empty(), "{text}");
+        }
+        for text in [
+            "password: PasswordFieldComponent",
+            "{password: PasswordFieldComponent}",
+            "PASSWORD=PasswordFieldComponent",
+            "export PASSWORD=PasswordFieldComponent",
+            "readonly PASSWORD=PasswordFieldComponent",
+            "const password=\"PasswordFieldComponent\";",
+            "{\"password\":\"PasswordFieldComponent\"}",
+            "# const password=PasswordFieldComponent;",
+            "\"const password=PasswordFieldComponent;\"",
+            "password: AbCdEfGhIjKlMnOp::Credential (value)",
+            "password: AbCdEfGhIjKlMnOp::Credential(value)",
+            "PASSWORD=AbCdEfGhIjKlMnOp::Credential(value)",
+            "password: AbCdEfGhIjKlMnOp::Credential {",
+            "/* interface Auth { */ password: PasswordFieldComponent",
+            "\"interface Auth {\"; password: PasswordFieldComponent",
+            "fn declared();\n{password: PasswordFieldComponent}",
+            "export const PASSWORD=PasswordFieldComponent",
+            "export const PASSWORD = PasswordFieldComponent;",
+            "local var PASSWORD=PasswordFieldComponent",
+            "local var PASSWORD = PasswordFieldComponent;",
+            "readonly final PASSWORD=PasswordFieldComponent",
+            "declare -r const PASSWORD=PasswordFieldComponent",
+            "export const PASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0;",
+            "local var PASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0;",
+            "export \\\nconst PASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0",
+            "export \\\nconst PASSWORD = PasswordFieldComponent;",
+            "export\\\n const PASSWORD = PasswordFieldComponent;",
+            "expor\\\nt const PASSWORD = PasswordFieldComponent;",
+            "local \\\nvar PASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0",
+            "readonly \\\r\nfinal PASSWORD = PasswordFieldComponent;",
+            "const\\\nPASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0",
+            "const\\\nPASSWORD = PasswordFieldComponent;",
+            "const\\\n\\\nPASSWORD=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0",
+            "const\\\r\nPASSWORD = PasswordFieldComponent;",
+            "const password: PasswordFieldComponent",
+            "let password: PasswordFieldComponent;",
+            "pub credential: HubCredential,",
+            "interface Auth {\npassword: PasswordFieldComponent",
+            "struct Auth {\npassword: PasswordFieldComponent",
+            "fn configure(\npassword: PasswordFieldComponent",
+            "fn main() {\npassword: PasswordFieldComponent",
+            "const password=c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0;",
+            "let mut token = c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0;",
+            "var secret = AbCdEfGhIjKlMnOp;",
+            "interface Auth { password: c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0; }",
+            "fn new(credential: c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0)",
+            "struct Auth { credential: secret_store::c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0, }",
+        ] {
+            assert!(
+                scan_high_confidence(text, 32)
+                    .findings
+                    .iter()
+                    .any(|hit| hit.rule == "credential-assignment"),
+                "{text}"
+            );
+        }
+        let provider = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        let source = format!("const token={provider};");
+        assert!(
+            scan_high_confidence(&source, 32)
+                .findings
+                .iter()
+                .any(|hit| &source[hit.start..hit.end] == provider)
+        );
+        let registered = super::super::policy::Snapshot::compile(
+            &[super::super::policy::Literal {
+                value: "PasswordFieldComponent",
+                source: super::super::policy::Source::GlobalUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(
+            registered
+                .scan("interface Auth { password: PasswordFieldComponent; }", 32)
+                .findings
+                .iter()
+                .any(|hit| hit.rule == "explicit-block")
+        );
+    }
 
     #[test]
     fn partial_detection_keeps_exact_spans_and_does_not_claim_completion() {

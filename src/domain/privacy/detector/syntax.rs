@@ -1,4 +1,4 @@
-//! Syntactic identifier roles supply evidence for entropy-only discovery.
+//! Syntactic roles distinguish source references from opaque content.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -13,6 +13,201 @@ struct Token {
     start: usize,
     end: usize,
     kind: Kind,
+}
+
+/// Unquoted declarations and type positions name code, while the same spelling in a
+/// configuration value remains credential evidence. Literal and comment tokens cannot open
+/// a declaration or a typed scope.
+pub(super) fn credential_reference_regions(text: &str) -> Vec<(usize, usize)> {
+    let Some(tokens) = lex(text) else {
+        return Vec::new();
+    };
+    let word = |i: usize| -> &str {
+        tokens
+            .get(i)
+            .filter(|token| token.kind == Kind::Word)
+            .map_or("", |token| &text[token.start..token.end])
+    };
+    let declaration_start = |i: usize| {
+        if matches!(
+            word(i),
+            "const" | "let" | "var" | "val" | "final" | "static"
+        ) {
+            Some(i)
+        } else if matches!(word(i), "mut" | "ref")
+            && i > 0
+            && matches!(word(i - 1), "let" | "var" | "const")
+        {
+            Some(i - 1)
+        } else {
+            None
+        }
+    };
+    let mut scopes = Vec::new();
+    // Only a closed scope can establish a type or executable role. An unfinished snippet
+    // must not grant that role to credentials in the prose that follows it.
+    let mut closed = vec![false; tokens.len()];
+    let mut openings = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        match token.kind {
+            Kind::Symbol(open @ (b'(' | b'{' | b'[')) => openings.push((i, open)),
+            Kind::Symbol(close @ (b')' | b'}' | b']')) => {
+                let expected = match close {
+                    b')' => b'(',
+                    b'}' => b'{',
+                    _ => b'[',
+                };
+                let Some((at, open)) = openings.pop() else {
+                    return Vec::new();
+                };
+                if open != expected {
+                    return Vec::new();
+                }
+                closed[at] = true;
+            }
+            _ => {}
+        }
+    }
+    let mut regions = Vec::new();
+    let mut statement = 0;
+    let mut function_body = false;
+    for (i, token) in tokens.iter().enumerate() {
+        match token.kind {
+            Kind::Boundary | Kind::Symbol(b';' | b'}') => statement = i + 1,
+            _ => {}
+        }
+        if matches!(token.kind, Kind::Symbol(b';' | b'}')) {
+            function_body = false;
+        }
+        match token.kind {
+            Kind::Symbol(open @ (b'(' | b'{' | b'[')) => {
+                let typed = closed[i]
+                    && (statement..i).any(|at| {
+                        !word(at + 1).is_empty()
+                            && match open {
+                                b'(' => matches!(word(at), "fn" | "def" | "function"),
+                                b'{' => {
+                                    matches!(word(at), "struct" | "interface")
+                                        || (word(at) == "type"
+                                            && tokens.get(at + 2).is_some_and(|token| {
+                                                token.kind == Kind::Symbol(b'=')
+                                            }))
+                                }
+                                _ => false,
+                            }
+                    });
+                let executable = closed[i]
+                    && open == b'{'
+                    && (function_body
+                        || scopes.last().is_some_and(|&(_, _, executable)| executable)
+                        || (statement..i)
+                            .any(|at| word(at) == "match" && !word(at + 1).is_empty())
+                        || (i > 0
+                            && regions
+                                .last()
+                                .is_some_and(|&(_, end)| end == tokens[i - 1].end)));
+                if open == b'{' {
+                    function_body = false;
+                }
+                scopes.push((open, typed, executable));
+                statement = i + 1;
+            }
+            Kind::Symbol(close @ (b')' | b'}' | b']')) => {
+                let open = match close {
+                    b')' => b'(',
+                    b'}' => b'{',
+                    _ => b'[',
+                };
+                let Some((found, typed, _)) = scopes.pop() else {
+                    return Vec::new();
+                };
+                if found != open {
+                    return Vec::new();
+                }
+                if open == b'(' && typed {
+                    function_body = true;
+                }
+            }
+            _ => {}
+        }
+        let next = match token.kind {
+            Kind::Symbol(b'=') => {
+                i + 1
+                    + usize::from(
+                        tokens
+                            .get(i + 1)
+                            .is_some_and(|token| token.kind == Kind::Symbol(b'>')),
+                    )
+            }
+            Kind::Symbol(b':')
+                if i > 0
+                    && tokens[i - 1].kind != Kind::Symbol(b':')
+                    && tokens
+                        .get(i + 1)
+                        .is_none_or(|token| token.kind != Kind::Symbol(b':')) =>
+            {
+                i + 1
+            }
+            _ => continue,
+        };
+        let Some(value) = tokens.get(next).filter(|token| token.kind == Kind::Word) else {
+            continue;
+        };
+        let mut end = next;
+        while let Some(separator) = tokens.get(end + 1) {
+            let width = match separator.kind {
+                Kind::Symbol(b'.') => 1,
+                Kind::Symbol(b':')
+                    if tokens
+                        .get(end + 2)
+                        .is_some_and(|token| token.kind == Kind::Symbol(b':')) =>
+                {
+                    2
+                }
+                _ => break,
+            };
+            let last = end + width + 1;
+            if !tokens
+                .get(last)
+                .is_some_and(|token| token.kind == Kind::Word)
+                || !(end..last).all(|at| tokens[at].end == tokens[at + 1].start)
+            {
+                break;
+            }
+            end = last;
+        }
+        // Shell declarations can name variables called `const` or `var` before assigning a
+        // password. An adjacent keyword alone therefore cannot establish a source binding.
+        let binding = i >= 2
+            && tokens[i - 1].kind == Kind::Word
+            && declaration_start(i - 2) == Some(statement);
+        // The terminal word names the type; namespace segments can contain underscores.
+        let annotation = token.kind == Kind::Symbol(b':')
+            && reference_name(word(end))
+            && scopes
+                .last()
+                .is_some_and(|(_, typed, executable)| *typed || (*executable && binding));
+        let initializer = token.kind == Kind::Symbol(b'=')
+            && next == i + 1
+            && binding
+            && (end > next || reference_name(word(next)));
+        let qualified_call = end > next
+            && scopes.last().is_some_and(|(_, _, executable)| *executable)
+            && tokens.get(end + 1).is_some_and(|token| {
+                token.kind == Kind::Symbol(b'{')
+                    || (token.kind == Kind::Symbol(b'(') && tokens[end].end == token.start)
+            });
+        if annotation || initializer || qualified_call {
+            regions.push((value.start, tokens[end].end));
+        }
+    }
+    regions
+}
+
+fn reference_name(value: &str) -> bool {
+    // A leading acronym can qualify a source name; random mixed runs still need word shape.
+    let capitals = value.bytes().take_while(u8::is_ascii_uppercase).count();
+    super::camel_identifier(&value[capitals.saturating_sub(1)..])
 }
 
 /// Only bounded identifier roles are exempt; values and comments keep their entropy evidence.
@@ -292,6 +487,31 @@ fn import_list(tokens: &[Token], text: &str) -> bool {
 // Exemption discovery is optional; exceeding its budget leaves the carrier fully scannable.
 const MAX_SYNTAX_TOKENS: usize = 32_768;
 
+/// A continued physical line retains the declaration authority of its logical statement.
+pub(super) fn statement_prefix(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let mut end = bytes.len();
+    while let Some(at) = bytes[..end]
+        .iter()
+        .rposition(|byte| matches!(byte, b'\n' | b'\r' | b';' | b'{' | b'}'))
+    {
+        if matches!(bytes[at], b'\n' | b'\r') {
+            let start = at - usize::from(bytes[at] == b'\n' && at > 0 && bytes[at - 1] == b'\r');
+            let slashes = bytes[..start]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count();
+            if !slashes.is_multiple_of(2) {
+                end = start - slashes;
+                continue;
+            }
+        }
+        return &text[at + 1..];
+    }
+    text
+}
+
 fn lex(text: &str) -> Option<Vec<Token>> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
@@ -302,6 +522,45 @@ fn lex(text: &str) -> Option<Vec<Token>> {
         }
         let start = i;
         let b = bytes[i];
+        if b == b'\\' {
+            let continuation = if bytes[i..].starts_with(b"\\\r\n") {
+                3
+            } else if bytes[i..].starts_with(b"\\\n") {
+                2
+            } else {
+                0
+            };
+            if continuation > 0 {
+                let preceding = bytes[..i]
+                    .iter()
+                    .rev()
+                    .take_while(|&&byte| byte == b'\\')
+                    .count();
+                if preceding.is_multiple_of(2) {
+                    let mut after = i + continuation;
+                    loop {
+                        if bytes[after..].starts_with(b"\\\r\n") {
+                            after += 3;
+                        } else if bytes[after..].starts_with(b"\\\n") {
+                            after += 2;
+                        } else {
+                            break;
+                        }
+                    }
+                    let word_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+                    // Splicing joins adjacent word fragments. Treating them as separate tokens
+                    // could manufacture a declaration keyword from part of a variable name.
+                    if i > 0
+                        && word_byte(bytes[i - 1])
+                        && bytes.get(after).is_some_and(|&byte| word_byte(byte))
+                    {
+                        return None;
+                    }
+                    i = after;
+                    continue;
+                }
+            }
+        }
         let kind = if b == b'\n' || b == b'\r' {
             i += 1;
             Kind::Boundary
@@ -404,6 +663,43 @@ fn lex(text: &str) -> Option<Vec<Token>> {
 #[cfg(test)]
 mod tests {
     use super::identifier_regions;
+
+    /// A closed annotation scope does not prove that its value names a type. Classification
+    /// must reject opaque values independently of whether the field name suggests a credential.
+    /// Qualified paths retain their full range while their terminal type name supplies the shape.
+    #[test]
+    fn annotation_roles_require_reference_shaped_values() {
+        for (text, name) in [
+            (
+                "interface Auth { value: PasswordFieldComponent; }",
+                "PasswordFieldComponent",
+            ),
+            ("fn new(value: HubCredential)", "HubCredential"),
+            (
+                "struct Auth { value: secret_store::HubCredential, }",
+                "secret_store::HubCredential",
+            ),
+            (
+                "fn new(value: secret_store::credential_types::HubCredential)",
+                "secret_store::credential_types::HubCredential",
+            ),
+        ] {
+            let start = text.find(name).unwrap();
+            assert_eq!(
+                super::credential_reference_regions(text),
+                vec![(start, start + name.len())],
+                "{text}"
+            );
+            let opaque = text.replace(
+                name.rsplit("::").next().unwrap(),
+                "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0",
+            );
+            assert!(
+                super::credential_reference_regions(&opaque).is_empty(),
+                "{opaque}"
+            );
+        }
+    }
 
     fn includes(text: &str, needle: &str) -> bool {
         let start = text.find(needle).unwrap();

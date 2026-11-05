@@ -31,6 +31,7 @@ fn main() {
     unsafe {
         std::env::set_var("AGIT_HOME", home.path());
         std::env::set_var("AGIT_HUB_URL", "http://127.0.0.1:1");
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
     }
     // A cold worker that misses its first foreground budget backs off; wait until it serves, so
     // the cases below measure protection rather than start-up time.
@@ -68,8 +69,16 @@ fn main() {
             a_value_is_protected_when_its_context_left_earlier,
         ),
         (
-            "a session label in its repository",
-            a_session_label_is_protected_under_its_repository_rules,
+            "a session's history and labels in its repository",
+            a_sessions_history_and_labels_require_its_repository_rules,
+        ),
+        (
+            "encoded credentials across the record size boundary",
+            encoded_credentials_require_a_complete_semantic_check,
+        ),
+        (
+            "omitted containers stay omitted in stored envelopes",
+            omitted_containers_stay_omitted_in_stored_envelopes,
         ),
         ("an unprocessed text", unprocessed_text_is_withheld),
     ];
@@ -84,6 +93,90 @@ fn key() -> String {
         "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----",
         BODY.join("\n")
     )
+}
+
+/// Omitting an unscanned container changes stored content even without credential replacements.
+/// Reusing the original envelope would restore unchecked secrets and its obsolete content hash.
+fn omitted_containers_stay_omitted_in_stored_envelopes(_home: &Path) {
+    use agit::domain::{
+        privacy::{projector::Mode, service},
+        storage, transcript,
+    };
+    let row = "ordinary report output ".repeat(8);
+    let mut rows =
+        vec![row.clone(); agit::domain::privacy::projector::MAX_UNIT_BYTES / row.len() + 1];
+    let secret = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
+    rows[0] = format!("PASSWORD={secret}");
+    let native = serde_json::json!({"type":"response_item", "payload": {
+        "type":"function_call_output", "call_id":"omitted-call", "output":{"rows":rows}
+    }});
+    let line = format!("{native}\n");
+    assert!(line.len() > agit::domain::privacy::projector::MAX_UNIT_BYTES);
+    let input = transcript::wrap_lines(&line, "codex", &format!("agit-{}", "a".repeat(40)));
+    let outcome = service::transform(None, &input, Mode::ProtectEnvelopes);
+    assert!(service::passed(&outcome), "{:?}", outcome.reason);
+    assert_eq!(outcome.replacements, 0);
+    assert_eq!(outcome.omitted, 1);
+    assert!(!outcome.content.contains(secret));
+    assert!(
+        outcome
+            .content
+            .contains("[content omitted: too large for the privacy check]")
+    );
+    let original = storage::parse_envelope_line(&input).unwrap();
+    let protected = storage::parse_envelope_line(&outcome.content).unwrap();
+    assert_eq!(protected.session_id, original.session_id);
+    assert_eq!(protected.source, original.source);
+    assert_eq!(protected.content["payload"]["call_id"], "omitted-call");
+    assert_ne!(protected.object_hash, original.object_hash);
+    assert_eq!(
+        protected.object_hash,
+        transcript::object_hash(&protected.content)
+    );
+}
+
+/// Crossing the frame boundary cannot downgrade encoded tool data to plain-text scanning.
+/// Small carriers protect decoded keys; carriers that cannot be checked refuse durable capture.
+fn encoded_credentials_require_a_complete_semantic_check(_home: &Path) {
+    use agit::domain::{
+        privacy::{
+            projector::{Mode, Reason},
+            service,
+        },
+        transcript,
+    };
+    let secret = "AbCdEfGhIjKlMnOp";
+    let record = |padding: &str| {
+        serde_json::json!({
+            "type":"response_item","payload":{"type":"function_call","call_id":"encoded-call",
+            "name":"Inspect","arguments":format!(r#"{{"api_\u006bey":"{secret}","padding":{}}}"#, serde_json::json!(padding))}
+        })
+    };
+    let small = record("ordinary report output");
+    let protected =
+        service::protect_for_commit(None, &small.to_string(), Mode::ProtectJsonl).unwrap();
+    assert!(!protected.contains(secret));
+    let restored = service::transform(None, &protected, Mode::HydrateJsonl);
+    assert!(service::passed(&restored));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restored.content).unwrap(),
+        small
+    );
+
+    let line = "ordinary report output ";
+    let padding = line.repeat(agit::domain::privacy::projector::MAX_UNIT_BYTES / line.len() + 1);
+    let large = format!("{}\n", record(&padding));
+    assert!(large.len() > agit::domain::privacy::projector::MAX_UNIT_BYTES);
+    let envelope = transcript::wrap_lines(&large, "codex", &format!("agit-{}", "a".repeat(40)));
+    for (mode, text) in [
+        (Mode::ProtectJsonl, large.as_str()),
+        (Mode::ProtectEnvelopes, envelope.as_str()),
+    ] {
+        let refusal = service::protect_for_commit(None, text, mode).unwrap_err();
+        assert_eq!(refusal.reason, Some(Reason::Oversize));
+        assert!(!refusal.to_string().contains("next attempt tries again"));
+        assert!(!refusal.to_string().contains(secret));
+    }
 }
 
 /// The protected text keeps everything around the key and puts exactly one placeholder where
@@ -400,12 +493,10 @@ fn a_value_is_protected_when_its_context_left_earlier(_home: &Path) {
     assert_eq!(shape(&delivered), shape(&whole));
 }
 
-/// A session's labels in the session list are protected under the rules of the repository its
-/// link names: a phrase registered in that repository is replaced in the title and opening
-/// prompt, while the same phrase in a session no repository claims stays, since only that
-/// repository registered it. A listing protected with the device's rules alone would send the
-/// registered phrase raw.
-fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
+/// A session's history and labels use the rules of the repository its link names. Unclaimed
+/// sessions use device rules, but an unreadable link or missing linked repository cannot mean
+/// unclaimed: that would release repository-blocked text through the device-only policy.
+fn a_sessions_history_and_labels_require_its_repository_rules(home: &Path) {
     let phrase = "cedar lantern";
     let repo = agit::domain::repo::Repo::init(&home.join("repos/alice/notes")).unwrap();
     agit::domain::secret_filter::RepositoryDictionary::open(repo.root())
@@ -423,7 +514,8 @@ fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
     let mut link = agit::domain::link::Link::new("claude-code", native, Some(&work));
     link.owner = Some("alice".into());
     link.agent = Some("notes".into());
-    agit::domain::link::write(&store, &link).unwrap();
+    let link_path = agit::domain::link::write(&store, &link).unwrap();
+    let unclaimed = "6b3f2c1e-0000-4000-8000-000000000002";
     let row = |id: &str| agit::protocol::LocalSession {
         runtime_session_id: id.into(),
         runtime: "claude-code".into(),
@@ -436,7 +528,7 @@ fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
         agent: None,
         likely_active: false,
     };
-    let mut sessions = vec![row(native), row("6b3f2c1e-0000-4000-8000-000000000002")];
+    let mut sessions = vec![row(native), row(unclaimed)];
     agit::rc::daemon::protect_session_labels(&mut sessions);
     for label in [&sessions[0].gist, &sessions[0].title] {
         let label = label.as_deref().unwrap();
@@ -451,6 +543,99 @@ fn a_session_label_is_protected_under_its_repository_rules(home: &Path) {
         sessions[1].gist.as_deref(),
         Some(format!("ask about the {phrase}").as_str())
     );
+    let project = home
+        .join("claude/projects")
+        .join(agit::adapter::claude_code::slug_for(&work));
+    std::fs::create_dir_all(&project).unwrap();
+    for id in [native, unclaimed] {
+        std::fs::write(
+            project.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","cwd":work,"message":{"role":"user","content":format!("ask about the {phrase}")}})
+            ),
+        )
+        .unwrap();
+    }
+    let history = |id: &str| {
+        agit::rc::local_history::read(
+            serde_json::json!({"session_id":id,"runtime":"claude-code","cwd":work}),
+        )
+    };
+    assert!(!history(native).unwrap().to_string().contains(phrase));
+    assert!(history(unclaimed).unwrap().to_string().contains(phrase));
+    let source_home = home.join("native-source");
+    std::fs::create_dir_all(source_home.join("sessions")).unwrap();
+    std::fs::write(
+        source_home.join(format!("sessions/rollout-{native}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":work}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("ask about the {phrase}")}]}})
+        ),
+    )
+    .unwrap();
+    let source = agit::rc::runtime_sources::Registry::open()
+        .unwrap()
+        .register(&source_home, None, None, None)
+        .unwrap();
+    let mut roster = agit::rc::roster::Roster::default();
+    roster
+        .record(
+            "qualified-history",
+            serde_json::from_value(serde_json::json!({
+                "native_source":{"source_id":source.source_id,"generation":source.generation},
+                "runtime":"codex","thread_id":native,"cwd":work,"workspace_id":"local-owner"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    roster.save().unwrap();
+    let source_params = serde_json::json!({"session_id":"qualified-history"});
+    assert!(
+        agit::rc::local_history::read(source_params.clone())
+            .unwrap()
+            .to_string()
+            .contains(phrase)
+    );
+    let mut source_link =
+        agit::domain::link::Link::new("codex", &source.session_ref(native), Some(&work));
+    source_link.owner = link.owner.clone();
+    source_link.agent = link.agent.clone();
+    source_link.native_binding = Some(agit::domain::link::NativeBinding {
+        source: agit::protocol::NativeSourceRef {
+            source_id: source.source_id,
+            generation: source.generation,
+        },
+        thread_id: native.into(),
+    });
+    let source_link_path = agit::domain::link::write(&store, &source_link).unwrap();
+    let native_params = serde_json::json!({"session_id":native,"runtime":"claude-code","cwd":work});
+    for (link, path, params) in [
+        (link, link_path, native_params),
+        (source_link, source_link_path, source_params),
+    ] {
+        let history = || agit::rc::local_history::read(params.clone());
+        assert!(!history().unwrap().to_string().contains(phrase));
+        std::fs::write(&path, "{invalid link").unwrap();
+        let refusal = history().unwrap_err().to_string();
+        assert!(
+            refusal.contains("privacy rules are unavailable"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("restore access"), "{refusal}");
+        agit::domain::link::write(&store, &link).unwrap();
+        let moved = home.join("unavailable-notes");
+        std::fs::rename(repo.root(), &moved).unwrap();
+        let refusal = history().unwrap_err().to_string();
+        assert!(
+            refusal.contains("privacy rules are unavailable"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("restore access"), "{refusal}");
+        std::fs::rename(moved, repo.root()).unwrap();
+        assert!(!history().unwrap().to_string().contains(phrase));
+    }
 }
 
 /// Text, stream output and JSON values the worker cannot process are withheld: the marker

@@ -48,22 +48,36 @@ mod startup_cache;
 
 #[test]
 fn authorized_resume_recovers_original_codex_history_through_settlement() {
-    recovery_roundtrip("codex", "codex", false);
+    recovery_roundtrip("codex", "codex", false, None);
+}
+
+/// Authorized encrypted originals can outgrow a worker frame. Fork must protect their native
+/// content, retain valid v1 event hashes, and restore the same records from its local dictionary.
+#[test]
+fn authorized_fork_protects_and_restores_oversized_encrypted_records() {
+    recovery_roundtrip("codex", "codex", false, Some(OversizedFork::Text));
+}
+
+/// Refusing uncheckable encoded originals must leave the new branch absent and the source
+/// checkout intact, even though the account is entitled to decrypt the snapshot.
+#[test]
+fn authorized_fork_refuses_oversized_encoded_credentials() {
+    recovery_roundtrip("codex", "codex", false, Some(OversizedFork::EncodedJson));
 }
 
 #[test]
 fn account_unlock_resume_preserves_native_history_and_upgrades_legacy_baselines() {
-    recovery_roundtrip("claude-code", "claude-code", false);
+    recovery_roundtrip("claude-code", "claude-code", false, None);
 }
 
 #[test]
 fn cross_runtime_recovery_uses_ordinary_conversion() {
-    recovery_roundtrip("codex", "claude-code", false);
+    recovery_roundtrip("codex", "claude-code", false, None);
 }
 
 #[test]
 fn legacy_recovery_with_new_turns_settles_its_quoted_context() {
-    recovery_roundtrip("claude-code", "claude-code", true);
+    recovery_roundtrip("claude-code", "claude-code", true, None);
 }
 
 #[test]
@@ -255,7 +269,18 @@ fn recovery_workspace(root: &std::path::Path) -> std::path::PathBuf {
     physical
 }
 
-fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OversizedFork {
+    Text,
+    EncodedJson,
+}
+
+fn recovery_roundtrip(
+    source: &str,
+    runtime: &str,
+    legacy_commit: bool,
+    oversized_fork: Option<OversizedFork>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -274,12 +299,13 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             .unwrap();
     agit::hub::identity::pin(&repo, &identity).unwrap();
     repo.set_remote(&format!("{base}/alice/app.git")).unwrap();
+    let synthetic_key = "m7Qp4Vn9Rx2Lw8Cs5Tb3Yh6Jd1Fz0Kae";
     let raw = if source == "claude-code" {
         claude_history("glm-5.3")
     } else {
         [
             json!({"type":"session_meta","payload":{"id":"source-runtime","cwd":"/source/workspace","base_instructions":"SYNTHETIC_OLD_AUTHORITY","approval_policy":"never"}}),
-            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"synthetic private session"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("synthetic private session; api_key=\"{synthetic_key}\"")}]}}),
             json!({"type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"historical-call","arguments":"SYNTHETIC_OLD_TOOL"}}),
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"historical-call","output":"SYNTHETIC_OLD_SHELL_OUTPUT"}}),
             json!({"type":"response_item","payload":{"type":"function_call","name":"Read","call_id":"private-file","arguments":json!({"file_path":"/source/private.txt"}).to_string()}}),
@@ -296,10 +322,24 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
     // Evidence the LOG alone keeps outgrows a local inspection read, so unlock and resume reach
     // the original only by reading the envelope up to the envelope's own limit.
     let evidence = format!(
-        "SYNTHETIC_LOG_ONLY_EVIDENCE {}",
-        "x".repeat(MAX_INSPECTION_OUTPUT_BYTES)
+        "SYNTHETIC_LOG_ONLY_EVIDENCE {} api_key=\"{synthetic_key}\"",
+        if oversized_fork.is_some() {
+            let line = "Ordinary report output remains readable.\n";
+            line.repeat(agit::domain::privacy::projector::MAX_UNIT_BYTES / line.len() + 1)
+        } else {
+            "x".repeat(MAX_INSPECTION_OUTPUT_BYTES)
+        }
     );
-    let log_only = if source == "codex" {
+    let log_only = if oversized_fork == Some(OversizedFork::EncodedJson) {
+        let line = "ordinary report output ";
+        let padding =
+            line.repeat(agit::domain::privacy::projector::MAX_UNIT_BYTES / line.len() + 1);
+        let arguments = format!(
+            r#"{{"api_\u006bey":"AbCdEfGhIjKlMnOp","padding":{}}}"#,
+            json!(padding)
+        );
+        json!({"type":"response_item","payload":{"type":"function_call","call_id":"encoded-call","name":"Inspect","arguments":arguments}})
+    } else if source == "codex" {
         json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":evidence}]}})
     } else {
         json!({"type":"assistant","message":{"role":"assistant","model":"glm-5.3","content":[{"type":"text","text":evidence}]}})
@@ -343,6 +383,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         "SYNTHETIC_OLD_AUTHORITY".into(),
         "SYNTHETIC_OLD_TOOL".into(),
         "SYNTHETIC_OLD_SHELL_OUTPUT".into(),
+        "historical-call".into(),
     ]);
     let key = SecretKey::from([13; 32]);
     let public = STANDARD.encode(key.public_key().as_bytes());
@@ -571,7 +612,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
                 key_requests += 1;
                 match (
                     source_access.load(Ordering::Acquire),
-                    automatic_recovery,
+                    automatic_recovery && oversized_fork.is_none(),
                     key_requests,
                 ) {
                     (1, _, _) => (
@@ -624,7 +665,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         }
         (requests, key_requests)
     });
-    let run = |args: &[&str]| {
+    let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
         for name in ["PATH", "SystemRoot", "TEMP", "TMP"] {
@@ -641,11 +682,10 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
             .env("CI", "1")
             .env("AGIT_TUI", "0")
             .env("AGIT_USE_SYSTEM_GIT", "1")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(args)
-            .output()
-            .unwrap()
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
     };
+    let run = |args: &[&str]| command().args(args).output().unwrap();
     let unlock_args = [
         "privacy",
         "unlock",
@@ -705,6 +745,263 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         },
     )
     .unwrap();
+    let check_fork = || {
+        use agit::domain::session_privacy::ForkContext;
+        let fork =
+            |point: &str, branch: &str| run(&["fork", &format!("alice/app@{point}"), "-b", branch]);
+        fork_access.store(2, Ordering::Release);
+        let failed = fork(&before, "unavailable-original");
+        assert!(!failed.status.success(), "{failed:?}");
+        assert!(!repo.has_ref("refs/heads/unavailable-original"));
+        fork_access.store(1, Ordering::Release);
+        let sanitized = fork(&before, "sanitized-copy");
+        assert!(sanitized.status.success(), "{sanitized:?}");
+        let sanitized_meta = meta::read_at_ref(&repo, "sanitized-copy").unwrap();
+        assert_eq!(
+            sanitized_meta.fork_origin.as_ref().unwrap().context,
+            ForkContext::Sanitized
+        );
+        assert_eq!(
+            sanitized_meta
+                .session_privacy
+                .as_ref()
+                .unwrap()
+                .creator
+                .as_deref(),
+            Some("account-bob")
+        );
+        assert_eq!(
+            storage::materialize_at(repo.root(), "sanitized-copy", meta::LOG_FILE).unwrap(),
+            public_log
+        );
+        assert!(
+            repo.show("sanitized-copy", "privacy/envelope.json")
+                .is_none()
+        );
+
+        fork_access.store(0, Ordering::Release);
+        let original_copy = fork(&before, "original-copy");
+        if oversized_fork == Some(OversizedFork::EncodedJson) {
+            assert!(!original_copy.status.success(), "{original_copy:?}");
+            let error = String::from_utf8_lossy(&original_copy.stderr);
+            assert!(error.contains("exceeds the supported size"), "{error}");
+            assert!(!error.contains("next attempt tries again"), "{error}");
+            assert!(!error.contains("AbCdEfGhIjKlMnOp"), "{error}");
+            assert!(!repo.has_ref("refs/heads/original-copy"));
+            assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap().trim(), before);
+            return;
+        }
+        assert!(original_copy.status.success(), "{original_copy:?}");
+        let copied = meta::read_at_ref(&repo, "original-copy").unwrap();
+        assert_eq!(copied.layout, meta::LayoutVersion::V1);
+        assert_ne!(copied.session, sanitized_meta.session);
+        assert_eq!(
+            copied.session_privacy.as_ref().unwrap().creator.as_deref(),
+            Some("account-bob")
+        );
+        let provenance = copied.fork_origin.as_ref().unwrap();
+        assert_ne!(
+            copied.session,
+            provenance.snapshot.as_ref().unwrap().binding.session_id
+        );
+        assert_ne!(
+            copied.session,
+            provenance
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .binding
+                .published_session_id
+        );
+        assert_eq!(provenance.context, ForkContext::Original);
+        assert_eq!(provenance.commit, before);
+        assert_eq!(
+            provenance
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .binding
+                .owner_key
+                .account_id,
+            "account-alice"
+        );
+        // Canonical fork objects must protect both remembered values and detected credentials;
+        // dictionary hydration must still restore the native records and their call references.
+        let protected_log =
+            storage::materialize_at(repo.root(), "original-copy", meta::LOG_FILE).unwrap();
+        let protected_view =
+            storage::materialize_at(repo.root(), "original-copy", meta::VIEW_FILE).unwrap();
+        for protected in [&protected_log, &protected_view] {
+            for secret in [
+                synthetic_key,
+                "synthetic private session",
+                "SYNTHETIC_OLD_TOOL",
+            ] {
+                assert!(
+                    !protected.contains(secret),
+                    "fork stores protected fixture value {secret}"
+                );
+            }
+            assert!(protected.contains("historical-call"));
+            assert!(protected.contains("private-file"));
+        }
+        let mut worker = command()
+            .arg("__privacy-worker-v1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut request = |mode: &str, text: &str, context: &str| {
+            let request = serde_json::to_vec(&json!({
+                "repo":repo.root(),"mode":mode,"text":text,"context":context,"deadline_ms":60_000
+            }))
+            .unwrap();
+            let input = worker.stdin.as_mut().unwrap();
+            input
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .unwrap();
+            input.write_all(&request).unwrap();
+            input.flush().unwrap();
+            let output = worker.stdout.as_mut().unwrap();
+            let mut size = [0; 4];
+            output.read_exact(&mut size).unwrap_or_else(|error| {
+                panic!(
+                    "privacy worker reply failed for {mode} ({context}), {} input bytes: {error}",
+                    text.len()
+                )
+            });
+            let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+            output.read_exact(&mut bytes).unwrap();
+            let restored: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored["status"], "complete");
+            assert_eq!(restored["unresolved"], 0);
+            restored
+        };
+        let mut call = |mode: &str, text: &str| {
+            if mode != "hydrate_envelopes" {
+                return request(mode, text, "")["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+            let mut restored = String::new();
+            for (index, line) in text.split_inclusive('\n').enumerate() {
+                if line.len() <= agit::domain::privacy::projector::MAX_UNIT_BYTES {
+                    restored.push_str(request(mode, line, "")["content"].as_str().unwrap());
+                    continue;
+                }
+                let operation = format!("fork-roundtrip-{index}");
+                let mut offset = 0;
+                for chunk in line.as_bytes().chunks(4 * 1024 * 1024) {
+                    let context = if offset == 0 {
+                        json!({"phase":"begin","operation":operation,"mode":mode,"bytes":line.len(),"output_limit":agit::domain::storage::MAX_EVENT_BYTES})
+                    } else {
+                        json!({"phase":"append","operation":operation,"offset":offset})
+                    };
+                    request(
+                        "hydrate_transfer",
+                        std::str::from_utf8(chunk).unwrap(),
+                        &context.to_string(),
+                    );
+                    offset += chunk.len();
+                }
+                let mut offset = 0;
+                loop {
+                    let page = request(
+                        "hydrate_transfer",
+                        "",
+                        &json!({"phase":"read","operation":operation,"offset":offset}).to_string(),
+                    );
+                    let part = page["content"].as_str().unwrap();
+                    restored.push_str(part);
+                    offset += part.len();
+                    if offset == page["consumed"].as_u64().unwrap() as usize {
+                        break;
+                    }
+                }
+                request(
+                    "hydrate_transfer",
+                    "",
+                    &json!({"phase":"close","operation":operation}).to_string(),
+                );
+            }
+            restored
+        };
+        for (protected, original) in [(&protected_log, &log), (&protected_view, &view)] {
+            let restored = call("hydrate_envelopes", protected);
+            let records = |text: &str| {
+                text.lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                records(&restored) == records(original),
+                "fork hydration changed native records"
+            );
+        }
+        // Re-importing protection respects local unblocks and allows; merely identifying a
+        // value creates a recovery mapping without introducing a protection rule.
+        let remembered = "synthetic private session";
+        let mut manage = |action: &str, id: Option<&str>, secret: Option<String>| {
+            serde_json::from_str::<Value>(&call(
+                "manage",
+                &json!({"action":action,"global":false,"id":id,"name":null,"secret":secret})
+                    .to_string(),
+            ))
+            .unwrap()
+        };
+        let values = serde_json::to_string(&[remembered]).unwrap();
+        let ids = manage("identify", None, Some(values.clone()));
+        manage("remove", ids[0].as_str(), None);
+        manage("remember", None, Some(values));
+        let allowed = "local-approved-fixture";
+        let values = serde_json::to_string(&[allowed]).unwrap();
+        manage("identify", None, Some(values.clone()));
+        assert_eq!(call("protect_text", allowed), allowed);
+        // An imported alias may carry the local decision while replacement prefers an earlier
+        // token for the same value; recovery must not introduce a block on that earlier token.
+        use agit::domain::privacy::{dictionary, keys};
+        let owner = keys::owner(&base, "account-bob").unwrap();
+        let route = keys::owner_directory(&home.join("privacy"), &owner).join("dictionary");
+        let mut journal = agit::domain::privacy::storage::Store::open(&route, Some(owner)).unwrap();
+        let alias = dictionary::Record::new(
+            &journal.dictionary_id,
+            allowed,
+            dictionary::Origin::Legacy,
+            dictionary::Label::secret("generic-api-key"),
+        )
+        .unwrap();
+        journal.append(std::slice::from_ref(&alias), None).unwrap();
+        drop(journal);
+        let command = |action: &str, id: Option<&str>, secret: Option<&str>| {
+            json!({"action":action,"global":false,"id":id,"name":null,"secret":secret}).to_string()
+        };
+        call("manage", &command("allow", Some(&alias.token), None));
+        call("manage", &command("remember", None, Some(&values)));
+        assert_eq!(call("protect_text", allowed), allowed);
+        assert_eq!(call("protect_text", remembered), remembered);
+        let _ = worker.kill();
+        let _ = worker.wait();
+        assert!(
+            repo.show("original-copy", "privacy/envelope.json")
+                .is_none()
+        );
+        assert!(copied.runtime_instances.is_empty() && copied.baseline_bytes.is_none());
+        fork_access.store(1, Ordering::Release);
+        let independent = fork("original-copy", "independent-copy");
+        assert!(independent.status.success(), "{independent:?}");
+        assert_eq!(
+            storage::materialize_at(repo.root(), "independent-copy", meta::LOG_FILE).unwrap(),
+            protected_log
+        );
+    };
+    if oversized_fork.is_some() {
+        check_fork();
+        stop.store(true, Ordering::Relaxed);
+        let (_, key_requests) = server.join().unwrap();
+        assert_eq!(key_requests, 3);
+        return;
+    }
     if automatic_recovery {
         // Local edits cannot carry a parent's envelope into a different snapshot or alter staging on refusal.
         let draft = repo.root().join("draft.md");
@@ -1325,94 +1622,7 @@ fn recovery_roundtrip(source: &str, runtime: &str, legacy_commit: bool) {
         );
     }
     if automatic_recovery {
-        use agit::domain::session_privacy::ForkContext;
-        let fork =
-            |point: &str, branch: &str| run(&["fork", &format!("alice/app@{point}"), "-b", branch]);
-        fork_access.store(2, Ordering::Release);
-        let failed = fork(&before, "unavailable-original");
-        assert!(!failed.status.success(), "{failed:?}");
-        assert!(!repo.has_ref("refs/heads/unavailable-original"));
-        fork_access.store(1, Ordering::Release);
-        let sanitized = fork(&before, "sanitized-copy");
-        assert!(sanitized.status.success(), "{sanitized:?}");
-        let sanitized_meta = meta::read_at_ref(&repo, "sanitized-copy").unwrap();
-        assert_eq!(
-            sanitized_meta.fork_origin.as_ref().unwrap().context,
-            ForkContext::Sanitized
-        );
-        assert_eq!(
-            sanitized_meta
-                .session_privacy
-                .as_ref()
-                .unwrap()
-                .creator
-                .as_deref(),
-            Some("account-bob")
-        );
-        assert_eq!(
-            storage::materialize_at(repo.root(), "sanitized-copy", meta::LOG_FILE).unwrap(),
-            public_log
-        );
-        assert!(
-            repo.show("sanitized-copy", "privacy/envelope.json")
-                .is_none()
-        );
-
-        fork_access.store(0, Ordering::Release);
-        let original_copy = fork(&before, "original-copy");
-        assert!(original_copy.status.success(), "{original_copy:?}");
-        let copied = meta::read_at_ref(&repo, "original-copy").unwrap();
-        assert_ne!(copied.session, sanitized_meta.session);
-        assert_eq!(
-            copied.session_privacy.as_ref().unwrap().creator.as_deref(),
-            Some("account-bob")
-        );
-        let provenance = copied.fork_origin.as_ref().unwrap();
-        assert_ne!(
-            copied.session,
-            provenance.snapshot.as_ref().unwrap().binding.session_id
-        );
-        assert_ne!(
-            copied.session,
-            provenance
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .binding
-                .published_session_id
-        );
-        assert_eq!(provenance.context, ForkContext::Original);
-        assert_eq!(provenance.commit, before);
-        assert_eq!(
-            provenance
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .binding
-                .owner_key
-                .account_id,
-            "account-alice"
-        );
-        assert_eq!(
-            storage::materialize_at(repo.root(), "original-copy", meta::LOG_FILE).unwrap(),
-            log
-        );
-        assert_eq!(
-            storage::materialize_at(repo.root(), "original-copy", meta::VIEW_FILE).unwrap(),
-            view
-        );
-        assert!(
-            repo.show("original-copy", "privacy/envelope.json")
-                .is_none()
-        );
-        assert!(copied.runtime_instances.is_empty() && copied.baseline_bytes.is_none());
-        fork_access.store(1, Ordering::Release);
-        let independent = fork("original-copy", "independent-copy");
-        assert!(independent.status.success(), "{independent:?}");
-        assert_eq!(
-            storage::materialize_at(repo.root(), "independent-copy", meta::LOG_FILE).unwrap(),
-            log
-        );
+        check_fork();
     }
     if automatic_recovery {
         agit::hub::identity::rebind(&repo, &identity, &copy_identity).unwrap();

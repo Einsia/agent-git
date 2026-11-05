@@ -402,6 +402,7 @@ impl PublicationHydrator {
 
     pub fn jsonl(&mut self, text: &str) -> crate::Result<Zeroizing<String>> {
         let mut output = Zeroizing::new(String::new());
+        let operation = uuid::Uuid::new_v4().to_string();
         let mut cursor = 0;
         while cursor < text.len() {
             let mut end = cursor;
@@ -414,11 +415,32 @@ impl PublicationHydrator {
                     break;
                 }
             }
-            ensure!(
-                end - cursor <= MAX_UNIT_BYTES,
-                "publication event exceeds the hydration byte budget"
-            );
-            let outcome = self.request(&text[cursor..end], Mode::HydrateFrozenJsonl)?;
+            let outcome = if end - cursor > MAX_UNIT_BYTES {
+                let started = self.started;
+                let remaining = || {
+                    Duration::from_secs(120)
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(25))
+                };
+                let outcome = hydrate_event(
+                    &mut self.process,
+                    Some(&self.repo),
+                    &operation,
+                    &text[cursor..end],
+                    Mode::HydrateFrozenJsonl,
+                    crate::domain::privacy_envelope::MAX_PRIVATE_BYTES.saturating_sub(output.len()),
+                    &remaining,
+                )
+                .map_err(anyhow::Error::new)?;
+                ensure!(
+                    outcome.status == Status::Complete && outcome.unresolved == 0,
+                    "publication hydration is incomplete ({}); restore the source dictionary or review the input limits",
+                    reason_name(outcome.reason)
+                );
+                outcome
+            } else {
+                self.request(&text[cursor..end], Mode::HydrateFrozenJsonl)?
+            };
             validate(&text[cursor..end], &outcome, Mode::HydrateJsonl)?;
             crate::domain::privacy_layer::PrivateLayer::check_session_size(
                 output
@@ -486,8 +508,7 @@ pub fn processed<'a>(outcome: &'a Outcome, input: &str) -> (&'a str, usize) {
     (&outcome.content[..content], input.len() - unprocessed)
 }
 
-/// Content the privacy worker did not protect in full is not committed; the operation waits and
-/// can be retried.
+/// Content the privacy worker did not protect in full is not committed.
 #[derive(Debug)]
 pub struct Pending {
     pub reason: Option<Reason>,
@@ -503,6 +524,18 @@ impl Pending {
 
 impl std::fmt::Display for Pending {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reason == Some(Reason::UnsupportedScalar) {
+            return write!(
+                f,
+                "privacy check refused: a numeric or boolean data value matches a blocked literal; use a string value or review the privacy rule before trying again; nothing was committed"
+            );
+        }
+        if self.reason == Some(Reason::Oversize) {
+            return write!(
+                f,
+                "privacy check refused: a record exceeds the supported size; reduce the record before trying again; nothing was committed"
+            );
+        }
         write!(
             f,
             "privacy check pending ({}); nothing was committed, and the next attempt tries again",
@@ -536,6 +569,7 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
         Some(Reason::FindingsCap) => "findings_cap",
         Some(Reason::DeviceRules) => "device_rules",
         Some(Reason::LegacyRules) => "legacy_rules",
+        Some(Reason::UnsupportedScalar) => "unsupported_scalar",
         None => "unknown",
     }
 }
@@ -676,7 +710,17 @@ fn transform_inner(
         mode,
         Mode::ProtectText | Mode::ProtectJsonl | Mode::ProtectEnvelopes
     );
-    let budget = budget.for_input(text.len());
+    let hydrates = matches!(
+        mode,
+        Mode::HydrateText | Mode::HydrateJsonl | Mode::HydrateEnvelopes
+    );
+    let hydration_operation = hydrates.then(|| uuid::Uuid::new_v4().to_string());
+    // Placeholders can be much shorter than their originals; the durable cap bounds restoration.
+    let budget = budget.for_input(if hydrates {
+        crate::domain::storage::MAX_MATERIALIZED_BYTES
+    } else {
+        text.len()
+    });
     let started = Instant::now();
     let mut outcome = Outcome {
         content: String::with_capacity(text.len()),
@@ -695,7 +739,13 @@ fn transform_inner(
             stopped = Some(Reason::Deadline);
             break;
         }
-        let end = if matches!(
+        let end = if hydrates && !matches!(mode, Mode::HydrateText) {
+            cursor
+                + text[cursor..]
+                    .split_inclusive('\n')
+                    .next()
+                    .map_or(0, str::len)
+        } else if matches!(
             mode,
             Mode::ProtectJsonl
                 | Mode::ProtectEnvelopes
@@ -719,7 +769,13 @@ fn transform_inner(
         // The worker counts the context against the same bound, so the check here does too.
         let carried = if cursor == 0 { context.len() } else { 0 };
         let oversized = carried + end - cursor > MAX_UNIT_BYTES;
-        if oversized && !matches!(mode, Mode::ProtectJsonl | Mode::ProtectText) {
+        if oversized
+            && !hydrates
+            && !matches!(
+                mode,
+                Mode::ProtectJsonl | Mode::ProtectText | Mode::ProtectEnvelopes
+            )
+        {
             stopped = Some(Reason::Oversize);
             if protects {
                 break;
@@ -731,8 +787,21 @@ fn transform_inner(
         }
         let process = state.process.as_mut().expect("worker started");
         let remaining = || budget.saturating_sub(started.elapsed());
-        let result = if oversized && matches!(mode, Mode::ProtectText) {
+        let result = if let Some(operation) = &hydration_operation {
+            hydrate_event(
+                process,
+                repo,
+                operation,
+                &text[cursor..end],
+                mode,
+                crate::domain::storage::MAX_MATERIALIZED_BYTES
+                    .saturating_sub(outcome.content.len()),
+                &remaining,
+            )
+        } else if oversized && matches!(mode, Mode::ProtectText) {
             protect_windows(process, repo, context, text, &remaining)
+        } else if oversized && matches!(mode, Mode::ProtectEnvelopes) {
+            protect_oversized_envelope(process, repo, &text[cursor..end], &remaining)
         } else if oversized {
             protect_oversized_line(process, repo, &text[cursor..end], &remaining)
         } else {
@@ -751,6 +820,13 @@ fn transform_inner(
         };
         match result {
             Ok(batch) => {
+                if hydrates
+                    && outcome.content.len().saturating_add(batch.content.len())
+                        > crate::domain::storage::MAX_MATERIALIZED_BYTES
+                {
+                    stopped = Some(Reason::Oversize);
+                    break;
+                }
                 if matches!(mode, Mode::ProtectStream) {
                     return batch;
                 }
@@ -759,7 +835,11 @@ fn transform_inner(
                     stopped = batch.reason.or(Some(Reason::StoreBusy));
                     break;
                 }
-                outcome.content.push_str(&batch.content);
+                if outcome.content.is_empty() {
+                    outcome.content = batch.content;
+                } else {
+                    outcome.content.push_str(&batch.content);
+                }
                 outcome.replacements += batch.replacements;
                 outcome.unresolved += batch.unresolved;
                 outcome.omitted += batch.omitted;
@@ -792,7 +872,27 @@ fn transform_inner(
             }
         }
     }
+    if let Some(operation) = hydration_operation {
+        let command = super::hydration::Command::Close { operation };
+        if let Ok(context) = serde_json::to_string(&command) {
+            // Closing clears event and dictionary buffers. It needs its own bounded allowance,
+            // even when processing used the pass's budget, before another request reuses the worker.
+            let _ = state.process.as_mut().expect("worker started").request(
+                repo,
+                &context,
+                "",
+                Mode::HydrateTransfer,
+                STARTUP_DEADLINE,
+            );
+        }
+    }
     if cursor < text.len() {
+        if hydrates
+            && outcome.content.len().saturating_add(text.len() - cursor)
+                > crate::domain::storage::MAX_MATERIALIZED_BYTES
+        {
+            return skipped(text, Reason::Oversize);
+        }
         outcome.content.push_str(&text[cursor..]);
         if cursor == 0 {
             outcome.status = Status::Skipped;
@@ -809,6 +909,123 @@ fn transform_inner(
     outcome
 }
 
+/// A complete event stays inside the worker's native parser; only its transport is divided.
+/// Decoding JSON fragments on the caller would lose encoded-carrier and protocol-ID semantics.
+fn hydrate_event(
+    process: &mut Process,
+    repo: Option<&Path>,
+    operation: &str,
+    text: &str,
+    mode: Mode,
+    output_limit: usize,
+    remaining: &dyn Fn() -> Duration,
+) -> Result<Outcome, Failure> {
+    use super::hydration::{CHUNK_BYTES, Command};
+    use crate::domain::storage::MAX_EVENT_BYTES;
+    if !super::detector::placeholder::may_contain_token(text) {
+        return Ok(Outcome {
+            content: text.into(),
+            status: Status::Complete,
+            replacements: 0,
+            unresolved: 0,
+            consumed: None,
+            unprocessed: 0,
+            omitted: 0,
+            reason: None,
+        });
+    }
+    if text.len() > MAX_EVENT_BYTES || text.len() > output_limit {
+        return Ok(skipped(text, Reason::Oversize));
+    }
+    let mut offset = 0;
+    loop {
+        let mut end = text.len().min(offset + CHUNK_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let command = if offset == 0 {
+            Command::Begin {
+                operation: operation.into(),
+                mode,
+                bytes: text.len(),
+                output_limit,
+            }
+        } else {
+            Command::Append {
+                operation: operation.into(),
+                offset,
+            }
+        };
+        let context =
+            serde_json::to_string(&command).map_err(|error| Failure::Protocol(error.into()))?;
+        let ack = process.request(
+            repo,
+            &context,
+            &text[offset..end],
+            Mode::HydrateTransfer,
+            remaining(),
+        )?;
+        if ack.status != Status::Complete || ack.consumed != Some(end) || !ack.content.is_empty() {
+            return Err(Failure::Protocol(anyhow::anyhow!(
+                "invalid hydration input acknowledgement"
+            )));
+        }
+        offset = end;
+        if offset == text.len() {
+            break;
+        }
+    }
+    let mut output: Option<Outcome> = None;
+    let mut total = None;
+    loop {
+        let offset = output.as_ref().map_or(0, |output| output.content.len());
+        let context = serde_json::to_string(&Command::Read {
+            operation: operation.into(),
+            offset,
+        })
+        .map_err(|error| Failure::Protocol(error.into()))?;
+        let mut part = process.request(repo, &context, "", Mode::HydrateTransfer, remaining())?;
+        let size = part.consumed.ok_or_else(|| {
+            Failure::Protocol(anyhow::anyhow!("hydration output length is missing"))
+        })?;
+        if size > output_limit
+            || total.is_some_and(|total| total != size)
+            || part.content.len() > CHUNK_BYTES
+            || offset.saturating_add(part.content.len()) > size
+            || (part.content.is_empty() && offset != size)
+        {
+            return Err(Failure::Protocol(anyhow::anyhow!(
+                "invalid hydration output page"
+            )));
+        }
+        total = Some(size);
+        if let Some(output) = &mut output {
+            if output.status != part.status
+                || output.replacements != part.replacements
+                || output.unresolved != part.unresolved
+                || output.reason != part.reason
+            {
+                return Err(Failure::Protocol(anyhow::anyhow!(
+                    "hydration result changed between pages"
+                )));
+            }
+            output.content.push_str(&part.content);
+        } else {
+            part.consumed = None;
+            output = Some(part);
+        }
+        if output
+            .as_ref()
+            .is_some_and(|output| output.content.len() == size)
+        {
+            break;
+        }
+    }
+    let output = output.expect("hydration output received");
+    validate(text, &output, mode).map_err(Failure::Protocol)?;
+    Ok(output)
+}
+
 /// How much of an oversized string one request carries, and the room an oversized record keeps
 /// below the request bound once its largest strings are taken out.
 const WINDOW_BYTES: usize = 4 * 1024 * 1024;
@@ -821,6 +1038,36 @@ pub(crate) const OMITTED_TEXT: &str = "[content omitted: too large for the priva
 /// What a long text keeps in place of a part with too many findings for the privacy check to
 /// finish or divide.
 pub(crate) const CROWDED_TEXT: &str = "[content omitted: too many findings for the privacy check]";
+
+/// The envelope is storage framing; only its native content crosses the privacy boundary.
+/// Recomputing its address after protection keeps the stored event valid on older readers.
+fn protect_oversized_envelope(
+    process: &mut Process,
+    repo: Option<&Path>,
+    line: &str,
+    remaining: &dyn Fn() -> Duration,
+) -> Result<Outcome, Failure> {
+    let mut envelope =
+        crate::domain::storage::parse_envelope_line(line).map_err(Failure::Protocol)?;
+    let native = envelope.content.to_string();
+    let mut outcome = protect_oversized_line(process, repo, &native, remaining)?;
+    if !passed(&outcome) {
+        return Ok(skipped(
+            line,
+            outcome.reason.unwrap_or(Reason::SourceIncomplete),
+        ));
+    }
+    if outcome.replacements == 0 && outcome.omitted == 0 {
+        outcome.content = line.to_owned();
+    } else {
+        envelope.content = serde_json::from_str(&outcome.content)
+            .map_err(|error| Failure::Protocol(error.into()))?;
+        envelope.object_hash = crate::domain::transcript::object_hash(&envelope.content);
+        outcome.content = crate::domain::storage::envelope_line(&envelope);
+    }
+    validate(line, &outcome, Mode::ProtectEnvelopes).map_err(Failure::Protocol)?;
+    Ok(outcome)
+}
 
 /// One JSONL line too large for a request, protected in parts. Its base64 media payloads stay
 /// here, since media is never scanned, and every other string too large to travel with the record
@@ -856,6 +1103,19 @@ fn protect_oversized_line(
     for (index, part) in strings.into_iter().enumerate() {
         if !part.media && size <= MAX_UNIT_BYTES - WINDOW_CONTEXT_BYTES {
             break;
+        }
+        // JSON carriers need the complete decoded keys and values. Text windows cannot prove
+        // their protection, and replacing them with stubs would hide that requirement from the
+        // native projector. Refuse the record instead of treating an unexamined carrier as text.
+        if !part.media
+            && record
+                .pointer(&part.pointer)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| {
+                    serde_json::from_str::<&serde_json::value::RawValue>(text).is_ok()
+                })
+        {
+            return Ok(skipped(line, Reason::Oversize));
         }
         let mut stub = format!("agit-oversized-part-{index}");
         while body.contains(&stub) {
@@ -1257,10 +1517,38 @@ fn validate(input: &str, output: &Outcome, mode: Mode) -> crate::Result<()> {
                 "privacy changed a record boundary"
             );
             match (
-                serde_json::from_str::<serde_json::Value>(before),
-                serde_json::from_str::<serde_json::Value>(after),
+                serde_json::from_str::<&serde_json::value::RawValue>(before),
+                serde_json::from_str::<&serde_json::value::RawValue>(after),
             ) {
                 (Ok(before), Ok(after)) => {
+                    // Only carrier identities need comparison. Borrow the large content instead
+                    // of allocating a second restored event merely to inspect its header.
+                    let fields = |raw: &serde_json::value::RawValue| {
+                        serde_json::from_str::<
+                            std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+                        >(raw.get())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(key, _)| {
+                            matches!(
+                                key.as_str(),
+                                "_session_id"
+                                    | "_source"
+                                    | "session_id"
+                                    | "sessionId"
+                                    | "event_id"
+                                    | "uuid"
+                                    | "type"
+                            )
+                        })
+                        .map(|(key, value)| {
+                            serde_json::from_str::<serde_json::Value>(value.get())
+                                .map(|value| (key, value))
+                        })
+                        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
+                    };
+                    let before = fields(before)?;
+                    let after = fields(after)?;
                     for field in [
                         "_session_id",
                         "_source",
