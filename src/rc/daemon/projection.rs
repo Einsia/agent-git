@@ -951,6 +951,7 @@ mod bound_lineage_tests {
                     let (cmd_tx, _cmd_rx) = mpsc::channel(1);
                     let info = SessionInfo {
                         interrupt_fenced: None,
+                        interrupted: None,
                         lease: None,
                         publication: None,
                         session_id: "agit-S".into(),

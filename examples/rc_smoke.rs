@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         runtime_session_id: None,
         native_source: None,
         interrupt_fenced: None,
+        interrupted: None,
         agent: None,
         branch: None,
         status: SessionStatus::Idle,

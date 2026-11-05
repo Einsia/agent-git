@@ -245,6 +245,7 @@ impl Daemon {
         let (title, gist) = catalog_labels(&source, native);
         let info = SessionInfo {
             interrupt_fenced: None,
+            interrupted: None,
             lease: None,
             publication: None,
             session_id: logical,

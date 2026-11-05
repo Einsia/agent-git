@@ -490,3 +490,56 @@ async fn bridge_waits_for_another_process_to_release_the_lifecycle_lock() {
     );
     bridge.kill().await.unwrap();
 }
+
+/// SIGTERM, which a service manager or `kill` sends, stops the daemon the way `agit rc stop`
+/// does: it exits by itself. Left unhandled, the signal ends the process the way a crash does,
+/// and a running turn is cut without an interrupt and nothing settles.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_stops_the_daemon_by_its_own_exit() {
+    use agit::rc::control::{Presence, presence_in, socket_path_for};
+    use std::time::{Duration, Instant};
+
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path();
+    startup_cache::seed(home);
+    let rc = home.join("desktop-rc");
+    let mut daemon = OwnedChild(
+        command(home)
+            .args(["rc", "local", "start"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while presence_in(&rc) != Presence::Running(daemon.0.id()) {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited during startup"
+        );
+        assert!(Instant::now() < deadline, "daemon did not start");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _cleanup = Stop(home);
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &daemon.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let exited = loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "SIGTERM did not stop the daemon");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(exited.success(), "{exited:?}");
+    // Short-path sockets live outside the disposable home; remove only this fixture's paths.
+    let socket = socket_path_for(&rc);
+    let _ = std::fs::remove_file(socket.with_extension("rpc"));
+    let _ = std::fs::remove_file(socket);
+}

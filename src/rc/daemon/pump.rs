@@ -267,6 +267,23 @@ impl Daemon {
                 }
             });
         }
+        // A service manager or `kill` stops the daemon with SIGTERM. Unhandled, it ends the process
+        // the way a crash does: the running turn is cut without an interrupt and nothing settles.
+        #[cfg(unix)]
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                let stop_tx = stop_tx.clone();
+                tokio::spawn(async move {
+                    if terminate.recv().await.is_some() {
+                        let _ = stop_tx.try_send(());
+                    }
+                });
+            }
+            // Said where the daemon's log is read: a stop by SIGTERM is then the crash it looks like.
+            Err(error) => eprintln!(
+                "agitd: SIGTERM cannot be handled, so it ends the daemon without a clean stop: {error}"
+            ),
+        }
 
         // The local endpoint owns outbound delivery independently of individual peer attachments.
         let link_stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -981,6 +998,33 @@ impl Daemon {
         });
     }
 
+    fn record_stopped_turns(&mut self) {
+        let at = chrono::Utc::now().to_rfc3339();
+        let mut recorded = false;
+        for (id, live) in &self.sessions {
+            // A runtime the daemon shares keeps running its turn after the stop.
+            if !live.shared_executor
+                && matches!(
+                    live.info.status,
+                    SessionStatus::Running | SessionStatus::AwaitingApproval
+                )
+                && self.roster.get(id).is_some()
+            {
+                self.roster.interrupted.insert(
+                    id.clone(),
+                    crate::protocol::Interruption {
+                        at: at.clone(),
+                        cause: crate::protocol::InterruptionCause::Stopped,
+                    },
+                );
+                recorded = true;
+            }
+        }
+        if recorded && let Err(error) = self.roster.save() {
+            eprintln!("agitd: the interrupted turns could not be recorded: {error:#}");
+        }
+    }
+
     pub(super) async fn shutdown(&mut self) {
         let mut terminal_cleanup = Vec::with_capacity(self.terminals.len());
         for (_, t) in self.terminals.drain() {
@@ -1021,6 +1065,9 @@ impl Daemon {
         // notified. Failing to push it in is fine: the channel's **sending end is dropped
         // here**, so `commands.recv()` on the session side immediately gets `None` and
         // takes the same finishing path as a `Shutdown`.
+        // A turn this stop cuts is recorded before the sessions end: after the restart the web can
+        // say the conversation was interrupted, not only that it is not running.
+        self.record_stopped_turns();
         let _ = tokio::time::timeout(FLEET_EXIT_GRACE, async {
             let mut tasks = vec![];
             for (_, l) in self.sessions.drain() {

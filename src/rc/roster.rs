@@ -187,6 +187,10 @@ pub enum StartClaim {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
+    /// Conversations whose last turn was cut by agit stopping, by logical id, until they run
+    /// again. Kept on this computer; only the interruption itself is shown to the web.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) interrupted: BTreeMap<String, crate::protocol::Interruption>,
     /// Explicitly observed native sessions retain collection after their viewers disconnect.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) observed: BTreeSet<String>,
@@ -343,6 +347,7 @@ pub(crate) fn fail_next_fallback_removals(count: usize) {
 impl Roster {
     fn unusable() -> Roster {
         Roster {
+            interrupted: BTreeMap::new(),
             observed: BTreeSet::new(),
             captures: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -1386,6 +1391,7 @@ mod tests {
     fn start_info() -> crate::protocol::SessionInfo {
         crate::protocol::SessionInfo {
             interrupt_fenced: None,
+            interrupted: None,
             lease: None,
             publication: None,
             session_id: "agit-started".into(),

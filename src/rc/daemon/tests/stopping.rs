@@ -2102,3 +2102,64 @@ fn a_close_that_cannot_save_leaves_the_session_running_and_answers_what_the_disk
             });
     });
 }
+
+/// A daemon stop records each turn it cuts on a runtime it owns, and the conversation then tells a
+/// subscriber when and why, with nothing else from the record. An idle conversation is not
+/// recorded, nor a turn on a shared runtime, which outlives the stop. A stop that records nothing
+/// leaves the web saying only "not running" about a conversation whose turn it cut; one that
+/// copies the roster row onto the wire publishes this computer's paths.
+#[test]
+fn a_stop_records_the_turns_it_cuts_and_subscribe_reports_them() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::protocol::PermissionMode;
+                let mut roster = Roster::default();
+                let mut sessions = HashMap::new();
+                for (id, status, shared) in [
+                    ("agit-cut", SessionStatus::Running, false),
+                    ("agit-idle", SessionStatus::Idle, false),
+                    ("agit-shared", SessionStatus::Running, true),
+                ] {
+                    roster.sessions.insert(
+                        id.into(),
+                        rpc_test_roster_entry(id, PermissionMode::Default),
+                    );
+                    let (tx, _rx) = mpsc::channel(1);
+                    let mut live = rpc_test_live(id, 1, tx, PermissionMode::Default);
+                    live.info.status = status;
+                    live.shared_executor = shared;
+                    sessions.insert(id.to_string(), live);
+                }
+                let daemon = rpc_test_daemon(sessions, roster);
+                let mut state = daemon.lock().await;
+                state.shutdown().await;
+                let recorded: Vec<_> = Roster::load().interrupted.into_keys().collect();
+                assert_eq!(recorded, ["agit-cut"]);
+
+                let (frames, _) = mpsc::channel(1);
+                let mut subscribe = Frame::request(
+                    method::SESSION_SUBSCRIBE,
+                    serde_json::json!({"session_id": "agit-cut"}),
+                );
+                subscribe.caller = Some(claim("viewer", "ws-a"));
+                let data = state
+                    .dispatch(&subscribe, &frames)
+                    .await
+                    .unwrap_err()
+                    .data
+                    .unwrap();
+                assert_eq!(data["reason"], "dormant");
+                let interrupted = data["interrupted"].as_object().unwrap();
+                assert_eq!(
+                    interrupted.keys().map(String::as_str).collect::<Vec<_>>(),
+                    ["at", "cause"]
+                );
+                assert_eq!(interrupted["cause"], "stopped");
+            })
+    });
+}

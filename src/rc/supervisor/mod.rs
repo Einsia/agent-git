@@ -656,6 +656,9 @@ impl Drop for ProcessGroupGuard {
 /// `agit resume`'s slow path does).
 pub const TAIL_POLL_MS: u64 = 120;
 const ROLLOVER_CHECK: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a stop waits for the turn it interrupted to end. It sits inside the daemon's own exit
+/// bound with room for the runtime's teardown and the exit settlement after it.
+const STOP_TURN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long, in milliseconds, to wait at most for the transcript file to go quiet before
 /// declaring a turn over.
@@ -930,6 +933,11 @@ pub struct Session {
     /// The daemon told this session to stop, by its own exit or restart. That can be a person's stop,
     /// so a turn it cuts off is theirs; a harness that ends on its own stopped without anyone.
     stop_requested: bool,
+    /// While a stop waits for the turn it interrupted to end: until when. The turn then ends the
+    /// way a person's interrupt ends it, archived and announced, instead of being cut by the kill.
+    stopping_turn: Option<tokio::time::Instant>,
+    /// How long that wait may last: [`STOP_TURN_GRACE`] outside tests.
+    stop_turn_grace: std::time::Duration,
     completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// See [`SettlementChild`]: test-only, always `None` in production.
     settlement_child: Option<SettlementChild>,
@@ -1712,6 +1720,8 @@ impl Session {
             local_settlement: None,
             settlement_due: false,
             stop_requested: false,
+            stopping_turn: None,
+            stop_turn_grace: STOP_TURN_GRACE,
             completed_boundary: None,
             settlement_child: None,
             queued_initial_turn: None,
@@ -2575,6 +2585,46 @@ impl Session {
             .await;
     }
 
+    fn turn_running(&self) -> bool {
+        matches!(
+            self.info.status,
+            SessionStatus::Running | SessionStatus::AwaitingApproval
+        )
+    }
+
+    /// Interrupt the running turn because the daemon is stopping, so the runtime closes it the
+    /// way it closes any interrupt. False when no turn runs or the interrupt could not be sent;
+    /// the stop then goes ahead at once. A runtime the daemon did not start, or shares, outlives
+    /// the stop, and its turn is left to run.
+    async fn interrupt_for_stop(&mut self) -> bool {
+        if self.stopping_turn.is_some()
+            || !self.turn_running()
+            || !self.driver.started_process()
+            || self.driver.shared_executor()
+        {
+            return false;
+        }
+        // A person's interrupt already on its way closes the same turn.
+        if self.pending_interrupt_command.is_none() {
+            match self.driver.interrupt(None).await {
+                InterruptDispatch::Resolved(Ok(
+                    crate::rc::harness::InterruptOutcome::Requested,
+                ))
+                | InterruptDispatch::Awaiting => {}
+                InterruptDispatch::Resolved(_) => return false,
+            }
+        }
+        self.stopping_turn = Some(tokio::time::Instant::now() + self.stop_turn_grace);
+        true
+    }
+
+    async fn stop(&mut self) {
+        self.stopping_turn = None;
+        self.stop_requested = true;
+        self.abandon_pending_approvals().await;
+        self.set_status(SessionStatus::Ended).await;
+    }
+
     async fn run_inner(&mut self, commands: &mut mpsc::Receiver<Command>) {
         // Native ownership is announced before commands run; repository preparation is independent.
         self.bind_if_known().await;
@@ -2597,7 +2647,7 @@ impl Session {
                         Some(command) => command,
                         None => commands.recv().await,
                     }
-                } => {
+                }, if self.stopping_turn.is_none() => {
                     // **Do not do it when nobody is waiting.**
                     //
                     // The daemon's wait for an answer is bounded (a slow settlement can hold it
@@ -2647,9 +2697,14 @@ impl Session {
                         }
                     match cmd {
                         None | Some(Command::Shutdown) => {
+                            // Recorded before the wait: a runtime that exits during it without
+                            // ending the turn must still leave a turn this stop cut, not one that
+                            // ended on its own.
                             self.stop_requested = true;
-                            self.abandon_pending_approvals().await;
-                            self.set_status(SessionStatus::Ended).await;
+                            if self.interrupt_for_stop().await {
+                                continue;
+                            }
+                            self.stop().await;
                             return;
                         }
                         Some(Command::ClaudeRestartGuardReady) => {
@@ -3106,11 +3161,22 @@ impl Session {
                             if self.info.status == SessionStatus::Ended {
                                 return;
                             }
+                            if self.stopping_turn.is_some() && !self.turn_running() {
+                                self.stop().await;
+                                return;
+                            }
                         }
                     }
                 }
 
                 _ = ticker.tick() => {
+                    if self
+                        .stopping_turn
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    {
+                        self.stop().await;
+                        return;
+                    }
                     self.retry_unshown_approvals().await;
                     self.finish_local_settlement(false).await;
                     self.finish_publication(false).await;
