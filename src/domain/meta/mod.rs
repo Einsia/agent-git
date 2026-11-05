@@ -573,6 +573,7 @@ pub fn write(repo_root: &Path, meta: &Meta) -> Result<PathBuf> {
         .sync_all()
         .with_context(|| format!("cannot sync temporary metadata for {}", p.display()))?;
     temporary
+        .into_temp_path()
         .persist(&p)
         .map_err(|error| error.error)
         .with_context(|| format!("cannot publish {}", p.display()))?;

@@ -400,6 +400,7 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
     use std::io::Write as _;
     writeln!(temporary, "{}", link.to_json()?)?;
     temporary
+        .into_temp_path()
         .persist(&lp)
         .with_context(|| format!("cannot write {}", lp.display()))?;
     Ok(lp)
