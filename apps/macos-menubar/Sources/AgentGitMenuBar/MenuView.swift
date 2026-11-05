@@ -206,6 +206,8 @@ private struct ProblemRow: View {
             Button("Check again") { model.checkAgain() }.disabled(model.refreshing)
         case .dismiss(let key):
             Button("Dismiss") { model.dismiss(key) }
+        case .acknowledge(let key):
+            Button("OK") { model.acknowledge(key) }
         case .none:
             EmptyView()
         }

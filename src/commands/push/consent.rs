@@ -82,45 +82,135 @@ pub(crate) fn confirms_public(repo: &Repo, destination: &RemoteIdentity) -> Resu
     }))
 }
 
-/// Only a person switches on automatic upload into a public repository: at a terminal, or with a
-/// click in agit's own menu bar, which passes `--public-consent` naming the repository its dialog
-/// showed. No `--yes`, `--json` or `AGIT_YES` answers it, and neither does the flag inside an agent
-/// session: an agent that relays a yes would otherwise enable every later turn's upload on one
-/// sentence.
-pub(crate) fn require_person_for_public(
+/// Set by agit's menu bar for the commands it runs after its own question.
+pub(crate) const ASKED_ENV: &str = "AGIT_MENUBAR_ASKED";
+
+/// Who answered a switch-on of automatic upload into a public repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicAnswer {
+    /// A person: at a terminal, or with a click in agit's own menu bar, which passes
+    /// `--public-consent` naming the repository its dialog showed.
+    Person,
+    /// `--yes`, `--json` or `AGIT_YES`, or the menu bar's flag from inside an agent session: an
+    /// answer, but not necessarily from the person who will read the result.
+    Unattended,
+}
+
+/// A public automatic upload is switched on like a private one: by a person, or by `--yes`,
+/// `--json` or `AGIT_YES` from any session, an agent's included. Only a switch-on that nobody
+/// answered is refused. One answered without a person is recorded by `record_unattended`, so the
+/// menu bar tells the person what was switched on and where to turn it off.
+///
+/// The menu bar sets `ASKED_ENV` for its commands: its own question already answered whether to
+/// upload, and only its public question answers whether to upload publicly. There a `--yes` without
+/// the consent is no answer for a public destination, so a repository that turned public after
+/// its question was asked is refused and asked again in the public words.
+pub(crate) fn answer_public_switch_on(
     repository: &str,
     command: &str,
     public_consent: Option<&str>,
-) -> crate::Result<()> {
+) -> crate::Result<PublicAnswer> {
     let in_agent_session = crate::tui::Signals::from_process().agent_session.is_some();
-    if person_consents(
-        repository,
-        public_consent,
+    let yes = (std::env::var_os("AGIT_YES").is_some() || crate::commands::json::requested())
+        && std::env::var_os(ASKED_ENV).is_none();
+    match answer(
         crate::ui::prompt::can_ask(),
+        public_consent == Some(repository),
         in_agent_session,
+        yes,
     ) {
-        return Ok(());
+        Some(answer) => Ok(answer),
+        None => Err(crate::commands::InteractionRequired(format!(
+            "Turning on automatic upload into the public repository {repository} needs a yes: run `{command}` with --yes, or turn it on from the AgentGit menu bar."
+        ))
+        .into()),
     }
-    Err(crate::commands::InteractionRequired(format!(
-        "Automatic upload into the public repository {repository} is turned on from the AgentGit menu bar, or by running `{command}` in a terminal."
-    ))
-    .into())
 }
 
-/// Whether a person stands behind switching on automatic upload into the public `repository`:
-/// a terminal outside an agent session, or the menu bar's consent for exactly that repository,
-/// also outside one.
-fn person_consents(
-    repository: &str,
-    public_consent: Option<&str>,
+/// Who answered: a terminal outside an agent session, or the menu bar's consent for exactly
+/// that repository outside one, is a person; any other explicit answer is unattended; none is
+/// no answer.
+fn answer(
     at_terminal: bool,
+    menu_bar: bool,
     in_agent_session: bool,
-) -> bool {
-    at_terminal || (!in_agent_session && public_consent == Some(repository))
+    yes: bool,
+) -> Option<PublicAnswer> {
+    if at_terminal || (menu_bar && !in_agent_session) {
+        Some(PublicAnswer::Person)
+    } else if yes || menu_bar {
+        Some(PublicAnswer::Unattended)
+    } else {
+        None
+    }
 }
 
-/// Records the person's enrollment when switching automatic upload on for a checkout pinned to a
-/// public repository, and refuses the switch when no person stands behind it.
+/// A public automatic upload that was switched on with nobody at a terminal or in the menu bar.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UnattendedSwitchOn {
+    pub repository: String,
+    /// Seconds since the Unix epoch.
+    pub at: u64,
+}
+
+/// How many unattended switch-ons are kept for the menu bar to tell; it tells each once.
+const UNATTENDED_KEPT: usize = 32;
+
+fn unattended_path() -> Result<std::path::PathBuf> {
+    Ok(crate::infra::config::agit_home()?.join("notices/public-switch-on.json"))
+}
+
+/// Records that automatic upload into the public `repository` was switched on unattended. The
+/// record holds the repository name and a time, both under the agit home and never sent.
+pub(crate) fn record_unattended(repository: &str) -> Result<()> {
+    record_unattended_at(&unattended_path()?, repository)
+}
+
+/// Adds `repository` to the list at `path`. The list is read and replaced under one exclusive
+/// lock on a lock file that stays beside it: two switch-ons recorded at once both stay, where a
+/// read outside the lock would let the later replacement drop the earlier entry.
+fn record_unattended_at(path: &std::path::Path, repository: &str) -> Result<()> {
+    let directory = path.parent().context("notice file has no directory")?;
+    crate::infra::config::create_state_dir(directory)?;
+    let lock = crate::infra::config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut kept = read_unattended(path);
+    kept.push(UnattendedSwitchOn {
+        repository: repository.into(),
+        at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+    });
+    let excess = kept.len().saturating_sub(UNATTENDED_KEPT);
+    kept.drain(..excess);
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(&serde_json::to_vec(&kept)?)?;
+    file.persist(path).map_err(|error| error.error)?;
+    let _ = fs2::FileExt::unlock(&lock);
+    Ok(())
+}
+
+/// The unattended public switch-ons recorded here, oldest first; none when unreadable.
+pub(crate) fn unattended() -> Vec<UnattendedSwitchOn> {
+    unattended_path()
+        .map(|path| read_unattended(&path))
+        .unwrap_or_default()
+}
+
+fn read_unattended(path: &std::path::Path) -> Vec<UnattendedSwitchOn> {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Records the enrollment when switching automatic upload on for a checkout pinned to a public
+/// repository, and refuses the switch when nobody answered it.
 ///
 /// A checkout whose destination or audience cannot be read records nothing; automatic
 /// publication then refuses a public destination by itself.
@@ -139,8 +229,14 @@ pub(crate) fn enroll_public_destination(
     if consent.visibility != "public" {
         return Ok(());
     }
-    require_person_for_public(repository, command, public_consent)?;
+    let answer = answer_public_switch_on(repository, command, public_consent)?;
     consent.save(repo)?;
+    crate::ui::warning(&format!(
+        "automatic upload into {repository} is on (public: anyone can read it)"
+    ));
+    if answer == PublicAnswer::Unattended {
+        record_unattended(repository)?;
+    }
     Ok(())
 }
 
@@ -148,34 +244,65 @@ pub(crate) fn enroll_public_destination(
 mod tests {
     use super::*;
 
-    /// The menu bar's consent counts only for the repository it names and only outside an agent
-    /// session; `--yes` alone is no consent. A gate that took any repository named, or the flag
-    /// from an agent's own session, would let an agent switch a public upload on by passing it.
+    /// A person at a terminal, or the menu bar's consent for the repository outside an agent
+    /// session, is a person's answer; `--yes` or the flag from an agent's session is an answer
+    /// too, recorded as unattended; nothing given is no answer. A gate that refused the agent's
+    /// yes would block what the person allowed, and one that took it as the person's would leave
+    /// them unaware a public upload was switched on.
     #[test]
-    fn a_public_switch_on_needs_a_terminal_or_the_menu_bars_consent_for_that_repository() {
-        assert!(person_consents("alice/app", None, true, false));
-        assert!(person_consents(
-            "alice/app",
-            Some("alice/app"),
-            false,
-            false
-        ));
+    fn a_public_switch_on_is_answered_by_anyone_and_told_when_no_person_answered() {
+        use PublicAnswer::{Person, Unattended};
+        assert_eq!(answer(true, false, false, false), Some(Person));
+        assert_eq!(answer(false, true, false, false), Some(Person));
+        assert_eq!(answer(false, false, false, true), Some(Unattended));
+        assert_eq!(answer(false, false, true, true), Some(Unattended));
+        assert_eq!(answer(false, true, true, false), Some(Unattended));
+        assert_eq!(answer(false, false, true, false), None);
+        assert_eq!(answer(false, false, false, false), None);
+    }
+
+    /// Two switch-ons recorded at once both stay: a writer waits for the list's lock before it
+    /// reads. A writer that read before taking it would replace the list with its own copy, and the
+    /// person would never be told of the other switch-on.
+    #[test]
+    fn switch_ons_recorded_at_once_both_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notices/public-switch-on.json");
+        record_unattended_at(&path, "alice/one").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let (done, recorded) = std::sync::mpsc::channel();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                record_unattended_at(&path, "alice/two").unwrap();
+                done.send(()).unwrap();
+            })
+        };
         assert!(
-            !person_consents("alice/app", None, false, false),
-            "--yes alone"
+            recorded
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a switch-on was recorded while another writer held the list"
         );
-        assert!(!person_consents(
-            "alice/app",
-            Some("alice/other"),
-            false,
-            false
-        ));
-        assert!(!person_consents(
-            "alice/app",
-            Some("alice/app"),
-            false,
-            true
-        ));
+        // The writer holding the lock replaces the list meanwhile.
+        let mut kept = read_unattended(&path);
+        kept.push(UnattendedSwitchOn {
+            repository: "alice/three".into(),
+            at: 3,
+        });
+        fs::write(&path, serde_json::to_vec(&kept).unwrap()).unwrap();
+        fs2::FileExt::unlock(&held).unwrap();
+        writer.join().unwrap();
+        let names: Vec<_> = read_unattended(&path)
+            .into_iter()
+            .map(|entry| entry.repository)
+            .collect();
+        assert_eq!(names, ["alice/one", "alice/three", "alice/two"]);
     }
 
     /// A saved enrollment cannot authorize another account, repository or audience.

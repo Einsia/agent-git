@@ -82,7 +82,7 @@ pub(super) fn run(
         };
         if !enrolled {
             return Err(crate::commands::InteractionRequired(format!(
-                "automatic upload into the public repository {repository} was not switched on by the person; ask them to run `agit config --repo {repository} push.auto true` themselves in a terminal, or publish this once with `agit push {repository}@<branch>`"
+                "automatic upload into the public repository {repository} is not switched on; `agit config --repo {repository} push.auto true --yes` switches it on, or `agit push {repository}@<branch>` publishes this once"
             ))
             .into());
         }

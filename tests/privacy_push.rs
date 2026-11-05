@@ -5433,21 +5433,21 @@ fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
     );
 }
 
-/// Automatic upload into a public repository is switched on only by the person: at a terminal, or
-/// with the menu bar's consent naming that repository, outside any agent session. Each row names an
-/// entry point, the destination's audience, whether `--yes` was given and whether a terminal is
-/// attached. Without either, a public switch-on is refused with or without `--yes` and leaves
-/// automatic upload off; private, and user-wide or destination-less switches, stay allowed, but an
-/// automatic push into a public repository that nobody enrolled is refused before upload. A gate
-/// that accepted `--yes`, or the consent for another repository or from inside an agent session,
-/// would let an agent enroll a public repository on a relayed sentence; a gate only at the entry
-/// points would let an inherited user preference publish publicly. The dry run the menu bar asks
-/// first names the audience, so its question can say the repository is public. Choosing "On", or inheriting an enabled preference, in a first checkout's
+/// Automatic upload into a public repository is switched on by an explicit answer from anyone: a
+/// terminal, the menu bar's consent naming that repository, or `--yes` from any session, an
+/// agent's included. Each row names an entry point, the destination's audience, whether `--yes`
+/// was given and whether a terminal is attached. A switch-on nobody answered is refused and leaves
+/// automatic upload off; user-wide or destination-less switches stay allowed, but an automatic push
+/// into a public repository that nobody switched on is refused before upload. A switch-on answered
+/// with no person present is recorded and listed for the menu bar to tell the person; one a person
+/// answered is not. A gate that refused an agent's `--yes` would block what the person allowed; a
+/// gate only at the entry points would let an inherited user preference publish publicly. The dry
+/// run the menu bar asks first names the audience, so its question can say the repository is public. Choosing "On", or inheriting an enabled preference, in a first checkout's
 /// menu at a terminal records the same enrollment as `--auto-push=true` there; a menu that only
 /// stored the switch would leave every later automatic upload refused.
 #[cfg(unix)]
 #[test]
-fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person() {
+fn automatic_upload_into_a_public_repository_is_switched_on_by_an_explicit_answer() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     let remote_root = temp.path().join("remote");
@@ -5542,6 +5542,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
     assert_success(&run(&["--yes", "push", "alice/app@main"], false));
     let work = home.join("worktrees/alice/app/work");
     let enrollment = repo.root().join(".git/agit/privacy-auto-consent.json");
+    let unattended = home.join("notices/public-switch-on.json");
     // A terminal with no agent session: the person typing the command. When `answer` is given,
     // it is typed once the automatic-upload menu is drawn.
     let run_terminal = |home: &Path, args: &[&str], answer: Option<&str>| {
@@ -5701,17 +5702,18 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
     };
     let rows = [
         row(repo_switch, "public", false, false, false, None),
-        row(repo_switch, "public", true, false, false, None),
+        row(repo_switch, "public", true, false, true, Some(true)),
         row(repo_switch, "public", false, true, true, Some(true)),
         row(repo_switch, "private", false, false, true, Some(true)),
         row(clone_switch, "public", false, false, false, None),
-        row(clone_switch, "public", true, false, false, None),
+        row(clone_switch, "public", true, false, true, None),
         row(clone_switch, "private", false, false, true, None),
-        row(bind_switch, "public", true, false, false, None),
+        row(bind_switch, "public", true, false, true, None),
         // The menu bar's click, outside any agent session, consents for the repository it names
-        // and enrolls it as a terminal answer does; consent for another repository is none.
+        // and enrolls it as a terminal answer does; consent naming another repository answers
+        // nothing.
         row(repo_consent, "public", false, false, true, Some(true)),
-        row(repo_consent_other, "public", true, false, false, None),
+        row(repo_consent_other, "public", false, false, false, None),
         // The menu bar passes --yes for the bind's own question; the consent answers the public one.
         row(bind_consent, "public", true, false, true, None),
         row(user_switch, "public", true, false, true, Some(false)),
@@ -5743,6 +5745,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
             .ok();
         assert_success(&run(&["config", "--unset", "push.auto"], false));
         let _ = fs::remove_file(&enrollment);
+        let _ = fs::remove_file(&unattended);
         *hub.visibility.lock().unwrap() = audience;
 
         if let Some(keys) = menu {
@@ -5807,7 +5810,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
                             String::from_utf8_lossy(&pushed.stdout),
                             String::from_utf8_lossy(&pushed.stderr)
                         )
-                        .contains("was not switched on by the person"),
+                        .contains("is not switched on;"),
                         "{case}: {pushed:?}"
                     );
                     assert_eq!(hub.posts.load(Ordering::Acquire), 0, "{case}");
@@ -5829,12 +5832,24 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
             assert_eq!(out.status.success(), switched_on, "{case}: {out:?}");
             if !switched_on {
                 assert!(
-                    String::from_utf8_lossy(&out.stderr)
-                        .contains("is turned on from the AgentGit menu bar, or by running"),
+                    String::from_utf8_lossy(&out.stderr).contains("needs a yes: run"),
                     "{case}: {out:?}"
                 );
             }
         }
+        // Only a public switch-on that enrolls a destination, answered with nobody at a terminal
+        // or in the menu bar, is told; a user-wide or destination-less switch enrolls none.
+        let enrolls = entry != user_switch && entry != init_switch;
+        let told = switched_on
+            && enrolls
+            && audience == "public"
+            && !terminal
+            && !entry.contains(&"--public-consent");
+        assert_eq!(
+            fs::read_to_string(&unattended).is_ok_and(|text| text.contains("alice/app")),
+            told,
+            "{case}"
+        );
         if entry[0] != "init" {
             assert_eq!(effective(&home), switched_on, "{case}");
         }
@@ -5856,7 +5871,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
                         String::from_utf8_lossy(&pushed.stdout),
                         String::from_utf8_lossy(&pushed.stderr)
                     )
-                    .contains("was not switched on by the person"),
+                    .contains("is not switched on;"),
                     "{case}: {pushed:?}"
                 );
                 assert_eq!(hub.posts.load(Ordering::Acquire), 0, "{case}");
@@ -5865,8 +5880,8 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         }
     }
 
-    // The same consent from inside an agent's own session is none: an agent that runs the menu
-    // bar's command line would otherwise switch a public upload on for itself.
+    // An agent may switch a public upload on itself, with the menu bar's flag or `--yes`: it is
+    // switched on and enrolled, and listed as unattended for the menu bar to tell the person.
     repo.git(&["config", "--local", "--unset-all", "agit.autoPush"])
         .ok();
     let _ = fs::remove_file(&enrollment);
@@ -5893,7 +5908,47 @@ fn automatic_upload_into_a_public_repository_is_switched_on_only_by_the_person()
         .args(repo_consent)
         .output()
         .unwrap();
-    assert!(!inside.status.success(), "{inside:?}");
+    assert_success(&inside);
+    assert!(effective(&home));
+    assert!(enrollment.exists());
+    let listed = run(&["--json", "project", "list"], false);
+    assert_success(&listed);
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(
+        listed["result"]["value"]["public_switched_on_unattended"][0]["repository"], "alice/app",
+        "{listed}"
+    );
+
+    // After the menu bar's own question, which for a repository it did not know to be public was
+    // not the public one, its `--yes` does not switch a public upload on: agit asks for the public
+    // consent, so the person sees the public question before anything uploads.
+    repo.git(&["config", "--local", "--unset-all", "agit.autoPush"])
+        .ok();
+    let _ = fs::remove_file(&enrollment);
+    let mut asked = Command::new(env!("CARGO_BIN_EXE_agit"));
+    asked.env_clear_local();
+    for (name, value) in git_command(temp.path()).get_envs() {
+        if let Some(value) = value {
+            asked.env(name, value);
+        }
+    }
+    let asked = asked
+        .current_dir(temp.path())
+        .env("AGIT_HOME", &home)
+        .env("CODEX_HOME", home.join("codex"))
+        .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+        .env("AGIT_HUB_URL", &hub.base)
+        .env("CI", "1")
+        .env("AGIT_TUI", "0")
+        .env("AGIT_USE_SYSTEM_GIT", "1")
+        .env("AGIT_SECRETS_KEYSTORE", "file")
+        .env("AGIT_MENUBAR_ASKED", "1")
+        .stdin(Stdio::null())
+        .arg("--yes")
+        .args(repo_switch)
+        .output()
+        .unwrap();
+    assert_eq!(asked.status.code(), Some(8), "{asked:?}");
     assert!(!effective(&home));
     assert!(!enrollment.exists());
 

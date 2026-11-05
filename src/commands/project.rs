@@ -46,8 +46,8 @@ pub enum Action {
         #[arg(long)]
         rebind: bool,
         /// The person's consent, given in agit's menu bar, to upload automatically into this
-        /// public repository. It must name the `--repo` repository and counts only outside an
-        /// agent session.
+        /// public repository. It must name the `--repo` repository; from inside an agent session
+        /// it is an unattended answer, like `--yes`.
         #[arg(long, value_name = "OWNER/REPO", requires = "auto_upload", hide = true)]
         public_consent: Option<String>,
     },
@@ -1723,8 +1723,8 @@ fn bind(
     let me = super::remote_request(client.me())?;
     project.account = me.username;
     project.account_id = me.account_id;
-    if automatic && remote.visibility == "public" {
-        super::push::require_person_for_public(
+    let public_answer = if automatic && remote.visibility == "public" {
+        Some(super::push::answer_public_switch_on(
             repository,
             &format!(
                 "agit project bind {} --repo {repository} --history {} --auto-upload",
@@ -1736,8 +1736,10 @@ fn bind(
                 }
             ),
             public_consent,
-        )?;
-    }
+        )?)
+    } else {
+        None
+    };
     let org = owner_is_org(&client, &owner, &project.account);
     let audience = Audience {
         visibility: Some(remote.visibility.clone()),
@@ -1750,7 +1752,11 @@ fn bind(
     println!(
         "Project: {} -> {repository} ({})",
         root.display(),
-        remote.visibility
+        if remote.visibility == "public" {
+            "public: anyone can read it"
+        } else {
+            remote.visibility.as_str()
+        }
     );
     println!(
         "History: {history:?}; candidates: {} session{}{}; automatic upload: {automatic}",
@@ -1806,6 +1812,9 @@ fn bind(
             )?;
         }
         consent.save(&repo)?;
+        if public_answer == Some(super::push::PublicAnswer::Unattended) {
+            super::push::record_unattended(repository)?;
+        }
         repository_guard = Some(repository_lock(repository)?);
         enable_auto_push(&mut project, &repo)?;
     }
@@ -4679,6 +4688,9 @@ fn listing() -> Result<serde_json::Value> {
         "hub": config::hub_url(),
         "folders": folders,
         "incomplete": !(policies_complete && sessions_complete),
+        // Public automatic uploads switched on with no person answering, for the menu bar to
+        // tell the person once each.
+        "public_switched_on_unattended": super::push::unattended(),
     }))
 }
 

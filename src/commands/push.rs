@@ -14,7 +14,10 @@ pub(crate) use audited_push::{
     automatic_publication_consent, automatic_publication_consent_with_client, publication_consent,
     publication_consent_with_client,
 };
-pub(crate) use consent::{AutoConsent, enroll_public_destination, require_person_for_public};
+pub(crate) use consent::{
+    AutoConsent, PublicAnswer, answer_public_switch_on, enroll_public_destination,
+    record_unattended, unattended,
+};
 mod preview;
 
 use super::{CmdResult, require_login};

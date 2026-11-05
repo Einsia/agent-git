@@ -19,7 +19,8 @@ enum Health {
 /// Something the user has to act on, in plain words, with the one action that fixes it.
 struct Problem: Identifiable, Equatable {
     enum Fix: Equatable {
-        case signIn, retry(String), allowAutoUpload(String), chooseCLI, checkAgain, dismiss(String), none
+        case signIn, retry(String), allowAutoUpload(String), chooseCLI, checkAgain, dismiss(String)
+        case acknowledge(String), none
     }
 
     let id: String
@@ -132,6 +133,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var paused: [String: String] = [:]
     /// The outcome of the last action, shown once in the menu.
     @Published var notice: String?
+    /// Public automatic uploads switched on with no person answering, not yet acknowledged here.
+    @Published private(set) var unattended: [UnattendedSwitchOn] = []
 
     private var timer: Timer?
     private let notifier = Notifier()
@@ -152,6 +155,7 @@ final class AppModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private static let historyKey = "uploadHistory"
     private static let pausedKey = "pausedFolders"
+    private static let acknowledgedKey = "acknowledgedPublicSwitchOns"
     private static let hooksRepairedKey = "hooksRepairedFor"
     private static let permissionHookAskedKey = "permissionHookAskedFor"
     private static let repairRetry: TimeInterval = 600
@@ -237,6 +241,19 @@ final class AppModel: ObservableObject {
                 id: "upload:\(folder.folder)",
                 title: "Uploads from \(folder.name) are failing",
                 detail: folder.lastUpload?.error, fix: .retry(folder.folder)))
+        }
+        for switchOn in unattended {
+            // An agent may switch a public upload on by itself; the person learns it here, and
+            // where to turn it off, until they say they have seen it.
+            let names = folders.filter { $0.repository == switchOn.repository }.map(\.name)
+            let what = names.isEmpty
+                ? "Every conversation this Mac saves in \(switchOn.repository) now uploads"
+                : "\(names.joined(separator: ", ")) now uploads new conversations"
+            problems.append(Problem(
+                id: "unattended:\(switchOn.key)",
+                title: "\(what) to \(switchOn.repository) (public: anyone can read them)",
+                detail: "It was turned on without a question here, such as by an agent. Turn it off with the folder's switch if you did not mean it.",
+                fix: .acknowledge(switchOn.key)))
         }
         for folder in folders where folder.blocked {
             problems.append(Problem(
@@ -505,9 +522,34 @@ final class AppModel: ObservableObject {
             incomplete = list.incomplete
             folders = list.folders.sorted { ($0.isOn ? 0 : 1, $0.name) < ($1.isOn ? 0 : 1, $1.name) }
             observe(list.folders)
+            tell(list.publicSwitchedOnUnattended ?? [])
         } catch {
             listProblem = CLIError.unreadable(error.localizedDescription).errorDescription
         }
+    }
+
+    /// Shows each unattended public switch-on until the person acknowledges it, and notifies it
+    /// once when it first appears.
+    private func tell(_ switchOns: [UnattendedSwitchOn]) {
+        let acknowledged = Set(defaults.stringArray(forKey: Self.acknowledgedKey) ?? [])
+        let fresh = switchOns.filter { !acknowledged.contains($0.key) }
+        for switchOn in fresh where !unattended.contains(switchOn) {
+            let names = folders.filter { $0.repository == switchOn.repository }.map(\.name)
+            let subject = names.isEmpty ? switchOn.repository : names.joined(separator: ", ")
+            notifier.post(
+                key: Notifier.key("unattended", switchOn.key),
+                title: "\(subject) now uploads to a public repository",
+                body: "New conversations upload to \(switchOn.repository) (public: anyone can read them). Turn it off in the AgentGit menu bar.")
+        }
+        unattended = fresh
+    }
+
+    /// The person has seen an unattended switch-on; it is not shown again.
+    func acknowledge(_ key: String) {
+        var acknowledged = defaults.stringArray(forKey: Self.acknowledgedKey) ?? []
+        if !acknowledged.contains(key) { acknowledged.append(key) }
+        defaults.set(acknowledged, forKey: Self.acknowledgedKey)
+        unattended.removeAll { $0.key == key }
     }
 
     /// Records each finished upload attempt once, and tells the user about a refused one.
