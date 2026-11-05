@@ -100,9 +100,17 @@ impl Daemon {
                 // With the test inverted this is not "slightly stale": the allowlist **is** the
                 // entire basis for containment, and a root that should have disappeared is a pass
                 // that stays valid.
+                let folder = self.mirror.project_path(&p.workspace_id, &p.project_id);
                 self.mirror.unbind(&p.workspace_id, &p.project_id);
                 let _ = self.mirror.save();
                 self.refresh_confinement();
+                // The folder's record of the conversations it held when its uploads were turned
+                // on goes with its last binding; one that stays only keeps more out.
+                if let Some(folder) = folder
+                    && !self.mirror.all_roots().contains(&folder)
+                {
+                    let _ = crate::rc::folder_cutoff::clear(&folder);
+                }
                 Ok(serde_json::json!({}))
             }
 

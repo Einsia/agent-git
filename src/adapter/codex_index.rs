@@ -307,6 +307,56 @@ pub fn thread_page_in(home: &Path, after: Option<&str>, limit: usize) -> crate::
     })
 }
 
+/// Whether `home` has no native index, for a caller that must tell that from a folder it can't
+/// list: [`index_path_in`] answers `None` for both, and a home that can't be listed may hold
+/// conversations. A home that isn't there is an error here too.
+pub fn lacks_index(home: &Path) -> crate::Result<bool> {
+    for entry in std::fs::read_dir(home)? {
+        entry?;
+    }
+    Ok(index_path_in(home).is_none())
+}
+
+/// The threads of `home` every list leaves out but that can come back, as id and working folder:
+/// archived ones, which unarchiving restores, and ones with no rollout yet. A home that keeps
+/// archived rollouts without an index to name them is an error: nothing here can list them.
+pub fn hidden_threads_in(home: &Path) -> crate::Result<Vec<(String, Option<String>)>> {
+    use anyhow::{Context, ensure};
+    if std::fs::symlink_metadata(home)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    let path = if lacks_index(home).context("cannot list the Codex home")? {
+        None
+    } else {
+        index_path_in(home)
+    };
+    let Some(path) = path else {
+        let archived = home.join("archived_sessions");
+        match std::fs::read_dir(&archived) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            entries => ensure!(
+                entries
+                    .context("cannot read the archived rollouts")?
+                    .next()
+                    .is_none(),
+                "archived rollouts have no native index"
+            ),
+        }
+        return Ok(Vec::new());
+    };
+    let con = open(&path).context("native index cannot be opened")?;
+    ensure!(schema_ok(&con), "native index schema is unsupported");
+    con.busy_timeout(std::time::Duration::from_millis(100))?;
+    let mut statement =
+        con.prepare("SELECT id, cwd FROM threads WHERE archived != 0 OR rollout_path IS NULL")?;
+    let threads = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(threads)
+}
+
 /// Exact lookup of one thread by id. Observed at 0.40 ms; id is unique in the table.
 ///
 /// No `archived = 0` here: an explicit id means the user knows which one they want, and
@@ -418,6 +468,65 @@ fn native_path_at(
 
 #[cfg(test)]
 mod tests {
+
+    /// A path that isn't a folder can't be listed, on any runner and for any account, so it is an
+    /// error and not a home with no index.
+    #[test]
+    fn a_plain_file_is_not_read_as_a_home_with_no_index() {
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("home");
+        std::fs::write(&file, "").unwrap();
+        assert!(super::lacks_index(&file).is_err());
+    }
+
+    /// A home that can't be listed is not a home with no index: it may hold conversations.
+    /// Permissions don't apply to root, so there the case can't be made: it says so where the log
+    /// shows it (a passing test's `eprintln!` is captured) instead of passing as if it had run.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_cannot_be_listed_is_not_read_as_having_no_index() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            writeln!(
+                std::io::stderr(),
+                "SKIPPED a_home_that_cannot_be_listed_is_not_read_as_having_no_index: running as root, which permissions don't apply to"
+            )
+            .unwrap();
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("state_1.sqlite"), "").unwrap();
+        assert!(!super::lacks_index(home.path()).unwrap());
+        let mode = |mode| {
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(0o111);
+        let listed = super::lacks_index(home.path());
+        let hidden = super::hidden_threads_in(home.path());
+        mode(0o755);
+        assert!(listed.is_err(), "{listed:?}");
+        assert!(hidden.is_err(), "{hidden:?}");
+    }
+
+    /// A home with no index has nothing hidden only when it has no archived rollouts at all: an
+    /// archive that holds some, or that can't be read, is an error. Read as empty, the
+    /// conversations in it would miss the record of what a folder held.
+    #[test]
+    fn a_home_without_an_index_hides_nothing_only_when_its_archive_is_absent() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(super::hidden_threads_in(home.path()).unwrap().is_empty());
+        let archive = home.path().join("archived_sessions");
+        // A file in its place fails to read as a directory wherever the test runs; removing read
+        // permission would not, for root.
+        std::fs::write(&archive, "").unwrap();
+        assert!(super::hidden_threads_in(home.path()).is_err());
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::create_dir(&archive).unwrap();
+        assert!(super::hidden_threads_in(home.path()).unwrap().is_empty());
+        std::fs::write(archive.join("rollout.jsonl"), "").unwrap();
+        assert!(super::hidden_threads_in(home.path()).is_err());
+    }
     use super::*;
 
     #[test]

@@ -33,6 +33,8 @@ pub(crate) mod project_publication;
 /// Session reuse receipts that `agit run` sends when it starts from a session.
 pub mod reuse;
 pub(crate) mod transport;
+/// The device's workspace and its folder projects, for `agit rc start --here`.
+pub(crate) mod workspaces;
 
 pub use client::Client;
 

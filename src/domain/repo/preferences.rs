@@ -4,6 +4,8 @@ use super::Repo;
 use anyhow::{Result, bail};
 
 const AUTO_PUSH_KEY: &str = "agit.autoPush";
+/// Set on a device-local repository when the person turned its folder off with `agit off`.
+const UPLOADS_OFF_KEY: &str = "agit.uploadsOff";
 
 impl Repo {
     /// Only the repository's local config can override the user's automatic publishing choice.
@@ -58,6 +60,42 @@ impl Repo {
             Some(value) => !value,
             None => crate::infra::config::get_global("push.auto")?.as_deref() == Some("false"),
         })
+    }
+
+    /// Whether the person turned this repository's folder off (`agit off`): nothing re-enables
+    /// its automatic uploads, a later bind of the folder included, until they turn it on again.
+    pub fn uploads_turned_off(&self) -> Result<bool> {
+        let (status, output, error) = self.git_status(&[
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            UPLOADS_OFF_KEY,
+        ])?;
+        match status {
+            Some(0) => Ok(output.trim() != "false"),
+            Some(1) => Ok(false),
+            _ => bail!("could not read whether uploads are off: {}", error.trim()),
+        }
+    }
+
+    pub fn turn_uploads_off(&self, off: bool) -> Result<()> {
+        if off {
+            self.git(&[
+                "config",
+                "--local",
+                "--replace-all",
+                UPLOADS_OFF_KEY,
+                "true",
+            ])?;
+            return self.set_auto_push(Some(false));
+        }
+        let (status, _, error) =
+            self.git_status(&["config", "--local", "--unset-all", UPLOADS_OFF_KEY])?;
+        if !matches!(status, Some(0 | 5)) {
+            bail!("could not turn uploads back on: {}", error.trim());
+        }
+        Ok(())
     }
 
     pub fn auto_push_enabled(&self) -> Result<bool> {

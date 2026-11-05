@@ -507,7 +507,9 @@ fn confirm_repository(
         consent.hub == destination.hub && consent.agent_id == destination.agent_id,
         "publication enrollment names another destination"
     );
-    if crate::commands::auto_push::publication_explicitly_off(repository)? {
+    if crate::commands::auto_push::publication_explicitly_off(repository)?
+        || repo.uploads_turned_off()?
+    {
         return Err(AutoPushOff.into());
     }
     selection.bind(repo, destination)?;
@@ -873,6 +875,13 @@ mod tests {
             "a user-wide off with no repository preference is as explicit"
         );
         crate::infra::config::set_global("push.auto", None).unwrap();
+        repo.turn_uploads_off(true).unwrap();
+        assert!(
+            confirm(&destination).unwrap_err().is::<AutoPushOff>(),
+            "a folder turned off with `agit off` stays off"
+        );
+        assert_eq!(repo.auto_push_override().unwrap(), Some(false));
+        repo.turn_uploads_off(false).unwrap();
         confirm(&destination).unwrap();
         assert!(repo.auto_push_enabled().unwrap());
         assert!(consent.matches(&repo).unwrap());

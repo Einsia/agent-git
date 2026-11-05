@@ -43,6 +43,8 @@ pub struct ApiError {
     remedies: Vec<Remediation>,
     /// Refs a `refs_withdrawn` refusal names; the Hub names only refs the request proposed.
     refused_refs: Vec<String>,
+    /// The new repository a 409 `repository_choice` answer suggests.
+    suggested: Option<String>,
 }
 
 /// A server recipe names a local capability; it never supplies executable arguments or routing.
@@ -53,6 +55,13 @@ pub(crate) enum Remediation {
 }
 
 impl ApiError {
+    /// The new repository a 409 `repository_choice` answer suggests, if this is one.
+    pub(crate) fn suggested_repository(&self) -> Option<&str> {
+        (self.status == 409 && self.kind == "repository_choice")
+            .then_some(self.suggested.as_deref())
+            .flatten()
+    }
+
     /// A Hub refusal with `status`, for tests elsewhere in the crate.
     #[cfg(test)]
     pub(crate) fn for_test(status: u16, detail: &str) -> Self {
@@ -63,6 +72,7 @@ impl ApiError {
             base: "http://hub.invalid".into(),
             remedies: Vec::new(),
             refused_refs: Vec::new(),
+            suggested: None,
         }
     }
 
@@ -131,6 +141,9 @@ struct ErrorBody {
     fix: serde_json::Value,
     #[serde(default)]
     refused_refs: Vec<String>,
+    /// A `repository_choice` answer's suggested new repository (`owner/name`).
+    #[serde(default)]
+    suggested: Option<String>,
 }
 
 impl ErrorBody {
@@ -643,17 +656,18 @@ impl Client {
         // Left empty when the body cannot be read (not JSON, rewritten by a proxy). Display
         // then falls back to "the hub returned HTTP <code>" — imprecise, but more honest than
         // inventing an explanation.
-        let (kind, detail, remedies, refused_refs) =
+        let (kind, detail, remedies, refused_refs, suggested) =
             match super::json_response::read::<ErrorBody>(resp) {
                 Ok(b) => {
                     let remedies = b.remedies(status);
-                    (b.kind, b.error, remedies, b.refused_refs)
+                    (b.kind, b.error, remedies, b.refused_refs, b.suggested)
                 }
                 Err(_) => (
                     String::new(),
                     format!("the hub returned HTTP {status} ({path})"),
                     Vec::new(),
                     Vec::new(),
+                    None,
                 ),
             };
         anyhow::Error::new(ApiError {
@@ -663,6 +677,7 @@ impl Client {
             base: self.base.clone(),
             remedies,
             refused_refs,
+            suggested,
         })
     }
 
@@ -3066,6 +3081,7 @@ mod tests {
             base: "http://h".into(),
             remedies: Vec::new(),
             refused_refs: Vec::new(),
+            suggested: None,
         }
     }
 

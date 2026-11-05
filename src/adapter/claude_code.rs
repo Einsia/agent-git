@@ -664,6 +664,32 @@ impl Adapter for ClaudeCode {
             .collect())
     }
 
+    /// Only a store that isn't there is empty: one that can't be read, or an entry of it, is an
+    /// error here, where listings show what they can.
+    fn every_session(&self) -> Result<Vec<SessionRef>> {
+        let root = projects_dir()?;
+        let entries = match std::fs::read_dir(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            entries => entries?,
+        };
+        let mut out = vec![];
+        for e in entries {
+            let path = e?.path();
+            // Followed like the listing's `is_dir`, whose false also hides a failed stat.
+            let metadata = match std::fs::metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                metadata => metadata?,
+            };
+            if metadata.is_dir() {
+                for file in std::fs::read_dir(&path)? {
+                    file?;
+                }
+                out.extend(collect_dir(&path, None)?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Claude Code writes these around every start, stop and exit without a turn to settle: hook
     /// and duration summaries, cost counters, a copy of the last prompt, the session's mode and
     /// titles. If one is missing here, a session that merely ended after its last settlement

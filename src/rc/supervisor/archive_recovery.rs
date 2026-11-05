@@ -141,6 +141,10 @@ pub(crate) enum Waiting {
     /// its destination (see [`publication_target`]).
     #[error("automatic archive publication is not enabled")]
     PushDisabled,
+    /// The turn is committed locally; the conversation ran in a folder before its uploads were
+    /// turned on, and stays here until the person saves it (see [`crate::rc::folder_cutoff`]).
+    #[error("the conversation stays on this computer until it is saved")]
+    HeldBack,
 }
 
 /// A recovery subprocess exited unsuccessfully; its exit code tells a refusal from a fault.
@@ -303,7 +307,7 @@ pub(crate) async fn prepare(
         }
         anyhow::bail!("archive commit does not cover the completed native turn");
     }
-    let destination = publication_target(&repo, &lineage)?;
+    let destination = publication_target(&repo, &lineage, &job.runtime, &job.native)?;
     let mut request = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::now_v7().to_string(),
@@ -334,20 +338,25 @@ pub(crate) async fn prepare(
 }
 
 /// Where the capture's turns publish, while automatic publication may carry them there: the
-/// capture repository's own preference allows it, and the person has not turned it off for the
-/// destination. Recovery and its recheck judge by this one rule; a recheck that read less would
-/// resume a job the destination still refuses, and each resumed attempt lands and commits again.
+/// capture repository's own preference allows it, the person has not turned it off for the
+/// destination, and the conversation (`native` of `runtime`) is not one its folder holds back.
+/// Recovery and its recheck judge by this one rule; a recheck that read less would resume a job
+/// the destination still refuses, and each resumed attempt lands and commits again.
 pub(crate) fn publication_target(
     repo: &crate::domain::repo::Repo,
     lineage: &crate::rc::lineage::AgitSession,
+    runtime: &str,
+    native: &str,
 ) -> crate::Result<crate::rc::capture::PublicationDestination> {
-    publication_target_by(repo, lineage, Authority::Process)
+    publication_target_by(repo, lineage, runtime, native, Authority::Process)
 }
 
 /// [`publication_target`], with a device-local capture repository verified against `authority`.
 fn publication_target_by(
     repo: &crate::domain::repo::Repo,
     lineage: &crate::rc::lineage::AgitSession,
+    runtime: &str,
+    native: &str,
     authority: Authority,
 ) -> crate::Result<crate::rc::capture::PublicationDestination> {
     let destination = crate::rc::capture::destination_by(
@@ -359,6 +368,9 @@ fn publication_target_by(
     .context("archive publication destination is not configured")?;
     if !crate::commands::auto_push::publication_allowed(repo, &destination.repository)? {
         return Err(Waiting::PushDisabled.into());
+    }
+    if crate::rc::folder_cutoff::holds_back(repo, runtime, native) {
+        return Err(Waiting::HeldBack.into());
     }
     Ok(destination)
 }
@@ -393,7 +405,7 @@ pub(crate) fn publication_waits()
         let Ok(repo) = crate::rc::capture::require_by(&lineage, authority) else {
             continue;
         };
-        let waiting = publication_target_by(&repo, &lineage, authority)
+        let waiting = publication_target_by(&repo, &lineage, &job.runtime, &job.native, authority)
             .err()
             .is_some_and(|error| error.downcast_ref::<Waiting>() == Some(&Waiting::PushDisabled));
         if !waiting {
@@ -675,7 +687,9 @@ mod tests {
             .unwrap();
         repo.set_auto_push(Some(true)).unwrap();
         assert_eq!(
-            publication_target(&repo, &lineage).unwrap().repository,
+            publication_target(&repo, &lineage, "codex", "native")
+                .unwrap()
+                .repository,
             "owner/project"
         );
 
@@ -683,7 +697,7 @@ mod tests {
         std::fs::create_dir_all(&checkout_dir).unwrap();
         let checkout = Repo::init(&checkout_dir).unwrap();
         checkout.set_auto_push(Some(false)).unwrap();
-        let refused = publication_target(&repo, &lineage).unwrap_err();
+        let refused = publication_target(&repo, &lineage, "codex", "native").unwrap_err();
         assert_eq!(
             refused.downcast_ref::<Waiting>(),
             Some(&Waiting::PushDisabled)

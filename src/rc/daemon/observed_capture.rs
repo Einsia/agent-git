@@ -385,13 +385,20 @@ fn capture_boundary(
     }))
 }
 
-/// Whether the conversation `native` of `runtime`, running in `root` inside a project an RC
-/// workspace binds, may be saved and uploaded without the person asking: as the agit folder
-/// governing `root` decides,
-/// else by that binding (see [`crate::rc::capture::consented`]), and for Codex only once AgentGit
-/// saw a hook of that very conversation.
-fn capture_allowed(runtime: &str, root: &std::path::Path, native: &str) -> bool {
+/// Whether the conversation `native` of `runtime`, running in `root` inside the project folder
+/// `project` an RC workspace binds, may be saved and uploaded without the person asking: as the
+/// agit folder governing `root` decides, else by that binding (see
+/// [`crate::rc::capture::consented`]); never one the project folder held when its uploads were
+/// turned on ([`crate::rc::folder_cutoff::leaves_out`], the rule its publication is held back by
+/// too); and for Codex only once AgentGit saw a hook of that very conversation.
+fn capture_allowed(
+    runtime: &str,
+    project: &std::path::Path,
+    root: &std::path::Path,
+    native: &str,
+) -> bool {
     crate::commands::project::folder_decision(root, runtime, native).unwrap_or(true)
+        && !crate::rc::folder_cutoff::leaves_out(project, runtime, native)
         && (runtime != "codex" || crate::commands::project::codex_capture_allowed(root, native))
 }
 
@@ -407,7 +414,9 @@ impl Daemon {
         let project_id = entry.project_id.as_ref()?;
         let project = self.mirror.project_path(&entry.workspace_id, project_id)?;
         let cwd = PathBuf::from(&entry.cwd);
-        if !cwd.starts_with(&project) || !capture_allowed(&entry.runtime, &cwd, &entry.thread_id) {
+        if !cwd.starts_with(&project)
+            || !capture_allowed(&entry.runtime, &project, &cwd, &entry.thread_id)
+        {
             return None;
         }
         let conflicts = |runtime: &str,
@@ -494,7 +503,7 @@ impl Daemon {
         // A conversation the folder leaves out, or a Codex one whose own hooks never ran, is not
         // saved in the background: watching it doesn't change that, and it stays on this
         // computer until the person saves it.
-        if !capture_allowed(&info.runtime, cwd, native) {
+        if !capture_allowed(&info.runtime, &root, cwd, native) {
             return Ok(None);
         }
         let logical = self
@@ -929,6 +938,105 @@ mod tests {
                 );
                 assert!(state.reserve_observed_capture(&taken.session_id).is_none());
             }
+        });
+    }
+
+    /// A conversation the folder held when its uploads were turned on is not taken in when it is
+    /// watched from the Hub, later turns included, and still not after the daemon restarts; one
+    /// started afterwards is. Once the person saves it themselves, it is taken in too.
+    #[test]
+    fn a_conversation_from_before_the_folder_was_turned_on_is_not_taken_in() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::observed_capture::tests::a_conversation_from_before_the_folder_was_turned_on_is_not_taken_in",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = runtime.enter();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let project = project.canonicalize().unwrap();
+        let watched = |name: &str, native: &str| {
+            let (tx, _rx) = mpsc::channel(1);
+            let mut live = super::super::tests::rpc_test_live(
+                name,
+                1,
+                tx,
+                crate::protocol::PermissionMode::Default,
+            );
+            live.info.workspace_id = crate::rc::endpoint::WORKSPACE.into();
+            live.info.project_id = Some("project".into());
+            live.info.runtime_session_id = Some(native.into());
+            live.runtime_thread_id = Some(native.into());
+            crate::commands::project::codex_hooks_seen(native);
+            live
+        };
+        let kind = watched("probe", "probe-native").info.runtime;
+        crate::rc::folder_cutoff::record(&project, [format!("{kind}:before-native")]).unwrap();
+        // Each run is a daemon started afresh, with only what it keeps on disk.
+        let start = || {
+            let daemon = super::super::tests::rpc_test_daemon(HashMap::new(), Roster::default());
+            let project = project.clone();
+            async move {
+                {
+                    let mut state = daemon.lock().await;
+                    state.opts.local_owner = true;
+                    state
+                        .settlement
+                        .send_modify(|authority| authority.local_owner = true);
+                    state
+                        .mirror
+                        .bind(crate::rc::endpoint::WORKSPACE, "project", &project)
+                        .unwrap();
+                }
+                daemon
+            }
+        };
+        runtime.block_on(async {
+            let daemon = start().await;
+            let mut state = daemon.lock().await;
+            let before = watched("before", "before-native");
+            assert!(
+                state
+                    .retain_observed_capture(&before.info, &project)
+                    .unwrap()
+                    .is_none(),
+                "a conversation from before is not taken in"
+            );
+            let after = watched("after", "after-native");
+            let taken = state
+                .retain_observed_capture(&after.info, &project)
+                .unwrap()
+                .expect("a conversation started afterwards is taken in");
+            assert!(state.reserve_observed_capture(&taken.session_id).is_some());
+        });
+        runtime.block_on(async {
+            let daemon = start().await;
+            let mut state = daemon.lock().await;
+            let before = watched("before", "before-native");
+            assert!(
+                state
+                    .retain_observed_capture(&before.info, &project)
+                    .unwrap()
+                    .is_none(),
+                "nor after the daemon restarts"
+            );
+            crate::rc::folder_cutoff::admit(&project, &kind, "before-native").unwrap();
+            assert!(
+                state
+                    .retain_observed_capture(&before.info, &project)
+                    .unwrap()
+                    .is_some(),
+                "saved by the person, it is taken in"
+            );
         });
     }
 

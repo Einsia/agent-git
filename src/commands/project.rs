@@ -2750,10 +2750,16 @@ pub(crate) fn save_now(
             )));
             continue;
         }
-        saved.push(match save_one(project, candidate, earlier || named) {
+        let outcome = match save_one(project, candidate, earlier || named) {
             Ok(outcome) => outcome,
             Err(error) => Saved::upload_failed(format!("{error:#}")),
-        });
+        };
+        // A conversation the person saved themselves no longer stays out of the folder's uploads
+        // because it predates `agit rc start --here` (see `rc::folder_cutoff`).
+        if (earlier || named) && matches!(outcome, Saved::Uploaded(_) | Saved::Pending(_)) {
+            crate::rc::folder_cutoff::admit(cwd, runtime, session_id)?;
+        }
+        saved.push(outcome);
     }
     // A Stop that arrived meanwhile queued its session and left it to the lock holder.
     drop(worker);

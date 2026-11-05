@@ -52,7 +52,17 @@ impl Session {
                     == crate::hub::identity::normalize_hub(&crate::infra::config::hub_url())?,
                 "RC publication Hub changed"
             );
-            if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)? {
+            let native_session_id = self
+                .driver
+                .runtime_thread_id()
+                .context("RC native session is unavailable")?;
+            if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)?
+                || crate::rc::folder_cutoff::holds_back(
+                    &repo,
+                    &self.info.runtime,
+                    &native_session_id,
+                )
+            {
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Configuration);
                 status.reason = Some(Reason::PushDisabled);
@@ -69,10 +79,7 @@ impl Session {
             };
             let capture = Capture {
                 session_id: self.info.session_id.clone(),
-                native_session_id: self
-                    .driver
-                    .runtime_thread_id()
-                    .context("RC native session is unavailable")?,
+                native_session_id,
                 runtime: self.info.runtime.clone(),
                 generation: self.generation,
                 incarnation: self.publication_incarnation.clone(),

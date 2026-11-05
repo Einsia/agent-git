@@ -38,10 +38,13 @@ pub(crate) fn publication_explicitly_off(repository: &str) -> crate::Result<bool
     }
 }
 
-/// Whether `repo` may publish to `repository` automatically: its own preference allows it, and the
-/// person has not turned automatic publication off for the destination on this computer.
+/// Whether `repo` may publish to `repository` automatically: its own preference allows it, its
+/// folder was not turned off, and the person has not turned automatic publication off for the
+/// destination on this computer.
 pub(crate) fn publication_allowed(repo: &Repo, repository: &str) -> crate::Result<bool> {
-    Ok(repo.auto_push_enabled()? && !publication_explicitly_off(repository)?)
+    Ok(repo.auto_push_enabled()?
+        && !repo.uploads_turned_off()?
+        && !publication_explicitly_off(repository)?)
 }
 
 /// Which setting keeps [`publication_allowed`] from letting `repo` publish to a destination.

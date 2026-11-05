@@ -108,6 +108,48 @@ pub(crate) fn publication_destination(
     Ok(publication::Destination::load(&repo)?.map(|destination| (repository.slug, destination)))
 }
 
+/// The device-local repositories that hold the conversations of `dir`: those of a bound folder
+/// that is `dir` or holds it, in each daemon namespace on this computer, each with its folder and
+/// checked to be that daemon's own. Asking never creates one.
+pub(crate) fn covering(dir: &Path) -> crate::Result<Vec<(std::path::PathBuf, Repo)>> {
+    let dir = dir.canonicalize()?;
+    let mut found: Vec<(std::path::PathBuf, Repo)> = Vec::new();
+    for namespace in [super::LOCAL_NAMESPACE, "rc"] {
+        let repositories = registry(&super::namespace_dir(namespace)?.join("repositories.json"))?;
+        for repository in repositories
+            .into_values()
+            .filter(|repository| dir.starts_with(&repository.directory))
+        {
+            let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
+            let repo = require_by(&lineage, Authority::Saved(namespace))?;
+            if !found.iter().any(|(_, known)| known.root() == repo.root()) {
+                found.push((repository.directory.into(), repo));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The folders whose conversations `repo` holds, when it is a device-local repository a daemon on
+/// this computer registered; another repository holds none.
+pub(crate) fn folders_of(repo: &Repo) -> crate::Result<Vec<std::path::PathBuf>> {
+    let root = repo.root().canonicalize()?;
+    let mut folders = Vec::new();
+    for namespace in [super::LOCAL_NAMESPACE, "rc"] {
+        let repositories = registry(&super::namespace_dir(namespace)?.join("repositories.json"))?;
+        for repository in repositories.into_values() {
+            let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
+            let directory = std::path::PathBuf::from(&repository.directory);
+            if lineage.repo_dir()?.canonicalize().ok().as_ref() == Some(&root)
+                && !folders.contains(&directory)
+            {
+                folders.push(directory);
+            }
+        }
+    }
+    Ok(folders)
+}
+
 pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Repository> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
