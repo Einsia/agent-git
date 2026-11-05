@@ -98,7 +98,7 @@ agit privacy policy show --repo alice/project
 agit privacy policy file --repo alice/project
 ```
 
-Memory collection requires an explicit repository allowlist entry. The default list is empty:
+Memory collection requires an entry in your own allowlist for that repository, kept on this computer. A teammate's entries don't cover your files. The default list is empty:
 
 ```bash
 agit privacy policy allow-memory decisions.md --repo alice/project

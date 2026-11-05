@@ -3,7 +3,7 @@
 //! subdirectory of the runtime directory; `memory status` names what is not in main yet;
 //! `distill -y` carries them into main, after which status reports everything in sync. The
 //! repository's privacy policy allow-lists its memory files, since memory leaves the machine only
-//! where the policy lets it. An implementation that treats the runtime directory as the branch
+//! where the policy lets it, and a distill of a file it keeps here is refused before any question. An implementation that treats the runtime directory as the branch
 //! itself (rather than a live copy) fails on "no local file moves"; one that writes main on its
 //! own fails on "main does not have it before distill".
 
@@ -96,7 +96,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     );
     let display = String::from_utf8_lossy(&unreadable.stdout);
     assert!(
-        !display.contains("repository memory allowlist is empty"),
+        !display.contains("your memory allowlist for drh/qa on this computer is empty"),
         "{display}"
     );
     assert!(!display.contains("eligible for collection"), "{display}");
@@ -108,7 +108,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
         &["memory", "status", "--into", &into],
     ));
     assert!(
-        status.contains("repository memory allowlist is empty"),
+        status.contains("your memory allowlist for drh/qa on this computer is empty"),
         "{status}"
     );
     assert!(!status.contains("eligible for collection"), "{status}");
@@ -162,7 +162,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     ));
     assert!(status.contains("eligible for collection"), "{status}");
     assert!(
-        !status.contains("repository memory allowlist is empty"),
+        !status.contains("your memory allowlist for drh/qa on this computer is empty"),
         "{status}"
     );
 
@@ -198,6 +198,36 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
         status.contains("1 change on `s1` not yet in main"),
         "{status}"
     );
+
+    // A file the person's allowlist keeps on this computer is refused before any question and
+    // before anything is written, with the command that allows it.
+    agit::domain::privacy::PrivacyPolicy::default()
+        .save(&repo)
+        .unwrap();
+    let refused = agit(&home, &claude, &["distill", "--into", &into]);
+    assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refusal.contains(
+            "your memory allowlist for drh/qa on this computer is empty: memory files stay on this computer until you allow them (agit privacy policy allow-memory --repo drh/qa -- mine.md)"
+        ),
+        "{refusal}"
+    );
+    assert!(!refusal.contains("confirmation"), "{refusal}");
+    assert!(repo.show("refs/heads/main", "memory/mine.md").is_none());
+    ok(&agit(
+        &home,
+        &claude,
+        &[
+            "privacy",
+            "policy",
+            "allow-memory",
+            "--repo",
+            REPO,
+            "--",
+            "mine.md",
+        ],
+    ));
 
     // distill -y: into main, after which everything is in sync.
     let distilled = agit(&home, &claude, &["distill", "-y", "--into", &into]);

@@ -220,19 +220,25 @@ fn memory_exclusion(
         .as_deref()
         .unwrap_or("privacy policy excluded the candidate");
     let authorization = if decision.rule == "repository.memory_allow" {
-        #[cfg(windows)]
-        use crate::ui::quote_powershell_argument as quote_arg;
-        #[cfg(not(windows))]
-        use crate::ui::session::shell_arg as quote_arg;
-        format!(
-            "; allow with `agit privacy policy allow-memory --repo {} -- {}`",
-            quote_arg(slug),
-            quote_arg(name)
-        )
+        format!("; allow with `{}`", allow_memory_command(slug, name))
     } else {
         String::new()
     };
     format!("{name} ({reason}{authorization})")
+}
+
+/// The command that puts `file` on the person's memory allowlist for `slug`, each argument quoted
+/// for this platform's shell: a name with a space pastes as two arguments otherwise.
+fn allow_memory_command(slug: &str, file: &str) -> String {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    format!(
+        "agit privacy policy allow-memory --repo {} -- {}",
+        quote_arg(slug),
+        quote_arg(file)
+    )
 }
 
 /// Only top-level Markdown is a managed memory file.
@@ -1214,6 +1220,45 @@ pub fn distill(
     commit_memory_at(primary, "main", Some(&plan.main_tip), edits, &message).map(Some)
 }
 
+/// The sentence for an empty memory allowlist. The allowlist is the person's own, kept on this
+/// computer: a teammate's entries do not cover their files.
+fn empty_allowlist(slug: &str, file: &str) -> String {
+    format!(
+        "your memory allowlist for {slug} on this computer is empty: memory files stay on this computer until you allow them ({})",
+        allow_memory_command(slug, file)
+    )
+}
+
+/// Why `memory/{name}` may not be distilled, when the privacy policy keeps it on this computer.
+fn not_distillable(
+    privacy: &crate::domain::privacy::PrivacyPolicy,
+    slug: &str,
+    name: &str,
+    branch: &str,
+) -> Option<String> {
+    let decision = privacy.evaluate_memory(name, Some(branch));
+    if decision.action == crate::domain::privacy::CandidateAction::Allowed {
+        return None;
+    }
+    // Only the allowlist's own refusal is lifted by `allow-memory`; any other rule keeps its reason.
+    Some(if decision.rule != "repository.memory_allow" {
+        format!(
+            "memory/{name} is excluded by the repository privacy policy: {}",
+            decision
+                .reason
+                .as_deref()
+                .unwrap_or("candidate is not allowlisted")
+        )
+    } else if privacy.memory_allow.is_empty() {
+        empty_allowlist(slug, name)
+    } else {
+        format!(
+            "memory/{name} is not on your memory allowlist for {slug} on this computer: it stays on this computer until you allow it ({})",
+            allow_memory_command(slug, name)
+        )
+    })
+}
+
 /// A reminder of how many items on this branch are not distilled into main yet. It fails
 /// silently — a reminder must not interrupt the main flow.
 pub fn remind_pending(primary: &Repo, branch: &str) {
@@ -1380,9 +1425,7 @@ fn status(target: &Target) -> CmdResult {
     }
 
     if privacy.memory_allow.is_empty() {
-        println!(
-            "  repository memory allowlist is empty — new and edited memory files stay private until explicitly allowed"
-        );
+        println!("  {}", empty_allowlist(&target.slug, "<file>"));
     }
     let track = Policy::from_config(Scope::SinceBaseline).track;
     let decisions: BTreeMap<_, _> = plan
@@ -1602,6 +1645,28 @@ fn distill_cmd(
             "  memory on `{branch}` already matches main — nothing to distill."
         ));
         return Ok(ExitCode::Ok);
+    }
+    // A file the privacy policy keeps on this computer is refused here, before any question and
+    // before anything is written: asking first would offer a carry that cannot happen.
+    let privacy = crate::domain::privacy::PrivacyPolicy::load(primary)
+        .context("cannot read the repository's memory privacy policy; nothing was distilled")?;
+    let wanted: Vec<Pending> = wanted
+        .into_iter()
+        .filter(|item| {
+            let Pending::Carry(name) = item else {
+                return true;
+            };
+            match not_distillable(&privacy, &target.slug, name, branch) {
+                Some(reason) => {
+                    ui::error(&reason);
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect();
+    if wanted.is_empty() {
+        return Ok(ExitCode::Policy);
     }
 
     // Promotion uses the immutable tip in the plan so confirmation and landing select the same bytes.
@@ -2564,6 +2629,35 @@ mod tests {
             file(&repo, "refs/heads/main", "new.md").unwrap(),
             "unreviewed version\n"
         );
+    }
+
+    /// A distill refusal names the rule that refused the file, and offers `allow-memory` only when
+    /// the allowlist is that rule, with each name as one shell argument. One that blames an empty
+    /// allowlist for a device exclusion sends the person to a command that changes nothing; an
+    /// unquoted name with a space pastes as two arguments.
+    #[test]
+    fn a_distill_refusal_names_its_rule_and_a_command_that_pastes_whole() {
+        let mut privacy = crate::domain::privacy::PrivacyPolicy::default();
+        let refusal = not_distillable(&privacy, SLUG, "team notes.md", "s1").unwrap();
+        assert!(
+            refusal.ends_with("(agit privacy policy allow-memory --repo me/qa -- 'team notes.md')"),
+            "{refusal}"
+        );
+        privacy
+            .mandatory
+            .push(crate::domain::privacy::mandatory::MandatoryPolicy {
+                version: 1,
+                id: "organization".into(),
+                revision: "r1".into(),
+                exclude: vec![],
+                memory_exclude: vec!["**/*.md".into()],
+            });
+        let refusal = not_distillable(&privacy, SLUG, "team notes.md", "s1").unwrap();
+        assert!(
+            refusal.contains("mandatory policy organization"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("allow-memory"), "{refusal}");
     }
 
     /// Only top-level Markdown is managed: subdirectories and other extensions in the branch are
