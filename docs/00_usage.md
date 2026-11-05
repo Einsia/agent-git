@@ -584,12 +584,16 @@ phase is done:
 ```sh
 agit memory status          # one line per file: branch vs main, local vs branch
 agit memory diff notes.md
-agit distill                # files that differ from main enter main after item-by-item confirmation (with best-effort local protection)
+agit distill                # files this branch changed enter main after item-by-item confirmation (with best-effort local protection)
 agit push -b main
 ```
 
 A file deleted on the branch that main had passed down is carried into main as a deletion by
-distillation too. `commit --milestone` and `push` report how many items are not distilled yet.
+distillation too. Distillation merges each file three ways: a file the branch left alone is not
+carried, so it never undoes a colleague's change on main, and a file both sides changed keeps both
+changes. Where they changed the same lines, `distill` stops with nothing written and shows those
+lines with who changed them on main; make yours match main's there, or keep yours with
+`agit distill --take-mine notes.md`, which names whose change it replaces. `commit --milestone` and `push` report how many items are not distilled yet.
 `agit memory sync` does one bidirectional sync right away. Only Claude Code has a per-project
 memory directory on disk; on other runtimes `sync` is a no-op, while `status` / `distill` work on
 the branch as usual.

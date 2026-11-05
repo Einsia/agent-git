@@ -544,22 +544,6 @@ fn set_visibility(repo: &str, v: &str) -> CmdResult {
     }
 }
 
-fn finding_display(value: &str) -> String {
-    value
-        .chars()
-        .take(512)
-        .map(|character| {
-            if character.is_control()
-                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
 /// `expected_agent_id` is carried the whole way: the scan and the publication that follows must
 /// land on the **same** immutable identity. A server-side scan and a human confirmation sit in
 /// between, and `owner/name` can be deleted and rebuilt under the same name in that window; a
@@ -603,10 +587,10 @@ fn set_public_visibility(
         for finding in prepared.finding_locations.iter().take(10) {
             println!(
                 "  {} line {} [{}] {}",
-                finding_display(&finding.file),
+                ui::printable(&finding.file),
                 finding.line,
-                finding_display(&finding.rule),
-                finding_display(&finding.redacted)
+                ui::printable(&finding.rule),
+                ui::printable(&finding.redacted)
             );
         }
         ui::hint(
@@ -1302,15 +1286,6 @@ fn path(repo: Option<String>) -> CmdResult {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn finding_locations_cannot_inject_terminal_controls_or_unbounded_text() {
-        assert_eq!(
-            finding_display("file\n\u{1b}[31m\u{202e}txt"),
-            "file  [31m txt"
-        );
-        assert_eq!(finding_display(&"界".repeat(600)).chars().count(), 512);
-    }
-
     #[test]
     fn publication_location_details_are_optional_for_older_servers() {
         let response = serde_json::json!({

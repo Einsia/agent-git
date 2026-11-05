@@ -49,7 +49,10 @@
 //! A session branch snapshots itself; the `main` file line advances only through
 //! `agit memory distill` (or a merge): main gets pushed and inherited by a colleague's
 //! `agit new`, while a runtime memory directory naturally holds personal feedback and privacy, so
-//! every file receives best-effort local protection and per-item confirmation before it enters main. A file
+//! every file receives best-effort local protection and per-item confirmation before it enters main.
+//! Each file is merged three ways from the version the branch last agreed with main on, so a file
+//! the branch left alone is never carried, and lines both sides changed stop the distill until the
+//! person chooses whose to keep (`--take-mine`). A file
 //! inherited from main and deleted on the branch is carried over as a deletion as long as main is
 //! still at the inherited version; a file main changed itself after the fork is a modify/delete
 //! conflict — reported, never deleted automatically. `commit --milestone` and `push` remind you
@@ -111,6 +114,9 @@ pub enum Cmd {
         /// Skip the per-file confirmation.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Where this file and main changed the same lines, keep this branch's lines.
+        #[arg(long = "take-mine", value_name = "FILE")]
+        take_mine: Vec<String>,
     },
     /// Sync now: runtime directory → branch, then branch → runtime directory.
     Sync,
@@ -124,6 +130,9 @@ pub struct DistillArgs {
     /// Skip the per-file confirmation.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Where this file and main changed the same lines, keep this branch's lines.
+    #[arg(long = "take-mine", value_name = "FILE")]
+    pub take_mine: Vec<String>,
     /// Target `<owner/repo>@<branch>` (default: the current session).
     #[arg(long, value_name = "owner/repo@branch")]
     pub into: Option<String>,
@@ -135,6 +144,7 @@ pub fn run_distill(args: DistillArgs) -> CmdResult {
             cmd: Some(Cmd::Distill {
                 paths: args.paths,
                 yes: args.yes,
+                take_mine: args.take_mine,
             }),
             into: args.into,
         },
@@ -230,15 +240,20 @@ fn memory_exclusion(
 /// The command that puts `file` on the person's memory allowlist for `slug`, each argument quoted
 /// for this platform's shell: a name with a space pastes as two arguments otherwise.
 fn allow_memory_command(slug: &str, file: &str) -> String {
+    format!(
+        "agit privacy policy allow-memory --repo {} -- {}",
+        shell_word(slug),
+        shell_word(file)
+    )
+}
+
+/// `value` as one argument for this platform's shell, for a command the person is told to run.
+fn shell_word(value: &str) -> String {
     #[cfg(windows)]
     use crate::ui::quote_powershell_argument as quote_arg;
     #[cfg(not(windows))]
     use crate::ui::session::shell_arg as quote_arg;
-    format!(
-        "agit privacy policy allow-memory --repo {} -- {}",
-        quote_arg(slug),
-        quote_arg(file)
-    )
+    quote_arg(value)
 }
 
 /// Only top-level Markdown is a managed memory file.
@@ -1057,20 +1072,30 @@ pub fn collect_with(
 /// One change waiting to be distilled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pending {
-    /// On the branch, missing from main or different there: carry it over.
+    /// Changed on the branch since its fork point, and not on main: carry the branch's version.
     Carry(String),
+    /// Changed on the branch and on main since its fork point, in different lines: carry the
+    /// merge, which keeps both changes.
+    Merge(String),
+    /// Changed on the branch and on main since its fork point, in the same lines. Nothing is
+    /// carried unless the person names it with `--take-mine`, which keeps the branch's lines there.
+    Clash(String),
     /// Inherited from main and later deleted on the branch, with main still at the inherited
     /// version: main deletes it too.
     Remove(String),
-    /// Deleted on the branch and changed on main after the fork: a modify/delete conflict,
-    /// reported and left alone.
+    /// Deleted on one side and changed on the other since its fork point, or changed on both in a
+    /// way git cannot merge as text: reported and left to a hand edit.
     Conflict(String),
 }
 
 impl Pending {
     pub fn name(&self) -> &str {
         match self {
-            Pending::Carry(n) | Pending::Remove(n) | Pending::Conflict(n) => n,
+            Pending::Carry(n)
+            | Pending::Merge(n)
+            | Pending::Clash(n)
+            | Pending::Remove(n)
+            | Pending::Conflict(n) => n,
         }
     }
 }
@@ -1093,31 +1118,135 @@ fn tip_of(primary: &Repo, git_ref: &str) -> crate::Result<String> {
         .to_string())
 }
 
+/// The trailers a distill writes into main's commit: the session tip it carried from, and each
+/// file it carried. A later distill of a branch that contains that tip takes the tip's version
+/// of those files as their fork point; without it, a branch that distills a line and then edits
+/// it again clashes with its own earlier distill on every run.
+const DISTILLED_FROM: &str = "Distilled-From: ";
+const DISTILLED_FILE: &str = "Distilled-File: ";
+
+/// Whether `value` is a full git object id. A trailer on main is written by whoever can push
+/// there and reaches git as an argument: a value starting with "-" or naming a ref must not.
+fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// What the person sees when main moved between the plan and the landing.
+const STALE_MAIN: &str = "main's memory changed while you were choosing (someone else distilled); run `agit distill` again";
+
+/// The memory files of one distill: at the session tip, at the main tip, and at the point where
+/// each file last agreed between the two.
+struct Sides {
+    ours: BTreeMap<String, Vec<u8>>,
+    main: BTreeMap<String, Vec<u8>>,
+    /// The fork-point version of each file: the version this branch last distilled, else the one
+    /// it forked with. A file missing here was absent at its fork point.
+    base: BTreeMap<String, Vec<u8>>,
+    /// The commit main and the branch forked from, when they share history.
+    fork: Option<String>,
+}
+
+impl Sides {
+    fn read(primary: &Repo, branch_tip: &str, main_tip: &str) -> crate::Result<Sides> {
+        let fork = primary
+            .git_opt(&["merge-base", main_tip, branch_tip])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mut base = match &fork {
+            Some(fork) => branch_files(primary, fork)?,
+            None => BTreeMap::new(),
+        };
+        let range = match &fork {
+            Some(fork) => format!("{fork}..{main_tip}"),
+            None => main_tip.to_string(),
+        };
+        let log = primary.git(&["log", "--reverse", "-z", "--format=%H%n%B", &range])?;
+        for record in log.split('\0') {
+            let from = record
+                .lines()
+                .find_map(|line| line.strip_prefix(DISTILLED_FROM))
+                .map(str::trim);
+            let Some(from) = from.filter(|from| is_object_id(from)) else {
+                continue;
+            };
+            let (code, _, _) =
+                primary.git_status_local(&["merge-base", "--is-ancestor", from, branch_tip])?;
+            if code != Some(0) {
+                continue;
+            }
+            let carried = branch_files(primary, from)?;
+            // The name follows the prefix exactly: trimming it would read " a.md" as "a.md".
+            for name in record
+                .lines()
+                .filter_map(|line| line.strip_prefix(DISTILLED_FILE))
+            {
+                match carried.get(name) {
+                    Some(bytes) => base.insert(name.to_string(), bytes.clone()),
+                    None => base.remove(name),
+                };
+            }
+        }
+        Ok(Sides {
+            ours: branch_files(primary, branch_tip)?,
+            main: branch_files(primary, main_tip)?,
+            base,
+            fork,
+        })
+    }
+
+    /// The three-way merge of `memory/{name}` from its fork point, and whether main and the
+    /// branch changed the same lines. With `keep_branch`, those lines take the branch's text.
+    /// None when git cannot merge the versions as text.
+    fn merge(
+        &self,
+        primary: &Repo,
+        name: &str,
+        keep_branch: bool,
+    ) -> crate::Result<Option<(Vec<u8>, bool)>> {
+        let (Some(main), Some(ours)) = (self.main.get(name), self.ours.get(name)) else {
+            anyhow::bail!("memory/{name} is not on both main and this branch");
+        };
+        let base = self.base.get(name).map(Vec::as_slice).unwrap_or_default();
+        merge_memory(primary, base, main, ours, keep_branch)
+    }
+}
+
 /// Compute the distill plan from the two tips as they stand right now.
+///
+/// A file is carried only where the branch changed it since its fork point, so a file the branch
+/// left alone never undoes what main did to it since. A file both sides changed is merged; where
+/// they changed the same lines it is a [`Pending::Clash`].
 pub fn distill_plan(primary: &Repo, branch: &str) -> crate::Result<DistillPlan> {
     let branch_tip = tip_of(primary, &tree_ref(branch))?;
     let main_tip = tip_of(primary, "refs/heads/main")?;
-    let ours = branch_files(primary, &branch_tip)?;
-    let main = branch_files(primary, &main_tip)?;
-    let base = primary
-        .git_opt(&["merge-base", &main_tip, &branch_tip])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let inherited = match &base {
-        Some(base) => branch_files(primary, base)?,
-        None => BTreeMap::new(),
-    };
+    let sides = Sides::read(primary, &branch_tip, &main_tip)?;
     let mut items = Vec::new();
-    for (name, bytes) in &ours {
-        if main.get(name) != Some(bytes) {
-            items.push(Pending::Carry(name.clone()));
-        }
-    }
-    for (name, on_main) in &main {
-        if ours.contains_key(name) {
+    for (name, bytes) in &sides.ours {
+        let at_fork = sides.base.get(name);
+        let on_main = sides.main.get(name);
+        if on_main == Some(bytes) || at_fork == Some(bytes) {
             continue;
         }
-        match inherited.get(name) {
+        if on_main == at_fork {
+            items.push(Pending::Carry(name.clone()));
+        } else if on_main.is_none() {
+            items.push(Pending::Conflict(name.clone()));
+        } else {
+            match sides.merge(primary, name, false)? {
+                // One file git cannot merge must not stop the others: it is left to a hand edit.
+                None => items.push(Pending::Conflict(name.clone())),
+                Some((_, true)) => items.push(Pending::Clash(name.clone())),
+                // Main already holds every change the branch made.
+                Some((merged, false)) if Some(&merged) == on_main => {}
+                Some((_, false)) => items.push(Pending::Merge(name.clone())),
+            }
+        }
+    }
+    for (name, on_main) in &sides.main {
+        if sides.ours.contains_key(name) {
+            continue;
+        }
+        match sides.base.get(name) {
             None => {}
             Some(at_fork) if at_fork == on_main => items.push(Pending::Remove(name.clone())),
             Some(_) => items.push(Pending::Conflict(name.clone())),
@@ -1130,6 +1259,187 @@ pub fn distill_plan(primary: &Repo, branch: &str) -> crate::Result<DistillPlan> 
     })
 }
 
+/// The three-way merge of a memory file, and whether main and the branch changed the same lines,
+/// which the merge then shows in diff3 style. With `keep_branch`, those lines take the branch's
+/// text and the merge has no conflict; every other change of either side is kept. None when git
+/// cannot merge the versions as text.
+fn merge_memory(
+    primary: &Repo,
+    base: &[u8],
+    main: &[u8],
+    branch: &[u8],
+    keep_branch: bool,
+) -> crate::Result<Option<(Vec<u8>, bool)>> {
+    let dir = tempfile::tempdir()?;
+    let write = |name: &str, bytes: &[u8]| -> crate::Result<String> {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes)?;
+        Ok(path.to_string_lossy().into_owned())
+    };
+    let current = write("main", main)?;
+    let base = write("base", base)?;
+    let other = write("branch", branch)?;
+    let mut args = vec![
+        "merge-file",
+        "-q",
+        "--diff3",
+        "-L",
+        "main",
+        "-L",
+        "fork point",
+        "-L",
+        "this branch",
+    ];
+    if keep_branch {
+        args.push("--theirs");
+    }
+    args.extend([current.as_str(), base.as_str(), other.as_str()]);
+    let (code, _, _) = primary.git_status(&args)?;
+    // merge-file exits with the number of conflicts, capped below the codes it fails with.
+    let conflicted = match code {
+        Some(0) => false,
+        Some(1..=127) => true,
+        _ => return Ok(None),
+    };
+    Ok(Some((std::fs::read(&current)?, conflicted)))
+}
+
+/// One change between two versions of a file, as `git diff -U0` reports it: `len` lines of the
+/// older version from the 0-based line `at` replaced by `lines`, which start at the 1-based line
+/// `new_at` of the newer version.
+struct Hunk {
+    at: usize,
+    len: usize,
+    new_at: usize,
+    lines: Vec<String>,
+}
+
+impl Hunk {
+    /// Whether two changes from the same version touch the same or adjacent lines and differ:
+    /// the rule `git merge-file` conflicts by.
+    fn clashes(&self, other: &Hunk) -> bool {
+        let apart = self.at + self.len < other.at || other.at + other.len < self.at;
+        let same = self.at == other.at && self.len == other.len && self.lines == other.lines;
+        !apart && !same
+    }
+}
+
+fn hunks(primary: &Repo, old: &[u8], new: &[u8]) -> crate::Result<Vec<Hunk>> {
+    let dir = tempfile::tempdir()?;
+    let (old_path, new_path) = (dir.path().join("old"), dir.path().join("new"));
+    std::fs::write(&old_path, old)?;
+    std::fs::write(&new_path, new)?;
+    let (old_path, new_path) = (old_path.to_string_lossy(), new_path.to_string_lossy());
+    let (code, out, stderr) = primary.git_status(&[
+        "diff",
+        "--no-index",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-indent-heuristic",
+        "--diff-algorithm=myers",
+        "-U0",
+        &old_path,
+        &new_path,
+    ])?;
+    anyhow::ensure!(
+        matches!(code, Some(0 | 1)),
+        "cannot compare memory versions: {stderr}"
+    );
+    let range = |text: &str| -> Option<(usize, usize)> {
+        match text.split_once(',') {
+            Some((start, len)) => Some((start.parse().ok()?, len.parse().ok()?)),
+            None => Some((text.parse().ok()?, 1)),
+        }
+    };
+    let mut found: Vec<Hunk> = Vec::new();
+    for line in out.lines() {
+        if let Some(header) = line.strip_prefix("@@ -") {
+            let parsed = header.split_once(" +").and_then(|(old, rest)| {
+                let (start, len) = range(old)?;
+                let (new_at, _) = range(rest.split_once(" @@")?.0)?;
+                Some(Hunk {
+                    at: if len == 0 { start } else { start - 1 },
+                    len,
+                    new_at,
+                    lines: Vec::new(),
+                })
+            });
+            found.push(parsed.ok_or_else(|| anyhow::anyhow!("cannot read a diff hunk: {line}"))?);
+        } else if let (Some(hunk), Some(added)) = (found.last_mut(), line.strip_prefix('+')) {
+            hunk.lines.push(added.to_string());
+        }
+    }
+    Ok(found)
+}
+
+/// Who made main's side of the lines main and the branch both changed in `memory/{name}`, as git
+/// records the commits on main: the people a `--take-mine` overrules.
+fn clash_owners(
+    primary: &Repo,
+    sides: &Sides,
+    main_tip: &str,
+    name: &str,
+) -> crate::Result<Vec<String>> {
+    let empty = Vec::new();
+    let base = sides.base.get(name).unwrap_or(&empty);
+    let main = sides.main.get(name).unwrap_or(&empty);
+    let ours = sides.ours.get(name).unwrap_or(&empty);
+    let mine = hunks(primary, base, ours)?;
+    let path = format!("{TREE_DIR}/{name}");
+    let mut commits: Vec<String> = Vec::new();
+    for hunk in hunks(primary, base, main)? {
+        if hunk.lines.is_empty() || !mine.iter().any(|m| m.clashes(&hunk)) {
+            continue;
+        }
+        let lines = format!("{},+{}", hunk.new_at, hunk.lines.len());
+        let blame = primary.git(&["blame", "--porcelain", "-L", &lines, main_tip, "--", &path])?;
+        for line in blame.lines().filter(|line| !line.starts_with('\t')) {
+            let sha = line.split(' ').next().unwrap_or_default();
+            if is_object_id(sha) && !commits.iter().any(|c| c == sha) {
+                commits.push(sha.to_string());
+            }
+        }
+    }
+    if commits.is_empty() {
+        // Main deleted those lines: no line on main to blame, so name its newest change of the file.
+        let range = match &sides.fork {
+            Some(fork) => format!("{fork}..{main_tip}"),
+            None => main_tip.to_string(),
+        };
+        if let Some(sha) = primary
+            .git_opt(&["log", "-1", "--format=%H", &range, "--", &path])
+            .map(|sha| sha.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+        {
+            commits.push(sha);
+        }
+    }
+    Ok(commits
+        .iter()
+        .filter_map(|sha| {
+            primary
+                .git_opt(&["log", "-1", "--format=%an (%h, %ad)", "--date=short", sha])
+                .map(|who| ui::printable(who.trim()))
+                .filter(|who| !who.is_empty())
+        })
+        .collect())
+}
+
+/// The lines of each place main and the branch changed the same lines, markers included, from a
+/// merge [`merge_memory`] reported as conflicted.
+fn clash_lines(merged: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in String::from_utf8_lossy(merged).lines() {
+        inside |= line.starts_with("<<<<<<< ");
+        if inside {
+            out.push(line.to_string());
+        }
+        inside &= !line.starts_with(">>>>>>> ");
+    }
+    out
+}
+
 /// Changes in the branch `memory/` against main (the candidates of [`distill_plan`]).
 pub fn distill_pending(primary: &Repo, branch: &str) -> crate::Result<Vec<Pending>> {
     if branch == "main" || !primary.has_ref("refs/heads/main") {
@@ -1138,14 +1448,16 @@ pub fn distill_pending(primary: &Repo, branch: &str) -> crate::Result<Vec<Pendin
     Ok(distill_plan(primary, branch)?.items)
 }
 
-/// Carry the chosen changes into main. A conflict item is not accepted. Returns the commit that
-/// landed (None when there is nothing to carry).
+/// Carry the chosen changes into main. A conflict item is not accepted; a clash item lands as the
+/// merge that keeps the branch's lines where main changed the same ones, so the caller passes one
+/// only when the person chose that for the file (`--take-mine`). Returns the commit that landed
+/// (None when there is nothing to carry).
 ///
 /// The options were computed against the two tips in `plan`, and either side can advance while
 /// the user confirms: once the session branch moves, the bytes to carry are no longer the ones
 /// that were scanned and confirmed; once main moves, the three-way decision is void. Before
-/// landing, this checks that the session tip has not moved, reads the bytes at that same tip, and
-/// does a CAS on the main tip.
+/// landing, this checks that neither tip has moved, reads the bytes at those same tips, and does
+/// a CAS on the main tip.
 pub fn distill(
     primary: &Repo,
     plan: &DistillPlan,
@@ -1179,44 +1491,66 @@ pub fn distill(
             "the session branch moved after this distill was planned; run `agit memory status` and choose again"
         );
     }
-    let ours = branch_files(primary, &plan.branch_tip)?;
+    anyhow::ensure!(
+        tip_of(primary, "refs/heads/main")? == plan.main_tip,
+        "{STALE_MAIN}"
+    );
+    let sides = Sides::read(primary, &plan.branch_tip, &plan.main_tip)?;
     let privacy = crate::domain::privacy::PrivacyPolicy::load(primary).unwrap_or_default();
     let source_branch = branch.lines().find(|name| *name != "main");
     let mut edits: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     for item in chosen {
-        match item {
-            Pending::Carry(name) => {
-                let decision = privacy.evaluate_memory(name, source_branch);
-                anyhow::ensure!(
-                    decision.action == crate::domain::privacy::CandidateAction::Allowed,
-                    "memory/{name} is excluded by the repository privacy policy: {}",
-                    decision
-                        .reason
-                        .as_deref()
-                        .unwrap_or("candidate is not allowlisted")
-                );
-                let bytes = ours
-                    .get(name)
-                    .ok_or_else(|| anyhow::anyhow!("the plan has no memory/{name}"))?;
-                let bytes = protect_memory_bytes(primary, bytes)?
-                    .map_err(|reason| anyhow::anyhow!("cannot protect memory/{name}: {reason}"))?;
-                edits.insert(name.clone(), Some(bytes));
+        let name = item.name();
+        let bytes = match item {
+            Pending::Remove(_) => {
+                edits.insert(name.to_string(), None);
+                continue;
             }
-            Pending::Remove(name) => {
-                edits.insert(name.clone(), None);
-            }
-            Pending::Conflict(name) => {
+            Pending::Conflict(_) => {
                 anyhow::bail!(
-                    "memory/{name} was changed on main after this branch forked and deleted here; resolve it by hand"
+                    "memory/{name} was {} after this branch forked; resolve it by hand",
+                    conflict_shape(&sides, name)
                 );
             }
-        }
+            Pending::Carry(_) => sides
+                .ours
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("the plan has no memory/{name}"))?,
+            Pending::Merge(_) => match sides.merge(primary, name, false)? {
+                Some((merged, false)) => merged,
+                _ => anyhow::bail!(
+                    "memory/{name} no longer merges cleanly; run `agit distill` again"
+                ),
+            },
+            Pending::Clash(_) => match sides.merge(primary, name, true)? {
+                Some((merged, _)) => merged,
+                None => anyhow::bail!("memory/{name} no longer merges; run `agit distill` again"),
+            },
+        };
+        let decision = privacy.evaluate_memory(name, source_branch);
+        anyhow::ensure!(
+            decision.action == crate::domain::privacy::CandidateAction::Allowed,
+            "memory/{name} is excluded by the repository privacy policy: {}",
+            decision
+                .reason
+                .as_deref()
+                .unwrap_or("candidate is not allowlisted")
+        );
+        let bytes = protect_memory_bytes(primary, &bytes)?
+            .map_err(|reason| anyhow::anyhow!("cannot protect memory/{name}: {reason}"))?;
+        edits.insert(name.to_string(), Some(bytes));
     }
-    let message = format!(
-        "agit: distill memory from {} ({} changes)",
+    let mut message = format!(
+        "agit: distill memory from {} ({} changes)\n\n{DISTILLED_FROM}{}\n",
         &plan.branch_tip[..9.min(plan.branch_tip.len())],
-        edits.len()
+        edits.len(),
+        plan.branch_tip
     );
+    // A name with a line break cannot be one trailer line; such a file keeps its fork point.
+    for name in edits.keys().filter(|name| !name.contains(['\n', '\r'])) {
+        message.push_str(&format!("{DISTILLED_FILE}{name}\n"));
+    }
     commit_memory_at(primary, "main", Some(&plan.main_tip), edits, &message).map(Some)
 }
 
@@ -1348,7 +1682,11 @@ fn run_inner(args: Args, command: &'static str) -> CmdResult {
     match args.cmd.unwrap_or(Cmd::Status) {
         Cmd::Status => status(&target),
         Cmd::Diff { path } => diff(&target, path.as_deref()),
-        Cmd::Distill { paths, yes } => distill_cmd(&target, &paths, yes, command, source),
+        Cmd::Distill {
+            paths,
+            yes,
+            take_mine,
+        } => distill_cmd(&target, &paths, yes, &take_mine, command, source),
         Cmd::Sync => sync(&target),
     }
 }
@@ -1454,7 +1792,13 @@ fn status(target: &Target) -> CmdResult {
         let branch_col = match pending.iter().find(|p| p.name() == name) {
             Some(Pending::Carry(_)) if in_main.is_some() => "differs from main",
             Some(Pending::Carry(_)) => "not in main",
+            Some(Pending::Merge(_)) => "changed here and on main",
+            Some(Pending::Clash(_)) => "changed here and on main, same lines",
             Some(Pending::Remove(_)) => "deleted here",
+            Some(Pending::Conflict(_)) if in_branch.is_some() && in_main.is_some() => {
+                "changed here and on main, cannot merge"
+            }
+            Some(Pending::Conflict(_)) if in_branch.is_some() => "changed here, deleted on main",
             Some(Pending::Conflict(_)) => "deleted here, changed on main",
             None if in_branch.is_some() => "= main",
             None => "—",
@@ -1543,16 +1887,26 @@ fn status(target: &Target) -> CmdResult {
         .iter()
         .filter(|p| matches!(p, Pending::Conflict(_)))
         .count();
-    let carry = pending.len() - conflicts;
+    let clashes = pending
+        .iter()
+        .filter(|p| matches!(p, Pending::Clash(_)))
+        .count();
+    let carry = pending.len() - conflicts - clashes;
     if carry > 0 {
         println!(
             "  {carry} change{} on `{branch}` not yet in main — `agit distill` carries them (locally protected, confirmed one by one)",
             if carry == 1 { "" } else { "s" }
         );
     }
+    if clashes > 0 {
+        println!(
+            "  {clashes} file{} changed on `{branch}` and on main in the same lines — `agit distill` shows them",
+            if clashes == 1 { "" } else { "s" }
+        );
+    }
     if conflicts > 0 {
         println!(
-            "  {conflicts} modify/delete conflict{} with main — edit `$(agit repo path {}@main)` by hand",
+            "  {conflicts} conflict{} with main to resolve by hand — edit `$(agit repo path {}@main)`",
             if conflicts == 1 { "" } else { "s" },
             target.slug
         );
@@ -1601,6 +1955,7 @@ fn distill_cmd(
     target: &Target,
     paths: &[String],
     yes: bool,
+    take_mine: &[String],
     command: &'static str,
     source: super::echo::Source,
 ) -> CmdResult {
@@ -1616,23 +1971,20 @@ fn distill_cmd(
     }
     let plan = distill_plan(primary, branch)?;
     let pending = plan.items.clone();
-    let wanted: Vec<Pending> = if paths.is_empty() {
-        pending.clone()
-    } else {
-        let mut picked = Vec::new();
-        for p in paths {
-            match pending.iter().find(|item| item.name() == p) {
-                Some(item) => picked.push(item.clone()),
-                None => {
-                    ui::error(&format!(
-                        "memory/{p} is not a pending change on `{branch}` (already matches main, or never existed)."
-                    ));
-                    return Ok(ExitCode::Ref);
-                }
-            }
+    for p in paths.iter().chain(take_mine) {
+        if !pending.iter().any(|item| item.name() == p) {
+            ui::error(&format!(
+                "memory/{p} is not a pending change on `{branch}` (already matches main, or never existed)."
+            ));
+            return Ok(ExitCode::Ref);
         }
-        picked
-    };
+    }
+    // A file named for `--take-mine` is wanted whatever else is named.
+    let wanted: Vec<Pending> = pending
+        .iter()
+        .filter(|item| paths.is_empty() || paths.iter().chain(take_mine).any(|p| p == item.name()))
+        .cloned()
+        .collect();
     super::echo::emit(
         command,
         &[
@@ -1653,10 +2005,10 @@ fn distill_cmd(
     let wanted: Vec<Pending> = wanted
         .into_iter()
         .filter(|item| {
-            let Pending::Carry(name) = item else {
+            if matches!(item, Pending::Remove(_) | Pending::Conflict(_)) {
                 return true;
-            };
-            match not_distillable(&privacy, &target.slug, name, branch) {
+            }
+            match not_distillable(&privacy, &target.slug, item.name(), branch) {
                 Some(reason) => {
                     ui::error(&reason);
                     false
@@ -1668,16 +2020,43 @@ fn distill_cmd(
     if wanted.is_empty() {
         return Ok(ExitCode::Policy);
     }
+    // Where main and this branch changed the same lines, nothing is written until the person
+    // chooses for that file: landing the other files first would leave main half of a decision.
+    let sides = Sides::read(primary, &plan.branch_tip, &plan.main_tip)?;
+    let mut stopped = false;
+    for item in &wanted {
+        let Pending::Clash(name) = item else { continue };
+        if take_mine.contains(name) {
+            continue;
+        }
+        stopped = true;
+        report_clash(primary, &sides, &plan, branch, name)?;
+    }
+    if stopped {
+        return Ok(ExitCode::Precondition);
+    }
 
     // Promotion uses the immutable tip in the plan so confirmation and landing select the same bytes.
     let mut chosen = Vec::new();
     for item in &wanted {
         let question = match item {
             Pending::Carry(name) => format!("carry memory/{name} into main?"),
+            Pending::Merge(name) => {
+                format!("carry memory/{name} into main, merged with the changes on main?")
+            }
+            Pending::Clash(name) => {
+                let owners = clash_owners(primary, &sides, &plan.main_tip, name)?;
+                ui::warning(&format!(
+                    "memory/{name}: your lines replace the change {} made on main to the same lines; every other change stays",
+                    named(&owners)
+                ));
+                format!("carry memory/{name} into main with your lines there?")
+            }
             Pending::Remove(name) => format!("delete memory/{name} from main?"),
             Pending::Conflict(name) => {
                 ui::warning(&format!(
-                    "memory/{name} skipped — deleted here but changed on main after this branch forked; edit main by hand"
+                    "memory/{name} skipped — {} after this branch forked; edit main by hand",
+                    conflict_shape(&sides, name)
                 ));
                 continue;
             }
@@ -1696,6 +2075,8 @@ fn distill_cmd(
                         "  {} memory/{}",
                         match item {
                             Pending::Carry(_) => "carry   ",
+                            Pending::Merge(_) => "merge   ",
+                            Pending::Clash(_) => "mine    ",
                             Pending::Remove(_) => "delete  ",
                             Pending::Conflict(_) => "conflict",
                         },
@@ -1721,6 +2102,64 @@ fn distill_cmd(
         ui::hint(&format!("publish it: `agit push {}@main`", target.slug));
     }
     Ok(ExitCode::Ok)
+}
+
+/// How a [`Pending::Conflict`] came about, for the sentence that reports it.
+fn conflict_shape(sides: &Sides, name: &str) -> &'static str {
+    match (sides.ours.contains_key(name), sides.main.contains_key(name)) {
+        (true, true) => "changed here and on main in a way git cannot merge",
+        (true, false) => "changed here and deleted on main",
+        _ => "deleted here and changed on main",
+    }
+}
+
+/// The people [`clash_owners`] found, or a stand-in when git records none.
+fn named(owners: &[String]) -> String {
+    if owners.is_empty() {
+        "someone else".to_string()
+    } else {
+        owners.join(" and ")
+    }
+}
+
+/// Tell the person that `memory/{name}` changed on main and here in the same lines: which lines,
+/// in all three versions, who changed them on main, and the two ways on.
+fn report_clash(
+    primary: &Repo,
+    sides: &Sides,
+    plan: &DistillPlan,
+    branch: &str,
+    name: &str,
+) -> crate::Result<()> {
+    // Enough to recognise the lines; `agit memory diff` shows the whole file.
+    const SHOWN: usize = 40;
+    let merged = sides
+        .merge(primary, name, false)?
+        .map(|(merged, _)| merged)
+        .unwrap_or_default();
+    let lines = clash_lines(&merged);
+    let owners = clash_owners(primary, sides, &plan.main_tip, name)?;
+    ui::error(&format!(
+        "memory/{name}: main and `{branch}` changed the same lines; nothing was distilled"
+    ));
+    eprintln!("  changed on main by {}:", named(&owners));
+    for line in lines.iter().take(SHOWN) {
+        eprintln!("    {}", ui::printable(line));
+    }
+    if lines.len() > SHOWN {
+        eprintln!(
+            "    … (`agit memory diff -- {}` shows the whole file)",
+            shell_word(name)
+        );
+    }
+    ui::hint(&format!(
+        "to keep your lines there: `agit distill --take-mine={}` (it replaces that change; every other change stays)",
+        shell_word(name)
+    ));
+    ui::hint(
+        "to keep main's: make yours match them, `agit memory sync`, then `agit distill` again",
+    );
+    Ok(())
 }
 
 fn sync(target: &Target) -> CmdResult {
@@ -2597,7 +3036,7 @@ mod tests {
         )
         .unwrap();
         let error = distill(&repo, &plan, &plan.items).unwrap_err().to_string();
-        assert!(error.contains("moved"), "{error}");
+        assert!(error.contains("changed while you were choosing"), "{error}");
         assert_eq!(
             file(&repo, "refs/heads/main", "team.md").unwrap(),
             "revised on main\n"

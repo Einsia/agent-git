@@ -480,3 +480,181 @@ fn memory_that_did_not_pass_protection_stays_off_every_branch() {
     );
     assert!(repo.show("refs/heads/main", "memory/leaked.md").is_none());
 }
+
+/// A session line `name` forked from main's tip, as `agit new` leaves one.
+fn fork_session(repo: &Repo, name: &str, id: char) {
+    let mut snap = Meta::new_session_line("claude-code".into(), "/work".into());
+    snap.session = format!(
+        "{}{}",
+        meta::ID_PREFIX,
+        id.to_string().repeat(meta::ID_HEX_LEN)
+    );
+    meta::write(repo.root(), &snap).unwrap();
+    repo.git(&["switch", "-q", "-c", name]).unwrap();
+    repo.add_all().unwrap();
+    repo.commit(&format!("agit: new session {name}")).unwrap();
+    repo.switch("main").unwrap();
+    meta::write(repo.root(), &Meta::new_file_line()).unwrap();
+}
+
+/// `text` settled as `memory/team.md` on session line `branch`.
+fn settle_team(repo: &Repo, branch: &str, text: &str) {
+    let refname = format!("refs/heads/{branch}");
+    let tree = agit::commands::plumbing::tree_apply_owned(
+        repo,
+        &refname,
+        vec![("memory/team.md".into(), Some(text.as_bytes().to_vec()))],
+    )
+    .unwrap();
+    let head = repo.git(&["rev-parse", &refname]).unwrap();
+    let c = agit::commands::plumbing::commit_tree(repo, &tree, &[head.trim()], "settle").unwrap();
+    repo.git(&["update-ref", &refname, &c]).unwrap();
+}
+
+/// Two sessions forked from one main distill the same memory file. Changes to different lines
+/// both reach main, and a distill of a file the session left alone carries nothing. Where the
+/// second session changed a line the first one also changed, its distill stops with nothing
+/// written, shows the lines and names who changed them on main, with the terminal controls and
+/// bidi overrides the other person put in their line and name made inert; after it settles a
+/// third text,
+/// `--take-mine` lands that text, its own later edit of a line it distilled before, and the first
+/// session's other lines. A distill that compares with main alone undoes a colleague's change; one
+/// whose fork point never moves names the session's own earlier distill as the clash; one that
+/// stops on every rerun leaves no way to land the third text; an overwrite of the whole file drops
+/// the first session's other line; one that prints the other person's bytes raw lets them
+/// rewrite this person's terminal.
+#[test]
+fn two_sessions_distilling_one_file_keep_both_changes_or_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo, claude, _mem) = fixture(tmp.path());
+    let lines = |description: &str, ids: &str, naming: &str| {
+        format!(
+            "---\nname: team\ndescription: {description}\n---\nids: {ids}\ntime: UTC everywhere\nlogs: JSON lines\nnaming: {naming}\n"
+        )
+    };
+    let main_text = || {
+        String::from_utf8(
+            repo.git_bytes(&["show", "refs/heads/main:memory/team.md"])
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let main_tip = || repo.git(&["rev-parse", "refs/heads/main"]).unwrap();
+    fs::write(
+        repo.root().join("memory/team.md"),
+        lines("shared", "uid, not user_id", "snake_case"),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("team.md grows").unwrap();
+    fork_session(&repo, "pat", 'a');
+    fork_session(&repo, "quinn", 'b');
+
+    // Set by the other person: a bidi override and an escape sequence inside their name and line.
+    let pat_ids = "uid, never user_id\u{1b}]52;c;cGF0\u{7}\u{202e}";
+    repo.git(&["config", "user.name", "Pat\u{202e}\u{1b}[2J Lee"])
+        .unwrap();
+    repo.git(&["config", "user.email", "pat@example.com"])
+        .unwrap();
+    settle_team(
+        &repo,
+        "pat",
+        &lines("shared", pat_ids, "snake_case, no abbreviations"),
+    );
+    ok(&agit(
+        &home,
+        &claude,
+        &["distill", "-y", "--into", "drh/qa@pat"],
+    ));
+    repo.git(&["config", "user.name", "Quinn"]).unwrap();
+    repo.git(&["config", "user.email", "quinn@example.com"])
+        .unwrap();
+    settle_team(
+        &repo,
+        "quinn",
+        &lines("shared by the whole team", "uid, not user_id", "snake_case"),
+    );
+    ok(&agit(
+        &home,
+        &claude,
+        &["distill", "-y", "--into", "drh/qa@quinn"],
+    ));
+    assert_eq!(
+        main_text(),
+        lines(
+            "shared by the whole team",
+            pat_ids,
+            "snake_case, no abbreviations"
+        )
+    );
+    let merged = main_tip();
+    ok(&agit(
+        &home,
+        &claude,
+        &["distill", "-y", "--into", "drh/qa@pat"],
+    ));
+    assert_eq!(main_tip(), merged, "pat left team.md alone since");
+
+    settle_team(
+        &repo,
+        "quinn",
+        &lines("shared by everyone", "account_id", "snake_case"),
+    );
+    let stopped = agit(&home, &claude, &["distill", "-y", "--into", "drh/qa@quinn"]);
+    assert_eq!(stopped.status.code(), Some(4), "{stopped:?}");
+    let report = String::from_utf8_lossy(&stopped.stderr);
+    for expected in [
+        "memory/team.md: main and `quinn` changed the same lines; nothing was distilled",
+        "changed on main by Pat  [2J Lee (",
+        "<<<<<<< main",
+        "ids: uid, never user_id ]52;c;cGF0",
+        "||||||| fork point",
+        "ids: uid, not user_id",
+        "ids: account_id",
+        "`agit distill --take-mine=team.md`",
+    ] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
+    assert!(!report.contains("Quinn"), "{report}");
+    assert!(
+        !report.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+        "{report:?}"
+    );
+    assert_eq!(main_tip(), merged);
+
+    settle_team(
+        &repo,
+        "quinn",
+        &lines("shared by everyone", "uid as account_id", "snake_case"),
+    );
+    let taken = agit(
+        &home,
+        &claude,
+        &[
+            "distill",
+            "-y",
+            "--take-mine",
+            "team.md",
+            "--into",
+            "drh/qa@quinn",
+        ],
+    );
+    ok(&taken);
+    let notice = String::from_utf8_lossy(&taken.stderr);
+    assert!(
+        notice.contains("your lines replace the change Pat  [2J Lee ("),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+        "{notice:?}"
+    );
+    assert_eq!(
+        main_text(),
+        lines(
+            "shared by everyone",
+            "uid as account_id",
+            "snake_case, no abbreviations"
+        )
+    );
+}
