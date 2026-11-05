@@ -166,6 +166,15 @@ impl Session {
                         status.reason = None;
                     }
                 }
+                // The Hub or the network did not answer; the next publication tries again.
+                Some(output) if output.status.code() == Some(crate::ExitCode::Network as i32) => {
+                    status.progress = Progress::LocalSaved;
+                    status.stage = Some(Stage::Publication);
+                    status.reason = Some(Reason::ReceiverUnavailable);
+                    tracing_note(
+                        "RC automatic publication could not reach the Hub; the source remains local and the next publication tries again",
+                    );
+                }
                 Some(output) if matches!(output.status.code(), Some(code) if code == crate::ExitCode::Interactive as i32 || code == crate::ExitCode::Auth as i32) =>
                 {
                     status.readiness = Readiness::SetupRequired;

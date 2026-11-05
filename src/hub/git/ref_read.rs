@@ -7,6 +7,8 @@ use super::*;
 pub(super) struct Failure {
     message: String,
     pub transient: bool,
+    /// The read ran out of its time rather than being refused or dropped.
+    pub timed_out: bool,
 }
 
 impl Failure {
@@ -14,6 +16,15 @@ impl Failure {
         Self {
             message: message.into(),
             transient,
+            timed_out: false,
+        }
+    }
+
+    fn timed_out(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+            timed_out: true,
         }
     }
 
@@ -72,6 +83,16 @@ pub(super) fn capture(
     args: &[&str],
     transport: Option<&TransportIdentity>,
 ) -> std::result::Result<String, Failure> {
+    capture_within(dir, args, transport, PROBE_TIMEOUT)
+}
+
+/// [`capture`] with its own deadline, for a read whose answer is expected to be large.
+pub(super) fn capture_within(
+    dir: &Path,
+    args: &[&str],
+    transport: Option<&TransportIdentity>,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, Failure> {
     let once = || -> std::result::Result<(bool, String, String), Failure> {
         let mut cmd = match transport {
             Some(transport) => transport.command(Some(dir)),
@@ -108,29 +129,34 @@ pub(super) fn capture(
         };
         let stdout = drain(stdout);
         let stderr = drain(stderr);
-        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        let deadline = std::time::Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(25))
                 }
-                result => {
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Failure::timed_out("Git destination read timed out"));
+                }
+                Err(_) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(Failure::new(
-                        "Git destination read timed out or could not be observed",
-                        result.is_ok(),
+                        "Git destination read could not be observed",
+                        false,
                     ));
                 }
             }
         };
         let stdout = stdout
-            .recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| Failure::new("Git destination output timed out", true))?;
+            .recv_timeout(timeout)
+            .map_err(|_| Failure::timed_out("Git destination output timed out"))?;
         let stderr = stderr
-            .recv_timeout(PROBE_TIMEOUT)
-            .map_err(|_| Failure::new("Git destination diagnostics timed out", true))?;
+            .recv_timeout(timeout)
+            .map_err(|_| Failure::timed_out("Git destination diagnostics timed out"))?;
         Ok((
             status.success(),
             String::from_utf8_lossy(&stdout).into_owned(),

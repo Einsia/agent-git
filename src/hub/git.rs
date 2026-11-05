@@ -53,9 +53,9 @@ pub mod inspection_summary;
 mod ref_read;
 pub use crate::domain::secrets::publication::InspectionFailure;
 pub use frozen::{
-    BlockedContentInspection, BlockedInspection, CapturedPublication, CompleteContentInspection,
-    CompleteInspection, ContentInspection, FrozenPublication, InspectionReport,
-    PreparedPayloadAvailability, PreparedPublication, PublicationInspection,
+    AdvertisementUnread, BlockedContentInspection, BlockedInspection, CapturedPublication,
+    CompleteContentInspection, CompleteInspection, ContentInspection, FrozenPublication,
+    InspectionReport, PreparedPayloadAvailability, PreparedPublication, PublicationInspection,
 };
 mod frozen_lfs_stage;
 pub use frozen_lfs_stage::{LfsStagingError, LfsStagingFailure, StagedLfsPayloads};
@@ -1080,6 +1080,12 @@ fn parse_remote_refs(out: &str) -> Option<RemoteRefs> {
 /// The direction of a timeout is safe: a failed probe → `Destination::Unknown` → **a full scan**.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a publication waits for the destination's branch list. Longer than a scan probe's:
+/// a publication needs the whole list of a repository that holds one branch per session, over
+/// whatever link the person has, and giving up early only fails the upload, where a scan probe
+/// that gives up falls back safely.
+pub const PUBLICATION_REF_READ: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Run a git command that needs authentication and **take its stdout**. Any failure is `None`.
 ///
 /// Separate from [`run`] because that one leaves stdout to the user (push's progress), while
@@ -1889,6 +1895,49 @@ mod probe_timeout_tests {
         assert!(
             took < PROBE_TIMEOUT * 3,
             "an unbounded probe waits out the kernel timeout: took {took:?}, cap {PROBE_TIMEOUT:?}"
+        );
+    }
+
+    /// A publication's branch-list read that runs out of its time is said as such and counts as a
+    /// network failure, so a background retry keeps trying; a read the Hub refused is not one. A
+    /// read that folded every failure into one sentence would show a slow Hub as broken history,
+    /// and one that made every failure final would stop uploads after one slow moment.
+    #[test]
+    fn a_branch_list_that_does_not_answer_in_time_is_retried_and_named_as_such() {
+        // Accepts the connection and never answers, as a Hub too slow to send its list does.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/alice/app.git", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            drop(held);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = std::time::Duration::from_secs(1);
+        let failure =
+            ref_read::capture_within(dir.path(), &["ls-remote", "--heads", &url], None, timeout)
+                .unwrap_err();
+        assert!(failure.timed_out && failure.transient, "{failure}");
+        let slow = crate::commands::push::branch_list_unread(
+            "alice/app",
+            AdvertisementUnread::from_read(failure, timeout),
+        );
+        assert_eq!(
+            format!("{slow:#}"),
+            "remote request failed: cannot read the Hub's branch list for alice/app: it did not answer within 1 s"
+        );
+        assert_eq!(
+            crate::commands::terminal_error_code(&slow, crate::ExitCode::Failure),
+            crate::ExitCode::Network
+        );
+
+        let refused = crate::commands::push::branch_list_unread(
+            "alice/app",
+            AdvertisementUnread::refused("Git destination rejected authentication"),
+        );
+        assert_eq!(
+            crate::commands::terminal_error_code(&refused, crate::ExitCode::Failure),
+            crate::ExitCode::Failure
         );
     }
 

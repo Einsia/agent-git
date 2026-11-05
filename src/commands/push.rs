@@ -588,6 +588,24 @@ pub(crate) const UNSUPPORTED_BLOCK: &str =
 /// privacy's words. A newer agit publishes it; pushing again does not.
 pub(crate) const ENCRYPTED_REFUSED: &str = "This session's encrypted publication was refused by the Hub (unsupported Claude Code record); it will publish once agit is updated.";
 
+/// The failure of reading `repository`'s branch list from the Hub, which every publication starts
+/// with, named with its cause. One the next try may get past (a timeout, a dropped connection)
+/// is a network failure, so a background retry keeps trying; one the Hub refused is not.
+pub(crate) fn branch_list_unread(
+    repository: &str,
+    cause: crate::hub::git::AdvertisementUnread,
+) -> anyhow::Error {
+    let transient = cause.transient;
+    let error = anyhow::Error::new(cause).context(format!(
+        "cannot read the Hub's branch list for {repository}"
+    ));
+    if transient {
+        super::remote_request::<()>(Err(error)).unwrap_err()
+    } else {
+        error
+    }
+}
+
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [

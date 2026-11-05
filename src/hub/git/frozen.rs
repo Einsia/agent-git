@@ -59,6 +59,39 @@ pub struct FrozenPublication {
     push_limits: Option<crate::hub::PushLimits>,
 }
 
+/// Why a destination's branch list was not read, in a fixed sentence that names no secret.
+/// `transient` says whether the next try may get past it: a timeout or a dropped connection may,
+/// a refused account or a missing repository does not.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct AdvertisementUnread {
+    message: String,
+    pub transient: bool,
+}
+
+impl AdvertisementUnread {
+    pub(super) fn refused(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+
+    pub(super) fn from_read(
+        failure: super::ref_read::Failure,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            message: if failure.timed_out {
+                format!("it did not answer within {} s", timeout.as_secs())
+            } else {
+                failure.to_string()
+            },
+            transient: failure.transient,
+        }
+    }
+}
+
 /// One receive-pack request: the refs it moves and the receipt policy it confirms.
 struct ReceiveBatch<'a> {
     refs: Vec<FrozenRef>,
@@ -89,9 +122,20 @@ impl FrozenPublication {
         canonical_url: &str,
         identity: &RemoteIdentity,
     ) -> Option<RemoteRefs> {
-        let source = Source::new(repo).ok()?;
-        let (url, client) = Self::destination(&source, canonical_url, identity).ok()?;
-        let directory = captured::private_git_directory("sha1").ok()?;
+        Self::read_advertised_refs(repo, canonical_url, identity, super::PROBE_TIMEOUT).ok()
+    }
+
+    /// [`Self::advertised_refs_for`], waiting up to `timeout`, with why the list was not read.
+    pub fn read_advertised_refs(
+        repo: &Repo,
+        canonical_url: &str,
+        identity: &RemoteIdentity,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<RemoteRefs, AdvertisementUnread> {
+        let setup = |_| AdvertisementUnread::refused("the Git transport could not be prepared");
+        let source = Source::new(repo).map_err(setup)?;
+        let (url, client) = Self::destination(&source, canonical_url, identity).map_err(setup)?;
+        let directory = captured::private_git_directory("sha1").map_err(setup)?;
         let transport = Self::prepare_transport(
             &source,
             directory.path(),
@@ -100,10 +144,13 @@ impl FrozenPublication {
             Some(client),
             "http:https",
         )
-        .ok()?;
+        .map_err(setup)?;
         let args = super::remote_ref_args(&url, true);
-        let output = super::capture_transport(directory.path(), &args, Some(&transport))?;
+        let output =
+            super::ref_read::capture_within(directory.path(), &args, Some(&transport), timeout)
+                .map_err(|failure| AdvertisementUnread::from_read(failure, timeout))?;
         super::parse_remote_refs(&output)
+            .ok_or_else(|| AdvertisementUnread::refused("its answer was not a branch list"))
     }
 
     /// A true result means every generated public branch and tag has the exact advertised OID.
