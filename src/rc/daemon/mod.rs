@@ -2599,16 +2599,62 @@ fn is_texty(mime: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn finish_local_sessions(
+    sessions: Vec<LocalSession>,
+    purpose: LocalSessionScan,
+    gist_for: impl FnMut(&LocalSession) -> Option<String>,
+) -> Vec<LocalSession> {
+    finish_local_sessions_timed(sessions, purpose, gist_for, &mut ScanTimes::default())
+}
+
+/// Where a local scan's time went, in milliseconds, for the daemon's log.
+#[derive(Clone, Copy, Debug, Default)]
+struct ScanTimes {
+    enumerate: u64,
+    gist: u64,
+    labels: u64,
+}
+
+/// Where one `session.list` spent its time, for the daemon's log: the waits for the daemon's
+/// lock, and each phase. A slow list names its slow phase instead of only its total.
+#[derive(Clone, Copy, Debug)]
+struct ListTiming {
+    started: std::time::Instant,
+    include_local: bool,
+    lock_prepare: u64,
+    prepare: u64,
+    scan: u64,
+    scan_times: ScanTimes,
+    lock_finish: u64,
+}
+
+impl ListTiming {
+    fn start(include_local: bool) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            include_local,
+            lock_prepare: 0,
+            prepare: 0,
+            scan: 0,
+            scan_times: ScanTimes::default(),
+            lock_finish: 0,
+        }
+    }
+}
+
+fn finish_local_sessions_timed(
     mut sessions: Vec<LocalSession>,
     purpose: LocalSessionScan,
     mut gist_for: impl FnMut(&LocalSession) -> Option<String>,
+    times: &mut ScanTimes,
 ) -> Vec<LocalSession> {
     // Most recently talked to first — "continue where I left off" almost always means the most
     // recent one.
     sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
     sessions.dedup_by(|a, b| a.runtime_session_id == b.runtime_session_id);
 
+    let gists = std::time::Instant::now();
     if purpose == LocalSessionScan::Listing {
         // Spend parsing only on the leading few that **have no gist yet**. Nothing from codex
         // reaches here.
@@ -2632,7 +2678,10 @@ fn finish_local_sessions(
             );
         }
     }
+    times.gist = crate::rc::diagnostics::elapsed_ms(gists);
+    let labels = std::time::Instant::now();
     protect_session_labels(&mut sessions);
+    times.labels = crate::rc::diagnostics::elapsed_ms(labels);
     sessions
 }
 
