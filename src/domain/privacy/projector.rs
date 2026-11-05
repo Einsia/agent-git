@@ -68,8 +68,8 @@ pub enum Reason {
     /// A rule this device registered under another account or Hub could not be read, so a value
     /// it blocks could pass unreplaced.
     DeviceRules,
-    /// The repository's legacy secret dictionary could not be read whole, so a value it blocks
-    /// could pass unreplaced.
+    /// A legacy secret dictionary, the repository's or this computer's, could not be read whole,
+    /// so a value it blocks could pass unreplaced.
     LegacyRules,
 }
 

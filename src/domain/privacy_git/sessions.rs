@@ -822,6 +822,10 @@ impl ProjectedHistory {
         let mut preserved = BTreeSet::new();
         let mut reports = Vec::new();
         let mut left_out = LeftOut::default();
+        let mut rechecked = Rechecked::default();
+        // The source commit holding each plain public commit's LOG, for public commits this run
+        // writes.
+        let mut written = std::collections::HashMap::new();
         let mut imports = crate::commands::plumbing::CommitImports::default();
         let mut completed = BTreeSet::new();
         let mut reused = 0;
@@ -1027,6 +1031,7 @@ impl ProjectedHistory {
                         }
                         None => None,
                     };
+                    let neutral = rechecked.message(&source, oid, neutral)?;
                     let config = if metadata.is_file_line() {
                         None
                     } else {
@@ -1068,8 +1073,21 @@ impl ProjectedHistory {
                         // A session snapshot publishes its conversation records only.
                         let conversation = match config {
                             Some(_) if selected.delivery.is_none() => {
-                                let conversation =
-                                    conversation_commit(&source, oid, &parents[oid])?;
+                                let published = published_lines(
+                                    &source,
+                                    &repo,
+                                    &written,
+                                    oid,
+                                    &parents[oid],
+                                    &public_parents,
+                                )?;
+                                let conversation = conversation_commit(
+                                    &source,
+                                    oid,
+                                    &parents[oid],
+                                    &published,
+                                    &mut rechecked,
+                                )?;
                                 count_left_out(
                                     &repo,
                                     &public_parents,
@@ -1155,6 +1173,12 @@ impl ProjectedHistory {
                             oid.clone()
                         };
                         plain_rewrites.insert(oid.clone());
+                        if selected.delivery.is_none() {
+                            written.insert(
+                                public.clone(),
+                                conversation.clone().unwrap_or_else(|| oid.clone()),
+                            );
+                        }
                         let snapshot = match config {
                             None => PublishedSnapshot::FileLine {
                                 commit: public.clone(),
@@ -1791,10 +1815,263 @@ fn held_events(source: &Repo, oid: &str) -> Result<BTreeSet<String>> {
     Ok(held)
 }
 
+/// What a snapshot's public parents already published: lines a publication carries as they are.
+#[derive(Default)]
+struct Published<'a> {
+    /// The event ids the public parents' LOGs name.
+    ids: std::collections::HashSet<String>,
+    /// When the snapshot's LOG extends a source parent's, as a merge's extends its target's, the
+    /// public LOG of the longest such parent, in order.
+    prefix: Option<Prefix<'a>>,
+}
+
+/// The public lines of the records a snapshot shares with a source parent whose LOG its own
+/// extends. The publication rule decides a record by it and the records before it alone, so the
+/// records the two share are kept the same way in both, and the public parent's LOG names them in
+/// the same order.
+struct Prefix<'a> {
+    /// How many of the snapshot's LOG lines its source parent holds.
+    source_lines: usize,
+    /// The public parent's LOG, in order.
+    public: Vec<String>,
+    holder: &'a Repo,
+    commit: String,
+}
+
+impl Prefix<'_> {
+    /// The line the public parent publishes as `id`.
+    fn line(&self, id: &str) -> Result<String> {
+        use crate::domain::storage;
+        let bytes = read(
+            self.holder,
+            &[
+                "cat-file",
+                "blob",
+                &format!("{}:{}", self.commit, meta::event_path(id)?),
+            ],
+            storage::MAX_MATERIALIZED_BYTES,
+        )?;
+        let line = String::from_utf8(bytes).context("a published event is not UTF-8")?;
+        ensure!(
+            storage::event_id(&line)? == id,
+            "a published event does not match its id"
+        );
+        Ok(line)
+    }
+}
+
+/// [`Published`] for a snapshot `oid` with source `parents` and their `public_parents`. A parent
+/// this run wrote is read through the source commit `written` names for it, which holds the same
+/// LOG: what the run writes reaches the publication repository only when the run ends.
+fn published_lines<'a>(
+    source: &'a Repo,
+    repo: &'a Repo,
+    written: &std::collections::HashMap<String, String>,
+    oid: &str,
+    parents: &[String],
+    public_parents: &[String],
+) -> Result<Published<'a>> {
+    use crate::domain::storage;
+    let limit = storage::MAX_MATERIALIZED_BYTES;
+    let blob = |holder: &Repo, commit: &str, path: &str| -> Result<Option<String>> {
+        let spec = format!("{commit}:{path}");
+        if holder.git_opt(&["cat-file", "-e", &spec]).is_none() {
+            return Ok(None);
+        }
+        let bytes = read(holder, &["cat-file", "blob", &spec], limit)?;
+        Ok(Some(
+            String::from_utf8(bytes).context("a published LOG is not UTF-8")?,
+        ))
+    };
+    let mut published = Published::default();
+    let mut orders = Vec::new();
+    for parent in public_parents {
+        let commit = written.get(parent).unwrap_or(parent);
+        let holder = [source, repo]
+            .into_iter()
+            .find(|holder| {
+                holder
+                    .git_opt(&["cat-file", "-e", &format!("{commit}^{{tree}}")])
+                    .is_some()
+            })
+            .context("a published parent is unavailable")?;
+        if let Some(log) = blob(holder, commit, meta::LOG_FILE)? {
+            let ids = log.lines().map(str::to_owned).collect::<Vec<_>>();
+            published.ids.extend(ids.iter().cloned());
+            orders.push(Some((holder, commit.clone(), ids)));
+        } else {
+            if let Some(log) = blob(holder, commit, meta::LEGACY_LOG_FILE)? {
+                published.ids.extend(
+                    log.lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| storage::canonical_event_id(&format!("{line}\n"))),
+                );
+            }
+            orders.push(None);
+        }
+    }
+    if let Some(own) = blob(source, oid, meta::LOG_FILE)? {
+        let own = own.lines().collect::<Vec<_>>();
+        for (parent, order) in parents.iter().zip(&orders) {
+            let Some((holder, commit, public)) = order else {
+                continue;
+            };
+            let Some(shared) = blob(source, parent, meta::LOG_FILE)? else {
+                continue;
+            };
+            let shared = shared.lines().collect::<Vec<_>>();
+            if own.starts_with(&shared)
+                && published
+                    .prefix
+                    .as_ref()
+                    .is_none_or(|prefix| prefix.source_lines < shared.len())
+            {
+                published.prefix = Some(Prefix {
+                    source_lines: shared.len(),
+                    public: public.clone(),
+                    holder,
+                    commit: commit.clone(),
+                });
+            }
+        }
+    }
+    Ok(published)
+}
+
+/// How much of a snapshot's added records one protection call takes. The records, their text and
+/// what protection returns are all in memory during the call, so a batch the size of a long
+/// session would add several times its size to a push's peak.
+const PROTECTION_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Records a publication run has already passed through today's protection, by the digest of
+/// their text as captured. Protection depends on a record's text alone, so a record passed once
+/// is published the same way in every later snapshot of the run that carries it.
+#[derive(Default)]
+struct Rechecked {
+    /// Records protection leaves as they are.
+    unchanged: std::collections::HashSet<String>,
+    /// Records protection changes, as they are published.
+    protected: std::collections::HashMap<String, serde_json::Value>,
+    /// Commit messages protection leaves as they are.
+    messages: std::collections::HashSet<String>,
+}
+
+impl Rechecked {
+    /// `contents`, records a snapshot's publication adds, as they are published today. A record is
+    /// protected under the rules in force when it was captured; one captured before a rule existed,
+    /// or before a value was registered, would otherwise go out holding what today's rules replace.
+    /// So every record a publication adds passes capture's own protection again before anything
+    /// is sent, and is judged as capture judges it: field by field on decoded values, each with its
+    /// field's name as context. A scan of the serialized line is a different judgement, and finds
+    /// less. A record protection leaves as it is stays the value it was, so its event id does not
+    /// move. A record whose protection does not complete refuses the publication.
+    ///
+    /// Returns the indices of the records protection changed.
+    fn contents(&mut self, repo: &Repo, contents: &mut [serde_json::Value]) -> Result<Vec<usize>> {
+        let mut changed = Vec::new();
+        let mut pending = Vec::new();
+        let mut input = String::new();
+        for (index, content) in contents.iter_mut().enumerate() {
+            let text = serde_json::to_string(content)?;
+            let digest = digest_bytes(text.as_bytes());
+            if self.unchanged.contains(&digest) {
+                continue;
+            }
+            if let Some(protected) = self.protected.get(&digest) {
+                *content = protected.clone();
+                changed.push(index);
+                continue;
+            }
+            input.push_str(&text);
+            input.push('\n');
+            pending.push((index, digest, text));
+        }
+        if pending.is_empty() {
+            return Ok(changed);
+        }
+        let output = crate::domain::privacy::service::protect_for_commit(
+            Some(repo.root()),
+            &input,
+            crate::domain::privacy::projector::Mode::ProtectJsonl,
+        )
+        .map_err(|pending| {
+            anyhow::Error::new(pending).context(
+                "a record this publication carries did not pass today's privacy check, so nothing was published",
+            )
+        })?;
+        let lines = output.split_terminator('\n').collect::<Vec<_>>();
+        ensure!(
+            lines.len() == pending.len(),
+            "protection returned a different number of records than it was given"
+        );
+        for ((index, digest, text), line) in pending.into_iter().zip(lines) {
+            if line == text {
+                self.unchanged.insert(digest);
+                continue;
+            }
+            let protected: serde_json::Value =
+                serde_json::from_str(line).context("a protected record is not one JSON record")?;
+            self.protected.insert(digest, protected.clone());
+            contents[index] = protected;
+            changed.push(index);
+        }
+        Ok(changed)
+    }
+
+    /// The commit a snapshot is published with, `commit` when an earlier step rewrote it,
+    /// otherwise `oid`'s own, with its message as capture's text protection writes it today: a
+    /// message is written text like any record. `None` when `commit` is `None` and protection
+    /// leaves `oid`'s message as it is.
+    fn message(
+        &mut self,
+        repo: &Repo,
+        oid: &str,
+        commit: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
+        let original = match &commit {
+            Some(commit) => commit.clone(),
+            None => read(repo, &["cat-file", "commit", oid], MAX_COMMIT)?,
+        };
+        let boundary = original
+            .windows(2)
+            .position(|bytes| bytes == b"\n\n")
+            .context("publication source commit has no header boundary")?;
+        let message = std::str::from_utf8(&original[boundary + 2..])
+            .context("publication source commit message is not UTF-8")?;
+        let digest = digest_bytes(message.as_bytes());
+        if self.messages.contains(&digest) {
+            return Ok(commit);
+        }
+        let protected = crate::domain::privacy::service::protect_for_commit(
+            Some(repo.root()),
+            message,
+            crate::domain::privacy::projector::Mode::ProtectText,
+        )
+        .map_err(|pending| {
+            anyhow::Error::new(pending).context(
+                "a commit message this publication carries did not pass today's privacy check, so nothing was published",
+            )
+        })?;
+        if protected == message {
+            self.messages.insert(digest);
+            return Ok(commit);
+        }
+        let mut rewritten = original[..boundary + 2].to_vec();
+        rewritten.extend_from_slice(protected.as_bytes());
+        Ok(Some(rewritten))
+    }
+}
+
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
 /// The local commit is left as it is, so local history and resume keep the complete native
 /// transcript.
-fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<Conversation> {
+fn conversation_commit(
+    source: &Repo,
+    oid: &str,
+    parents: &[String],
+    published: &Published<'_>,
+    rechecked: &mut Rechecked,
+) -> Result<Conversation> {
     use crate::domain::{publication_records, storage, transcript::Envelope};
     let limit = storage::MAX_MATERIALIZED_BYTES;
     let (log, view) = storage::materialize_pair_local(source.root(), oid, limit, limit)?;
@@ -1820,18 +2097,72 @@ fn conversation_commit(source: &Repo, oid: &str, parents: &[String]) -> Result<C
             .iter()
             .map(|envelope| (envelope.source.as_str(), &envelope.content)),
     );
+    let public = |envelope: &Envelope, content: serde_json::Value| Envelope {
+        source: envelope.source.clone(),
+        session_id: envelope.session_id.clone(),
+        object_hash: crate::domain::transcript::object_hash(&content),
+        content,
+    };
+    // A line a public parent already holds goes out as it is: it is published, and this LOG
+    // extends the parent's only while those lines keep their bytes. A record this snapshot shares
+    // with the parent whose LOG it extends goes out as the line the public parent published for
+    // it, though protection changed it then and today's rules would change it again. Every other
+    // kept record passes today's protection first.
+    let prefix = published.prefix.as_ref().filter(|prefix| {
+        prefix.source_lines <= kept.len()
+            && kept[..prefix.source_lines]
+                .iter()
+                .filter(|kept| kept.is_some())
+                .count()
+                == prefix.public.len()
+    });
+    let mut shared = 0;
+    let mut public_lines = Vec::with_capacity(log.len());
+    let mut fresh = Vec::new();
+    let mut contents = Vec::new();
+    let mut batched = 0;
+    let mut protect = |fresh: &mut Vec<usize>,
+                       contents: &mut Vec<serde_json::Value>,
+                       public_lines: &mut Vec<Option<String>>|
+     -> Result<()> {
+        for changed in rechecked.contents(source, contents)? {
+            let index = fresh[changed];
+            let content = std::mem::take(&mut contents[changed]);
+            public_lines[index] = Some(storage::envelope_line(&public(&envelopes[index], content)));
+        }
+        fresh.clear();
+        contents.clear();
+        Ok(())
+    };
+    for (index, (envelope, kept)) in envelopes.iter().zip(kept).enumerate() {
+        let Some(content) = kept else {
+            public_lines.push(None);
+            continue;
+        };
+        let candidate = public(envelope, content);
+        let mut line = storage::envelope_line(&candidate);
+        let id = storage::canonical_event_id(&line);
+        if let Some(prefix) = prefix.filter(|prefix| index < prefix.source_lines) {
+            if prefix.public[shared] != id {
+                line = prefix.line(&prefix.public[shared])?;
+            }
+            shared += 1;
+        } else if !published.ids.contains(&id) {
+            batched += line.len();
+            fresh.push(index);
+            contents.push(candidate.content);
+        }
+        public_lines.push(Some(line));
+        if batched >= PROTECTION_BATCH_BYTES {
+            protect(&mut fresh, &mut contents, &mut public_lines)?;
+            batched = 0;
+        }
+    }
+    protect(&mut fresh, &mut contents, &mut public_lines)?;
     let mut published = BTreeMap::<&str, Option<String>>::new();
     let mut public_log = String::new();
     let mut changed = false;
-    for ((line, envelope), kept) in log.iter().zip(&envelopes).zip(kept) {
-        let public = kept.map(|content| {
-            storage::envelope_line(&Envelope {
-                source: envelope.source.clone(),
-                session_id: envelope.session_id.clone(),
-                object_hash: crate::domain::transcript::object_hash(&content),
-                content,
-            })
-        });
+    for (line, public) in log.iter().zip(public_lines) {
         changed |= public.as_deref() != Some(line.as_str());
         if let Some(public) = &public {
             public_log.push_str(public);
@@ -2778,7 +3109,14 @@ mod tests {
         let head = git(temp.path(), &["rev-parse", "HEAD"]);
         let repo = Repo::at(temp.path());
         assert_eq!(
-            conversation_commit(&repo, head.trim(), &[]).unwrap(),
+            conversation_commit(
+                &repo,
+                head.trim(),
+                &[],
+                &Published::default(),
+                &mut Rechecked::default()
+            )
+            .unwrap(),
             Conversation {
                 commit: None,
                 left_out: BTreeSet::new(),

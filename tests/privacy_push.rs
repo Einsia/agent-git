@@ -3405,6 +3405,17 @@ fn continued_plain_session_declares_only_what_it_adds() {
 /// pushed object never holds the instructions, memory or AGENTS.md text a Claude Code or Codex
 /// transcript carries, while the local snapshot keeps the complete transcript. A session first
 /// published while it held conversation only keeps that commit, and its next snapshot builds on it.
+/// Records and a commit message recorded without protection, as ones captured before a rule
+/// existed, are published as capture protects them today: the value they hold goes out as a
+/// placeholder. One record holds a quoted assignment, which capture's judgement of the decoded
+/// field finds and a scan of the serialized record does not, so a push that scanned the line would
+/// send it. A line the Hub already holds stays as it was published, even when a value registered
+/// since then is in it, so the LOG still extends the published one; a new line holding that value
+/// gets a placeholder. A push that rechecked published lines would rewrite them, and one that
+/// rechecked none would send the new value. A record protection changed when it was published
+/// keeps its published line the same way, in a merge as in a turn; a push that matched lines only
+/// by their unprotected form would protect it again under the newer value and drop the published
+/// line.
 #[test]
 fn plain_publication_carries_only_conversation_records() {
     const CLAUDE_MD: &str = "CANARY-PROJECT-CLAUDE-MD-7f3a";
@@ -3425,6 +3436,11 @@ fn plain_publication_carries_only_conversation_records() {
     const CODEX_TURN_CONTEXT: &str = "CANARY-CODEX-TURN-CONTEXT-INSTRUCTIONS-5e21";
     const CODEX_WORLD_STATE: &str = "CANARY-CODEX-WORLD-STATE-9b07";
     const CODEX_SETTINGS: &str = "CANARY-CODEX-THREAD-SETTINGS-APPLIED-3f6a";
+    const UNPROTECTED: &str = "AKIA2E7YQXK4NMZ5VJ3T";
+    const AFTER_NEWLINE: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    const QUOTED: &str = "CedarBranchPetalRiver";
+    const REGISTERED: &str = "heron-ledger-7731";
+    const LATER: &str = "otter-quay-5512";
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -3447,7 +3463,7 @@ fn plain_publication_carries_only_conversation_records() {
         },
     )
     .unwrap();
-    let run = |args: &[&str]| {
+    let agit = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
@@ -3467,11 +3483,10 @@ fn plain_publication_carries_only_conversation_records() {
                 "AGIT_SECRETS_KEYSTORE",
                 if cfg!(unix) { "file" } else { "os" },
             )
-            .stdin(Stdio::null())
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        command
     };
+    let run = |args: &[&str]| agit(args).stdin(Stdio::null()).output().unwrap();
     let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
     repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
         .unwrap();
@@ -3501,13 +3516,30 @@ fn plain_publication_carries_only_conversation_records() {
     };
     let reminder = |body: &str| format!("<system-reminder>\n{body}\n</system-reminder>");
     let mut claude = vec![
-        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","message":{"role":"user","content":"fix the failing test"}}),
+        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","message":{"role":"user","content":format!("fix the failing test in {REGISTERED}")}}),
         json!({"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"Looking."}]}}),
     ];
     repo.git(&["checkout", "main"]).unwrap();
     let clean = snapshot("talk", "claude-code", 'c', &claude);
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), clean);
+    let (first_log, _) = storage::materialize_pair_at(&remote, &clean).unwrap();
+    let register = |name: &str, value: &str| {
+        let mut add = agit(&["secrets", "add", name, "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        add.stdin
+            .take()
+            .unwrap()
+            .write_all(value.as_bytes())
+            .unwrap();
+        assert_success(&add.wait_with_output().unwrap());
+    };
+    // A value registered after that line was published.
+    register("later", REGISTERED);
 
     claude.extend([
         json!({"type":"attachment","uuid":"u3","parentUuid":"u2","sessionId":"s","attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":CLAUDE_MD}}),
@@ -3538,6 +3570,11 @@ fn plain_publication_carries_only_conversation_records() {
         json!({"type":"api-request-blob","sessionId":"s","hash":"h2","message":{"role":"user","content":REQUEST_BLOB}}),
         json!({"type":"api-request","sessionId":"s","requestId":"r1","body":{"messages":[{"role":"user","content":REQUEST}]}}),
         json!({"type":"file-history-delta","sessionId":"s","messageId":"m1","delta":{"/work/a.rs":{"content":FILE_DELTA}}}),
+        json!({"type":"user","uuid":"u15","parentUuid":"u8","sessionId":"s","message":{"role":"user","content":format!("deploy with {UNPROTECTED} through {LATER}")}}),
+        // A key straight after an escaped newline in the serialized record.
+        json!({"type":"user","uuid":"u16","parentUuid":"u15","sessionId":"s","message":{"role":"user","content":format!("first line\n{AFTER_NEWLINE}")}}),
+        json!({"type":"user","uuid":"u17","parentUuid":"u16","sessionId":"s","message":{"role":"user","content":format!("const token = \"{QUOTED}\";")}}),
+        json!({"type":"user","uuid":"u18","parentUuid":"u17","sessionId":"s","message":{"role":"user","content":format!("ship {REGISTERED} today")}}),
     ]);
     let continued = snapshot("talk", "claude-code", 'c', &claude);
     // An event object the tree holds but its LOG does not name.
@@ -3547,7 +3584,14 @@ fn plain_publication_carries_only_conversation_records() {
     fs::create_dir_all(orphan.parent().unwrap()).unwrap();
     fs::write(&orphan, format!("{}\n", json!({"note":ORPHAN_EVENT}))).unwrap();
     repo.add_all().unwrap();
-    repo.git(&["commit", "-q", "--amend", "--no-edit"]).unwrap();
+    repo.git(&[
+        "commit",
+        "-q",
+        "--amend",
+        "-m",
+        &format!("rename the flag with {UNPROTECTED}"),
+    ])
+    .unwrap();
     assert_ne!(git(repo.root(), &["rev-parse", "HEAD"]), continued);
     let continued = git(repo.root(), &["rev-parse", "HEAD"]);
     repo.git(&["checkout", "main"]).unwrap();
@@ -3681,8 +3725,19 @@ fn plain_publication_carries_only_conversation_records() {
         REQUEST_BLOB,
         REQUEST,
         FILE_DELTA,
+        UNPROTECTED,
+        AFTER_NEWLINE,
+        QUOTED,
     ] {
         assert!(!objects.contains(canary), "{canary} reached the Hub");
+    }
+    for protected in [
+        "deploy with ‹secret:",
+        "first line\\n‹secret:",
+        "rename the flag with ‹secret:",
+        "const token = ",
+    ] {
+        assert!(objects.contains(protected), "{protected}: {objects}");
     }
     for words in [
         "now rename the flag",
@@ -3696,7 +3751,21 @@ fn plain_publication_carries_only_conversation_records() {
         assert!(objects.contains(words), "{words} is missing from the Hub");
     }
     let (log, _) = storage::materialize_pair_at(&remote, &published).unwrap();
-    assert_eq!(log.lines().count(), 5, "{log}");
+    assert_eq!(log.lines().count(), 9, "{log}");
+    for line in first_log.lines() {
+        assert!(
+            log.lines().any(|public| public == line),
+            "{line} moved: {log}"
+        );
+    }
+    let shipped = log
+        .lines()
+        .find(|line| line.contains("\"uuid\":\"u18\""))
+        .unwrap();
+    assert!(
+        shipped.contains("ship ") && shipped.contains(" today") && !shipped.contains(REGISTERED),
+        "{shipped}"
+    );
     assert!(log.contains("\"parentUuid\":\"u2\""), "{log}");
 
     // The local snapshots are the complete transcripts, for history and resume.
@@ -3713,6 +3782,9 @@ fn plain_publication_carries_only_conversation_records() {
     let (local, _) = storage::materialize_pair_at(repo.root(), &continued).unwrap();
     assert_eq!(local.lines().count(), claude.len());
 
+    // A record protection changed when it was published keeps that line, though a value
+    // registered since is in it too.
+    register("latest", LATER);
     // A branch reset to an older public commit is behind the Hub tip, not diverged from it.
     claude.push(json!({"type":"user","uuid":"u12","parentUuid":"u11","sessionId":"s","message":{"role":"user","content":"and update the docs"}}));
     repo.git(&["checkout", "talk"]).unwrap();
@@ -3721,6 +3793,13 @@ fn plain_publication_carries_only_conversation_records() {
     let tip = git(&remote, &["rev-parse", "refs/heads/talk"]);
     assert_ne!(tip, next);
     assert_eq!(git(&remote, &["rev-parse", &format!("{tip}^")]), published);
+    let (extended, _) = storage::materialize_pair_at(&remote, &tip).unwrap();
+    for line in log.lines() {
+        assert!(
+            extended.lines().any(|public| public == line),
+            "{line} moved: {extended}"
+        );
+    }
     repo.git(&["checkout", "main"]).unwrap();
     git(
         repo.root(),
@@ -3742,6 +3821,187 @@ fn plain_publication_carries_only_conversation_records() {
         .unwrap_or_else(|| panic!("talk has no status row:\n{status}"));
     assert!(row.contains("ahead 0, behind 1"), "{row}");
     repo.git(&["update-ref", "refs/heads/talk", &next]).unwrap();
+
+    // A merge of another session into this one keeps the lines its target's publication holds.
+    let aside = snapshot(
+        "aside",
+        "claude-code",
+        'e',
+        &[
+            json!({"type":"user","uuid":"a1","parentUuid":null,"sessionId":"e","message":{"role":"user","content":"check the other branch"}}),
+        ],
+    );
+    repo.git(&["checkout", "talk"]).unwrap();
+    claude.push(json!({"type":"user","uuid":"u20","parentUuid":"u12","sessionId":"s","message":{"role":"user","content":"merged the other branch"}}));
+    let turn = snapshot("talk", "claude-code", 'c', &claude);
+    let merged = git(
+        repo.root(),
+        &[
+            "commit-tree",
+            &format!("{turn}^{{tree}}"),
+            "-p",
+            &next,
+            "-p",
+            &aside,
+            "-m",
+            "merge aside",
+        ],
+    );
+    repo.git(&["update-ref", "refs/heads/talk", &merged])
+        .unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let merged_tip = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{merged_tip}^1")]),
+        tip
+    );
+    let (after_merge, _) = storage::materialize_pair_at(&remote, &merged_tip).unwrap();
+    for line in extended.lines() {
+        assert!(
+            after_merge.lines().any(|public| public == line),
+            "{line} moved: {after_merge}"
+        );
+    }
+}
+
+/// An automatic upload the privacy check holds back sends nothing, and `agit status` says so: the
+/// target, the reason, and, for a reason waiting does not end, the step that ends it. The note
+/// stays until the Hub acknowledges that target. Here the device cannot read its older secret
+/// list whole, so a value it blocks could pass. An upload that failed only in its own stderr would
+/// stop a session's uploads with nobody told; one whose note outlived the landing push would
+/// report a wait that is over, and one whose note any successful command cleared would hide the
+/// wait after a preview, which sends nothing.
+#[test]
+fn an_upload_the_privacy_check_holds_back_shows_in_status_until_it_lands() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-B", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","message":{"role":"user","content":"fix the failing test"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("talk").unwrap();
+    let posts = hub.posts.load(Ordering::Acquire);
+
+    let vault = home.join("secret-filter/vault.json");
+    fs::create_dir_all(vault.parent().unwrap()).unwrap();
+    fs::write(&vault, "not a vault").unwrap();
+    let held = run(&["__push-automatic", "alice/app@talk"]);
+    assert_eq!(held.status.code(), Some(7), "{held:?}");
+    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+    assert!(
+        git_command(&remote)
+            .arg("-C")
+            .arg(&remote)
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/talk"])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    );
+    let status = run(&["status"]);
+    let told = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        told.contains("alice/app@talk: its upload waits for the privacy check (legacy_rules)")
+            && told.contains("nothing was sent")
+            && told.contains("older secret list cannot be read whole")
+            && !told.contains("the next upload tries again"),
+        "{told}"
+    );
+    let waits = |output: &Output| {
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["result"]["value"]
+            ["upload_waits"]
+            .clone()
+    };
+    let listed = waits(&run(&["status", "--json"]));
+    assert_eq!(listed[0]["target"], "alice/app@talk", "{listed}");
+    assert_eq!(listed[0]["reason"], "legacy_rules", "{listed}");
+
+    fs::remove_file(&vault).unwrap();
+    // A preview sends nothing, so the wait stays.
+    assert_success(&run(&["--yes", "push", "--dry-run", "alice/app@talk"]));
+    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+    assert_eq!(waits(&run(&["status", "--json"])), listed);
+    assert_success(&run(&["__push-automatic", "alice/app@talk"]));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/talk"]),
+        git(repo.root(), &["rev-parse", "talk"])
+    );
+    assert_eq!(waits(&run(&["status", "--json"])), json!([]));
 }
 
 /// A session whose new history is more than one publication to this Hub can carry is published in

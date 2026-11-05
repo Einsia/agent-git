@@ -194,6 +194,7 @@ pub fn run(args: Args) -> CmdResult {
             if count == 1 { "it" } else { "them" },
         );
     }
+    print_upload_waits();
 
     // ── Local store ──
     ui::section("local");
@@ -664,6 +665,7 @@ fn structured(args: &Args) -> CmdResult {
             "count": count,
             "command": "agit save --all",
         })),
+        "upload_waits": upload_waits_json(),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,
             "limit": limit, "next_offset": (next < links.len()).then_some(next),
@@ -869,15 +871,15 @@ fn print_publication_waits(links: &[crate::domain::link::Link]) {
 }
 
 /// Sessions whose settlement waits for the privacy check. A hook settles quietly, so this is
-/// where such a wait becomes visible.
+/// where such a wait becomes visible. A wait that does not end by itself names the step that ends
+/// it, once for every wait it ends.
 fn print_privacy_waits(links: &[crate::domain::link::Link]) {
     let waiting = crate::domain::privacy::pending::load();
-    let mut unreadable = false;
+    let mut steps = Vec::new();
     for link in links {
         let Some(entry) = waiting.get(&link.session_id) else {
             continue;
         };
-        unreadable |= entry.reason == "device_rules";
         let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
         if let Some(bytes) = entry.refused_bytes {
             ui::warning(&format!(
@@ -893,22 +895,72 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
             ));
             continue;
         }
+        let ends = crate::domain::privacy::pending::steps(&entry.reason);
         ui::warning(&format!(
-            "{}: privacy check pending ({}) since {}; {} turn{} wait, and the next settlement tries again",
+            "{}: privacy check pending ({}) since {}; {} turn{} wait{}",
             crate::domain::link::short(&link.session_id),
             entry.reason,
             ui::ago(since),
             entry.turns,
             if entry.turns == 1 { "" } else { "s" },
+            if ends.is_none() {
+                ", and the next settlement tries again"
+            } else {
+                ""
+            },
         ));
-    }
-    if unreadable {
-        for hint in crate::domain::privacy::service::unreadable_rule_hints().unwrap_or_else(|_| {
-            vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
-        }) {
-            ui::hint(&hint);
+        for step in ends.into_iter().flatten() {
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
         }
     }
+    for step in steps {
+        ui::hint(&step);
+    }
+}
+
+/// Uploads the privacy check holds back, for every target on this computer: an automatic upload
+/// has nobody watching it, and its wait is not tied to the folder status runs in.
+fn print_upload_waits() {
+    let mut steps = Vec::new();
+    for (target, entry) in crate::domain::privacy::pending::upload::load() {
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
+        let ends = crate::domain::privacy::pending::steps(&entry.reason);
+        ui::warning(&format!(
+            "{target}: its upload waits for the privacy check ({}) since {}; nothing was sent{}",
+            entry.reason,
+            ui::ago(since),
+            if ends.is_none() {
+                ", and the next upload tries again"
+            } else {
+                ""
+            },
+        ));
+        for step in ends.into_iter().flatten() {
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+    }
+    for step in steps {
+        ui::hint(&step);
+    }
+}
+
+/// [`print_upload_waits`] for `status --json`.
+fn upload_waits_json() -> Vec<serde_json::Value> {
+    crate::domain::privacy::pending::upload::load()
+        .into_iter()
+        .map(|(target, entry)| {
+            serde_json::json!({
+                "target": target,
+                "reason": entry.reason,
+                "since": entry.since,
+                "steps": crate::domain::privacy::pending::steps(&entry.reason),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

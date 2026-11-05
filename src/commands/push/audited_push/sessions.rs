@@ -888,6 +888,18 @@ pub(super) fn run(
             )
         })?;
         show_publication(&report);
+        // A target whose branch the Hub now holds no longer waits for the privacy check. Only the
+        // Hub's acknowledgement says so: a preview, a cancelled push or a refused one sends nothing.
+        for branch in report
+            .heads
+            .iter()
+            .flat_map(|phase| &phase.attempts)
+            .flat_map(|attempt| &attempt.refs)
+            .filter(|published| published.status != PublicationStatus::Unconfirmed)
+            .filter_map(|published| published.reference.name().strip_prefix("refs/heads/"))
+        {
+            crate::domain::privacy::pending::upload::clear(&format!("{repository}@{branch}"));
+        }
         let accepted: Vec<String> = [&report.heads, &report.tags]
             .into_iter()
             .flatten()

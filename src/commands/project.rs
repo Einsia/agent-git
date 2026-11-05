@@ -1118,7 +1118,9 @@ impl UploadFailure {
         match self {
             Self::SignedOut => "agit is signed out; run `agit login` and the next turn uploads it",
             Self::Hub => "the Hub could not be reached or refused it",
-            Self::PrivacyIncomplete => "its privacy check did not complete",
+            Self::PrivacyIncomplete => {
+                "its privacy check did not complete, so nothing was sent; `agit status` says why and what ends the wait"
+            }
             Self::TooLarge => {
                 "the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again"
             }

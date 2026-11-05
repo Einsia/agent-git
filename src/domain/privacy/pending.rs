@@ -19,22 +19,26 @@ pub struct Waiting {
     pub refused_bytes: Option<u64>,
 }
 
-fn path() -> Option<std::path::PathBuf> {
+fn path(file: &str) -> Option<std::path::PathBuf> {
     crate::infra::config::agit_home()
         .ok()
-        .map(|home| home.join(FILE))
+        .map(|home| home.join(file))
 }
 
-/// Every session that waits.
-pub fn load() -> BTreeMap<String, Waiting> {
-    path()
+fn read<T: serde::de::DeserializeOwned + Default>(file: &str) -> T {
+    path(file)
         .and_then(|path| std::fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn store(waiting: &BTreeMap<String, Waiting>) {
-    let Some(path) = path() else {
+/// Every session that waits.
+pub fn load() -> BTreeMap<String, Waiting> {
+    read(FILE)
+}
+
+fn write<T: serde::Serialize>(file: &str, waiting: &T) {
+    let Some(path) = path(file) else {
         return;
     };
     let Ok(bytes) = serde_json::to_vec(waiting) else {
@@ -52,11 +56,7 @@ pub fn record(session: &str, reason: &str, turns: usize, refused_bytes: Option<u
     let since = waiting
         .get(session)
         .map(|entry| entry.since)
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs())
-        });
+        .unwrap_or_else(now);
     waiting.insert(
         session.to_owned(),
         Waiting {
@@ -66,13 +66,88 @@ pub fn record(session: &str, reason: &str, turns: usize, refused_bytes: Option<u
             refused_bytes,
         },
     );
-    store(&waiting);
+    write(FILE, &waiting);
 }
 
 /// Note that `session` settled what it had.
 pub fn clear(session: &str) {
     let mut waiting = load();
     if waiting.remove(session).is_some() {
-        store(&waiting);
+        write(FILE, &waiting);
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The steps that end a wait for `reason`, worded for the person who reads it, or `None` when the
+/// wait ends by itself. A reason about this device's rules or about the content does not end by
+/// waiting, so it names what the person can do; any other reason is the worker's state, and the
+/// next attempt retries.
+pub fn steps(reason: &str) -> Option<Vec<String>> {
+    match reason {
+        "device_rules" => Some(super::service::unreadable_rule_hints().unwrap_or_else(|_| {
+            vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
+        })),
+        "legacy_rules" => Some(vec![
+            "an older secret list cannot be read whole, so a value it blocks could pass; run `agit doctor` to see what cannot be read".into(),
+        ]),
+        "oversize" => Some(vec![
+            "a record in this conversation is too large to check, so it can't be published; it stays on this computer. To stop uploading this conversation, and only it, run `agit project drop` inside it; its local history stays".into(),
+        ]),
+        "findings_cap" => Some(vec![
+            "a record holds more secret values than one check replaces, so waiting does not end this; `agit scan` shows where they are".into(),
+        ]),
+        _ => None,
+    }
+}
+
+/// Uploads that wait for the privacy check, by the `owner/repo@branch` they push: nothing of such
+/// a push was sent. An automatic upload has nobody watching it, so `agit status` is where its wait
+/// shows. The record is best effort, like the settlement record.
+pub mod upload {
+    use std::collections::BTreeMap;
+
+    const FILE: &str = "publication-pending.json";
+
+    /// Why one target's upload waits, and since when.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Waiting {
+        pub reason: String,
+        /// Seconds since the Unix epoch when the wait began.
+        pub since: u64,
+    }
+
+    /// Every target whose upload waits.
+    pub fn load() -> BTreeMap<String, Waiting> {
+        super::read(FILE)
+    }
+
+    /// Note that `target`'s upload waits; an earlier start of the same wait is kept.
+    pub fn record(target: &str, reason: &str) {
+        let mut waiting = load();
+        let since = waiting
+            .get(target)
+            .map(|entry| entry.since)
+            .unwrap_or_else(super::now);
+        waiting.insert(
+            target.to_owned(),
+            Waiting {
+                reason: reason.to_owned(),
+                since,
+            },
+        );
+        super::write(FILE, &waiting);
+    }
+
+    /// Note that `target` uploaded.
+    pub fn clear(target: &str) {
+        let mut waiting = load();
+        if waiting.remove(target).is_some() {
+            super::write(FILE, &waiting);
+        }
     }
 }
