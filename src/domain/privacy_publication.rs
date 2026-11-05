@@ -1074,6 +1074,11 @@ impl Projector<'_> {
                     .collect();
                 (!blocks.is_empty()).then_some(("assistant".into(), blocks))
             }
+            // The person's row as publication keeps it: its text, never its attached files.
+            "opencode" if value["kind"] == "session_message" && value["type"] == "user" => {
+                let text = value["data"]["text"].as_str()?;
+                Some(("user".into(), vec![json!({"type":"text", "text":text})]))
+            }
             "opencode" if value["kind"] == "message" => {
                 let role = value["data"]["role"].as_str()?.to_owned();
                 let blocks = native_content_blocks(&value["data"]["content"]);
@@ -3015,13 +3020,14 @@ mod tests {
         );
     }
 
-    /// OpenCode's one-row messages: a reply is projected as the assistant's text, a user row
-    /// keeps its place without its text.
+    /// OpenCode's one-row messages: a reply is projected as the assistant's text, a user row as
+    /// the person's text without its attached files.
     #[test]
-    fn opencode_single_row_messages_project_replies_and_omit_user_rows() {
+    fn opencode_single_row_messages_project_replies_and_typed_user_rows() {
         let session = format!("agit-{}", "a".repeat(40));
         let raw = [
-            json!({"id":"msg_v3","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,"time_created":520,"data":{"text":"PRIVATE_USER_ROW"}}),
+            json!({"id":"msg_v3","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,"time_created":520,
+                "data":{"text":"PUBLIC_USER_ROW","files":[{"uri":"file:///Users/canary/PRIVATE_FILE.md","mime":"text/markdown","name":"PRIVATE_FILE.md"}]}}),
             json!({"id":"msg_v4","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":9,"time_created":530,
                 "data":{"time":{"created":530,"completed":538},"system":"PRIVATE_SYSTEM","content":[{"type":"text","id":"text-0","text":"Done."}]}}),
         ]
@@ -3041,10 +3047,15 @@ mod tests {
         .unwrap();
         let records = storage::parse_envelopes(projection.log()).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].content["isMeta"], true);
+        assert_eq!(records[0].content["message"]["role"], "user");
+        assert_eq!(
+            records[0].content["message"]["content"][0]["text"],
+            "PUBLIC_USER_ROW"
+        );
         assert_eq!(records[1].content["message"]["role"], "assistant");
         assert!(projection.log().contains("Done."));
-        assert!(!projection.log().contains("PRIVATE_USER_ROW"));
+        assert!(!projection.log().contains("PRIVATE_FILE"));
+        assert!(!projection.log().contains("canary"));
         assert!(!projection.log().contains("PRIVATE_SYSTEM"));
     }
 

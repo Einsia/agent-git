@@ -64,7 +64,7 @@ pub fn records(workspace: &Path) -> Vec<Value> {
                 "api_keys":[CREDENTIAL,[CREDENTIAL],{"label":CREDENTIAL},42,true],"references":[CREDENTIAL]}}
         ]}}),
         json!({"type":"user","message":{"role":"user","content":[
-            {"type":"tool_result","tool_use_id":"fixture-shell","content":"PRIVATE_SHELL_RESULT"},
+            {"type":"tool_result","tool_use_id":"fixture-shell","content":format!("PRIVATE_SHELL_RESULT {SECRET}")},
             {"type":"tool_result","tool_use_id":"fixture-mcp","content":{"label":"PRIVATE_MCP_RESULT","password":CREDENTIAL,"reference":CREDENTIAL,
                 "passwords":[CREDENTIAL],"references":[CREDENTIAL]}}
         ]}}),

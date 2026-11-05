@@ -57,7 +57,7 @@ pub const RUNTIMES: &[&str] = &[
 
 /// The runtimes whose user messages are left out entirely, because their records carry no marker
 /// that tells the person's words apart from context the runtime injected in the user's role.
-pub const USER_MESSAGES_WITHHELD: &[&str] = &["opencode", "hermes", "openclaw"];
+pub const USER_MESSAGES_WITHHELD: &[&str] = &["hermes", "openclaw"];
 
 /// The runtimes whose user messages are published with only the request inside their
 /// `<user_query>` wrapper; a user message without one is left out.
@@ -68,9 +68,27 @@ pub const USER_QUERY_ONLY: &[&str] = &["cursor", "workbuddy"];
 pub struct Classifier {
     /// OpenCode message ids and their roles, from the message headers seen so far.
     opencode_roles: HashMap<String, String>,
-    /// The same for the ordered judgement of kinds: each message id's hash, and whether its role
-    /// is the assistant's.
-    assistant_messages: HashMap<u64, bool>,
+    /// The same for the ordered judgement of kinds: each message id's hash, and its role.
+    message_roles: HashMap<u64, Host>,
+}
+
+/// The role of the OpenCode message a part belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Host {
+    Assistant,
+    User,
+    /// Any other role, or a message whose header was not seen.
+    Other,
+}
+
+impl Host {
+    fn of(role: Option<&str>) -> Self {
+        match role {
+            Some("assistant") => Host::Assistant,
+            Some("user") => Host::User,
+            _ => Host::Other,
+        }
+    }
 }
 
 /// What one record contributes to the ordered judgement of a session, read from the record
@@ -83,18 +101,18 @@ pub struct RecordKind(Kind);
 enum Kind {
     /// A class that does not depend on the records around it.
     Fixed(RecordClass),
-    /// An OpenCode message header: its id's hash, whether its role is the assistant's, and its
-    /// own class.
+    /// An OpenCode message header: its id's hash, its role, and its own class.
     OpencodeHeader {
         message: Option<u64>,
-        assistant: bool,
+        host: Host,
         class: RecordClass,
     },
-    /// An OpenCode part: its message id's hash, and its class under an assistant message and
-    /// under any other.
+    /// An OpenCode part: its message id's hash, and its class under an assistant message, under
+    /// a user message and under any other.
     OpencodePart {
         message: Option<u64>,
         under_assistant: RecordClass,
+        under_user: RecordClass,
         otherwise: RecordClass,
     },
 }
@@ -119,15 +137,16 @@ pub fn record_kind(source: &str, content: &Value) -> RecordKind {
         Some("message") => match record["data"]["role"].as_str() {
             Some(role) => RecordKind(Kind::OpencodeHeader {
                 message: message("id"),
-                assistant: role == "assistant",
+                host: Host::of(Some(role)),
                 class: class_from(opencode_header(record), content),
             }),
             None => fixed(source),
         },
         Some("part") => RecordKind(Kind::OpencodePart {
             message: message("message_id"),
-            under_assistant: class_from(opencode_part(record, true), content),
-            otherwise: class_from(opencode_part(record, false), content),
+            under_assistant: class_from(opencode_part(record, Host::Assistant), content),
+            under_user: class_from(opencode_part(record, Host::User), content),
+            otherwise: class_from(opencode_part(record, Host::Other), content),
         }),
         _ => fixed(source),
     }
@@ -167,29 +186,28 @@ impl Classifier {
             Kind::Fixed(class) => class,
             Kind::OpencodeHeader {
                 message,
-                assistant,
+                host,
                 class,
             } => {
                 if let Some(message) = message {
-                    self.assistant_messages.insert(message, assistant);
+                    self.message_roles.insert(message, host);
                 }
                 class
             }
             Kind::OpencodePart {
                 message,
                 under_assistant,
+                under_user,
                 otherwise,
-            } => {
-                let assistant = message
-                    .and_then(|message| self.assistant_messages.get(&message))
-                    .copied()
-                    .unwrap_or(false);
-                if assistant {
-                    under_assistant
-                } else {
-                    otherwise
-                }
-            }
+            } => match message
+                .and_then(|message| self.message_roles.get(&message))
+                .copied()
+                .unwrap_or(Host::Other)
+            {
+                Host::Assistant => under_assistant,
+                Host::User => under_user,
+                Host::Other => otherwise,
+            },
         }
     }
 
@@ -434,8 +452,19 @@ fn typed_content(content: &Value) -> Option<Value> {
 /// left out.
 fn tool_result(block: &Value) -> Value {
     let mut block = block.clone();
-    match &block["content"] {
-        Value::String(text) => block["content"] = Value::String(without_injected(text)),
+    if let Some(content) = block.get_mut("content") {
+        *content = tool_output(content, true);
+    }
+    block
+}
+
+/// Tool output follows one rule for Claude and Codex: its text, and the text parts of an array,
+/// without injected elements; only Claude-shaped results retain images. Any other output, a
+/// structured result or a scalar, is kept as it is; protection masks its credential fields and
+/// keeps its references.
+fn tool_output(output: &Value, keep_images: bool) -> Value {
+    match output {
+        Value::String(text) => Value::String(without_injected(text)),
         Value::Array(parts) => {
             let parts = parts
                 .iter()
@@ -453,15 +482,14 @@ fn tool_result(block: &Value) -> Value {
                             part
                         })
                     }
-                    _ if part["type"] == "image" => Some(part.clone()),
+                    _ if keep_images && part["type"] == "image" => Some(part.clone()),
                     _ => None,
                 })
                 .collect();
-            block["content"] = Value::Array(parts);
+            Value::Array(parts)
         }
-        _ => {}
+        other => other.clone(),
     }
-    block
 }
 
 /// Tags a runtime wraps around context it supplies on its own. A block runs to its closing tag,
@@ -694,13 +722,12 @@ fn codex(record: &Map<String, Value>) -> Option<Value> {
                 "user" => codex_typed_by_person(payload),
                 _ => false,
             },
-            "reasoning"
-            | "function_call"
-            | "function_call_output"
-            | "custom_tool_call"
-            | "custom_tool_call_output"
-            | "local_shell_call"
-            | "local_shell_call_output" => true,
+            "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
+                let mut record = Value::Object(record.clone());
+                record["payload"]["output"] = tool_output(payload.get("output")?, false);
+                return Some(record);
+            }
+            "reasoning" | "function_call" | "custom_tool_call" | "local_shell_call" => true,
             _ => false,
         },
         "event_msg" if kind == Some("user_message") => {
@@ -840,8 +867,10 @@ fn codex_typed_by_person(payload: &Map<String, Value>) -> bool {
 
 impl Classifier {
     /// OpenCode: message headers (role and mode only), the assistant's text, reasoning, tool and
-    /// compaction parts. Its user text carries no marker of who wrote it (`synthetic` marks some
-    /// injections, not all), so a text part is kept only under an assistant message.
+    /// compaction parts, and the text parts of the person's message that OpenCode leaves
+    /// unmarked. OpenCode 1.19.4 marks each text part it adds to the person's turn `synthetic`.
+    /// Accepted residual: a text part a plugin adds without a mark or any other field reads as
+    /// typed and is published.
     fn opencode(&mut self, record: &Map<String, Value>) -> Option<Value> {
         match record.get("kind").and_then(Value::as_str)? {
             "message" => {
@@ -852,16 +881,20 @@ impl Classifier {
                 opencode_header(record)
             }
             "part" => {
-                let assistant = record
-                    .get("message_id")
-                    .and_then(Value::as_str)
-                    .and_then(|id| self.opencode_roles.get(id))
-                    .is_some_and(|role| role == "assistant");
-                opencode_part(record, assistant)
+                let host = Host::of(
+                    record
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| self.opencode_roles.get(id))
+                        .map(String::as_str),
+                );
+                opencode_part(record, host)
             }
             // The other storage shape: one row per message, its parts inside. Assistant rows
             // keep their timing and their text, reasoning and tool items; a compaction keeps its
-            // summary. User rows carry no mark of who wrote them.
+            // summary. A user row holds what the person sent, and OpenCode writes what it adds as
+            // rows of other types: it keeps its timing and its text through `typed_text`, never
+            // its attached files, and a row with any other field is left out.
             "session_message" => {
                 let data = record.get("data")?.as_object()?;
                 let mut kept_data = Map::new();
@@ -883,6 +916,17 @@ impl Classifier {
                     }
                     "compaction" => {
                         kept_data.insert("summary".into(), data.get("summary")?.clone());
+                    }
+                    "user" => {
+                        const FIELDS: &[&str] = &["time", "text", "files"];
+                        if data.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+                            return None;
+                        }
+                        if let Some(time) = data.get("time") {
+                            kept_data.insert("time".into(), time.clone());
+                        }
+                        let text = typed_text(data.get("text")?.as_str()?)?;
+                        kept_data.insert("text".into(), Value::String(text));
                     }
                     _ => return None,
                 }
@@ -920,15 +964,43 @@ fn opencode_header(record: &Map<String, Value>) -> Option<Value> {
     Some(Value::Object(kept))
 }
 
-/// An OpenCode part as it is published under an assistant message or under any other.
-fn opencode_part(record: &Map<String, Value>, under_assistant: bool) -> Option<Value> {
+/// An OpenCode part as it is published under a message of role `host`. The assistant's text and
+/// every message's reasoning, tool and compaction parts are kept. Of the person's message only a
+/// text part OpenCode leaves unmarked is kept, as [`opencode_typed_part`] reduces it: OpenCode
+/// writes what it adds to the person's turn as text parts marked `synthetic`, and its attached
+/// files are never published.
+fn opencode_part(record: &Map<String, Value>, host: Host) -> Option<Value> {
     let data = record.get("data")?;
-    let kept = match data["type"].as_str()? {
-        "text" => under_assistant && data["synthetic"] != true,
-        "reasoning" | "tool" | "compaction" => true,
-        _ => false,
-    };
-    kept.then(|| Value::Object(record.clone()))
+    match (host, data["type"].as_str()?) {
+        (Host::Assistant, "text") => {
+            (data["synthetic"] != true).then(|| Value::Object(record.clone()))
+        }
+        (_, "reasoning" | "tool" | "compaction") => Some(Value::Object(record.clone())),
+        (Host::User, "text") => opencode_typed_part(record),
+        _ => None,
+    }
+}
+
+/// A text part of the person's message with its text through [`typed_text`], or `None` when the
+/// part carries any field beyond its text, type, time and ids (a `synthetic` or `ignored` mark of
+/// either value among them) or no typed words remain.
+fn opencode_typed_part(record: &Map<String, Value>) -> Option<Value> {
+    const DATA: &[&str] = &["type", "text", "time", "id", "messageID", "sessionID"];
+    let data = record.get("data")?.as_object()?;
+    if data.keys().any(|key| !DATA.contains(&key.as_str())) {
+        return None;
+    }
+    let text = typed_text(data.get("text")?.as_str()?)?;
+    let mut data = data.clone();
+    data.insert("text".into(), Value::String(text));
+    let mut kept = Map::new();
+    for key in ["id", "kind", "session_id", "message_id", "time_created"] {
+        if let Some(value) = record.get(key) {
+            kept.insert(key.into(), value.clone());
+        }
+    }
+    kept.insert("data".into(), Value::Object(data));
+    Some(Value::Object(kept))
 }
 
 // ---- Hermes, OpenClaw, WorkBuddy ------------------------------------------------------------
