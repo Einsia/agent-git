@@ -53,6 +53,7 @@
 //! Not a single `links.json`: writes can fire concurrently (two sessions opened at once), one
 //! file per session drops the read-modify-write race, and file names cannot collide.
 
+pub mod launch;
 mod native_source;
 pub use native_source::NativeBinding;
 
@@ -127,6 +128,9 @@ pub struct Link {
     pub merge_archive: Option<MergeArchiveRole>,
     /// The user dismissed this unclaimed session from the naming inbox.
     pub naming_ignored: bool,
+    /// How a fresh session came to hold its branch: `launch` when it took the claim an agit launch
+    /// made for it. Absent for links made before this was recorded, and for every other path.
+    pub claimed_by: Option<String>,
     /// A milestone or tag asked for while the turn it names had not been saved yet. The
     /// settlement that lands that turn records it and clears it.
     pub pending_milestone: Option<PendingMilestone>,
@@ -188,6 +192,8 @@ struct Body {
     naming_ignored: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_milestone: Option<PendingMilestone>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claimed_by: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -214,6 +220,7 @@ impl Link {
             superseded_by: None,
             merge_archive: None,
             naming_ignored: false,
+            claimed_by: None,
             pending_milestone: None,
         }
     }
@@ -251,6 +258,7 @@ impl Link {
             superseded_by: self.superseded_by.clone(),
             merge_archive: self.merge_archive.clone(),
             naming_ignored: self.naming_ignored,
+            claimed_by: self.claimed_by.clone(),
             pending_milestone: self.pending_milestone.clone(),
         }
     }
@@ -416,6 +424,9 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = link_path(store, &link.source, &link.session_id);
+    if read(&lp).is_some_and(|before| launch::unsettles(&before, link)) {
+        launch::record_holds(store)?;
+    }
     let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
     use std::io::Write as _;
     writeln!(temporary, "{}", link.to_json()?)?;
@@ -424,6 +435,13 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
         .persist(&lp)
         .with_context(|| format!("cannot write {}", lp.display()))?;
     Ok(lp)
+}
+
+/// Removes a link, keeping any hold the store calls for now.
+pub fn remove(store: &Store, source: &str, session_id: &str) -> Result<()> {
+    launch::record_holds(store)?;
+    std::fs::remove_file(link_path(store, source, session_id))?;
+    Ok(())
 }
 
 /// An exact local Link image retained by a merge archive transition journal.
@@ -577,6 +595,7 @@ pub fn publish_archive_transition_locked(
             && archive_link_directory_exists(&store.root().join(source))?,
         "archive Link parent is missing; acquire its Link lock before publication"
     );
+    launch::record_holds(store)?;
     let path = link_path(store, source, session_id);
     crate::domain::merge_archive::durable_publish_transition_bytes(
         &path,
@@ -607,6 +626,7 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         superseded_by: body.superseded_by,
         merge_archive: body.merge_archive,
         naming_ignored: body.naming_ignored,
+        claimed_by: body.claimed_by,
         pending_milestone: body.pending_milestone,
     }
 }
@@ -1393,6 +1413,63 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let s = Store::at(&root);
         (d, s)
+    }
+
+    /// Every way agit takes a link off a held branch leaves the hold on record first.
+    #[test]
+    fn a_hold_outlasts_every_change_to_the_links_behind_it() {
+        let held = |change: &dyn Fn(&Store, &Link, &Link)| {
+            let (_dir, store) = store();
+            let mut unconfirmed = Link::new("codex", "bare", None);
+            unconfirmed.owner = Some("me".into());
+            unconfirmed.agent = Some("qa".into());
+            unconfirmed.branch = Some("work".into());
+            let mut other = unconfirmed.clone();
+            other.session_id = "other".into();
+            other.claimed_by = Some(launch::CLAIMED_BY.into());
+            write(&store, &unconfirmed).unwrap();
+            write(&store, &other).unwrap();
+            change(&store, &unconfirmed, &other);
+            launch::held(&store, "me/qa", "work").is_some()
+        };
+        let moved = |link: &Link| {
+            let mut moved = link.clone();
+            moved.branch = Some("elsewhere".into());
+            moved
+        };
+        assert!(held(&|store, bare, _| remove(
+            store,
+            "codex",
+            &bare.session_id
+        )
+        .unwrap()));
+        assert!(held(&|store, _, other| {
+            remove(store, "codex", &other.session_id).unwrap();
+        }));
+        assert!(held(&|store, bare, _| {
+            write(store, &moved(bare)).unwrap();
+        }));
+        assert!(held(&|store, _, other| {
+            write(store, &moved(other)).unwrap();
+        }));
+        assert!(held(&|store, bare, _| {
+            let mut settled = bare.clone();
+            settled.claimed_by = Some(launch::CLAIMED_BY.into());
+            write(store, &settled).unwrap();
+        }));
+        assert!(held(&|store, bare, _| {
+            let mut planned = bare.clone();
+            planned.branch = Some("elsewhere".into());
+            let before = std::fs::read_to_string(link_path(store, "codex", &bare.session_id));
+            publish_archive_transition_locked(
+                store,
+                "codex",
+                &bare.session_id,
+                Some(&before.unwrap()),
+                &planned.to_json().unwrap(),
+            )
+            .unwrap();
+        }));
     }
 
     /// Diagnostics retain malformed records while ordinary discovery keeps its accepted links.

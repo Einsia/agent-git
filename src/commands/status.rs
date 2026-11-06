@@ -195,6 +195,7 @@ pub fn run(args: Args) -> CmdResult {
         );
     }
     print_upload_waits();
+    print_held_branches();
 
     // ── Local store ──
     ui::section("local");
@@ -1007,6 +1008,20 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
     }
     for step in steps {
         ui::hint(&step);
+    }
+}
+
+/// Branches that stay on this computer because a Codex link that may be another conversation's
+/// names them.
+fn print_held_branches() {
+    let Some(store) = crate::domain::store::Store::open().ok().flatten() else {
+        return;
+    };
+    for hold in crate::domain::link::launch::all_holds(&store) {
+        ui::info(format_args!(
+            "{}",
+            crate::domain::link::launch::explain(&hold)
+        ));
     }
 }
 

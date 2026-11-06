@@ -40,6 +40,15 @@ pub enum Cmd {
     },
     /// Seal: not resumable, only forkable/viewable (hand-off done, distillation source).
     Seal { name: String },
+    /// Let a branch that may hold another conversation's turns upload again, with its turns as
+    /// they are. Asks the person at the terminal first.
+    #[command(hide = true)]
+    Unhold {
+        name: String,
+        /// Let it upload without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Filename of the seal marker (committed into the branch tree; its content is the seal notice).
@@ -166,6 +175,36 @@ pub fn run(args: Args) -> CmdResult {
             ui::success(&format!("local branch {name} deleted"));
             ui::info(ui::dim("  published history on the hub is unaffected"));
             warn_orphaned_claims(&slug, &name);
+            Ok(ExitCode::Ok)
+        }
+        Some(Cmd::Unhold { name, yes }) => {
+            let Some((_, slug)) = ctx_repo(args.repo.as_deref()) else {
+                return Ok(ExitCode::Precondition);
+            };
+            let store = crate::domain::store::Store::open_or_init()?;
+            if crate::domain::link::launch::held(&store, &slug, &name).is_none() {
+                ui::info(format_args!("{slug}@{name} isn't held; nothing to do."));
+                return Ok(ExitCode::Ok);
+            }
+            ui::warning(&format!(
+                "{slug}@{name} may hold turns from another conversation. Letting it upload sends \
+                 this branch's turns as they are, those included."
+            ));
+            if !yes {
+                match ui::prompt::confirm("Let it upload as it is?", false)? {
+                    Some(true) => {}
+                    Some(false) => return Ok(ExitCode::Ok),
+                    None => {
+                        ui::error("nothing was changed: with nobody here to ask, it needs --yes");
+                        ui::hint(&format!("agit branch unhold {name} --repo {slug} --yes"));
+                        return Ok(ExitCode::Interactive);
+                    }
+                }
+            }
+            crate::domain::link::launch::release(&store, &slug, &name)?;
+            ui::success(&format!(
+                "{slug}@{name} uploads again, with its turns as they are"
+            ));
             Ok(ExitCode::Ok)
         }
         Some(Cmd::Seal { name }) => {

@@ -366,8 +366,29 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── launch ──
+    // A fresh Codex session claims its branch from the claim this launch makes for it, so the
+    // launch's variables, which Codex keeps for every later session, claim nothing else.
+    let claim = if runtime_of(&args) == "codex" {
+        let store = crate::domain::store::Store::open_or_init()?;
+        let id = crate::domain::link::launch::mint(
+            &store,
+            "codex",
+            &slug,
+            &branch,
+            &work_dir,
+            crate::domain::link::launch::STARTUP,
+            None,
+        )?;
+        format!(
+            "export {}={}; ",
+            crate::domain::link::launch::ENV,
+            shell_q(&id)
+        )
+    } else {
+        String::new()
+    };
     let cmd = format!(
-        "(export AGIT_SESSION={}; cd {} && {})",
+        "({claim}export AGIT_SESSION={}; cd {} && {})",
         shell_q(&super::context::encode_session_env(&slug, &branch)),
         shell_q(&work_dir.to_string_lossy()),
         launch
@@ -382,6 +403,12 @@ pub fn run(args: Args) -> CmdResult {
                 "  note: a fresh session gets its id minted by the harness; once `agit setup --hooks` is installed, the first settle claims this branch"
             )
         );
+        if !claim.is_empty() {
+            println!(
+                "{}",
+                ui::dim("  for Codex, run it within 2 minutes: the claim it carries expires")
+            );
+        }
         return Ok(ExitCode::Ok);
     }
     let status = std::process::Command::new("sh")
