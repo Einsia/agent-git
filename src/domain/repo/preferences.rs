@@ -3,6 +3,22 @@
 use super::Repo;
 use anyhow::{Result, bail};
 
+/// What this computer records about a destination's automatic upload, as the checkout reads it;
+/// builds without the record read `Unset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "secret-vault"), allow(dead_code))]
+enum Recorded {
+    Off,
+    Unset,
+    Unreadable,
+}
+
+impl Recorded {
+    fn holds_off(self) -> bool {
+        self != Self::Unset
+    }
+}
+
 const AUTO_PUSH_KEY: &str = "agit.autoPush";
 /// Set on a device-local repository when the person turned its folder off with `agit off`.
 const UPLOADS_OFF_KEY: &str = "agit.uploadsOff";
@@ -56,10 +72,60 @@ impl Repo {
     /// the setting lifts it. An unset preference is a choice not yet made, which enrolment may
     /// make.
     pub fn auto_push_explicitly_off(&self) -> Result<bool> {
+        let recorded = self.destination_recorded();
+        if recorded == Recorded::Off {
+            return Ok(true);
+        }
         Ok(match self.auto_push_override()? {
             Some(value) => !value,
+            None if recorded.holds_off() => true,
             None => crate::infra::config::get_global("push.auto")?.as_deref() == Some("false"),
         })
+    }
+
+    /// What this computer records about this destination's automatic upload, when this is a
+    /// destination's checkout (`<repos>/<owner>/<name>`), and `Unset` otherwise.
+    ///
+    /// The record holds an off only while the person's latest choice for the destination is that
+    /// off: every choice that turns it on writes the checkout's own setting and then drops the
+    /// record. So a recorded off outranks the checkout's setting, which can then only be one a
+    /// refused command left behind and could not take back. A record that can't be read speaks
+    /// only for a checkout without a setting of its own.
+    fn destination_recorded(&self) -> Recorded {
+        #[cfg(feature = "secret-vault")]
+        {
+            let Ok(repos) = crate::infra::config::repos_dir() else {
+                return Recorded::Unset;
+            };
+            let canonical = |path: &std::path::Path| path.canonicalize().ok();
+            let relative = match self.root().strip_prefix(&repos) {
+                Ok(relative) => relative.to_path_buf(),
+                Err(_) => match (canonical(self.root()), canonical(&repos)) {
+                    (Some(root), Some(repos)) => match root.strip_prefix(&repos) {
+                        Ok(relative) => relative.to_path_buf(),
+                        Err(_) => return Recorded::Unset,
+                    },
+                    _ => return Recorded::Unset,
+                },
+            };
+            let mut parts = relative.components();
+            match (parts.next(), parts.next(), parts.next()) {
+                (Some(owner), Some(name), None) => {
+                    use super::automatic_upload_off::Recorded as Record;
+                    match super::automatic_upload_off::recorded(
+                        &owner.as_os_str().to_string_lossy(),
+                        &name.as_os_str().to_string_lossy(),
+                    ) {
+                        Record::Off => Recorded::Off,
+                        Record::Unset => Recorded::Unset,
+                        Record::Unreadable => Recorded::Unreadable,
+                    }
+                }
+                _ => Recorded::Unset,
+            }
+        }
+        #[cfg(not(feature = "secret-vault"))]
+        Recorded::Unset
     }
 
     /// Whether the person turned this repository's folder off (`agit off`): nothing re-enables
@@ -99,8 +165,13 @@ impl Repo {
     }
 
     pub fn auto_push_enabled(&self) -> Result<bool> {
+        let recorded = self.destination_recorded();
+        if recorded == Recorded::Off {
+            return Ok(false);
+        }
         match self.auto_push_override()? {
             Some(value) => Ok(value),
+            None if recorded.holds_off() => Ok(false),
             None => crate::infra::config::auto_push_default(),
         }
     }

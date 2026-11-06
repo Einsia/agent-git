@@ -7875,6 +7875,205 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
 /// push, whichever path recorded its branch and whatever the checkout's own setting says; the
 /// person's own push still uploads it. A client that judged only the checkout's setting would
 /// upload what the folder keeps back.
+/// An off the person sets for a destination before its checkout exists on this computer holds
+/// once the checkout is created, whatever spelling named it: a folder bound to upload into it
+/// leaves automatic upload off, and an automatic push of a saved conversation sends nothing.
+/// Turning it on without a checkout says which step creates one, and a record that can't be read
+/// keeps automatic upload off for every destination without its own setting. An implementation
+/// that refused the off for want of a checkout, let a later checkout inherit around it, matched
+/// only the exact spelling, or read a damaged record as "no record" would upload here.
+#[test]
+fn an_off_set_before_the_checkout_exists_holds_after_it_is_created() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [37; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    // A stand-in `claude`, so binding a folder for automatic upload finds a runtime to capture.
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let setting = |repository: &str| {
+        let out = run(&["--json", "config", "--repo", repository, "push.auto"]);
+        assert_success(&out);
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["result"]["value"]["setting"].clone()
+    };
+    // The destination exists on the Hub; this computer has no checkout of it.
+    let checkout = home.join("repos/alice/app");
+    let repo = Repo::init(&checkout).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    fs::remove_dir_all(&checkout).unwrap();
+    assert_success(&run(&["config", "push.auto", "true"]));
+
+    let on = run(&["config", "--repo", "alice/app", "push.auto", "true"]);
+    assert_eq!(on.status.code(), Some(4), "{on:?}");
+    assert!(
+        String::from_utf8_lossy(&on.stderr).contains("`agit clone alice/app`"),
+        "{on:?}"
+    );
+    assert_success(&run(&[
+        "config",
+        "--repo",
+        "alice/App",
+        "push.auto",
+        "false",
+    ]));
+    assert_eq!(setting("alice/app")["effective"], "false");
+    assert!(!checkout.exists());
+
+    // A folder bound to upload into it creates the checkout and leaves the person's off in place.
+    let folder = temp.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    let bound = run(&[
+        "--yes",
+        "project",
+        "bind",
+        folder.to_str().unwrap(),
+        "--repo",
+        "alice/app",
+        "--history",
+        "none",
+        "--auto-upload",
+    ]);
+    assert_success(&bound);
+    assert!(
+        String::from_utf8_lossy(&bound.stdout)
+            .contains("automatic upload into alice/app stays off"),
+        "{bound:?}"
+    );
+    let repo = Repo::open(&checkout).expect("the bind created the checkout");
+    assert_eq!(repo.auto_push_override().unwrap(), None);
+    assert_eq!(setting("alice/app")["effective"], "false");
+
+    // A conversation saved there is not uploaded automatically.
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["checkout", "-q", "-b", "kept"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        folder.to_string_lossy().into_owned(),
+    );
+    session.runtime_instances = vec!["019a0000-0000-7000-8000-00000000e0e0".into()];
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"stays here"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("stays here").unwrap();
+    let posts = hub.posts.load(Ordering::Acquire);
+    let refused = || {
+        let automatic = run(&["__push-automatic", "alice/app@kept"]);
+        assert!(!automatic.status.success(), "{automatic:?}");
+        assert!(
+            String::from_utf8_lossy(&automatic.stderr)
+                .contains("automatic publication is disabled for this repository"),
+            "{automatic:?}"
+        );
+        assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+        assert!(
+            git(&remote, &["show-ref"])
+                .lines()
+                .all(|line| !line.ends_with("refs/heads/kept"))
+        );
+    };
+    refused();
+
+    // A record that can't be read keeps automatic upload off where nothing else decides it.
+    fs::write(
+        home.join("preferences/automatic-upload-off.json"),
+        "not a record",
+    )
+    .unwrap();
+    refused();
+
+    // Once the checkout exists, another spelling reaches its own setting rather than a record
+    // beside it, which its setting would outrank.
+    fs::remove_file(home.join("preferences/automatic-upload-off.json")).unwrap();
+    assert_success(&run(&[
+        "config",
+        "--repo",
+        "alice/app",
+        "push.auto",
+        "true",
+    ]));
+    assert_success(&run(&[
+        "config",
+        "--repo",
+        "alice/APP",
+        "push.auto",
+        "false",
+    ]));
+    assert_eq!(repo.auto_push_override().unwrap(), Some(false));
+    assert_eq!(setting("alice/app")["effective"], "false");
+}
+
 #[test]
 fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
     let temp = tempfile::tempdir().unwrap();

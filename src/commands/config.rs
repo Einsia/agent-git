@@ -227,9 +227,12 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     if let Some(value) = args.value.as_deref() {
         crate::input_argument(validate("push.auto", value))?;
     }
-    let repo = Repo::open(config::repo_dir(&owner, &name)?).ok_or_else(|| {
-        anyhow::anyhow!("{owner}/{name} is not a local Agent repository; clone it first")
-    })?;
+    // A checkout spelled in another case is this repository's: recording an off beside it would
+    // report off while the checkout's own setting keeps uploading.
+    let name = super::checkout_spelling(&owner, &name).unwrap_or(name);
+    let Some(repo) = Repo::open(config::repo_dir(&owner, &name)?) else {
+        return run_repo_without_checkout(args, &owner, &name);
+    };
     let switching_on = match args.value.as_deref() {
         Some(value) => value == "true",
         None => args.unset && config::auto_push_default()?,
@@ -242,11 +245,16 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
             args.public_consent.as_deref(),
         )?;
     }
+    // The checkout's own setting is the one source once it exists, so the off recorded before it
+    // goes, but only once that setting is written: dropped first, a failed write would leave the
+    // inherited value in its place.
     let operation = if args.unset {
         repo.set_auto_push(None)?;
+        crate::domain::repo::automatic_upload_off::set(&owner, &name, false)?;
         "unset"
     } else if let Some(value) = args.value.as_deref() {
         repo.set_auto_push(Some(value == "true"))?;
+        crate::domain::repo::automatic_upload_off::set(&owner, &name, false)?;
         "set"
     } else if args.list || args.key.is_none() {
         "list"
@@ -288,6 +296,67 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// `push.auto` for a destination with no checkout on this computer yet: a folder uploads into it,
+/// and its first saved conversation creates the checkout. Turning automatic upload off, or
+/// unsetting it, is recorded here and holds for the checkout created later; turning it on needs
+/// the checkout, where a public destination's enrolment is kept, so it says which step creates
+/// one.
+fn run_repo_without_checkout(args: &Args, owner: &str, name: &str) -> CmdResult {
+    use crate::domain::repo::automatic_upload_off;
+    let slug = format!("{owner}/{name}");
+    if args.value.as_deref() == Some("true") {
+        ui::error(&format!(
+            "{slug} has no checkout on this computer yet, so automatic upload can't be turned on for it here"
+        ));
+        ui::hint(&format!(
+            "the first conversation saved for {slug}, or `agit clone {slug}`, creates it; then run `agit config --repo {slug} push.auto true`"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
+    let operation = if args.unset {
+        automatic_upload_off::set(owner, name, false)?;
+        "unset"
+    } else if args.value.as_deref() == Some("false") {
+        automatic_upload_off::set(owner, name, true)?;
+        "set"
+    } else if args.list || args.key.is_none() {
+        "list"
+    } else {
+        "get"
+    };
+    // Reporting a value it can't read would name a source it doesn't have, so an unreadable
+    // record fails here, as an invalid setting in a checkout does; uploads treat it as off.
+    let stored = automatic_upload_off::read(owner, name)?.then_some(false);
+    let effective = stored.is_none() && config::auto_push_default()?;
+    let entry = serde_json::json!({
+        "key": "push.auto", "description": "Automatically publish settled turns",
+        "effective": effective.to_string(), "stored": stored.map(|value| value.to_string()),
+        "source": if stored.is_some() { "repository" } else { "inherited" },
+    });
+    if super::json::requested() {
+        let mut response =
+            serde_json::json!({"schema_version": 1, "operation": operation, "repository": slug});
+        if operation == "list" {
+            response["settings"] = serde_json::json!([entry]);
+        } else {
+            response["setting"] = entry;
+        }
+        println!("{response}");
+    } else if operation == "get" {
+        println!("{effective}");
+    } else {
+        println!(
+            "push.auto = {effective} ({})",
+            if stored.is_some() {
+                "repository, kept on this computer until its checkout exists"
+            } else {
+                "inherited from user preferences"
+            }
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
 /// The automatic-push setting a repository receives when it is created.
 pub(super) struct RepoAutoPush {
     /// A per-repository override; `None` inherits the user preference.
@@ -319,9 +388,13 @@ impl RepoAutoPush {
     /// enrollment, which only a terminal choice can make; without it every later automatic upload
     /// into that repository is refused.
     pub(super) fn apply(&self, repo: &crate::domain::repo::Repo, slug: &str) -> crate::Result<()> {
+        // A choice made for this repository, on the command line or in the question, is the
+        // person's own and replaces an off they recorded for it before its checkout existed. An
+        // inherited one leaves that off in place.
+        let recorded_off = recorded_off(slug)?;
         let enabling = match self.value {
             Some(value) => value,
-            None => self.asked && config::auto_push_default()?,
+            None => !recorded_off && self.asked && config::auto_push_default()?,
         };
         if enabling {
             super::push::enroll_public_destination(
@@ -332,7 +405,8 @@ impl RepoAutoPush {
             )?;
         }
         if let Some(value) = self.value {
-            return repo.set_auto_push(Some(value));
+            repo.set_auto_push(Some(value))?;
+            return settle_recorded_off(slug, recorded_off, value);
         }
         if self.unasked {
             // An unreadable user preference must not fail a creation that never asked about it;
@@ -348,6 +422,34 @@ impl RepoAutoPush {
         }
         Ok(())
     }
+}
+
+/// Whether the person turned automatic upload off for `slug` on this computer before its checkout
+/// existed, or the record of it can't be read.
+pub(super) fn recorded_off(slug: &str) -> crate::Result<bool> {
+    let (owner, name) = super::parse_slug(slug)?;
+    Ok(crate::domain::repo::automatic_upload_off::recorded(&owner, &name).holds_off())
+}
+
+/// The checkout of `slug` now holds the person's own choice, so the off recorded before it existed
+/// goes; turning it on says that earlier off was replaced. Callers write that choice first: the
+/// record dropped before it, a failed write leaves the destination inheriting.
+pub(super) fn settle_recorded_off(
+    slug: &str,
+    recorded_off: bool,
+    value: bool,
+) -> crate::Result<()> {
+    if !recorded_off {
+        return Ok(());
+    }
+    let (owner, name) = super::parse_slug(slug)?;
+    crate::domain::repo::automatic_upload_off::set(&owner, &name, false)?;
+    if value {
+        ui::progress(format_args!(
+            "automatic upload into {slug} was turned off on this computer; this choice turns it on"
+        ));
+    }
+    Ok(())
 }
 
 /// Ask only at an interactive repository creation boundary; unattended commands inherit.

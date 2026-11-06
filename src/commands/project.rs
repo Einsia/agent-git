@@ -175,6 +175,22 @@ fn auto_push_holders(project: &Project) -> Result<Vec<Project>> {
 /// current one. A folder that recorded the override another folder set would turn automatic
 /// push back on when it is unbound last.
 fn enable_auto_push(project: &mut Project, repo: &Repo) -> Result<()> {
+    // An off the person recorded for this destination before its checkout existed holds: a
+    // folder bind is not their choice to upload into it. Only their own `push.auto true`, or
+    // naming it with `agit on --repo`, lifts it.
+    // A recorded off also outranks a setting the checkout holds, as the checkout's own reads do,
+    // so a bind over a refused command's leftover setting says why it stays off.
+    let (owner, name) = super::parse_slug(&project.repository)?;
+    let recorded = crate::domain::repo::automatic_upload_off::recorded(&owner, &name);
+    if recorded == crate::domain::repo::automatic_upload_off::Recorded::Off
+        || (repo.auto_push_override()?.is_none() && recorded.holds_off())
+    {
+        println!(
+            "automatic upload into {} stays off: you turned it off on this computer; `agit config --repo {} push.auto true` turns it on",
+            project.repository, project.repository
+        );
+        return Ok(());
+    }
     if project.push_auto_before.is_none() {
         project.push_auto_before = Some(
             match auto_push_holders(project)?

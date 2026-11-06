@@ -55,6 +55,8 @@
 //! Authenticated git operations (`clone` / `fetch` / `push`) do not live here; they live in
 //! [`crate::hub::git`] — authentication is the hub's business.
 
+#[cfg(feature = "secret-vault")]
+pub mod automatic_upload_off;
 #[cfg(feature = "cli")]
 pub mod integrity;
 #[cfg(feature = "cli")]
