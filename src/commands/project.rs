@@ -5256,6 +5256,25 @@ mod tests {
         }
     }
 
+    /// A captured OpenCode conversation is judged by the folder it started in, like the others:
+    /// that folder is the `directory` of OpenCode's session, which its materialized transcript
+    /// names in its first record rather than as a `cwd`. A reader that knows only `cwd` finds no
+    /// start for any OpenCode conversation, and publication withholds every one of them as having
+    /// started somewhere it cannot verify.
+    #[test]
+    fn an_opencode_conversation_starts_in_its_sessions_folder() {
+        if !isolated("an_opencode_conversation_starts_in_its_sessions_folder") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let folder = work.path().canonicalize().unwrap();
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("opencode");
+        fs::create_dir_all(&data).unwrap();
+        opencode_database(&data.join("opencode.db"), &folder, &["ses_started_here"]);
+        let claim = link::Link::new("opencode", "ses_started_here", Some(&folder));
+        assert_eq!(start(&claim), Some(folder));
+    }
+
     /// A bind without earlier history records the folder's OpenCode conversations only from a
     /// complete reading of OpenCode's store. A store it cannot read, the database or the path to
     /// it, leaves the policy unmarked, so a conversation that was there keeps counting as earlier

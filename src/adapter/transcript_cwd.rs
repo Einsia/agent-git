@@ -38,13 +38,16 @@ pub(crate) fn opening_file(path: &std::path::Path) -> Option<std::fs::File> {
     Some(file)
 }
 
-/// A record names its directory at top level (Claude Code) or in its payload (Codex). A relative
+/// A record names its directory at top level (Claude Code) or in its payload (Codex); OpenCode's
+/// materialized transcript names it once, as `directory` in its `opencode.meta` record. A relative
 /// path names none: resolving it against the reader's own directory would attribute the session
 /// to wherever agit happens to run.
 pub(crate) fn record_cwd(record: &serde_json::Value) -> Option<String> {
+    let opencode = record.get("kind").and_then(serde_json::Value::as_str) == Some("opencode.meta");
     record
         .get("cwd")
         .or_else(|| record.get("payload")?.get("cwd"))
+        .or_else(|| opencode.then(|| record.get("directory")).flatten())
         .and_then(serde_json::Value::as_str)
         .filter(|cwd| std::path::Path::new(cwd).is_absolute())
         .map(str::to_owned)
