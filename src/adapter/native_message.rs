@@ -4,18 +4,20 @@ use super::{Event, EventKind, OpenCall, Session, ToolDetail, ToolDetails};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The content block types [`text`] reads a message's text from.
+pub(super) const TEXT_BLOCKS: &[&str] = &["text", "input_text", "output_text"];
+
 pub(super) fn text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
             .iter()
             .filter_map(|block| {
-                matches!(
-                    block["type"].as_str(),
-                    Some("text" | "input_text" | "output_text")
-                )
-                .then(|| block["text"].as_str())
-                .flatten()
+                block["type"]
+                    .as_str()
+                    .is_some_and(|kind| TEXT_BLOCKS.contains(&kind))
+                    .then(|| block["text"].as_str())
+                    .flatten()
             })
             .collect::<Vec<_>>()
             .join("\n"),

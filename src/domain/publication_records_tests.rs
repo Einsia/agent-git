@@ -724,14 +724,46 @@ fn a_user_query_is_published_only_from_exactly_one_well_formed_block() {
             None,
             "{shape}"
         );
-        let message = json!({"type":"message","role":"user","content":shape});
-        assert_eq!(published("workbuddy", &message), None, "{shape}");
+        for content in [json!(shape), json!([{"type":"input_text","text":shape}])] {
+            let message = json!({"type":"message","role":"user","content":content});
+            assert_eq!(published("workbuddy", &message), None, "{shape}");
+        }
     }
     let split = user(json!([
         text("<user_query>\nfirst".into()),
         text("second</user_query>".into())
     ]));
     assert_eq!(published("cursor", &split), None);
+}
+
+/// A WorkBuddy request written as the `input_text` block WorkBuddy uses is published in that block,
+/// without the context around it, and the published session reads back with the request as its
+/// prompt and the turn it opens. A rule that read only `text` blocks would leave the session with
+/// replies and no question.
+#[test]
+fn a_workbuddy_request_in_its_own_block_type_survives_publication_and_parsing() {
+    use crate::adapter::{Adapter, EventKind, workbuddy::WorkBuddy};
+    let request = "Build a document comparison desk.";
+    let asked = json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!(
+        "<system-reminder>{AGENTS_MD}</system-reminder><user_query>{request}</user_query><user_info>{CLAUDE_MD}</user_info>")}]});
+    let kept = published("workbuddy", &asked).unwrap();
+    assert_eq!(
+        kept["content"],
+        json!([{"type":"input_text","text":format!("<user_query>\n{request}\n</user_query>")}])
+    );
+    assert_republishes("workbuddy", &kept);
+    let reply = json!({"type":"message","role":"assistant","status":"completed",
+        "content":[{"type":"output_text","text":"Done."}],"message":{"usage":{}}});
+    let reply = published("workbuddy", &reply).unwrap();
+    let session = WorkBuddy.parse(&format!("{kept}\n{reply}\n")).unwrap();
+    assert!(session.events.iter().any(|event| {
+        event.kind == EventKind::UserPrompt
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(request))
+    }));
+    assert_eq!(crate::domain::turn::completed_count(&session), 1);
 }
 
 /// Codex's own record of a submission is published when it is the person's plain input, without

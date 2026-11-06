@@ -3735,6 +3735,120 @@ mod tests {
         );
     }
 
+    /// A WorkBuddy request an earlier publication rule withheld is published on the session's next
+    /// push. The public copy of the parent keeps fewer of the records the two snapshots share than
+    /// today's rule keeps, so none of that copy's lines are reused for the shared part and each
+    /// record there is decided again; the reply it did publish goes out as it was. A publication
+    /// that reused the public parent's lines whenever the LOG extends it would keep the person's
+    /// question hidden for good.
+    #[test]
+    fn a_request_an_earlier_rule_withheld_is_published_on_the_next_push() {
+        use crate::domain::{storage, transcript::Envelope};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        let session = format!("agit-{}", "b".repeat(40));
+        let line = |content: serde_json::Value| {
+            storage::envelope_line(&Envelope {
+                source: "workbuddy".into(),
+                session_id: session.clone(),
+                object_hash: crate::domain::transcript::object_hash(&content),
+                content,
+            })
+        };
+        let asked = |request: &str| {
+            line(
+                json!({"type":"message","role":"user","content":[{"type":"input_text",
+                "text":format!("<system-reminder>rules</system-reminder><user_query>{request}</user_query>")}]}),
+            )
+        };
+        let replied = line(
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}]}),
+        );
+        let snapshot = |name: &str, parents: &[&str], log: &[String]| {
+            let work = temp.path().join(name);
+            std::fs::create_dir_all(&work).unwrap();
+            storage::write_snapshot(&work, &log.concat(), &log.concat()).unwrap();
+            meta::write(
+                &work,
+                &Meta::new(session.clone(), "workbuddy".into(), String::new()),
+            )
+            .unwrap();
+            let index = temp.path().join(format!("{name}.index"));
+            let staged = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(&work)
+                    .args(args)
+                    .env("GIT_DIR", root.join(".git"))
+                    .env("GIT_WORK_TREE", &work)
+                    .env("GIT_INDEX_FILE", &index)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env(
+                        "GIT_CONFIG_GLOBAL",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            staged(&["add", "-A", "."]);
+            let tree = staged(&["write-tree"]);
+            let mut args = vec!["commit-tree", tree.as_str(), "-m", "turn"];
+            for parent in parents {
+                args.extend(["-p", parent]);
+            }
+            git(&root, &args)
+        };
+        let first = asked("Build a desk.");
+        let parent = snapshot("parent", &[], &[first.clone(), replied.clone()]);
+        let child = snapshot(
+            "child",
+            &[&parent],
+            &[first, replied.clone(), asked("Add a chart.")],
+        );
+        // What the earlier rule published for the parent: the reply alone.
+        let public = snapshot("public", &[], &[replied.clone()]);
+        let reply = storage::canonical_event_id(&replied);
+        let source = Repo::at(&root);
+        let published = Published {
+            ids: [reply.clone()].into_iter().collect(),
+            prefix: Some(Prefix {
+                source_lines: 2,
+                public: vec![reply],
+                holder: &source,
+                commit: public,
+            }),
+        };
+        let projected = conversation_commit(
+            &source,
+            &child,
+            &[parent],
+            &published,
+            Carried::default(),
+            &mut Rechecked::default(),
+        )
+        .unwrap();
+        let limit = storage::MAX_MATERIALIZED_BYTES;
+        let (log, _) = storage::materialize_pair_local(
+            &root,
+            &projected.commit.expect("the snapshot is rewritten"),
+            limit,
+            limit,
+        )
+        .unwrap();
+        assert!(
+            log.contains("Build a desk.") && log.contains("Add a chart.") && log.contains("Done."),
+            "{log}"
+        );
+        assert!(!log.contains("rules"), "{log}");
+    }
+
     /// A long session's snapshot lists every event object it holds, where its listing is longer
     /// than one local inspection may print. Each object is one line of the listing, so a listing
     /// read whole through that inspection refuses the first publication of every session that

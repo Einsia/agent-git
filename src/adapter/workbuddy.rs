@@ -11,6 +11,10 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// The content block types a WorkBuddy message's text is read from. The publication rule reads a
+/// user message's text through the same list, so a block shown here is never one it overlooks.
+pub(crate) const TEXT_BLOCKS: &[&str] = message::TEXT_BLOCKS;
+
 pub struct WorkBuddy;
 
 pub fn home() -> Result<PathBuf> {
@@ -137,10 +141,9 @@ fn parse(text: &str) -> Result<Parsed> {
                 }
                 if let Some(blocks) = value["content"].as_array() {
                     for block in blocks.iter().filter(|block| {
-                        !matches!(
-                            block["type"].as_str(),
-                            Some("input_text" | "output_text" | "text")
-                        )
+                        !block["type"]
+                            .as_str()
+                            .is_some_and(|kind| TEXT_BLOCKS.contains(&kind))
                     }) {
                         events.push(Event::text(
                             EventKind::Other,
@@ -385,10 +388,9 @@ impl Adapter for WorkBuddy {
                 }
                 if let Some(blocks) = value["content"].as_array() {
                     for block in blocks.iter().filter(|block| {
-                        !matches!(
-                            block["type"].as_str(),
-                            Some("input_text" | "output_text" | "text")
-                        )
+                        !block["type"]
+                            .as_str()
+                            .is_some_and(|kind| TEXT_BLOCKS.contains(&kind))
                     }) {
                         details.opaque.push(plaintext(
                             block["thinking"]
