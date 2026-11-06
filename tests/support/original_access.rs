@@ -1,3 +1,4 @@
+//! Granting originals is retired; access people already have keeps working until its owner ends it.
 //! Confirmed scopes survive uncertain replies; disable retries cannot replay converted grants.
 
 use agit::{
@@ -31,7 +32,8 @@ impl Fixture {
             policy_revision: 1,
             session_revision: 1,
             revision: 1,
-            explicit: false,
+            // An older client granted the session's members access to its originals.
+            explicit: true,
             revoked: false,
             default_suppressed: false,
             operations: BTreeMap::new(),
@@ -237,53 +239,40 @@ pub fn exercise(
     assert!(!denied.status.success(), "{denied:?}");
     credential("alice");
     let pending = repo.common_dir().unwrap().join("agit/privacy-access");
-    let unconfirmed = run(&["privacy", "access", "grant", &target]);
-    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
-    assert!(!pending.exists());
-    let uncertain = run(&["--yes", "privacy", "access", "grant", &target]);
-    assert!(!uncertain.status.success(), "{uncertain:?}");
-    assert!(
-        String::from_utf8_lossy(&uncertain.stderr).contains("is retained"),
-        "{uncertain:?}"
-    );
-    let request = std::fs::read_dir(&pending)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let original = std::fs::read(&request).unwrap();
-    let saved: Value = serde_json::from_slice(&original).unwrap();
-    let id = saved["request"]["mutation"]["idempotency_key"]
-        .as_str()
-        .unwrap();
-    assert_eq!(saved["snapshot"]["published_commit"], commit);
-    before_retry();
-    let retry = run(&[
-        "--yes",
-        "--json",
-        "privacy",
-        "access",
-        "retry",
-        "alice/app",
-        id,
-    ]);
-    assert!(retry.status.success(), "{retry:?}");
+    for args in [
+        vec!["privacy", "access", "grant", &target],
+        vec!["--yes", "privacy", "access", "grant", &target],
+    ] {
+        let retired = run(&args);
+        assert!(!retired.status.success(), "{retired:?}");
+        assert!(
+            String::from_utf8_lossy(&retired.stderr)
+                .contains("Granting access to originals is retired"),
+            "{retired:?}"
+        );
+        assert!(!pending.exists());
+    }
+    let granted = run(&["--json", "privacy", "access", "show", &target]);
+    assert!(granted.status.success(), "{granted:?}");
+    let state: Value = serde_json::from_slice(&granted.stdout).unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&retry.stdout).unwrap()["result"]["value"]["grant_revision"],
-        2
+        state["result"]["value"]["access"]["readers"][1]["session_explicit_grant"],
+        true
     );
-    assert_eq!(std::fs::read(&request).unwrap(), original);
-    assert_eq!(saved["request"]["mutation"]["target"]["scope"], "session");
-    assert!(String::from_utf8_lossy(&uncertain.stderr).contains("all existing and future"));
+    assert_eq!(
+        state["result"]["value"]["access"]["readers"][1]["can_read"],
+        true
+    );
+    before_retry();
     let disable = run(&["--yes", "privacy", "access", "disable-session", &target]);
     assert!(!disable.status.success(), "{disable:?}");
     assert!(String::from_utf8_lossy(&disable.stderr).contains("is retained"));
     let disable_path = std::fs::read_dir(&pending)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path != &request)
-        .unwrap();
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
     let disable_bytes = std::fs::read(&disable_path).unwrap();
     let disable_saved: Value = serde_json::from_slice(&disable_bytes).unwrap();
     let disable_id = disable_saved["request"]["mutation"]["idempotency_key"]
@@ -298,9 +287,6 @@ pub fn exercise(
         disable_id,
     ]);
     assert!(disabled_retry.status.success(), "{disabled_retry:?}");
-    let stale = run(&["--yes", "privacy", "access", "retry", "alice/app", id]);
-    assert!(!stale.status.success(), "{stale:?}");
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("superseded"));
     let policy = run(&["--json", "privacy", "access", "policy", &target]);
     assert!(policy.status.success(), "{policy:?}");
     assert_eq!(
@@ -311,9 +297,6 @@ pub fn exercise(
         "--yes", "privacy", "access", "revoke", &target, "--member", "bob",
     ]);
     assert!(revoke.status.success(), "{revoke:?}");
-    let stale = run(&["--yes", "privacy", "access", "retry", "alice/app", id]);
-    assert!(!stale.status.success(), "{stale:?}");
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("superseded"));
     let disabled_retry = run(&[
         "--yes",
         "privacy",
@@ -350,9 +333,5 @@ pub fn exercise(
             .iter()
             .all(|reader| reader["explicit_grant"] == false)
     );
-    credential("bob");
-    let switched = run(&["--yes", "privacy", "access", "retry", "alice/app", id]);
-    assert!(!switched.status.success(), "{switched:?}");
     assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
-    assert_eq!(std::fs::read(&request).unwrap(), original);
 }

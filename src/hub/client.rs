@@ -1323,6 +1323,30 @@ impl Client {
             .push_limits()
     }
 
+    /// The configuration this Hub publishes.
+    pub(crate) fn hub_config(&self) -> Result<super::HubConfig> {
+        self.get::<super::HubConfig>("api/hub/config")
+    }
+
+    /// Whether this Hub accepts this client's declaration that it ran the carried-record proof. An
+    /// unreadable configuration counts as no.
+    pub fn accepts_carried_records_proof(&self) -> bool {
+        self.get::<super::HubConfig>("api/hub/config")
+            .is_ok_and(|config| config.accepts_carried_records_proof())
+    }
+
+    /// [`Self::post_expected`] that also sends `headers`.
+    pub(super) fn post_expected_with<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        expected_agent_id: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Result<T> {
+        self.forget_probes();
+        self.post_with(path, body, expected_agent_id, headers)
+    }
+
     /// Whether this Hub takes `planned_refs` on a publication preview. An older one refuses the
     /// field outright, so an unreadable configuration counts as no.
     pub fn accepts_planned_refs(&self) -> bool {

@@ -534,6 +534,12 @@ pub(super) fn run(
         .map_err(unsent)?;
         selected.asking_again = asked_again.iter().cloned().collect();
         resolving.finish();
+        // A real push tells of a switch only once the Hub has taken it, just before the upload.
+        if args.dry_run {
+            for switched in &selected.switched {
+                ui::publication::notice(switched.notice(true));
+            }
+        }
         ui::publication::notice(format!(
             "Repository visibility: {}; session modes: {} encrypted, {} plain (new publication)",
             intent.visibility,
@@ -642,8 +648,10 @@ pub(super) fn run(
                 selection.verify(&repo)?;
             }
             // Nothing is sent on this path, so a registration can only matter to the receipt a
-            // supervisor records from it.
+            // supervisor records from it. A planned switch isn't made: the session keeps what the
+            // Hub holds.
             if supervisor.is_some() {
+                selected.forgo_switches(&client, &repository)?;
                 selected.verify_configs(&client, &repository)?;
             }
             let (repo, destination) = intent.materialize(&client, repo)?;
@@ -839,7 +847,6 @@ pub(super) fn run(
         complete.verify_source(projected.repo())?;
         intent.verify_account(&client)?;
         intent.verify_before_mutation(&client, &repo)?;
-        selected.verify_configs(&client, &repository)?;
         if let Some(selection) = &local_target {
             selection.verify(&repo)?;
         }
@@ -847,6 +854,14 @@ pub(super) fn run(
             !automatic || crate::commands::auto_push::publication_allowed(&repo, &repository)?,
             "automatic publication was disabled during inspection"
         );
+        // A switched session is registered, and the carried-record proof declared, only now that
+        // its proof and the outgoing inspection have passed and the person has confirmed.
+        if selected.register_switched(&client, &repository)? {
+            for switched in &selected.switched {
+                ui::publication::notice(switched.notice(false));
+            }
+        }
+        selected.verify_configs(&client, &repository)?;
         // The policy checked before the part is read again before its upload.
         if rechecks {
             still_publishable(&repo, &part_branches)?;

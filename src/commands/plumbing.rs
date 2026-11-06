@@ -232,6 +232,55 @@ pub fn tree_apply_owned(
     base_commitish: &str,
     edits: Vec<(String, Option<Vec<u8>>)>,
 ) -> Result<String> {
+    tree_edit(
+        repo,
+        base_commitish,
+        edits
+            .into_iter()
+            .map(|(path, content)| (path, content.map_or(Edit::Remove, Edit::Bytes)))
+            .collect(),
+    )
+}
+
+/// [`tree_apply_owned`] for entries the repository already holds: each path is set to an existing
+/// object with its own mode (`100644`, `100755` or `120000`), or removed. A restored file keeps
+/// the mode it had, so a script stays executable and a symbolic link stays one.
+pub fn tree_restore_owned(
+    repo: &Repo,
+    base_commitish: &str,
+    edits: Vec<(String, Option<(String, String)>)>,
+) -> Result<String> {
+    let edits = edits
+        .into_iter()
+        .map(|(path, entry)| {
+            let edit = match entry {
+                None => Edit::Remove,
+                Some((mode, blob)) => {
+                    let kind = match mode.as_str() {
+                        "100644" => gix::object::tree::EntryKind::Blob,
+                        "100755" => gix::object::tree::EntryKind::BlobExecutable,
+                        "120000" => gix::object::tree::EntryKind::Link,
+                        _ => anyhow::bail!("a restored file has an unsupported mode {mode}"),
+                    };
+                    Edit::Entry(kind, gix::ObjectId::from_hex(blob.as_bytes())?)
+                }
+            };
+            Ok((path, edit))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tree_edit(repo, base_commitish, edits)
+}
+
+/// One change [`tree_edit`] makes at a path.
+enum Edit {
+    /// A regular file with these bytes.
+    Bytes(Vec<u8>),
+    /// An object the repository holds, with its mode.
+    Entry(gix::object::tree::EntryKind, gix::ObjectId),
+    Remove,
+}
+
+fn tree_edit(repo: &Repo, base_commitish: &str, edits: Vec<(String, Edit)>) -> Result<String> {
     let mut paths = std::collections::BTreeSet::new();
     for (path, _) in &edits {
         validate_tree_path(path)?;
@@ -267,9 +316,9 @@ pub fn tree_apply_owned(
     let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
     let tree = {
         let mut editor = objects.edit_tree(base_id)?;
-        for (path, content) in edits {
-            match content {
-                Some(bytes) => {
+        for (path, edit) in edits {
+            match edit {
+                Edit::Bytes(bytes) => {
                     let kind = gix::object::Kind::Blob;
                     let id = gix::objs::compute_hash(objects.object_hash(), kind, &bytes)?;
                     if !objects.has_object(id) {
@@ -277,7 +326,14 @@ pub fn tree_apply_owned(
                     }
                     editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
                 }
-                None => {
+                Edit::Entry(kind, id) => {
+                    anyhow::ensure!(
+                        objects.has_object(id),
+                        "a restored file's object is missing: {path:?}"
+                    );
+                    editor.upsert(path.as_str(), kind, id)?;
+                }
+                Edit::Remove => {
                     editor.remove_leaf(path.as_str())?;
                 }
             }

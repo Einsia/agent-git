@@ -104,7 +104,7 @@ fn account_registration_and_original_read_keep_exact_session_authority() {
         ..SessionPrivacy::new(Some(expected)).unwrap()
     };
     let registered = client
-        .register_session_privacy("team/notes", &identity, &config.session_id, &local)
+        .register_session_privacy("team/notes", &identity, &config.session_id, &local, false)
         .unwrap();
     assert_eq!(registered.config.privacy, local);
     assert_eq!(

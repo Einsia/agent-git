@@ -39,8 +39,8 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
-    /// Inspect or choose a session's publication mode before its first remote registration.
-    /// New sessions publish plain by default; select encrypted to enable encryption.
+    /// Inspect a session's publication mode. Sessions publish plain; encrypted publication is
+    /// retired, and an encrypted session continues as plain at its next push.
     Mode {
         #[arg(value_name = "OWNER/REPO@REF")]
         target: String,

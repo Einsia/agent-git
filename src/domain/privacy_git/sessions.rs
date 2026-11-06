@@ -34,6 +34,58 @@ pub struct SessionPublicationPlan {
     /// The repository identity this checkout is pinned to on the destination's Hub, read when the
     /// publication was resolved: a `fork_origin` without a snapshot points into it.
     pub(crate) pinned_source: Option<String>,
+    /// Sessions registered encrypted that this publication continues as plain, in order.
+    pub switched: Vec<SwitchedSession>,
+    /// The destination accepts this client's declaration that it ran the carried-record proof;
+    /// without it the Hub refuses any session that continues an encrypted one.
+    pub carried_records_proof: bool,
+    /// Switched sessions whose plain registration waits until what they publish has been proven
+    /// and inspected: each target session and the privacy it registers.
+    pub(crate) to_register: Vec<(String, SessionPrivacy)>,
+}
+
+/// A session that was published encrypted and continues as plain from this publication on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitchedSession {
+    pub session: String,
+    /// Where it is published, `owner/repo@branch`, when a branch of this publication carries it.
+    pub target: Option<String>,
+    /// Whether the signed-in account owns it; otherwise its owner is told on the Hub.
+    pub owned: bool,
+}
+
+impl SwitchedSession {
+    /// What the person pushing is told, once, at the push that switches the session.
+    pub fn notice(&self, dry_run: bool) -> String {
+        let session = &self.session;
+        let (subject, verb) = match (self.owned, dry_run) {
+            (true, false) => (session.clone(), "now publishes"),
+            (true, true) => (session.clone(), "will publish, once pushed,"),
+            (false, false) => (
+                format!("{session}, another account's session,"),
+                "now publishes",
+            ),
+            (false, true) => (
+                format!("{session}, another account's session,"),
+                "will publish, once pushed,",
+            ),
+        };
+        let mut notice = format!(
+            "{subject} {verb} like your other sessions: new turns upload only the redacted view people with access already see, and the originals stay on this computer. Files it changed before this, such as memory or skills, are not uploaded."
+        );
+        if self.owned {
+            let show = match &self.target {
+                Some(target) => format!("agit privacy access show {target}"),
+                None => "agit privacy access show".to_owned(),
+            };
+            notice.push_str(&format!(
+                " People you gave access to the originals keep it for earlier turns only (`{show}` lists them)."
+            ));
+        } else {
+            notice.push_str(" Its owner is told on the Hub.");
+        }
+        notice
+    }
 }
 
 /// Committed facts belong to the same object store and frozen selection. Remote authority and
@@ -221,6 +273,8 @@ impl SessionPublicationPlan {
             register,
         )?;
         // Every selected source is admitted before registering any destination session.
+        // Asked once: the Hub takes the declaration that the carried-record proof ran.
+        let carried_records_proof = delivery.is_none() && client.accepts_carried_records_proof();
         if let Some(delivery) = &mut delivery {
             delivery.load_source_accounts(&source_hubs)?;
             for session in &sessions {
@@ -235,6 +289,8 @@ impl SessionPublicationPlan {
             }
         }
         let mut configs = BTreeMap::new();
+        let mut switched = Vec::new();
+        let mut to_register = Vec::new();
         for session in sessions {
             let target_session = match &delivery {
                 Some(delivery) => delivery.session(&session)?.to_owned(),
@@ -254,6 +310,67 @@ impl SessionPublicationPlan {
                 &identity,
                 &target_session,
             )? {
+                // Encrypted publication is retired: a session registered encrypted continues as
+                // plain at its next revision, whoever publishes it. Its earlier snapshots stay as
+                // they are, and its turns already out keep their published projection.
+                Some(response)
+                    if delivery.is_none()
+                        && response.config.privacy.scheme == SessionScheme::SessionOwnerV2 =>
+                {
+                    ensure!(
+                        carried_records_proof,
+                        "this Hub doesn't yet accept a conversation that continues one published encrypted, so nothing was uploaded; it will once the Hub is updated"
+                    );
+                    let mut privacy = response.config.privacy.clone();
+                    privacy.scheme = SessionScheme::Plain;
+                    let account = client.session_account().ok();
+                    // Planned only: the Hub learns of the switch, and declares it, only once the
+                    // proof and the outgoing inspection passed (see `register_switched`).
+                    if register {
+                        to_register.push((target_session.clone(), privacy.clone()));
+                    }
+                    let continued = SessionPrivacyResponse {
+                        config: crate::domain::session_privacy::SessionPrivacyConfig {
+                            privacy,
+                            revision: response.config.revision + 1,
+                            ..response.config.clone()
+                        },
+                        owner_key: None,
+                    };
+                    // A Hub that keeps the session encrypted has not retired encrypted
+                    // publication yet; the session continues as before.
+                    if continued.config.privacy.scheme == SessionScheme::Plain {
+                        let carries = |head: &crate::domain::repo::publication::FrozenRef| {
+                            ancestors(head.oid(), &history.parents).is_ok_and(|reachable| {
+                                reachable.iter().any(|oid| {
+                                    history
+                                        .stored(oid)
+                                        .is_some_and(|metadata| metadata.session == session)
+                                })
+                            })
+                        };
+                        let target =
+                            plan.heads()
+                                .iter()
+                                .find(|head| carries(head))
+                                .and_then(|head| {
+                                    head.name()
+                                        .strip_prefix("refs/heads/")
+                                        .map(|branch| format!("{repository}@{branch}"))
+                                });
+                        switched.push(SwitchedSession {
+                            session: session.clone(),
+                            target,
+                            owned: account.is_some_and(|account| {
+                                continued.config.privacy.owner
+                                    == Some(crate::domain::session_privacy::SessionOwner::User(
+                                        account.account_id,
+                                    ))
+                            }),
+                        });
+                    }
+                    continued
+                }
                 // A session already registered in this repository continues under its stored
                 // configuration, whatever this client chose or recorded.
                 Some(response) => response,
@@ -319,16 +436,18 @@ impl SessionPublicationPlan {
                         ))?;
                         privacy.scheme = SessionScheme::Plain;
                     }
-                    if privacy.scheme == SessionScheme::SessionOwnerV2
-                        && privacy.creator.as_deref() == Some(account.account_id.as_str())
-                    {
-                        client.ensure_session_key(&account)?;
+                    // Encrypted publication is retired: whatever the birth, an inherited link or
+                    // an earlier choice recorded, a new session registers as plain. A cross-Hub
+                    // delivery keeps the registration it carries.
+                    if delivery.is_none() {
+                        privacy.scheme = SessionScheme::Plain;
                     }
                     client.register_session_privacy(
                         repository,
                         &identity,
                         &target_session,
                         &privacy,
+                        carried_records_proof,
                     )?
                 }
             };
@@ -363,6 +482,9 @@ impl SessionPublicationPlan {
             asking_again: BTreeSet::new(),
             fork_sources,
             pinned_source,
+            switched,
+            to_register,
+            carried_records_proof,
         })
     }
 
@@ -427,6 +549,50 @@ impl SessionPublicationPlan {
                 metadata.fork_origin = None;
             }
         }
+    }
+
+    /// Registers the switched sessions as planned, declaring the carried-record proof that has
+    /// run by now, once; whether any was. Each answer must be the plain configuration planned for
+    /// it, at its planned revision; anything else refuses, with nothing sent.
+    pub fn register_switched(
+        &mut self,
+        client: &crate::hub::Client,
+        repository: &str,
+    ) -> Result<bool> {
+        let pending = std::mem::take(&mut self.to_register);
+        let registered_any = !pending.is_empty();
+        for (session, privacy) in &pending {
+            let planned = self
+                .configs
+                .get(session)
+                .context("a switched session has no planned configuration")?;
+            let registered = client.register_session_privacy(
+                repository,
+                &self.identity,
+                session,
+                privacy,
+                self.carried_records_proof,
+            )?;
+            ensure!(
+                registered.config.privacy.scheme == SessionScheme::Plain
+                    && registered.config.revision == planned.config.revision,
+                "the Hub didn't continue {session} as plain as planned, so nothing was sent"
+            );
+        }
+        Ok(registered_any)
+    }
+
+    /// Drops the planned switches of a publication that sends nothing: each such session keeps
+    /// the configuration the Hub holds for it, and nobody is told of a switch.
+    pub fn forgo_switches(&mut self, client: &crate::hub::Client, repository: &str) -> Result<()> {
+        for (session, _) in std::mem::take(&mut self.to_register) {
+            let held = client
+                .registered_session_privacy(repository, &self.identity, &session)?
+                .with_context(|| format!("{session} is no longer registered on the Hub"))?;
+            self.configs.insert(session, held);
+        }
+        self.switched.clear();
+        Ok(())
     }
 
     pub fn verify_configs(&self, client: &crate::hub::Client, repository: &str) -> Result<()> {
@@ -929,7 +1095,9 @@ impl ProjectedHistory {
                 }
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
                 let mut plain_rewrites = BTreeSet::new();
-                let mut encrypted_reach = EncryptedReach::new(&ledger);
+                let mut encrypted_below =
+                    super::frozen::Finder::new(&source, &parent, &ledger, &held, branch);
+                let mut file_line_bases = std::collections::HashMap::new();
                 for oid in order.iter().filter(|oid| reachable.contains(*oid)) {
                     // The plan leaves a boundary commit's ancestry out, so its public parents come
                     // from its accepted mapping instead of from this walk.
@@ -1080,52 +1248,107 @@ impl ProjectedHistory {
                     if config.is_none_or(|response| {
                         response.config.privacy.scheme == SessionScheme::Plain
                     }) {
-                        // A plain snapshot never carries an encrypted session's turns: readers
-                        // were shown only their projection, and nothing here can publish them in
-                        // that form. One whose history reaches an encrypted snapshot, through any
-                        // parent, is refused before anything is sent.
-                        if config.is_some()
-                            && let Some(encrypted) = encrypted_reach.of(
-                                &source,
-                                oid,
-                                &parents[oid],
-                                enveloped.contains(oid),
-                            )?
-                        {
-                            anyhow::bail!(
-                                "{encrypted} was published encrypted, and the history of {} includes it, so its turns can't be published as a plain session; nothing was uploaded",
-                                metadata.session
+                        // A session snapshot continuing one this device published encrypted, and
+                        // the Hub accepted, is rewritten onto its public parents with the turns
+                        // that one published kept as projected (see `frozen`), so its source
+                        // ancestry never leaves.
+                        let continues_projection = config.is_some() && selected.delivery.is_none();
+                        for (source, public) in parents[oid].iter().zip(&public_parents) {
+                            ensure!(
+                                source == public
+                                    || plain_rewrites.contains(source)
+                                    || (continues_projection
+                                        && ledger
+                                            .inherited_immutable(branch, source)?
+                                            .is_some_and(super::frozen::encrypted)),
+                                "plain publication cannot expose unaccepted original ancestry from an encrypted session"
                             );
                         }
-                        ensure!(
-                            parents[oid]
-                                .iter()
-                                .zip(&public_parents)
-                                .all(|(source, public)| source == public
-                                    || plain_rewrites.contains(source)),
-                            "plain publication cannot expose unaccepted original ancestry from an encrypted session"
-                        );
                         ensure!(
                             !enveloped.contains(oid),
                             "encrypted or obsolete ciphertext cannot be admitted as plaintext"
                         );
                         imports.add(oid, &parents[oid]);
-                        // A session snapshot publishes its conversation records only.
+                        // A session snapshot publishes its conversation records only, and those an
+                        // encrypted snapshot below it published as they were projected then.
                         let conversation = match config {
                             Some(_) if selected.delivery.is_none() => {
-                                let published = published_lines(
+                                let nearest = encrypted_below
+                                    .below_new(oid, parents[oid].first().map(String::as_str))?;
+                                let published = nearest
+                                    .as_deref()
+                                    .map(super::frozen::Nearest::published)
+                                    .transpose()?;
+                                let encrypted_others =
+                                    encrypted_below.others(oid, nearest.as_deref())?;
+                                let others = encrypted_others
+                                    .iter()
+                                    .map(|other| other.published())
+                                    .collect::<Result<Vec<_>>>()?;
+                                ensure!(
+                                    (published.is_none() && others.is_empty())
+                                        || selected.carried_records_proof,
+                                    "this Hub doesn't yet accept a conversation that continues one published encrypted, so nothing was uploaded; it will once the Hub is updated"
+                                );
+                                // Files the session changed while it was published encrypted were
+                                // never uploaded; they stay as its file line had them.
+                                let encrypted: Vec<String> = nearest
+                                    .as_deref()
+                                    .into_iter()
+                                    .chain(encrypted_others.iter().map(|other| &**other))
+                                    .filter_map(super::frozen::Nearest::local_source)
+                                    .map(str::to_owned)
+                                    .collect();
+                                let held_back = super::frozen::held_back_files(
+                                    &source,
+                                    oid,
+                                    &encrypted,
+                                    &mut file_line_bases,
+                                )?;
+                                // Lines a public parent already holds go out as they are, so only
+                                // a parent shown to be plain counts: an encrypted parent's
+                                // projection is what `splice` carries, and it passes today's
+                                // protection again, as does every line of a parent that can't
+                                // be shown plain.
+                                let mut plain_sources = Vec::new();
+                                let mut plain_publics = Vec::new();
+                                for (source_parent, public) in
+                                    parents[oid].iter().zip(&public_parents)
+                                {
+                                    let encrypted_here = ledger
+                                        .inherited_immutable(branch, source_parent)?
+                                        .is_some_and(super::frozen::encrypted);
+                                    if !encrypted_here
+                                        && shown_plain(
+                                            &source,
+                                            &repo,
+                                            written
+                                                .get(public)
+                                                .map_or(public.as_str(), String::as_str),
+                                        )
+                                    {
+                                        plain_sources.push(source_parent.clone());
+                                        plain_publics.push(public.clone());
+                                    }
+                                }
+                                let public_records = published_lines(
                                     &source,
                                     &repo,
                                     &written,
                                     oid,
-                                    &parents[oid],
-                                    &public_parents,
+                                    &plain_sources,
+                                    &plain_publics,
                                 )?;
                                 let conversation = conversation_commit(
                                     &source,
                                     oid,
                                     &parents[oid],
-                                    &published,
+                                    &public_records,
+                                    Carried {
+                                        projected: published,
+                                        others: &others,
+                                        held_back,
+                                    },
                                     &mut rechecked,
                                 )?;
                                 count_left_out(
@@ -1772,109 +1995,6 @@ struct Conversation {
     left_out: BTreeSet<String>,
 }
 
-/// Which encrypted session, if any, a commit's history reaches through any parent: a commit
-/// carrying an envelope, or one this device published encrypted. Answers are kept per commit, so a
-/// snapshot whose parents were already answered costs no walk of their shared history.
-struct EncryptedReach {
-    /// This device's encrypted publications: each source commit and its session.
-    published: Vec<(String, String)>,
-    answers: BTreeMap<String, Option<String>>,
-}
-
-impl EncryptedReach {
-    fn new(ledger: &accepted::Ledger) -> Self {
-        Self {
-            published: ledger
-                .every_accepted()
-                .filter(|entry| !entry.plain && !entry.delivered && entry.source != entry.public)
-                .map(|entry| (entry.source.clone(), entry.source_session.clone()))
-                .collect(),
-            answers: BTreeMap::new(),
-        }
-    }
-
-    fn of(
-        &mut self,
-        source: &Repo,
-        oid: &str,
-        parents: &[String],
-        enveloped: bool,
-    ) -> Result<Option<String>> {
-        if let Some(answer) = self.answers.get(oid) {
-            return Ok(answer.clone());
-        }
-        let known: Option<Vec<&Option<String>>> = parents
-            .iter()
-            .map(|parent| self.answers.get(parent))
-            .collect();
-        let answer = match known {
-            Some(known)
-                if !enveloped && !self.published.iter().any(|(commit, _)| commit == oid) =>
-            {
-                known.into_iter().flatten().next().cloned()
-            }
-            _ => self.walk(source, oid)?,
-        };
-        self.answers.insert(oid.to_owned(), answer.clone());
-        Ok(answer)
-    }
-
-    /// Asked of Git with bounded output: one ancestry test per encrypted publication, and at
-    /// most a few commits that touched an envelope.
-    fn walk(&self, source: &Repo, oid: &str) -> Result<Option<String>> {
-        for (commit, session) in &self.published {
-            if commit == oid {
-                return Ok(Some(session.clone()));
-            }
-            // A publication whose commit this checkout doesn't hold can't be in its history.
-            if source
-                .git_status_local(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?
-                .0
-                != Some(0)
-            {
-                continue;
-            }
-            match source
-                .git_status_local(&["merge-base", "--is-ancestor", commit, oid])?
-                .0
-            {
-                Some(0) => return Ok(Some(session.clone())),
-                Some(1) => {}
-                // Git couldn't answer, so the history can't be shown to be free of it.
-                _ => anyhow::bail!(
-                    "this checkout can't tell whether {session}, which was published encrypted, is in the history being pushed; nothing was uploaded"
-                ),
-            }
-        }
-        // Full history: by default a path query skips a parent the merge's tree doesn't take.
-        let touched: Vec<String> = source
-            .git(&[
-                "rev-list",
-                "--max-count=32",
-                "--full-history",
-                oid,
-                "--",
-                "privacy/envelope.json",
-            ])?
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        if touched.is_empty() {
-            return Ok(None);
-        }
-        let held = enveloped_commits(source, &touched)?;
-        let commit = touched
-            .iter()
-            .find(|commit| held.contains(*commit))
-            .unwrap_or(&touched[0]);
-        Ok(Some(
-            crate::domain::storage::metadata_local(source.root(), commit)
-                .map(|metadata| metadata.session)
-                .unwrap_or_else(|_| commit.clone()),
-        ))
-    }
-}
-
 /// The longest path under `events/` a session tree may list. The reader refuses a longer one
 /// before holding all of it, so with the most events a session may hold it bounds what
 /// [`held_events`] keeps in memory; a bound checked only on the finished path leaves a tree with
@@ -1955,6 +2075,18 @@ impl Prefix<'_> {
         );
         Ok(line)
     }
+}
+
+/// Whether the public commit `commit` shows by its own tree that it is plain: a tree this run can
+/// read, holding nothing under `privacy/`. An envelope of any format, a tree that can't be read or
+/// any answer Git can't give cleanly says no, so its lines pass protection again.
+fn shown_plain(source: &Repo, repo: &Repo, commit: &str) -> bool {
+    [source, repo].into_iter().any(|holder| {
+        matches!(
+            holder.git_status_local(&["ls-tree", "--name-only", commit, "--", "privacy"]),
+            Ok((Some(0), stdout, stderr)) if stdout.trim().is_empty() && stderr.is_empty()
+        )
+    })
 }
 
 /// [`Published`] for a snapshot `oid` with source `parents` and their `public_parents`. A parent
@@ -2159,31 +2291,39 @@ impl Rechecked {
     }
 }
 
+/// What encrypted snapshots below a plain one published, which it carries (see `frozen`).
+#[derive(Default)]
+struct Carried<'a> {
+    /// The nearest encrypted snapshot below, or the plain one the destination holds above it.
+    projected: Option<&'a super::frozen::Published>,
+    /// Those a merge below it brought in.
+    others: &'a [&'a super::frozen::Published],
+    /// Files the session changed while it was published encrypted, put back as its file line had
+    /// them.
+    held_back: Vec<(String, Option<super::frozen::Restored>)>,
+}
+
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
 /// The local commit is left as it is, so local history and resume keep the complete native
-/// transcript.
+/// transcript. `published` is what plain public parents already hold, and `carried` what encrypted
+/// snapshots below `oid` published.
 fn conversation_commit(
     source: &Repo,
     oid: &str,
     parents: &[String],
     published: &Published<'_>,
+    carried: Carried<'_>,
     rechecked: &mut Rechecked,
 ) -> Result<Conversation> {
+    let Carried {
+        projected,
+        others,
+        held_back,
+    } = carried;
     use crate::domain::{publication_records, storage, transcript::Envelope};
     let limit = storage::MAX_MATERIALIZED_BYTES;
     let (log, view) = storage::materialize_pair_local(source.root(), oid, limit, limit)?;
-    let lines = |text: &str| -> Vec<String> {
-        text.split_inclusive('\n')
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                let mut line = line.to_owned();
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                line
-            })
-            .collect()
-    };
+    let lines = super::frozen::record_lines;
     let log = lines(&log);
     let envelopes = log
         .iter()
@@ -2194,22 +2334,31 @@ fn conversation_commit(
             .iter()
             .map(|envelope| (envelope.source.as_str(), &envelope.content)),
     );
+    // Records an encrypted snapshot already published keep the projection their readers saw,
+    // narrowed by today's rules.
+    let spliced = super::frozen::splice(&envelopes, kept, projected, others)?;
+    let spliced = spliced
+        .into_iter()
+        .map(|line| line.map(|line| storage::parse_legacy_envelope_line(&line)))
+        .map(Option::transpose)
+        .collect::<Result<Vec<_>>>()?;
     let public = |envelope: &Envelope, content: serde_json::Value| Envelope {
         source: envelope.source.clone(),
         session_id: envelope.session_id.clone(),
         object_hash: crate::domain::transcript::object_hash(&content),
         content,
     };
-    // A line a public parent already holds goes out as it is: it is published, and this LOG
+    // A line a plain public parent already holds goes out as it is: it is published, and this LOG
     // extends the parent's only while those lines keep their bytes. A record this snapshot shares
     // with the parent whose LOG it extends goes out as the line the public parent published for
     // it, though protection changed it then and today's rules would change it again. Every other
-    // kept record passes today's protection first.
+    // line passes today's protection first, a record an encrypted snapshot published as well:
+    // its readers weren't plain readers, and protection only replaces more.
     let prefix = published.prefix.as_ref().filter(|prefix| {
-        prefix.source_lines <= kept.len()
-            && kept[..prefix.source_lines]
+        prefix.source_lines <= spliced.len()
+            && spliced[..prefix.source_lines]
                 .iter()
-                .filter(|kept| kept.is_some())
+                .filter(|line| line.is_some())
                 .count()
                 == prefix.public.len()
     });
@@ -2225,19 +2374,21 @@ fn conversation_commit(
         for changed in rechecked.contents(source, contents)? {
             let index = fresh[changed];
             let content = std::mem::take(&mut contents[changed]);
-            public_lines[index] = Some(storage::envelope_line(&public(&envelopes[index], content)));
+            let base = spliced[index]
+                .as_ref()
+                .context("a protected record has no line")?;
+            public_lines[index] = Some(storage::envelope_line(&public(base, content)));
         }
         fresh.clear();
         contents.clear();
         Ok(())
     };
-    for (index, (envelope, kept)) in envelopes.iter().zip(kept).enumerate() {
-        let Some(content) = kept else {
+    for (index, candidate) in spliced.iter().enumerate() {
+        let Some(candidate) = candidate else {
             public_lines.push(None);
             continue;
         };
-        let candidate = public(envelope, content);
-        let mut line = storage::envelope_line(&candidate);
+        let mut line = storage::envelope_line(candidate);
         let id = storage::canonical_event_id(&line);
         if let Some(prefix) = prefix.filter(|prefix| index < prefix.source_lines) {
             if prefix.public[shared] != id {
@@ -2247,7 +2398,7 @@ fn conversation_commit(
         } else if !published.ids.contains(&id) {
             batched += line.len();
             fresh.push(index);
-            contents.push(candidate.content);
+            contents.push(candidate.content.clone());
         }
         public_lines.push(Some(line));
         if batched >= PROTECTION_BATCH_BYTES {
@@ -2295,6 +2446,7 @@ fn conversation_commit(
         .map(|line| meta::event_path(&storage::event_id(line)?))
         .collect::<Result<BTreeSet<_>>>()?;
     changed |= held.iter().any(|path| !named.contains(path));
+    changed |= !held_back.is_empty();
     if !changed {
         return Ok(Conversation {
             commit: None,
@@ -2341,6 +2493,11 @@ fn conversation_commit(
             &public_view,
             &meta::to_text(&metadata)?,
         )?
+    };
+    let tree = if held_back.is_empty() {
+        tree
+    } else {
+        crate::commands::plumbing::tree_restore_owned(source, &tree, held_back)?
     };
     let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
     Ok(Conversation {
@@ -3567,6 +3724,7 @@ mod tests {
                 head.trim(),
                 &[],
                 &Published::default(),
+                Carried::default(),
                 &mut Rechecked::default()
             )
             .unwrap(),
@@ -3750,6 +3908,9 @@ mod tests {
                     BTreeSet::from(["alice/private".to_owned()]),
                 ),
                 pinned_source: pinned_source(&source, &hub),
+                switched: Vec::new(),
+                carried_records_proof: true,
+                to_register: Vec::new(),
                 asking_again: Default::default(),
             };
             let published = ProjectedHistory::prepare_sessions_with_redactor(
@@ -4016,6 +4177,33 @@ mod tests {
         assert_eq!(carry(&ledger, both).0, BTreeSet::from([version]));
     }
 
+    /// A session that continues as plain is told in plain words, naming only the session; the
+    /// person's own grants are mentioned only when the session is theirs, and a dry run says what
+    /// the push will do.
+    #[test]
+    fn a_switched_session_is_told_in_plain_words() {
+        let own = SwitchedSession {
+            session: "agit-x".into(),
+            target: Some("alice/app@work".into()),
+            owned: true,
+        };
+        assert_eq!(
+            own.notice(false),
+            "agit-x now publishes like your other sessions: new turns upload only the redacted view people with access already see, and the originals stay on this computer. Files it changed before this, such as memory or skills, are not uploaded. People you gave access to the originals keep it for earlier turns only (`agit privacy access show alice/app@work` lists them)."
+        );
+        assert!(
+            own.notice(true)
+                .starts_with("agit-x will publish, once pushed, like")
+        );
+        let theirs = SwitchedSession {
+            owned: false,
+            ..own
+        };
+        let told = theirs.notice(false);
+        assert!(told.starts_with("agit-x, another account's session, now publishes like"));
+        assert!(told.ends_with("are not uploaded. Its owner is told on the Hub."));
+    }
+
     /// A root introduces its tree and a merge introduces only paths whose blob differs from every
     /// parent; a union over parents would review again what one parent already carries.
     #[test]
@@ -4054,119 +4242,6 @@ mod tests {
                 (side.as_str(), "b.txt"),
                 (merge.as_str(), "c.txt"),
             ]
-        );
-    }
-
-    /// A long plain history is asked about with bounded output, and an encrypted publication on
-    /// an unrelated branch doesn't make it reach one; one on its own history does.
-    #[test]
-    fn a_long_plain_history_is_asked_about_with_bounded_output() {
-        let temp = tempfile::tempdir().unwrap();
-        git(temp.path(), &["init", "-q"]);
-        let commits = 30_000;
-        let mut script = String::new();
-        for index in 0..commits {
-            script.push_str(&format!(
-                "commit refs/heads/main\nmark :{}\ncommitter t <t@example.com> 1600000000 +0000\ndata 1\n.\n{}\n",
-                index + 1,
-                if index == 0 { String::new() } else { format!("from :{index}\n") }
-            ));
-        }
-        script.push_str(
-            "commit refs/heads/other\nmark :999999\ncommitter t <t@example.com> 1600000000 +0000\ndata 5\nother\n\n",
-        );
-        let mut import = std::process::Command::new("git")
-            .arg("-C")
-            .arg(temp.path())
-            .args(["fast-import", "--quiet"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        use std::io::Write as _;
-        import
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(script.as_bytes())
-            .unwrap();
-        assert!(import.wait().unwrap().success());
-        let tip = git(temp.path(), &["rev-parse", "main"]).trim().to_owned();
-        let parent = git(temp.path(), &["rev-parse", "main^"]).trim().to_owned();
-        let other = git(temp.path(), &["rev-parse", "other"]).trim().to_owned();
-        let source = Repo::at(temp.path()).local_objects_only();
-        let mut reach = EncryptedReach {
-            published: vec![(other.clone(), "agit-encrypted".into())],
-            answers: BTreeMap::new(),
-        };
-        assert_eq!(
-            reach
-                .of(&source, &tip, std::slice::from_ref(&parent), false)
-                .unwrap(),
-            None
-        );
-        let first = git(temp.path(), &["rev-list", "--max-parents=0", "main"])
-            .trim()
-            .to_owned();
-        let mut reach = EncryptedReach {
-            published: vec![(first, "agit-encrypted".into())],
-            answers: BTreeMap::new(),
-        };
-        assert_eq!(
-            reach
-                .of(&source, &tip, &[parent], false)
-                .unwrap()
-                .as_deref(),
-            Some("agit-encrypted")
-        );
-    }
-
-    /// A publication whose commit this checkout doesn't hold is skipped; one Git can't place in
-    /// the history refuses the push rather than count as absent.
-    #[test]
-    fn an_encrypted_publication_git_cannot_place_refuses() {
-        let temp = tempfile::tempdir().unwrap();
-        git(temp.path(), &["init", "-q"]);
-        git(
-            temp.path(),
-            &["commit", "-q", "--allow-empty", "-m", "first"],
-        );
-        let first = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
-        git(
-            temp.path(),
-            &["commit", "-q", "--allow-empty", "-m", "second"],
-        );
-        let tip = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
-        git(temp.path(), &["checkout", "-q", "--orphan", "other"]);
-        git(
-            temp.path(),
-            &["commit", "-q", "--allow-empty", "-m", "other"],
-        );
-        let other = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
-        let source = Repo::at(temp.path()).local_objects_only();
-        let reach = |published: Vec<(String, String)>| EncryptedReach {
-            published,
-            answers: BTreeMap::new(),
-        };
-        let absent = "0123456789abcdef0123456789abcdef01234567".to_owned();
-        assert_eq!(
-            reach(vec![(absent, "agit-absent".into())])
-                .walk(&source, &tip)
-                .unwrap(),
-            None
-        );
-        // The tip's parent is gone: Git can't walk its history to answer.
-        std::fs::remove_file(
-            temp.path()
-                .join(".git/objects")
-                .join(&first[..2])
-                .join(&first[2..]),
-        )
-        .unwrap();
-        // Whichever probe fails first, the ancestry test or the envelope query, the push stops.
-        assert!(
-            reach(vec![(other, "agit-elsewhere".into())])
-                .walk(&source, &tip)
-                .is_err()
         );
     }
 }
