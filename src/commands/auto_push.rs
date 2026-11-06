@@ -203,7 +203,8 @@ pub(super) fn after_settlement(
             Ok(output) => Err(super::project::UploadFailure::reported(
                 output.status.code(),
                 &failure_reason(&output.stdout).map_or_else(String::new, |(reason, _)| reason),
-            )),
+            )
+            .waiting_on(None, Some(&target))),
             Err(_) => Err(super::project::UploadFailure::Other),
         });
     }

@@ -1129,11 +1129,13 @@ pub(crate) enum UploadFailure {
     TooLarge,
     BuildsOnWithdrawn,
     Refused,
+    /// A folder's capture rule keeps the branch from this computer's uploads.
+    Withheld,
     Other,
 }
 
 impl UploadFailure {
-    fn of(error: &anyhow::Error, project: &Project) -> Self {
+    fn of(error: &anyhow::Error, project: &Project, candidate: &Candidate) -> Self {
         let reported = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<ChildFailed>())
@@ -1143,7 +1145,33 @@ impl UploadFailure {
         if reported == Self::Other && sign_in(project) == SignIn::Absent {
             return Self::SignedOut;
         }
-        reported
+        let branch = Store::open()
+            .ok()
+            .flatten()
+            .and_then(|store| link::get(&store, &candidate.runtime, &candidate.session_id))
+            .and_then(|link| link.branch);
+        reported.waiting_on(
+            Some(candidate.session_id.as_str()),
+            branch
+                .map(|branch| format!("{}@{branch}", project.repository))
+                .as_deref(),
+        )
+    }
+
+    /// A policy exit is told as a privacy wait only when one is recorded for the conversation
+    /// (`session`) or its branch (`target`): that is what `agit status` shows, and a line that
+    /// sends the person there for a wait it does not list leaves them nowhere. Every other policy
+    /// exit, such as a refusal this class has no name for, is told as [`Self::Other`].
+    pub(crate) fn waiting_on(self, session: Option<&str>, target: Option<&str>) -> Self {
+        if self != Self::PrivacyIncomplete {
+            return self;
+        }
+        let capture = session
+            .is_some_and(|session| crate::domain::privacy::pending::load().contains_key(session));
+        let upload = target.is_some_and(|target| {
+            crate::domain::privacy::pending::upload::load().contains_key(target)
+        });
+        if capture || upload { self } else { Self::Other }
     }
 
     /// The class of a failed `agit push` child, from its exit status and the error it reported.
@@ -1153,6 +1181,9 @@ impl UploadFailure {
         }
         if message.contains(super::push::BUILDS_ON_WITHDRAWN) {
             return Self::BuildsOnWithdrawn;
+        }
+        if message.contains(super::push::WITHHELD_HERE) {
+            return Self::Withheld;
         }
         // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
         // name to rename is refused before the Hub is asked.
@@ -1181,6 +1212,9 @@ impl UploadFailure {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
             Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
+            Self::Withheld => {
+                "this computer keeps the conversation from uploading, so no later turn sends it either; pushing its branch yourself says why and what to do"
+            }
             Self::Other => "it could not be completed on this computer; the next turn tries again",
         }
     }
@@ -1423,7 +1457,7 @@ fn sync_one(
             pushed
                 .as_ref()
                 .map(|_| ())
-                .map_err(|error| UploadFailure::of(error, project)),
+                .map_err(|error| UploadFailure::of(error, project, candidate)),
         );
     }
     pushed?;
@@ -2867,7 +2901,7 @@ fn capture_candidate(
     let reason = result
         .as_ref()
         .err()
-        .map(|error| UploadFailure::of(error, &project));
+        .map(|error| UploadFailure::of(error, &project, &candidate));
     project.last_result = Some(serde_json::json!({
         "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),
@@ -7348,13 +7382,23 @@ mod tests {
         );
     }
 
-    /// A Hub refusal comes back from the child as a policy exit, as a privacy check that did not
-    /// complete does. It is told as a refusal, and a save offers no retry for it; a failure the
-    /// next try may get past still gets one.
+    /// A policy exit from the child is told by what it was. A Hub refusal is told as one, and a
+    /// save offers no retry for it; a branch the folder keeps back is told as kept back; and only a
+    /// privacy check that left a wait `agit status` lists is told as a privacy wait, since that
+    /// line sends the person to status. A class read from the exit code alone tells a kept-back
+    /// branch as a privacy wait that status never shows.
     #[test]
-    fn a_hub_refusal_is_told_as_one_and_not_offered_again() {
+    fn a_policy_exit_is_told_by_what_it_was() {
+        if !isolated("a_policy_exit_is_told_by_what_it_was") {
+            return;
+        }
         let work = tempfile::tempdir().unwrap();
         let policy = project(work.path());
+        let candidate = Candidate {
+            runtime: "claude-code".into(),
+            session_id: "dddddddd-0000-4000-8000-000000000007".into(),
+            cwd: policy.root.clone(),
+        };
         let refused = format!(
             "publication did not complete (HTTP 422 provenance_rejected: x); no branch or tag refs were updated; {}",
             super::super::push::REFUSED_AGAIN
@@ -7366,11 +7410,25 @@ mod tests {
             })
         };
         assert_eq!(
-            UploadFailure::of(&child(&refused), &policy),
+            UploadFailure::of(&child(&refused), &policy, &candidate),
             UploadFailure::Refused
         );
+        let kept_back = format!(
+            "`alice/app@talk` {}: agit cannot verify where the conversation started",
+            super::super::push::WITHHELD_HERE
+        );
         assert_eq!(
-            UploadFailure::of(&child("the privacy review did not finish"), &policy),
+            UploadFailure::of(&child(&kept_back), &policy, &candidate),
+            UploadFailure::Withheld
+        );
+        let pending = child("the privacy review did not finish");
+        assert_eq!(
+            UploadFailure::of(&pending, &policy, &candidate),
+            UploadFailure::Other
+        );
+        crate::domain::privacy::pending::record(&candidate.session_id, "deadline", 1, None);
+        assert_eq!(
+            UploadFailure::of(&pending, &policy, &candidate),
             UploadFailure::PrivacyIncomplete
         );
         assert!(matches!(Saved::upload_failed(refused), Saved::Refused(_)));
