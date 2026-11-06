@@ -70,6 +70,9 @@ struct Cache {
 
 pub struct ProjectedHistory {
     repo: Repo,
+    /// The repository whose privacy rules a publication's files are judged under; [`Self::repo`]
+    /// is a working copy of what is sent.
+    source_root: std::path::PathBuf,
     source: PublicationPlan,
     branches: Vec<String>,
     plan: PublicationPlan,
