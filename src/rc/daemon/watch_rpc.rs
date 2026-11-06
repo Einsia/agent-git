@@ -429,6 +429,7 @@ impl Daemon {
         let info = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: watch_id.clone(),

@@ -115,6 +115,9 @@ impl Daemon {
             && let Ok(p) = frame.params_as::<crate::protocol::SessionStatusChanged>()
             && let Some(live) = self.sessions.get_mut(&stream)
         {
+            if live.info.status != p.status {
+                live.status_since = std::time::Instant::now();
+            }
             live.info.status = p.status;
             if p.status != SessionStatus::AwaitingApproval {
                 live.approval_requests.clear();
@@ -954,6 +957,7 @@ mod bound_lineage_tests {
                     let info = SessionInfo {
                         interrupt_fenced: None,
                         interrupted: None,
+                        paused: None,
                         lease: None,
                         publication: None,
                         session_id: "agit-S".into(),
@@ -999,6 +1003,7 @@ mod bound_lineage_tests {
                         ended: false,
                         writer_released: false,
                         writer_process: None,
+                        status_since: std::time::Instant::now(),
                     };
                     let (notes, _notes_rx) = mpsc::channel(1);
                     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());
@@ -1030,6 +1035,7 @@ mod bound_lineage_tests {
                         term_tx: None,
                         online: false,
                         stop_cause: StopCause::Person,
+                        replaced_by: None,
 
                         settlement,
                         started_at: std::time::Instant::now(),

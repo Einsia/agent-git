@@ -964,6 +964,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                 let info = SessionInfo {
                     interrupt_fenced: None,
                     interrupted: None,
+                    paused: None,
                     lease: None,
                     publication: None,
                     session_id: "agit-danger-start".into(),
@@ -1053,6 +1054,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let info = SessionInfo {
                     interrupt_fenced: None,
                     interrupted: None,
+                    paused: None,
                     lease: None,
                     publication: None,
                     session_id: "agit-unjudged".into(),
@@ -1124,6 +1126,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                 let info = SessionInfo {
                     interrupt_fenced: None,
                     interrupted: None,
+                    paused: None,
                     lease: None,
                     publication: None,
                     session_id: "agit-unauthorized".into(),
@@ -1261,6 +1264,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
     let session = SessionInfo {
         interrupt_fenced: None,
         interrupted: None,
+        paused: None,
         lease: None,
         publication: None,
         session_id: "agit-existing".into(),
@@ -2262,6 +2266,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         info: SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "s-1".into(),
@@ -2300,6 +2305,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         ended: false,
         writer_released: false,
         writer_process: None,
+        status_since: std::time::Instant::now(),
     };
     let event = |applied| {
         Frame::notification(
@@ -2493,6 +2499,7 @@ fn a_viewer_joining_at_the_last_moment_keeps_the_tail_alive() {
         info: SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "s".into(),
@@ -2592,6 +2599,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         term_tx: None,
         online: false,
         stop_cause: StopCause::Person,
+        replaced_by: None,
 
         settlement,
         started_at: std::time::Instant::now(),
@@ -3059,6 +3067,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
     let info = SessionInfo {
         interrupt_fenced: None,
         interrupted: None,
+        paused: None,
         lease: None,
         publication: None,
         session_id: "session-a".into(),

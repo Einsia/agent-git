@@ -797,6 +797,7 @@ mod tests {
         let session = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "agit-one".into(),

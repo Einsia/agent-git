@@ -526,6 +526,12 @@ struct SessionRpcBoundWait {
 
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 
+/// How long a conversation on a runtime only the daemon runs must sit idle before an upgrade may
+/// end it, so the update is not held for ever by one forgotten conversation. Long enough that
+/// someone still reading its last reply is not cut off; the conversation continues with the next
+/// message. A busy or approval-waiting conversation is never ended this way.
+const IDLE_DETACH: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 struct Live {
     /// Which generation on the same logical id. See `SessionNote::Ended`.
     generation: u64,
@@ -611,6 +617,9 @@ struct Live {
     writer_released: bool,
     /// The harness process writing the conversation, as the supervisor reported it.
     writer_process: Option<crate::rc::lease::Terminal>,
+    /// When the session last changed status: an upgrade may end a private conversation only once
+    /// it has been idle for [`IDLE_DETACH`].
+    status_since: std::time::Instant,
 }
 
 impl Live {
@@ -1112,9 +1121,13 @@ pub(super) enum StopCause {
     /// reacting to the turn, so it is held like their own interrupt.
     #[default]
     Person,
-    /// Nobody chose to stop the turn: a service manager's SIGTERM, a restart for an upgrade. The
-    /// turn ends where agit stopped it and is archived like any turn that ended.
+    /// Nobody chose to stop the turn: a service manager's SIGTERM. The turn ends where agit
+    /// stopped it and is archived like any turn that ended. Only unix delivers the signal.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Unattended,
+    /// A restart for an upgrade: unattended as above, and the idle conversations it ends are
+    /// marked paused for it.
+    Upgrade,
 }
 
 pub struct Daemon {
@@ -1177,6 +1190,8 @@ pub struct Daemon {
     term_tx: Option<mpsc::Sender<TerminalEvent>>,
     online: bool,
     stop_cause: StopCause,
+    /// The build an upgrade replaces this daemon with, once one is accepted.
+    replaced_by: Option<String>,
     /// Shared by every live session; a control socket reload builds the replacement in full and
     /// swaps it in at once.
 

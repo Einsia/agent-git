@@ -256,6 +256,7 @@ impl Daemon {
             dormant.push(self.stamped(SessionInfo {
                 interrupt_fenced: None,
                 interrupted: self.roster.interrupted.get(id).cloned(),
+                paused: self.roster.paused.get(id).cloned(),
                 lease: None,
                 publication: None,
                 native_source: None,
@@ -392,6 +393,7 @@ impl Daemon {
         let info = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             native_source: None,
@@ -639,6 +641,7 @@ impl Daemon {
             let info = SessionInfo {
                 interrupt_fenced: None,
                 interrupted: None,
+                paused: None,
                 lease: None,
                 publication: None,
                 session_id: p.session_id.clone(),
@@ -920,6 +923,7 @@ impl Daemon {
         let info = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: logical,
@@ -1369,6 +1373,7 @@ impl Daemon {
         let info = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: session_id.clone(),

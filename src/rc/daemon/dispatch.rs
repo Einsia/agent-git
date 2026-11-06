@@ -493,6 +493,9 @@ impl Daemon {
                             if let Some(interrupted) = self.roster.interrupted.get(&p.session_id) {
                                 data["interrupted"] = serde_json::json!(interrupted);
                             }
+                            if let Some(paused) = self.roster.paused.get(&p.session_id) {
+                                data["paused"] = serde_json::json!(paused);
+                            }
                             error.data = Some(data);
                             error
                         } else {
@@ -719,6 +722,7 @@ mod tests {
             term_tx: None,
             online: true,
             stop_cause: StopCause::Person,
+            replaced_by: None,
             settlement,
             started_at: std::time::Instant::now(),
             notes,
@@ -786,6 +790,7 @@ mod tests {
             info: SessionInfo {
                 interrupt_fenced: None,
                 interrupted: None,
+                paused: None,
                 lease: None,
                 publication: None,
                 session_id: stream.into(),

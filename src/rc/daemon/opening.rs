@@ -839,7 +839,9 @@ impl Daemon {
         let runtime_thread_id = session.runtime_thread_id().or(spec.resume_from);
         let task = tokio::spawn(session.run(cmd_rx));
         // Running again, the conversation is no longer the one a stop interrupted.
-        if self.roster.interrupted.remove(&session_id).is_some()
+        let interrupted = self.roster.interrupted.remove(&session_id).is_some();
+        let paused = self.roster.paused.remove(&session_id).is_some();
+        if (interrupted || paused)
             && let Err(error) = self.roster.save()
         {
             eprintln!("agitd: a resumed conversation is still recorded as interrupted: {error:#}");
@@ -864,6 +866,7 @@ impl Daemon {
                 ended: false,
                 writer_released: false,
                 writer_process: None,
+                status_since: std::time::Instant::now(),
                 info: info.clone(),
                 shared_executor,
                 started_process,
@@ -982,6 +985,7 @@ mod tests {
         let info = SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "agit-opening".into(),

@@ -21,6 +21,7 @@ pub(super) fn rpc_test_live(
         info: SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: session_id.into(),
@@ -61,6 +62,7 @@ pub(super) fn rpc_test_live(
         ended: false,
         writer_released: false,
         writer_process: None,
+        status_since: std::time::Instant::now(),
     }
 }
 
@@ -94,6 +96,7 @@ pub(super) fn rpc_test_daemon(
         term_tx: None,
         online: true,
         stop_cause: StopCause::Person,
+        replaced_by: None,
 
         settlement,
         started_at: std::time::Instant::now(),
