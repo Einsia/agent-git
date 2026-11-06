@@ -663,15 +663,20 @@ fn opening(text: &str, tag: &str) -> Option<usize> {
 /// `<user_query>` block, or `None`. Text in any other shape (no block, two, or nested or
 /// unbalanced tags) withholds the whole record. These runtimes put the context they supply
 /// (`<user_info>`, rules, timestamps) around that block in the same message, so everything
-/// outside it is left out.
-fn user_query_content(content: &Value) -> Option<Value> {
+/// outside it is left out. `text_blocks` are the block types the runtime's adapter reads as text:
+/// a block of a type left off it is neither counted nor kept, so a request in it is never shown.
+fn user_query_content(content: &Value, text_blocks: &[&str]) -> Option<Value> {
     const OPEN: &str = "<user_query>";
     const CLOSE: &str = "</user_query>";
     let texts: Vec<&str> = match content {
         Value::String(text) => vec![text.as_str()],
         Value::Array(blocks) => blocks
             .iter()
-            .filter(|block| block["type"] == "text")
+            .filter(|block| {
+                block["type"]
+                    .as_str()
+                    .is_some_and(|kind| text_blocks.contains(&kind))
+            })
             .filter_map(|block| block["text"].as_str())
             .filter(|text| !text.trim().is_empty())
             .collect(),
@@ -706,10 +711,11 @@ fn user_query_content(content: &Value) -> Option<Value> {
     for block in blocks {
         match block["type"].as_str() {
             Some("tool_result") => kept.push(tool_result(block)),
-            Some("text")
-                if block["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains(OPEN)) =>
+            Some(kind)
+                if text_blocks.contains(&kind)
+                    && block["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(OPEN)) =>
             {
                 let mut block = block.clone();
                 block["text"] = Value::String(request.clone()?);
@@ -734,7 +740,10 @@ fn cursor(record: &Map<String, Value>) -> Option<Value> {
     match role? {
         "assistant" => Some(Value::Object(record.clone())),
         "user" => {
-            let kept = user_query_content(record.get("message")?.get("content")?)?;
+            let kept = user_query_content(
+                record.get("message")?.get("content")?,
+                crate::adapter::cursor::TEXT_BLOCKS,
+            )?;
             let mut record = Value::Object(record.clone());
             record["message"]["content"] = kept;
             Some(record)
@@ -1254,7 +1263,10 @@ fn workbuddy(record: &Map<String, Value>) -> Option<Value> {
         "message" => match record.get("role").and_then(Value::as_str)? {
             "assistant" => true,
             "user" => {
-                let kept = user_query_content(record.get("content")?)?;
+                let kept = user_query_content(
+                    record.get("content")?,
+                    crate::adapter::workbuddy::TEXT_BLOCKS,
+                )?;
                 let mut record = Value::Object(record.clone());
                 record["content"] = kept;
                 return Some(record);

@@ -51,6 +51,10 @@ use crate::Result;
 use anyhow::{Context, bail};
 use std::path::{Path, PathBuf};
 
+/// The content block types a Cursor user message's text is read from. The publication rule reads
+/// a user message's text through the same list, so a block shown here is never one it overlooks.
+pub(crate) const TEXT_BLOCKS: &[&str] = &["text"];
+
 pub struct Cursor;
 
 /// Name of the directory holding the session directories. The only stable anchor in the path
@@ -403,7 +407,11 @@ fn parse_text(text: &str) -> (Session, Vec<String>) {
             // can land in different blocks.
             let raw = blocks
                 .iter()
-                .filter(|b| b.get("type").and_then(|x| x.as_str()) == Some("text"))
+                .filter(|b| {
+                    b.get("type")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|kind| TEXT_BLOCKS.contains(&kind))
+                })
                 .filter_map(|b| b.get("text").and_then(|x| x.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n");
