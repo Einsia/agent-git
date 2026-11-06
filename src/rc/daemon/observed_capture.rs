@@ -21,6 +21,8 @@ const DELAYS: (std::time::Duration, std::time::Duration) = (
 
 struct Delay {
     failures: u32,
+    /// The quick tries used since the last capture that recorded a carrier.
+    quick: u32,
     until: tokio::time::Instant,
 }
 
@@ -163,11 +165,27 @@ impl Collector {
                     continue;
                 }
             }
+            // A quick try that finds another one waiting on the worker keeps its place.
+            let _quick = if self.in_quick(&logical) {
+                match super::archive_recovery::QUICK_GATE.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
             let request = {
                 let mut state = daemon.lock().await;
                 state.reserve_observed_capture(&logical)
             };
             let Some(request) = request else { continue };
+            let claim = request.prior_entry.as_ref().map(|entry| {
+                entry
+                    .native_source
+                    .as_ref()
+                    .map(|source| source.session_ref(&entry.thread_id))
+                    .unwrap_or_else(|| entry.thread_id.clone())
+            });
             let result = tokio::select! {
                 biased;
                 _ = stop.wait_for(|stopped| *stopped) => None,
@@ -176,9 +194,29 @@ impl Collector {
             };
             daemon.lock().await.opening_sessions.remove(&logical);
             let Some(result) = result else { return };
+            // Slow: the capture ran out of its time, or its landing recorded a wait the worker
+            // may get past when asked again.
+            let slow = match &result {
+                Err(_) => true,
+                Ok(Err(_)) => match claim {
+                    Some(claim) => tokio::task::spawn_blocking(move || {
+                        crate::domain::privacy::pending::load()
+                            .get(&claim)
+                            .is_some_and(|wait| {
+                                wait.refused_bytes.is_none()
+                                    && crate::domain::privacy::service::transient(&wait.reason)
+                            })
+                    })
+                    .await
+                    .unwrap_or(false),
+                    None => false,
+                },
+                Ok(Ok(_)) => false,
+            };
             self.settled(
                 &logical,
                 matches!(result, Ok(Ok(Some(_)))),
+                slow,
                 tokio::time::Instant::now(),
             );
             match result {
@@ -210,16 +248,32 @@ impl Collector {
             .is_some_and(|delay| now < delay.until)
     }
 
-    /// Notes how a capture of `logical` ended: with a carrier recorded, or not.
-    fn settled(&mut self, logical: &str, recorded: bool, now: tokio::time::Instant) {
+    /// Whether the next capture of `logical` is one of its quick tries.
+    fn in_quick(&self, logical: &str) -> bool {
+        self.delayed
+            .get(logical)
+            .is_some_and(|delay| delay.failures == 0 && delay.quick > 0)
+    }
+
+    /// Notes how a capture of `logical` ended: with a carrier recorded, or not. One that ended
+    /// only because the privacy worker did not answer in time (`slow`) is tried again shortly a
+    /// few times before the doubling delay applies.
+    fn settled(&mut self, logical: &str, recorded: bool, slow: bool, now: tokio::time::Instant) {
+        use super::archive_recovery::{QUICK_DELAY, QUICK_TRIES};
         if recorded {
             self.delayed.remove(logical);
             return;
         }
         let delay = self.delayed.entry(logical.into()).or_insert(Delay {
             failures: 0,
+            quick: 0,
             until: now,
         });
+        if slow && delay.failures == 0 && delay.quick < QUICK_TRIES {
+            delay.quick += 1;
+            delay.until = now + super::archive_recovery::retry_delay(QUICK_DELAY);
+            return;
+        }
         delay.failures = delay.failures.saturating_add(1);
         delay.until = now
             + super::archive_recovery::retry_delay(
@@ -654,20 +708,54 @@ mod tests {
         let mut collector = Collector::default();
         let start = tokio::time::Instant::now();
         assert!(!collector.is_delayed("logical", start));
-        collector.settled("logical", false, start);
+        collector.settled("logical", false, false, start);
         assert!(collector.is_delayed("logical", start + first / 2));
         assert!(!collector.is_delayed("logical", start + first));
         assert!(!collector.is_delayed("other", start));
-        collector.settled("logical", false, start);
+        collector.settled("logical", false, false, start);
         assert!(collector.is_delayed("logical", start + first));
         assert!(!collector.is_delayed("logical", start + first * 2));
         for _ in 0..32 {
-            collector.settled("logical", false, start);
+            collector.settled("logical", false, false, start);
         }
         assert!(collector.is_delayed("logical", start + longest / 2));
         assert!(!collector.is_delayed("logical", start + longest));
-        collector.settled("logical", true, start);
+        collector.settled("logical", true, false, start);
         assert!(!collector.is_delayed("logical", start));
+    }
+
+    /// A capture that ended only because the privacy worker did not answer in time is tried again
+    /// a few times a short delay apart, and only then does the doubling delay begin; a capture
+    /// that failed otherwise starts the doubling at once, and one that records a carrier gives
+    /// the quick tries back. Without them a new conversation whose landing met a worker still
+    /// starting would wait half a minute, then a minute, for its finished turn.
+    #[test]
+    fn a_capture_that_met_a_slow_privacy_worker_is_tried_again_shortly() {
+        use super::super::archive_recovery::{QUICK_DELAY, QUICK_TRIES};
+        let (first, _) = DELAYS;
+        let mut collector = Collector::default();
+        let start = tokio::time::Instant::now();
+        let mut now = start;
+        for _ in 0..QUICK_TRIES {
+            collector.settled("logical", false, true, now);
+            assert!(collector.in_quick("logical"));
+            assert!(collector.is_delayed("logical", now + QUICK_DELAY / 2));
+            now += QUICK_DELAY;
+            assert!(!collector.is_delayed("logical", now));
+        }
+        collector.settled("logical", false, true, now);
+        assert!(!collector.in_quick("logical"));
+        assert!(collector.is_delayed("logical", now + QUICK_DELAY));
+        assert!(!collector.is_delayed("logical", now + first));
+        collector.settled("logical", true, false, now);
+        collector.settled("logical", false, true, now);
+        assert!(!collector.is_delayed("logical", now + QUICK_DELAY));
+
+        collector.settled("other", false, false, start);
+        assert!(!collector.in_quick("other"));
+        assert!(collector.is_delayed("other", start + QUICK_DELAY));
+        collector.settled("other", false, true, start);
+        assert!(collector.is_delayed("other", start + first));
     }
 
     /// A Claude Code turn can end by a completion receipt alone, with the transcript unchanged,
