@@ -195,6 +195,60 @@ fn session_pages_preserve_runtime_identity_namespaces_and_supersession() {
     assert_eq!(last["items"][1]["superseded_by"], "codex/replacement");
 }
 
+/// The current folder's sessions lead the session list and the text page's budget never cuts
+/// them: it holds both ahead of the other folders' sessions although the limit is one row, and
+/// names the command for the rest. JSON pages strictly by its limit, with the folder's sessions
+/// first and marked. A listing in the claim store's order can leave them past the first page,
+/// and one that applies the limit before taking them in shows only one.
+#[test]
+fn the_current_folders_sessions_lead_every_status_page() {
+    let lab = Lab::new();
+    let elsewhere = lab.cwd.with_file_name("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let dir = lab.store.join("store").join("claude-code");
+    fs::create_dir_all(&dir).unwrap();
+    let here = [
+        "ffffffff-0000-4000-8000-000000000000",
+        "ffffffff-0000-4000-8000-000000000001",
+    ];
+    let claims = (0..12)
+        .map(|index| (format!("aaaaaaaa-0000-4000-8000-{index:012}"), &elsewhere))
+        .chain(here.map(|id| (id.to_owned(), &lab.cwd)));
+    for (index, (id, cwd)) in claims.enumerate() {
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::json!({
+                "owner": "organization", "agent": "demo", "branch": format!("topic/{index}"),
+                "cwd": cwd,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    let text = String::from_utf8(lab.output(&["status", "--limit", "1"]).stdout).unwrap();
+    let mut rows: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("\tclaude-code\t"))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    rows.sort();
+    assert_eq!(rows, here, "{text}");
+    assert!(
+        text.contains("this folder's 2 sessions are listed first"),
+        "{text}"
+    );
+    assert!(
+        text.contains("… 12 more; next page: `agit status --offset 2 --limit 1`"),
+        "{text}"
+    );
+    let page = lab.run(&["status", "--json", "--limit", "1"]);
+    let sessions = &page["result"]["value"]["sessions"];
+    assert_eq!(sessions["items"].as_array().unwrap().len(), 1);
+    assert!(here.contains(&sessions["items"][0]["session_id"].as_str().unwrap()));
+    assert_eq!(sessions["items"][0]["in_current_folder"], true);
+    assert_eq!(sessions["next_offset"], 1);
+}
+
 /// A WorkBuddy conversation whose transcript exists and whose claim is saved to
 /// `local/demo@work`; returns its native id.
 fn saved_workbuddy_session(lab: &Lab) -> &'static str {

@@ -7,11 +7,15 @@ use crate::infra::{config, local_git::Deadline};
 pub(super) const MAX_LINKS: usize = 4_096;
 pub(super) const MAX_LINK_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The claim inventory as a set: callers order a page as they choose, so a re-listing in another
+/// order is the same inventory, and only a claim added, removed or changed invalidates a page.
 fn identity(links: &[link::Link]) -> Option<Vec<(String, String)>> {
-    links
+    let mut identity = links
         .iter()
         .map(|link| Some((link.instance(), link.to_json().ok()?)))
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    identity.sort();
+    Some(identity)
 }
 
 fn cell(value: &str) -> String {
@@ -248,8 +252,7 @@ fn finish_rows(
     complete: bool,
     mut rows: Vec<Vec<String>>,
 ) -> Page {
-    let (mut after, issues) = link::list_checked_with_limits(store, MAX_LINKS, MAX_LINK_BYTES);
-    after.sort_by_key(|link| !link.is_active());
+    let (after, issues) = link::list_checked_with_limits(store, MAX_LINKS, MAX_LINK_BYTES);
     let unchanged = before.is_some() && before == identity(&after) && issues.is_empty();
     if !unchanged {
         for row in &mut rows {
