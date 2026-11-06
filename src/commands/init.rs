@@ -97,7 +97,6 @@ pub fn run(args: Args) -> CmdResult {
                 // The owner names a directory under the repository store, so it must be a namespace
                 // name before anything is written: `..` or `.` would place the checkout outside it.
                 Some(_) => match super::parse_slug(&n).and_then(|(owner, name)| {
-                    super::canonical_owner(&owner)?;
                     repo::valid_name(&owner)?;
                     Ok((owner, name))
                 }) {

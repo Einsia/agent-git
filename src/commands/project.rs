@@ -1624,12 +1624,14 @@ fn bind(
 ) -> CmdResult {
     let root = root(path)?;
     let (owner, name) = super::parse_slug(repository)?;
-    super::canonical_owner(&owner)?;
     crate::domain::repo::valid_name(&name)?;
     ensure!(
         !repository.contains('@'),
         "project binding requires OWNER/REPO, not a session branch"
     );
+    let name = super::checkout_spelling(&owner, &name).unwrap_or(name);
+    let repository = format!("{owner}/{name}");
+    let repository = repository.as_str();
     let client = crate::hub::Client::from_env();
     let mut project = Project {
         root: root.clone(),
@@ -1714,6 +1716,17 @@ fn bind(
     }
     let client = super::require_login()?;
     let remote = super::remote_request(client.get_agent(&owner, &name))?;
+    // The Hub finds the repository whatever the case of its name; the binding records the
+    // spelling it stores, which its checkout gets.
+    ensure!(
+        remote.owner == owner && remote.name.eq_ignore_ascii_case(&name),
+        "the Hub answered for {repository} with {}/{}",
+        remote.owner,
+        remote.name
+    );
+    let repository = format!("{}/{}", remote.owner, remote.name);
+    let repository = repository.as_str();
+    project.repository = repository.into();
     project.identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
     ensure!(
         matches!(

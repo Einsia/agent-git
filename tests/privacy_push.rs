@@ -198,6 +198,12 @@ impl Hub {
                 let mut words = first.split_whitespace();
                 let method = words.next().unwrap();
                 let target = words.next().unwrap();
+                // The Hub finds a repository whatever the case of its name.
+                let target = if target.eq_ignore_ascii_case("/api/agents/alice/app") {
+                    "/api/agents/alice/app"
+                } else {
+                    target
+                };
                 let mut length = 0;
                 let mut content_type = String::new();
                 let mut compressed = false;
@@ -1917,9 +1923,10 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
 /// checkout's default destination. A checkout of `alice/notes`, pinned to its own repository
 /// identity, publishes to `alice/app` with `--to`: the history lands there, the checkout keeps its
 /// pinned identity and origin, and a plain push still targets `alice/notes`, where the pin refuses
-/// to create a replacement for the missing repository. An implementation that compared the
-/// destination with the pin would refuse the `--to` push; one that bound the checkout to the
-/// destination would send the plain push to `alice/app`.
+/// to create a replacement for the missing repository. `--to` names an existing destination in
+/// another case, and the summary shown before anything uploads names the spelling the Hub stores. An
+/// implementation that compared the destination with the pin would refuse the `--to` push; one
+/// that bound the checkout to the destination would send the plain push to `alice/app`.
 #[test]
 fn an_explicit_destination_publishes_without_rebinding_the_checkout() {
     use agit::hub::identity::{self, RemoteIdentity};
@@ -1989,13 +1996,20 @@ fn an_explicit_destination_publishes_without_rebinding_the_checkout() {
     identity::pin(&repo, &own).unwrap();
     repo.set_remote(&own_url).unwrap();
 
-    assert_success(&run(&[
-        "--yes",
-        "push",
-        "alice/notes@main",
-        "--to",
-        "alice/app",
-    ]));
+    // The destination already exists; `--to` names it in another case.
+    let destination = remote_root.join("alice/app.git");
+    fs::create_dir_all(&destination).unwrap();
+    git(&destination, &["init", "--bare", "--initial-branch=main"]);
+    git(&destination, &["config", "http.receivepack", "true"]);
+    let pushed = run(&["--yes", "push", "alice/notes@main", "--to", "alice/App"]);
+    assert_success(&pushed);
+    assert!(
+        String::from_utf8_lossy(&pushed.stdout).contains(&format!(
+            "Publication destination: alice/app on {} (private, existing repository)",
+            hub.base
+        )),
+        "{pushed:?}"
+    );
     let published = remote_root.join("alice/app.git");
     assert_eq!(
         git(&published, &["rev-parse", "refs/heads/main"]),

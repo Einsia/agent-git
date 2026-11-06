@@ -68,6 +68,7 @@ pub fn run(args: Args) -> CmdResult {
     // ── 1. Fetch. owner-qualified = explicitly networked ──
     let (slug, networked) = match &spec.repo {
         refs::RepoSel::Slug(o, n) => {
+            let n = &super::checkout_spelling(o, n).unwrap_or_else(|| n.clone());
             let slug = format!("{o}/{n}");
             if args.mine {
                 // Ensure it is under your own name first (equivalent to `clone --mine`;
@@ -82,7 +83,9 @@ pub fn run(args: Args) -> CmdResult {
                 if *o != me {
                     copied_from = Some((o.clone(), n.clone()));
                 }
-                (format!("{me}/{n}"), true)
+                // The copy goes by the spelling the Hub gave it, which its checkout has.
+                let mine = super::checkout_spelling(&me, n).unwrap_or_else(|| n.clone());
+                (format!("{me}/{mine}"), true)
             } else if let Some(local) = Repo::open(config::repo_dir(o, n).unwrap_or_default()) {
                 if !fetch_quiet(o, n) {
                     // Damaged objects fail the fetch too, and local history then fails every
@@ -102,12 +105,14 @@ pub fn run(args: Args) -> CmdResult {
                 (slug, true)
             } else {
                 // Automatic read-only clone: **does not bind the current directory**.
-                if let Err(e) = super::clone::readonly_clone(o, n) {
-                    super::fix::register_terminal_api_error(&e);
-                    ui::error(&format!("fetch failed: {e:#}"));
-                    return Ok(super::clone::readonly_clone_error_code(&e));
+                match super::clone::readonly_clone(o, n) {
+                    Ok((_, stored)) => (format!("{o}/{stored}"), true),
+                    Err(e) => {
+                        super::fix::register_terminal_api_error(&e);
+                        ui::error(&format!("fetch failed: {e:#}"));
+                        return Ok(super::clone::readonly_clone_error_code(&e));
+                    }
                 }
-                (slug, true)
             }
         }
         refs::RepoSel::Local(name) => match super::clone::unique_checkout(name)? {
@@ -586,6 +591,7 @@ fn ensure_mine(slug: &str) -> crate::Result<()> {
         return Ok(());
     }
     // Already a local checkout under your own name?
+    let n = super::checkout_spelling(&me, &n).unwrap_or(n);
     if Repo::open(config::repo_dir(&me, &n)?).is_some() {
         return Ok(());
     }

@@ -149,13 +149,21 @@ pub struct Args {
     pub no_launch: bool,
 }
 
-/// Read-only clone (does not bind the current directory).
-pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
+/// Read-only clone (does not bind the current directory), into the checkout of the spelling the
+/// Hub stores, which it returns: the Hub finds a repository whatever the case of its name.
+pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<(Repo, String)> {
     let client = crate::hub::Client::from_env();
     if client.has_token() {
         crate::domain::privacy::service::schedule_sync(client.base());
     }
     let a = super::remote_request(client.get_agent(owner, name))?;
+    anyhow::ensure!(
+        a.owner == owner && a.name.eq_ignore_ascii_case(name),
+        "the Hub answered for {owner}/{name} with {}/{}",
+        a.owner,
+        a.name
+    );
+    let name = a.name.as_str();
     let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &a.agent_id)?;
     let dest = config::repo_dir(owner, name)?;
     let history_update =
@@ -175,7 +183,7 @@ pub(super) fn readonly_clone(owner: &str, name: &str) -> crate::Result<Repo> {
     repo.set_remote(&a.clone_url)?;
     super::migration::finish_external_history_update(&repo, history_update)?;
     super::config::choose_repo_auto_push()?.apply(&repo, &format!("{owner}/{name}"))?;
-    Ok(repo)
+    Ok((repo, name.to_owned()))
 }
 
 /// A fresh clone that failed and left no repository behind published nothing locally, so the

@@ -162,7 +162,10 @@ pub fn run(args: Args) -> CmdResult {
                 .and_then(|t| t.repo.clone())
                 .unwrap_or_else(|| r.to_string());
             match super::parse_slug(&repo_name) {
-                Ok((o, n)) => (format!("{o}/{n}"), true),
+                Ok((o, n)) => (
+                    format!("{o}/{}", super::checkout_spelling(&o, &n).unwrap_or(n)),
+                    true,
+                ),
                 Err(_) => match super::clone::unique_checkout(&repo_name)? {
                     Some(checkout) => (checkout.slug(), false),
                     None => {
@@ -216,10 +219,10 @@ pub fn run(args: Args) -> CmdResult {
 
     let (owner, name) = super::parse_slug(&slug)?;
     let dir = config::repo_dir(&owner, &name)?;
-    let repo = match Repo::open(&dir) {
-        Some(repo) => repo,
+    let (repo, slug) = match Repo::open(&dir) {
+        Some(repo) => (repo, slug),
         None if explicitly_named => match super::clone::readonly_clone(&owner, &name) {
-            Ok(repo) => repo,
+            Ok((repo, stored)) => (repo, format!("{owner}/{stored}")),
             Err(error) => {
                 super::fix::register_terminal_api_error(&error);
                 ui::error(&format!("fetch failed: {error:#}"));

@@ -1447,9 +1447,10 @@ mod unix {
 
     /// `agit repo create <org>/<name>` asks the Hub for a private repository under the
     /// organization and pins the checkout in the organization's directory, where
-    /// `agit init <org>/<name>` completes it in place. Omitting the owner would create the
-    /// repository in the caller's namespace, asking for public would be refused for a member,
-    /// and an init that ignored the owner would build a second, unpinned repository.
+    /// `agit init <org>/<name>` completes it in place. The organization may be typed in any case.
+    /// Omitting the owner would create the repository in the caller's namespace, asking for
+    /// public would be refused for a member, and an init that ignored the owner would build a
+    /// second, unpinned repository.
     #[test]
     fn an_organization_repository_is_created_private_and_completed_in_its_namespace() {
         let lab = Lab::new();
@@ -1484,10 +1485,11 @@ mod unix {
                     json!({"agent_id":AGENT_ID,"owner":"acme","name":"notes",
                            "clone_url":clone_url,"visibility":"private"}),
                 ),
+                step("PATCH", "/api/agents/acme/notes", 200, json!({})),
             ]
         });
         lab.seed_credentials(&hub.base, true);
-        let created = run_bounded(lab.command(&hub.base, &["repo", "create", "acme/notes"]));
+        let created = run_bounded(lab.command(&hub.base, &["repo", "create", "Acme/notes"]));
         assert!(created.status.success(), "{created:?}");
         let checkout = lab.store.join("repos/acme/notes");
         assert!(!lab.store.join("repos/me/notes").exists());
@@ -1505,6 +1507,26 @@ mod unix {
         assert!(initialized.status.success(), "{initialized:?}");
         assert!(!lab.store.join("repos/me/notes").exists());
         lab.git(&checkout, &["rev-parse", "--verify", "refs/heads/main"]);
+
+        // A rename that changes only the case moves the checkout to the new spelling, on a disk
+        // that ignores case as well, and points its remote there.
+        let renamed =
+            run_bounded(lab.command(&hub.base, &["repo", "rename", "acme/notes", "Notes"]));
+        assert!(renamed.status.success(), "{renamed:?}");
+        let checkouts: Vec<_> = fs::read_dir(lab.store.join("repos/acme"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(checkouts, ["Notes"]);
+        let remote = lab.git(
+            &lab.store.join("repos/acme/Notes"),
+            &["remote", "get-url", "origin"],
+        );
+        assert!(
+            String::from_utf8_lossy(&remote)
+                .trim()
+                .ends_with("/acme/Notes.git")
+        );
 
         let requests = hub.finish();
         let publish: Value = serde_json::from_slice(&requests[1].body).unwrap();
