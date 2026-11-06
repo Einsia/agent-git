@@ -2195,7 +2195,32 @@ fn native_resume_cmd(
     let inner = adapter::get(runtime)
         .ok()?
         .resume_command(sid, cwd, prompt, system_prompt)?;
-    Some(wrap_launch(&inner, cwd, slug, branch))
+    let cmd = wrap_launch(&inner, cwd, slug, branch);
+    // Codex may continue in a new session of its own: the launch makes it the claim to its branch,
+    // which nothing else that sees the launch's variables can take.
+    if runtime == "codex"
+        && let Some(store) = Store::open_or_init().ok()
+        && let Ok(id) = crate::domain::link::launch::mint(
+            &store,
+            runtime,
+            slug,
+            branch,
+            cwd,
+            crate::domain::link::launch::RESUME,
+            Some(sid),
+        )
+    {
+        return Some(cmd.replacen(
+            "(export AGIT_SESSION=",
+            &format!(
+                "(export {}={}; export AGIT_SESSION=",
+                crate::domain::link::launch::ENV,
+                shell_quote(&id)
+            ),
+            1,
+        ));
+    }
+    Some(cmd)
 }
 
 /// Reconstruct the next step for an already materialized runtime instance.

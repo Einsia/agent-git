@@ -1142,3 +1142,339 @@ fn supervisor_settles_its_exact_native_link_and_checks_the_branch() {
     );
     assert!(path.exists(), "Unrelated native evidence must be retained");
 }
+
+/// Codex runs every conversation's hooks in one shared process, which keeps the variables of
+/// whichever agit launch started it. A fresh Codex conversation holds the branch only its own
+/// launch made a claim for, and only once: a second conversation under the same variables, in the
+/// same folder or another, records nothing and is told so. An older link that holds a branch on
+/// the variables' word alone, beside another conversation, keeps that branch off the Hub, and
+/// `agit status` says so.
+#[test]
+fn a_codex_conversation_holds_only_the_branch_its_own_launch_claimed() {
+    const C: &str = "cccccccc-0000-4000-8000-000000000003";
+    const D: &str = "dddddddd-0000-4000-8000-000000000004";
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let launch = "11111111-2222-4333-8444-555555555555";
+    let launches = lab.agit_home.join("launch-claims/codex");
+    fs::create_dir_all(&launches).unwrap();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    fs::write(
+        launches.join(format!("{launch}.json")),
+        serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,"start":"startup"})
+            .to_string(),
+    )
+    .unwrap();
+    // A Codex rollout begins with its session header, naming the folder it started in.
+    let rollout = |session: &str, cwd: &std::path::Path| {
+        let dir = lab.home.join(".codex/sessions/2026/11/06");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-11-06T00-00-00-{session}.jsonl"));
+        if path.exists() {
+            return path;
+        }
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({"timestamp":"2026-11-06T00:00:00Z","type":"session_meta",
+                    "payload":{"id":session,"timestamp":"2026-11-06T00:00:00Z","cwd":cwd,
+                        "originator":"codex_cli_rs","cli_version":"0.167.0","source":"cli"}})
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let hook_as =
+        |source: &str, action: &str, session: &str, cwd: &std::path::Path, env: &[(&str, &str)]| {
+            let transcript = rollout(session, cwd);
+            let mut command = lab.agit(&["hooks", action, "--runtime", "codex"]);
+            for (name, value) in env {
+                command.env(name, value);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(
+                    serde_json::json!({"session_id":session,"source":source,"cwd":cwd,
+                    "transcript_path":transcript,
+                    "hook_event_name":if action == "ingest" {"SessionStart"} else {"Stop"}})
+                    .to_string()
+                    .as_bytes(),
+                )
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+    let hook = |action: &str, session: &str, cwd: &std::path::Path, env: &[(&str, &str)]| {
+        hook_as("startup", action, session, cwd, env)
+    };
+    let start = |session: &str, cwd: &std::path::Path, env: &[(&str, &str)]| {
+        hook("ingest", session, cwd, env)
+    };
+    let link = |session: &str| -> Option<serde_json::Value> {
+        fs::read(
+            lab.agit_home
+                .join("store/codex")
+                .join(format!("{session}.json")),
+        )
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+    };
+    let launched = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", launch)];
+    let elsewhere = lab.home.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    for (session, cwd) in [(B, &lab.work), (C, &lab.work), (D, &elsewhere)] {
+        rollout(session, cwd);
+    }
+
+    // The launched conversation takes its launch's claim.
+    start(B, &lab.work, &launched);
+    let b = link(B).expect("the launched conversation holds its branch");
+    assert_eq!(b["branch"], "s1");
+    assert_eq!(b["claimed_by"], "launch");
+    // Another conversation under the same variables, in the same folder: nothing, and it's told.
+    let said = start(C, &lab.work, &launched);
+    assert!(link(C).is_none(), "{:?}", link(C));
+    assert!(
+        said.contains("isn't saving this Codex conversation"),
+        "{said}"
+    );
+    // A launch that resumes a conversation makes its claim for a resumed session: a fresh Codex
+    // conversation in the same folder, under that launch's variables, can't take it; the resumed
+    // one does.
+    const E: &str = "eeeeeeee-0000-4000-8000-000000000005";
+    const F: &str = "ffffffff-0000-4000-8000-000000000006";
+    let resumed = "22222222-3333-4444-8555-666666666666";
+    fs::write(
+        launches.join(format!("{resumed}.json")),
+        serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,"start":"resume"})
+            .to_string(),
+    )
+    .unwrap();
+    let resume_env = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", resumed)];
+    rollout(E, &lab.work);
+    rollout(F, &lab.work);
+    let said = start(E, &lab.work, &resume_env);
+    assert!(link(E).is_none(), "{:?}", link(E));
+    assert!(said.contains("isn't saving"), "{said}");
+    hook_as("resume", "ingest", F, &lab.work, &resume_env);
+    let f = link(F).expect("the resumed conversation takes its launch's claim");
+    assert_eq!(f["claimed_by"], "launch");
+    // A resume launch whose Codex session is already linked by another path: its claim is retired
+    // when that session starts, so another conversation resumed in the same folder, inside the
+    // window and under the same variables, gets nothing.
+    const G: &str = "abababab-0000-4000-8000-000000000007";
+    let rejoined = "33333333-4444-4555-8666-777777777777";
+    fs::write(
+        launches.join(format!("{rejoined}.json")),
+        serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,"start":"resume"})
+            .to_string(),
+    )
+    .unwrap();
+    let rejoin_env = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", rejoined)];
+    hook_as("resume", "ingest", B, &lab.work, &rejoin_env);
+    assert!(
+        !launches.join(format!("{rejoined}.json")).exists(),
+        "the claim is retired"
+    );
+    rollout(G, &lab.work);
+    let said = hook_as("resume", "ingest", G, &lab.work, &rejoin_env);
+    assert!(link(G).is_none(), "{:?}", link(G));
+    assert!(said.contains("isn't saving"), "{said}");
+    // A resume launch's Codex may continue the resumed conversation as a new one that names it as
+    // its origin, and report that start as a fresh one: it still takes the launch's claim, while a
+    // fresh conversation that names no origin can't.
+    const K: &str = "cdcdcdcd-0000-4000-8000-000000000008";
+    const ORIGINAL: &str = "efefefef-0000-4000-8000-000000000009";
+    let continued = "44444444-5555-4666-8777-888888888888";
+    fs::write(
+        launches.join(format!("{continued}.json")),
+        serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,
+            "start":"resume","thread":ORIGINAL})
+        .to_string(),
+    )
+    .unwrap();
+    let continue_env = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", continued)];
+    const L: &str = "dededede-0000-4000-8000-00000000000a";
+    rollout(L, &lab.work);
+    let said = start(L, &lab.work, &continue_env);
+    assert!(link(L).is_none(), "{:?}", link(L));
+    assert!(said.contains("isn't saving"), "{said}");
+    let dir = lab.home.join(".codex/sessions/2026/11/06");
+    fs::write(
+        dir.join(format!("rollout-2026-11-06T00-00-00-{K}.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({"timestamp":"2026-11-06T00:00:00Z","type":"session_meta",
+                "payload":{"id":K,"forked_from_id":ORIGINAL,"timestamp":"2026-11-06T00:00:00Z",
+                    "cwd":lab.work,"originator":"codex_cli_rs","cli_version":"0.167.0","source":"cli"}})
+        ),
+    )
+    .unwrap();
+    // Nor can another conversation resumed in the folder that doesn't continue it.
+    const M: &str = "fafafafa-0000-4000-8000-00000000000b";
+    rollout(M, &lab.work);
+    let said = hook_as("resume", "ingest", M, &lab.work, &continue_env);
+    assert!(link(M).is_none(), "{:?}", link(M));
+    assert!(said.contains("isn't saving"), "{said}");
+    start(K, &lab.work, &continue_env);
+    let k = link(K).expect("the continued conversation takes its launch's claim");
+    assert_eq!(k["claimed_by"], "launch");
+    assert_eq!(k["branch"], "s1");
+    // Under the variables of an older launch that made no claim, in another folder: the same.
+    let before = lab.local_state();
+    let said = start(D, &elsewhere, &[("AGIT_SESSION", "me/qa@s1")]);
+    assert!(said.contains("isn't saving"), "{said}");
+    let changed = |before: &[(String, State)], after: &[(String, State)]| -> Vec<String> {
+        let names = |state: &[(String, State)]| -> std::collections::BTreeSet<String> {
+            state.iter().map(|(name, _)| name.clone()).collect()
+        };
+        names(after)
+            .symmetric_difference(&names(before))
+            .cloned()
+            .collect()
+    };
+    let after = lab.local_state();
+    assert_eq!(
+        changed(&before, &after),
+        Vec::<String>::new(),
+        "nothing is recorded for it"
+    );
+    assert_eq!(after, before);
+    // Its turn's end records nothing either.
+    let before = lab.local_state();
+    hook(
+        "settle",
+        D,
+        &elsewhere,
+        &[("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", launch)],
+    );
+    // Only the note that Codex runs Stop hooks at all, which `agit on` reads, is written.
+    let unchanged = |state: Vec<(String, State)>| -> Vec<(String, State)> {
+        state
+            .into_iter()
+            .filter(|(name, _)| !name.ends_with("hooks-seen/codex-stop"))
+            .collect()
+    };
+    let after = unchanged(lab.local_state());
+    let before = unchanged(before);
+    assert_eq!(changed(&before, &after), Vec::<String>::new());
+    assert_eq!(after, before);
+
+    // A link from before launches made claims, on the variables' word alone, beside another
+    // conversation on the same branch: the branch stays on this computer.
+    fs::write(
+        lab.agit_home.join("store/codex").join(format!("{D}.json")),
+        serde_json::json!({"cwd":lab.work,"owner":"me","agent":"qa","branch":"s1"}).to_string(),
+    )
+    .unwrap();
+    let status = lab.run(&["status"]);
+    assert!(
+        status.contains("me/qa@s1 may hold another conversation's turns"),
+        "{status}"
+    );
+    // The way on leads with the fork; lifting the hold is named second.
+    let fork = status.find("agit fork me/qa@s1").expect("names the fork");
+    let unhold = status
+        .find("agit branch unhold s1")
+        .expect("names the unhold");
+    assert!(fork < unhold, "{status}");
+    let pushed = lab.agit(&["push", "me/qa@s1"]).output().unwrap();
+    assert_eq!(pushed.status.code(), Some(7), "{pushed:?}");
+    assert!(
+        String::from_utf8_lossy(&pushed.stderr).contains("will not be uploaded"),
+        "{pushed:?}"
+    );
+    // Lifting the hold asks; with nobody to ask it changes nothing and names the command with
+    // --yes. Both ways it says the branch's turns upload as they are.
+    let unheld = lab
+        .agit(&["branch", "unhold", "s1", "--repo", "me/qa"])
+        .output()
+        .unwrap();
+    assert_ne!(unheld.status.code(), Some(0), "{unheld:?}");
+    let said = String::from_utf8_lossy(&unheld.stderr).into_owned();
+    assert!(
+        said.contains("agit branch unhold s1 --repo me/qa --yes"),
+        "{said}"
+    );
+    assert!(said.contains("turns as they are"), "{said}");
+    // Moved by agit itself before any hook or push has seen it, the link leaves the hold behind.
+    let holds = lab.agit_home.join("upload-holds");
+    let legacy = lab.agit_home.join("store/codex").join(format!("{D}.json"));
+    let image = fs::read(&legacy).unwrap();
+    fs::remove_dir_all(&holds).unwrap();
+    rollout(D, &lab.work);
+    let moved = lab.run(&[
+        "import",
+        D,
+        "--from",
+        "codex",
+        "--into",
+        "me/qa@elsewhere",
+        "--independent",
+    ]);
+    assert_eq!(
+        link(D).and_then(|link| link["branch"].as_str().map(str::to_owned)),
+        Some("elsewhere".to_owned()),
+        "{moved}"
+    );
+    assert!(holds.exists(), "the move records the hold first");
+    let pushed = lab.agit(&["push", "me/qa@s1"]).output().unwrap();
+    assert_eq!(pushed.status.code(), Some(7), "{pushed:?}");
+    fs::write(&legacy, image).unwrap();
+
+    // Seen first by `agit status` (which changes nothing) and then by any Codex hook, the hold is
+    // recorded there, so it stays when the link goes before any push.
+    let status_only = lab.agit_home.join("upload-holds");
+    let _ = fs::remove_dir_all(&status_only);
+    let shown = lab.run(&["status"]);
+    assert!(
+        shown.contains("may hold another conversation's turns"),
+        "{shown}"
+    );
+    assert!(!status_only.exists(), "status records nothing");
+    start(C, &lab.work, &[]);
+    assert!(status_only.exists(), "a Codex hook records the hold");
+    // The hold stays when the link goes.
+    fs::remove_file(lab.agit_home.join("store/codex").join(format!("{D}.json"))).unwrap();
+    let pushed = lab.agit(&["push", "me/qa@s1"]).output().unwrap();
+    assert_eq!(pushed.status.code(), Some(7), "{pushed:?}");
+    // With --yes it lets the branch go, saying what that means; the push is no longer held.
+    let unheld = lab
+        .agit(&["branch", "unhold", "s1", "--repo", "me/qa", "--yes"])
+        .output()
+        .unwrap();
+    assert!(unheld.status.success(), "{unheld:?}");
+    assert!(
+        String::from_utf8_lossy(&unheld.stderr).contains("turns as they are"),
+        "{unheld:?}"
+    );
+    let pushed = lab.agit(&["push", "me/qa@s1"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&pushed.stderr)
+            .contains("will not be uploaded from this computer"),
+        "{pushed:?}"
+    );
+}

@@ -631,6 +631,46 @@ fn restored_title(rt: &str, ev: &Event) -> Option<String> {
     )
 }
 
+/// The conversation a Codex rollout's header says this one continues, if it names one.
+fn codex_continues(transcript: Option<&str>) -> Option<String> {
+    let head = crate::adapter::codex_rollout::first_line(
+        std::path::Path::new(transcript?),
+        crate::adapter::codex_rollout::HEADER_LIMIT,
+    )
+    .ok()?;
+    let record: serde_json::Value = serde_json::from_slice(&head).ok()?;
+    (record["type"] == "session_meta")
+        .then(|| {
+            record["payload"]["forked_from_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
+/// The claim id an agit launch passes along, if any.
+fn launch_env() -> Option<String> {
+    std::env::var(link::launch::ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether a Codex session carries agit's launch variables without holding a branch of its own.
+/// Codex runs every session's hooks in one shared process, which keeps the variables of whichever
+/// agit launch started it, so they say nothing about this session.
+fn foreign_launch_env(rt: &str, store: Option<&Store>, session_id: &str) -> bool {
+    rt == "codex"
+        && !crate::rc::harness::settlement_is_delegated()
+        && (super::context::from_session_env().is_some() || launch_env().is_some())
+        && store.is_none_or(|store| {
+            // A link that can't be read is left to the paths that report it.
+            let exists = link::link_path(store, rt, session_id).exists();
+            !exists
+                || link::get(store, rt, session_id)
+                    .is_some_and(|link| link.agent.is_none() || link.branch.is_none())
+        })
+}
+
 /// Record which session started and describe its state to the agent.
 fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     let env_session = super::context::from_session_env();
@@ -638,6 +678,54 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     let dir = ev.cwd.as_deref().map(std::path::Path::new);
     let origin = session_origin(ev);
     let origin = origin.as_deref().map(std::path::Path::new);
+    // A branch an unconfirmed Codex link names is held from the first time agit sees it, so the
+    // hold outlives the link whatever becomes of it.
+    if rt == "codex"
+        && let Some(store) = Store::open().ok().flatten()
+    {
+        let _ = link::launch::record_holds(&store);
+    }
+    // A fresh Codex session that an agit launch made a claim for takes it below. Any other one
+    // carrying the launch's variables isn't that launch's: agit records nothing for it here, and
+    // says so to the person.
+    // A launch's claim is for the session it starts, begun as the launch begins it: a fresh
+    // `codex` can't take what a `codex resume` launch made, nor the other way round.
+    let start = match ev.source {
+        Source::Startup => Some(link::launch::STARTUP),
+        Source::Resume => Some(link::launch::RESUME),
+        _ => None,
+    };
+    // The conversation this one continues, as its rollout's header names it.
+    let continues = (rt == "codex")
+        .then(|| codex_continues(ev.transcript_path.as_deref()))
+        .flatten();
+    let launch_claim = rt == "codex"
+        && foreign_launch_env(rt, Store::open().ok().flatten().as_ref(), &ev.session_id);
+    if launch_claim {
+        let claimable = match (&env_session, launch_env(), origin, start) {
+            (Some((slug, branch)), Some(id), Some(origin), Some(start)) => {
+                Store::open().ok().flatten().is_some_and(|store| {
+                    link::launch::open(
+                        &store,
+                        rt,
+                        &id,
+                        link::launch::Taker {
+                            slug,
+                            branch,
+                            origin,
+                            start,
+                            session_id: &ev.session_id,
+                            continues: continues.as_deref(),
+                        },
+                    )
+                })
+            }
+            _ => false,
+        };
+        if !claimable {
+            return Some(serde_json::json!({ "systemMessage": link::launch::NOTICE }));
+        }
+    }
     // A new conversation in a git worktree an on folder covers is where that coverage begins,
     // when nothing began it before: from then on, conversations there upload by themselves.
     if matches!(ev.source, Source::Startup | Source::Clear)
@@ -692,15 +780,58 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
         return None;
     }
 
-    let env_value = match decide(
-        ev.source,
-        env_session.is_some(),
-        existing.is_some(),
-        has_binding,
-    ) {
+    // The session a launch started, already linked by another path: the launch's claim is its
+    // own, so it is retired here rather than left for another session to take.
+    if rt == "codex"
+        && has_binding
+        && let (Some(id), Some((slug, branch))) = (launch_env(), &env_session)
+        && existing.as_ref().is_some_and(|link| {
+            link.branch.as_ref() == Some(branch)
+                && super::context::slug_of_link(link).as_deref() == Some(slug.as_str())
+        })
+    {
+        link::launch::retire(&store, rt, &id, slug, branch, &ev.session_id);
+    }
+    let decision = if launch_claim && !has_binding {
+        Decision::Claim
+    } else {
+        decide(
+            ev.source,
+            env_session.is_some(),
+            existing.is_some(),
+            has_binding,
+        )
+    };
+    let env_value = match decision {
         Decision::Claim => {
             let (repo, branch) = env_session.clone()?;
+            // A Codex session claims only the launch made for it, once.
+            let claimed_by = if rt == "codex" {
+                let taken = match (launch_env(), origin, start) {
+                    (Some(id), Some(origin), Some(start)) => link::launch::take(
+                        &store,
+                        rt,
+                        &id,
+                        link::launch::Taker {
+                            slug: &repo,
+                            branch: &branch,
+                            origin,
+                            start,
+                            session_id: &ev.session_id,
+                            continues: continues.as_deref(),
+                        },
+                    ),
+                    _ => false,
+                };
+                if !taken {
+                    return Some(serde_json::json!({ "systemMessage": link::launch::NOTICE }));
+                }
+                Some(link::launch::CLAIMED_BY.to_owned())
+            } else {
+                None
+            };
             let mut lk = existing.unwrap_or_else(|| Link::new(rt, &ev.session_id, dir));
+            lk.claimed_by = claimed_by;
             if lk.cwd.is_none() {
                 lk.cwd = ev.cwd.clone();
             }
@@ -1051,6 +1182,23 @@ fn settle_event(
         Some(store) => (store, true),
         None => (Store::open_or_init()?, false),
     };
+    if rt == "codex" {
+        let _ = link::launch::record_holds(&store);
+        // The launch's own session, linked: its claim is retired, as at its start.
+        if let (Some(id), Some((slug, branch))) = (launch_env(), super::context::from_session_env())
+            && link::get(&store, rt, &ev.session_id).is_some_and(|link| {
+                link.branch.as_ref() == Some(&branch)
+                    && super::context::slug_of_link(&link).as_deref() == Some(slug.as_str())
+            })
+        {
+            link::launch::retire(&store, rt, &id, &slug, &branch, &ev.session_id);
+        }
+    }
+    // A Codex session holding no branch of its own, under another launch's variables: nothing of
+    // it is recorded here.
+    if !archive_required && foreign_launch_env(rt, Some(&store), &ev.session_id) {
+        return Ok(());
+    }
     // Archive settlement reports its failure to the hook's caller, so it never detaches.
     if !archive_required
         && rt == "claude-code"

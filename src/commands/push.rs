@@ -143,6 +143,19 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Policy)
 }
 
+/// The records a push reads its branch holds from. Records that can't be read hold every branch
+/// of the push, so it is refused with why; no records at all hold nothing.
+fn hold_records(
+    store: crate::Result<Option<crate::domain::store::Store>>,
+) -> Result<Option<crate::domain::store::Store>, String> {
+    store.map_err(|error| {
+        format!(
+            "nothing was uploaded: agit couldn't read its own records of which branches may hold \
+             another conversation's turns ({error:#})"
+        )
+    })
+}
+
 fn publish(mut args: Args) -> CmdResult {
     if args.audit && !ui::prompt::can_ask() {
         ui::error(
@@ -327,6 +340,43 @@ fn publish(mut args: Args) -> CmdResult {
             ui::dim(&format!(
                 "  skipping {} (claimed, nothing settled onto it yet)",
                 unsettled.join(", ")
+            ))
+        ));
+    }
+    // A branch an unconfirmed Codex link named may hold another conversation's turns: it is
+    // never published, automatically or on request.
+    let store = match hold_records(crate::domain::store::Store::open()) {
+        Ok(store) => store,
+        Err(refusal) => {
+            ui::error(&refusal);
+            return Ok(ExitCode::Policy);
+        }
+    };
+    let (held, branches): (Vec<_>, Vec<_>) = branches.into_iter().partition(|branch| {
+        store.as_ref().is_some_and(|store| {
+            crate::domain::link::launch::held(store, &checkout.slug(), branch).is_some()
+        })
+    });
+    for branch in &held {
+        let hold = crate::domain::link::launch::Hold {
+            slug: checkout.slug(),
+            branch: branch.clone(),
+            sessions: Vec::new(),
+            released: false,
+        };
+        if asked_explicitly {
+            ui::error(&format!(
+                "`{}@{branch}` will not be uploaded from this computer.",
+                checkout.slug()
+            ));
+            ui::hint(&crate::domain::link::launch::explain(&hold));
+            ui::hint("its local history stays; nothing was sent to the Hub");
+            return Ok(ExitCode::Policy);
+        }
+        ui::info(format_args!(
+            "{}",
+            ui::dim(&format!(
+                "  skipping {branch} (it may hold another conversation's turns)"
             ))
         ));
     }
@@ -1323,6 +1373,15 @@ mod publication_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hold records that can't be read refuse the push; no records at all hold nothing.
+    #[test]
+    fn unreadable_hold_records_refuse_the_push() {
+        let refused = hold_records(Err(anyhow::anyhow!("permission denied"))).unwrap_err();
+        assert!(refused.contains("nothing was uploaded"), "{refused}");
+        assert!(refused.contains("permission denied"), "{refused}");
+        assert!(matches!(hold_records(Ok(None)), Ok(None)));
+    }
 
     /// Build a repo with two branches off `main`, each carrying a tag.
     fn fixture(tag: &str) -> (std::path::PathBuf, Repo) {

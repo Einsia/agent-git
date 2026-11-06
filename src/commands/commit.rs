@@ -629,6 +629,22 @@ pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
 /// ended happened in**, so this goes from the link straight to the branch and guesses nothing.
 ///
 /// Ordinary hook preconditions stay quiet; Archive authority and capture failures propagate.
+/// Whether a session that runs in `cwd` may settle into a session line recorded in `line_cwd`:
+/// in that folder or below it. A line that records no folder takes any.
+fn settles_in_folder(cwd: Option<&str>, line_cwd: &str) -> bool {
+    line_cwd.is_empty()
+        || cwd.is_some_and(|cwd| {
+            within_folder(std::path::Path::new(cwd), std::path::Path::new(line_cwd))
+        })
+}
+
+/// Whether `path` is `folder` or lies inside it, as the file system resolves them.
+fn within_folder(path: &std::path::Path, folder: &std::path::Path) -> bool {
+    let canonical =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    canonical(path).starts_with(canonical(folder))
+}
+
 pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     if let Some(code) = delegated_settlement(true)? {
         return Ok(code);
@@ -665,7 +681,18 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     // Settle only into a local repo that already exists: exit quietly when it is missing, and
     // never create one out of nowhere under any name — least of all for a link that records a
     // namespace, where a missing checkout is simply missing.
-    if Repo::open(&dir).is_none() {
+    let Some(repo) = Repo::open(&dir) else {
+        return Ok(ExitCode::Ok);
+    };
+    // A Codex session settles only into a session line of its own folder: a session elsewhere
+    // that a shared Codex process put on this branch never lands here.
+    if lk.source == "codex"
+        && let Some(meta) = crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{branch}"))
+        && !settles_in_folder(lk.cwd.as_deref(), &meta.cwd)
+    {
+        crate::warn(&format!(
+            "this Codex conversation runs outside {slug}@{branch}'s folder, so it isn't saved there"
+        ));
         return Ok(ExitCode::Ok);
     }
     let stop_receipt = observe_stop(&lk);
@@ -5375,6 +5402,25 @@ pub(super) fn record_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Codex session settles only into a session line of its own folder or one above it.
+    #[test]
+    fn a_codex_session_settles_only_into_a_line_of_its_own_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let at = |path: &std::path::Path| path.to_string_lossy().into_owned();
+        assert!(settles_in_folder(Some(&at(&project)), &at(&project)));
+        assert!(settles_in_folder(
+            Some(&at(&project.join("sub"))),
+            &at(&project)
+        ));
+        assert!(!settles_in_folder(Some(&at(&elsewhere)), &at(&project)));
+        assert!(!settles_in_folder(None, &at(&project)));
+        assert!(settles_in_folder(Some(&at(&elsewhere)), ""));
+    }
     use crate::domain::link::Link;
     use crate::domain::store::Store;
 

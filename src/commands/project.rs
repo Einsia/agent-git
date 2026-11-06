@@ -3593,7 +3593,7 @@ fn release(
         if link::get(store, &claim.source, &claim.session_id)
             .is_some_and(|current| link::claims_branch(&current, &owner, &agent, branch))
         {
-            fs::remove_file(link::link_path(store, &claim.source, &claim.session_id))?;
+            link::remove(store, &claim.source, &claim.session_id)?;
         }
     }
     Ok(())
