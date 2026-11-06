@@ -88,10 +88,11 @@ pub(super) fn run(
         }
     }
     // Starting the local privacy worker overlaps its startup with the destination checks. It is
-    // joined before preparation, so the preparation's own branch-name check never contends for it.
-    let warmed = {
+    // joined before preparation, so the preparation's own branch-name check never contends for it,
+    // and on every way out before that (see [`WarmUp`]).
+    let mut warmed = WarmUp({
         let (root, names) = (repo.root().to_path_buf(), branches.to_vec());
-        std::thread::spawn(move || {
+        Some(std::thread::spawn(move || {
             if let Ok(redactor) = crate::domain::redact::Redactor::try_this_machine()
                 .and_then(|redactor| redactor.with_repository(&root))
             {
@@ -99,8 +100,8 @@ pub(super) fn run(
                     let _ = redactor.try_scrub(name);
                 }
             }
-        })
-    };
+        }))
+    });
     intent.verify_account(&client)?;
     intent.verify_before_mutation(&client, &repo)?;
     // A destination needs only the selected heads up front, whatever the length of their
@@ -349,7 +350,7 @@ pub(super) fn run(
     // Only an automatic push sets aside a branch it names. The shared-file line may still be
     // publishable, but the branch the push was for is not, so it fails before any request.
     if named && !set_aside.is_empty() {
-        let _ = warmed.join();
+        warmed.join();
         resolving.finish();
         ui::error(&format!(
             "{repository}@{} is withdrawn on the Hub; it stays in this checkout and was not pushed",
@@ -358,7 +359,7 @@ pub(super) fn run(
         return Ok(ExitCode::Policy);
     }
     if named && let Some((branch, limit)) = too_large.first() {
-        let _ = warmed.join();
+        warmed.join();
         resolving.finish();
         ui::error(&format!(
             "{repository}@{branch} {} (at most {limit} in one session snapshot); it stays in this checkout and was not pushed",
@@ -367,7 +368,7 @@ pub(super) fn run(
         return Ok(ExitCode::Policy);
     }
     if selected_branches.is_empty() {
-        let _ = warmed.join();
+        warmed.join();
         resolving.finish();
         ui::info(format_args!("{repository}: nothing to publish."));
         return Ok(ExitCode::Ok);
@@ -444,7 +445,7 @@ pub(super) fn run(
         super::Attempt::First => Some(true),
         super::Attempt::Retry(_) => None,
     };
-    let _ = warmed.join();
+    warmed.join();
     // The first publication resolves its sessions under the stage that read the remote history,
     // so a refusal there stops that stage; each later part opens its own.
     let mut reading_history = Some(resolving);
@@ -1220,6 +1221,27 @@ fn report_left_out_tags(tags: &[crate::domain::privacy_git::sessions::LeftOutTag
             tag.name,
             tag.reason.describe()
         ));
+    }
+}
+
+/// The privacy worker's warm-up, joined however the push ends. The warm-up holds the process's
+/// worker while it starts it, and the process closes its worker on exit only when no thread holds
+/// it. A warm-up still running when a refusal ends the push leaves that worker open after the
+/// command, with the privacy journal open, and the next command's check then finds the journal
+/// busy and publishes nothing.
+struct WarmUp(Option<std::thread::JoinHandle<()>>);
+
+impl WarmUp {
+    fn join(&mut self) {
+        if let Some(warming) = self.0.take() {
+            let _ = warming.join();
+        }
+    }
+}
+
+impl Drop for WarmUp {
+    fn drop(&mut self) {
+        self.join();
     }
 }
 
