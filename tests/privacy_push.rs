@@ -3452,7 +3452,11 @@ fn continued_plain_session_declares_only_what_it_adds() {
 /// rechecked none would send the new value. A record protection changed when it was published
 /// keeps its published line the same way, in a merge as in a turn; a push that matched lines only
 /// by their unprotected form would protect it again under the newer value and drop the published
-/// line.
+/// line. A file holding such a value refuses its publication by name, with nothing sent; a check
+/// of generic rules alone would miss it, and one that skipped what it cannot read would send a
+/// large text file unchecked. So does a value that spans what a file held and what is appended to
+/// it, which a check of the appended bytes alone misses, and a file whose bytes are also a session
+/// record's, which a check that took the record's pass for the file's would send.
 #[test]
 fn plain_publication_carries_only_conversation_records() {
     const CLAUDE_MD: &str = "CANARY-PROJECT-CLAUDE-MD-7f3a";
@@ -3900,6 +3904,88 @@ fn plain_publication_carries_only_conversation_records() {
             "{line} moved: {after_merge}"
         );
     }
+
+    // A file a person's history added, holding a value only the privacy rules know, refuses its
+    // publication by name, with nothing sent: a file is never rewritten for them. So does a text
+    // file too large to check, which would otherwise go out unread. A binary file of that size
+    // goes out, as capture does not read one.
+    let file_branch = |branch: &str, name: &str, content: &[u8]| {
+        repo.git(&["checkout", "-q", "-b", branch, "main"]).unwrap();
+        fs::write(repo.root().join(name), content).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(branch).unwrap();
+        repo.git(&["checkout", "-q", "main"]).unwrap();
+    };
+    let oversized = agit::domain::privacy_publication::MAX_INPUT_BYTES + 1;
+    file_branch(
+        "notes",
+        "notes.txt",
+        format!("ask {REGISTERED} first\n").as_bytes(),
+    );
+    file_branch(
+        "big",
+        "big.txt",
+        "line\n".repeat(oversized / 5 + 1).as_bytes(),
+    );
+    file_branch("image", "image.bin", &vec![0; oversized]);
+    // A value that begins in what a file held and ends in what a later commit appends.
+    file_branch("split", "split.txt", b"ask heron-led");
+    repo.git(&["checkout", "-q", "split"]).unwrap();
+    fs::write(
+        repo.root().join("split.txt"),
+        "ask heron-ledger-7731 first\n",
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("split more").unwrap();
+    // A person's file whose bytes are a session record's, which is judged as records are and
+    // not as text, holding a value registered since.
+    repo.git(&["checkout", "-q", "main"]).unwrap();
+    snapshot(
+        "copy",
+        "claude-code",
+        'f',
+        &[
+            json!({"type":"user","uuid":"c1","parentUuid":null,"sessionId":"f","message":{"role":"user","content":"start the copy"}}),
+        ],
+    );
+    let copied = fs::read_to_string(repo.root().join(meta::LOG_FILE)).unwrap();
+    register("copied", copied.lines().next().unwrap());
+    fs::write(repo.root().join("copy.txt"), &copied).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("copy the record list").unwrap();
+    repo.git(&["checkout", "-q", "main"]).unwrap();
+    for (branch, name, said) in [
+        ("notes", "`notes.txt`", "holds a value"),
+        ("big", "`big.txt`", "too large"),
+        ("split", "`split.txt`", "holds a value"),
+        ("copy", "`copy.txt`", "holds a value"),
+    ] {
+        let before = hub.posts.load(Ordering::Acquire);
+        let refused = run(&["--yes", "push", &format!("alice/app@{branch}")]);
+        assert!(!refused.status.success(), "{refused:?}");
+        let told = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            told.contains(name) && told.contains(said) && told.contains("nothing was published"),
+            "{told}"
+        );
+        assert_eq!(hub.posts.load(Ordering::Acquire), before);
+        assert!(
+            Command::new("git")
+                .current_dir(&remote)
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
+    }
+    assert_success(&run(&["--yes", "push", "alice/app@image"]));
 }
 
 /// A conversation whose first message quotes a placeholder this computer never made publishes

@@ -644,9 +644,14 @@ pub(crate) fn branch_list_unread(
     }
 }
 
+/// How a push says a file in the branch's history stops it: the same push meets the same file.
+pub(crate) const FILE_IN_HISTORY: &str =
+    "so nothing was published. It is in this branch's history:";
+
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
+        FILE_IN_HISTORY,
         REFUSED_AGAIN,
         UPGRADE_FIRST,
         UPGRADE_FIRST_ELSEWHERE,

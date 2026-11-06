@@ -290,7 +290,7 @@ pub fn run(args: Args) -> CmdResult {
             ));
         }
         ui::hint(
-            "· this scan is advisory: `agit push` does not run it or stop on its findings. A push replaces what today's rules recognize in the session records and commit messages it adds; files and tag messages go out as they are",
+            "· this scan is advisory: `agit push` doesn't run it. A push replaces what today's rules recognize in the session records and commit messages it adds, and refuses to send a text file it adds that holds one; binary files, tag messages and low-confidence values go out as they are",
         );
         match &records {
             Some(_) => ui::hint(&format!(

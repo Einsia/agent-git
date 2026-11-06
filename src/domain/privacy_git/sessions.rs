@@ -1525,6 +1525,7 @@ impl ProjectedHistory {
         preparing.finish();
         super::schedule_compaction(&root);
         Ok(Self {
+            source_root: source.root().to_path_buf(),
             repo,
             source: source_plan,
             branches: branches.to_vec(),
@@ -2501,6 +2502,70 @@ impl PreviewOrder<'_> {
     }
 }
 
+/// A session snapshot's own record files: their content passed protection as records, field by
+/// field, and a text judgement of the same bytes is a different one. Every other path of a tree,
+/// and every path of a file line, is a person's file.
+fn session_record_file(path: &str) -> bool {
+    path == meta::LOG_FILE
+        || path == meta::VIEW_FILE
+        || path == meta::LEGACY_LOG_FILE
+        || path == meta::LEGACY_VIEW_FILE
+        || path == meta::FILE
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|id| meta::event_path(id).is_ok_and(|event| event == path))
+}
+
+/// A text file a publication adds must pass capture's protection as it is, whatever rules were in
+/// force when it was recorded, values registered or blocked since included. Anything protection
+/// would replace refuses the publication and names the file: unlike a conversation record, a
+/// person's file is never rewritten for them. The whole file is judged, an appended one included,
+/// since a value can span what its parent held and what is appended. A binary file is not read, as
+/// capture does not read one.
+fn passes_protection(root: &Path, entry: &Introduced, bytes: &[u8]) -> Result<()> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Ok(());
+    };
+    if text.contains('\0') {
+        return Ok(());
+    }
+    let protected = crate::domain::privacy::service::protect_for_commit(
+        Some(root),
+        text,
+        crate::domain::privacy::projector::Mode::ProtectText,
+    )
+    .map_err(|pending| {
+        anyhow::Error::new(pending).context(format!(
+            "`{}` did not pass today's privacy check, so nothing was published",
+            entry.path
+        ))
+    })?;
+    ensure!(
+        protected == text,
+        "`{}` (from commit {}) holds a value today's privacy check replaces, {} remove it there before publishing the branch, or keep the branch local. `agit scan` shows where it is.",
+        entry.path,
+        &entry.commit[..entry.commit.len().min(12)],
+        crate::commands::push::FILE_IN_HISTORY,
+    );
+    Ok(())
+}
+
+/// A text file too large to read here cannot be checked, and unchecked text never goes out quietly:
+/// the person moves it, or chooses Git LFS knowing nothing reads what LFS carries. Whether it is
+/// text is judged as Git judges it, by a NUL in its first bytes.
+fn checkable(repo: &Repo, entry: &Introduced) -> Result<()> {
+    const SNIFF_BYTES: usize = 8000;
+    ensure!(
+        repo.blob_prefix(&entry.blob, SNIFF_BYTES)?.contains(&0),
+        "`{}` (from commit {}) is text too large for the privacy check to read, {} move it out of the session, or keep the branch local; a file tracked with Git LFS is published as it is, unchecked.",
+        entry.path,
+        &entry.commit[..entry.commit.len().min(12)],
+        crate::commands::push::FILE_IN_HISTORY,
+    );
+    Ok(())
+}
+
 /// Text is shown as text; anything else by its length.
 fn describe(value: &mut serde_json::Value, bytes: &[u8]) {
     match std::str::from_utf8(bytes) {
@@ -3229,7 +3294,24 @@ impl ProjectedHistory {
             .filter(|entry| !matches!(entry, PublishedSnapshot::SessionOwnerV2 { .. }))
             .map(PublishedSnapshot::commit)
             .collect::<Vec<_>>();
+        let sessions = self
+            .session_manifest
+            .snapshots
+            .iter()
+            .filter(|entry| matches!(entry, PublishedSnapshot::Plain { .. }))
+            .map(PublishedSnapshot::commit)
+            .collect::<BTreeSet<_>>();
+        let person_file = |entry: &Introduced| {
+            !sessions.contains(entry.commit.as_str()) || !session_record_file(&entry.path)
+        };
         let introduced = introduced_blobs(&self.repo, &commits)?;
+        // A blob is read once, under the first entry that carries it. Any person's file carrying
+        // it is checked as text there, whatever that first entry is, and is the file the refusal
+        // names: a session record's pass is a different judgement and stands for no file.
+        let mut checked_as = BTreeMap::<&str, &Introduced>::new();
+        for entry in introduced.iter().filter(|entry| person_file(entry)) {
+            checked_as.entry(entry.blob.as_str()).or_insert(entry);
+        }
         let mut seen = BTreeSet::new();
         let mut reads = Vec::new();
         let mut steps = Vec::new();
@@ -3272,11 +3354,18 @@ impl ProjectedHistory {
                 let mut value = entry.preview();
                 let bytes = match body {
                     ObjectBody::TooLarge(size) => {
+                        if let Some(file) = checked_as.get(entry.blob.as_str()) {
+                            checkable(&self.repo, file)?;
+                        }
                         value["omitted_bytes"] = json!(size);
                         order.next = index + 1;
                         return emit(value);
                     }
                     ObjectBody::Read(bytes) => bytes,
+                };
+                let check = |bytes: &[u8]| match checked_as.get(entry.blob.as_str()) {
+                    Some(file) => passes_protection(&self.source_root, file, bytes),
+                    None => Ok(()),
                 };
                 if let Some(pointer) = super::super::lfs::Pointer::parse(bytes)? {
                     value["lfs"] = serde_json::to_value(&pointer)?;
@@ -3291,14 +3380,19 @@ impl ProjectedHistory {
                         let mut payload = Vec::new();
                         captured.open_payload(&pointer)?.read_to_end(&mut payload)?;
                         pointer.verify(payload.as_slice())?;
+                        check(&payload)?;
                         describe(&mut value, &payload);
                     }
                 } else if let Some(base) =
                     base.filter(|base| !base.is_empty() && bytes.starts_with(base))
                 {
                     value["appended_to"] = json!(entry.previous);
+                    // The whole file is checked: a value can begin in what the parent held and
+                    // end in what this commit appends. Only the appended bytes are shown.
+                    check(bytes)?;
                     describe(&mut value, &bytes[base.len()..]);
                 } else {
+                    check(bytes)?;
                     describe(&mut value, bytes);
                 }
                 order.next = index + 1;

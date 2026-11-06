@@ -450,7 +450,7 @@ fn remedy_hint(r: SecretRemedy) -> String {
         // Deleting or reverting is the natural reaction and it removes the value from the VIEW
         // only: the object stays reachable and a copy may already be on the Hub, so a real
         // credential has to be revoked where it was issued.
-        SecretRemedy::AgentHistory => "· some findings are in Agent history (blob, commit or tag objects), which AgentGit never rewrites. What the Hub already holds stays, and a push sends files, tag messages and low-confidence values as they are, so don't publish this branch until you've checked them. If a value is a credential, whoever it belongs to should revoke and rotate it; if it isn't yours, tell its owner. To continue the work publicly, start a new session. `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW; LOG and Git history keep it".to_string(),
+        SecretRemedy::AgentHistory => "· some findings are in Agent history (blob, commit or tag objects), which AgentGit never rewrites. What the Hub already holds stays, and a push sends binary files, tag messages and low-confidence values as they are, so don't publish this branch until you've checked them. If a value is a credential, whoever it belongs to should revoke and rotate it; if it isn't yours, tell its owner. To continue the work publicly, start a new session. `agit revert <owner/repo>@<branch>#n.k` removes an event from the VIEW; LOG and Git history keep it".to_string(),
     }
 }
 
