@@ -45,7 +45,9 @@ pub fn home_for(primary: &Repo) -> crate::Result<PathBuf> {
         .join(format!("{name}.worktrees")))
 }
 
-fn canonical(path: &Path) -> PathBuf {
+/// `path` with its links resolved, in the form Git's worktree commands and agit's checkout paths use:
+/// on Windows an ordinary drive or UNC path, not the verbatim one canonicalization returns.
+pub(in crate::commands) fn canonical(path: &Path) -> PathBuf {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     {

@@ -270,17 +270,34 @@ fn file_pull_reconciles_disjoint_changes_and_can_publish_the_result() {
     );
 }
 
-/// Conflict recovery is a persistent manual transaction; refusing dirty input cannot consume it.
+/// Conflict recovery is a persistent manual transaction; refusing dirty input cannot consume it. The
+/// conflict offers ways out on the CLI (keep yours, take theirs, merge by hand). With two conflicting
+/// files, a command that settles only one changes nothing, and one command with a side for each
+/// lands both: a keep-mine leaves no edit behind, so a confirmation spread over two commands would
+/// be lost. Taking a side replaces a link planted at the file instead of writing through it. Off a
+/// terminal the conflicting lines are not printed: an agent's tool output is captured and can be
+/// published.
 #[test]
 fn file_pull_preserves_dirty_input_and_conflicts_can_be_completed_or_aborted() {
     let lab = Lab::new();
     let local = lab.file_checkout();
     fs::write(local.join("page.md"), "Local text\n").unwrap();
+    fs::write(local.join("notes.md"), "Local notes\n").unwrap();
+    // An executable file keeps its bit when a side of it is chosen.
+    #[cfg(unix)]
+    fs::set_permissions(
+        local.join("notes.md"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     lab.git(&local, &["add", "-A"]);
+    lab.git(&local, &["update-index", "--chmod=+x", "notes.md"]);
     lab.git(&local, &["commit", "-qm", "Local text"]);
     let left = lab.git(&local, &["rev-parse", "HEAD"]);
-    lab.git(&lab.source, &["rm", "page.md"]);
-    lab.git(&lab.source, &["commit", "-qm", "Remote deletion"]);
+    fs::write(lab.source.join("page.md"), "Remote text\n").unwrap();
+    fs::write(lab.source.join("notes.md"), "Remote notes\n").unwrap();
+    lab.git(&lab.source, &["add", "-A"]);
+    lab.git(&lab.source, &["commit", "-qm", "Remote text"]);
     fs::write(local.join("draft.md"), "Uncommitted draft\n").unwrap();
     lab.git(&local, &["add", "draft.md"]);
     let index = fs::read(local.join(".git/index")).unwrap();
@@ -297,8 +314,16 @@ fn file_pull_preserves_dirty_input_and_conflicts_can_be_completed_or_aborted() {
     let conflicted = lab.agit(&["pull", "alice/notes@main"]);
     assert!(!conflicted.status.success(), "{conflicted:?}");
     let text = String::from_utf8_lossy(&conflicted.stderr);
+    for way_out in [
+        "--continue --keep-mine page.md",
+        "--continue --take-theirs page.md",
+        "--edit page.md",
+        "--continue --resolved page.md",
+    ] {
+        assert!(text.contains(way_out), "{way_out}: {conflicted:?}");
+    }
     assert!(
-        text.contains("--continue --resolved page.md"),
+        !text.contains("Local text") && !text.contains("Remote text"),
         "{conflicted:?}"
     );
     assert_eq!(lab.git(&local, &["rev-parse", "HEAD"]), left);
@@ -314,20 +339,64 @@ fn file_pull_preserves_dirty_input_and_conflicts_can_be_completed_or_aborted() {
     );
     let conflicted = lab.agit(&["pull", "alice/notes@main"]);
     assert!(!conflicted.status.success(), "{conflicted:?}");
-    fs::write(local.join("page.md"), "Resolved text\n").unwrap();
-    let completed = lab.agit(&[
-        "merge",
-        "--into",
-        "alice/notes@main",
-        "--continue",
-        "--resolved",
-        "page.md",
-    ]);
+    let continue_with = |choices: &[&str]| {
+        let mut args = vec!["merge", "--into", "alice/notes@main", "--continue"];
+        args.extend_from_slice(choices);
+        lab.agit(&args)
+    };
+    let partial = continue_with(&["--keep-mine", "notes.md"]);
+    assert!(!partial.status.success(), "{partial:?}");
+    assert!(
+        String::from_utf8_lossy(&partial.stderr).contains("page.md"),
+        "the file still without a side is named: {partial:?}"
+    );
+    assert!(agit::domain::mergetx::read(&local).unwrap().is_some());
+    // A link planted where the chosen file goes.
+    #[cfg(unix)]
+    let outside = {
+        let outside = lab.home.join("outside.md");
+        fs::write(&outside, "Not in the checkout\n").unwrap();
+        fs::remove_file(local.join("page.md")).unwrap();
+        std::os::unix::fs::symlink(&outside, local.join("page.md")).unwrap();
+        Some(outside)
+    };
+    #[cfg(not(unix))]
+    let outside: Option<PathBuf> = None;
+    let completed = continue_with(&["--keep-mine", "notes.md", "--take-theirs", "page.md"]);
     assert!(completed.status.success(), "{completed:?}");
+    if let Some(outside) = &outside {
+        assert_eq!(
+            fs::read_to_string(outside).unwrap(),
+            "Not in the checkout\n"
+        );
+        assert!(
+            fs::symlink_metadata(local.join("page.md"))
+                .unwrap()
+                .is_file()
+        );
+    }
     assert_eq!(
         fs::read_to_string(local.join("page.md")).unwrap(),
-        "Resolved text\n"
+        "Remote text\n"
     );
+    assert_eq!(
+        fs::read_to_string(local.join("notes.md")).unwrap(),
+        "Local notes\n"
+    );
+    #[cfg(unix)]
+    assert_ne!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &fs::metadata(local.join("notes.md")).unwrap().permissions()
+        ) & 0o100,
+        0,
+        "the kept version stays executable"
+    );
+    assert!(
+        lab.git(&local, &["ls-tree", "HEAD", "--", "notes.md"])
+            .starts_with("100755"),
+        "and the merge records it so"
+    );
+    assert_ne!(lab.git(&local, &["rev-parse", "HEAD"]), left);
     assert!(agit::domain::mergetx::read(&local).unwrap().is_none());
 }
 

@@ -72,6 +72,16 @@ pub struct Args {
     /// Confirm the current contents of a conflicted shared path, including unchanged target text.
     #[arg(long, value_name = "path", requires = "continue_", conflicts_with_all = ["source", "status", "abort", "manual", "dry_run", "as_runtime", "message"])]
     pub resolved: Vec<String>,
+    /// Resolve a conflicted shared file with the target's version (yours) and continue.
+    #[arg(long, value_name = "path", requires = "continue_", conflicts_with_all = ["source", "status", "abort", "manual", "dry_run", "as_runtime", "message"])]
+    pub keep_mine: Vec<String>,
+    /// Resolve a conflicted shared file with the source's version (theirs) and continue.
+    #[arg(long, value_name = "path", requires = "continue_", conflicts_with_all = ["source", "status", "abort", "manual", "dry_run", "as_runtime", "message"])]
+    pub take_theirs: Vec<String>,
+    /// Open a conflicted shared file in your editor with both sides marked; confirm it after with
+    /// `--continue --resolved <path>`.
+    #[arg(long, value_name = "path", conflicts_with_all = ["source", "status", "continue_", "abort", "manual", "dry_run", "as_runtime", "message"])]
+    pub edit: Option<String>,
     /// Cancel this merge; a visible archive landing is completed without rollback.
     #[arg(long)]
     pub abort: bool,
@@ -106,8 +116,15 @@ pub fn run(args: Args) -> CmdResult {
     if args.status {
         return status(&cwd, args.into.as_deref());
     }
+    if let Some(path) = &args.edit {
+        return file_pull::edit(&cwd, args.into.as_deref(), path);
+    }
     if args.continue_ {
-        return continue_tx(&cwd, args.into.as_deref(), &args.resolved);
+        let choices = file_pull::Choices {
+            mine: args.keep_mine.clone(),
+            theirs: args.take_theirs.clone(),
+        };
+        return continue_tx(&cwd, args.into.as_deref(), &args.resolved, &choices);
     }
     if args.abort {
         return abort(&cwd, args.into.as_deref());
@@ -959,7 +976,12 @@ fn pick_drop_summary(cwd: &std::path::Path, into: Option<&str>, cmd: PickCmd) ->
     Ok(ExitCode::Ok)
 }
 
-fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -> CmdResult {
+fn continue_tx(
+    cwd: &std::path::Path,
+    into: Option<&str>,
+    resolved: &[String],
+    choices: &file_pull::Choices,
+) -> CmdResult {
     let Some(selected) = open_lifecycle(cwd, into)? else {
         return Ok(ExitCode::Precondition);
     };
@@ -978,6 +1000,14 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
         else {
             unreachable!()
         };
+        // A side is chosen only in a file merge; an archive merge would land without it.
+        if !choices.is_empty() {
+            ui::error(
+                "--keep-mine and --take-theirs apply to a file merge, not to this archive merge",
+            );
+            ui::hint("edit the file, then confirm it with `--continue --resolved <path>`");
+            return Ok(ExitCode::Usage);
+        }
         let store = crate::domain::store::Store::at(crate::infra::config::store_root()?);
         let target = binding.target_branch().to_owned();
         let before = super::auto_push::branch_tip(repo.root(), &target);
@@ -1017,8 +1047,12 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
     // with no VIEW change. The test is `meta.line` — "meta cannot be read" is not a file line,
     // and such a checkout errors below in its own words.
     let target_is_file_line = meta::is_file_line_at(&repo, &tx.target_head);
-    if !resolved.is_empty() && (!target_is_file_line || tx.generation.is_none()) {
-        ui::error("--resolved requires a current file-line merge transaction with a generation");
+    if (!resolved.is_empty() || !choices.is_empty())
+        && (!target_is_file_line || tx.generation.is_none())
+    {
+        ui::error(
+            "--resolved, --keep-mine and --take-theirs require a current file-line merge transaction with a generation",
+        );
         return Ok(ExitCode::Precondition);
     }
     let target_layout = super::plumbing::storage_layout_at(&repo, &tx.target_head)?;
@@ -1060,6 +1094,29 @@ fn continue_tx(cwd: &std::path::Path, into: Option<&str>, resolved: &[String]) -
     // "worktree ↔ target_head" difference is a difference between two branches, not the merge
     // agent's work, and taking it in credits it to the wrong party.
     let checkout = super::worktree::existing(&repo, &tx.target)?;
+    // The person's choice of side for each conflicted file goes into the checkout here, under this
+    // transaction's control lock and against its own two sides, so a transaction replaced meanwhile
+    // can't receive another's files.
+    let mut resolved = resolved.to_vec();
+    if !choices.is_empty() {
+        let Some(checkout) = &checkout else {
+            ui::error("--keep-mine and --take-theirs require the target branch checkout");
+            return Ok(ExitCode::Precondition);
+        };
+        match file_pull::apply_choices(
+            &repo,
+            checkout,
+            &tx,
+            src_head,
+            choices,
+            &resolved,
+            storage_exclusions(target_layout),
+        )? {
+            Some(chosen) => resolved.extend(chosen),
+            None => return Ok(ExitCode::Precondition),
+        }
+    }
+    let resolved = resolved.as_slice();
     let shared: Vec<String> = match &checkout {
         Some(checkout) => super::plumbing::worktree_changes(
             checkout,
