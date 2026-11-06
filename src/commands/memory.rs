@@ -765,6 +765,155 @@ fn plan_collect(
     plan
 }
 
+// ──────────────────── Codex ────────────────────
+
+/// The folder agit keeps Codex's copies of a branch's memory in, under the account's agit home:
+/// one per repository and branch, the branch's `/` written as `%2F` so each branch is one folder.
+fn codex_mirror_root() -> crate::Result<PathBuf> {
+    Ok(crate::infra::config::agit_home()?
+        .join("runtime-memory")
+        .join("codex"))
+}
+
+fn codex_branch_folder(branch: &str) -> String {
+    branch.replace('%', "%25").replace('/', "%2F")
+}
+
+/// How long one heading and one file name in the Codex index may be, and how many files it lists.
+const CODEX_HEADING_CHARS: usize = 80;
+const CODEX_NAME_CHARS: usize = 80;
+const CODEX_INDEX_FILES: usize = 64;
+
+/// Codex keeps no memory per project, so before agit starts Codex it puts the branch's memory
+/// files, read-only, in a folder of its own and returns what Codex is told: the folder and, for
+/// each file, its name and first heading. Codex reads a file when it is relevant, as Claude Code
+/// reads the files its index names. `None` when the branch has no memory.
+///
+/// The copies are what the Claude Code mirror holds for the same branch, after the same transform,
+/// and nothing collects them back: an edit there never reaches the branch, and the next start
+/// writes the copies over again. The index never carries a body line: only file names and first
+/// headings, a long heading cut and one that isn't printable text left out, so a memory file can't
+/// put a long instruction into what Codex is told about it. The folder of every other branch of
+/// this repository that no longer exists here is removed at the same time.
+pub fn codex_instructions(
+    primary: &Repo,
+    branch: &str,
+    slug: &str,
+) -> crate::Result<Option<String>> {
+    let root = codex_mirror_root()?;
+    let repository = root.join(slug);
+    let folder = repository.join(codex_branch_folder(branch));
+    let mut files = branch_files(primary, &tree_ref(branch))?;
+    for bytes in files.values_mut() {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            *bytes = crate::domain::privacy::service::transform(
+                Some(primary.root()),
+                text,
+                crate::domain::privacy::projector::Mode::HydrateText,
+            )
+            .content
+            .into_bytes();
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&repository) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let other = name.replace("%2F", "/").replace("%25", "%");
+            if other != branch && !primary.has_ref(&tree_ref(&other)) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    if files.is_empty() {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Ok(None);
+    }
+    crate::infra::config::create_state_dir(&folder)?;
+    for existing in md_files(&folder)?.keys() {
+        if !files.contains_key(existing) {
+            std::fs::remove_file(folder.join(existing))?;
+        }
+    }
+    let mut index = Vec::new();
+    for (name, bytes) in &files {
+        let destination = folder.join(name);
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".memory-")
+            .tempfile_in(&folder)?;
+        std::io::Write::write_all(&mut temporary, bytes)?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
+        // A name is text whoever can push wrote, as a heading is: one that isn't short printable
+        // text is left out of the index, its copy still written.
+        if index.len() < CODEX_INDEX_FILES
+            && let Some(name) = index_text(name, CODEX_NAME_CHARS, false)
+        {
+            index.push(match first_heading(bytes) {
+                Some(heading) => format!("- {name}: {heading}"),
+                None => format!("- {name}"),
+            });
+        }
+    }
+    if files.len() > CODEX_INDEX_FILES {
+        index.push(format!(
+            "- … {} more files",
+            files.len() - CODEX_INDEX_FILES
+        ));
+    }
+    Ok(Some(format!(
+        "Team memory for {slug}@{branch}: copies of the shared memory files are in {}. \
+         Read the ones that bear on the task before relying on what they say; changes made there \
+         are not kept.\n{}",
+        folder.display(),
+        index.join("\n")
+    )))
+}
+
+/// The first Markdown heading of a memory file after any frontmatter, cut to
+/// [`CODEX_HEADING_CHARS`]; `None` when there is none or it isn't printable text.
+fn first_heading(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let body = text
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.find("\n---").map(|end| &rest[end + 4..]))
+        .unwrap_or(text);
+    let heading = body
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix('#'))?
+        .trim_start_matches('#')
+        .trim();
+    index_text(heading, CODEX_HEADING_CHARS, true)
+}
+
+/// `text` as the Codex index may show it: `None` when it is empty or holds a control or bidi
+/// character (a newline included), or, unless `cut`, when it runs past `limit` characters; cut to
+/// `limit` with "…" when `cut`.
+fn index_text(text: &str, limit: usize, cut: bool) -> Option<String> {
+    let long = text.chars().count() > limit;
+    if text.is_empty()
+        || (long && !cut)
+        || text.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return None;
+    }
+    let mut shown: String = text.chars().take(limit).collect();
+    if long {
+        shown.push('…');
+    }
+    Some(shown)
+}
+
+/// Removes every Codex copy of memory: the account they were made under is leaving this device.
+pub fn forget_codex_mirrors() {
+    if let Ok(root) = codex_mirror_root() {
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 // ──────────────────── The two directions ────────────────────
 
 /// Before start: branch `memory/` → the runtime directory. None means this runtime has no memory

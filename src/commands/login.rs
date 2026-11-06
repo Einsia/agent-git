@@ -233,6 +233,14 @@ struct Claim {
 fn save_obtained(hub: &str, signed_in: &mut SignedIn) -> crate::Result<Option<Withdrawal>> {
     let claim = signed_in.claim.take();
     let credential = &signed_in.credential;
+    // Codex's copies of memory made under another account leave the device when this one signs
+    // in in its place.
+    if crate::infra::credentials::load(hub)
+        .and_then(|previous| previous.account_id)
+        .is_some_and(|previous| credential.account_id.as_deref() != Some(previous.as_str()))
+    {
+        crate::commands::memory::forget_codex_mirrors();
+    }
     let mut withdrawal = None;
     crate::telemetry::acquisition::save_login_with(hub, credential, || match &claim {
         Some(claim) => {

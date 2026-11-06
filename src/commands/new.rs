@@ -348,9 +348,14 @@ pub fn run(args: Args) -> CmdResult {
     )?;
     super::plumbing::update_ref_cas(&repo, &format!("refs/heads/{branch}"), &commit, None)?;
 
-    ui::success(&format!(
-        "new session {slug} @ {branch} (memory inherited from {from_ref})"
-    ));
+    // Codex keeps no project memory of its own: the branch's memory reaches it only as the index
+    // agit's session-start hook gives a Codex that agit itself starts.
+    let memory = if runtime_of(&args) == "codex" {
+        format!("memory from {from_ref} goes to Codex as an index when agit starts it")
+    } else {
+        format!("memory inherited from {from_ref}")
+    };
+    ui::success(&format!("new session {slug} @ {branch} ({memory})"));
 
     // ── materialize the shared files ──
     //

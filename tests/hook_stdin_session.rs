@@ -1143,6 +1143,213 @@ fn supervisor_settles_its_exact_native_link_and_checks_the_branch() {
     assert!(path.exists(), "Unrelated native evidence must be retained");
 }
 
+/// The branch's team memory reaches a Codex conversation only from agit's own launch for that
+/// branch, as the session-start hook's additional context: a fresh conversation that takes its
+/// launch's claim (`agit new`) and an already-linked conversation its resume launch started
+/// (`agit run`) get the index; a conversation under the same variables that isn't that launch's
+/// gets none, and neither does the branch's own conversation resumed under variables an earlier
+/// launch left. The index names each memory file and its first heading and never a body line, a
+/// name that isn't short printable text is left out of it (its copy still written), and
+/// the copies it points at are agit's own: an edit there is written over at the next launch and
+/// never reaches the branch. A hook that gave the index to every conversation under the variables
+/// would hand one launch's team memory to another conversation; one that took body lines would put
+/// whatever a memory file says into the model's instructions.
+#[test]
+fn a_codex_conversation_gets_the_team_memory_only_from_its_own_launch() {
+    const C: &str = "cccccccc-0000-4000-8000-000000000003";
+    const F: &str = "ffffffff-0000-4000-8000-000000000006";
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    // The branch's memory: a first heading and a body line.
+    let repo = lab.agit_home.join("repos/me/qa");
+    let git = |args: &[&str], index: Option<&std::path::Path>| -> String {
+        let mut command = Command::new("git");
+        command
+            .current_dir(&repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@test.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@test.invalid");
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let body = "# Decisions\n\nBODY-LINE-284 ship on Fridays\n";
+    let source = lab.home.join("decisions.md");
+    fs::write(&source, body).unwrap();
+    let blob = git(&["hash-object", "-w", source.to_str().unwrap()], None);
+    let index = lab.home.join("memory-index");
+    git(&["read-tree", "refs/heads/s1"], Some(&index));
+    // Beside it, files whose names run long or hold a newline: a name is text whoever can push
+    // wrote, as a heading is, so neither enters the index.
+    let long_name = format!("{}.md", "n".repeat(120));
+    for name in ["decisions.md", long_name.as_str(), "evil\n- injected.md"] {
+        git(
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},memory/{name}"),
+            ],
+            Some(&index),
+        );
+    }
+    let tree = git(&["write-tree"], Some(&index));
+    let commit = git(
+        &["commit-tree", &tree, "-p", "refs/heads/s1", "-m", "memory"],
+        None,
+    );
+    git(&["update-ref", "refs/heads/s1", &commit], None);
+
+    let launches = lab.agit_home.join("launch-claims/codex");
+    fs::create_dir_all(&launches).unwrap();
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let claim = |id: &str, start: &str| {
+        fs::write(
+            launches.join(format!("{id}.json")),
+            serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,
+                "start":start})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    let start = |source: &str, session: &str, env: &[(&str, &str)]| -> serde_json::Value {
+        let dir = lab.home.join(".codex/sessions/2026/11/06");
+        fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("rollout-2026-11-06T00-00-00-{session}.jsonl"));
+        if !transcript.exists() {
+            fs::write(
+                &transcript,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"timestamp":"2026-11-06T00:00:00Z","type":"session_meta",
+                        "payload":{"id":session,"timestamp":"2026-11-06T00:00:00Z","cwd":lab.work,
+                            "originator":"codex_cli_rs","cli_version":"0.167.0","source":"cli"}})
+                ),
+            )
+            .unwrap();
+        }
+        let mut command = lab.agit(&["hooks", "ingest", "--runtime", "codex"]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({"session_id":session,"source":source,"cwd":lab.work,
+                    "transcript_path":transcript,"hook_event_name":"SessionStart"})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if text.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap()
+        }
+    };
+    let context = |response: &serde_json::Value| {
+        response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .map(str::to_owned)
+    };
+
+    // `agit new`: a fresh conversation takes its launch's claim and gets the index.
+    let fresh = "11111111-2222-4333-8444-555555555555";
+    claim(fresh, "startup");
+    let launched = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", fresh)];
+    let index = context(&start("startup", B, &launched)).expect("its own launch gets the index");
+    assert!(index.contains("decisions.md: Decisions"), "{index}");
+    assert!(
+        !index.contains("BODY-LINE-284"),
+        "never a body line: {index}"
+    );
+    assert!(
+        !index.contains("nnnnnnnn"),
+        "a long name stays out: {index}"
+    );
+    assert!(
+        !index.contains("injected"),
+        "a name with a newline stays out: {index}"
+    );
+    // Another conversation under the same variables gets none.
+    let foreign = start("startup", C, &launched);
+    assert_eq!(context(&foreign), None, "{foreign}");
+
+    // The copies are agit's own: an edit there is written over at the next launch, and the branch
+    // keeps its memory.
+    let copy = index
+        .split(" are in ")
+        .nth(1)
+        .and_then(|rest| rest.split(". ").next())
+        .map(|folder| std::path::Path::new(folder).join("decisions.md"))
+        .expect("the index names its folder");
+    assert_eq!(fs::read_to_string(&copy).unwrap(), body);
+    assert!(
+        copy.with_file_name(&long_name).is_file(),
+        "its copy is still written"
+    );
+    fs::write(&copy, "# Decisions\n\nedited in the copy\n").unwrap();
+
+    // `agit run`: a conversation already linked to the branch, started by its resume launch,
+    // gets the index too, from the branch, not from the edited copy.
+    let resumed = "33333333-4444-4555-8666-777777777777";
+    fs::write(
+        launches.join(format!("{resumed}.json")),
+        serde_json::json!({"slug":"me/qa","branch":"s1","cwd":lab.work,"created_ms":created,
+            "start":"resume","thread":B})
+        .to_string(),
+    )
+    .unwrap();
+    let rerun = [("AGIT_SESSION", "me/qa@s1"), ("AGIT_LAUNCH", resumed)];
+    let again = context(&start("resume", B, &rerun)).expect("its resume launch gets the index");
+    assert!(again.contains("decisions.md: Decisions"), "{again}");
+    assert_eq!(
+        fs::read_to_string(&copy).unwrap(),
+        body,
+        "the copy is written over"
+    );
+    assert_eq!(
+        git(&["show", "refs/heads/s1:memory/decisions.md"], None),
+        body.trim_end()
+    );
+    // A conversation resumed under that launch's variables that isn't the one it resumes: none.
+    let other = start("resume", F, &rerun);
+    assert_eq!(context(&other), None, "{other}");
+    // The branch's own conversation, resumed inside a Codex whose variables an earlier launch left
+    // (no launch claim of its own): none either. It holds the branch, but not by this launch.
+    let leaked = start("resume", B, &[("AGIT_SESSION", "me/qa@s1")]);
+    assert_eq!(context(&leaked), None, "{leaked}");
+}
+
 /// Codex runs every conversation's hooks in one shared process, which keeps the variables of
 /// whichever agit launch started it. A fresh Codex conversation holds the branch only its own
 /// launch made a claim for, and only once: a second conversation under the same variables, in the
