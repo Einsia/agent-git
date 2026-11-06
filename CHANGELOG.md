@@ -8,6 +8,33 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.44] - 2026-11-07
+
+### Added
+
+- When `agit pull` stops on a file that changed on both sides, the terminal shows each conflicting place with both
+  versions and who last changed each, and one `agit merge --into <target> --continue` settles every file with
+  `--keep-mine`, `--take-theirs` or `--resolved` (after `--edit <path>` opens it in your editor), instead of editing
+  agit's checkout by hand.
+
+### Changed
+
+- Commits in a repository agit made for a project on this computer, as remote control does, now carry that repository's
+  own agit identity instead of your account's name and email. Commits made before the upgrade keep the name they had.
+
+### Fixed
+
+- Some branches with a Codex conversation that an agit before 0.2.43 linked hold their uploads until you confirm that
+  conversation with `agit branch confirm` (or fork at your own turn). `agit status` names them.
+- The request inside a WorkBuddy message's `<user_query>` block is published, as it is for Cursor, and a session
+  published earlier shows its requests from its next push.
+- On a computer that continued a session it took from the Hub with `agit run`, `agit run` and `agit resume` no longer
+  refuse the branch as having tracking commits that aren't integrated right after its own upload.
+- `agit config --repo <repo> push.auto false` now works before the repository's checkout exists on this computer, and
+  the off holds when the first saved conversation creates it.
+- Resuming a session in a changed folder as another runtime asks once; choosing to continue no longer meets a second
+  question whose default cancels.
+
 ## [0.2.43] - 2026-11-06
 
 ### Changed
