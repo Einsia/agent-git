@@ -938,7 +938,7 @@ pub(super) fn run(
             .filter(|published| published.status != PublicationStatus::Unconfirmed)
             .filter_map(|published| published.reference.name().strip_prefix("refs/heads/"))
         {
-            crate::domain::privacy::pending::upload::clear(&format!("{repository}@{branch}"));
+            crate::domain::privacy::pending::upload::clear_uploaded(&[&repository, slug], branch);
         }
         let accepted: Vec<String> = [&report.heads, &report.tags]
             .into_iter()

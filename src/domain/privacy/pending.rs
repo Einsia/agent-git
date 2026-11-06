@@ -153,11 +153,38 @@ pub mod upload {
         super::write(FILE, &waiting);
     }
 
-    /// Note that `target` uploaded.
-    pub fn clear(target: &str) {
+    /// Note that `branch` of the repository known here as any of `repositories` uploaded.
+    pub fn clear_uploaded(repositories: &[&str], branch: &str) {
         let mut waiting = load();
-        if waiting.remove(target).is_some() {
+        let before = waiting.len();
+        waiting.retain(|target, _| !uploaded(target, repositories, branch));
+        if waiting.len() != before {
             super::write(FILE, &waiting);
+        }
+    }
+
+    /// Whether the wait recorded for `target` ends when `branch` of the repository known here as
+    /// any of `repositories` lands. A wait is recorded under the target the push was asked for,
+    /// which for a device-local checkout is its local name while the Hub's destination has
+    /// another, so either name ends it. Matched by the destination's name alone, such a wait is
+    /// never cleared, and status lists it after the upload landed.
+    fn uploaded(target: &str, repositories: &[&str], branch: &str) -> bool {
+        target.split_once('@').is_some_and(|(repository, waited)| {
+            waited == branch && repositories.contains(&repository)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A wait recorded under a device-local checkout's name ends when its branch lands under
+        /// the Hub destination's name; another branch's wait, and another repository's, stay.
+        #[test]
+        fn a_wait_ends_when_its_branch_lands_under_either_name() {
+            let known = ["alice/notes", "local/project-1"];
+            assert!(super::uploaded("local/project-1@talk", &known, "talk"));
+            assert!(super::uploaded("alice/notes@talk", &known, "talk"));
+            assert!(!super::uploaded("local/project-1@other", &known, "talk"));
+            assert!(!super::uploaded("alice/app@talk", &known, "talk"));
         }
     }
 }
