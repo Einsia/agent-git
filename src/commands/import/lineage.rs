@@ -51,6 +51,15 @@ struct Report {
     candidates: Vec<Candidate>,
     unavailable: Vec<Unavailable>,
     independent: Option<FixCommand>,
+    /// The session's claim an import into the destination moves, when it is claimed on another
+    /// branch.
+    claim_move: Option<ClaimMove>,
+}
+
+#[derive(Serialize)]
+struct ClaimMove {
+    from: String,
+    to: String,
 }
 
 #[derive(Clone)]
@@ -137,6 +146,7 @@ impl Report {
                 session_id: session_id.to_owned(),
             },
             independent: action(runtime, session_id, &destination, None),
+            claim_move: None,
             destination,
             scan_state: "complete",
             semantic_discovery_available: false,
@@ -191,6 +201,8 @@ impl Report {
     }
 }
 
+/// A typed action carries the confirmation only when this invocation already supplied it
+/// (`--yes` or `AGIT_YES`): reporting never confirms on the caller's behalf.
 fn action(
     runtime: &str,
     session_id: &str,
@@ -202,10 +214,12 @@ fn action(
     let choice = commit
         .map(|commit| format!("--onto={commit}"))
         .unwrap_or_else(|| "--independent".to_owned());
-    FixCommand::current(
-        &["import", &runtime, &destination, &choice, "--", session_id],
-        true,
-    )
+    let mut args = vec!["import", &runtime, &destination, &choice];
+    if std::env::var_os("AGIT_YES").is_some() {
+        args.push("-y");
+    }
+    args.extend(["--", session_id]);
+    FixCommand::current(&args, true)
 }
 
 struct Prepared {
@@ -285,6 +299,16 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
             }));
         }
     };
+    if let Some((_, link)) = &selected
+        && link.is_active()
+        && let Some((owner, agent)) = destination.slug.split_once('/')
+        && let Some(from) = super::claimed_elsewhere(link, owner, agent, &destination.branch)
+    {
+        report.claim_move = Some(ClaimMove {
+            from,
+            to: destination.qualified(),
+        });
+    }
     if let Some(repo) = repo::Repo::open(&destination.directory)
         && let Err(error) = crate::commands::migration::check_readonly_repo_startup_local(&repo)
     {
@@ -536,13 +560,21 @@ fn print_report(report: &Report) {
         "Local lineage inspection: {} ({})",
         report.destination, report.scan_state
     );
+    if let Some(claim) = &report.claim_move {
+        eprintln!(
+            "Importing here also moves session {}'s claim from {} to {}; its later turns settle there. The -y in the commands below confirms that move.",
+            link::short(&report.native.session_id),
+            claim.from,
+            claim.to
+        );
+    }
     for candidate in &report.candidates {
         eprintln!(
             "  {}: {} completed turns, {} records ({})",
             candidate.commit, candidate.completed_turns, candidate.records, candidate.evidence
         );
         if let Some(action) = &candidate.apply {
-            print_action(action);
+            print_action(action, report.claim_move.is_some());
         }
     }
     if report.candidates.is_empty() {
@@ -564,11 +596,21 @@ fn print_report(report: &Report) {
     }
     if let Some(action) = &report.independent {
         eprintln!("Explicit independent import:");
-        print_action(action);
+        print_action(action, report.claim_move.is_some());
     }
 }
 
-fn print_action(action: &FixCommand) {
+/// Prints a command a person can run as it stands. When the import moves a claim, the line
+/// printed before it says so and the command carries `-y`: in import, `-y` confirms that move
+/// and nothing else, so a confirmation import gains later must not be answered by this `-y`.
+fn print_action(action: &FixCommand, moves_claim: bool) {
+    let confirmed;
+    let action = if moves_claim {
+        confirmed = action.confirmed();
+        &confirmed
+    } else {
+        action
+    };
     if let Some(command) = action.human_command() {
         #[cfg(windows)]
         eprintln!("  PowerShell 7.3 or newer:");

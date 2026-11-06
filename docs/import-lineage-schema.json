@@ -15,7 +15,8 @@
     "semantic_discovery_available",
     "candidates",
     "unavailable",
-    "independent"
+    "independent",
+    "claim_move"
   ],
   "properties": {
     "schema": {
@@ -169,6 +170,32 @@
         },
         {
           "$ref": "cli-output-v2.json#/$defs/fix_command"
+        }
+      ]
+    },
+    "claim_move": {
+      "description": "The session's existing claim an import into the destination moves, when the session is claimed on another branch; null otherwise. The typed actions carry --yes only when the inspecting invocation supplied it; the human report prints its commands with -y after a line naming this move.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "from",
+            "to"
+          ],
+          "properties": {
+            "from": {
+              "type": "string",
+              "minLength": 1
+            },
+            "to": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
       ]
     }

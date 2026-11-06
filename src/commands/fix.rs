@@ -78,6 +78,24 @@ impl FixCommand {
         )
     }
 
+    /// The same command with `-y` before its `--`, unless it already carries it.
+    pub(crate) fn confirmed(&self) -> Self {
+        let mut confirmed = self.clone();
+        if !confirmed
+            .argv
+            .iter()
+            .any(|arg| arg == "-y" || arg == "--yes")
+        {
+            let at = confirmed
+                .argv
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(confirmed.argv.len());
+            confirmed.argv.insert(at, "-y".to_owned());
+        }
+        confirmed
+    }
+
     /// A copied command retains its observed directory and routing without changing the shell.
     pub(crate) fn human_command(&self) -> Option<String> {
         if self
