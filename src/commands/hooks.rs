@@ -1213,6 +1213,13 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         .then(|| session_origin(&ev))
         .flatten()
         .and_then(|origin| failure_line(rt, &ev.session_id, std::path::Path::new(&origin)));
+    // A Codex conversation an older agit linked to a branch held for it: told once, at the end of
+    // a turn, how to go on.
+    let failure = failure.or_else(|| {
+        (!await_reply && rt == "codex")
+            .then(|| older_line(&ev.session_id))
+            .flatten()
+    });
     let Some(failure) = failure else {
         return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
     };
@@ -1222,6 +1229,29 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     crate::ui::with_info_on_stderr(true, || {
         settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
     })
+}
+
+/// The line a Codex conversation an older agit linked to a held branch is told, the first time
+/// one of its turns ends after the hold.
+fn older_line(session_id: &str) -> Option<String> {
+    let store = Store::open().ok().flatten()?;
+    let _ = link::launch::record_holds(&store);
+    let lk = link::get(&store, "codex", session_id)?;
+    if !link::launch::older(&lk) {
+        return None;
+    }
+    let slug = super::context::slug_of_link(&lk)?;
+    let hold = link::launch::held(&store, &slug, lk.branch.as_deref()?)?;
+    let told = crate::infra::config::agit_home()
+        .ok()?
+        .join("hooks-seen")
+        .join(format!("codex-older-{session_id}"));
+    if told.exists() {
+        return None;
+    }
+    crate::infra::config::create_state_dir(told.parent()?).ok()?;
+    std::fs::write(&told, b"").ok()?;
+    Some(link::launch::explain(&hold))
 }
 
 fn settle_event(
