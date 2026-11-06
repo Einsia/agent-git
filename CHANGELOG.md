@@ -8,6 +8,55 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.42] - 2026-11-06
+
+### Added
+
+- Published Hermes and OpenClaw sessions show the prompts the person typed: in Hermes, those from their own console; in
+  OpenClaw, those it marks as the owner's.
+
+### Changed
+
+- Published OpenCode sessions show the prompts the person typed.
+- A push stops before uploading anything when a text file it adds holds a value your privacy rules replace, or is too
+  large to check, and names the file so you can move it or keep the branch local.
+- `agit scan --secrets` says which parts a push replaces and which it sends as they are, advises not to publish a branch
+  whose Agent history holds a secret until the findings are checked, to have its owner revoke and rotate a real
+  credential, and to continue in a new session; it suggests allowing a value only when it's yours and not a credential.
+- `agit tag -m` is refused on a session turn: a tag there is published without a message, and its name is held to the
+  check a branch name meets.
+- An owner typed in uppercase is accepted as the lowercase owner, and a repository name typed in another case reaches
+  the existing repository and its checkout.
+
+### Fixed
+
+- A turn whose transcript ends with a stop-hook summary now finishes archiving and uploads, instead of retrying without
+  end.
+- A turn whose archive met a slow privacy check is tried again within seconds.
+- When the Hub is slow to answer a sign-in renewal, agit tries again instead of signing the device out, keeps saving
+  conversations on this computer while signed out, and says once that `agit login` is needed when the Hub has really
+  ended the sign-in.
+- After an agit upgrade, the running daemon keeps settling and archiving conversations with its own version instead of
+  failing or running the new binary's helpers; a privacy check that cannot run is retried instead of leaving turns
+  unsettled.
+- An agit upgrade no longer waits for ever behind a conversation left idle; after 30 minutes idle it is paused for the
+  update and continues with your next message.
+- Stopping the agit daemon, including with SIGTERM, interrupts a running turn the way a person's interrupt does instead
+  of cutting it off mid-tool; the conversation shows as interrupted and continues with the next message.
+- When the agit daemon crashes or is killed during a turn, the next start closes that turn so the conversation can
+  continue, and archives what was recorded; resuming a conversation left with an unfinished tool call no longer fails.
+- Of two terminals open on one conversation, the first stays its writer; the second says what holds it and waits.
+- A new conversation whose first message quotes a placeholder from somewhere else, such as pasted output, now uploads;
+  only its first message is checked against its branch name.
+- A push run right after a push that stopped early no longer fails with "privacy check pending (store_busy)".
+- `agit commit --milestone` (and `--tag`) given while the turn is still running goes on that turn when it is saved; with
+  nothing new to save, it names the last saved turn.
+- A tag on a session turn reaches the Hub on the commit the turn was published as; `agit push` names any local tag it
+  doesn't upload and why, and doesn't report "already up to date" while one is missing.
+- When an import prints the command to run next and that import also moves the session's claim from another branch, the
+  printed command now works as printed: the report says the claim moves, and the command carries the -y that confirms
+  it.
+
 ## [0.2.41] - 2026-11-06
 
 ### Added
