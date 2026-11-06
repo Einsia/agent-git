@@ -63,9 +63,8 @@ fn run_json(
     let mut check = Check::default();
     let mut result_code = ExitCode::Ok;
     if args.check {
-        if cred.refresh_expired() {
-            ui::error("the refresh token is expired — decidable locally, no round-trip needed.");
-            ui::hint("next: sign in again with `agit login`");
+        if !cred.renewable() {
+            unrenewable(hub, cred);
             // No request was made, so reachability is unknown rather than false.
             result_code = ExitCode::Auth;
         } else {
@@ -193,7 +192,7 @@ fn json_report(
                 "expires_at": cred.access_expires_at,
             },
             "refresh": {
-                "state": token_state(&cred.refresh_expires_at),
+                "state": if cred.refused() { "refused" } else { token_state(&cred.refresh_expires_at) },
                 "expires_at": cred.refresh_expires_at,
             },
         },
@@ -214,9 +213,8 @@ fn run_human(
     let mut code = ExitCode::Ok;
     let mut authenticated = false;
     if args.check {
-        if cred.refresh_expired() {
-            ui::error("the refresh token is expired — decidable locally, no round-trip needed.");
-            ui::hint("next: sign in again with `agit login`");
+        if !cred.renewable() {
+            unrenewable(hub, cred);
             code = ExitCode::Auth;
         } else {
             let (check, result) = verify_online(hub, client, true);
@@ -238,9 +236,32 @@ fn run_human(
     println!(
         "tokens   access {} · refresh {}",
         state(&cred.access_expires_at),
-        state(&cred.refresh_expires_at),
+        if cred.refused() {
+            "refused by the Hub".to_owned()
+        } else {
+            state(&cred.refresh_expires_at)
+        },
     );
+    if cred.refused() {
+        ui::hint(&format!(
+            "the Hub no longer accepts this sign-in; {}",
+            ui::login_hint(hub)
+        ));
+    }
     Ok(code)
+}
+
+/// Why a sign-in that can't be renewed can't, told without asking the Hub.
+fn unrenewable(hub: &str, cred: &credentials::HubCredential) {
+    if cred.refused() {
+        ui::error(
+            "the Hub refused this sign-in when agit last renewed it, so it can't be renewed again.",
+        );
+        ui::hint(&ui::login_hint(hub));
+    } else {
+        ui::error("the refresh token is expired — decidable locally, no round-trip needed.");
+        ui::hint("next: sign in again with `agit login`");
+    }
 }
 
 fn parsed_state(expires_at: &chrono::DateTime<chrono::FixedOffset>) -> &'static str {

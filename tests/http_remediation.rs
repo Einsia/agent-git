@@ -1108,14 +1108,21 @@ mod unix {
                 );
                 refresh.status = status;
                 refresh.bearer = None;
-                vec![
-                    Step::error(
-                        "GET",
-                        "/api/auth/me",
-                        authentication_error("synthetic expired access"),
-                    ),
-                    refresh,
-                ]
+                let mut steps = vec![Step::error(
+                    "GET",
+                    "/api/auth/me",
+                    authentication_error("synthetic expired access"),
+                )];
+                // A renewal with no answer from the Hub is sent again at once.
+                if status == 503 {
+                    let mut again =
+                        Step::error("POST", "/api/auth/refresh", refresh.response.clone());
+                    again.status = status;
+                    again.bearer = None;
+                    steps.push(again);
+                }
+                steps.push(refresh);
+                steps
             });
             lab.seed_credentials(&hub.base, true);
             let before = fs::read(lab.credential_path(&hub.base)).unwrap();
@@ -1144,11 +1151,13 @@ mod unix {
             assert!(!value.to_string().contains("synthetic expired access"));
             assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
             let requests = hub.finish();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(
-                serde_json::from_slice::<Value>(&requests[1].body).unwrap(),
-                json!({"refresh_token":OLD_REFRESH})
-            );
+            assert_eq!(requests.len(), if status == 503 { 3 } else { 2 });
+            for renewal in &requests[1..] {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&renewal.body).unwrap(),
+                    json!({"refresh_token":OLD_REFRESH})
+                );
+            }
         }
     }
 
@@ -1162,9 +1171,16 @@ mod unix {
             (503, "repository_unavailable", true, false),
         ] {
             let lab = Lab::new();
+            // The Hub's own refusal of a renewal is recorded, so the second run answers from it
+            // without sending the refused token again.
+            let refused_here = status == 401 && login;
             let hub = Hub::new(|_| {
                 let mut steps = Vec::new();
-                for _ in [true, false] {
+                for _ in if refused_here {
+                    &[true][..]
+                } else {
+                    &[true, false][..]
+                } {
                     let mut body =
                         json!({"error":"synthetic identity refusal", "kind":kind, "fix":[]});
                     if recipe {
@@ -1209,14 +1225,26 @@ mod unix {
             let output = run_bounded(lab.command(&hub.base, &["whoami", "--check"]));
             assert_eq!(output.status.code(), Some(code));
             let stderr = String::from_utf8(output.stderr).unwrap();
-            assert!(stderr.contains("synthetic identity refusal"));
+            assert_eq!(
+                stderr.contains("synthetic identity refusal"),
+                !refused_here,
+                "{stderr}"
+            );
+            assert_eq!(
+                stderr.contains("refused this sign-in"),
+                refused_here,
+                "{stderr}"
+            );
             assert!(!stderr.contains("synthetic expired access"));
             assert_eq!(stderr.contains("log in with `agit login --hub"), login);
             if !login {
                 assert!(!stderr.contains("sign in again"));
             }
             assert_eq!(fs::read(lab.credential_path(&hub.base)).unwrap(), before);
-            assert_eq!(hub.finish().len(), if status == 401 { 4 } else { 2 });
+            assert_eq!(
+                hub.finish().len(),
+                if status == 401 && !refused_here { 4 } else { 2 }
+            );
         }
     }
 

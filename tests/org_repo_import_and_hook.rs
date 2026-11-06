@@ -29,9 +29,12 @@ const QA_AGENT_ID: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 /// access (the hub gives one answer for
 /// both "exists but not writable" and "does not exist"); `einsia/fresh` does not exist and I am
 /// the owner of `einsia`; `acme/ghost` does not exist and I am only a plain member of `acme`.
+/// Once the `signed_out` file appears, every request is refused as unauthenticated, a sign-in
+/// renewal included, as the Hub answers a device whose sign-in it no longer accepts.
 /// Serves until the process ends.
 fn fake_hub(
     gate_closed: std::path::PathBuf,
+    signed_out: std::path::PathBuf,
     clone_url: std::path::PathBuf,
     hub_requests: Arc<AtomicUsize>,
 ) -> String {
@@ -54,7 +57,8 @@ fn fake_hub(
             }
             let req = String::from_utf8_lossy(&buf).into_owned();
             let line = req.lines().next().unwrap_or_default().to_string();
-            let authed = req.to_ascii_lowercase().contains("authorization: bearer ");
+            let authed =
+                !signed_out.exists() && req.to_ascii_lowercase().contains("authorization: bearer ");
             let path = line
                 .split_whitespace()
                 .nth(1)
@@ -163,6 +167,8 @@ struct Lab {
     hub: String,
     /// Creating this file stops the fake hub from allowing writes to `einsia/qa`.
     gate_closed: std::path::PathBuf,
+    /// Creating this file makes the fake hub refuse this device's sign-in.
+    signed_out: std::path::PathBuf,
     clone_url: std::path::PathBuf,
     hub_requests: Arc<AtomicUsize>,
     home: std::path::PathBuf,
@@ -183,11 +189,13 @@ impl Lab {
         // to match.
         let work = work.canonicalize().unwrap();
         let gate_closed = tmp.path().join("gate-closed");
+        let signed_out = tmp.path().join("signed-out");
         let clone_url = tmp.path().join("clone-url");
         let hub_requests = Arc::new(AtomicUsize::new(0));
         fs::write(&clone_url, "x").unwrap();
         let hub = fake_hub(
             gate_closed.clone(),
+            signed_out.clone(),
             clone_url.clone(),
             Arc::clone(&hub_requests),
         );
@@ -211,6 +219,7 @@ impl Lab {
             _tmp: tmp,
             hub,
             gate_closed,
+            signed_out,
             clone_url,
             hub_requests,
             home,
@@ -3878,6 +3887,127 @@ fn a_folder_never_uploads_a_conversation_with_no_finished_turn() {
     assert!(claim.branch.is_some(), "{claim:?}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
     assert!(state["last_result"].is_null(), "{state}");
+}
+
+/// Saving on this computer never waits on the sign-in. While the Hub refuses this device's
+/// sign-in, a folder that uploads by itself still saves every finished turn of a conversation on
+/// this computer, and only the upload waits, recorded as a sign-in failure. A capture that stopped
+/// at the refused sign-in would leave the branch without the turn, or stop it at the first one.
+#[test]
+fn a_folder_saves_each_turn_here_while_the_hub_refuses_the_sign_in() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let repo = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    repo.set_auto_push(Some(true)).unwrap();
+    agit::hub::identity::pin(
+        &repo,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        state.with_extension("json"),
+        serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let id = "eeeeeeee-0000-4000-8000-000000000005";
+    let rollout = lab
+        .home
+        .join(".codex/sessions/2026/11/06")
+        .join(format!("rollout-2026-11-06T00-00-00-{id}.jsonl"));
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let at = "2026-11-06T00:00:00.000Z";
+    let turn = |n: usize| -> String {
+        [
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_started",
+                "turn_id":format!("t{n}")}}),
+            serde_json::json!({"timestamp":at,"type":"turn_context","payload":{"cwd":lab.work,"model":"m"}}),
+            serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"message",
+                "role":"user","content":[{"type":"input_text","text":format!("synthetic prompt {n}")}]}}),
+            serde_json::json!({"timestamp":at,"type":"response_item","payload":{"type":"message",
+                "role":"assistant","content":[{"type":"output_text","text":format!("synthetic answer {n}")}]}}),
+            serde_json::json!({"timestamp":at,"type":"event_msg","payload":{"type":"task_complete",
+                "turn_id":format!("t{n}"),"last_agent_message":format!("synthetic answer {n}")}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect()
+    };
+    let header = serde_json::json!({"timestamp":at,"type":"session_meta",
+        "payload":{"id":id,"cwd":lab.work,"timestamp":at,"cli_version":"0.166.0"}});
+    fs::write(&rollout, format!("{header}\n{}", turn(1))).unwrap();
+    fs::write(&lab.signed_out, "").unwrap();
+
+    // The Stop of each turn, then the folder's worker in the foreground: holding the worker's
+    // lock leaves the Stop's capture queued instead of detached.
+    let settle = || {
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state.with_extension("capture"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let mut process = lab
+            .agit(&["hooks", "settle", "--runtime", "codex"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = serde_json::json!({"session_id":id,"cwd":lab.work,
+            "transcript_path":rollout,"hook_event_name":"Stop"});
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let stopped = process.wait_with_output().unwrap();
+        assert!(stopped.status.success(), "{stopped:?}");
+        drop(lock);
+        let worker = lab
+            .agit(&["--quiet", "project", "capture"])
+            .arg(&lab.work)
+            .output()
+            .unwrap();
+        assert!(worker.status.success(), "{worker:?}");
+        let policy: serde_json::Value =
+            serde_json::from_slice(&fs::read(state.with_extension("json")).unwrap()).unwrap();
+        let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+        let branch = agit::domain::link::get(&store, "codex", id)
+            .and_then(|claim| claim.branch)
+            .unwrap_or_else(|| panic!("the conversation is claimed: {policy} {stopped:?}"));
+        (commits_on(&lab.repo("einsia", "qa"), &branch), policy)
+    };
+    let (first, policy) = settle();
+    assert!(first > 0, "the first turn is saved here");
+    assert_eq!(
+        policy["last_result"]["reason"], "signed_out",
+        "only the upload waits: {policy}"
+    );
+    let mut text = fs::read_to_string(&rollout).unwrap();
+    text.push_str(&turn(2));
+    fs::write(&rollout, text).unwrap();
+    let (second, _) = settle();
+    assert!(second > first, "the next turn is saved here too");
 }
 
 /// A delegated task must finish before publication, and dropping its root also fences children

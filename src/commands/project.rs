@@ -3685,7 +3685,7 @@ fn sign_in(project: &Project) -> SignIn {
             if credential.username == project.account
                 && credential.account_id == project.account_id =>
         {
-            if credential.refresh_expired() {
+            if !credential.renewable() {
                 SignIn::Expired
             } else {
                 SignIn::Current

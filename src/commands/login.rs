@@ -625,7 +625,7 @@ fn nothing_to_complete(hub: &str) -> crate::Result<Option<SignedIn>> {
         ))));
     }
     if let Some(credential) =
-        crate::infra::credentials::load(hub).filter(|credential| !credential.refresh_expired())
+        crate::infra::credentials::load(hub).filter(|credential| credential.renewable())
     {
         return Ok(Some(SignedIn::new(credential, Origin::AlreadySaved)));
     }
