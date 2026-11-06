@@ -269,9 +269,6 @@ pub fn run(args: Args) -> CmdResult {
                 "  fast-forwarded `{base_name}` +{commits} to the published tip {}",
                 &to[..9.min(to.len())]
             )),
-            super::pull::Alignment::BroughtOver { turns } => {
-                startup_notes.push(format!("  {}", super::pull::brought_over(turns)))
-            }
             super::pull::Alignment::Diverged => return Ok(ExitCode::Precondition),
         }
     }

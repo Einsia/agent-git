@@ -1157,7 +1157,6 @@ fn resume_branch_for(
             "fast-forwarded `{branch}` +{commits} to the published tip {}",
             &to[..9.min(to.len())]
         )),
-        super::pull::Alignment::BroughtOver { turns } => ui::info(super::pull::brought_over(turns)),
         super::pull::Alignment::Diverged => return Ok(None),
     }
     if super::branch::is_sealed(repo, branch) {

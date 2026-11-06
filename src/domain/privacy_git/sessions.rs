@@ -2303,39 +2303,6 @@ struct Carried<'a> {
     held_back: Vec<(String, Option<super::frozen::Restored>)>,
 }
 
-/// The commit whose LOG and VIEW plain publication sends for `oid`, a turn on `parent`, when
-/// `public_parent` is the published form of `parent`: what the next push publishes for it, under
-/// this computer's rules today. `None` when `public_parent` doesn't show by its own tree that it
-/// is plain, since the push then passes every line through protection again.
-pub(super) fn plain_published(
-    source: &Repo,
-    oid: &str,
-    parent: &str,
-    public_parent: &str,
-) -> Result<Option<String>> {
-    if !shown_plain(source, source, public_parent) {
-        return Ok(None);
-    }
-    let parents = [parent.to_owned()];
-    let published = published_lines(
-        source,
-        source,
-        &std::collections::HashMap::new(),
-        oid,
-        &parents,
-        &[public_parent.to_owned()],
-    )?;
-    let conversation = conversation_commit(
-        source,
-        oid,
-        &parents,
-        &published,
-        Carried::default(),
-        &mut Rechecked::default(),
-    )?;
-    Ok(Some(conversation.commit.unwrap_or_else(|| oid.to_owned())))
-}
-
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.
 /// The local commit is left as it is, so local history and resume keep the complete native
 /// transcript. `published` is what plain public parents already hold, and `carried` what encrypted
