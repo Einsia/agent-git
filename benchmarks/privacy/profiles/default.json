@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "case_ids": [
+    "provider-repeated",
+    "multiple-credentials",
+    "context-and-references",
+    "structured-fields",
+    "protocol-id",
+    "normal-placeholders",
+    "bare-entropy-default",
+    "explicit-block",
+    "allow-default",
+    "block-over-allow",
+    "url-password",
+    "private-key",
+    "default-file-exclusion",
+    "user-file-exclusion",
+    "ordinary-file",
+    "path-mention",
+    "literal-replacement",
+    "regex-replacement",
+    "attachment-omit",
+    "attachment-metadata",
+    "attachment-original",
+    "metadata-minimal",
+    "metadata-project",
+    "split-context",
+    "stream-boundary",
+    "plain-file-content",
+    "privacy-export-file"
+  ]
+}

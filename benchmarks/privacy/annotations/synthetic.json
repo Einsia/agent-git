@@ -1,0 +1,493 @@
+{
+  "provider-repeated": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 6,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 6,
+      "end": 46,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 46,
+      "end": 55,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 55,
+      "end": 95,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 95,
+      "end": 119,
+      "expect": "keep"
+    }
+  ],
+  "multiple-credentials": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 10,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 10,
+      "end": 43,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 43,
+      "end": 68,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 68,
+      "end": 105,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 105,
+      "end": 121,
+      "expect": "keep"
+    }
+  ],
+  "context-and-references": [
+    {
+      "pointer": "/messages/0/type",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/0/message/role",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/0/message/content",
+      "start": 0,
+      "end": 111,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/1/type",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/1/message/role",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/1/message/content",
+      "start": 0,
+      "end": 12,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/messages/1/message/content",
+      "start": 12,
+      "end": 45,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/messages/1/message/content",
+      "start": 45,
+      "end": 46,
+      "expect": "keep"
+    }
+  ],
+  "structured-fields": [
+    {
+      "pointer": "/api_key",
+      "start": 0,
+      "end": 40,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/file_token",
+      "start": 0,
+      "end": 37,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/message",
+      "start": 0,
+      "end": 38,
+      "expect": "keep"
+    }
+  ],
+  "protocol-id": [
+    {
+      "pointer": "/type",
+      "start": 0,
+      "end": 8,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/id",
+      "start": 0,
+      "end": 40,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/name",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/input/note",
+      "start": 0,
+      "end": 40,
+      "expect": "protect"
+    }
+  ],
+  "normal-placeholders": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 88,
+      "expect": "keep"
+    }
+  ],
+  "bare-entropy-default": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 55,
+      "expect": "keep"
+    }
+  ],
+  "bare-entropy-opt-in": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 18,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 18,
+      "end": 55,
+      "expect": "protect"
+    }
+  ],
+  "explicit-block": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 12,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 12,
+      "end": 35,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 35,
+      "end": 43,
+      "expect": "keep"
+    }
+  ],
+  "allow-default": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 65,
+      "expect": "keep"
+    }
+  ],
+  "block-over-allow": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 8,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 8,
+      "end": 48,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 48,
+      "end": 64,
+      "expect": "keep"
+    }
+  ],
+  "url-password": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 23,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 23,
+      "end": 56,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 56,
+      "end": 92,
+      "expect": "keep"
+    }
+  ],
+  "private-key": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 7,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 7,
+      "end": 98,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 98,
+      "end": 104,
+      "expect": "keep"
+    }
+  ],
+  "default-file-exclusion": [
+    {
+      "pointer": "/records",
+      "expect": "hide",
+      "value": "CONSTRUCTED_FILE_BODY"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/file_path",
+      "expect": "hide",
+      "value": "{workspace}/.env"
+    }
+  ],
+  "user-file-exclusion": [
+    {
+      "pointer": "/records",
+      "expect": "hide",
+      "value": "CONSTRUCTED_FILE_BODY"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/file_path",
+      "expect": "hide",
+      "value": "{workspace}/private.txt"
+    }
+  ],
+  "ordinary-file": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "CONSTRUCTED_FILE_BODY"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/file_path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/main.rs",
+      "replacement": "<workspace>/src/main.rs"
+    }
+  ],
+  "path-mention": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "does not read it. Keep this explanation."
+    }
+  ],
+  "literal-replacement": [
+    {
+      "pointer": "/records/0/message/content",
+      "expect": "rewrite",
+      "value": "bench-person",
+      "replacement": "public-person"
+    },
+    {
+      "pointer": "/records/0/message/content",
+      "expect": "keep",
+      "value": "ordinary neighbor."
+    }
+  ],
+  "regex-replacement": [
+    {
+      "pointer": "/records/0/message/content",
+      "expect": "rewrite",
+      "value": "BENCH-123",
+      "replacement": "TICKET"
+    },
+    {
+      "pointer": "/records/0/message/content",
+      "expect": "keep",
+      "value": "ordinary neighbor."
+    }
+  ],
+  "attachment-omit": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "Keep the adjacent message."
+    },
+    {
+      "pointer": "/records",
+      "expect": "hide",
+      "value": "U1lOVEhFVElDX0lNQUdF"
+    }
+  ],
+  "attachment-metadata": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "Keep the adjacent message."
+    },
+    {
+      "pointer": "/records",
+      "expect": "hide",
+      "value": "U1lOVEhFVElDX0lNQUdF"
+    }
+  ],
+  "attachment-original": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "Keep the adjacent message."
+    },
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "U1lOVEhFVElDX0lNQUdF"
+    }
+  ],
+  "metadata-minimal": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "Keep the conversation."
+    },
+    {
+      "pointer": "/metadata",
+      "expect": "hide",
+      "value": "/bench/private-user"
+    },
+    {
+      "pointer": "/metadata",
+      "expect": "hide",
+      "value": "https://example.invalid/team/repo"
+    }
+  ],
+  "metadata-project": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "Keep the conversation."
+    },
+    {
+      "pointer": "/metadata",
+      "expect": "hide",
+      "value": "/bench/private-user"
+    },
+    {
+      "pointer": "/metadata",
+      "expect": "keep",
+      "value": "https://example.invalid/team/repo"
+    }
+  ],
+  "split-context": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 33,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 33,
+      "end": 53,
+      "expect": "keep"
+    }
+  ],
+  "stream-boundary": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 19,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 19,
+      "end": 52,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 52,
+      "end": 238,
+      "expect": "keep"
+    }
+  ],
+  "entropy-source-identifiers": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 193,
+      "expect": "keep"
+    }
+  ],
+  "plain-file-content": [
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "PLAIN_FILE_BODY"
+    },
+    {
+      "pointer": "/records",
+      "expect": "keep",
+      "value": "{workspace}/.env"
+    }
+  ],
+  "privacy-export-file": [
+    {
+      "pointer": "/records",
+      "expect": "hide",
+      "value": "EXPORT_PRIVATE_BODY"
+    }
+  ],
+  "memory-allowlist": [
+    {
+      "pointer": "/decisions/0/action",
+      "expect": "allow",
+      "value": "allowed"
+    },
+    {
+      "pointer": "/decisions/1/action",
+      "expect": "exclude",
+      "value": "excluded"
+    }
+  ]
+}

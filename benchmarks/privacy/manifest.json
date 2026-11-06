@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "dataset_version": "1.0.1",
+  "annotation_version": 2,
+  "offset_unit": "Unicode code points in decoded JSON strings",
+  "seed": null,
+  "files": {
+    "annotations/synthetic.json": "b45f2e5672b365947c3135387d523b236db68ae30d66c94d4ede87745d687d25",
+    "cases/synthetic.json": "f5c319d80e22f8cda2d9bd4e2913f2363393ff1ce2054fed517d3aba3005e7c1",
+    "generate.py": "23483d43ce932c2d94fc55db2cf73975cf0164573c63dd3ffc8ecb7cd8494bfd",
+    "profiles/all.json": "639d250ca350ae38c3938eda0037a760bcce1203a35c900bcf6e46074c1cd102",
+    "profiles/default.json": "0f2ca050827a95152dda47473958550d2fa0b71446769a8bb70026120681e5df",
+    "profiles/entropy.json": "9bb38ab990c08a70ac0be31f091f2b7240700f1c54a66616a187d83339d02f5e"
+  },
+  "dataset_sha256": "758b1189d01e917dd81cedc80570f437ad05bd4d4836a89b001fd8b0c2f4d81f",
+  "provenance": "Reconstructed synthetic contracts; historical private audit artifacts were not imported."
+}

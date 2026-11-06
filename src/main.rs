@@ -31,6 +31,9 @@ fn main() {
     }
 
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = agit::domain::privacy::bench::entry(&raw_args) {
+        exit(code);
+    }
     if let Some(code) = agit::domain::privacy::worker::entry(&raw_args) {
         exit(code);
     }

@@ -1,0 +1,696 @@
+[
+  {
+    "id": "provider-repeated",
+    "layer": "secret",
+    "input": "First ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr; second ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr. Keep this explanation.",
+    "description": "Each repeated provider credential is protected without deleting its neighbors.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "multiple-credentials",
+    "layer": "secret",
+    "input": "password=\"c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\"; Authorization: Bearer Bf7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr\nKeep this note.",
+    "description": "Missing either credential counts as its own false negative.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "context-and-references",
+    "layer": "secret",
+    "input": {
+      "messages": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "type Config = { password: string; api_key?: string }; password = settings.password; token = process.env.API_KEY"
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "password = \"c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\""
+          }
+        }
+      ]
+    },
+    "description": "References remain readable beside a real password assignment.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "structured-fields",
+    "layer": "secret",
+    "input": {
+      "api_key": "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+      "file_token": "Bf7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+      "count": 7,
+      "enabled": true,
+      "message": "Keep \"quoted\" text and a newline\nhere."
+    },
+    "description": "Decoded credentials are protected and document tokens, types and escapes survive.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "protocol-id",
+    "layer": "secret",
+    "input": {
+      "type": "tool_use",
+      "id": "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+      "name": "Read",
+      "input": {
+        "note": "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"
+      }
+    },
+    "description": "Native protocol identifiers keep identity while ordinary content is protected.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "normal-placeholders",
+    "layer": "secret",
+    "input": "password = \"YOUR_PASSWORD\"; https://example.invalid/docs; API_KEY = os.getenv(\"API_KEY\")",
+    "description": "Document placeholders and configuration references are not actual credentials.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "bare-entropy-default",
+    "layer": "secret",
+    "input": "Trace identifier: Bf7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+    "description": "Bare entropy remains readable without opt-in.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "bare-entropy-opt-in",
+    "layer": "secret",
+    "input": "Trace identifier: Bf7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
+    "description": "Entropy opt-in protects a bare synthetic high-entropy value.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "entropy": true
+  },
+  {
+    "id": "explicit-block",
+    "layer": "secret",
+    "input": "Keep prefix confidential-demo-value suffix.",
+    "description": "An explicit rule protects an otherwise ordinary value.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "blocks": [
+      "confidential-demo-value"
+    ]
+  },
+  {
+    "id": "allow-default",
+    "layer": "secret",
+    "input": "Example ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr remains allowed.",
+    "description": "An explicit allow overrides heuristic detection.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "allows": [
+      "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"
+    ]
+  },
+  {
+    "id": "block-over-allow",
+    "layer": "secret",
+    "input": "Example ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr must be hidden.",
+    "description": "An explicit block wins when the same value is allowed.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "blocks": [
+      "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"
+    ],
+    "allows": [
+      "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"
+    ]
+  },
+  {
+    "id": "url-password",
+    "layer": "secret",
+    "input": "Use https://bench-user:c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0@example.invalid/path then continue.",
+    "description": "A URL credential is protected without removing the host and path.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "private-key",
+    "layer": "secret",
+    "input": "Before\n-----BEGIN PRIVATE KEY-----\nBf7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr\n-----END PRIVATE KEY-----\nAfter",
+    "description": "The complete synthetic private-key block is protected.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only"
+  },
+  {
+    "id": "default-file-exclusion",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "assistant",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-example",
+                "name": "Read",
+                "input": {
+                  "file_path": "{workspace}/.env"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-example",
+                "content": "CONSTRUCTED_FILE_BODY"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ]
+    },
+    "description": "File access policy follows the call through to its result; public source content stays readable.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "user-file-exclusion",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "assistant",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-example",
+                "name": "Read",
+                "input": {
+                  "file_path": "{workspace}/private.txt"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-example",
+                "content": "CONSTRUCTED_FILE_BODY"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "exclude": [
+        "private.txt"
+      ]
+    },
+    "description": "File access policy follows the call through to its result; public source content stays readable.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "ordinary-file",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "assistant",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-example",
+                "name": "Read",
+                "input": {
+                  "file_path": "{workspace}/src/main.rs"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-example",
+                "content": "CONSTRUCTED_FILE_BODY"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ]
+    },
+    "description": "File access policy follows the call through to its result; public source content stays readable.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "path-mention",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Mentioning {workspace}/.env does not read it. Keep this explanation."
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ]
+    },
+    "description": "Mentioning an excluded path does not hide the surrounding message.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "literal-replacement",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Hello bench-person and ordinary neighbor."
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "replacements": [
+        {
+          "pattern": "bench-person",
+          "replacement": "public-person"
+        }
+      ]
+    },
+    "description": "Literal substitution preserves adjacent conversation.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "regex-replacement",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Ticket BENCH-123 and ordinary neighbor."
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "replacements": [
+        {
+          "pattern": "BENCH-[0-9]+",
+          "replacement": "TICKET",
+          "regex": true
+        }
+      ]
+    },
+    "description": "Regex substitution changes only the selected content.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "attachment-omit",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Keep the adjacent message."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "U1lOVEhFVElDX0lNQUdF"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "attachments": "omit"
+    },
+    "description": "Attachment mode controls the synthetic payload without hiding adjacent text.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "attachment-metadata",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Keep the adjacent message."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "U1lOVEhFVElDX0lNQUdF"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "attachments": "metadata"
+    },
+    "description": "Attachment mode controls the synthetic payload without hiding adjacent text.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "attachment-original",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Keep the adjacent message."
+              },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "U1lOVEhFVElDX0lNQUdF"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "attachments": "original"
+    },
+    "description": "Attachment mode controls the synthetic payload without hiding adjacent text.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "metadata-minimal",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Keep the conversation."
+          }
+        }
+      ],
+      "metadata": {
+        "cwd": "/bench/private-user",
+        "cwd_state": {
+          "origin": "https://example.invalid/team/repo",
+          "worktree": "clean"
+        }
+      }
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "metadata": "minimal"
+    },
+    "description": "Metadata mode limits project coordinates and never exposes the original device path.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "metadata-project",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": "Keep the conversation."
+          }
+        }
+      ],
+      "metadata": {
+        "cwd": "/bench/private-user",
+        "cwd_state": {
+          "origin": "https://example.invalid/team/repo",
+          "worktree": "clean"
+        }
+      }
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "metadata": "project"
+    },
+    "description": "Metadata mode limits project coordinates and never exposes the original device path.",
+    "mode": "encrypted_public",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "split-context",
+    "layer": "secret",
+    "input": "c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\" and a safe suffix.",
+    "description": "A credential whose assignment precedes the chunk retains its context.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "context": "password = \""
+  },
+  {
+    "id": "stream-boundary",
+    "layer": "secret",
+    "input": "Before\npassword = \"c7Zq4xR2mNv8LpT3!wYb6Ks1Hd9Fg5Jt0\"\nKeep this public line.\nKeep this public line.\nKeep this public line.\nKeep this public line.\nKeep this public line.\nKeep this public line.\nKeep this public line.\nKeep this public line.\n",
+    "description": "A credential split across input chunks cannot escape through the released prefix.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "stream_cuts": [
+      27,
+      43,
+      90
+    ]
+  },
+  {
+    "id": "entropy-source-identifiers",
+    "layer": "secret",
+    "input": "const digest = \"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\";\nAsset: https://assets.example.invalid/font/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2",
+    "description": "Typed digests and resource URLs retain their source evidence under entropy opt-in.",
+    "source": "Reconstructed from privacy/policy.rs and privacy/projector.rs contracts; synthetic values only",
+    "entropy": true
+  },
+  {
+    "id": "plain-file-content",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "assistant",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "plain-call",
+                "name": "Read",
+                "input": {
+                  "file_path": "{workspace}/.env"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "plain-call",
+                "content": "PLAIN_FILE_BODY"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ]
+    },
+    "description": "Plain capture protection does not apply public-view file exclusions.",
+    "mode": "plain",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "privacy-export-file",
+    "layer": "policy",
+    "input": {
+      "records": [
+        {
+          "type": "assistant",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "export-call",
+                "name": "Read",
+                "input": {
+                  "file_path": "{workspace}/.env"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "type": "user",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "export-call",
+                "content": "EXPORT_PRIVATE_BODY"
+              }
+            ]
+          }
+        }
+      ],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ]
+    },
+    "description": "Privacy export shares the frozen projection used by the encrypted public view.",
+    "mode": "privacy_export",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data"
+  },
+  {
+    "id": "memory-allowlist",
+    "layer": "policy",
+    "input": {
+      "records": [],
+      "metadata": {}
+    },
+    "policy": {
+      "version": 1,
+      "include": [
+        "src/**"
+      ],
+      "memory_allow": [
+        "notes.md",
+        ".env"
+      ]
+    },
+    "description": "Memory is opt-in and sensitive paths remain excluded even with an allowlist.",
+    "mode": "memory",
+    "source": "Reconstructed from privacy_publication.rs and privacy/repository.rs contracts; no historical session data",
+    "paths": [
+      "notes.md",
+      ".env"
+    ]
+  }
+]

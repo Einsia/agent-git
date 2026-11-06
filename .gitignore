@@ -25,3 +25,5 @@ __pycache__/
 /.cache/build-python/
 /.cache/test-python/
 /.cache/runtime-*.tar.gz*
+
+/privacy-bench-report/
