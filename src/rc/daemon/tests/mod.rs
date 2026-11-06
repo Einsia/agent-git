@@ -93,6 +93,7 @@ pub(super) fn rpc_test_daemon(
         terminal_delivery_blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         term_tx: None,
         online: true,
+        stop_cause: StopCause::Person,
 
         settlement,
         started_at: std::time::Instant::now(),
@@ -105,7 +106,7 @@ pub(super) fn rpc_test_daemon(
     }))
 }
 
-fn rpc_test_roster_entry(
+pub(super) fn rpc_test_roster_entry(
     session_id: &str,
     mode: crate::protocol::PermissionMode,
 ) -> crate::rc::roster::Entry {
@@ -193,7 +194,7 @@ fn rpc_turn_frame(session_id: &str) -> Frame {
 
 use super::*;
 
-fn claim(role: &str, ws: &str) -> crate::protocol::CallerClaim {
+pub(super) fn claim(role: &str, ws: &str) -> crate::protocol::CallerClaim {
     crate::protocol::CallerClaim {
         account_id: Some("a".into()),
         username: None,

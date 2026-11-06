@@ -92,6 +92,8 @@ impl Daemon {
             live.approval_requests.remove(&p.approval_id);
         }
         self.observe_lease_frame(&stream, &frame);
+        #[cfg(unix)]
+        self.observe_open_turn(&stream, &frame);
         // Viewers learn who writes the conversation with every status change.
         if frame.method() == method::SESSION_STATUS
             && let Some(view) = self.lease_view(&stream)
@@ -1027,6 +1029,7 @@ mod bound_lineage_tests {
                         ),
                         term_tx: None,
                         online: false,
+                        stop_cause: StopCause::Person,
 
                         settlement,
                         started_at: std::time::Instant::now(),

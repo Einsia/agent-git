@@ -58,12 +58,15 @@ pub(crate) enum TurnEnd {
 /// gets an end receipt there: Claude marks such a stop only with a tool denial or synthetic text,
 /// which also occur in turns that go on, so no transcript rule can close it, and a conversation
 /// that is never continued would never settle it. A turn the transcript shows the person stopped
-/// gets no receipt, whoever reports it.
+/// gets no receipt, whoever reports it, unless `agit_interrupt` says the one interrupt since the
+/// last cut is the one agit sent to stop while nobody chose to: Claude writes the same marker for
+/// it, and holding it would keep back a turn nobody stopped.
 pub(crate) fn turn_end(
     session: &str,
     transcript: &Path,
     consumed: u64,
     stopped: Option<(&str, &str)>,
+    agit_interrupt: bool,
 ) -> crate::Result<TurnEnd> {
     let transcript = transcript.canonicalize()?;
     let mut prefix = read_prefix(&transcript, consumed)?;
@@ -89,11 +92,25 @@ pub(crate) fn turn_end(
             .unwrap_or(0)
             .max(closed);
         let ended = crate::adapter::claude_code::ended_turn_boundary(text).unwrap_or(0);
-        return Ok(if ended > own {
-            TurnEnd::Held
-        } else {
-            TurnEnd::Closed(own as u64)
-        });
+        if ended <= own {
+            return Ok(TurnEnd::Closed(own as u64));
+        }
+        let interrupts = crate::adapter::claude_code::interrupted_turn_boundaries(text)
+            .into_iter()
+            .filter(|end| *end > own)
+            .count();
+        return match stopped {
+            Some((generation, turn)) if agit_interrupt && interrupts == 1 => {
+                ensure!(
+                    crate::rc::native_inbox::valid_id(turn),
+                    "native completion requires an exact turn UUID"
+                );
+                Ok(TurnEnd::Closed(
+                    write(session, generation, turn, transcript, &prefix)?.bytes,
+                ))
+            }
+            _ => Ok(TurnEnd::Held),
+        };
     }
     let Some((generation, turn)) = stopped else {
         return Ok(TurnEnd::Open(prefix.len() as u64));

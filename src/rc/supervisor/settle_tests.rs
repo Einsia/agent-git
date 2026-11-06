@@ -279,7 +279,9 @@ async fn session_end_runs_a_final_settlement_for_the_pending_push() {
 /// a stopped turn left to wait for a later completion, ends past every cut a commit makes and stays
 /// queued. A job capped at the last completion lets an earlier reply acknowledge a prompt that is
 /// still open. An interrupt, or a stop the daemon was asked for, that gets its own cut publishes
-/// what the person may have stopped in order to withhold.
+/// what the person may have stopped in order to withhold. The interrupt agit sent for a stop
+/// nobody chose ends its turn, unless a person's interrupt came first in that hold; holding it
+/// keeps back a turn nobody stopped, and receipting past a person's interrupt publishes it.
 #[cfg(unix)]
 #[test]
 fn archived_turns_end_where_the_completed_only_cut_ends() {
@@ -460,6 +462,44 @@ fn archived_turns_end_where_the_completed_only_cut_ends() {
         retain(&session, TurnEnding::Completed);
         assert_eq!(queued(), reopened.len() as u64);
         assert_eq!(cut(&reopened), stopped.len() as u64);
+
+        // Claude marks agit's interrupt the way it marks a person's; the stop that sent it says
+        // whose it was.
+        let by_agit = reopened.clone()
+            + &tool_call("toolu_4")
+            + &denial(
+                "toolu_4",
+                "interrupted",
+                "[Request interrupted by user for tool use]",
+            );
+        read(&mut session, &by_agit);
+        retain(&session, TurnEnding::StoppedByAgit);
+        assert_eq!(queued(), by_agit.len() as u64);
+        assert_eq!(cut(&by_agit), by_agit.len() as u64);
+
+        let person_first = by_agit.clone()
+            + &prompt("fifth")
+            + &tool_call("toolu_5")
+            + &denial(
+                "toolu_5",
+                "interrupted",
+                "[Request interrupted by user for tool use]",
+            )
+            + &prompt("sixth")
+            + &tool_call("toolu_6")
+            + &denial(
+                "toolu_6",
+                "interrupted",
+                "[Request interrupted by user for tool use]",
+            );
+        read(&mut session, &person_first);
+        retain(&session, TurnEnding::StoppedByAgit);
+        assert_eq!(
+            queued(),
+            by_agit.len() as u64,
+            "a person's interrupt before agit's keeps the hold"
+        );
+        assert_eq!(cut(&person_first), by_agit.len() as u64);
     });
 }
 
@@ -2688,4 +2728,115 @@ async fn idle_settlement_retries_a_failed_archive_before_publishing() {
     assert_ne!(settled.commit_sha, before);
     assert_eq!(fixture.tracking(), settled.commit_sha);
     assert!(!session.idle_settlement_ready());
+}
+
+/// A stop nobody chose (a service manager's SIGTERM, an upgrade restart) archives the turn it
+/// interrupts, through the interrupt Claude writes for it, while a person's stop (`agit rc stop`)
+/// holds the same turn like their own interrupt and queues nothing. A stop that holds both keeps
+/// back turns nobody stopped; one that archives both publishes what a person may have stopped to
+/// withhold.
+#[cfg(unix)]
+#[test]
+fn an_unattended_stop_archives_the_turn_it_interrupts_and_a_persons_stop_holds_it() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::settle_tests::an_unattended_stop_archives_the_turn_it_interrupts_and_a_persons_stop_holds_it",
+    ) {
+        return;
+    }
+    let line = |value: serde_json::Value| format!("{value}\n");
+    let opened = line(
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": "go"}}),
+    ) + &line(serde_json::json!({"type": "assistant", "message": {
+        "model": "claude-haiku-5-5", "role": "assistant", "stop_reason": "tool_use",
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "sleep 60"}}],
+    }}));
+    let interrupted = line(
+        serde_json::json!({"type": "user", "toolDenialKind": "interrupted", "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true,
+                         "content": "[Request interrupted by user for tool use]"}],
+        }}),
+    );
+    for (stop, archived) in [
+        (Command::ShutdownUnattended, true),
+        (Command::Shutdown, false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        crate::rc::select_local_authority();
+        let transcript = home.path().join("native.jsonl");
+        std::fs::write(&transcript, &opened).unwrap();
+        let record = home.path().join("interrupted.jsonl");
+        std::fs::write(&record, &interrupted).unwrap();
+        // On an interrupt, writes Claude's interrupted denial to the transcript and its marker to
+        // stdout, as Claude Code does.
+        let script = format!(
+            r#"while IFS= read -r line; do case "$line" in *'"subtype":"interrupt"'*) cat '{}' >> '{}'; printf '%s\n' '{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"[Request interrupted by user]"}}]}}}}';; esac; done"#,
+            record.display(),
+            transcript.display()
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = runtime.enter();
+        let mut driver =
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_running(&script);
+        driver.set_test_current_turn(&uuid::Uuid::new_v4().to_string());
+        let (mut session, mut out, _notes) = super::tests::harness_test_session_with_channels(
+            AnyDriver::ClaudeCode(Box::new(driver)),
+            "claude-code",
+            SessionStatus::Running,
+        );
+        let (_lease, settlement) = tokio::sync::watch::channel(SettlementState {
+            local_owner: true,
+            epoch: 1,
+            agent_identity_v1: true,
+            session_start_idempotency_v1: false,
+        });
+        session.settlement = settlement;
+        session.agit_session = Some(
+            crate::rc::lineage::AgitSession::new(
+                "alice/photo",
+                "6f35cd22-85ae-4ed5-a106-2d9069d6b346",
+                "s/settlement",
+            )
+            .unwrap(),
+        );
+        session.settlement_child = Some(SettlementChild {
+            exe: "/usr/bin/true".into(),
+            repo_dir: home.path().into(),
+        });
+        session.tailer = Some(Tailer::new(&transcript, false));
+        session.stop_turn_grace = std::time::Duration::from_secs(60);
+        crate::rc::with_agit_home(home.path(), || {
+            runtime.block_on(async {
+                let (commands, mut command_rx) = mpsc::channel(4);
+                commands.send(stop).await.unwrap();
+                drop(commands);
+                let run = tokio::spawn(async move {
+                    session.run_inner(&mut command_rx).await;
+                    session
+                });
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !run.is_finished() {
+                    assert!(tokio::time::Instant::now() < deadline, "the stop ends");
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(50), out.recv())
+                        .await;
+                }
+                let mut session = run.await.unwrap();
+                let _ = session.driver.shutdown().await;
+            });
+            let jobs = crate::rc::archive_jobs::pending().unwrap();
+            let whole = (opened.len() + interrupted.len()) as u64;
+            if archived {
+                assert_eq!(jobs.len(), 1, "an unattended stop queues its turn");
+                assert_eq!(jobs[0].required_bytes, whole);
+            } else {
+                assert!(jobs.is_empty(), "a person's stop queues nothing");
+            }
+        });
+    }
 }

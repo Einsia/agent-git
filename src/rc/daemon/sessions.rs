@@ -605,6 +605,9 @@ impl Daemon {
                     &entry.thread_id,
                 ));
             }
+            // A turn a daemon that died left open is closed at the next start, where the writer is
+            // proven gone (`open_turns`). A resume never writes the transcript: the terminal it
+            // may attach to can be running a tool whose result is still to come.
             // The cell in the roster may hold legacy lineage that does not pass today's test.
             //
             // This path must not fail hard: the session belongs to the user, the roster is our

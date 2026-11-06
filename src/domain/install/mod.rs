@@ -382,13 +382,35 @@ pub const OPEN_CALL_PLACEHOLDER_OUTPUT: &str =
 /// materialized baseline, so settlement treats them as history along with the baseline rather than
 /// as new content.
 fn close_open_calls(content: &str, format: &str, new_id: &str, cwd: &Path) -> Result<String> {
+    let closing = closing_records(content, format, new_id, cwd, OPEN_CALL_PLACEHOLDER_OUTPUT)?;
+    if closing.is_empty() {
+        return Ok(content.to_owned());
+    }
+    let mut out = content.to_owned();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&closing);
+    Ok(out)
+}
+
+/// The records that close every tool call in `content` that never got an output, each with
+/// `output` as its result, in the transcript's own format; empty when none is open or the format
+/// has no such record. They go after the last line, never in place of one.
+pub(crate) fn closing_records(
+    content: &str,
+    format: &str,
+    id: &str,
+    cwd: &Path,
+    output: &str,
+) -> Result<String> {
     let runtime = match format {
         "codex" | "claude-code" => format,
-        _ => return Ok(content.to_owned()),
+        _ => return Ok(String::new()),
     };
     let open = adapter::get(runtime)?.open_tool_calls(content);
     if open.is_empty() {
-        return Ok(content.to_owned());
+        return Ok(String::new());
     }
 
     let last: Option<serde_json::Value> = content
@@ -402,10 +424,7 @@ fn close_open_calls(content: &str, format: &str, new_id: &str, cwd: &Path) -> Re
         .unwrap_or("2026-01-01T00:00:00.000Z")
         .to_string();
 
-    let mut out = content.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
+    let mut out = String::new();
     match runtime {
         "codex" => {
             for c in open {
@@ -423,7 +442,7 @@ fn close_open_calls(content: &str, format: &str, new_id: &str, cwd: &Path) -> Re
                     "payload": {
                         "type": output_type,
                         "call_id": c.call_id,
-                        "output": OPEN_CALL_PLACEHOLDER_OUTPUT
+                        "output": output
                     }
                 }))?);
                 out.push('\n');
@@ -446,11 +465,11 @@ fn close_open_calls(content: &str, format: &str, new_id: &str, cwd: &Path) -> Re
                             "type": "tool_result",
                             "tool_use_id": c.call_id,
                             "is_error": true,
-                            "content": OPEN_CALL_PLACEHOLDER_OUTPUT
+                            "content": output
                         }]
                     },
                     "parentUuid": parent,
-                    "sessionId": new_id,
+                    "sessionId": id,
                     "timestamp": ts,
                     "type": "user",
                     "userType": "external",

@@ -69,6 +69,8 @@ mod dispatch;
 mod guard;
 mod leases;
 mod observed_capture;
+#[cfg(unix)]
+mod open_turns;
 mod opening;
 mod terminal_input;
 mod terminal_open;
@@ -1103,6 +1105,18 @@ const FLEET_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30)
 const FAIL_CLOSED_PERSIST_RETRY_MIN: std::time::Duration = std::time::Duration::from_millis(250);
 const FAIL_CLOSED_PERSIST_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Who stopped the daemon, which decides what becomes of a turn the stop cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum StopCause {
+    /// A person at this computer: Ctrl-C, `agit rc stop`, the menu bar's stop. They may be
+    /// reacting to the turn, so it is held like their own interrupt.
+    #[default]
+    Person,
+    /// Nobody chose to stop the turn: a service manager's SIGTERM, a restart for an upgrade. The
+    /// turn ends where agit stopped it and is archived like any turn that ended.
+    Unattended,
+}
+
 pub struct Daemon {
     identity: crate::rc::build_identity::DaemonIdentity,
     /// Replay frames this dispatch accumulated, to be sent **outside the mutex**. See
@@ -1162,6 +1176,7 @@ pub struct Daemon {
     /// Where terminal bytes flow back. Built when the first terminal opens.
     term_tx: Option<mpsc::Sender<TerminalEvent>>,
     online: bool,
+    stop_cause: StopCause,
     /// Shared by every live session; a control socket reload builds the replacement in full and
     /// swaps it in at once.
 

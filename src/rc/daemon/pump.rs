@@ -50,6 +50,7 @@ impl Daemon {
             terminal_delivery_blockers: terminal_delivery_blockers.clone(),
             term_tx: None,
             online: false,
+            stop_cause: StopCause::Person,
 
             settlement: settlement_tx.clone(),
             started_at: std::time::Instant::now(),
@@ -88,7 +89,7 @@ impl Daemon {
         // the lock until process exit; no shutdown unlink can erase a replacement's state.
         #[cfg(windows)]
         control::write_pidfile()?;
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let (stop_tx, mut stop_rx) = mpsc::channel::<StopCause>(1);
         let (safe_stop_tx, mut safe_stop_rx) = mpsc::channel::<restart::SafeStopRequest>(1);
         {
             let d = d.clone();
@@ -124,7 +125,7 @@ impl Daemon {
                             }
                         }
                         control::Request::Stop => {
-                            let _ = stop_tx.try_send(());
+                            let _ = stop_tx.try_send(StopCause::Person);
                             control::Reply::Stopping
                         }
                         control::Request::StopIfIdle {
@@ -263,7 +264,7 @@ impl Daemon {
             let stop_tx = stop_tx.clone();
             tokio::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ = stop_tx.try_send(());
+                    let _ = stop_tx.try_send(StopCause::Person);
                 }
             });
         }
@@ -275,7 +276,7 @@ impl Daemon {
                 let stop_tx = stop_tx.clone();
                 tokio::spawn(async move {
                     if terminate.recv().await.is_some() {
-                        let _ = stop_tx.try_send(());
+                        let _ = stop_tx.try_send(StopCause::Unattended);
                     }
                 });
             }
@@ -327,6 +328,10 @@ impl Daemon {
         // worker may outlive the state coordinator it needs for finalization.
         let mut session_rpc_tasks = tokio::task::JoinSet::new();
         let (session_rpc_stop_tx, _) = tokio::sync::watch::channel(false);
+        // Turns a daemon that died left open are closed before anything resumes them, and their
+        // archive jobs are queued before archive recovery starts.
+        #[cfg(unix)]
+        d.lock().await.recover_open_turns().await;
         let _archive_recovery = archive_recovery::start(
             d.clone(),
             admission.clone(),
@@ -851,13 +856,15 @@ impl Daemon {
                         Ok(frozen) => {
                             if request.reply.send(control::Reply::Stopping).is_ok() {
                                 frozen.commit();
+                                d.lock().await.stop_cause = StopCause::Unattended;
                                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), request.written).await;
                                 begin_daemon_stop(&mut stopping, &link_stopping, &session_rpc_stop_tx, shutdown_deadline.as_mut());
                             }
                         }
                     }
                 }
-                _ = stop_rx.recv(), if !stopping => {
+                Some(cause) = stop_rx.recv(), if !stopping => {
+                    d.lock().await.stop_cause = cause;
                     begin_daemon_stop(
                         &mut stopping,
                         &link_stopping,
@@ -1017,6 +1024,11 @@ impl Daemon {
                         cause: crate::protocol::InterruptionCause::Stopped,
                     },
                 );
+                // Should the runtime be killed before the turn ends, the next start closes it as
+                // this stop decides.
+                if let Some(turn) = self.roster.open_turns.get_mut(id) {
+                    turn.stopped_by_person = self.stop_cause == StopCause::Person;
+                }
                 recorded = true;
             }
         }
@@ -1071,7 +1083,10 @@ impl Daemon {
         let _ = tokio::time::timeout(FLEET_EXIT_GRACE, async {
             let mut tasks = vec![];
             for (_, l) in self.sessions.drain() {
-                let _ = l.tx.try_send(Command::Shutdown);
+                let _ = l.tx.try_send(match self.stop_cause {
+                    StopCause::Person => Command::Shutdown,
+                    StopCause::Unattended => Command::ShutdownUnattended,
+                });
                 drop(l.tx);
                 tasks.push(l.task);
             }

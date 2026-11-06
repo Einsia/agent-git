@@ -339,6 +339,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     terminal_delivery_blockers: blockers,
                     term_tx: None,
                     online: false,
+                    stop_cause: StopCause::Person,
 
                     settlement,
                     started_at: std::time::Instant::now(),

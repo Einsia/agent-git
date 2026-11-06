@@ -185,8 +185,29 @@ pub enum StartClaim {
     HistoryLost,
 }
 
+/// A turn running on a runtime the daemon started: recorded when it starts, removed when it ends.
+/// One still here when a daemon starts was cut by the death of the one before. Kept on this
+/// computer only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenTurn {
+    pub turn_id: String,
+    pub runtime: String,
+    pub thread_id: String,
+    pub cwd: String,
+    /// The runtime's process, by pid and start time, when the runtime reports it: a pid alone may
+    /// name someone else's process by the time it is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<(u32, i64)>,
+    /// A person's stop cut it, so it is held like their interrupt instead of archived.
+    #[serde(default)]
+    pub stopped_by_person: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
+    /// Turns running on runtimes the daemon started, by logical id. See [`OpenTurn`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) open_turns: BTreeMap<String, OpenTurn>,
     /// Conversations whose last turn was cut by agit stopping, by logical id, until they run
     /// again. Kept on this computer; only the interruption itself is shown to the web.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -347,6 +368,7 @@ pub(crate) fn fail_next_fallback_removals(count: usize) {
 impl Roster {
     fn unusable() -> Roster {
         Roster {
+            open_turns: BTreeMap::new(),
             interrupted: BTreeMap::new(),
             observed: BTreeSet::new(),
             captures: BTreeMap::new(),
