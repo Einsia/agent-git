@@ -2424,7 +2424,14 @@ fn materialize_and_resume(
         None => lk.agent = Some(slug.to_string()),
     }
     lk.branch = Some(branch.to_string());
-    lk.session_privacy = snap.session_privacy.clone();
+    // Encrypted publication is retired: a resumed session publishes plain, whatever its snapshot
+    // recorded.
+    lk.session_privacy = snap.session_privacy.clone().map(|privacy| {
+        crate::domain::session_privacy::SessionPrivacy {
+            scheme: crate::domain::session_privacy::SessionScheme::Plain,
+            ..privacy
+        }
+    });
     lk.materialized_from = Some(head.to_string());
     lk.privacy_recovery = recovered.map(RecoveredSnapshot::binding);
     lk.privacy_recovery_format = recovered.map(|_| link::NATIVE_PRIVACY_RECOVERY_FORMAT.into());

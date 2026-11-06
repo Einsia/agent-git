@@ -1589,8 +1589,12 @@ pub(super) fn declare_session_line(
     );
     born.kind = meta::Kind::File;
     born.committer_account = crate::infra::credentials::current_account()?;
+    // Encrypted publication is retired: a new line records plain, whatever the link inherited.
     born.session_privacy = Some(match &lk.session_privacy {
-        Some(privacy) => privacy.clone(),
+        Some(privacy) => crate::domain::session_privacy::SessionPrivacy {
+            scheme: crate::domain::session_privacy::SessionScheme::Plain,
+            ..privacy.clone()
+        },
         None => {
             crate::domain::session_privacy::SessionPrivacy::new(born.committer_account.clone())?
         }

@@ -35,6 +35,7 @@ mod accepted_tests;
 #[cfg(test)]
 mod commit_tests;
 mod delivery;
+mod frozen;
 pub(crate) mod modes;
 mod published;
 #[cfg(test)]

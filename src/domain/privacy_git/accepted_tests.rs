@@ -123,6 +123,9 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
+        switched: Vec::new(),
+        carried_records_proof: true,
+        to_register: Vec::new(),
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
@@ -359,6 +362,9 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
+        switched: Vec::new(),
+        carried_records_proof: true,
+        to_register: Vec::new(),
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {
@@ -823,7 +829,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
             .err()
             .unwrap()
             .to_string()
-            .contains("was published encrypted")
+            .contains("unaccepted original ancestry")
     );
 }
 
@@ -883,6 +889,9 @@ fn metadata_upgrade_refreshes_previews_and_preserves_accepted_anonymous_history(
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
+        switched: Vec::new(),
+        carried_records_proof: true,
+        to_register: Vec::new(),
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs::default(),
@@ -1150,6 +1159,9 @@ fn legacy_accepted_mapping_preserves_public_objects_when_original_history_contin
         asking_again: Default::default(),
         fork_sources: Default::default(),
         pinned_source: None,
+        switched: Vec::new(),
+        carried_records_proof: true,
+        to_register: Vec::new(),
         delivery: None,
         identity: identity.clone(),
         remote: RemoteRefs {

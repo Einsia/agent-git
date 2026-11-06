@@ -40,7 +40,7 @@ pub enum Action {
         #[arg(value_name = "OWNER/REPO@REF")]
         target: String,
     },
-    /// Grant originals at the active scope to the confirmed current members.
+    /// Retired: originals stay on this computer. Existing grants keep reading earlier snapshots.
     Grant {
         #[arg(value_name = "OWNER/REPO@REF")]
         target: String,
@@ -119,7 +119,14 @@ impl SavedMutation {
     }
 }
 
+/// What `privacy access grant` answers now that encrypted publication is retired.
+const GRANT_RETIRED: &str = "Granting access to originals is retired: sessions publish only the redacted view, and the originals stay on this computer. People you already gave access keep it for earlier snapshots; `agit privacy access show` lists them and `agit privacy access revoke` ends it. Nothing was changed.";
+
 pub(super) fn run(command: Action) -> CmdResult {
+    if matches!(command, Action::Grant { .. }) {
+        ui::error(GRANT_RETIRED);
+        return Ok(ExitCode::Precondition);
+    }
     let target = match &command {
         Action::Show { target }
         | Action::Grant { target }
@@ -269,12 +276,60 @@ impl Selection {
         let (repo, checkout) = super::resolve_repo(Some(&slug))?;
         let resolved = refs::resolve(&repo, &spec)?;
         let (_, _, identity) = super::unlock::reader_context(&repo)?;
-        let (published_commit, bytes) = crate::domain::privacy_git::publication_envelope(
+        let mut found = crate::domain::privacy_git::publication_envelope(
             &repo,
             resolved.branch.as_deref(),
             &resolved.sha,
             &identity,
         )?;
+        // A session published encrypted that continues as plain keeps the access to its earlier
+        // snapshots' originals: a plain snapshot names that of the newest encrypted one below it.
+        if found.1.is_none() {
+            let session = crate::domain::storage::metadata_local(repo.root(), &resolved.sha)
+                .ok()
+                .map(|metadata| metadata.session)
+                .filter(|session| crate::domain::meta::is_bare_id(session));
+            let line = repo.git(&[
+                "rev-list",
+                "--first-parent",
+                "--max-count=2000",
+                &resolved.sha,
+            ])?;
+            // Only the selected session's own earlier snapshots. An encrypted snapshot names its
+            // session in its binding: as published, its metadata carries the public id instead, so
+            // it is judged by the binding. Any other commit of another session, such as the one
+            // this session was forked from, ends the walk.
+            for commit in line.lines().skip(1) {
+                let Some(session) = &session else {
+                    break;
+                };
+                if let Ok(candidate @ (_, Some(_))) =
+                    crate::domain::privacy_git::publication_envelope(
+                        &repo,
+                        resolved.branch.as_deref(),
+                        commit,
+                        &identity,
+                    )
+                {
+                    let bound = candidate.1.as_deref().and_then(|bytes| {
+                        PrivacyEnvelope::parse(bytes)
+                            .ok()?
+                            .session_binding
+                            .map(|binding| binding.session_id)
+                    });
+                    if bound.as_deref() == Some(session.as_str()) {
+                        found = candidate;
+                    }
+                    break;
+                }
+                let same = crate::domain::storage::metadata_local(repo.root(), commit)
+                    .is_ok_and(|metadata| metadata.session == *session);
+                if !same {
+                    break;
+                }
+            }
+        }
+        let (published_commit, bytes) = found;
         let snapshot = bytes
             .map(|bytes| -> Result<_> {
                 let envelope = PrivacyEnvelope::parse(&bytes)?;
@@ -347,7 +402,7 @@ impl Selection {
                 None => {
                     ensure!(
                         local.scheme != crate::domain::session_privacy::SessionScheme::Plain,
-                        "plain sessions use repository read access; select encrypted mode before managing original grants"
+                        "plain sessions use repository read access; access to originals applies only to sessions published encrypted earlier"
                     );
                     let privacy = if local.owner_source == OwnerResolution::Unresolved {
                         let mut privacy = SessionPrivacy::new(Some(actor.clone()))?;
@@ -370,6 +425,7 @@ impl Selection {
                         &identity,
                         &metadata.session,
                         &privacy,
+                        false,
                     )?
                 }
             };
@@ -631,12 +687,28 @@ fn retry(repository: &str, request_id: &str) -> CmdResult {
         "saved original access destination changed"
     );
     saved.verify_account(&client)?;
+    if grants_access(&saved.request) {
+        ui::error(GRANT_RETIRED);
+        return Ok(ExitCode::Precondition);
+    }
     if saved.confirm()? {
         saved.verify_account(&client)?;
         saved.verify_source(&repo)?;
         saved.submit(&client, repository)?;
     }
     Ok(ExitCode::Ok)
+}
+
+/// Whether a saved request gives someone access to originals, which is retired; ending access
+/// is not.
+fn grants_access(request: &SavedMutation) -> bool {
+    matches!(
+        request,
+        SavedMutation::Grants(GrantMutation {
+            action: GrantOperation::Grant { .. },
+            ..
+        })
+    )
 }
 
 fn request_path(repo: &Repo, id: &str) -> Result<PathBuf> {
@@ -741,5 +813,34 @@ fn show_policy(repository: &str, policy: &SessionGrantPolicy) {
         if policy.grant_scope == GrantScope::Commit {
             println!("Re-enabling session-level authorization is unsupported.");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grant saved before encrypted publication was retired is not sent on retry; a saved
+    /// revoke or stop still is, so the owner can end access people already have.
+    #[test]
+    fn a_saved_grant_is_retired_and_ending_access_is_not() {
+        let saved = |action| {
+            SavedMutation::Grants(GrantMutation::new(
+                GrantTarget::Session {
+                    agent_id: "agent".into(),
+                    session_id: "session".into(),
+                },
+                1,
+                1,
+                action,
+            ))
+        };
+        assert!(grants_access(&saved(GrantOperation::Grant {
+            preview_id: "preview".into()
+        })));
+        assert!(!grants_access(&saved(GrantOperation::Revoke {
+            account_id: "bob".into()
+        })));
+        assert!(!grants_access(&saved(GrantOperation::StopExplicit)));
     }
 }

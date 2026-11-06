@@ -183,19 +183,31 @@ impl Client {
         identity: &RemoteIdentity,
         session: &str,
         local: &SessionPrivacy,
+        declare: bool,
     ) -> Result<SessionPrivacyResponse> {
         local.validate()?;
         let response: SessionPrivacyResponse =
             self.with_repository_route(repository, identity, |repository| {
                 let path =
                     self.session_privacy_path(repository, identity, session, "privacy-config")?;
-                self.post_expected(
+                // `declare` when the caller ran the carried-record proof and the Hub takes the
+                // declaration.
+                let declared: &[(&str, &str)] = if declare {
+                    &[(
+                        crate::hub::CARRIED_RECORDS_PROOF_HEADER,
+                        crate::hub::CARRIED_RECORDS_PROOF,
+                    )]
+                } else {
+                    &[]
+                };
+                self.post_expected_with(
                     &path,
                     &Registration {
                         expected_repository_id: &identity.agent_id,
                         privacy: local,
                     },
                     Some(&identity.agent_id),
+                    declared,
                 )
             })?;
         response.verify(identity, session)?;

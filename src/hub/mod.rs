@@ -631,7 +631,16 @@ pub(crate) struct HubConfig {
 struct PublishedCapabilities {
     #[serde(default)]
     publication_planned_refs: bool,
+    /// Versions of the carried-record proof the Hub accepts a declaration of.
+    #[serde(default)]
+    carried_records_proof: Vec<String>,
 }
+
+/// The header with which a client declares it ran the carried-record proof on what it publishes.
+pub(crate) const CARRIED_RECORDS_PROOF_HEADER: &str = "x-agentgit-carried-records-proof";
+
+/// The proof this client runs, as declared in [`CARRIED_RECORDS_PROOF_HEADER`].
+pub(crate) const CARRIED_RECORDS_PROOF: &str = "v1";
 
 #[derive(Deserialize)]
 struct PublishedLimits {
@@ -650,6 +659,15 @@ impl HubConfig {
         self.capabilities
             .as_ref()
             .is_some_and(|capabilities| capabilities.publication_planned_refs)
+    }
+
+    pub(crate) fn accepts_carried_records_proof(&self) -> bool {
+        self.capabilities.as_ref().is_some_and(|capabilities| {
+            capabilities
+                .carried_records_proof
+                .iter()
+                .any(|version| version == CARRIED_RECORDS_PROOF)
+        })
     }
 
     pub(crate) fn push_limits(&self) -> anyhow::Result<PushLimits> {

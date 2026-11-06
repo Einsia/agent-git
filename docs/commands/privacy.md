@@ -1,34 +1,30 @@
 # Session publication mode and original access
 
-## Choose an initial publication mode
+## Publication mode
 
-New sessions default to `plain` publication. This applies to new sessions, first imports, forks
-and offline creation. A session whose history includes an encrypted snapshot (a fork or merge of
-one) is not published: its push is refused, and nothing is uploaded. Before the session's first remote registration, its
-creator can explicitly enable encryption:
+Every session publishes `plain`: repository readers can read the published history. Local secret
+protection and the ordinary publication checks still apply, and `--private` and `--public` set
+the repository's visibility, not the session's.
+
+Encrypted publication is retired. `agit privacy mode <owner/repo>@<branch> encrypted` says so,
+changes nothing and exits non-zero. Omit the mode argument to see the local choice and the
+registered one:
 
 ```sh
-agit privacy mode alice/project@work encrypted
-agit privacy status alice/project@work
-agit push alice/project@work --private
+agit privacy mode alice/project@work
 ```
 
-`plain` publishes the session without session encryption. Repository readers can read the
-published history. Local secret protection and ordinary publication checks still apply.
-`--private` and `--public` control repository visibility separately from session encryption.
+A session that was published encrypted continues as plain at its next push, and the push says so
+once. Its new turns upload only the redacted view people with access already see, and the
+originals stay on this computer. Turns that were already published go up as they were published,
+no wider, and its earlier encrypted snapshots stay as they are. Files it changed before this, such
+as memory or skills, are not uploaded. People given access to its
+originals keep that access for the earlier snapshots (`agit privacy access show` lists them). The
+Hub must accept a client that continues an encrypted session; one that doesn't yet refuses the
+push, and nothing is uploaded.
 
-The choice is local and follows the logical session across branch renames and multiple branches.
-It covers all unpublished snapshots and future commits in that session. It does not create a
-remote repository or register the session. Before registration, choose `plain` to return to
-unencrypted publication. Omit the mode argument to inspect the local choice and remote registration.
-Existing sessions retain their recorded mode, including encrypted sessions created offline. Resume,
-repeat import and clone preserve that mode; upgrading the CLI does not downgrade existing sessions.
-Changes require confirmation; use global `--yes` for an explicitly authorized unattended change.
-
-The first push registers the selected mode. Once registered, it cannot change, even if that push
-fails before uploading history. Original-access policy commands can also register an encrypted
-session before its first push. A registered plain session uses repository read access instead
-of original-content grants. `push --dry-run` still requires an existing registered session.
+The same holds for any session whose history includes an encrypted snapshot, a fork or merge of
+one: it publishes what was already published, or is refused, and then nothing is uploaded.
 
 Existing local snapshots retain their source commits. Publication generates plain metadata and
 mapped parents when their birth metadata declares encryption; event bytes and file content stay
@@ -228,8 +224,8 @@ membership and the membership epoch still apply: departure invalidates grants an
 rejoining does not restore them. Owner departure does not revoke other eligible
 readers' access.
 
-A fork of an encrypted snapshot stays on this computer: it can be resumed and continued, and its
-push is refused. Resume, repeat import, clone, branch rename, and repository copies preserve
+A fork of an encrypted snapshot can be resumed and continued. Its push publishes the snapshot's
+turns as they were already published, or is refused. Resume, repeat import, clone, branch rename, and repository copies preserve
 source authority. Inherited originals remain governed by their source repository and session.
 
 Changes require confirmation. Use the global `--yes` flag for an explicitly

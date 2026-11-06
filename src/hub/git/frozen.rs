@@ -518,13 +518,22 @@ impl FrozenPublication {
         }
         // Asked once, after the stages have read the limits, so every receipt of this
         // publication sends the same request.
-        let planned_refs = policy.is_some()
-            && self
-                .transport
-                .client
+        // One read of the Hub's configuration; one it can't give counts as advertising nothing.
+        let config = self
+            .transport
+            .client
+            .as_ref()
+            .filter(|_| policy.is_some())
+            .and_then(|client| client.hub_config().ok());
+        let asks = crate::hub::privacy::publication::ReceiveAsks {
+            planned_refs: config
                 .as_ref()
-                .is_some_and(crate::hub::Client::accepts_planned_refs);
-        let mut heads = self.push_phase(&batches, held, planned_refs);
+                .is_some_and(crate::hub::HubConfig::accepts_planned_refs),
+            carried_records: config
+                .as_ref()
+                .is_some_and(crate::hub::HubConfig::accepts_carried_records_proof),
+        };
+        let mut heads = self.push_phase(&batches, held, asks);
         // A refused receipt sends nothing. When the Hub refused only tags of the shared receive as
         // withdrawn, the tips go alone and the tags follow as they would unshared, so a withdrawn
         // tag holds back itself and not its branch.
@@ -537,7 +546,7 @@ impl FrozenPublication {
         {
             let last = batches.len() - 1;
             batches[last].refs = alone;
-            let retried = self.push_phase_from(&batches, last, held, planned_refs);
+            let retried = self.push_phase_from(&batches, last, held, asks);
             heads.attempts.extend(retried.attempts);
             heads.unattempted = retried.unattempted;
             heads.error = retried.error;
@@ -550,7 +559,7 @@ impl FrozenPublication {
         });
         let tags = heads
             .ok()
-            .then(|| self.push_phase(&self.batches(&tags, policy), held, planned_refs));
+            .then(|| self.push_phase(&self.batches(&tags, policy), held, asks));
         (heads, tags)
     }
 
@@ -902,7 +911,7 @@ impl FrozenPublication {
         batch: &[FrozenRef],
         held: Option<&BTreeMap<String, String>>,
         delivered: &[ReceiveBatch<'_>],
-        planned_refs: bool,
+        asks: crate::hub::privacy::publication::ReceiveAsks,
         before: BTreeMap<String, String>,
     ) -> Result<crate::hub::privacy::publication::ReceiveReceipt> {
         if let Some(held) = held {
@@ -919,7 +928,7 @@ impl FrozenPublication {
                 .context("publication needs a Hub account")?,
             &before,
             &after,
-            planned_refs,
+            asks,
         )
     }
 
@@ -1084,9 +1093,9 @@ impl FrozenPublication {
         &self,
         batches: &[ReceiveBatch<'_>],
         held: Option<&BTreeMap<String, String>>,
-        planned_refs: bool,
+        asks: crate::hub::privacy::publication::ReceiveAsks,
     ) -> PublicationPhase {
-        self.push_phase_from(batches, 0, held, planned_refs)
+        self.push_phase_from(batches, 0, held, asks)
     }
 
     /// [`Self::push_phase`] for the batches from `start` on; the ones before it count as delivered.
@@ -1095,7 +1104,7 @@ impl FrozenPublication {
         batches: &[ReceiveBatch<'_>],
         start: usize,
         held: Option<&BTreeMap<String, String>>,
-        planned_refs: bool,
+        asks: crate::hub::privacy::publication::ReceiveAsks,
     ) -> PublicationPhase {
         let mut phase = PublicationPhase::default();
         let owed = |from: usize| -> Vec<FrozenRef> {
@@ -1145,7 +1154,7 @@ impl FrozenPublication {
                                 &pending,
                                 held,
                                 &batches[..index],
-                                planned_refs,
+                                asks,
                                 before,
                             )
                         })

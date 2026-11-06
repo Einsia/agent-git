@@ -74,6 +74,18 @@ struct Preview {
 pub(crate) struct ReceiveReceipt {
     id: String,
     scope: String,
+    /// The Hub accepts this client's declaration that it ran the carried-record proof.
+    carried_records: bool,
+}
+
+/// What a receipt asks of the Hub beyond the publication itself, each only of a Hub that
+/// advertises it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReceiveAsks {
+    /// Name the refs the transition changes ([`RefsWithdrawn`]).
+    pub planned_refs: bool,
+    /// Declare that the carried-record proof ran on what is published.
+    pub carried_records: bool,
 }
 
 /// The Hub refused a receipt because these planned ref updates name refs withdrawn from the
@@ -92,11 +104,18 @@ impl std::fmt::Display for RefsWithdrawn {
 impl std::error::Error for RefsWithdrawn {}
 
 impl ReceiveReceipt {
-    pub(crate) fn headers(&self) -> [(&'static str, &str); 2] {
-        [
-            ("X-AgentGit-Privacy-Preview-Id", &self.id),
-            ("X-AgentGit-Privacy-Receiver-Scope", &self.scope),
-        ]
+    pub(crate) fn headers(&self) -> Vec<(&'static str, &str)> {
+        let mut headers = vec![
+            ("X-AgentGit-Privacy-Preview-Id", self.id.as_str()),
+            ("X-AgentGit-Privacy-Receiver-Scope", self.scope.as_str()),
+        ];
+        if self.carried_records {
+            headers.push((
+                crate::hub::CARRIED_RECORDS_PROOF_HEADER,
+                crate::hub::CARRIED_RECORDS_PROOF,
+            ));
+        }
+        headers
     }
 }
 
@@ -206,14 +225,14 @@ impl PublicationPolicy {
         client: &Client,
         before: &BTreeMap<String, String>,
         after: &BTreeMap<String, String>,
-        planned_refs: bool,
+        asks: ReceiveAsks,
     ) -> Result<ReceiveReceipt> {
         let binding = self.binding(before, after)?;
         let mut request = serde_json::to_value(&binding)?;
         request["manifest"] = serde_json::to_value(&self.session_manifest)?;
         let planned = changed_refs(before, after);
         let mut preview_request = request.clone();
-        if planned_refs {
+        if asks.planned_refs {
             preview_request["planned_refs"] = json!(planned);
         }
         let preview: Preview = client
@@ -240,6 +259,7 @@ impl PublicationPolicy {
         Ok(ReceiveReceipt {
             id: confirmed.preview_id,
             scope: self.receiver_scope.clone(),
+            carried_records: asks.carried_records,
         })
     }
 
@@ -478,10 +498,28 @@ mod tests {
             "private",
         )
         .unwrap();
-        let receipt = policy.confirm(&client, &before, &after, true).unwrap();
+        let receipt = policy
+            .confirm(
+                &client,
+                &before,
+                &after,
+                ReceiveAsks {
+                    planned_refs: true,
+                    carried_records: false,
+                },
+            )
+            .unwrap();
         assert_eq!(receipt.headers()[0].1, "session-preview");
         assert_eq!(receipt.headers()[1].1, expected.receiver_scope);
-        let refused = || match policy.confirm(&client, &before, &after, true) {
+        let refused = || match policy.confirm(
+            &client,
+            &before,
+            &after,
+            ReceiveAsks {
+                planned_refs: true,
+                carried_records: false,
+            },
+        ) {
             Ok(_) => panic!("the Hub refused this receipt"),
             Err(error) => error,
         };

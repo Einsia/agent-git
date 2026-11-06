@@ -45,9 +45,17 @@ struct Hub {
     /// Refuses a receive that updates only tags, as a Hub that closed them would.
     refuse_tags: Arc<AtomicBool>,
     unsupported_policy: Arc<AtomicBool>,
+    /// Sessions a client from before encrypted publication was retired registers encrypted. Once
+    /// one leaves the set, it continues as plain at its next revision when a writer registers it
+    /// plain, once.
+    legacy_encrypted: Arc<Mutex<std::collections::BTreeSet<String>>>,
     corrupt_receipt: Arc<AtomicBool>,
     /// The repository's location answers 404, as it does for a reader who lost access to it.
     location_gone: Arc<AtomicBool>,
+    /// The Hub doesn't advertise the carried-record proof declaration.
+    undeclared: Arc<AtomicBool>,
+    /// The requests that carried the carried-record proof declaration, by method and path.
+    declarations: Arc<Mutex<Vec<String>>>,
     creations: Arc<AtomicUsize>,
     viewing_public: Arc<Mutex<String>>,
     visibility: Arc<Mutex<&'static str>>,
@@ -117,10 +125,16 @@ impl Hub {
         let refusing_tags = Arc::clone(&refuse_tags);
         let unsupported_policy = Arc::new(AtomicBool::new(false));
         let unsupported = Arc::clone(&unsupported_policy);
+        let legacy_encrypted = Arc::new(Mutex::new(std::collections::BTreeSet::<String>::new()));
+        let legacy = Arc::clone(&legacy_encrypted);
         let corrupt_receipt = Arc::new(AtomicBool::new(false));
         let corrupting = Arc::clone(&corrupt_receipt);
         let location_gone = Arc::new(AtomicBool::new(false));
         let gone = Arc::clone(&location_gone);
+        let undeclared = Arc::new(AtomicBool::new(false));
+        let without_declaration = Arc::clone(&undeclared);
+        let declarations = Arc::new(Mutex::new(Vec::new()));
+        let declared_requests = Arc::clone(&declarations);
         let confirmations = Arc::new(AtomicUsize::new(0));
         let confirmed = Arc::clone(&confirmations);
         let creations = Arc::new(AtomicUsize::new(0));
@@ -211,6 +225,7 @@ impl Hub {
                 let mut authenticated = false;
                 let mut collaborator_account = false;
                 let mut receipt_id = None;
+                let mut declared = false;
                 let mut receiver_scope = None;
                 loop {
                     let mut line = String::new();
@@ -239,6 +254,7 @@ impl Hub {
                     if let Some(value) = lower.strip_prefix("x-agentgit-privacy-preview-id:") {
                         receipt_id = Some(value.trim().to_owned());
                     }
+                    declared |= lower.trim() == "x-agentgit-carried-records-proof: v1";
                     if let Some(value) = lower.strip_prefix("x-agentgit-privacy-receiver-scope:") {
                         receiver_scope = Some(value.trim().to_owned());
                     }
@@ -247,6 +263,12 @@ impl Hub {
                     authenticated || collaborator_account || target == "/api/auth/refresh",
                     "{first}"
                 );
+                if declared {
+                    declared_requests
+                        .lock()
+                        .unwrap()
+                        .push(format!("{method} {target}"));
+                }
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).unwrap();
                 drop(reader);
@@ -325,6 +347,16 @@ impl Hub {
                     {
                         Some(json!({"ok":true}))
                     }
+                    // This Hub gives no computer the originals of an encrypted snapshot.
+                    ("POST", path)
+                        if path.starts_with("/api/agents/alice/app/sessions/")
+                            && path.ends_with("/original-key") =>
+                    {
+                        let body =
+                            r#"{"kind":"original_access_denied","error":"no access to originals"}"#;
+                        write!(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        continue;
+                    }
                     (method, path)
                         if path.starts_with("/api/agents/alice/app/sessions/")
                             && path.ends_with("/privacy-config") =>
@@ -338,7 +370,23 @@ impl Hub {
                             registered.fetch_add(1, Ordering::AcqRel);
                             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
                             assert_eq!(request["expected_repository_id"], AGENT_ID);
-                            let config = json!({"repository_id":AGENT_ID,"session_id":session,"privacy":request["privacy"],"revision":1,"created_at":"2026-01-01T00:00:00Z"});
+                            let mut privacy = request["privacy"].clone();
+                            let legacy = legacy.lock().unwrap().contains(session);
+                            if legacy {
+                                privacy["scheme"] = json!("session_owner_v2");
+                            }
+                            let mut config = json!({"repository_id":AGENT_ID,"session_id":session,"privacy":privacy,"revision":1,"created_at":"2026-01-01T00:00:00Z"});
+                            if let Some(previous) = sessions.get(session)
+                                && previous["privacy"]["scheme"] == "session_owner_v2"
+                                && request["privacy"]["scheme"] == "plain"
+                                && declared
+                            {
+                                config = previous.clone();
+                                config["privacy"]["scheme"] = json!("plain");
+                                config["revision"] =
+                                    json!(previous["revision"].as_u64().unwrap() + 1);
+                                sessions.insert(session.into(), config.clone());
+                            }
                             policies.entry(session.into()).or_insert_with(|| {
                                 agit::domain::session_grants::SessionGrantPolicy {
                                     agent_id: AGENT_ID.into(),
@@ -546,7 +594,11 @@ impl Hub {
                             "max_new_commits":published_limit.load(Ordering::Acquire),
                             "max_request_bytes":2147483648u64
                         }},
-                        "capabilities":{"publication_planned_refs":true}
+                        "capabilities": if without_declaration.load(Ordering::Acquire) {
+                            json!({"publication_planned_refs":true})
+                        } else {
+                            json!({"publication_planned_refs":true,"carried_records_proof":["v1"]})
+                        }
                     })),
                     _ => None,
                 };
@@ -677,8 +729,11 @@ impl Hub {
             deny,
             refuse_tags,
             unsupported_policy,
+            legacy_encrypted,
             corrupt_receipt,
             location_gone,
+            undeclared,
+            declarations,
             creations,
             viewing_public,
             visibility,
@@ -792,6 +847,14 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     let remote = remote_root.join("alice/app.git");
     let key = SecretKey::from([25; 32]);
     let hub = Hub::start(&remote_root, key.to_bytes());
+    // Sessions this test publishes encrypted were registered that way by clients from before
+    // encrypted publication was retired.
+    for session in ["a", "f"] {
+        hub.legacy_encrypted
+            .lock()
+            .unwrap()
+            .insert(format!("agit-{}", session.repeat(40)));
+    }
     save_at(
         &home
             .join("credentials")
@@ -1112,7 +1175,10 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             )),
         "{displayed}"
     );
-    assert!(!displayed.contains("PRIVATE_NATIVE_FILE"));
+    // The session was only registered encrypted, never published that way, so no encrypted
+    // snapshot bounds what readers saw: it continues as plain, and its files publish as any plain
+    // session's do.
+    assert!(displayed.contains("PRIVATE_NATIVE_FILE"), "{displayed}");
     assert!(
         String::from_utf8_lossy(&refused.stdout).contains("receipt differs"),
         "{refused:?}"
@@ -1222,56 +1288,39 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         )
         .unwrap()
     };
-    let first = envelope(&planned);
-    assert!(first.open_layer(&key).is_ok());
-    assert!(first.open_layer(&rotated).is_err());
-    let binding = first.session_binding.as_ref().unwrap();
-    assert_eq!(binding.owner_key.account_id, "session-owner");
-    assert_eq!(
-        binding.committer,
-        CommitterAttribution::Account {
-            account_id: "account-1".into()
-        }
-    );
+    // That session was registered encrypted by an older client but never published that way, so
+    // its first publication continues it as plain: no envelope, and its files publish as any plain
+    // session's do.
     let tree = git(&remote, &["ls-tree", "-r", "--name-only", &planned]);
-    assert!(!tree.contains("native-private.txt"));
     assert!(
-        !git_command(&remote)
-            .args(["cat-file", "-e", &original])
-            .output()
-            .unwrap()
-            .status
-            .success()
+        !tree.lines().any(|path| path.starts_with("privacy/")),
+        "{tree}"
     );
+    assert!(tree.contains("native-private.txt"), "{tree}");
     let pushed = hub.posts.load(Ordering::Acquire);
     assert_success(&run(&args, false));
     assert_eq!(hub.posts.load(Ordering::Acquire), pushed);
     repo.set_auto_push(Some(true)).unwrap();
-    let continued = save(&metadata, "Private continuation COMPLETE_CONTEXT");
+    save(&metadata, "Private continuation COMPLETE_CONTEXT");
     assert_success(&run(&["push", "alice/app@work"], true));
     let next = git(&remote, &["rev-parse", "refs/heads/work"]);
     assert_eq!(git(&remote, &["rev-parse", &format!("{next}^")]), planned);
-    let next_envelope = envelope(&next);
-    let next_binding = next_envelope.session_binding.as_ref().unwrap();
-    assert_eq!(next_binding.owner_key.account_id, "session-owner");
-    assert_eq!(next_binding.owner_key.key_version, 2);
-    assert_eq!(
-        next_binding.published_session_id,
-        binding.published_session_id
+    assert!(
+        !git(&remote, &["ls-tree", "-r", "--name-only", &next])
+            .lines()
+            .any(|path| path.starts_with("privacy/"))
     );
-    assert_eq!(next_binding.source_commit, continued);
-    assert!(next_envelope.open_layer(&rotated).is_ok());
     let receipt = agit::domain::privacy_receipt::PublicationReceipt::load(&repo, "work")
         .unwrap()
         .unwrap();
-    assert_eq!(receipt.session_snapshot.unwrap().binding, *next_binding);
+    assert!(receipt.session_snapshot.is_none());
 
     // Policy configuration precedes publication without becoming immutable encryption metadata.
     assert_success(&run(
         &["new", "alice/app", "-b", "prepublish", "--no-launch"],
         false,
     ));
-    assert_success(&run(
+    let retired = run(
         &[
             "--yes",
             "privacy",
@@ -1280,11 +1329,81 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
             "encrypted",
         ],
         false,
-    ));
+    );
+    assert!(!retired.status.success(), "{retired:?}");
+    assert!(
+        String::from_utf8_lossy(&retired.stderr).contains(
+            "Encrypted publication is retired: sessions publish only the redacted view, and the originals stay on this computer. Nothing was changed."
+        ),
+        "{retired:?}"
+    );
     let before_policy = git(repo.root(), &["rev-parse", "refs/heads/prepublish"]);
     let created = meta::read_at_ref_result(&repo, &before_policy)
         .unwrap()
         .unwrap();
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(created.session.clone());
+    // An unpublished session publishes plain, so it has no grant policy to configure.
+    let unregistered = run(
+        &[
+            "--json",
+            "privacy",
+            "access",
+            "policy",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert!(!unregistered.status.success(), "{unregistered:?}");
+    assert!(
+        String::from_utf8_lossy(&unregistered.stdout)
+            .contains("plain sessions use repository read access"),
+        "{unregistered:?}"
+    );
+    let unpublished = run(
+        &[
+            "--yes",
+            "privacy",
+            "access",
+            "grant",
+            "alice/app@prepublish",
+        ],
+        false,
+    );
+    assert!(!unpublished.status.success(), "{unpublished:?}");
+    let refusal = String::from_utf8_lossy(&unpublished.stderr);
+    assert!(
+        refusal.contains("Granting access to originals is retired")
+            && !refusal.contains("requires an accepted snapshot"),
+        "{unpublished:?}"
+    );
+    let partial = run(
+        &["privacy", "access", "policy", "alice/app@prepublish#1"],
+        false,
+    );
+    assert!(!partial.status.success(), "{partial:?}");
+    let again = run_at(
+        &["--yes", "push", "alice/app@prepublish"],
+        false,
+        &home,
+        &project,
+    );
+    assert_success(&again);
+    // Once per folder.
+    assert!(
+        !String::from_utf8_lossy(&again.stdout).contains("For the agent:"),
+        "{again:?}"
+    );
+    let published = git(&remote, &["rev-parse", "refs/heads/prepublish"]);
+    let publication = envelope(&published);
+    let authority = publication.session_binding.as_ref().unwrap();
+    assert_eq!(authority.session_id, created.session);
+    assert_eq!(authority.owner_key.account_id, "account-1");
+    assert_eq!(authority.source_commit, before_policy);
+    // A session an older client published encrypted keeps its grant policy, and the owner can
+    // still narrow it.
     let policy = run(
         &[
             "--json",
@@ -1325,41 +1444,6 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         git(repo.root(), &["rev-parse", "refs/heads/prepublish"]),
         before_policy
     );
-    let unpublished = run(
-        &[
-            "--yes",
-            "privacy",
-            "access",
-            "grant",
-            "alice/app@prepublish",
-        ],
-        false,
-    );
-    assert!(!unpublished.status.success(), "{unpublished:?}");
-    assert!(String::from_utf8_lossy(&unpublished.stderr).contains("requires an accepted snapshot"));
-    let partial = run(
-        &["privacy", "access", "policy", "alice/app@prepublish#1"],
-        false,
-    );
-    assert!(!partial.status.success(), "{partial:?}");
-    let again = run_at(
-        &["--yes", "push", "alice/app@prepublish"],
-        false,
-        &home,
-        &project,
-    );
-    assert_success(&again);
-    // Once per folder.
-    assert!(
-        !String::from_utf8_lossy(&again.stdout).contains("For the agent:"),
-        "{again:?}"
-    );
-    let published = git(&remote, &["rev-parse", "refs/heads/prepublish"]);
-    let publication = envelope(&published);
-    let authority = publication.session_binding.as_ref().unwrap();
-    assert_eq!(authority.session_id, created.session);
-    assert_eq!(authority.owner_key.account_id, "account-1");
-    assert_eq!(authority.source_commit, before_policy);
     let policy_after = run(
         &[
             "--json",
@@ -1459,7 +1543,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         false,
     );
     assert!(!locked.status.success());
-    assert!(String::from_utf8_lossy(&locked.stderr).contains("already registered"));
+    assert!(String::from_utf8_lossy(&locked.stderr).contains("Encrypted publication is retired"));
     hub.corrupt_receipt.store(false, Ordering::Release);
     assert_success(&run(&plain_push, false));
     let plain_head = git(&remote, &["rev-parse", "refs/heads/publish-plain"]);
@@ -1514,14 +1598,18 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         agit::domain::privacy_receipt::PublicationMode::Ordinary
     );
     assert_eq!(hub.key_requests.load(Ordering::Acquire), key_requests);
-    for (target, mode) in [
-        ("alice/app@publish-plain", "encrypted"),
-        ("alice/app@prepublish", "plain"),
+    for (target, mode, reason) in [
+        (
+            "alice/app@publish-plain",
+            "encrypted",
+            "Encrypted publication is retired",
+        ),
+        ("alice/app@prepublish", "plain", "already registered"),
     ] {
         let refused = run(&["--yes", "privacy", "mode", target, mode], false);
         assert!(!refused.status.success(), "{refused:?}");
         assert!(
-            String::from_utf8_lossy(&refused.stderr).contains("already registered"),
+            String::from_utf8_lossy(&refused.stderr).contains(reason),
             "{refused:?}"
         );
     }
@@ -1653,16 +1741,29 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
         Label::secret("explicit-block"),
     )
     .unwrap();
+    // Hydration is checked on a session's first, encrypted publication; `hydrated` itself now
+    // continues as plain, which publishes the placeholder as it is.
+    repo.git(&["checkout", "-q", "-b", "unhydrated", &base])
+        .unwrap();
+    let unhydrated_meta = meta::Meta {
+        session: format!("agit-{}", "6".repeat(40)),
+        ..hydrated_meta.clone()
+    };
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(unhydrated_meta.session.clone());
     let unknown = transcript::wrap_lines(
         &json!({"type":"user","message":{"role":"user","content":missing.token}}).to_string(),
         "claude-code",
-        &hydrated_meta.session,
+        &unhydrated_meta.session,
     );
     write_snapshot(repo.root(), &unknown, &unknown).unwrap();
+    meta::write(repo.root(), &unhydrated_meta).unwrap();
     repo.add_all().unwrap();
     repo.commit("Unavailable original").unwrap();
     let received = hub.posts.load(Ordering::Acquire);
-    let refused = run(&["--yes", "push", "alice/app@hydrated"], false);
+    let refused = run(&["--yes", "push", "alice/app@unhydrated"], false);
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("publication hydration is incomplete"),
@@ -2152,6 +2253,12 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     let remote_root = temp.path().join("remote");
     let remote = remote_root.join("alice/app.git");
     let hub = Hub::start(&remote_root, [27; 32]);
+    // Its encrypted turns were registered that way by a client from before encrypted publication
+    // was retired.
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(format!("agit-{}", "a".repeat(40)));
     save_at(
         &home
             .join("credentials")
@@ -2715,6 +2822,192 @@ fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     assert_success(&run(&["--yes", "push", "alice/app@main"]));
     assert!(!git(&remote, &["for-each-ref", "refs/tags/release-2"]).is_empty());
     assert_eq!(uploads(), 1);
+}
+
+/// A fork of an encrypted snapshot that carries only what that snapshot published goes up on the
+/// Hub that holds the snapshot. Delivered to another Hub, which doesn't hold it, nothing of the
+/// envelope and nothing the projection hid goes along: the delivery is refused, or the target gets
+/// trees with no envelope in them.
+#[test]
+fn a_fork_of_an_encrypted_snapshot_takes_no_envelope_to_another_hub() {
+    use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy};
+    const CANARY: &str = "canary-f0rk";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let source_root = temp.path().join("source");
+    let target_root = temp.path().join("target");
+    let source = Hub::start(&source_root, [25; 32]);
+    let target = Hub::start(&target_root, [26; 32]);
+    for hub in [&source, &target] {
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+    let run = |hub: &Hub, args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let remote = source_root.join("alice/app.git");
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    for (key, value) in [
+        ("http.userAgent", TRANSPORT_USER_AGENT),
+        ("user.name", "Source Writer"),
+        ("user.email", "source@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ] {
+        repo.git(&["config", key, value]).unwrap();
+    }
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&source, &["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-q", "-b", "work"]).unwrap();
+    let mut encrypted = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    encrypted.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(
+            AccountIdentity::new(&source.base, "account-1").unwrap(),
+        ))
+        .unwrap()
+    });
+    encrypted.committer_account = Some(AccountIdentity::new(&source.base, "account-1").unwrap());
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":format!("please read /Users/alice/{CANARY}/plan.txt")}})
+        ),
+        "claude-code",
+        &encrypted.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &encrypted).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("encrypted turn").unwrap();
+    source
+        .legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(encrypted.session.clone());
+    assert_success(&run(&source, &["--yes", "push", "alice/app@work"]));
+    source.legacy_encrypted.lock().unwrap().clear();
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert!(
+        git(&remote, &["ls-tree", "-r", "--name-only", &published])
+            .lines()
+            .any(|path| path == "privacy/envelope.json"),
+        "published encrypted"
+    );
+
+    // A fork of the Hub's copy that carries only what it published, plus a turn of its own.
+    repo.git(&[
+        "fetch",
+        "-q",
+        remote.to_str().unwrap(),
+        "refs/heads/work:refs/remotes/hub/work",
+    ])
+    .unwrap();
+    repo.git(&["checkout", "-q", "-b", "forked", &published])
+        .unwrap();
+    repo.git(&["rm", "-rq", "privacy"]).unwrap();
+    let forked = meta::Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let mut log = storage::materialize_at(repo.root(), &published, meta::LOG_FILE).unwrap();
+    log.push_str(&transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"a turn on the fork"}})
+        ),
+        "claude-code",
+        &forked.session,
+    ));
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &forked).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("fork").unwrap();
+    assert_success(&run(&source, &["--yes", "push", "alice/app@forked"]));
+
+    // Delivered to a Hub that doesn't hold the encrypted snapshot.
+    let delivered = run(
+        &source,
+        &[
+            "--yes",
+            "push",
+            "alice/app@forked",
+            "--to-hub",
+            &target.base,
+        ],
+    );
+    let target_remote = target_root.join("alice/app.git");
+    if target_remote.is_dir() {
+        for commit in git(&target_remote, &["rev-list", "--all"]).lines() {
+            assert!(
+                !git(&target_remote, &["ls-tree", "-r", "--name-only", commit])
+                    .lines()
+                    .any(|path| path.starts_with("privacy/")),
+                "{commit} took an envelope to the other Hub: {delivered:?}"
+            );
+        }
+        for line in git(&target_remote, &["rev-list", "--all", "--objects"]).lines() {
+            let oid = line.split_whitespace().next().unwrap();
+            if git(&target_remote, &["cat-file", "-t", oid]) == "blob" {
+                assert!(
+                    !git(&target_remote, &["cat-file", "blob", oid]).contains(CANARY),
+                    "a hidden value reached the other Hub"
+                );
+            }
+        }
+    }
+    if !delivered.status.success() {
+        assert!(
+            !target_remote.is_dir()
+                || git(&target_remote, &["for-each-ref", "refs/heads/forked"]).is_empty(),
+            "{delivered:?}"
+        );
+    }
 }
 
 #[test]
@@ -4880,6 +5173,12 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
     let remote_root = temp.path().join("remote");
     let remote = remote_root.join("alice/app.git");
     let hub = Hub::start(&remote_root, [27; 32]);
+    // Its encrypted turns were registered that way by a client from before encrypted publication
+    // was retired.
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(format!("agit-{}", "a".repeat(40)));
     save_at(
         &home
             .join("credentials")
@@ -5003,21 +5302,22 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
     );
 }
 
-/// An encrypted session that continues its published history declares only what it adds, and its
-/// new snapshots keep the public session identity it was accepted under even when the local
-/// candidate cache is gone: the accepted record, not the cache, decides the identity. Minting one
-/// here would split the session into two public sessions on the Hub.
+/// An encrypted session on a Hub that doesn't yet take the declaration that its carried turns were
+/// proven isn't continued: encrypted publication is retired and that Hub would keep the session
+/// encrypted, so the push says so and nothing is sent.
 #[test]
-fn continued_encrypted_session_keeps_its_public_identity() {
-    use agit::domain::session_privacy::{
-        AccountIdentity, PublishedSnapshot, SessionPrivacy, SessionPublicationManifest,
-    };
+fn an_encrypted_session_the_hub_keeps_encrypted_is_not_continued() {
+    use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy};
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
     let remote_root = temp.path().join("remote");
     let remote = remote_root.join("alice/app.git");
     let hub = Hub::start(&remote_root, [27; 32]);
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(format!("agit-{}", "a".repeat(40)));
     save_at(
         &home
             .join("credentials")
@@ -5069,7 +5369,6 @@ fn continued_encrypted_session_keeps_its_public_identity() {
     fs::write(repo.root().join("README.md"), "Shared file").unwrap();
     repo.add_all().unwrap();
     repo.commit("File line").unwrap();
-    let base = git(repo.root(), &["rev-parse", "HEAD"]);
     assert_success(&run(&["--yes", "push", "alice/app@main"]));
     repo.git(&["checkout", "-b", "work"]).unwrap();
     let mut session = meta::Meta::new(
@@ -5105,72 +5404,1418 @@ fn continued_encrypted_session_keeps_its_public_identity() {
     }
     assert_success(&run(&["--yes", "push", "alice/app@work"]));
     let published = git(&remote, &["rev-parse", "refs/heads/work"]);
-    let public_session = |commit: &str| {
-        PrivacyEnvelope::parse(
-            git(
-                &remote,
-                &["show", &format!("{commit}:privacy/envelope.json")],
-            )
-            .as_bytes(),
-        )
-        .unwrap()
-        .session_binding
-        .unwrap()
-        .published_session_id
-    };
-    let accepted_identity = public_session(&published);
+    assert!(
+        git(&remote, &["ls-tree", "-r", "--name-only", &published])
+            .lines()
+            .any(|path| path == "privacy/envelope.json"),
+        "published encrypted"
+    );
 
-    // The candidate cache holds the session's public identity; losing it must not change it.
-    let stores = home
-        .join("repos/alice/app/.git/agit/privacy-publication")
-        .read_dir()
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.join(".git/session-candidates").exists())
-        .collect::<Vec<_>>();
-    assert_eq!(stores.len(), 1);
-    fs::remove_dir_all(stores[0].join(".git/session-candidates")).unwrap();
-
-    let earlier = hub.previews.lock().unwrap().len();
+    // Its next turns would continue it as plain, which this Hub doesn't take yet: the push says
+    // so, and nothing is sent.
     turn("turn 3");
     turn("turn 4");
-    assert_success(&run(&["--yes", "push", "alice/app@work"]));
-    let head = git(&remote, &["rev-parse", "refs/heads/work"]);
-    assert_eq!(
-        git(&remote, &["rev-parse", &format!("{head}^^")]),
-        published
+    hub.undeclared.store(true, Ordering::Release);
+    let refused = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(
+            "this Hub doesn't yet accept a conversation that continues one published encrypted"
+        ),
+        "{refused:?}"
     );
-    assert_eq!(public_session(&head), accepted_identity);
-    let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
-    assert!(!previews.is_empty());
-    for preview in previews {
-        let declared: SessionPublicationManifest =
-            serde_json::from_value(preview["manifest"].clone()).unwrap();
-        assert_eq!(
-            declared
-                .preserved_commits
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from([base.clone(), published.clone()])
-        );
-        assert_eq!(declared.snapshots.len(), 2);
-        for snapshot in &declared.snapshots {
-            let PublishedSnapshot::SessionOwnerV2 { snapshot, .. } = snapshot else {
-                panic!("an encrypted turn is declared as {snapshot:?}");
-            };
-            assert_eq!(snapshot.binding.published_session_id, accepted_identity);
-        }
-    }
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
 }
 
-/// A plain conversation that merges in the Hub's copy of an encrypted session, on the computer that
-/// published it, is refused before anything is sent: its records were only ever shown in their
-/// encrypted projection, and a plain push can't publish them in that form. That holds for a record
-/// the merged snapshot holds, and for one its later snapshot left out, as a revert does. A plain
-/// session with no encrypted ancestry still publishes.
+/// Encrypted publication is retired: a session an older client published encrypted continues as
+/// plain at the next push, and its turns already out keep the projection their readers were shown.
+/// The push that switches it says so once. Nothing it or a later push sends carries an envelope, or
+/// a value the encrypted projection had hidden, though plain capture would leave that value alone
+/// in a new turn; someone the owner gave access to the originals, who resumes the session from them
+/// on their own computer and publishes, sends none either. A client that published the session's
+/// local records as they are would show readers what they were never shown; one that kept the
+/// session encrypted would keep uploading the originals.
 #[test]
-fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
+fn an_encrypted_session_continues_as_plain_and_keeps_its_published_turns() {
+    use agit::domain::session_privacy::{
+        AccountIdentity, PublishedSnapshot, SessionPrivacy, SessionPublicationManifest,
+    };
+    const CANARY: &str = "canary-k7q2";
+    // A value the encrypted projection published as it was, registered only later.
+    const LATER: &str = "larkspur-overture-1931";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(format!("agit-{}", "a".repeat(40)));
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run_with = |args: &[&str], selected_home: &Path, vars: &[(&str, &Path)]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", selected_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .envs(vars.iter().copied())
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let run_home = |args: &[&str], selected_home: &Path| run_with(args, selected_home, &[]);
+    let run = |args: &[&str]| run_home(args, &home);
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(repo.root().join("memory/notes.md"), "base memory").unwrap();
+    // A script and a symbolic link on the file line, which the session changes while encrypted.
+    fs::create_dir_all(repo.root().join("tools")).unwrap();
+    fs::write(repo.root().join("tools/run.sh"), "#!/bin/sh\necho base\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(
+            repo.root().join("tools/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../README.md", repo.root().join("tools/readme")).unwrap();
+    }
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "work"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    session.session_privacy = Some(SessionPrivacy {
+        scheme: agit::domain::session_privacy::SessionScheme::SessionOwnerV2,
+        ..SessionPrivacy::new(Some(AccountIdentity::new(&hub.base, "account-1").unwrap())).unwrap()
+    });
+    session.committer_account = Some(AccountIdentity::new(&hub.base, "account-1").unwrap());
+    let record = |content: &str| {
+        transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &session.session,
+        )
+    };
+    let reply = |content: &str| {
+        transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":content}]}})
+            ),
+            "claude-code",
+            &session.session,
+        )
+    };
+    let commit = |log: &str, message: &str| {
+        storage::write_snapshot(repo.root(), log, log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(message).unwrap();
+    };
+    let mut log = record(&format!("please read /Users/alice/{CANARY}/plan.txt"));
+    log.push_str(&reply("noted"));
+    commit(&log, "turn 0");
+    log.push_str(&record("turn 1"));
+    log.push_str(&record(&format!("deploy with {LATER}")));
+    // While published encrypted, the session changes a memory file and adds a skill. No upload
+    // carries either: an encrypted snapshot publishes its records only.
+    fs::write(
+        repo.root().join("memory/notes.md"),
+        "MEMORY-CANARY changed while encrypted",
+    )
+    .unwrap();
+    fs::create_dir_all(repo.root().join("skills")).unwrap();
+    fs::write(
+        repo.root().join("skills/new.md"),
+        "SKILL-CANARY added while encrypted",
+    )
+    .unwrap();
+    fs::write(
+        repo.root().join("tools/run.sh"),
+        "#!/bin/sh\necho SCRIPT-CANARY\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        fs::remove_file(repo.root().join("tools/readme")).unwrap();
+        std::os::unix::fs::symlink("../memory/notes.md", repo.root().join("tools/readme")).unwrap();
+    }
+    commit(&log, "turn 1");
+    let originals = log.clone();
+    assert_success(&run(&["--yes", "push", "alice/app@work"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/work"]);
+    let published_source = git(repo.root(), &["rev-parse", "HEAD"]);
+    // Another session published encrypted then, which a later plain one merges in.
+    let other = meta::Meta {
+        session: format!("agit-{}", "9".repeat(40)),
+        ..session.clone()
+    };
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(other.session.clone());
+    repo.git(&["checkout", "-q", "-b", "other", "main"])
+        .unwrap();
+    let other_log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":format!("please read /Users/alice/{CANARY}/other.txt")}})
+        ),
+        "claude-code",
+        &other.session,
+    );
+    storage::write_snapshot(repo.root(), &other_log, &other_log).unwrap();
+    meta::write(repo.root(), &other).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("other turn").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@other"]));
+    let other_published = git(&remote, &["rev-parse", "refs/heads/other"]);
+    assert!(
+        git(&remote, &["ls-tree", "-r", "--name-only", &other_published])
+            .lines()
+            .any(|path| path == "privacy/envelope.json"),
+        "the merged branch was published encrypted"
+    );
+    let other_source = git(repo.root(), &["rev-parse", "HEAD"]);
+    // A third session published encrypted twice; its later snapshot leaves out a record the earlier
+    // one published, as a revert does.
+    let third = meta::Meta {
+        session: format!("agit-{}", "8".repeat(40)),
+        ..session.clone()
+    };
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(third.session.clone());
+    repo.git(&["checkout", "-q", "-b", "third", "main"])
+        .unwrap();
+    let third_record = |content: &str| {
+        transcript::wrap_lines(
+            &format!(
+                "{}\n",
+                json!({"type":"user","message":{"role":"user","content":content}})
+            ),
+            "claude-code",
+            &third.session,
+        )
+    };
+    // A full Claude Code record, as capture keeps it: its folder holds the hidden value too.
+    let reverted = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({
+                "type": "user",
+                "uuid": "00000000-0000-4000-8000-000000000001",
+                "parentUuid": null,
+                "sessionId": "00000000-0000-4000-8000-000000000002",
+                "cwd": format!("/Users/alice/{CANARY}/project"),
+                "gitBranch": "main",
+                "version": "2.1.314",
+                "timestamp": "2026-11-04T08:00:00Z",
+                "message": {"role": "user", "content": format!("please read /Users/alice/{CANARY}/reverted.txt")}
+            })
+        ),
+        "claude-code",
+        &third.session,
+    );
+    let kept_turn = third_record("a turn the revert kept");
+    let third_log = format!("{reverted}{kept_turn}");
+    storage::write_snapshot(repo.root(), &third_log, &third_log).unwrap();
+    meta::write(repo.root(), &third).unwrap();
+    // A memory file the session adds while published encrypted, which no upload carries.
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(repo.root().join("memory/third.md"), "THIRD-CANARY").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("third turn").unwrap();
+    storage::write_snapshot(repo.root(), &kept_turn, &kept_turn).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("revert the third session's first turn")
+        .unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@third"]));
+    let third_published = git(&remote, &["rev-parse", "refs/heads/third"]);
+    let third_earlier = git(&remote, &["rev-parse", &format!("{third_published}^")]);
+    for commit in [&third_published, &third_earlier] {
+        assert!(
+            git(&remote, &["ls-tree", "-r", "--name-only", commit])
+                .lines()
+                .any(|path| path == "privacy/envelope.json"),
+            "the third session was published encrypted"
+        );
+    }
+    let third_source = git(repo.root(), &["rev-parse", "HEAD"]);
+    repo.git(&["checkout", "-q", "work"]).unwrap();
+    // What a commit's tree publishes outside its envelope.
+    let public_text = |commit: &str| {
+        git(&remote, &["ls-tree", "-r", commit])
+            .lines()
+            .filter(|entry| !entry.ends_with("\tprivacy/envelope.json"))
+            .map(|entry| {
+                let blob = entry.split_whitespace().nth(2).unwrap();
+                git(&remote, &["cat-file", "blob", blob])
+            })
+            .collect::<String>()
+    };
+    assert!(
+        git(&remote, &["ls-tree", "-r", "--name-only", &published])
+            .lines()
+            .any(|path| path == "privacy/envelope.json"),
+        "an older client published the session encrypted"
+    );
+    let shown = public_text(&published);
+    assert!(
+        shown.contains("turn 1") && !shown.contains(CANARY),
+        "the encrypted projection hid the path its readers were not shown"
+    );
+
+    // Every object a push added: no envelope, and nothing the projection hid.
+    let added = |from: &[&str], to: &str| {
+        let mut range = vec!["rev-list", "--objects", to];
+        let excluded = from
+            .iter()
+            .map(|commit| format!("^{commit}"))
+            .collect::<Vec<_>>();
+        range.extend(excluded.iter().map(String::as_str));
+        let objects = git(&remote, &range);
+        let mut text = String::new();
+        for line in objects.lines() {
+            let mut fields = line.splitn(2, ' ');
+            let oid = fields.next().unwrap();
+            let path = fields.next().unwrap_or_default();
+            assert!(
+                !path.starts_with("privacy"),
+                "{path} was sent after the switch"
+            );
+            if git(&remote, &["cat-file", "-t", oid]) == "blob" {
+                text.push_str(&git(&remote, &["cat-file", "blob", oid]));
+            }
+        }
+        assert!(
+            !text.contains(CANARY),
+            "a hidden value was sent after the switch"
+        );
+        text
+    };
+
+    hub.legacy_encrypted.lock().unwrap().clear();
+    // A supervised push of the session as it is sends nothing, so nothing switches: the Hub keeps
+    // it encrypted, nobody is told, and the supervisor's receipt names the encrypted snapshot.
+    let request = temp.path().join("supervised.json");
+    fs::write(
+        &request,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "request_id": "6f0b6a52-3f61-4f0e-9a3c-1f8f8b5b8c01",
+            "repository": "alice/app",
+            "branch": "work",
+            "source": published_source,
+            "destination": {"hub": hub.base, "agent_id": AGENT_ID},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let registrations = hub.registrations.load(Ordering::Acquire);
+    let supervised = run_with(
+        &["--yes", "push", "alice/app@work"],
+        &home,
+        &[("AGIT_RC_SUPERVISOR_PUSH_RESULT", &request)],
+    );
+    assert_success(&supervised);
+    assert!(
+        !String::from_utf8_lossy(&supervised.stderr).contains("now publishes like"),
+        "{supervised:?}"
+    );
+    assert_eq!(hub.registrations.load(Ordering::Acquire), registrations);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
+    let result: serde_json::Value = serde_json::from_slice(&fs::read(&request).unwrap()).unwrap();
+    assert_eq!(result["publication"]["published"], published, "{result}");
+    assert_ne!(result["publication"]["mode"], "session_plain", "{result}");
+    let earlier = hub.previews.lock().unwrap().len();
+    log.push_str(&record("turn 2 after the switch"));
+    commit(&log, "turn 2");
+    // A Hub that doesn't take the declaration that the carried turns were proven refuses such a
+    // push, so this client sends nothing and says why.
+    hub.undeclared.store(true, Ordering::Release);
+    let before_refusal = git(&remote, &["rev-parse", "refs/heads/work"]);
+    let undeclared = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!undeclared.status.success(), "{undeclared:?}");
+    assert!(
+        String::from_utf8_lossy(&undeclared.stderr).contains(
+            "this Hub doesn't yet accept a conversation that continues one published encrypted"
+        ),
+        "{undeclared:?}"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        before_refusal
+    );
+    hub.undeclared.store(false, Ordering::Release);
+    // A push that stops after its proof and inspection, here for want of the person's confirmation
+    // of a public repository, has registered nothing: the Hub still holds the session encrypted,
+    // and nobody was told.
+    *hub.visibility.lock().unwrap() = "public";
+    let registrations = hub.registrations.load(Ordering::Acquire);
+    let unconfirmed = run(&["push", "alice/app@work"]);
+    *hub.visibility.lock().unwrap() = "private";
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    assert_eq!(
+        hub.registrations.load(Ordering::Acquire),
+        registrations,
+        "nothing is registered before the push is confirmed"
+    );
+    assert!(
+        !String::from_utf8_lossy(&unconfirmed.stderr).contains("now publishes like"),
+        "{unconfirmed:?}"
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        before_refusal
+    );
+    // Registered after the encrypted publication: a record the plain tip shares with it goes out
+    // as today's protection writes it, not as the encrypted projection's line.
+    let register_later = |selected_home: &Path| {
+        let mut add = Command::new(env!("CARGO_BIN_EXE_agit"));
+        add.env_clear_local();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                add.env(name, value);
+            }
+        }
+        let mut add = add
+            .current_dir(temp.path())
+            .env("AGIT_HOME", selected_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .args(["secrets", "add", "later", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        add.stdin
+            .take()
+            .unwrap()
+            .write_all(LATER.as_bytes())
+            .unwrap();
+        assert_success(&add.wait_with_output().unwrap());
+    };
+    register_later(&home);
+    assert!(
+        public_text(&published).contains(LATER),
+        "the encrypted projection published the value as it was"
+    );
+    hub.declarations.lock().unwrap().clear();
+    let switching = run(&["--yes", "push", "alice/app@work"]);
+    assert_success(&switching);
+    let switched = git(&remote, &["rev-parse", "refs/heads/work"]);
+    // Files held back go back as the file line had them, their modes included: the script stays
+    // executable and the link stays a link to where it pointed.
+    let mode = |path: &str| {
+        git(&remote, &["ls-tree", &switched, "--", path])
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    #[cfg(unix)]
+    {
+        assert_eq!(mode("tools/run.sh"), "100755");
+        assert_eq!(mode("tools/readme"), "120000");
+        assert_eq!(
+            git(
+                &remote,
+                &["cat-file", "-p", &format!("{switched}:tools/readme")]
+            ),
+            "../README.md"
+        );
+    }
+    assert_eq!(
+        git(
+            &remote,
+            &["cat-file", "-p", &format!("{switched}:tools/run.sh")]
+        ),
+        "#!/bin/sh\necho base"
+    );
+    let switched_text = public_text(&switched);
+    assert!(
+        switched_text.contains("deploy with ") && !switched_text.contains(LATER),
+        "the plain tip carries the registered value replaced"
+    );
+    // The switching push declares it on the session's registration and on its receive.
+    let declared = hub.declarations.lock().unwrap().clone();
+    assert!(
+        declared
+            .iter()
+            .any(|request| request.starts_with("POST ") && request.ends_with("/privacy-config")),
+        "{declared:?}"
+    );
+    assert!(
+        declared
+            .iter()
+            .any(|request| request.ends_with("/git-receive-pack")),
+        "{declared:?}"
+    );
+    let told = String::from_utf8_lossy(&switching.stderr);
+    assert_eq!(
+        told.matches("now publishes like your other sessions")
+            .count(),
+        1,
+        "{told}"
+    );
+    assert!(
+        told.contains("(`agit privacy access show alice/app@work` lists them)"),
+        "{told}"
+    );
+    // The access the notice points to is still there, on the session's encrypted snapshots.
+    let access = run(&["--json", "privacy", "access", "policy", "alice/app@work"]);
+    assert_success(&access);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&access.stdout).unwrap()["result"]["value"]["policy"]
+            ["session_id"],
+        session.session
+    );
+    // A session forked from it is a session of its own, plain: it has no access to originals to
+    // show or change, and the earlier session's grants are not its own.
+    repo.git(&["checkout", "-q", "-b", "forkb", &published_source])
+        .unwrap();
+    repo.git(&["rm", "-rq", "--ignore-unmatch", "privacy"])
+        .unwrap();
+    let forked = meta::Meta {
+        session: format!("agit-{}", "f".repeat(40)),
+        session_privacy: None,
+        ..session.clone()
+    };
+    meta::write(repo.root(), &forked).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("fork").unwrap();
+    for args in [
+        vec!["--json", "privacy", "access", "policy", "alice/app@forkb"],
+        vec![
+            "--yes",
+            "privacy",
+            "access",
+            "revoke",
+            "alice/app@forkb",
+            "--member",
+            "account-2",
+        ],
+    ] {
+        let refused = run(&args);
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stdout)
+                .contains("plain sessions use repository read access")
+                || String::from_utf8_lossy(&refused.stderr)
+                    .contains("plain sessions use repository read access"),
+            "{args:?}: {refused:?}"
+        );
+    }
+    // The same from the encrypted commit as the Hub holds it, whose envelope is in its tree and
+    // names the earlier session: the fork still finds no grants of its own.
+    repo.git(&[
+        "fetch",
+        "-q",
+        remote.to_str().unwrap(),
+        "refs/heads/work:refs/remotes/hub/work",
+    ])
+    .unwrap();
+    repo.git(&["checkout", "-q", "-b", "forkc", &published])
+        .unwrap();
+    repo.git(&["rm", "-rq", "privacy"]).unwrap();
+    meta::write(
+        repo.root(),
+        &meta::Meta {
+            session: format!("agit-{}", "6".repeat(40)),
+            ..forked.clone()
+        },
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("fork from the published commit").unwrap();
+    for args in [
+        vec!["--json", "privacy", "access", "policy", "alice/app@forkc"],
+        vec![
+            "--yes",
+            "privacy",
+            "access",
+            "revoke",
+            "alice/app@forkc",
+            "--member",
+            "account-2",
+        ],
+    ] {
+        let refused = run(&args);
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stdout)
+                .contains("plain sessions use repository read access")
+                || String::from_utf8_lossy(&refused.stderr)
+                    .contains("plain sessions use repository read access"),
+            "{args:?}: {refused:?}"
+        );
+    }
+    repo.git(&["checkout", "-q", "work"]).unwrap();
+    let mode = run(&["--json", "privacy", "mode", "alice/app@work"]);
+    assert_success(&mode);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&mode.stdout).unwrap()["result"]["value"]["local_mode"],
+        "plain"
+    );
+    let switched = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{switched}^")]),
+        published
+    );
+    let sent = added(&[&published], &switched);
+    assert!(sent.contains("turn 2 after the switch"));
+    // The files it changed while encrypted stay as the file line had them, and nothing else of
+    // the file line is lost.
+    assert!(
+        !sent.contains("MEMORY-CANARY") && !sent.contains("SKILL-CANARY"),
+        "{sent}"
+    );
+    assert_eq!(
+        git(&remote, &["show", &format!("{switched}:memory/notes.md")]),
+        "base memory"
+    );
+    assert_eq!(
+        git(&remote, &["show", &format!("{switched}:README.md")]),
+        "Shared file"
+    );
+    assert!(
+        !git(&remote, &["ls-tree", "-r", "--name-only", &switched])
+            .lines()
+            .any(|path| path == "skills/new.md")
+    );
+    assert!(
+        told.contains("Files it changed before this, such as memory or skills, are not uploaded."),
+        "{told}"
+    );
+    for preview in &hub.previews.lock().unwrap()[earlier..] {
+        let declared: SessionPublicationManifest =
+            serde_json::from_value(preview["manifest"].clone()).unwrap();
+        for snapshot in &declared.snapshots {
+            let PublishedSnapshot::Plain {
+                config_revision, ..
+            } = snapshot
+            else {
+                panic!("a turn after the switch is declared as {snapshot:?}");
+            };
+            assert_eq!(*config_revision, 2);
+        }
+    }
+
+    // A change made after the switch is new, and goes up.
+    fs::write(
+        repo.root().join("memory/notes.md"),
+        "memory after the switch",
+    )
+    .unwrap();
+    log.push_str(&record("turn 3"));
+    commit(&log, "turn 3");
+    let later = run(&["--yes", "push", "alice/app@work"]);
+    assert_success(&later);
+    assert!(
+        !String::from_utf8_lossy(&later.stderr).contains("now publishes like"),
+        "the switch is told once"
+    );
+    let head = git(&remote, &["rev-parse", "refs/heads/work"]);
+    assert!(added(&[&switched], &head).contains("turn 3"));
+    assert_eq!(
+        git(&remote, &["show", &format!("{head}:memory/notes.md")]),
+        "memory after the switch"
+    );
+
+    // Someone the owner gave access to the originals resumes the session from them, on their own
+    // computer, and publishes what they hold: the original records and a turn of their own.
+    let grantee = temp.path().join("grantee");
+    startup_cache::seed(&grantee);
+    fs::create_dir_all(grantee.join("credentials")).unwrap();
+    save_at(
+        &grantee
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-2".into()),
+            username: "bob".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-collaborator".into(),
+            refresh_token: "synthetic-collaborator-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    assert_success(&run_home(&["clone", "alice/app", "--no-bind"], &grantee));
+    let theirs = Repo::at(grantee.join("repos/alice/app"));
+    theirs
+        .git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    theirs.git(&["config", "user.name", "Grantee"]).unwrap();
+    theirs
+        .git(&["config", "user.email", "grantee@example.invalid"])
+        .unwrap();
+    let publish_from = |branch: &str, log: &str| {
+        theirs
+            .git(&["checkout", "-q", "-b", branch, &published])
+            .unwrap();
+        theirs.git(&["rm", "-rq", "privacy"]).unwrap();
+        storage::write_snapshot(theirs.root(), log, log).unwrap();
+        meta::write(theirs.root(), &session).unwrap();
+        theirs.add_all().unwrap();
+        theirs.commit(branch).unwrap();
+        run_home(&["--yes", "push", &format!("alice/app@{branch}")], &grantee)
+    };
+    let refused_as = |output: &std::process::Output, branch: &str, why: &str| {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(why),
+            "{output:?}"
+        );
+        assert!(
+            git(&remote, &["show-ref"])
+                .lines()
+                .all(|line| !line.ends_with(&format!("refs/heads/{branch}")))
+        );
+    };
+    const MISALIGNED: &str = "doesn't line up with its turns";
+    // The head the owner published plain, continued on this computer as resume restores it: its
+    // metadata and lines, then a turn. It goes through, its published lines go up as the Hub
+    // holds them, and the encrypted snapshot below doesn't decide. Turn 1's originals in place of
+    // what the head published are refused: the head proves only its own lines.
+    let shown_head = storage::materialize_at(&remote, &head, meta::LOG_FILE).unwrap();
+    let continue_head = |branch: &str| {
+        theirs
+            .git(&["checkout", "-q", "-b", branch, &head])
+            .unwrap();
+        let mut log = storage::materialize_at(theirs.root(), &head, meta::LOG_FILE).unwrap();
+        log.push_str(&record(&format!("turn on {branch}")));
+        storage::write_snapshot(theirs.root(), &log, &log).unwrap();
+        theirs.add_all().unwrap();
+        theirs.commit(branch).unwrap();
+        assert_success(&run_home(
+            &["--yes", "push", &format!("alice/app@{branch}")],
+            &grantee,
+        ));
+        let continued = git(&remote, &["rev-parse", &format!("refs/heads/{branch}")]);
+        assert!(added(&[&head], &continued).contains(&format!("turn on {branch}")));
+        let sent = storage::materialize_at(&remote, &continued, meta::LOG_FILE).unwrap();
+        assert!(sent.starts_with(&shown_head), "{sent}");
+
+        let swapped = format!("{branch}-originals");
+        theirs
+            .git(&["checkout", "-q", "-b", &swapped, &head])
+            .unwrap();
+        let mut log = originals.clone();
+        log.push_str(&record("turn 2 after the switch"));
+        log.push_str(&record("turn 3"));
+        log.push_str(&record(&format!("turn on {swapped}")));
+        storage::write_snapshot(theirs.root(), &log, &log).unwrap();
+        theirs.add_all().unwrap();
+        theirs.commit(&swapped).unwrap();
+        refused_as(
+            &run_home(
+                &["--yes", "push", &format!("alice/app@{swapped}")],
+                &grantee,
+            ),
+            &swapped,
+            MISALIGNED,
+        );
+    };
+    continue_head("fromhead");
+    // This computer holds the snapshot only as published, and has no access to its originals.
+    // A LOG that drops a record before what it published is refused, and so is the honest
+    // original LOG: without the originals, nothing proves its records are the published ones.
+    let mut shifted = reply("noted");
+    shifted.push_str(&record("turn 1"));
+    shifted.push_str(&record("turn from a shifted log"));
+    refused_as(&publish_from("shifted", &shifted), "shifted", MISALIGNED);
+    let mut unproven = originals.clone();
+    unproven.push_str(&record("turn from unproven originals"));
+    refused_as(&publish_from("unproven", &unproven), "unproven", MISALIGNED);
+    // A continuation of the projection itself proves itself, and publishes what was published.
+    // This computer has no record of how the session was published, and registered a value the
+    // projection published as it was: the plain continuation carries it replaced.
+    register_later(&grantee);
+    let mut continued = storage::materialize_at(theirs.root(), &published, meta::LOG_FILE).unwrap();
+    assert!(continued.contains(LATER));
+    continued.push_str(&record("turn from the projection"));
+    assert_success(&publish_from("fromprojection", &continued));
+    let fromprojection = git(&remote, &["rev-parse", "refs/heads/fromprojection"]);
+    assert!(added(&[&head], &fromprojection).contains("turn from the projection"));
+    let projected_text = public_text(&fromprojection);
+    assert!(
+        projected_text.contains("deploy with ") && !projected_text.contains(LATER),
+        "a clone's plain continuation carries the registered value replaced"
+    );
+
+    // Once the originals are unlocked on this computer, as `agit privacy unlock` leaves them,
+    // the original LOG is proven record by record. Each of its published turns goes up as the
+    // line published then, and the hidden value doesn't.
+    let unlocked = theirs
+        .common_dir()
+        .unwrap()
+        .join("agit/privacy-recovery")
+        .join(&published);
+    fs::create_dir_all(&unlocked).unwrap();
+    for (path, bytes) in storage::snapshot_files(&originals, &originals).unwrap() {
+        let file = unlocked.join(&path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    fs::create_dir_all(unlocked.join("session")).unwrap();
+    fs::write(unlocked.join(meta::FILE), meta::to_text(&session).unwrap()).unwrap();
+    let envelope = git_command(temp.path())
+        .args(["-C", theirs.root().to_str().unwrap(), "cat-file", "blob"])
+        .arg(format!("{published}:privacy/envelope.json"))
+        .output()
+        .unwrap();
+    assert!(envelope.status.success());
+    agit::domain::privacy_recovery::write_manifest(&unlocked, &envelope.stdout).unwrap();
+    let mut resumed = originals.clone();
+    resumed.push_str(&record("turn from elsewhere"));
+    assert_success(&publish_from("elsewhere", &resumed));
+    let elsewhere = git(&remote, &["rev-parse", "refs/heads/elsewhere"]);
+    // On this computer the published encrypted snapshot names the session by its public id, not
+    // by the id the plain snapshots carry; access to its originals is still found for them.
+    let public_id: meta::Meta = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("{published}:session/meta.json")],
+    ))
+    .unwrap();
+    assert_ne!(
+        public_id.session, session.session,
+        "published under a public id"
+    );
+    let access = run_home(
+        &[
+            "--json",
+            "privacy",
+            "access",
+            "policy",
+            "alice/app@elsewhere",
+        ],
+        &grantee,
+    );
+    assert_success(&access);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&access.stdout).unwrap()["result"]["value"]["policy"]
+            ["session_id"],
+        session.session
+    );
+    assert!(added(&[&head], &elsewhere).contains("turn from elsewhere"));
+    // With the originals there, a continuation of the projection itself still goes through.
+    let mut continued = storage::materialize_at(theirs.root(), &published, meta::LOG_FILE).unwrap();
+    continued.push_str(&record("turn from the projection, originals held"));
+    assert_success(&publish_from("fromprojection2", &continued));
+    continue_head("fromhead2");
+    // A session forked from the encrypted snapshot with its originals is merged into a
+    // conversation on the head published plain, carrying the originals past the head's own lines.
+    // The head proves only its own lines: the originals past them are held to the encrypted
+    // snapshot below it, as they were published.
+    theirs
+        .git(&["checkout", "-q", "-b", "originals-fork", &published])
+        .unwrap();
+    theirs.git(&["rm", "-rq", "privacy"]).unwrap();
+    let mut fork_log = originals.clone();
+    fork_log.push_str(&record("turn on the originals' fork"));
+    storage::write_snapshot(theirs.root(), &fork_log, &fork_log).unwrap();
+    meta::write(
+        theirs.root(),
+        &meta::Meta {
+            session: format!("agit-{}", "7".repeat(40)),
+            session_privacy: None,
+            ..session.clone()
+        },
+    )
+    .unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("fork with the originals").unwrap();
+    let shown_published = storage::parse_envelopes(
+        &storage::materialize_at(&remote, &published, meta::LOG_FILE).unwrap(),
+    )
+    .unwrap();
+    theirs
+        .git(&["checkout", "-q", "-b", "remerge", &head])
+        .unwrap();
+    let mut log = storage::materialize_at(theirs.root(), &head, meta::LOG_FILE).unwrap();
+    log.push_str(&record("turn on remerge"));
+    storage::write_snapshot(theirs.root(), &log, &log).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("turn on remerge").unwrap();
+    theirs
+        .git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-commit",
+            "-s",
+            "ours",
+            "originals-fork",
+        ])
+        .unwrap();
+    log.push_str(&originals);
+    storage::write_snapshot(theirs.root(), &log, &log).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("merge the originals' continuation").unwrap();
+    // Its line through the fork reaches the earlier encrypted snapshot without passing the head,
+    // and this computer can't read that one's originals yet: nothing is sent.
+    let refused = run_home(&["--yes", "push", "alice/app@remerge"], &grantee);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("can't tell which of its turns were already published"),
+        "{refused:?}"
+    );
+    // It says what the person can do instead.
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agit privacy unlock"),
+        "{refused:?}"
+    );
+    assert!(
+        git_command(temp.path())
+            .args([
+                "-C",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "-q",
+                "refs/heads/remerge"
+            ])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty(),
+        "nothing was sent"
+    );
+    // As published, or narrowed further by today's protection: the value registered since goes
+    // out replaced.
+    let narrowed = |published: &str, sent: &str| {
+        published == sent
+            || published.split_once(LATER).is_some_and(|(before, after)| {
+                !sent.contains(LATER)
+                    && sent.len() > before.len() + after.len()
+                    && sent.starts_with(before)
+                    && sent.ends_with(after)
+            })
+    };
+    let shown = storage::materialize_at(&remote, &published, meta::LOG_FILE).unwrap();
+    let sent = storage::materialize_at(&remote, &elsewhere, meta::LOG_FILE).unwrap();
+    for envelope in storage::parse_envelopes(&shown).unwrap() {
+        assert!(
+            storage::parse_envelopes(&sent).unwrap().iter().any(|sent| {
+                sent.source == envelope.source
+                    && narrowed(&envelope.content.to_string(), &sent.content.to_string())
+            }),
+            "a published turn goes up as it was published: {envelope:?}"
+        );
+    }
+
+    // That computer can read the earlier snapshot's originals too, as access to the session gives
+    // it: a merge below asks every encrypted snapshot it reaches, and one it can't read refuses.
+    let earlier_public = git(&remote, &["rev-parse", &format!("{published}^")]);
+    let earlier_originals =
+        storage::materialize_at(repo.root(), &format!("{published_source}^"), meta::LOG_FILE)
+            .unwrap();
+    let unlocked = theirs
+        .common_dir()
+        .unwrap()
+        .join("agit/privacy-recovery")
+        .join(&earlier_public);
+    fs::create_dir_all(&unlocked).unwrap();
+    for (path, bytes) in storage::snapshot_files(&earlier_originals, &earlier_originals).unwrap() {
+        let file = unlocked.join(&path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    fs::create_dir_all(unlocked.join("session")).unwrap();
+    fs::write(unlocked.join(meta::FILE), meta::to_text(&session).unwrap()).unwrap();
+    let envelope = git_command(temp.path())
+        .args(["-C", theirs.root().to_str().unwrap(), "cat-file", "blob"])
+        .arg(format!("{earlier_public}:privacy/envelope.json"))
+        .output()
+        .unwrap();
+    assert!(envelope.status.success());
+    agit::domain::privacy_recovery::write_manifest(&unlocked, &envelope.stdout).unwrap();
+    // Now that it can, the re-merge goes through: past the head's own lines, every turn goes up as
+    // the encrypted snapshots published it, or narrowed further by today's protection.
+    assert_success(&run_home(&["--yes", "push", "alice/app@remerge"], &grantee));
+    let remerge = git(&remote, &["rev-parse", "refs/heads/remerge"]);
+    assert!(added(&[&head, &elsewhere], &remerge).contains("turn on remerge"));
+    let sent = storage::materialize_at(&remote, &remerge, meta::LOG_FILE).unwrap();
+    assert!(sent.starts_with(&shown_head), "{sent}");
+    for envelope in storage::parse_envelopes(&sent[shown_head.len()..]).unwrap() {
+        assert!(
+            envelope.content.to_string().contains("turn on remerge")
+                || shown_published.iter().any(|published| {
+                    published.source == envelope.source
+                        && narrowed(
+                            &published.content.to_string(),
+                            &envelope.content.to_string(),
+                        )
+                }),
+            "{envelope:?}"
+        );
+    }
+
+    // On that computer a plain conversation merging the published commit in, keeping its own
+    // tree, holds the merged turns to it too.
+    let main_tip = git(&remote, &["rev-parse", "refs/heads/main"]);
+    theirs
+        .git(&["checkout", "-q", "-b", "crossmerge", &main_tip])
+        .unwrap();
+    let crossing = meta::Meta {
+        session: format!("agit-{}", "e".repeat(40)),
+        session_privacy: None,
+        ..session.clone()
+    };
+    let own = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"a turn of their own"}})
+        ),
+        "claude-code",
+        &crossing.session,
+    );
+    storage::write_snapshot(theirs.root(), &own, &own).unwrap();
+    meta::write(theirs.root(), &crossing).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("a turn of their own").unwrap();
+    theirs
+        .git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-commit",
+            "-s",
+            "ours",
+            &published,
+        ])
+        .unwrap();
+    let mut combined = own.clone();
+    combined.push_str(&originals);
+    storage::write_snapshot(theirs.root(), &combined, &combined).unwrap();
+    meta::write(theirs.root(), &crossing).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("merge the published conversation").unwrap();
+    assert_success(&run_home(
+        &["--yes", "push", "alice/app@crossmerge"],
+        &grantee,
+    ));
+    let crossmerge = git(&remote, &["rev-parse", "refs/heads/crossmerge"]);
+    assert!(added(&[&main_tip, &published], &crossmerge).contains("a turn of their own"));
+
+    // A new session whose records say encrypted, as one inherited from an encrypted link does,
+    // registers plain.
+    repo.git(&["checkout", "-q", "-b", "inherited", "main"])
+        .unwrap();
+    let inherited_session = meta::Meta {
+        session: format!("agit-{}", "c".repeat(40)),
+        ..session.clone()
+    };
+    let inherited_log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"an inherited turn"}})
+        ),
+        "claude-code",
+        &inherited_session.session,
+    );
+    storage::write_snapshot(repo.root(), &inherited_log, &inherited_log).unwrap();
+    meta::write(repo.root(), &inherited_session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("inherited turn").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@inherited"]));
+    let inherited = git(&remote, &["rev-parse", "refs/heads/inherited"]);
+    assert!(added(&[&elsewhere], &inherited).contains("an inherited turn"));
+    let registered: meta::Meta = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("{inherited}:session/meta.json")],
+    ))
+    .unwrap();
+    assert_eq!(
+        registered.session_privacy.unwrap().scheme,
+        agit::domain::session_privacy::SessionScheme::Plain
+    );
+
+    // A plain conversation that merges in one published encrypted publishes the merged turns no
+    // wider than that projection showed them.
+    repo.git(&["checkout", "-q", "-b", "merged", "main"])
+        .unwrap();
+    let merging = meta::Meta {
+        session: format!("agit-{}", "d".repeat(40)),
+        session_privacy: None,
+        ..session.clone()
+    };
+    let own = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"a plain turn"}})
+        ),
+        "claude-code",
+        &merging.session,
+    );
+    storage::write_snapshot(repo.root(), &own, &own).unwrap();
+    meta::write(repo.root(), &merging).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("a plain turn").unwrap();
+    repo.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-commit",
+        "-s",
+        "ours",
+        &published_source,
+    ])
+    .unwrap();
+    let mut combined = own.clone();
+    combined.push_str(&originals);
+    storage::write_snapshot(repo.root(), &combined, &combined).unwrap();
+    meta::write(repo.root(), &merging).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("merge the encrypted conversation").unwrap();
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "HEAD^2"]),
+        published_source,
+        "a merge commit"
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@merged"]));
+    let merged = git(&remote, &["rev-parse", "refs/heads/merged"]);
+    let main_tip = git(&remote, &["rev-parse", "refs/heads/main"]);
+    assert!(added(&[&main_tip, &published], &merged).contains("a plain turn"));
+
+    // The same on the head published plain, as another computer resumes it: the merged turns are
+    // held to the merged branch's projection, which the head's lines don't cover.
+    repo.git(&[
+        "fetch",
+        "-q",
+        remote.to_str().unwrap(),
+        "refs/heads/work:refs/remotes/hub/work",
+    ])
+    .unwrap();
+    repo.git(&["checkout", "-q", "-b", "headmerge", &head])
+        .unwrap();
+    let mut continued = storage::materialize_at(repo.root(), &head, meta::LOG_FILE).unwrap();
+    continued.push_str(&record("turn on headmerge"));
+    storage::write_snapshot(repo.root(), &continued, &continued).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn on headmerge").unwrap();
+    repo.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-commit",
+        "-s",
+        "ours",
+        &other_source,
+    ])
+    .unwrap();
+    continued.push_str(&other_log);
+    storage::write_snapshot(repo.root(), &continued, &continued).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("merge the other conversation").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@headmerge"]));
+    let headmerge = git(&remote, &["rev-parse", "refs/heads/headmerge"]);
+    // The branch's tip on the Hub is the merge, not the turn below it.
+    assert_eq!(
+        git(&remote, &["rev-list", "--parents", "-n", "1", &headmerge])
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>(),
+        vec![
+            git(&remote, &["rev-parse", &format!("{headmerge}^1")]).as_str(),
+            other_published.as_str(),
+        ],
+        "the merge is published as the branch tip"
+    );
+    assert!(added(&[&head, &other_published], &headmerge).contains("turn on headmerge"));
+    let sent = storage::materialize_at(&remote, &headmerge, meta::LOG_FILE).unwrap();
+    assert!(sent.starts_with(&shown_head), "{sent}");
+    // Past the head's lines, a merged turn goes up only as the merged branch's projection showed it.
+    let projected = storage::parse_envelopes(
+        &storage::materialize_at(&remote, &other_published, meta::LOG_FILE).unwrap(),
+    )
+    .unwrap();
+    for envelope in storage::parse_envelopes(&sent[shown_head.len()..]).unwrap() {
+        assert!(
+            envelope.content.to_string().contains("turn on headmerge")
+                || projected.iter().any(|published| {
+                    published.source == envelope.source
+                        && published.object_hash == envelope.object_hash
+                        && published.content == envelope.content
+                }),
+            "{envelope:?}"
+        );
+    }
+
+    // That plain head now holds the other session's published turn. On the grantee's computer,
+    // with that session's originals unlocked, a branch continues them from its encrypted snapshot,
+    // and a conversation on the plain head merges it in, carrying the originals past the head's
+    // lines. They go up as the encrypted snapshot published them: the plain head proves only its
+    // own lines.
+    theirs
+        .git(&[
+            "fetch",
+            "-q",
+            remote.to_str().unwrap(),
+            "refs/heads/headmerge:refs/remotes/hub/headmerge",
+        ])
+        .unwrap();
+    let unlocked = theirs
+        .common_dir()
+        .unwrap()
+        .join("agit/privacy-recovery")
+        .join(&other_published);
+    fs::create_dir_all(&unlocked).unwrap();
+    for (path, bytes) in storage::snapshot_files(&other_log, &other_log).unwrap() {
+        let file = unlocked.join(&path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, bytes).unwrap();
+    }
+    fs::create_dir_all(unlocked.join("session")).unwrap();
+    fs::write(unlocked.join(meta::FILE), meta::to_text(&other).unwrap()).unwrap();
+    let envelope = git_command(temp.path())
+        .args(["-C", theirs.root().to_str().unwrap(), "cat-file", "blob"])
+        .arg(format!("{other_published}:privacy/envelope.json"))
+        .output()
+        .unwrap();
+    assert!(envelope.status.success());
+    agit::domain::privacy_recovery::write_manifest(&unlocked, &envelope.stdout).unwrap();
+    theirs
+        .git(&["checkout", "-q", "-b", "continued-b", &other_published])
+        .unwrap();
+    theirs.git(&["rm", "-rq", "privacy"]).unwrap();
+    let mut restored = other_log.clone();
+    restored.push_str(&transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"a turn continuing the other session"}})
+        ),
+        "claude-code",
+        &other.session,
+    ));
+    storage::write_snapshot(theirs.root(), &restored, &restored).unwrap();
+    meta::write(theirs.root(), &other).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("continue the other session").unwrap();
+    theirs
+        .git(&["checkout", "-q", "-b", "bmerge", &headmerge])
+        .unwrap();
+    theirs
+        .git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-commit",
+            "-s",
+            "ours",
+            "continued-b",
+        ])
+        .unwrap();
+    let mut log = storage::materialize_at(theirs.root(), &headmerge, meta::LOG_FILE).unwrap();
+    let shown_merged = log.clone();
+    log.push_str(&restored);
+    storage::write_snapshot(theirs.root(), &log, &log).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("merge the continued session").unwrap();
+    assert_success(&run_home(&["--yes", "push", "alice/app@bmerge"], &grantee));
+    let bmerge = git(&remote, &["rev-parse", "refs/heads/bmerge"]);
+    assert!(added(&[&headmerge], &bmerge).contains("a turn continuing the other session"));
+    let sent = storage::materialize_at(&remote, &bmerge, meta::LOG_FILE).unwrap();
+    assert!(sent.starts_with(&shown_merged), "{sent}");
+    for envelope in storage::parse_envelopes(&sent[shown_merged.len()..]).unwrap() {
+        assert!(
+            envelope
+                .content
+                .to_string()
+                .contains("a turn continuing the other session")
+                || projected.iter().any(|published| {
+                    published.source == envelope.source
+                        && published.object_hash == envelope.object_hash
+                        && published.content == envelope.content
+                }),
+            "{envelope:?}"
+        );
+    }
+
+    // On the owner's computer, a conversation on the plain head merges the third session's later
+    // snapshot, bringing back the record its revert left out, past the head's lines. Only the
+    // earlier snapshot published that record, and it goes up as that one published it.
+    repo.git(&["checkout", "-q", "-b", "revmerge", &head])
+        .unwrap();
+    let mut log = storage::materialize_at(repo.root(), &head, meta::LOG_FILE).unwrap();
+    log.push_str(&record("turn on revmerge"));
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn on revmerge").unwrap();
+    repo.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-commit",
+        "-s",
+        "ours",
+        &third_source,
+    ])
+    .unwrap();
+    log.push_str(&reverted);
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    // The merge takes that memory file too; it isn't uploaded through the merge either.
+    repo.git(&["checkout", &third_source, "--", "memory/third.md"])
+        .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("merge the reverted record back").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@revmerge"]));
+    let revmerge = git(&remote, &["rev-parse", "refs/heads/revmerge"]);
+    assert!(
+        !git(&remote, &["ls-tree", "-r", "--name-only", &revmerge])
+            .lines()
+            .any(|path| path == "memory/third.md"),
+        "a file the merged session changed while encrypted went up"
+    );
+    assert!(added(&[&head, &third_published], &revmerge).contains("turn on revmerge"));
+    let sent = storage::materialize_at(&remote, &revmerge, meta::LOG_FILE).unwrap();
+    assert!(sent.starts_with(&shown_head), "{sent}");
+    let earlier_shown = storage::parse_envelopes(
+        &storage::materialize_at(&remote, &third_earlier, meta::LOG_FILE).unwrap(),
+    )
+    .unwrap();
+    let back = storage::parse_envelopes(&sent[shown_head.len()..]).unwrap();
+    assert_eq!(back.len(), 2, "{sent}");
+    assert!(back[0].content.to_string().contains("turn on revmerge"));
+    assert_eq!(
+        (&back[1].source, &back[1].object_hash, &back[1].content),
+        (
+            &earlier_shown[0].source,
+            &earlier_shown[0].object_hash,
+            &earlier_shown[0].content
+        ),
+        "{sent}"
+    );
+    assert!(!sent.contains("/Users/alice"), "{sent}");
+
+    // The same with the Hub's copy of the later snapshot merged in, as a checkout that took it
+    // from the Hub holds it: this computer published it, so the originals are still here.
+    repo.git(&[
+        "fetch",
+        "-q",
+        remote.to_str().unwrap(),
+        "refs/heads/third:refs/remotes/hub/third",
+    ])
+    .unwrap();
+    repo.git(&["checkout", "-q", "-b", "revmerge-public", &head])
+        .unwrap();
+    let mut log = storage::materialize_at(repo.root(), &head, meta::LOG_FILE).unwrap();
+    log.push_str(&record("turn on revmerge-public"));
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn on revmerge-public").unwrap();
+    repo.git(&[
+        "merge",
+        "-q",
+        "--no-ff",
+        "--no-commit",
+        "-s",
+        "ours",
+        &third_published,
+    ])
+    .unwrap();
+    log.push_str(&reverted);
+    storage::write_snapshot(repo.root(), &log, &log).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("merge the reverted record back from the Hub's copy")
+        .unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@revmerge-public"]));
+    let revmerge_public = git(&remote, &["rev-parse", "refs/heads/revmerge-public"]);
+    assert!(
+        added(&[&head, &third_published], &revmerge_public).contains("turn on revmerge-public")
+    );
+    let sent = storage::materialize_at(&remote, &revmerge_public, meta::LOG_FILE).unwrap();
+    assert!(sent.starts_with(&shown_head), "{sent}");
+    let back = storage::parse_envelopes(&sent[shown_head.len()..]).unwrap();
+    assert_eq!(back.len(), 2, "{sent}");
+    assert!(
+        back[0]
+            .content
+            .to_string()
+            .contains("turn on revmerge-public")
+    );
+    assert_eq!(
+        (&back[1].source, &back[1].object_hash, &back[1].content),
+        (
+            &earlier_shown[0].source,
+            &earlier_shown[0].object_hash,
+            &earlier_shown[0].content
+        ),
+        "{sent}"
+    );
+    assert!(!sent.contains("/Users/alice"), "{sent}");
+}
+
+/// A plain conversation that takes in an encrypted session's records, on the computer that
+/// published it, publishes each as the encrypted snapshot published it, or is refused with nothing
+/// sent: readers were only ever shown that form. That holds whether it merges the Hub's copy or
+/// this computer's own commits, forks it, or reaches it past a file-line commit, and for a record a
+/// later snapshot left out, as a revert does, which goes up as the earlier one published it. On a
+/// computer that holds those records but can't read the snapshot's originals, the merge is refused.
+/// A plain session with no encrypted ancestry publishes as before.
+#[test]
+fn records_from_an_encrypted_session_go_up_as_published_or_are_refused() {
     use agit::domain::session_privacy::{AccountIdentity, SessionPrivacy};
     const CANARY: &str = "canary-r3v9";
     let temp = tempfile::tempdir().unwrap();
@@ -5281,7 +6926,13 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
     repo.commit("revert the first turn").unwrap();
     let later_source = git(repo.root(), &["rev-parse", "HEAD"]);
     let earlier_source = git(repo.root(), &["rev-parse", "HEAD^"]);
+    // Registered encrypted by a client from before encrypted publication was retired.
+    hub.legacy_encrypted
+        .lock()
+        .unwrap()
+        .insert(encrypted.session.clone());
     assert_success(&run(&["--yes", "push", "alice/app@secret"]));
+    hub.legacy_encrypted.lock().unwrap().clear();
     let later = git(&remote, &["rev-parse", "refs/heads/secret"]);
     let earlier = git(&remote, &["rev-parse", &format!("{later}^")]);
     for commit in [&earlier, &later] {
@@ -5311,6 +6962,58 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
             git(&remote, &["for-each-ref"]),
             git(&remote, &["rev-list", "--all", "--objects"]),
         )
+    };
+    let shown: Vec<_> = [&earlier, &later]
+        .iter()
+        .flat_map(|commit| {
+            storage::parse_envelopes(
+                &storage::materialize_at(&remote, commit, meta::LOG_FILE).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    // A push of `branch` either goes through with every record of the encrypted session exactly as
+    // a snapshot of it published it (only the session binding differs) and nothing hidden on the
+    // Hub, or is refused with the Hub unchanged.
+    let published_or_refused = |branch: &str, own: &[&str]| {
+        let before = everything();
+        let pushed = run(&["--yes", "push", &format!("alice/app@{branch}")]);
+        if !pushed.status.success() {
+            let told = String::from_utf8_lossy(&pushed.stderr).into_owned();
+            assert!(told.contains("nothing was sent"), "{branch}: {told}");
+            assert_eq!(everything(), before, "{branch}: the Hub gained nothing");
+            return Err(told);
+        }
+        let tip = git(&remote, &["rev-parse", &format!("refs/heads/{branch}")]);
+        for line in git(&remote, &["rev-list", "--all", "--objects"]).lines() {
+            if before.1.contains(line) {
+                continue;
+            }
+            let oid = line.split_whitespace().next().unwrap();
+            if git(&remote, &["cat-file", "-t", oid]) == "blob" {
+                assert!(
+                    !git(&remote, &["cat-file", "blob", oid]).contains(CANARY),
+                    "{branch}: a hidden value reached the Hub"
+                );
+            }
+        }
+        for envelope in storage::parse_envelopes(
+            &storage::materialize_at(&remote, &tip, meta::LOG_FILE).unwrap(),
+        )
+        .unwrap()
+        {
+            let text = envelope.content.to_string();
+            assert!(
+                own.iter().any(|own| text.contains(own))
+                    || shown.iter().any(|published| {
+                        published.source == envelope.source
+                            && published.object_hash == envelope.object_hash
+                            && published.content == envelope.content
+                    }),
+                "{branch}: {envelope:?}"
+            );
+        }
+        Ok(())
     };
     // A plain conversation takes `snapshot` and carries the record back. Its own turn publishes;
     // the merge is refused, and the Hub gains nothing.
@@ -5349,23 +7052,9 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
         meta::write(repo.root(), &plain).unwrap();
         repo.add_all().unwrap();
         repo.commit("merge the record back").unwrap();
-        let before = everything();
-        let refused = run(&["--yes", "push", &format!("alice/app@{branch}")]);
-        assert!(!refused.status.success(), "{branch}: {refused:?}");
-        let told = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            told.contains("was published encrypted") && told.contains("nothing was uploaded"),
-            "{branch}: {told}"
-        );
-        assert_eq!(everything(), before, "{branch}: the Hub gained nothing");
-        assert!(
-            !before.1.lines().any(|line| {
-                let oid = line.split_whitespace().next().unwrap();
-                git(&remote, &["cat-file", "-t", oid]) == "blob"
-                    && git(&remote, &["cat-file", "blob", oid]).contains(CANARY)
-            }),
-            "{branch}: no hidden value on the Hub"
-        );
+        if let Err(told) = published_or_refused(branch, &["a plain turn on"]) {
+            panic!("{branch}: this computer can read the snapshots it merges: {told}");
+        }
     };
     // The record is in the merged snapshot itself.
     carry_back("merged", 'd', &earlier);
@@ -5376,7 +7065,7 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
     carry_back("reverted-source", '1', &later_source);
 
     // A fork of the Hub's copy of the snapshot, as `agit fork` writes one: the envelope left out,
-    // a new plain session holding the restored originals, and a turn of its own. Refused too.
+    // a new plain session holding the restored originals, and a turn of its own.
     repo.git(&["checkout", "-q", "-b", "forked", &earlier])
         .unwrap();
     repo.git(&["rm", "-rq", "privacy"]).unwrap();
@@ -5398,18 +7087,9 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
     meta::write(repo.root(), &forked).unwrap();
     repo.add_all().unwrap();
     repo.commit("fork").unwrap();
-    let before = everything();
-    let refused = run(&["--yes", "push", "alice/app@forked"]);
-    assert!(!refused.status.success(), "{refused:?}");
-    let told = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        told.contains("was published encrypted") && told.contains("nothing was uploaded"),
-        "{told}"
-    );
-    assert_eq!(everything(), before, "the Hub gained nothing");
+    published_or_refused("forked", &["a turn on the fork"]).unwrap();
 
-    // A file-line commit between the encrypted snapshot and the plain session hides nothing: the
-    // session's history still reaches the envelope.
+    // A file-line commit between the encrypted snapshot and the plain session hides nothing.
     repo.git(&["checkout", "-q", "-b", "through-file-line", &earlier])
         .unwrap();
     repo.git(&["rm", "-rq", "privacy"]).unwrap();
@@ -5434,13 +7114,101 @@ fn a_plain_conversation_merging_an_encrypted_session_is_refused() {
     meta::write(repo.root(), &on_top).unwrap();
     repo.add_all().unwrap();
     repo.commit("a plain turn past the file line").unwrap();
+    published_or_refused("through-file-line", &["a turn past the file line"]).unwrap();
+
+    let main_tip = git(&remote, &["rev-parse", "refs/heads/main"]);
+    // Another computer of the same account, which holds that session's record (copied, or kept
+    // from when its originals were readable) but can't read the snapshot's originals: a merge of
+    // the Hub's copy carrying the record past its own line is refused, and nothing is sent.
+    let other_home = temp.path().join("other");
+    startup_cache::seed(&other_home);
+    fs::create_dir_all(other_home.join("credentials")).unwrap();
+    fs::copy(
+        home.join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        other_home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+    )
+    .unwrap();
+    let run_other = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &other_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_success(&run_other(&["clone", "alice/app", "--no-bind"]));
+    let theirs = Repo::at(other_home.join("repos/alice/app"));
+    theirs
+        .git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    theirs
+        .git(&["config", "user.name", "Second Computer"])
+        .unwrap();
+    theirs
+        .git(&["config", "user.email", "second@example.invalid"])
+        .unwrap();
+    theirs
+        .git(&["checkout", "-q", "-b", "unreadable", &main_tip])
+        .unwrap();
+    let plain = meta::Meta::new(
+        format!("agit-{}", "4".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let own = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"a plain turn elsewhere"}})
+        ),
+        "claude-code",
+        &plain.session,
+    );
+    write_snapshot(theirs.root(), &own, &own).unwrap();
+    meta::write(theirs.root(), &plain).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("a plain turn elsewhere").unwrap();
+    theirs
+        .git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-commit",
+            "-s",
+            "ours",
+            &later,
+        ])
+        .unwrap();
+    let log = format!("{own}{reverted}");
+    write_snapshot(theirs.root(), &log, &log).unwrap();
+    meta::write(theirs.root(), &plain).unwrap();
+    theirs.add_all().unwrap();
+    theirs.commit("merge the record back").unwrap();
     let before = everything();
-    let refused = run(&["--yes", "push", "alice/app@through-file-line"]);
+    let refused = run_other(&["--yes", "push", "alice/app@unreadable"]);
     assert!(!refused.status.success(), "{refused:?}");
-    let told = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        told.contains("was published encrypted") && told.contains("nothing was uploaded"),
-        "{told}"
+        String::from_utf8_lossy(&refused.stderr).contains("nothing was sent"),
+        "{refused:?}"
     );
     assert_eq!(everything(), before, "the Hub gained nothing");
 }

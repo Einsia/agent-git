@@ -147,6 +147,13 @@ impl Selection {
             .registered
             .as_ref()
             .map(|response| response.config.privacy.scheme);
+        // A session the Hub continues as plain publishes plain, whatever was chosen before.
+        let switched = registered == Some(SessionScheme::Plain) && local != SessionScheme::Plain;
+        let local = if switched {
+            SessionScheme::Plain
+        } else {
+            local
+        };
         if crate::commands::json::requested() {
             println!(
                 "{}",
@@ -157,13 +164,18 @@ impl Selection {
             println!(
                 "Local publication mode: {}{}.",
                 label(local),
-                if self.choice.is_some() {
+                if switched {
+                    " (encrypted publication is retired)"
+                } else if self.choice.is_some() {
                     " (explicit choice)"
                 } else {
                     " (snapshot default)"
                 }
             );
             match registered {
+                Some(SessionScheme::SessionOwnerV2) => println!(
+                    "Registered publication mode: encrypted; it continues as plain at its next push."
+                ),
                 Some(mode) => println!("Registered publication mode: {} (locked).", label(mode)),
                 None => println!("Publication mode is not registered yet."),
             }
@@ -178,7 +190,14 @@ fn label(scheme: SessionScheme) -> &'static str {
     }
 }
 
+/// What `privacy mode … encrypted` answers now that encrypted publication is retired.
+pub(super) const ENCRYPTED_RETIRED: &str = "Encrypted publication is retired: sessions publish only the redacted view, and the originals stay on this computer. Nothing was changed.";
+
 pub(super) fn run(target: &str, mode: Option<Mode>) -> CmdResult {
+    if matches!(mode, Some(Mode::Encrypted)) {
+        ui::error(ENCRYPTED_RETIRED);
+        return Ok(ExitCode::Precondition);
+    }
     let mut selected = Selection::resolve(target)?;
     let Some(mode) = mode else {
         selected.show();
