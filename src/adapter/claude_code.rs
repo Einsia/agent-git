@@ -59,6 +59,16 @@ pub(crate) fn completed_turn_boundaries(text: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Where executions the person stopped end: the marker or interrupted tool denial that closes them.
+/// Only native Claude Code control reads this, which exists only on unix.
+#[cfg(all(unix, feature = "rc"))]
+pub(crate) fn interrupted_turn_boundaries(text: &str) -> Vec<usize> {
+    execution_closes(text, false)
+        .into_iter()
+        .filter_map(|(end, close)| (close == TurnClose::Interrupt).then_some(end))
+        .collect()
+}
+
 /// The end of the last execution, finished or stopped; nothing after it awaits a reply.
 #[cfg(any(feature = "cli", feature = "rc"))]
 pub(crate) fn ended_turn_boundary(text: &str) -> Option<usize> {

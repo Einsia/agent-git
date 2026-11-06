@@ -20,6 +20,10 @@ pub(super) enum TurnEnding {
     /// It stopped without anyone choosing to: a failed turn, or one still running when the session
     /// exits. An open tail ends where it stopped.
     Stopped,
+    /// agit interrupted it to stop while nobody chose to: a service manager's stop, a restart. The
+    /// interrupt the transcript ends with is agit's, so the turn ends there like [`Self::Stopped`],
+    /// unless a person stopped it first.
+    StoppedByAgit,
 }
 
 impl Session {
@@ -48,11 +52,12 @@ impl Session {
         let boundary = match &self.driver {
             AnyDriver::ClaudeNative(_) | AnyDriver::ClaudeCode(_) => {
                 let generation = self.generation.to_string();
-                let stopped = (ending == TurnEnding::Stopped
+                let stopped = (matches!(ending, TurnEnding::Stopped | TurnEnding::StoppedByAgit)
                     && matches!(self.driver, AnyDriver::ClaudeCode(_)))
                 .then_some((generation.as_str(), turn_id));
                 use crate::rc::native_claude::completion::{TurnEnd, turn_end};
-                match turn_end(&native, tailer.path(), boundary, stopped)? {
+                let agit_interrupt = ending == TurnEnding::StoppedByAgit;
+                match turn_end(&native, tailer.path(), boundary, stopped, agit_interrupt)? {
                     TurnEnd::Closed(at) => at,
                     TurnEnd::Open(_) if ending == TurnEnding::Interrupted => return Ok(()),
                     TurnEnd::Open(at) => at,

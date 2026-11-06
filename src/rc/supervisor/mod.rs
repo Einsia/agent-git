@@ -938,6 +938,9 @@ pub struct Session {
     stopping_turn: Option<tokio::time::Instant>,
     /// How long that wait may last: [`STOP_TURN_GRACE`] outside tests.
     stop_turn_grace: std::time::Duration,
+    /// Nobody chose to stop the running turn ([`Command::ShutdownUnattended`]), and no person's
+    /// interrupt was already on its way: the turn ends where agit stops it and is archived.
+    stop_unattended: bool,
     completed_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// See [`SettlementChild`]: test-only, always `None` in production.
     settlement_child: Option<SettlementChild>,
@@ -1210,7 +1213,10 @@ pub enum Command {
         armed: Option<u64>,
         reply: Ticket<PermissionModeOutcome>,
     },
+    /// Stop at a person's request: a turn it cuts is held like their own interrupt.
     Shutdown,
+    /// Stop that nobody chose for the running turn: it ends where agit stops it.
+    ShutdownUnattended,
 }
 
 /// Accept the ticket at dequeue: `false` = the caller already cancelled, so **this command has
@@ -1235,7 +1241,7 @@ fn accept(c: &Command) -> bool {
         Command::Interrupt { reply, .. } => reply.accept(),
         Command::Approve { reply, .. } => reply.accept(),
         Command::SetPermissionMode { reply, .. } => reply.accept(),
-        Command::Shutdown => true,
+        Command::Shutdown | Command::ShutdownUnattended => true,
     }
 }
 
@@ -1722,6 +1728,7 @@ impl Session {
             stop_requested: false,
             stopping_turn: None,
             stop_turn_grace: STOP_TURN_GRACE,
+            stop_unattended: false,
             completed_boundary: None,
             settlement_child: None,
             queued_initial_turn: None,
@@ -2696,11 +2703,13 @@ impl Session {
                             continue;
                         }
                     match cmd {
-                        None | Some(Command::Shutdown) => {
+                        None | Some(Command::Shutdown | Command::ShutdownUnattended) => {
                             // Recorded before the wait: a runtime that exits during it without
                             // ending the turn must still leave a turn this stop cut, not one that
-                            // ended on its own.
+                            // ended on its own. A person's interrupt already on its way wins.
                             self.stop_requested = true;
+                            self.stop_unattended = matches!(cmd, Some(Command::ShutdownUnattended))
+                                && self.pending_interrupt_command.is_none();
                             if self.interrupt_for_stop().await {
                                 continue;
                             }
@@ -3494,6 +3503,9 @@ impl Session {
                         &turn_id,
                         match outcome {
                             TurnOutcome::Ok => archive_recovery::TurnEnding::Completed,
+                            TurnOutcome::Interrupted if self.stop_unattended => {
+                                archive_recovery::TurnEnding::StoppedByAgit
+                            }
                             TurnOutcome::Interrupted => archive_recovery::TurnEnding::Interrupted,
                             TurnOutcome::Error => archive_recovery::TurnEnding::Stopped,
                         },
@@ -3811,13 +3823,18 @@ impl Session {
         self.release_held().await;
         // A turn the reaped harness was still running when it ended on its own ends here, as a
         // turn of its own; otherwise the exit commit finds no completion and the turn waits for one
-        // that may never come. A turn cut off by a requested stop is held like an interrupt.
+        // that may never come. A turn cut off by a person's stop is held like their interrupt; one
+        // a stop nobody chose cut ends where it stopped.
+        let ending = if self.stop_unattended {
+            archive_recovery::TurnEnding::StoppedByAgit
+        } else {
+            archive_recovery::TurnEnding::Stopped
+        };
         if let AnyDriver::ClaudeCode(driver) = &self.driver
             && let Some(turn_id) = driver.current_turn()
-            && !self.stop_requested
+            && (!self.stop_requested || self.stop_unattended)
             && self.settlement.borrow().local_owner
-            && let Err(error) =
-                self.retain_completed_archive(turn_id, archive_recovery::TurnEnding::Stopped)
+            && let Err(error) = self.retain_completed_archive(turn_id, ending)
         {
             tracing_note(&format!(
                 "[{}] stopped turn archive remains unrecorded: {error:#}",

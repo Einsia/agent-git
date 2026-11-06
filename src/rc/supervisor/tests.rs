@@ -132,6 +132,7 @@ pub(super) fn harness_test_session_with_channels(
         stopping_turn: None,
         // A stand-in runtime that never answers an interrupt holds a test's stop for this long.
         stop_turn_grace: std::time::Duration::from_millis(100),
+        stop_unattended: false,
         completed_boundary: None,
         settlement_child: None,
         queued_initial_turn: None,

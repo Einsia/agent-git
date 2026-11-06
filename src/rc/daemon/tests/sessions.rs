@@ -2591,6 +2591,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         terminal_delivery_blockers: Default::default(),
         term_tx: None,
         online: false,
+        stop_cause: StopCause::Person,
 
         settlement,
         started_at: std::time::Instant::now(),
