@@ -1543,10 +1543,10 @@ pub(super) fn create_main_file_line(repo: &Repo, owner: &str, lk: &Link) -> crat
     if !project.is_empty() {
         super::init::seed_into(repo.root(), Path::new(&project))?;
     }
-    // The author fields come from the credentials, the same as on the settlement path.
-    repo.git(&["config", "user.name", owner])?;
-    let email =
-        crate::infra::credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+    // The author fields come from `commit_author`, the same as on every other commit path: the
+    // repository's own identity where it has one, otherwise the account's.
+    let (name, email) = super::commit::commit_author(repo, owner)?;
+    repo.git(&["config", "user.name", &name])?;
     repo.git(&["config", "user.email", &email])?;
     repo.add_all()?;
     repo.commit("agit: init (main file line)")?;

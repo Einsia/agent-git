@@ -551,6 +551,8 @@ fn land_local(args: LandArgs) -> CmdResult {
     let lineage = crate::rc::lineage::AgitSession::new(&args.slug, &args.agent_id, &args.branch)?;
     let lineage = crate::rc::capture::from_environment(lineage)?;
     let repo = crate::rc::capture::require(&lineage)?;
+    // A repository made before it had its own identity takes it before this landing commits.
+    crate::rc::local_repository::use_commit_identity(&repo)?;
     let history_update = super::migration::begin_startup_recovery_for_path(
         &lineage.repo_dir()?,
         "local-land-history",

@@ -197,6 +197,7 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
     repo.set_auto_push(Some(false))?;
     let authority = format!("local:{}", machine.machine_fingerprint);
     repo.git(&["config", "--local", "agit.desktopIdentity", &id])?;
+    use_commit_identity(&repo)?;
     repo.git(&["config", "--local", "agit.desktopAuthority", &authority])?;
     let repository = Repository {
         slug,
@@ -208,6 +209,26 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
     repositories.insert(project_id.into(), repository.clone());
     super::save_json("repositories.json", &repositories)?;
     Ok(repository)
+}
+
+/// Writes a device-local repository's own identity into its local configuration, so every commit
+/// any path makes there carries it, and returns it; `None`, changing nothing, for any other
+/// repository. A repository made before it had one gets it at its next landing or commit.
+pub(crate) fn use_commit_identity(repo: &Repo) -> crate::Result<Option<(String, String)>> {
+    let Some((name, email)) = commit_identity(repo) else {
+        return Ok(None);
+    };
+    repo.git(&["config", "--local", "user.name", &name])?;
+    repo.git(&["config", "--local", "user.email", &email])?;
+    Ok(Some((name, email)))
+}
+
+/// The author and committer a device-local repository's commits carry: its own identity, the
+/// same for whoever is signed in, or `None` for any other repository.
+pub(crate) fn commit_identity(repo: &Repo) -> Option<(String, String)> {
+    let id = repo.git_opt(&["config", "--local", "--get", "agit.desktopIdentity"])?;
+    let id = uuid::Uuid::parse_str(id.trim()).ok()?.to_string();
+    Some((format!("agit-{id}"), format!("{id}@agit.local")))
 }
 
 #[cfg(test)]

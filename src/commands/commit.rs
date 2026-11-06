@@ -560,6 +560,17 @@ pub(crate) fn delegated_settlement(from_hook: bool) -> crate::Result<Option<Exit
     );
 }
 
+/// The author and committer of a commit recorded under `owner` in `repo`: a device-local
+/// repository's own identity, which its local configuration then carries for every other path
+/// too, else `owner` with the signed-in email.
+pub(crate) fn commit_author(repo: &Repo, owner: &str) -> crate::Result<(String, String)> {
+    if let Some(identity) = crate::rc::local_repository::use_commit_identity(repo)? {
+        return Ok(identity);
+    }
+    let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+    Ok((owner.to_owned(), email))
+}
+
 /// The account name a recorded version needs. Under `quiet` (from_hook) it returns None silently.
 pub fn owner_for_recording(quiet: bool) -> crate::Result<Option<String>> {
     #[cfg(unix)]
@@ -2032,9 +2043,10 @@ fn settle_file_line(
         "`{branch}` is not a file line — only the file line takes a session-less `-m` commit"
     );
 
-    // The author fields come from the credentials, the same as on the transcript path.
-    repo.git(&["config", "user.name", owner])?;
-    let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+    // The author fields come from `commit_author`, the same as on every other commit path: the
+    // repository's own identity where it has one, otherwise the account's.
+    let (name, email) = commit_author(&repo, owner)?;
+    repo.git(&["config", "user.name", &name])?;
     repo.git(&["config", "user.email", &email])?;
 
     file_commit(
@@ -3038,14 +3050,13 @@ fn settle_bytes(
                 ],
             )?;
             record_supervisor_prepared()?;
-            let email =
-                credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+            let (name, email) = commit_author(repo, owner)?;
             let commit = super::plumbing::commit_tree_as(
                 repo,
                 &tree,
                 &[tip],
                 "agit: record native capture identity",
-                (owner, &email),
+                (&name, &email),
             )?;
             maybe_interleave_publication(repo, branch);
             super::plumbing::update_branch_cas_and_refresh(repo, branch, &commit, tip, false)?;
@@ -3313,7 +3324,7 @@ fn settle_bytes(
         });
     let source = runtime.as_str();
 
-    let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+    let (author, email) = commit_author(repo, owner)?;
 
     let cwd = lk.cwd.clone().unwrap_or_else(|| ".".into());
     let total = new_chunks.len();
@@ -3655,7 +3666,7 @@ fn settle_bytes(
             &tree,
             &parents,
             &protected_message,
-            (owner, &email),
+            (&author, &email),
             authored_at,
         )?;
         pending_parent = Some(last_sha.clone());
@@ -3888,9 +3899,9 @@ fn name_saved_turn(
             ],
         )?;
         record_supervisor_prepared()?;
-        let email = credentials::current_email().unwrap_or_else(|| format!("{owner}@agit.local"));
+        let (name, email) = commit_author(repo, owner)?;
         let commit =
-            super::plumbing::commit_tree_as(repo, &tree, &[tip], &message, (owner, &email))?;
+            super::plumbing::commit_tree_as(repo, &tree, &[tip], &message, (&name, &email))?;
         maybe_interleave_publication(repo, branch);
         super::plumbing::update_branch_cas_and_refresh(repo, branch, &commit, tip, false)?;
         if lk.materialized_from.is_some() {
