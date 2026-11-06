@@ -2291,3 +2291,115 @@ fn an_import_seeds_the_main_line_from_the_session_folder_not_the_command_folder(
         }
     }
 }
+
+/// A lineage choice an import cannot ask for prints commands that work as printed. When the
+/// session is claimed on another branch, the report says the claim moves and the printed
+/// independent import carries `-y`, so running it verbatim with no terminal imports and moves the
+/// claim. The typed action in `--json` names the move and carries no confirmation the caller did
+/// not give. A session claimed nowhere prints no `-y`. A suggestion that dropped the confirmation
+/// the move needs is refused when run as printed; one that pre-filled it in the typed action
+/// would confirm a move nobody read.
+#[cfg(unix)]
+#[test]
+fn a_printed_import_suggestion_runs_as_printed_and_names_a_claim_move() {
+    let lab = Lab::new(2);
+    let import = |args: &[&str]| lab.command().args(args).output().unwrap();
+    let claimed = lab.sources[0].0.clone();
+    let first = import(&[
+        "import",
+        &claimed,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@one",
+        "--independent",
+    ]);
+    assert!(first.status.success(), "{first:?}");
+    let printed = |output: &std::process::Output| -> String {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        stderr
+            .lines()
+            .skip_while(|line| *line != "Explicit independent import:")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no printed independent import:\n{stderr}"))
+            .trim()
+            .to_owned()
+    };
+
+    let asked = import(&[
+        "import",
+        &claimed,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@two",
+    ]);
+    assert_eq!(asked.status.code(), Some(8), "{asked:?}");
+    let stderr = String::from_utf8_lossy(&asked.stderr).into_owned();
+    assert!(
+        stderr.contains("also moves session") && stderr.contains("from me/qa@one to me/qa@two"),
+        "{stderr}"
+    );
+    let command = printed(&asked);
+    assert!(command.contains("'-y'"), "{command}");
+    let bin = lab.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_agit"), bin.join("agit")).unwrap();
+    let environment = lab.command();
+    let mut shell = Command::new("sh");
+    shell.env_clear_local();
+    for (name, value) in environment.get_envs() {
+        if let Some(value) = value {
+            shell.env(name, value);
+        }
+    }
+    let ran = shell
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .arg("-c")
+        .arg(&command)
+        .current_dir(&lab.work)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{command}\n{ran:?}");
+    let repo = lab.store.join("repos/me/qa");
+    target_git(&lab, &repo, &["rev-parse", "--verify", "refs/heads/two"]);
+    let store = agit::domain::store::Store::at(lab.store.join("store"));
+    let link = agit::domain::link::get(&store, "claude-code", &claimed).unwrap();
+    assert_eq!(link.branch.as_deref(), Some("two"));
+
+    let typed = import(&[
+        "--json",
+        "import",
+        &claimed,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@three",
+    ]);
+    let document: serde_json::Value = serde_json::from_slice(&typed.stdout).unwrap();
+    let report = &document["result"]["value"];
+    assert_eq!(
+        report["claim_move"],
+        serde_json::json!({"from": "me/qa@two", "to": "me/qa@three"}),
+        "{document}"
+    );
+    let argv = report["independent"]["argv"].as_array().unwrap();
+    assert!(!argv.iter().any(|arg| arg == "-y"), "{document}");
+
+    let fresh = import(&[
+        "import",
+        &lab.sources[1].0,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@four",
+    ]);
+    assert_eq!(fresh.status.code(), Some(8), "{fresh:?}");
+    let stderr = String::from_utf8_lossy(&fresh.stderr).into_owned();
+    assert!(!stderr.contains("also moves session"), "{stderr}");
+    assert!(!printed(&fresh).contains("'-y'"), "{stderr}");
+}

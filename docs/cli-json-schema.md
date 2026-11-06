@@ -108,7 +108,11 @@ no action runs during reporting. They are `null` when safe command routing canno
 be represented. Candidate actions use the full frozen OID and explicit native
 and destination arguments. The independent action supplies `--independent` and
 keeps the ordinary import's claim, permission, and settlement checks. Neither
-option authorizes rerouting an existing claim without its normal confirmation.
+option authorizes rerouting an existing claim without its normal confirmation:
+when the session is claimed on another branch, `claim_move` names that claim and
+the destination, the typed actions carry `--yes` only when the inspecting invocation
+supplied it, and the human report prints its commands with `-y` after a line that
+names the move.
 An import without `--onto`, `--independent`, or `--link-only` requires an explicit
 choice unless it repeats the same active destination claim. Non-interactive
 invocations return exit code `8` with `operation: "choice_required"`; v2 also puts
