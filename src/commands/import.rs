@@ -164,7 +164,22 @@ pub fn needs_readonly_startup(args: &Args) -> bool {
     args.propose_lineage || args.session.is_none() || !args.link_only
 }
 
-pub fn run_with_output(args: Args, json: bool) -> CmdResult {
+/// `--into` with its repository spelled as that repository's checkout spells it, so the lineage
+/// check, the permission check, the directory and the session's records all use one spelling.
+/// Anything that is not `<owner>/<repo>[@...]` is left for the checks that refuse it.
+fn spelled_destination(raw: &str) -> String {
+    let (slug, rest) = raw.split_at(raw.find('@').unwrap_or(raw.len()));
+    match super::parse_slug(slug) {
+        Ok((owner, name)) => format!(
+            "{owner}/{}{rest}",
+            super::checkout_spelling(&owner, &name).unwrap_or(name)
+        ),
+        Err(_) => raw.to_owned(),
+    }
+}
+
+pub fn run_with_output(mut args: Args, json: bool) -> CmdResult {
+    args.repo = args.repo.as_deref().map(spelled_destination);
     if args.propose_lineage {
         return lineage::preview(&args, json);
     }
@@ -326,10 +341,6 @@ pub fn run_with_output(args: Args, json: bool) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
         let (dest_owner, dest_name) = crate::input_argument(super::parse_slug(repo))?;
-        if let Err(e) = super::canonical_owner(&dest_owner) {
-            ui::error(&format!("{e:#}"));
-            return Ok(ExitCode::Usage);
-        }
         let me = owner.as_deref().unwrap_or_default();
         // When the destination is not your own name, ask the hub's write-permission gate; being
         // unable to ask is an error, not "no permission".
@@ -2239,6 +2250,34 @@ mod tests {
     use super::*;
     use crate::domain::meta::{self, Meta};
     use clap::Parser;
+
+    /// `--into` takes its checkout's spelling before anything reads it, owner and repository
+    /// alike, and keeps the branch and selector it was given. An import that normalized only its
+    /// permission check would still land in, and record links for, a second checkout of the typed
+    /// spelling on a disk that keeps case; one that rewrote what is not a slug would change the
+    /// refusal a malformed target gets.
+    #[test]
+    fn the_destination_takes_its_checkouts_spelling() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("repos/alice/Notes")).unwrap();
+        let _env = crate::infra::config::env_lock();
+        let old_home = std::env::var_os("AGIT_HOME");
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        let spelled = [
+            spelled_destination("Alice/notes@work#1"),
+            spelled_destination("alice/NOTES"),
+            spelled_destination("notes@work"),
+        ];
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("AGIT_HOME", value),
+                None => std::env::remove_var("AGIT_HOME"),
+            }
+        }
+        assert_eq!(spelled, ["alice/Notes@work#1", "alice/Notes", "notes@work"]);
+    }
 
     #[derive(Parser)]
     struct W {

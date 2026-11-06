@@ -163,7 +163,7 @@ fn split_repo(s: &str) -> Result<(Option<RepoSel>, &str)> {
         if name.is_empty() {
             anyhow::bail!("`{s}` has an empty repo name");
         }
-        let repo = RepoSel::Slug(head.to_string(), name.to_string());
+        let repo = RepoSel::Slug(head.to_ascii_lowercase(), name.to_string());
         return Ok((Some(repo), if rest.is_empty() { "" } else { rest }));
     }
     Ok((None, s))

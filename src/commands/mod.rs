@@ -262,14 +262,68 @@ pub fn terminal_error_message(error: &anyhow::Error) -> String {
     crate::input_diagnostic(error)
 }
 
-/// Parse the `<owner>/<name>` form.
+/// Parse the `<owner>/<name>` form. Owners are lowercase on the hub, so an owner typed in any
+/// case names that one; the name keeps the spelling it was typed in until the hub answers with
+/// the one it stores.
 pub fn parse_slug(s: &str) -> Result<(String, String)> {
     let s = s.trim();
     match s.split_once('/') {
         Some((o, n)) if !o.is_empty() && !n.is_empty() && !n.contains('/') => {
-            Ok((o.to_string(), n.to_string()))
+            Ok((o.to_ascii_lowercase(), n.to_string()))
         }
         _ => anyhow::bail!("use the <owner>/<agent> form, e.g. einsia/payments (got: {s})"),
+    }
+}
+
+/// `name` as the local checkout of `owner/name` spells it, without asking the hub: the checkout
+/// named exactly so, else the only checkout of `owner` with the name in another case. The hub
+/// finds a repository whatever the case of its name, and its checkout and every local record of
+/// it use the one spelling. Two checkouts whose names differ only in case are two repositories,
+/// so neither stands in for a third spelling, which keeps the typed one. `None` when `owner` has
+/// no checkout of that name in any case.
+pub(crate) fn checkout_spelling(owner: &str, name: &str) -> Option<String> {
+    let checkouts: Vec<String> = crate::infra::config::repos_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_dir(dir.join(owner)).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|checkout| checkout.eq_ignore_ascii_case(name))
+        .collect();
+    match checkouts.as_slice() {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some(name.to_owned()),
+    }
+}
+
+/// [`checkout_spelling`], else the spelling the hub stores, else as typed. A hub that cannot
+/// answer leaves the typed spelling, the one a new repository gets.
+pub(crate) fn resolve_spelling(owner: &str, name: &str) -> String {
+    checkout_spelling(owner, name).unwrap_or_else(|| {
+        stored_name(&crate::hub::Client::from_env(), owner, name)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| name.to_owned())
+    })
+}
+
+/// The spelling the hub stores for `owner/name`. The hub finds a repository whatever the case of
+/// its name, so a name typed in another case is answered with the stored one. `None` when the
+/// hub has no such repository the caller can read.
+fn stored_name(client: &crate::hub::Client, owner: &str, name: &str) -> Result<Option<String>> {
+    match remote_request(client.get_agent(owner, name)) {
+        Ok(remote) => {
+            anyhow::ensure!(
+                remote.owner == owner && remote.name.eq_ignore_ascii_case(name),
+                "the Hub answered for {owner}/{name} with {}/{}",
+                remote.owner,
+                remote.name
+            );
+            Ok(Some(remote.name))
+        }
+        Err(error) if is_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -352,19 +406,6 @@ pub(crate) fn writability_with(
 fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::hub::client::ApiError>()
         .is_some_and(|api| api.status == 404)
-}
-
-/// Account names and org names are lowercase on the hub. A different spelling lands in another
-/// local directory and queries another remote path, so it is refused at the entry point rather
-/// than guessed at.
-pub fn canonical_owner(owner: &str) -> Result<()> {
-    if owner.chars().any(|c| c.is_ascii_uppercase()) {
-        anyhow::bail!(
-            "owner names are lowercase on the hub — write `{}`",
-            owner.to_ascii_lowercase()
-        );
-    }
-    Ok(())
 }
 
 /// What to do about one secret hit — **the remedies that branch on the carrier**.
@@ -823,13 +864,36 @@ mod tests {
         assert_eq!(PushAccess::from_status(302), None);
     }
 
-    /// A non-lowercase owner is refused at the entry point: names on the hub are lowercase, and
-    /// allowing one only makes the local directory and the remote path use different spellings.
+    /// An owner typed in any case is the hub's lowercase owner, and a name typed in another case
+    /// than its only local checkout takes the checkout's spelling, so the local directory, the
+    /// remote path and every record spell a repository one way. A resolver that kept the typed
+    /// spelling would open a second, empty checkout on a disk that keeps case.
     #[test]
-    fn owners_must_be_written_in_their_canonical_lowercase() {
-        assert!(super::canonical_owner("einsia").is_ok());
-        assert!(super::canonical_owner("a-b_1").is_ok());
-        assert!(super::canonical_owner("Einsia").is_err());
+    fn a_typed_repository_takes_the_spelling_it_has() {
+        assert_eq!(
+            super::parse_slug("Einsia/Payments").unwrap(),
+            ("einsia".to_owned(), "Payments".to_owned())
+        );
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("repos/alice/Notes")).unwrap();
+        let _env = crate::infra::config::env_lock();
+        let old_home = std::env::var_os("AGIT_HOME");
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        let resolved = (
+            super::checkout_spelling("alice", "notes"),
+            super::checkout_spelling("alice", "NOTES"),
+            super::checkout_spelling("alice", "Notes"),
+        );
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("AGIT_HOME", value),
+                None => std::env::remove_var("AGIT_HOME"),
+            }
+        }
+        let notes = Some("Notes".to_owned());
+        assert_eq!(resolved, (notes.clone(), notes.clone(), notes));
     }
 
     use super::{SecretRemedy, secret_remedies};

@@ -81,7 +81,6 @@ impl Destination {
         let (owner, name) = crate::commands::parse_slug(&slug)?;
         repo::valid_name(&owner)?;
         repo::valid_name(&name)?;
-        crate::commands::canonical_owner(&owner)?;
         let spelled_in_target = target.base.is_some();
         let branch = target
             .base

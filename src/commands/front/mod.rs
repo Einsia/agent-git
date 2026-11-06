@@ -356,6 +356,7 @@ pub(crate) fn destination(
     };
     if let Some(given) = given {
         let mut given = parse(given, Chosen::Given)?;
+        given.name = super::resolve_spelling(&given.owner, &given.name);
         given.replaces = bound(root).filter(|existing| *existing != given.slug());
         return Ok(given);
     }

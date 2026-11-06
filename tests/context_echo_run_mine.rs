@@ -68,32 +68,35 @@ impl Hub {
                     fields.next().unwrap_or_default()
                 );
                 received.lock().unwrap().push(route.clone());
-                let (status, body) = match route.as_str() {
-                    "GET /api/agents/alice/qa" => (
-                        "200 OK",
-                        json!({
-                            "agent_id": SOURCE, "owner": "alice", "name": "qa",
-                            "visibility": "public", "session_count": 1,
-                            "clone_url": format!("{server_url}/alice/qa.git"),
-                        }),
-                    ),
-                    "POST /api/agents/alice/qa/clone" => (
-                        "200 OK",
-                        json!({
-                            "agent_id": COPY, "forked_from": SOURCE,
-                            "owner": "me", "name": "qa",
-                            "push_url": format!("{server_url}/me/qa.git"),
-                            "web_url": format!("{server_url}/me/qa"),
-                        }),
-                    ),
-                    "GET /api/cli/version" => {
-                        ("200 OK", json!({"version": env!("CARGO_PKG_VERSION")}))
-                    }
-                    _ => (
-                        "404 Not Found",
-                        json!({"error": "unexpected fixture route", "kind": "not_found"}),
-                    ),
-                };
+                // The Hub finds a repository whatever the case of its name.
+                let (method, path) = route.split_once(' ').unwrap_or_default();
+                let (status, body) =
+                    match format!("{method} {}", path.to_ascii_lowercase()).as_str() {
+                        "GET /api/agents/alice/qa" => (
+                            "200 OK",
+                            json!({
+                                "agent_id": SOURCE, "owner": "alice", "name": "qa",
+                                "visibility": "public", "session_count": 1,
+                                "clone_url": format!("{server_url}/alice/qa.git"),
+                            }),
+                        ),
+                        "POST /api/agents/alice/qa/clone" => (
+                            "200 OK",
+                            json!({
+                                "agent_id": COPY, "forked_from": SOURCE,
+                                "owner": "me", "name": "qa",
+                                "push_url": format!("{server_url}/me/qa.git"),
+                                "web_url": format!("{server_url}/me/qa"),
+                            }),
+                        ),
+                        "GET /api/cli/version" => {
+                            ("200 OK", json!({"version": env!("CARGO_PKG_VERSION")}))
+                        }
+                        _ => (
+                            "404 Not Found",
+                            json!({"error": "unexpected fixture route", "kind": "not_found"}),
+                        ),
+                    };
                 let body = body.to_string();
                 write!(
                     stream,
@@ -309,12 +312,15 @@ impl Drop for Lab {
     }
 }
 
+/// The source is typed in another case than the Hub stores and its checkout has: the promotion
+/// and the run take the checkout's spelling, so they continue in the checkout that exists rather
+/// than one of the typed spelling, which a disk that keeps case would not have.
 #[test]
 fn run_mine_echoes_the_promoted_source_before_output_and_keeps_promotion_diagnostics() {
     let lab = Lab::new();
     let output = lab.run(&[
         "run",
-        "alice/qa@work",
+        "alice/QA@work",
         "--mine",
         "-b",
         "continued",

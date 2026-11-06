@@ -889,7 +889,6 @@ fn split_publish_target(arg: &str) -> crate::Result<(Option<String>, String, Opt
     let (owner, name) = match parsed.repo {
         Some(repo) if repo.contains('/') => {
             let (owner, name) = super::parse_slug(&repo)?;
-            super::canonical_owner(&owner)?;
             (Some(owner), name)
         }
         Some(name) => (None, name),
@@ -1464,9 +1463,12 @@ mod tests {
                 Some("refund".into())
             )
         );
-        // The owner must use the hub's lowercase spelling, or the local directory and the remote
-        // path each use their own.
-        assert!(split_publish_target("Einsia/agent-git-dev").is_err());
+        // The owner takes the hub's lowercase spelling, so the local directory and the remote
+        // path use the same one.
+        assert_eq!(
+            split_publish_target("Einsia/agent-git-dev").unwrap(),
+            (Some("einsia".into()), "agent-git-dev".into(), None)
+        );
         // A repo name does not occupy the ref namespace: the `agit-` prefix is unambiguous in
         // the `owner/<name>` position.
         assert_eq!(

@@ -156,7 +156,6 @@ fn create(target: &str, private: bool, public: bool) -> CmdResult {
         .ok_or_else(|| anyhow::anyhow!("the selected account is unavailable"))?;
     let (owner, name) = if target.contains('/') {
         let (owner, name) = crate::input_argument(super::parse_slug(target))?;
-        crate::input_argument(super::canonical_owner(&owner))?;
         crate::input_argument(crate::domain::repo::valid_name(&owner))?;
         (owner, name)
     } else {
@@ -184,13 +183,16 @@ fn create(target: &str, private: bool, public: bool) -> CmdResult {
     }
     match client.get_agent(&owner, name) {
         Ok(remote) => {
+            // The Hub finds a repository whatever the case of its name, and answers with the
+            // spelling it stores.
             anyhow::ensure!(
-                remote.owner == owner && remote.name == name,
+                remote.owner == owner && remote.name.eq_ignore_ascii_case(name),
                 "the Hub returned another repository for creation"
             );
-            ui::info(format_args!("{owner}/{name} already exists"));
+            let slug = format!("{}/{}", remote.owner, remote.name);
+            ui::info(format_args!("{slug} already exists"));
             ui::hint(&format!(
-                "use `agit clone {owner}/{name}` to retain its identity and history locally"
+                "use `agit clone {slug}` to retain its identity and history locally"
             ));
             return Ok(ExitCode::Precondition);
         }
@@ -776,7 +778,6 @@ fn parse_invite_target(raw: &str) -> crate::Result<InviteTarget> {
         None => (raw, None),
     };
     let (owner, name) = super::parse_slug(slug)?;
-    super::canonical_owner(&owner)?;
     Ok(InviteTarget {
         owner,
         name,
@@ -1140,9 +1141,18 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
         ui::error(&format!("{e:#}"));
         return Ok(ExitCode::Usage);
     }
+    let name = super::checkout_spelling(&owner, &name).unwrap_or(name);
+    let case_only = new_name.eq_ignore_ascii_case(&name);
     let old_dir = crate::infra::config::repo_dir(&owner, &name)?;
     let new_dir = crate::infra::config::repo_dir(&owner, new_name)?;
-    if new_dir.exists() {
+    // A disk that ignores case reports a case-only rename's target as the checkout itself, so
+    // only a checkout spelled exactly as the new name is in the way.
+    let taken = if case_only {
+        new_name != name && spelled_checkout(&owner, new_name)
+    } else {
+        new_dir.exists()
+    };
+    if taken {
         ui::error(&format!(
             "the local target already exists: {}. Deal with it first.",
             new_dir.display()
@@ -1165,9 +1175,16 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
             return Ok(super::terminal_error_code(&e, ExitCode::Network));
         }
     }
-    // The local directory follows.
+    // The local directory follows. A disk that ignores case may not move a directory onto its
+    // own name in another case, so a case-only rename goes through another name.
     if Repo::open(&old_dir).is_some() {
-        std::fs::rename(&old_dir, &new_dir)?;
+        if case_only {
+            let step = old_dir.with_file_name(format!(".{new_name}.renaming"));
+            std::fs::rename(&old_dir, &step)?;
+            std::fs::rename(&step, &new_dir)?;
+        } else {
+            std::fs::rename(&old_dir, &new_dir)?;
+        }
         if let Some(r) = Repo::open(&new_dir)
             && let Some(url) = r.remote_url()
         {
@@ -1183,6 +1200,16 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
         ));
     }
     Ok(ExitCode::Ok)
+}
+
+/// Whether `owner` has a checkout named exactly `name`, whatever the disk does with case.
+fn spelled_checkout(owner: &str, name: &str) -> bool {
+    crate::infra::config::repos_dir()
+        .ok()
+        .and_then(|dir| std::fs::read_dir(dir.join(owner)).ok())
+        .into_iter()
+        .flatten()
+        .any(|entry| entry.is_ok_and(|entry| entry.file_name() == name))
 }
 
 fn delete(repo: &str, local_only: bool) -> CmdResult {
@@ -1391,7 +1418,7 @@ mod tests {
                 .as_deref(),
             Some("feat/cache")
         );
-        for refused in ["alice/notes@", "notes", "Alice/notes", "alice/notes/x@y"] {
+        for refused in ["alice/notes@", "notes", "alice/notes/x@y"] {
             assert!(parse_invite_target(refused).is_err(), "{refused}");
         }
     }

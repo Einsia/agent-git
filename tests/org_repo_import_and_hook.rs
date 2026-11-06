@@ -545,19 +545,6 @@ fn an_import_the_hub_refuses_lands_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!lab.repo("acme", "ghost").exists());
-
-    let out = lab
-        .agit(&["import", SID, "--into", "Einsia/qa@work"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(agit::ExitCode::Usage.as_i32()),
-        "a non-lowercase owner is rejected at the entrance:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("owner names are lowercase"));
-    assert!(!lab.repo("Einsia", "qa").exists());
 }
 
 /// `agit run` arbitrates an org branch by asking the hub's write gate, not by asking whether I am

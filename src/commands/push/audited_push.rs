@@ -688,11 +688,17 @@ impl Intent {
                 "visibility flags only affect creation; the publication destination retains its existing audience",
             );
         }
+        // An existing destination goes by the spelling the Hub stores, which the publication
+        // summary shows and every later check compares with.
+        let name = match &action {
+            Action::Existing(remote) => remote.name.clone(),
+            Action::Create => checkout.name.clone(),
+        };
         let intent = Self {
             hub,
             account: me.into(),
             owner,
-            name: checkout.name.clone(),
+            name,
             url,
             visibility,
             accept_secret_findings,
@@ -892,9 +898,12 @@ fn lookup(client: &Client, owner: &str, name: &str) -> Result<Option<RemoteAgent
     }
 }
 
+/// The Hub finds a repository whatever the case of its name and answers with the spelling it
+/// stores. Which repository that is, where it matters, is settled by the agent id the caller
+/// compares next, never by the name.
 fn verify_agent_location(hub: &str, owner: &str, name: &str, remote: &RemoteAgent) -> Result<()> {
     ensure!(
-        remote.owner == owner && remote.name == name,
+        remote.owner == owner && remote.name.eq_ignore_ascii_case(name),
         "the Hub returned another publication destination"
     );
     RemoteIdentity::new(hub, &remote.agent_id)?;
