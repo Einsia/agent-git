@@ -633,10 +633,9 @@ pub(crate) fn schedule_compaction(root: &Path) {
     if !needs_compaction(&Repo::at(root)).unwrap_or(false) {
         return;
     }
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(mut command) = crate::infra::own_image::command() else {
         return;
     };
-    let mut command = std::process::Command::new(executable);
     command
         .arg(COMPACT)
         .arg(root)

@@ -314,7 +314,12 @@ impl SettlementProgram {
             command.arg(&self.exe);
             return command;
         }
-        tokio::process::Command::new(&self.exe)
+        let mut command = tokio::process::Command::new(&self.exe);
+        command.env(
+            crate::infra::own_image::PARENT_BUILD,
+            crate::infra::own_image::BUILD,
+        );
+        command
     }
 }
 
@@ -1803,18 +1808,8 @@ impl Session {
     fn settlement_exe(&self) -> Option<SettlementProgram> {
         let exe = match &self.settlement_child {
             Some(child) => Some(child.exe.clone()),
-            None => {
-                // Pin subprocesses to the running daemon's executable inode.
-                // An atomic installation can unlink its original pathname.
-                #[cfg(target_os = "linux")]
-                {
-                    Some(PathBuf::from(format!("/proc/{}/exe", std::process::id())))
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    std::env::current_exe().ok()
-                }
-            }
+            // An installation can replace or unlink the daemon's pathname while it runs.
+            None => crate::infra::own_image::own_image().ok(),
         }?;
         Some(SettlementProgram {
             exe,

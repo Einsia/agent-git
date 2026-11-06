@@ -10,6 +10,19 @@ const TERMINAL_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_se
 impl Daemon {
     pub async fn run(opts: Options) -> crate::Result<()> {
         let identity = crate::rc::build_identity::DaemonIdentity::current()?;
+        // Subprocesses start from this build's own copy: an upgrade can replace the installed
+        // file while this daemon still runs. Linux reaches the running image through /proc.
+        #[cfg(not(target_os = "linux"))]
+        let _image = match crate::rc::images::prepare() {
+            Ok(image) => {
+                crate::infra::own_image::pin(image.path.clone());
+                Some(image)
+            }
+            Err(error) => {
+                eprintln!("agitd: subprocesses start from the installed path: {error:#}");
+                None
+            }
+        };
         let admission = crate::rc::admission::Admission::default();
         let controller = crate::rc::peers::controller()?;
         // Internal notes, session → daemon. Capacity is generous: a session sends only a few

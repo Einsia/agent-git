@@ -1370,21 +1370,39 @@ pub(crate) fn completed_native_boundary(runtime: &str, text: &str) -> crate::Res
 /// committed, and the next settlement tries again. A record the check cannot divide
 /// (`refused`: its size, and the `owner/repo@branch` it would settle into) is named instead,
 /// since settling again meets the same record.
+///
+/// For the RC supervisor (`supervised`), a check that could not run at all is a failure: the
+/// supervisor reads a clean exit with nothing committed as "nothing to settle" and stops retrying,
+/// so the turns would stay unsettled with nobody told.
 fn privacy_pending(
     lk: &Link,
     quiet: bool,
     turns: usize,
     reason: Option<crate::domain::privacy::projector::Reason>,
     refused: Option<(usize, String)>,
+    supervised: bool,
 ) -> CmdResult {
     let reason = crate::domain::privacy::service::reason_name(reason);
     let bytes = refused.as_ref().map(|(bytes, _)| *bytes as u64);
     crate::domain::privacy::pending::record(&lk.session_id, reason, turns, bytes);
+    let unavailable = crate::domain::privacy::pending::worker_unavailable(reason);
+    let outcome = if supervised && unavailable && refused.is_none() {
+        ExitCode::Precondition
+    } else {
+        ExitCode::Ok
+    };
     if !quiet {
         let plural = if turns == 1 { "" } else { "s" };
         if let Some((bytes, target)) = &refused {
             warn_refused_record(Some(target), *bytes as u64, turns);
             return Ok(ExitCode::Ok);
+        }
+        if unavailable {
+            ui::warning(&format!(
+                "the privacy check couldn't run: {turns} turn{plural} stay unsettled and are kept on this computer; the next attempt tries again"
+            ));
+            ui::hint(crate::domain::privacy::pending::WORKER_UNAVAILABLE_STEP);
+            return Ok(outcome);
         }
         match crate::domain::privacy::pending::steps(reason) {
             None => ui::warning(&format!(
@@ -1400,7 +1418,7 @@ fn privacy_pending(
             }
         }
     }
-    Ok(ExitCode::Ok)
+    Ok(outcome)
 }
 
 /// What settlement says of records the privacy check could not divide, whose largest parts it
@@ -2979,7 +2997,7 @@ fn settle_bytes(
             metadata.kind = Kind::File;
             metadata.milestone = None;
             if let Err(pending) = privacy::protect_metadata(repo.root(), &mut metadata) {
-                return privacy_pending(&lk, quiet, 0, pending.reason, None);
+                return privacy_pending(&lk, quiet, 0, pending.reason, None, opts.completed_only);
             }
             let tree = super::plumbing::tree_apply_owned(
                 repo,
@@ -3144,6 +3162,7 @@ fn settle_bytes(
             unsettled,
             protected_increment.reason,
             refused_record.map(|bytes| (bytes, format!("{slug}@{branch}"))),
+            opts.completed_only,
         );
     }
     let privacy_end = if unsettled > 0 {
@@ -3419,7 +3438,14 @@ fn settle_bytes(
         )
     });
     if let Err(pending) = privacy::protect_metadata(repo.root(), &mut observations) {
-        return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
+        return privacy_pending(
+            &lk,
+            quiet,
+            new_chunks.len(),
+            pending.reason,
+            None,
+            opts.completed_only,
+        );
     }
     let mut native = if materialized_base.is_none() {
         Some(native::NativeSnapshots::new(
@@ -3477,7 +3503,14 @@ fn settle_bytes(
                 None => None,
                 Some(Ok(value)) => Some(value),
                 Some(Err(pending)) => {
-                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
+                    return privacy_pending(
+                        &lk,
+                        quiet,
+                        new_chunks.len(),
+                        pending.reason,
+                        None,
+                        opts.completed_only,
+                    );
                 }
             };
         }
@@ -3496,7 +3529,14 @@ fn settle_bytes(
             ) {
                 Ok(prompt) => prompt,
                 Err(pending) => {
-                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
+                    return privacy_pending(
+                        &lk,
+                        quiet,
+                        new_chunks.len(),
+                        pending.reason,
+                        None,
+                        opts.completed_only,
+                    );
                 }
             }
         };
@@ -3519,7 +3559,14 @@ fn settle_bytes(
             match privacy::protect_for_commit(Some(repo.root()), &msg, PrivacyMode::ProtectText) {
                 Ok(message) => message,
                 Err(pending) => {
-                    return privacy_pending(&lk, quiet, new_chunks.len(), pending.reason, None);
+                    return privacy_pending(
+                        &lk,
+                        quiet,
+                        new_chunks.len(),
+                        pending.reason,
+                        None,
+                        opts.completed_only,
+                    );
                 }
             };
         let snap_text = meta::to_text(&snap)?;
@@ -5330,6 +5377,51 @@ mod tests {
     use super::*;
     use crate::domain::link::Link;
     use crate::domain::store::Store;
+
+    /// The RC supervisor reads a clean exit with nothing committed as "nothing to settle" and stops
+    /// retrying, so its settlement fails when the privacy check could not run at all, and the wait
+    /// is recorded for `agit status`. A hook's settlement stays a clean exit: the next turn tries
+    /// again, and a failing hook would show an error in the person's terminal. A clean exit for the
+    /// supervisor leaves its turns unsettled with nobody told.
+    #[test]
+    fn a_privacy_check_that_could_not_run_fails_the_supervisors_settlement() {
+        if crate::rc::in_isolated_test(
+            "commands::commit::tests::a_privacy_check_that_could_not_run_fails_the_supervisors_settlement",
+        ) {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: the isolated child runs this test alone on one thread.
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        let link = Link::new("claude-code", "session-a", None);
+        let reason = Some(crate::domain::privacy::projector::Reason::SpawnFailed);
+        assert_eq!(
+            privacy_pending(&link, true, 2, reason, None, true).unwrap(),
+            ExitCode::Precondition
+        );
+        assert_eq!(
+            privacy_pending(&link, true, 2, reason, None, false).unwrap(),
+            ExitCode::Ok
+        );
+        assert_eq!(
+            crate::domain::privacy::pending::load()["session-a"].reason,
+            "spawn_failed"
+        );
+        // The attempt right after a failed start finds the worker held back: still unable to run.
+        let held = Some(crate::domain::privacy::projector::Reason::Backoff);
+        assert_eq!(
+            privacy_pending(&link, true, 2, held, None, true).unwrap(),
+            ExitCode::Precondition
+        );
+        let busy = Some(crate::domain::privacy::projector::Reason::LockBusy);
+        assert_eq!(
+            privacy_pending(&link, true, 2, busy, None, true).unwrap(),
+            ExitCode::Ok,
+            "a worker busy with another caller is the ordinary wait"
+        );
+    }
 
     fn store() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().unwrap();

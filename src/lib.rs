@@ -208,6 +208,8 @@ pub mod infra {
     pub(crate) mod local_git;
     /// Local state failures (an unwritable home, a held lock), told apart from Hub failures.
     pub mod local_state;
+    /// The executable every self-spawn starts from, and the build check between parent and child.
+    pub mod own_image;
     /// Where each runtime's project memory directory is.
     pub mod runtime_memory;
     /// Discovery of the runtime session the current process belongs to (no CLI output here).

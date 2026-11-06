@@ -491,6 +491,35 @@ async fn bridge_waits_for_another_process_to_release_the_lifecycle_lock() {
     bridge.kill().await.unwrap();
 }
 
+/// A child started by another agit build refuses before it reads, writes or sends anything, with
+/// its own exit status; one started by this build runs. A child that ignored the parent's build
+/// would take another build's arguments and replies as its own.
+#[test]
+fn a_child_of_another_build_refuses_before_doing_anything() {
+    let home = tempfile::tempdir().unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_agit"))
+        .args(["rc", "local", "status"])
+        .env("AGIT_HOME", home.path())
+        .env("HOME", home.path())
+        .env("AGIT_RC_PARENT_BUILD", "another-build")
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "nothing was written"
+    );
+    let own = Command::new(env!("CARGO_BIN_EXE_agit"))
+        .arg("--version")
+        .env("AGIT_HOME", home.path())
+        .env("HOME", home.path())
+        .env("AGIT_RC_PARENT_BUILD", agit::infra::own_image::BUILD)
+        .output()
+        .unwrap();
+    assert!(own.status.success(), "{own:?}");
+}
+
 /// SIGTERM, which a service manager or `kill` sends, stops the daemon the way `agit rc stop`
 /// does: it exits by itself. Left unhandled, the signal ends the process the way a crash does,
 /// and a running turn is cut without an interrupt and nothing settles.

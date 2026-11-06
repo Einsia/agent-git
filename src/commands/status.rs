@@ -896,6 +896,20 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
             ));
             continue;
         }
+        if crate::domain::privacy::pending::worker_unavailable(&entry.reason) {
+            ui::warning(&format!(
+                "{}: the privacy check couldn't run since {}; {} turn{} wait and are kept on this computer, and the next attempt tries again",
+                crate::domain::link::short(&link.session_id),
+                ui::ago(since),
+                entry.turns,
+                if entry.turns == 1 { "" } else { "s" },
+            ));
+            let step = crate::domain::privacy::pending::WORKER_UNAVAILABLE_STEP.to_owned();
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+            continue;
+        }
         let ends = crate::domain::privacy::pending::steps(&entry.reason);
         ui::warning(&format!(
             "{}: privacy check pending ({}) since {}; {} turn{} wait{}",
