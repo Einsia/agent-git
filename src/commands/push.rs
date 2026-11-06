@@ -352,24 +352,25 @@ fn publish(mut args: Args) -> CmdResult {
             return Ok(ExitCode::Policy);
         }
     };
-    let (held, branches): (Vec<_>, Vec<_>) = branches.into_iter().partition(|branch| {
-        store.as_ref().is_some_and(|store| {
-            crate::domain::link::launch::held(store, &checkout.slug(), branch).is_some()
-        })
-    });
-    for branch in &held {
-        let hold = crate::domain::link::launch::Hold {
-            slug: checkout.slug(),
-            branch: branch.clone(),
-            sessions: Vec::new(),
-            released: false,
-        };
+    let mut held = Vec::new();
+    let mut open = Vec::new();
+    for branch in branches {
+        match store
+            .as_ref()
+            .and_then(|store| crate::domain::link::launch::held(store, &checkout.slug(), &branch))
+        {
+            Some(hold) => held.push((branch, hold)),
+            None => open.push(branch),
+        }
+    }
+    let branches = open;
+    for (branch, hold) in &held {
         if asked_explicitly {
             ui::error(&format!(
                 "`{}@{branch}` will not be uploaded from this computer.",
                 checkout.slug()
             ));
-            ui::hint(&crate::domain::link::launch::explain(&hold));
+            ui::hint(&crate::domain::link::launch::explain(hold));
             ui::hint("its local history stays; nothing was sent to the Hub");
             return Ok(ExitCode::Policy);
         }

@@ -40,6 +40,14 @@ pub enum Cmd {
     },
     /// Seal: not resumable, only forkable/viewable (hand-off done, distillation source).
     Seal { name: String },
+    /// Confirm that a Codex conversation an older agit linked to a branch belongs there
+    Confirm {
+        name: String,
+        /// The conversation to confirm; needed, once for each, when an older agit linked more
+        /// than one to the branch
+        #[arg(long = "session", value_name = "ID")]
+        sessions: Vec<String>,
+    },
     /// Let a branch that may hold another conversation's turns upload again, with its turns as
     /// they are. Asks the person at the terminal first.
     #[command(hide = true)]
@@ -176,6 +184,12 @@ pub fn run(args: Args) -> CmdResult {
             ui::info(ui::dim("  published history on the hub is unaffected"));
             warn_orphaned_claims(&slug, &name);
             Ok(ExitCode::Ok)
+        }
+        Some(Cmd::Confirm { name, sessions }) => {
+            let Some((_, slug)) = ctx_repo(args.repo.as_deref()) else {
+                return Ok(ExitCode::Precondition);
+            };
+            confirm_older(&slug, &name, &sessions)
         }
         Some(Cmd::Unhold { name, yes }) => {
             let Some((_, slug)) = ctx_repo(args.repo.as_deref()) else {
@@ -440,4 +454,86 @@ mod tests {
         // renaming it is a breaking change.
         assert_eq!(SEAL_FILE, ".agit-sealed");
     }
+}
+
+/// One conversation an older agit linked to a branch, as this computer knows it: its id, the day
+/// it was last active, and, when `opening`, its opening words, read from the conversation itself.
+/// Shown to the person only: never in JSON output or telemetry.
+pub(crate) fn conversation_line(
+    store: &crate::domain::store::Store,
+    link: &crate::domain::link::Link,
+    opening: bool,
+) -> String {
+    let day = chrono::DateTime::<chrono::Local>::from(crate::domain::link::touched_at(store, link))
+        .format("%Y-%m-%d");
+    let gist = if !opening || super::json::requested() {
+        None
+    } else {
+        link.parse().ok().and_then(|session| session.gist(60))
+    };
+    match gist {
+        Some(gist) => format!("{}  {day}  {gist}", link.session_id),
+        None => format!("{}  {day}", link.session_id),
+    }
+}
+
+/// `agit branch confirm`: the conversations named, or the only one, belong to the branch; the
+/// hold an older agit's link put on it no longer counts them. With more than one, each is named.
+fn confirm_older(slug: &str, branch: &str, sessions: &[String]) -> CmdResult {
+    let store = crate::domain::store::Store::open_or_init()?;
+    let older = crate::domain::link::launch::unconfirmed_older(&store, slug, branch);
+    if older.is_empty() {
+        ui::info(format_args!(
+            "no Codex conversation an older agit linked to {slug}@{branch} is waiting; nothing to confirm"
+        ));
+        return Ok(ExitCode::Ok);
+    }
+    let unknown: Vec<&String> = sessions
+        .iter()
+        .filter(|session| !older.iter().any(|link| &&link.session_id == session))
+        .collect();
+    if older.len() > 1 && sessions.is_empty() || !unknown.is_empty() {
+        if unknown.is_empty() {
+            ui::error(&format!(
+                "an older agit linked {} Codex conversations to {slug}@{branch}; confirm each that belongs there by name",
+                older.len()
+            ));
+        } else {
+            ui::error(&format!(
+                "{} isn't a Codex conversation an older agit linked to {slug}@{branch}",
+                unknown
+                    .iter()
+                    .map(|session| session.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for link in &older {
+            ui::info(format_args!("  {}", conversation_line(&store, link, true)));
+        }
+        ui::hint(&format!(
+            "agit branch confirm {branch} --repo {slug} --session <id>"
+        ));
+        return Ok(ExitCode::Usage);
+    }
+    let chosen: Vec<String> = if sessions.is_empty() {
+        older.iter().map(|link| link.session_id.clone()).collect()
+    } else {
+        sessions.to_vec()
+    };
+    crate::domain::link::launch::confirm(&store, slug, branch, &chosen)?;
+    for link in older
+        .iter()
+        .filter(|link| chosen.contains(&link.session_id))
+    {
+        ui::success(&format!(
+            "confirmed for {slug}@{branch}: {}",
+            conversation_line(&store, link, true)
+        ));
+    }
+    match crate::domain::link::launch::held(&store, slug, branch) {
+        Some(hold) => ui::hint(&crate::domain::link::launch::explain(&hold)),
+        None => ui::info(format_args!("{slug}@{branch} uploads again")),
+    }
+    Ok(ExitCode::Ok)
 }

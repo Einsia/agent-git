@@ -1685,3 +1685,199 @@ fn a_codex_conversation_holds_only_the_branch_its_own_launch_claimed() {
         "{pushed:?}"
     );
 }
+
+/// A Codex link an agit before launches made their claims bound to its branch at the session's
+/// start holds that branch on this computer until the person confirms the conversation belongs
+/// there, whatever turns it took since, and with no other conversation to compare it with. Every
+/// other writer leaves its mark and holds nothing. With two such links on a branch, each is
+/// confirmed by name, and confirming one branch leaves every other as it was.
+#[test]
+fn codex_links_an_older_agit_made_hold_their_branch_until_confirmed() {
+    const C: &str = "cccccccc-0000-4000-8000-000000000013";
+    const D: &str = "dddddddd-0000-4000-8000-000000000014";
+    const E: &str = "eeeeeeee-0000-4000-8000-000000000015";
+    const F: &str = "ffffffff-0000-4000-8000-000000000016";
+    const G: &str = "abababab-0000-4000-8000-000000000017";
+    const H: &str = "cdcdcdcd-0000-4000-8000-000000000018";
+    const J: &str = "efefefef-0000-4000-8000-000000000019";
+    const K: &str = "12121212-0000-4000-8000-00000000001a";
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let repo = lab.agit_home.join("repos/me/qa");
+    for branch in ["mix", "own", "typed", "resumed", "two", "fresh"] {
+        let made = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", branch, "s1"])
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+    }
+    // A link as the version that wrote it left it: a turn it settled added its checkpoint.
+    let written = |session: &str, branch: &str, mark: serde_json::Value| {
+        let mut body = serde_json::json!({"cwd":lab.work,"owner":"me","agent":"qa","branch":branch,
+            "native_checkpoint":{"tip":"1".repeat(40),"bytes":10,"sha256":"2".repeat(64)}});
+        for (key, value) in mark.as_object().unwrap() {
+            match value {
+                serde_json::Value::Null => {
+                    body.as_object_mut().unwrap().remove(key);
+                }
+                value => body[key] = value.clone(),
+            }
+        }
+        let dir = lab.agit_home.join("store/codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session}.json")), body.to_string()).unwrap();
+    };
+    let status = || lab.run(&["status"]);
+    let older = |branch: &str| {
+        format!("me/qa@{branch} was linked to a Codex conversation by an older agit")
+    };
+    let pushed = |branch: &str| {
+        lab.agit(&["push", &format!("me/qa@{branch}")])
+            .output()
+            .unwrap()
+    };
+    // Whether a push of `branch` is refused for the hold; it may still fail for other reasons here.
+    let held = |branch: &str| {
+        let out = pushed(branch);
+        let said = String::from_utf8_lossy(&out.stderr);
+        let refused = said.contains(&format!(
+            "`me/qa@{branch}` will not be uploaded from this computer"
+        )) && said.contains("may hold another conversation's turns");
+        assert!(!refused || out.status.code() == Some(7), "{out:?}");
+        refused
+    };
+
+    // mix3 as 0.2.41 left it: a plain `codex` took the launch's branch, and the launched thread
+    // never took a turn, so nothing else names the branch.
+    written(B, "mix", serde_json::json!({}));
+    // The person's own session from 0.2.41 looks the same.
+    written(C, "own", serde_json::json!({}));
+    // A launch's typed claim since 0.2.43, and agit's own resume, leave their marks.
+    written(D, "typed", serde_json::json!({"claimed_by":"launch"}));
+    written(
+        E,
+        "resumed",
+        serde_json::json!({"materialized_from":"3".repeat(40),"baseline_bytes":10,"baseline_hash":"4".repeat(64)}),
+    );
+    // A project's capture binds through an import.
+    let dir = lab.home.join(".codex/sessions/2026/11/06");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("rollout-2026-11-06T00-00-00-{F}.jsonl")),
+        [
+            serde_json::json!({"timestamp":"2026-11-06T00:00:00Z","type":"session_meta",
+                "payload":{"id":F,"timestamp":"2026-11-06T00:00:00Z","cwd":lab.work,
+                    "originator":"codex_cli_rs","cli_version":"0.167.0","source":"cli"}}),
+            serde_json::json!({"timestamp":"2026-11-06T00:00:01Z","type":"response_item",
+                "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"captured prompt"}]}}),
+            serde_json::json!({"timestamp":"2026-11-06T00:00:02Z","type":"response_item",
+                "payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"captured answer"}]}}),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    lab.run(&[
+        "import",
+        F,
+        "--from",
+        "codex",
+        "--into",
+        "me/qa@cap",
+        "--independent",
+        "--project-capture",
+    ]);
+    // Two conversations an older agit linked to one branch.
+    written(G, "two", serde_json::json!({}));
+    written(H, "two", serde_json::json!({}));
+    // Two that haven't settled a turn yet, so nothing but their claim is on record.
+    written(J, "fresh", serde_json::json!({"native_checkpoint": null}));
+    written(K, "fresh", serde_json::json!({"native_checkpoint": null}));
+
+    let shown = status();
+    for branch in ["mix", "own", "two"] {
+        assert!(shown.contains(&older(branch)), "{branch}: {shown}");
+    }
+    for branch in ["typed", "resumed", "cap"] {
+        assert!(
+            !shown.contains(&format!("me/qa@{branch} ")),
+            "{branch}: {shown}"
+        );
+    }
+    let refused = pushed("mix");
+    assert_eq!(refused.status.code(), Some(7), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("agit branch confirm mix --repo me/qa"),
+        "{refused:?}"
+    );
+
+    // The person confirms their own session; nothing else is cleared with it.
+    lab.run(&["branch", "confirm", "own", "--repo", "me/qa"]);
+    let shown = status();
+    assert!(!shown.contains(&older("own")), "{shown}");
+    assert!(shown.contains(&older("mix")), "{shown}");
+    assert!(shown.contains(&older("two")), "{shown}");
+    assert!(!held("own"));
+    assert!(held("mix"));
+
+    // With two, a bare confirm names both and changes nothing; each is confirmed by name.
+    let bare = lab
+        .agit(&["branch", "confirm", "two", "--repo", "me/qa"])
+        .output()
+        .unwrap();
+    assert!(!bare.status.success(), "{bare:?}");
+    let said =
+        String::from_utf8_lossy(&bare.stderr).into_owned() + &String::from_utf8_lossy(&bare.stdout);
+    assert!(said.contains(G) && said.contains(H), "{said}");
+    assert!(held("two"));
+    lab.run(&[
+        "branch",
+        "confirm",
+        "two",
+        "--repo",
+        "me/qa",
+        "--session",
+        G,
+    ]);
+    assert!(held("two"), "the other stays held");
+    lab.run(&[
+        "branch",
+        "confirm",
+        "two",
+        "--repo",
+        "me/qa",
+        "--session",
+        H,
+    ]);
+    assert!(!held("two"));
+    assert!(held("mix"));
+    let confirm = |branch: &str, session: &str| {
+        lab.run(&[
+            "branch",
+            "confirm",
+            branch,
+            "--repo",
+            "me/qa",
+            "--session",
+            session,
+        ])
+    };
+    assert!(held("fresh"));
+    confirm("fresh", J);
+    assert!(held("fresh"), "the other stays held");
+    confirm("fresh", K);
+    assert!(!held("fresh"));
+}

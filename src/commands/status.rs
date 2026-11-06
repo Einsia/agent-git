@@ -1022,6 +1022,15 @@ fn print_held_branches() {
             "{}",
             crate::domain::link::launch::explain(&hold)
         ));
+        // Status reads no conversation's content; `agit branch confirm` shows each one's opening
+        // words.
+        for link in crate::domain::link::launch::unconfirmed_older(&store, &hold.slug, &hold.branch)
+        {
+            ui::info(format_args!(
+                "  {}",
+                super::branch::conversation_line(&store, &link, false)
+            ));
+        }
     }
 }
 
