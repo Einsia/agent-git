@@ -738,7 +738,7 @@ test("a terminal agit refuses as writer holds its input past the release window 
   f.setRefused(true);
   await f.fire("session.start");
   await f.poll();
-  const waiting = /Not sent yet: another process still writes this conversation\. Your input waits here until that process ends or hands the conversation to this terminal\./;
+  const waiting = /Not sent yet: another Claude Code is still open on this conversation\. Close it and this terminal can write; your input waits here\./;
   assert.match(statuses(f).at(-1), waiting);
   const { sent, downstream } = typing();
   for (const at of [1000, 40000, 3600000]) {
@@ -783,7 +783,7 @@ test("the daemon's own headless writer never holds its input, a refused terminal
     await other.poll();
     const held = typing();
     assert.match((await later(40000, () => other.fire("prompt.submit", typed, held.downstream))).drop,
-      /another process still writes/);
+      /another Claude Code is still open/);
     assert.deepEqual(held.sent, []);
   }
 });

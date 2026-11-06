@@ -139,18 +139,27 @@ impl Registration {
     /// that may name the same conversation meanwhile is the daemon's own headless writer handing
     /// it over (or whose release failed), as the lease file records it by pid and start time:
     /// otherwise a terminal opened during a web turn could never register, and its hold would
-    /// end. Any other second process still makes it no writer at all.
+    /// end. Of two terminals on one conversation the first stays its writer, so one of them can
+    /// write: a terminal opened later never takes this one's place, and is held until this one
+    /// closes. Only a terminal counts: a headless writer started later is running a turn, and
+    /// this process must not write beside it. Any other second process still makes it no writer
+    /// at all, a start time that can't be read included.
     fn live(&self) -> Result<super::claude_inbox::Live, super::claude_inbox::Missing> {
         let writer = super::lease::path()
             .and_then(|path| super::lease::Leases::handover_writer_in(&path, &self.session));
+        let own = started_ms(self.process.pid).map(|started| (started, self.process.pid));
         super::claude_inbox::discover_pid_in(
             &self.registry,
             &self.session,
             self.process.pid,
-            |other| {
-                writer.is_some_and(|writer| {
-                    writer.pid == other && started_ms(other) == Some(writer.started_ms)
-                })
+            |other, terminal| {
+                let later = own.is_some_and(|own| {
+                    started_ms(other).is_some_and(|started| (started, other) > own)
+                });
+                (terminal && later)
+                    || writer.is_some_and(|writer| {
+                        writer.pid == other && started_ms(other) == Some(writer.started_ms)
+                    })
             },
         )
     }
@@ -542,6 +551,61 @@ mod tests {
             );
             terminal.kill().unwrap();
             terminal.wait().unwrap();
+        });
+    }
+
+    /// Two terminals on one conversation leave one able to write: the first. The later one is
+    /// held, and takes over once the first closes. A later process that isn't a terminal changes
+    /// nothing: it may be a headless writer running a turn.
+    #[cfg(unix)]
+    #[test]
+    fn of_two_terminals_on_a_conversation_the_first_stays_its_writer() {
+        let root = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(root.path(), || {
+            let registry = root.path().join("sessions");
+            let session = uuid::Uuid::new_v4().to_string();
+            let (mut first, _a) = registered(root.path(), &registry, &session, "first");
+            // Start times are read in clock ticks: the second one starts visibly later.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (mut second, _b) = registered(root.path(), &registry, &session, "second");
+            let as_terminal = |pid: u32, entrypoint: &str| {
+                let path = registry.join(format!("{pid}.json"));
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                record["entrypoint"] = serde_json::json!(entrypoint);
+                std::fs::write(&path, record.to_string()).unwrap();
+            };
+            let registration = |pid: u32| {
+                let (process, _) = process(pid).unwrap();
+                Registration {
+                    version: 1,
+                    session: session.clone(),
+                    cwd: PathBuf::from("/"),
+                    generation: uuid::Uuid::new_v4().to_string(),
+                    revision: process.birth.clone(),
+                    process,
+                    registry: registry.clone(),
+                    descriptor: root.path().join("local.json"),
+                }
+            };
+            as_terminal(first.id(), "cli");
+            as_terminal(second.id(), "sdk-cli");
+            let error = registration(first.id()).refusal().unwrap_err();
+            assert!(
+                error.is::<NotCurrentWriter>(),
+                "a headless process started later still holds this terminal"
+            );
+
+            as_terminal(second.id(), "cli");
+            assert!(registration(first.id()).refusal().is_ok());
+            let error = registration(second.id()).refusal().unwrap_err();
+            assert!(error.is::<NotCurrentWriter>(), "the later terminal is held");
+
+            first.kill().unwrap();
+            first.wait().unwrap();
+            assert!(registration(second.id()).refusal().is_ok());
+            second.kill().unwrap();
+            second.wait().unwrap();
         });
     }
 

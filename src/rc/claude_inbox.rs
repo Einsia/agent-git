@@ -92,6 +92,12 @@ struct Record {
     peer_protocol: Option<u64>,
     #[serde(default)]
     messaging_socket_path: Option<String>,
+    /// How the process was started: `cli` for a person's terminal, `sdk-cli` for a headless
+    /// writer. The record's `kind` says `interactive` for both. Read only where a second
+    /// terminal can be told apart, which is Unix.
+    #[cfg(unix)]
+    #[serde(default)]
+    entrypoint: Option<String>,
 }
 
 /// A session that runs in a live Claude Code process listening on its messaging socket.
@@ -331,15 +337,16 @@ pub(crate) enum Missing {
 }
 
 /// [`discover_in`] for the process `pid`: found when it names `session_id` and every other live
-/// process naming it is one `handing_over` admits (the daemon's own headless writer, which still
-/// holds the conversation while a terminal takes it over). Any other second process leaves the
-/// session ambiguous, as in [`discover_in`], and is told apart from a process not listed at all.
+/// process naming it is one `admitted` passes, given its pid and whether it is a person's terminal
+/// (such as the daemon's own headless writer, which still holds the conversation while a terminal
+/// takes it over). Any other second process leaves the session ambiguous, as in [`discover_in`],
+/// and is told apart from a process not listed at all.
 #[cfg(unix)]
 pub(crate) fn discover_pid_in(
     registry: &Path,
     session_id: &str,
     pid: u32,
-    handing_over: impl Fn(u32) -> bool,
+    admitted: impl Fn(u32, bool) -> bool,
 ) -> Result<Live, Missing> {
     let mut found = None;
     for (other, record) in records(registry) {
@@ -350,7 +357,7 @@ pub(crate) fn discover_pid_in(
             continue;
         };
         if other != pid {
-            if handing_over(other) {
+            if admitted(other, record.entrypoint.as_deref() == Some("cli")) {
                 continue;
             }
             return Err(Missing::Shared);
