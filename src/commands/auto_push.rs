@@ -34,6 +34,9 @@ pub(crate) fn publication_explicitly_off(repository: &str) -> crate::Result<bool
     let (owner, name) = super::parse_slug(repository)?;
     match Repo::open(crate::infra::config::repo_dir(&owner, &name)?) {
         Some(checkout) => checkout.auto_push_explicitly_off(),
+        None if crate::domain::repo::automatic_upload_off::recorded(&owner, &name).holds_off() => {
+            Ok(true)
+        }
         None => Ok(crate::infra::config::get_global("push.auto")?.as_deref() == Some("false")),
     }
 }

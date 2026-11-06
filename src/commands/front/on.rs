@@ -168,9 +168,24 @@ pub(crate) fn enable(
         }
         None => None,
     };
+    // Naming the destination with `--repo` is the person's own choice to upload into it, so it
+    // replaces an off they recorded for it on this computer; a destination the folder chose keeps
+    // that off, and the bind below leaves its automatic upload off. A bind that fails puts both
+    // back, the off and the checkout's own setting the bind may already have written, so a
+    // refused `agit on` turns nothing on: the checkout's setting outranks the record.
+    let (owner, name) = crate::commands::parse_slug(&slug)?;
+    let checkout = crate::infra::config::repo_dir(&owner, &name)?;
+    let setting_before = crate::domain::repo::Repo::open(&checkout)
+        .map(|repo| repo.auto_push_override())
+        .transpose()?
+        .flatten();
+    let replaced = repo.is_some() && replace_recorded_off(&slug)?;
     if let Err(error) = bind(root, &slug) {
         if let Some(previous) = previous {
             previous.restore(root, &slug)?;
+        }
+        if replaced {
+            undo_replaced_off(&owner, &name, &checkout, setting_before)?;
         }
         return Err(error);
     }
@@ -286,6 +301,42 @@ fn public_refusal(root: &Path, destination: &super::Destination) -> Refusal {
         ),
         ExitCode::Precondition,
     )
+}
+
+/// Drops the off this computer recorded for `slug` before its checkout existed, and says so.
+/// Puts back the off a refused `agit on --repo` replaced, and the checkout's own setting as it was
+/// before. The off goes back first and on its own: it needs no Git configuration write, so a held
+/// configuration lock, which may be why the bind failed, can't keep it from returning. The setting
+/// is written only when the bind changed it.
+fn undo_replaced_off(
+    owner: &str,
+    name: &str,
+    checkout: &Path,
+    setting_before: Option<bool>,
+) -> Result<()> {
+    let off = crate::domain::repo::automatic_upload_off::set(owner, name, true);
+    let setting = match crate::domain::repo::Repo::open(checkout) {
+        Some(repo) if repo.auto_push_override().ok().flatten() != setting_before => {
+            repo.set_auto_push(setting_before)
+        }
+        _ => Ok(()),
+    };
+    off?;
+    setting
+}
+
+/// Drops the off recorded for `slug` on this computer, saying so; whether there was one.
+fn replace_recorded_off(slug: &str) -> Result<bool> {
+    use crate::domain::repo::automatic_upload_off;
+    let (owner, name) = crate::commands::parse_slug(slug)?;
+    if automatic_upload_off::recorded(&owner, &name) != automatic_upload_off::Recorded::Off {
+        return Ok(false);
+    }
+    automatic_upload_off::set(&owner, &name, false)?;
+    ui::progress(format_args!(
+        "automatic upload into {slug} was turned off on this computer; naming it with --repo turns it on"
+    ));
+    Ok(true)
 }
 
 /// Enrolls the folder as a project that uploads automatically, through `agit project bind`, so
@@ -950,5 +1001,56 @@ mod tests {
         );
         // Codex that does not answer is not claimed either way.
         assert_eq!(codex_state(None).name(), "needs_trust");
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::undo_replaced_off;
+    use crate::domain::repo::{Repo, automatic_upload_off};
+
+    /// A refused `agit on --repo` puts the person's off back even when the checkout's Git
+    /// configuration can't be written, which may be why the bind failed. Restoring the setting
+    /// first and returning on its error would leave the off out, and the destination would
+    /// inherit an enabled preference. With the setting unchanged, nothing is written to Git at
+    /// all; with it changed, the failed write is reported after the off is back.
+    #[test]
+    fn the_off_returns_even_when_the_checkouts_setting_cant_be_written() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::infra::config::env_lock();
+        let old_home = std::env::var_os("AGIT_HOME");
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+        }
+        let checkout = home.path().join("repos/alice/app");
+        let repo = Repo::init(&checkout).unwrap();
+        let lock = checkout.join(".git/config.lock");
+        std::fs::write(&lock, "held").unwrap();
+        let unchanged = undo_replaced_off("alice", "app", &checkout, None);
+        let unchanged_off = automatic_upload_off::recorded("alice", "app");
+        automatic_upload_off::set("alice", "app", false).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        std::fs::write(&lock, "held").unwrap();
+        let changed = undo_replaced_off("alice", "app", &checkout, None);
+        let changed_off = automatic_upload_off::recorded("alice", "app");
+        // The setting the refused bind left behind could not be taken back, and the restored off
+        // still keeps the destination from uploading.
+        let changed_uploads = (repo.auto_push_enabled(), repo.auto_push_explicitly_off());
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("AGIT_HOME", value),
+                None => std::env::remove_var("AGIT_HOME"),
+            }
+        }
+        assert!(unchanged.is_ok(), "{unchanged:?}");
+        assert_eq!(unchanged_off, automatic_upload_off::Recorded::Off);
+        assert!(changed.is_err());
+        assert_eq!(changed_off, automatic_upload_off::Recorded::Off);
+        assert_eq!(repo.auto_push_override().unwrap(), Some(true));
+        assert!(
+            matches!(changed_uploads, (Ok(false), Ok(true))),
+            "{changed_uploads:?}"
+        );
     }
 }

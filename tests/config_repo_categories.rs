@@ -96,13 +96,19 @@ fn repository_io_and_stored_value_failures_keep_runtime_codes() {
     let local = std::fs::read(path.join(".git/config")).unwrap();
     let lock = path.join(".git/config.lock");
     std::fs::write(&lock, "synthetic lock").unwrap();
+    // An off recorded before the checkout existed goes only once the checkout's own setting is
+    // written; a write that fails leaves it, so the destination doesn't fall back to inheriting.
+    let record = root
+        .path()
+        .join("agit/preferences/automatic-upload-off.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    let off = serde_json::json!({"version": 1, "off": [format!(
+        "{}/alice/demo",
+        agit::infra::config::hub_host_key("http://127.0.0.1:1").unwrap()
+    )]})
+    .to_string();
+    std::fs::write(&record, &off).unwrap();
     for version in [None, Some("1"), Some("2")] {
-        refused(
-            root.path(),
-            version,
-            &["--repo", "alice/missing", "push.auto"],
-            1,
-        );
         refused(
             root.path(),
             version,
@@ -111,8 +117,10 @@ fn repository_io_and_stored_value_failures_keep_runtime_codes() {
         );
         assert_eq!(std::fs::read(path.join(".git/config")).unwrap(), local);
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), "synthetic lock");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), off);
     }
     std::fs::remove_file(lock).unwrap();
+    std::fs::remove_file(&record).unwrap();
     repo.git(&["config", "--local", "agit.autoPush", "invalid"])
         .unwrap();
     let invalid = std::fs::read(path.join(".git/config")).unwrap();
@@ -124,5 +132,22 @@ fn repository_io_and_stored_value_failures_keep_runtime_codes() {
             1,
         );
         assert_eq!(std::fs::read(path.join(".git/config")).unwrap(), invalid);
+    }
+    // A repository without a checkout keeps its off in a record of its own; a record that can't be
+    // read fails reads and writes alike and is left as it was.
+    let record = root
+        .path()
+        .join("agit/preferences/automatic-upload-off.json");
+    std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+    std::fs::write(&record, "not a record").unwrap();
+    for version in [None, Some("1"), Some("2")] {
+        for args in [
+            &["--repo", "alice/missing", "push.auto"][..],
+            &["--repo", "alice/missing", "push.auto", "false"],
+            &["--repo", "alice/missing", "--unset", "push.auto"],
+        ] {
+            refused(root.path(), version, args, 1);
+            assert_eq!(std::fs::read(&record).unwrap(), b"not a record");
+        }
     }
 }

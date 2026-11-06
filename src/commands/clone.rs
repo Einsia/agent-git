@@ -492,6 +492,8 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     plan.report(&src_owner, &src_name, progress);
 
     if let Some(value) = args.auto_push {
+        let slug = format!("{owner}/{name}");
+        let recorded_off = super::config::recorded_off(&slug)?;
         if value {
             super::push::enroll_public_destination(
                 &store,
@@ -501,6 +503,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             )?;
         }
         store.set_auto_push(Some(value))?;
+        super::config::settle_recorded_off(&slug, recorded_off, value)?;
     } else if !existed {
         super::config::choose_repo_auto_push()?.apply(&store, &format!("{owner}/{name}"))?;
     }
