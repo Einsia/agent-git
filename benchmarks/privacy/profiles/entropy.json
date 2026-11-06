@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "case_ids": [
+    "bare-entropy-default",
+    "bare-entropy-opt-in",
+    "entropy-source-identifiers"
+  ]
+}

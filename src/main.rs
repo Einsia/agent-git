@@ -33,6 +33,9 @@ fn main() {
     // Before anything else: a child of another build must do nothing at all.
     agit::infra::own_image::refuse_foreign_parent();
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(code) = agit::domain::privacy::bench::entry(&raw_args) {
+        exit(code);
+    }
     if let Some(code) = agit::domain::privacy::worker::entry(&raw_args) {
         exit(code);
     }

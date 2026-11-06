@@ -1,5 +1,7 @@
 //! Optional local privacy processing. Business operations own their success criteria.
 
+#[cfg(feature = "cli")]
+pub mod bench;
 #[cfg(feature = "secret-vault")]
 pub mod continuity;
 #[cfg(feature = "secret-vault")]
