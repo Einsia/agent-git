@@ -14,12 +14,13 @@ import tempfile
 import time
 
 from adapter import ADAPTER_VERSION, Worker, cleanup, dumps, version, telemetry
-from evaluate import compare, score, succeeds, leaves
+from evaluate import compare, score, succeeds
+from contracts import validate_case
 from report import render, write_json
 from sources import BenchError, Sources
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNNER_VERSION = 1
+RUNNER_VERSION = 3
 
 
 class Cancelled(BenchError):
@@ -39,46 +40,64 @@ def dataset(profile):
         raise BenchError('Dataset aggregate hash mismatch')
     cases = json.loads((root / 'cases/synthetic.json').read_text())
     annotations = json.loads((root / 'annotations/synthetic.json').read_text())
-    selected = json.loads((root / f'profiles/{profile}.json').read_text())['case_ids']
-    cases = [c for c in cases if c['id'] in selected]
-    if not cases or len(cases) != len(selected) or len({c['id'] for c in cases}) != len(cases):
-        raise BenchError('Profile must select unique existing cases')
+    if manifest.get('schema_version') != 1 or manifest.get('annotation_version') != 3:
+        raise BenchError('Unsupported dataset or annotation schema')
+    ids = [c['id'] for c in cases]
+    if len(set(ids)) != len(ids) or set(annotations) != set(ids):
+        raise BenchError('Cases and annotations must have matching unique IDs')
     for case in cases:
-        checks = annotations[case['id']]
-        if not checks:
-            raise BenchError('Case has no independent expectations: ' + case['id'])
-        if case['layer'] == 'secret':
-            locations = {p: v for p, v in leaves(case['input']) if isinstance(v, str)}
-            if any(c['pointer'] not in locations for c in checks):
-                raise BenchError('Annotation pointer does not identify a string')
-            for path, value in locations.items():
-                cursor = 0
-                for check in sorted((c for c in checks if c['pointer'] == path), key=lambda c: c['start']):
-                    if check['expect'] not in ('protect', 'keep') or check['start'] != cursor or not cursor < check['end'] <= len(value):
-                        raise BenchError('Secret annotations must partition each input string exactly')
-                    cursor = check['end']
-                if cursor != len(value):
-                    raise BenchError('Unannotated input string range')
+        validate_case(case, annotations[case['id']])
+    selected = json.loads((root / f'profiles/{profile}.json').read_text())['case_ids']
+    if not selected or len(set(selected)) != len(selected) or set(selected) - set(ids):
+        raise BenchError('Profile must select unique existing cases')
+    cases = [c for c in cases if c['id'] in selected]
+
     return manifest, cases, {c['id']: annotations[c['id']] for c in cases}
+
+
+def worker_capability(case):
+    if case['layer'] == 'secret':
+        return 'secret'
+    return f"policy:{case['runtime']}:{'plain' if case['mode'] == 'plain' else 'public'}"
 
 
 def execute(binary, cases, annotations, work, diagnostics, checkpoint):
     results = {c['id']: {'status': 'failed', 'reason': 'not executed'} for c in cases}
     capabilities = {}
-    probe = telemetry(binary, work / 'telemetry-probe', {'operation': 'capabilities'})
-    capabilities['detector_telemetry'] = probe is not None and 'scan_text' in probe.get('capabilities', [])
-    capabilities['memory_policy'] = probe is not None and 'memory_policy' in probe.get('capabilities', [])
-    for mode, probe in [('secret', 'protect_text'), ('policy', 'project_publication')]:
-        worker = Worker(binary, work / ('probe-' + mode))
+    probe_error = None
+    try:
+        probe = telemetry(binary, work / 'telemetry-probe', {'operation': 'capabilities'})
+        if probe is not None and (not isinstance(probe.get('capabilities'), list)
+                                  or not all(isinstance(v, str) for v in probe['capabilities'])):
+            raise BenchError('Invalid capability response')
+    except (BenchError, OSError, ValueError, subprocess.SubprocessError) as error:
+        probe = None
+        probe_error = str(error)
+    capabilities['detector_telemetry'] = probe is not None and 'scan_text' in probe['capabilities']
+    capabilities['memory_policy'] = probe is not None and 'memory_policy' in probe['capabilities']
+    if probe_error:
+        capabilities['probe_error'] = probe_error
+    probes = {}
+    for case in cases:
+        if case.get('mode') == 'memory':
+            continue
+        key = worker_capability(case)
+        if case['layer'] == 'secret':
+            probes[key] = ('protect_text', 'offline probe')
+        elif case['mode'] == 'plain':
+            probes[key] = ('protect_envelopes', '')
+        else:
+            probes[key] = ('project_publication', dumps({'branch': None, 'log': '', 'view': '',
+                'metadata': {'session': 'agit-' + 'a' * 40, 'runtime': case['runtime'], 'cwd': '/bench'}, 'additional': []}))
+    for key, (mode, text) in probes.items():
+        worker = Worker(binary, work / ('probe-' + key.replace(':', '-')))
         try:
-            text = 'offline probe' if mode == 'secret' else dumps({'branch': None, 'log': '', 'view': '',
-                   'metadata': {'session': 'agit-' + 'a' * 40, 'runtime': 'claude-code', 'cwd': '/bench'}, 'additional': []})
-            response = worker.request(probe, text)
-            capabilities[mode] = response['status'] == 'complete'
+            response = worker.request(mode, text)
+            capabilities[key] = response['status'] == 'complete'
         except Cancelled:
             raise
         except (BenchError, OSError, ValueError):
-            capabilities[mode] = False
+            capabilities[key] = False
         finally:
             worker.close()
     for case in cases:
@@ -94,24 +113,15 @@ def execute(binary, cases, annotations, work, diagnostics, checkpoint):
                         raise BenchError('Advertised memory policy capability failed')
                     outcome = {'status': answer['status'], 'output': answer}
                 else:
-                    outcome = {'status': 'unsupported', 'reason': 'memory_policy requires the versioned offline entry'}
-            elif not capabilities[case['layer']]:
+                    outcome = {'status': 'failed' if probe_error else 'unsupported',
+                               'reason': probe_error or 'memory_policy requires the versioned offline entry'}
+            elif not capabilities[worker_capability(case)]:
                 outcome = {'status': 'failed', 'reason': 'Required worker mode did not pass the capability probe; support could not be established'}
             else:
-                worker = Worker(binary, work / name, case.get('entropy', False), case.get('policy'))
+                worker = Worker(binary, work / name, case.get('entropy', False), case.get('policy'), case.get('workspace_files'))
                 worker.prepare(case)
                 initialized = time.monotonic()
                 outcome = worker.run(case, prepared=True)
-                if (capabilities['detector_telemetry'] and case['layer'] == 'secret'
-                        and isinstance(case['input'], str) and not case.get('context')):
-                    detection = telemetry(binary, work / (name + '-scan'), {
-                        'operation': 'scan_text', 'text': case['input'], 'blocks': case.get('blocks', []),
-                        'allows': case.get('allows', []), 'entropy': case.get('entropy', False)})
-                    if detection is None:
-                        raise BenchError('Advertised detector telemetry failed')
-                    outcome['detection'] = detection
-                    if detection['status'] != 'complete':
-                        outcome['status'] = 'partial'
                 if worker.repo:
                     outcome = json.loads(dumps(outcome).replace(str(worker.repo), '{workspace}'))
                 outcome['initialization_seconds'] = initialized - started
@@ -124,8 +134,30 @@ def execute(binary, cases, annotations, work, diagnostics, checkpoint):
             if worker:
                 worker.close()
                 write_json(diagnostics / (name + '.json'), worker.raw)
+        eligible = case['layer'] == 'secret' and isinstance(case['input'], str) and not case.get('context')
+        outcome['detection_status'] = 'not_applicable'
+        if eligible:
+            outcome['detection_status'] = 'failed' if probe_error else 'unsupported'
+            outcome['detection_reason'] = probe_error or 'scan_text capability is unavailable'
+            if capabilities['detector_telemetry']:
+                try:
+                    detection = telemetry(binary, work / (name + '-scan'), {
+                        'operation': 'scan_text', 'text': case['input'], 'blocks': case.get('blocks', []),
+                        'allows': case.get('allows', []), 'entropy': case.get('entropy', False)})
+                    if detection is None:
+                        raise BenchError('Advertised detector telemetry failed')
+                    outcome['detection'] = detection
+                    outcome.pop('detection_reason', None)
+                except Cancelled:
+                    raise
+                except (BenchError, OSError, ValueError, subprocess.SubprocessError) as error:
+                    outcome['detection_status'] = 'failed'
+                    outcome['detection_reason'] = str(error)
         results[name] = score(case, annotations[name], outcome)
         results[name]['elapsed_seconds'] = time.monotonic() - started
+        if eligible:
+            write_json(diagnostics / (name + '-scan.json'),
+                       {k: v for k, v in results[name].items() if k.startswith('detection')})
         write_json(checkpoint, results)
     return results, capabilities
 
@@ -146,7 +178,7 @@ def main():
     if hasattr(os, 'sched_setaffinity'):
         os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
     start = time.monotonic()
-    result = {'schema_version': 1, 'status': 'execution_failed', 'profile': args.profile,
+    result = {'schema_version': 2, 'status': 'execution_failed', 'profile': args.profile,
               'cases': [], 'annotations': {}, 'baseline': {}, 'candidate': {}}
     manifest = {}
     lock = {'schema_version': 1, 'runner_version': RUNNER_VERSION, 'adapter_version': ADAPTER_VERSION,

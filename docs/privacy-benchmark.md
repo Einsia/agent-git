@@ -92,6 +92,107 @@ placeholder count. Recovery and repeated protection are checked independently. R
 responses are retained. Random placeholder IDs are normalized only in the displayed diff.
 Rule names absent from the protocol remain unavailable.
 
+### Annotation and execution contracts
+
+Dataset `1.5.0` uses annotation version `3`. The runner validates the entire corpus
+before downloading or executing either CLI, including cases outside the selected
+profile. Invalid pointers, unknown expectations, missing source values, overlapping
+ranges and invalid stream cuts are dataset errors, with the case and annotation
+identified in the diagnostic.
+
+Secret annotations still partition decoded strings into `protect` and `keep` ranges.
+The generator accepts a string to select every occurrence, or a selection object:
+
+```python
+{'value': 'synthetic-value', 'count': 2, 'occurrences': [1]}
+{'value': 'synthetic-value', 'start': 10, 'end': 25}
+```
+
+Occurrence indices are zero-based. `count` checks the total number of occurrences;
+`occurrences` selects which ones to protect. Explicit ranges must match `value`
+exactly. Missing values and duplicate or overlapping selections fail generation.
+The output structure is checked recursively, including empty objects and arrays,
+container lengths, field sets and scalar types. Structural damage is a contract
+failure and makes range scoring indeterminate rather than producing guessed counts.
+
+Policy annotations identify both `input_pointer` and output `pointer`. The input
+node must equal `value`, proving that the fixture actually contains the intended
+target. Expectations have distinct meanings:
+
+| Expectation | Required output |
+| --- | --- |
+| `keep` | The complete target node equals `value`, including types and neighboring text. |
+| `rewrite` | The complete target node equals `replacement`, or its entire string matches `replacement_pattern`. |
+| `hide` | The target node exists, the sensitive string is absent there, and the replacement contract passes. |
+| `remove` | The target node is absent and its parent container still exists. A null value is not absence. |
+| `allow`, `exclude` | The corresponding memory decision has the exact expected action. |
+
+`hide` and `rewrite` require exactly one replacement contract. Patterns are reserved
+for contract-defined variable components such as an allocated path alias; surrounding
+content remains part of the full match. A hidden value with an incorrect replacement
+still records a contract failure. Memory decisions must retain the input path order.
+Tool checks preserve each call/result association at its record and block position,
+allowing public ID aliases but rejecting duplicated or exchanged references. Exact
+annotations on names, arguments and result bodies check their content independently.
+The same association checks apply to plain capture.
+
+Publication cases may declare `branch` and `workspace_files`. The branch is passed
+to the production publication request. Fixture files are created before the worker
+starts, inside its temporary workspace, so a captured read can refer to an actual
+synthetic directory and file. Relative paths cannot escape that workspace or write
+Git control files. A fixture's filesystem and captured contents must describe the
+same scenario; missing parent directories must not accidentally stand in for an
+existing source tree.
+
+Every non-memory Policy case declares `runtime` and `record_layout`. The runner uses
+the declared runtime for envelope `_source`, publication metadata and capability
+probes. It sends the original native records to the worker, without converting their
+schema. Conflicting metadata runtimes and unknown runtime names fail dataset validation.
+Public projection produces the CLI's canonical message format; plain capture retains
+the native format.
+
+`record_layout` independently describes the expected roles and content-block positions.
+Its `preserve` pointers identify native role and event-kind fields that plain capture
+must retain exactly.
+Each block declares its type and binds its structural fields to JSON pointers in the
+corresponding native input record. For example, a Codex call binds `id` to
+`/records/0/payload/call_id`, `name` to `/records/0/payload/name`, and `input` to
+`/records/0/payload/arguments` with `encoding: "json"`. Bindings are resolved only for
+structural scoring. They neither modify worker input nor decide which content Policy
+should hide. Content expectations still use separate input and output pointers.
+Plain output is checked through the same native-field bindings and must also preserve
+the complete native JSON structure.
+If a completed worker response turns an encoded argument into an unreadable carrier,
+the report retains that output and its exact annotation verdicts. Encoded-field and
+dependent structural checks fail explicitly instead of discarding the response as an
+adapter JSON exception. Input fixtures still require valid encoded fields.
+
+The `native-*` corpus covers protocol envelopes for Claude Code, Claude Desktop,
+Cursor, Codex, OpenCode, Hermes, OpenClaw and WorkBuddy. These cases intentionally use
+synthetic `Read`/`ReadPublic` tools with a common `file_path` argument to isolate source
+routing, Policy overrides and associations. They do not establish coverage of the
+agents' actual default toolsets or daily workflows.
+
+The separate `workflow-*` cases use reference-backed tool names and argument shapes
+for a read/edit/test task, including string-valued patch inputs. Each declared profile
+has public and plain expectations. Claude Desktop and WorkBuddy use an explicitly
+configured Desktop Commander MCP profile, not claimed built-in tools. The traces are
+constructed from tool references and checked-in transcript conventions, not recordings
+of live agent runs. See [tool profiles, sources and limits](privacy-benchmark-workflows.md).
+
+Stream cuts are strictly increasing Unicode code-point offsets inside a text input.
+The worker's consumed coordinates are UTF-8 bytes and must end on character boundaries.
+The adapter retains the initial context and checks the final stream against whole-text
+protection through recovered ranges, independently of randomized placeholder IDs.
+
+Report schema `2` records protection and detection completion separately. Detector
+failure cannot erase a completed protection result, and a failed protection run cannot
+erase valid detector evidence. Each stage has its own common completed comparison set.
+Unsupported and inapplicable detector observations are distinct from failed or partial
+execution; an advertised detector that fails prevents a passing run. HTML case summaries
+distinguish protection quality from execution completion. Raw detector responses and
+errors are retained alongside worker diagnostics.
+
 New binaries also expose `__privacy-bench-v1`: one JSON request on stdin and one JSON
 response on stdout, dispatched before configuration, login, Git initialization or telemetry.
 `schema_version: 1` with `operation: capabilities` lists operations. `scan_text` takes
@@ -148,6 +249,78 @@ CLI's output. A failing genuine expectation is a benchmark finding, not a reason
 that expectation. Local checks expose a default-mode false positive on `YOUR_PASSWORD`
 and an entropy-opt-in false positive on a typed SHA-256 digest. These are recorded findings;
 selected profiles fail until the production detector satisfies the independent expectations.
+
+### Corpus review
+
+The annotation-version-3 review preserves the inputs and Secret protection decisions of
+the original cases. Policy expectations now check complete target
+nodes: file exclusion notices and tool names, complete replacement sentences, attachment
+notices or retained metadata, precise metadata removal, and ordinary file content.
+These expectations follow the production contracts and are not generated from CLI output.
+
+Dataset `1.5.0` contains the original boundaries, 16 native protocol probes, 25 business
+scenarios, 16 reference-backed read/edit/test traces, and 11 incident reconstructions.
+There are 98 cases: 41 Secret and 57 Policy. The default profile contains 87 cases,
+entropy contains 11, and all contains 98. Entropy includes opted-in native/media Policy
+cases and its default-mode control. The [case catalog](privacy-benchmark-cases.md)
+explains every case's scenario, expected behavior, basis and validity checks.
+
+The workflow fixtures cover valid Python and JavaScript modules, shell commands,
+INI credentials, HTTP Basic and signed JWT authentication, a PostgreSQL URI, decoded
+JSON escapes, localized logs, stream boundaries, overlapping explicit rules, and
+combined file/tool/attachment policies. The PEM pair is a valid offline-generated
+test key, and the PNG is a valid image. The generator reads the fixed PEM files;
+it never regenerates keys or derives expectations from scanner output.
+
+Run the independent format review before accepting fixture changes:
+
+```sh
+python3 benchmarks/privacy/generate.py
+python3 benchmarks/privacy/validate_fixtures.py --external
+```
+
+The external review uses Node.js syntax checking, a POSIX shell parser and OpenSSL
+key inspection. It also replays the fixed calculator edit in a temporary project,
+requiring its Python checks to fail before the edit and pass afterward. Recorded shell
+commands remain data; the checker does not start agents or MCP servers. The other checks
+use Python's standard library. Every declared
+format check passed locally. Provider-shaped credentials remain synthetic and are
+never sent to an issuer. The AWS profile distinguishes the non-secret access key
+identifier from the secret access key using the cited AWS documentation. Public
+path aliases are checked for their documented semantic form rather than a particular
+allocated alias number.
+
+The [incident review](privacy-benchmark-incidents.md) maps CLI issues and six readable
+frozen Hub sessions to the new cases. It distinguishes direct reader-visible anomalies,
+workflow corroboration and report-only facts. Samples use newly constructed IDs,
+credentials, paths and image bytes. Publication retry, account synchronization, locked
+key recovery, file-commit integration and reports without a concrete reproducer are
+listed separately rather than represented by misleading scanner-only cases.
+
+Native verification uses CLI `0.2.42` built from main revision `987ecc31`. Two isolated
+full-corpus runs completed all 98 cases with identical verdicts. Secret output scoring
+reported 14 FP ranges and 3 FN ranges. Policy reported 4 FP checks and 10 contract
+failures: the caption rewrite, omitted Codex freeform call/result checks, and opaque
+encoded-argument checks. These are failed checks, not a count of independent root causes.
+These are quality findings, not execution failures:
+
+| Finding | Cases |
+| --- | --- |
+| Human-readable password literals remain visible | `scenario-python-settings-review`, `scenario-ini-database-passphrase` |
+| Basic Authorization credentials remain visible | `scenario-http-basic-authentication` |
+| A valid Python class reference is replaced | `scenario-python-provider-references` |
+| Credential replacement also consumes surrounding quotation marks | `scenario-javascript-client-options`, `scenario-shell-password-value`, `scenario-unicode-authentication-log`, `scenario-stream-password-at-eof`, `scenario-stream-multiple-credentials` |
+| A bearer replacement consumes the caption's following full stop | `scenario-image-metadata-and-caption-secret` |
+| Public projection omits a valid freeform patch call and result | `workflow-codex-calculator-encrypted-public` |
+| A valid image companion/raw MCP payload is replaced under entropy opt-in while its equivalent structured/data-URL copy survives | `incident-claude-duplicated-image`, `incident-mcp-image-carrier-equivalence` |
+| A blocked content occurrence makes the whole encoded argument opaque; native ID annotations still pass, but argument rewrite/structure checks do not | `incident-codex-call-linkage` |
+| Document placeholder and typed digest false positives | `normal-placeholders`, `entropy-source-identifiers` |
+
+The full profile remains failed on these independent expectations. Secret recovery,
+idempotence and stream-equivalence checks passed. Every `workflow-*-plain` case and the
+other public workflow profiles passed. The remaining incident cases passed their local
+contracts, without claiming that historical integration defects are resolved. This is a native same-binary check,
+not a Linux CI or release-versus-dev acceptance result.
 
 Before rollout, configure the protected CI variable, verify runner availability, merge the
 CLI changes and allow its normal dev packaging to finish. Then the reviewer can run the

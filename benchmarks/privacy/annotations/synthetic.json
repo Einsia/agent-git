@@ -279,142 +279,238 @@
   ],
   "default-file-exclusion": [
     {
-      "pointer": "/records",
+      "pointer": "/records/1/message/content/0/content",
       "expect": "hide",
-      "value": "CONSTRUCTED_FILE_BODY"
+      "value": "CONSTRUCTED_FILE_BODY",
+      "input_pointer": "/records/1/message/content/0/content",
+      "replacement": "[File content excluded by policy]"
     },
     {
-      "pointer": "/records/0/message/content/0/input/file_path",
+      "pointer": "/records/0/message/content/0/input",
       "expect": "hide",
-      "value": "{workspace}/.env"
+      "value": "{workspace}/.env",
+      "input_pointer": "/records/0/message/content/0/input/file_path",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
     }
   ],
   "user-file-exclusion": [
     {
-      "pointer": "/records",
+      "pointer": "/records/1/message/content/0/content",
       "expect": "hide",
-      "value": "CONSTRUCTED_FILE_BODY"
+      "value": "CONSTRUCTED_FILE_BODY",
+      "input_pointer": "/records/1/message/content/0/content",
+      "replacement": "[File content excluded by policy]"
     },
     {
-      "pointer": "/records/0/message/content/0/input/file_path",
+      "pointer": "/records/0/message/content/0/input",
       "expect": "hide",
-      "value": "{workspace}/private.txt"
+      "value": "{workspace}/private.txt",
+      "input_pointer": "/records/0/message/content/0/input/file_path",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
     }
   ],
   "ordinary-file": [
     {
-      "pointer": "/records",
+      "pointer": "/records/1/message/content/0/content",
       "expect": "keep",
-      "value": "CONSTRUCTED_FILE_BODY"
+      "value": "CONSTRUCTED_FILE_BODY",
+      "input_pointer": "/records/1/message/content/0/content"
     },
     {
       "pointer": "/records/0/message/content/0/input/file_path",
       "expect": "rewrite",
       "value": "{workspace}/src/main.rs",
+      "input_pointer": "/records/0/message/content/0/input/file_path",
       "replacement": "<workspace>/src/main.rs"
+    },
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
     }
   ],
   "path-mention": [
     {
-      "pointer": "/records",
-      "expect": "keep",
-      "value": "does not read it. Keep this explanation."
+      "pointer": "/records/0/message/content/0/text",
+      "expect": "rewrite",
+      "value": "Mentioning {workspace}/.env does not read it. Keep this explanation.",
+      "input_pointer": "/records/0/message/content",
+      "replacement_pattern": "Mentioning <private-file-[1-9][0-9]*> does not read it\\. Keep this explanation\\."
     }
   ],
   "literal-replacement": [
     {
-      "pointer": "/records/0/message/content",
+      "pointer": "/records/0/message/content/0/text",
       "expect": "rewrite",
-      "value": "bench-person",
-      "replacement": "public-person"
-    },
-    {
-      "pointer": "/records/0/message/content",
-      "expect": "keep",
-      "value": "ordinary neighbor."
+      "value": "Hello bench-person and ordinary neighbor.",
+      "input_pointer": "/records/0/message/content",
+      "replacement": "Hello public-person and ordinary neighbor."
     }
   ],
   "regex-replacement": [
     {
-      "pointer": "/records/0/message/content",
+      "pointer": "/records/0/message/content/0/text",
       "expect": "rewrite",
-      "value": "BENCH-123",
-      "replacement": "TICKET"
-    },
-    {
-      "pointer": "/records/0/message/content",
-      "expect": "keep",
-      "value": "ordinary neighbor."
+      "value": "Ticket BENCH-123 and ordinary neighbor.",
+      "input_pointer": "/records/0/message/content",
+      "replacement": "Ticket TICKET and ordinary neighbor."
     }
   ],
   "attachment-omit": [
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0",
       "expect": "keep",
-      "value": "Keep the adjacent message."
+      "value": {
+        "type": "text",
+        "text": "Keep the adjacent message."
+      },
+      "input_pointer": "/records/0/message/content/0"
     },
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/1",
       "expect": "hide",
-      "value": "U1lOVEhFVElDX0lNQUdF"
+      "value": "U1lOVEhFVElDX0lNQUdF",
+      "input_pointer": "/records/0/message/content/1/source/data",
+      "replacement": {
+        "type": "text",
+        "text": "[Image omitted by policy]"
+      }
     }
   ],
   "attachment-metadata": [
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0",
       "expect": "keep",
-      "value": "Keep the adjacent message."
+      "value": {
+        "type": "text",
+        "text": "Keep the adjacent message."
+      },
+      "input_pointer": "/records/0/message/content/0"
     },
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/1",
       "expect": "hide",
-      "value": "U1lOVEhFVElDX0lNQUdF"
+      "value": "U1lOVEhFVElDX0lNQUdF",
+      "input_pointer": "/records/0/message/content/1/source/data",
+      "replacement": {
+        "type": "text",
+        "text": "[Attachment body omitted; metadata retained: {\"media_type\":\"image/png\",\"type\":\"image\"}]"
+      }
     }
   ],
   "attachment-original": [
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0",
       "expect": "keep",
-      "value": "Keep the adjacent message."
+      "value": {
+        "type": "text",
+        "text": "Keep the adjacent message."
+      },
+      "input_pointer": "/records/0/message/content/0"
     },
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/1",
       "expect": "keep",
-      "value": "U1lOVEhFVElDX0lNQUdF"
+      "value": {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "U1lOVEhFVElDX0lNQUdF"
+        }
+      },
+      "input_pointer": "/records/0/message/content/1"
     }
   ],
   "metadata-minimal": [
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0/text",
       "expect": "keep",
-      "value": "Keep the conversation."
+      "value": "Keep the conversation.",
+      "input_pointer": "/records/0/message/content"
     },
     {
-      "pointer": "/metadata",
-      "expect": "hide",
-      "value": "/bench/private-user"
+      "pointer": "/metadata/cwd",
+      "expect": "remove",
+      "value": "/bench/private-user",
+      "input_pointer": "/metadata/cwd"
     },
     {
-      "pointer": "/metadata",
+      "pointer": "/metadata/workspace",
       "expect": "hide",
-      "value": "https://example.invalid/team/repo"
+      "value": "/bench/private-user",
+      "input_pointer": "/metadata/cwd",
+      "replacement_pattern": "<private-file-[1-9][0-9]*>"
+    },
+    {
+      "pointer": "/metadata/origin",
+      "expect": "remove",
+      "value": "https://example.invalid/team/repo",
+      "input_pointer": "/metadata/cwd_state/origin"
+    },
+    {
+      "pointer": "/metadata/cwd_state",
+      "expect": "remove",
+      "value": {
+        "origin": "https://example.invalid/team/repo",
+        "worktree": "clean"
+      },
+      "input_pointer": "/metadata/cwd_state"
     }
   ],
   "metadata-project": [
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0/text",
       "expect": "keep",
-      "value": "Keep the conversation."
+      "value": "Keep the conversation.",
+      "input_pointer": "/records/0/message/content"
     },
     {
-      "pointer": "/metadata",
+      "pointer": "/metadata/cwd",
+      "expect": "remove",
+      "value": "/bench/private-user",
+      "input_pointer": "/metadata/cwd"
+    },
+    {
+      "pointer": "/metadata/workspace",
       "expect": "hide",
-      "value": "/bench/private-user"
+      "value": "/bench/private-user",
+      "input_pointer": "/metadata/cwd",
+      "replacement_pattern": "<private-file-[1-9][0-9]*>"
     },
     {
-      "pointer": "/metadata",
+      "pointer": "/metadata/origin",
       "expect": "keep",
-      "value": "https://example.invalid/team/repo"
+      "value": "https://example.invalid/team/repo",
+      "input_pointer": "/metadata/cwd_state/origin"
+    },
+    {
+      "pointer": "/metadata/cwd_state",
+      "expect": "remove",
+      "value": {
+        "origin": "https://example.invalid/team/repo",
+        "worktree": "clean"
+      },
+      "input_pointer": "/metadata/cwd_state"
     }
   ],
   "split-context": [
@@ -461,21 +557,47 @@
   ],
   "plain-file-content": [
     {
-      "pointer": "/records",
+      "pointer": "/records/1/message/content/0/content",
       "expect": "keep",
-      "value": "PLAIN_FILE_BODY"
+      "value": "PLAIN_FILE_BODY",
+      "input_pointer": "/records/1/message/content/0/content"
     },
     {
-      "pointer": "/records",
+      "pointer": "/records/0/message/content/0/input/file_path",
       "expect": "keep",
-      "value": "{workspace}/.env"
+      "value": "{workspace}/.env",
+      "input_pointer": "/records/0/message/content/0/input/file_path"
+    },
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
     }
   ],
   "privacy-export-file": [
     {
-      "pointer": "/records",
+      "pointer": "/records/1/message/content/0/content",
       "expect": "hide",
-      "value": "EXPORT_PRIVATE_BODY"
+      "value": "EXPORT_PRIVATE_BODY",
+      "input_pointer": "/records/1/message/content/0/content",
+      "replacement": "[File content excluded by policy]"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "hide",
+      "value": "{workspace}/.env",
+      "input_pointer": "/records/0/message/content/0/input/file_path",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
     }
   ],
   "memory-allowlist": [
@@ -488,6 +610,2663 @@
       "pointer": "/decisions/1/action",
       "expect": "exclude",
       "value": "excluded"
+    }
+  ],
+  "native-claude-code-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-claude-code-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content"
+    }
+  ],
+  "native-claude-desktop-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-claude-desktop-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content"
+    }
+  ],
+  "native-cursor-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-cursor-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content/0/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content/0/content"
+    }
+  ],
+  "native-codex-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/payload/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/payload/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/payload/arguments",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/payload/output"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/payload/output",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-codex-plain": [
+    {
+      "pointer": "/records/0/payload/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/payload/name"
+    },
+    {
+      "pointer": "/records/0/payload/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/payload/arguments"
+    },
+    {
+      "pointer": "/records/1/payload/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/payload/name"
+    },
+    {
+      "pointer": "/records/1/payload/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/payload/arguments"
+    },
+    {
+      "pointer": "/records/2/payload/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/payload/output"
+    },
+    {
+      "pointer": "/records/3/payload/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/payload/output"
+    }
+  ],
+  "native-opencode-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/data/content/0/tool",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/data/content/0/state/input",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/0/message/content/1/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/0/data/content/0/state/output",
+      "replacement": "[Tool output omitted by policy]"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/data/content/0/state/input",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/1/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/1/data/content/0/state/output"
+    }
+  ],
+  "native-opencode-plain": [
+    {
+      "pointer": "/records/0/data/content/0/tool",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/0/data/content/0/state/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/data/content/0/state/input"
+    },
+    {
+      "pointer": "/records/0/data/content/0/state/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/0/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/1/data/content/0/tool",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/1/data/content/0/state/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/data/content/0/state/input"
+    },
+    {
+      "pointer": "/records/1/data/content/0/state/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/1/data/content/0/state/output"
+    }
+  ],
+  "native-hermes-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/data/tool_calls/0/function/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/data/tool_calls/0/function/arguments",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/data/tool_calls/0/function/arguments",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/data/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/data/content",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-hermes-plain": [
+    {
+      "pointer": "/records/0/data/tool_calls/0/function/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/0/data/tool_calls/0/function/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/data/tool_calls/0/function/arguments"
+    },
+    {
+      "pointer": "/records/1/data/tool_calls/0/function/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/1/data/tool_calls/0/function/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/data/tool_calls/0/function/arguments"
+    },
+    {
+      "pointer": "/records/2/data/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/data/content"
+    },
+    {
+      "pointer": "/records/3/data/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/data/content"
+    }
+  ],
+  "native-openclaw-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/arguments",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/arguments",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-openclaw-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/0/message/content/0/arguments",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/private.rs"
+      },
+      "input_pointer": "/records/0/message/content/0/arguments"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/arguments",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/public.rs"
+      },
+      "input_pointer": "/records/1/message/content/0/arguments"
+    },
+    {
+      "pointer": "/records/2/message/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/message/content"
+    },
+    {
+      "pointer": "/records/3/message/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/message/content"
+    }
+  ],
+  "native-workbuddy-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/arguments",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/arguments",
+      "replacement": {
+        "file_path": "<workspace>/src/public.rs"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/output"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "hide",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/output",
+      "replacement": "[Tool output omitted by policy]"
+    }
+  ],
+  "native-workbuddy-plain": [
+    {
+      "pointer": "/records/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/name"
+    },
+    {
+      "pointer": "/records/0/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/private.rs\"}",
+      "input_pointer": "/records/0/arguments"
+    },
+    {
+      "pointer": "/records/1/name",
+      "expect": "keep",
+      "value": "ReadPublic",
+      "input_pointer": "/records/1/name"
+    },
+    {
+      "pointer": "/records/1/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/public.rs\"}",
+      "input_pointer": "/records/1/arguments"
+    },
+    {
+      "pointer": "/records/2/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PUBLIC_BODY",
+      "input_pointer": "/records/2/output"
+    },
+    {
+      "pointer": "/records/3/output",
+      "expect": "keep",
+      "value": "SYNTHETIC_PRIVATE_BODY",
+      "input_pointer": "/records/3/output"
+    }
+  ],
+  "scenario-python-settings-review": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 252,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 252,
+      "end": 265,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 265,
+      "end": 283,
+      "expect": "keep"
+    }
+  ],
+  "scenario-python-provider-references": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 160,
+      "expect": "keep"
+    }
+  ],
+  "scenario-javascript-client-options": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 80,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 80,
+      "end": 93,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 93,
+      "end": 190,
+      "expect": "keep"
+    }
+  ],
+  "scenario-ini-database-passphrase": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 65,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 65,
+      "end": 78,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 78,
+      "end": 91,
+      "expect": "keep"
+    }
+  ],
+  "scenario-shell-password-value": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 19,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 19,
+      "end": 34,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 34,
+      "end": 89,
+      "expect": "keep"
+    }
+  ],
+  "scenario-curl-environment-references": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 153,
+      "expect": "keep"
+    }
+  ],
+  "scenario-oauth-and-pagination": [
+    {
+      "pointer": "/session/access_token",
+      "start": 0,
+      "end": 32,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/session/token_type",
+      "start": 0,
+      "end": 6,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/page/nextPageToken",
+      "start": 0,
+      "end": 32,
+      "expect": "keep"
+    }
+  ],
+  "scenario-http-basic-authentication": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 75,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 75,
+      "end": 111,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 111,
+      "end": 141,
+      "expect": "keep"
+    }
+  ],
+  "scenario-http-signed-jwt": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 72,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 72,
+      "end": 277,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 277,
+      "end": 329,
+      "expect": "keep"
+    }
+  ],
+  "scenario-postgresql-encoded-password": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 23,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 23,
+      "end": 44,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 44,
+      "end": 92,
+      "expect": "keep"
+    }
+  ],
+  "scenario-gitlab-api-command": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 37,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 37,
+      "end": 63,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 63,
+      "end": 112,
+      "expect": "keep"
+    }
+  ],
+  "scenario-aws-shared-credentials": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 77,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 77,
+      "end": 117,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 117,
+      "end": 118,
+      "expect": "keep"
+    }
+  ],
+  "scenario-signing-key-pair": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 492,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 492,
+      "end": 2195,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 2195,
+      "end": 2196,
+      "expect": "keep"
+    }
+  ],
+  "scenario-json-escaped-password": [
+    {
+      "pointer": "/database/password",
+      "start": 0,
+      "end": 19,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/database/host",
+      "start": 0,
+      "end": 18,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/message",
+      "start": 0,
+      "end": 62,
+      "expect": "keep"
+    }
+  ],
+  "scenario-unicode-authentication-log": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 18,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 18,
+      "end": 31,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 31,
+      "end": 68,
+      "expect": "keep"
+    }
+  ],
+  "scenario-stream-password-at-eof": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 20,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 20,
+      "end": 33,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 33,
+      "end": 34,
+      "expect": "keep"
+    }
+  ],
+  "scenario-stream-multiple-credentials": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 20,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 20,
+      "end": 33,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 33,
+      "end": 56,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 56,
+      "end": 82,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 82,
+      "end": 106,
+      "expect": "keep"
+    }
+  ],
+  "scenario-overlapping-user-secrets": [
+    {
+      "pointer": "/current_deployment",
+      "start": 0,
+      "end": 17,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/previous_deployment",
+      "start": 0,
+      "end": 12,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/status",
+      "start": 0,
+      "end": 5,
+      "expect": "keep"
+    }
+  ],
+  "scenario-files-and-secret-protection": [
+    {
+      "pointer": "/records/0/message/content/0/text",
+      "expect": "keep",
+      "value": "Compare the local environment file with the checked-in service configuration.",
+      "input_pointer": "/records/0/message/content"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/1/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/.env"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/1/message/content/1/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/1/message/content/1/name"
+    },
+    {
+      "pointer": "/records/1/message/content/1/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/service_config.py"
+      },
+      "input_pointer": "/records/1/message/content/1/input",
+      "replacement": {
+        "file_path": "<workspace>/src/service_config.py"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/1/content",
+      "expect": "hide",
+      "value": "LOG_LEVEL=debug\nPORT=8080\n",
+      "input_pointer": "/records/2/message/content/1/content",
+      "replacement": "[File content excluded by policy]"
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "rewrite",
+      "value": "API_TOKEN = \"ghp_Q8wE4rT7yU2iO9pA5sD3fG6hJ1kL0zXcVbNm\"\nTIMEOUT_SECONDS = 30\nFEATURE_ENABLED = True\n",
+      "input_pointer": "/records/2/message/content/0/content",
+      "replacement_pattern": "API_TOKEN\\ =\\ \"(?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})\"\\\nTIMEOUT_SECONDS\\ =\\ 30\\\nFEATURE_ENABLED\\ =\\ True\\\n"
+    }
+  ],
+  "scenario-relative-paths-and-cwd": [
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "../.env"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "hide",
+      "value": "LOG_LEVEL=debug\nPORT=8080\n",
+      "input_pointer": "/records/2/message/content/0/content",
+      "replacement": "[File content excluded by policy]"
+    },
+    {
+      "pointer": "/records/1/message/content/1/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "./config.json"
+      },
+      "input_pointer": "/records/1/message/content/1/input",
+      "replacement": {
+        "file_path": "<workspace>/src/config.json"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/1/content",
+      "expect": "keep",
+      "value": "{\"log_level\":\"info\",\"retries\":3}\n",
+      "input_pointer": "/records/2/message/content/1/content"
+    }
+  ],
+  "scenario-tool-omit-with-docs-exception": [
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "rewrite",
+      "value": "Read",
+      "input_pointer": "/records/1/message/content/0/name",
+      "replacement": "omitted"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/config.json"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "notice": "[Tool call omitted by policy]"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "hide",
+      "value": "{\"log_level\":\"info\",\"retries\":3}\n",
+      "input_pointer": "/records/2/message/content/0/content",
+      "replacement": "[Tool output omitted by policy]"
+    },
+    {
+      "pointer": "/records/1/message/content/1/name",
+      "expect": "keep",
+      "value": "mcp__docs__search",
+      "input_pointer": "/records/1/message/content/1/name"
+    },
+    {
+      "pointer": "/records/1/message/content/1/input",
+      "expect": "keep",
+      "value": {
+        "query": "deployment configuration"
+      },
+      "input_pointer": "/records/1/message/content/1/input"
+    },
+    {
+      "pointer": "/records/2/message/content/1/content",
+      "expect": "keep",
+      "value": "Set the deployment region before starting the worker.",
+      "input_pointer": "/records/2/message/content/1/content"
+    }
+  ],
+  "scenario-image-metadata-and-caption-secret": [
+    {
+      "pointer": "/records/0/message/content/0/text",
+      "expect": "rewrite",
+      "value": "The icon upload returns 401. My request uses Authorization: Bearer u7JmQ3pV9cL2xR8hF4aN6wK1sD5bG0tY. Please check the header.",
+      "input_pointer": "/records/0/message/content/0/text",
+      "replacement_pattern": "The\\ icon\\ upload\\ returns\\ 401\\.\\ My\\ request\\ uses\\ Authorization:\\ Bearer\\ (?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})\\.\\ Please\\ check\\ the\\ header\\."
+    },
+    {
+      "pointer": "/records/0/message/content/1",
+      "expect": "hide",
+      "value": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGPQqLjwnxLMMGrAqAGjBgwXAwBXoG8fZOY5tAAAAABJRU5ErkJggg==",
+      "input_pointer": "/records/0/message/content/1/source/data",
+      "replacement": {
+        "type": "text",
+        "text": "[Attachment body omitted; metadata retained: {\"media_type\":\"image/png\",\"type\":\"image\"}]"
+      }
+    }
+  ],
+  "scenario-codex-terminal-secret": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "exec_command",
+      "input_pointer": "/records/0/payload/name"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/cmd",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"printenv DEPLOY_TOKEN\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement": "printenv DEPLOY_TOKEN"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/workdir",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"printenv DEPLOY_TOKEN\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "rewrite",
+      "value": "ghp_Q8wE4rT7yU2iO9pA5sD3fG6hJ1kL0zXcVbNm\n",
+      "input_pointer": "/records/1/payload/output",
+      "replacement_pattern": "(?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})\\\n"
+    }
+  ],
+  "scenario-branch-checklist-release": [
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/internal/checklist.md"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "notice": "[File content excluded by policy]"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "hide",
+      "value": "Deployment window: Tuesday.\nOwner: Platform team.\n",
+      "input_pointer": "/records/2/message/content/0/content",
+      "replacement": "[File content excluded by policy]"
+    }
+  ],
+  "scenario-branch-checklist-feature": [
+    {
+      "pointer": "/records/1/message/content/0/input",
+      "expect": "rewrite",
+      "value": {
+        "file_path": "{workspace}/src/internal/checklist.md"
+      },
+      "input_pointer": "/records/1/message/content/0/input",
+      "replacement": {
+        "file_path": "<workspace>/src/internal/checklist.md"
+      }
+    },
+    {
+      "pointer": "/records/2/message/content/0/content",
+      "expect": "keep",
+      "value": "Deployment window: Tuesday.\nOwner: Platform team.\n",
+      "input_pointer": "/records/2/message/content/0/content"
+    }
+  ],
+  "workflow-claude-code-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/file_path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/0/message/content/0/input/file_path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "Edit",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/file_path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/2/message/content/0/input/file_path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/old_string",
+      "expect": "keep",
+      "value": "return value + 1",
+      "input_pointer": "/records/2/message/content/0/input/old_string"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/new_string",
+      "expect": "keep",
+      "value": "return value * 2",
+      "input_pointer": "/records/2/message/content/0/input/new_string"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "Bash",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "rewrite",
+      "value": "cd \"{workspace}\" && python3 tests/check_calculator.py",
+      "input_pointer": "/records/4/message/content/0/input/command",
+      "replacement_pattern": "cd\\ \"<(?:workspace|private-file-[1-9][0-9]*)>\"\\ \\&\\&\\ python3\\ tests/check_calculator\\.py"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/description",
+      "expect": "keep",
+      "value": "Run calculator checks",
+      "input_pointer": "/records/4/message/content/0/input/description"
+    }
+  ],
+  "workflow-claude-code-calculator-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/calculator.py"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "Edit",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/calculator.py",
+        "old_string": "return value + 1",
+        "new_string": "return value * 2"
+      },
+      "input_pointer": "/records/2/message/content/0/input"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "Bash",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "command": "cd \"{workspace}\" && python3 tests/check_calculator.py",
+        "description": "Run calculator checks"
+      },
+      "input_pointer": "/records/4/message/content/0/input"
+    }
+  ],
+  "workflow-claude-desktop-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/0/message/content/0/input/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "edit_block",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/file_path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/2/message/content/0/input/file_path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/old_string",
+      "expect": "keep",
+      "value": "return value + 1",
+      "input_pointer": "/records/2/message/content/0/input/old_string"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/new_string",
+      "expect": "keep",
+      "value": "return value * 2",
+      "input_pointer": "/records/2/message/content/0/input/new_string"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "start_process",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "rewrite",
+      "value": "cd \"{workspace}\" && python3 tests/check_calculator.py",
+      "input_pointer": "/records/4/message/content/0/input/command",
+      "replacement_pattern": "cd\\ \"<(?:workspace|private-file-[1-9][0-9]*)>\"\\ \\&\\&\\ python3\\ tests/check_calculator\\.py"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/timeout_ms",
+      "expect": "keep",
+      "value": 10000,
+      "input_pointer": "/records/4/message/content/0/input/timeout_ms"
+    }
+  ],
+  "workflow-claude-desktop-calculator-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "edit_block",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "file_path": "{workspace}/src/calculator.py",
+        "old_string": "return value + 1",
+        "new_string": "return value * 2"
+      },
+      "input_pointer": "/records/2/message/content/0/input"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "start_process",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "command": "cd \"{workspace}\" && python3 tests/check_calculator.py",
+        "timeout_ms": 10000
+      },
+      "input_pointer": "/records/4/message/content/0/input"
+    }
+  ],
+  "workflow-cursor-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/0/message/content/0/input/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "ApplyPatch",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input",
+      "expect": "keep",
+      "value": "*** Begin Patch\n*** Update File: src/calculator.py\n@@\n def double(value):\n-    return value + 1\n+    return value * 2\n*** End Patch\n",
+      "input_pointer": "/records/2/message/content/0/input"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "Shell",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "keep",
+      "value": "python3 tests/check_calculator.py",
+      "input_pointer": "/records/4/message/content/0/input/command"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/working_directory",
+      "expect": "rewrite",
+      "value": "{workspace}",
+      "input_pointer": "/records/4/message/content/0/input/working_directory",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    }
+  ],
+  "workflow-cursor-calculator-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "Read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content/0/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py"
+      },
+      "input_pointer": "/records/0/message/content/0/input"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "ApplyPatch",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content/0/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input",
+      "expect": "keep",
+      "value": "*** Begin Patch\n*** Update File: src/calculator.py\n@@\n def double(value):\n-    return value + 1\n+    return value * 2\n*** End Patch\n",
+      "input_pointer": "/records/2/message/content/0/input"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "Shell",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content/0/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input",
+      "expect": "keep",
+      "value": {
+        "command": "python3 tests/check_calculator.py",
+        "working_directory": "{workspace}"
+      },
+      "input_pointer": "/records/4/message/content/0/input"
+    }
+  ],
+  "workflow-codex-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "exec_command",
+      "input_pointer": "/records/0/payload/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/payload/output"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/cmd",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"sed -n '1,80p' src/calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement": "sed -n '1,80p' src/calculator.py"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/workdir",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"sed -n '1,80p' src/calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "apply_patch",
+      "input_pointer": "/records/2/payload/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/payload/output"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input",
+      "expect": "keep",
+      "value": "*** Begin Patch\n*** Update File: src/calculator.py\n@@\n def double(value):\n-    return value + 1\n+    return value * 2\n*** End Patch\n",
+      "input_pointer": "/records/2/payload/input"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "exec_command",
+      "input_pointer": "/records/4/payload/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/payload/output"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/cmd",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"python3 tests/check_calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/4/payload/arguments",
+      "replacement": "python3 tests/check_calculator.py"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/workdir",
+      "expect": "rewrite",
+      "value": "{\"cmd\": \"python3 tests/check_calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/4/payload/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    }
+  ],
+  "workflow-codex-calculator-plain": [
+    {
+      "pointer": "/records/0/payload/name",
+      "expect": "keep",
+      "value": "exec_command",
+      "input_pointer": "/records/0/payload/name"
+    },
+    {
+      "pointer": "/records/1/payload/output",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/payload/output"
+    },
+    {
+      "pointer": "/records/0/payload/arguments",
+      "expect": "keep",
+      "value": "{\"cmd\": \"sed -n '1,80p' src/calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/0/payload/arguments"
+    },
+    {
+      "pointer": "/records/2/payload/name",
+      "expect": "keep",
+      "value": "apply_patch",
+      "input_pointer": "/records/2/payload/name"
+    },
+    {
+      "pointer": "/records/3/payload/output",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/payload/output"
+    },
+    {
+      "pointer": "/records/2/payload/input",
+      "expect": "keep",
+      "value": "*** Begin Patch\n*** Update File: src/calculator.py\n@@\n def double(value):\n-    return value + 1\n+    return value * 2\n*** End Patch\n",
+      "input_pointer": "/records/2/payload/input"
+    },
+    {
+      "pointer": "/records/4/payload/name",
+      "expect": "keep",
+      "value": "exec_command",
+      "input_pointer": "/records/4/payload/name"
+    },
+    {
+      "pointer": "/records/5/payload/output",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/payload/output"
+    },
+    {
+      "pointer": "/records/4/payload/arguments",
+      "expect": "keep",
+      "value": "{\"cmd\": \"python3 tests/check_calculator.py\", \"workdir\": \"{workspace}\"}",
+      "input_pointer": "/records/4/payload/arguments"
+    }
+  ],
+  "workflow-opencode-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read",
+      "input_pointer": "/records/0/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/0/message/content/1/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/0/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/0/data/content/0/state/input/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/1/message/content/0/name",
+      "expect": "keep",
+      "value": "edit",
+      "input_pointer": "/records/1/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/1/message/content/1/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/1/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/1/data/content/0/state/input/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input/oldString",
+      "expect": "keep",
+      "value": "return value + 1",
+      "input_pointer": "/records/1/data/content/0/state/input/oldString"
+    },
+    {
+      "pointer": "/records/1/message/content/0/input/newString",
+      "expect": "keep",
+      "value": "return value * 2",
+      "input_pointer": "/records/1/data/content/0/state/input/newString"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "shell",
+      "input_pointer": "/records/2/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/2/message/content/1/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/2/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/command",
+      "expect": "keep",
+      "value": "python3 tests/check_calculator.py",
+      "input_pointer": "/records/2/data/content/0/state/input/command"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/workdir",
+      "expect": "rewrite",
+      "value": "{workspace}",
+      "input_pointer": "/records/2/data/content/0/state/input/workdir",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    }
+  ],
+  "workflow-opencode-calculator-plain": [
+    {
+      "pointer": "/records/0/data/content/0/tool",
+      "expect": "keep",
+      "value": "read",
+      "input_pointer": "/records/0/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/0/data/content/0/state/output",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/0/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/0/data/content/0/state/input",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py"
+      },
+      "input_pointer": "/records/0/data/content/0/state/input"
+    },
+    {
+      "pointer": "/records/1/data/content/0/tool",
+      "expect": "keep",
+      "value": "edit",
+      "input_pointer": "/records/1/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/1/data/content/0/state/output",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/1/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/1/data/content/0/state/input",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py",
+        "oldString": "return value + 1",
+        "newString": "return value * 2"
+      },
+      "input_pointer": "/records/1/data/content/0/state/input"
+    },
+    {
+      "pointer": "/records/2/data/content/0/tool",
+      "expect": "keep",
+      "value": "shell",
+      "input_pointer": "/records/2/data/content/0/tool"
+    },
+    {
+      "pointer": "/records/2/data/content/0/state/output",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/2/data/content/0/state/output"
+    },
+    {
+      "pointer": "/records/2/data/content/0/state/input",
+      "expect": "keep",
+      "value": {
+        "command": "python3 tests/check_calculator.py",
+        "workdir": "{workspace}"
+      },
+      "input_pointer": "/records/2/data/content/0/state/input"
+    }
+  ],
+  "workflow-hermes-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/data/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{\"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/0/data/tool_calls/0/function/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "patch",
+      "input_pointer": "/records/2/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/data/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{\"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\", \"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/2/data/tool_calls/0/function/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/old_string",
+      "expect": "rewrite",
+      "value": "{\"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\", \"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/2/data/tool_calls/0/function/arguments",
+      "replacement": "return value + 1"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/new_string",
+      "expect": "rewrite",
+      "value": "{\"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\", \"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/2/data/tool_calls/0/function/arguments",
+      "replacement": "return value * 2"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "terminal",
+      "input_pointer": "/records/4/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/data/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "rewrite",
+      "value": "{\"command\": \"cd \\\"{workspace}\\\" && python3 tests/check_calculator.py\"}",
+      "input_pointer": "/records/4/data/tool_calls/0/function/arguments",
+      "replacement_pattern": "cd\\ \"<(?:workspace|private-file-[1-9][0-9]*)>\"\\ \\&\\&\\ python3\\ tests/check_calculator\\.py"
+    }
+  ],
+  "workflow-hermes-calculator-plain": [
+    {
+      "pointer": "/records/0/data/tool_calls/0/function/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/1/data/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/data/content"
+    },
+    {
+      "pointer": "/records/0/data/tool_calls/0/function/arguments",
+      "expect": "keep",
+      "value": "{\"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/0/data/tool_calls/0/function/arguments"
+    },
+    {
+      "pointer": "/records/2/data/tool_calls/0/function/name",
+      "expect": "keep",
+      "value": "patch",
+      "input_pointer": "/records/2/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/3/data/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/data/content"
+    },
+    {
+      "pointer": "/records/2/data/tool_calls/0/function/arguments",
+      "expect": "keep",
+      "value": "{\"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\", \"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/2/data/tool_calls/0/function/arguments"
+    },
+    {
+      "pointer": "/records/4/data/tool_calls/0/function/name",
+      "expect": "keep",
+      "value": "terminal",
+      "input_pointer": "/records/4/data/tool_calls/0/function/name"
+    },
+    {
+      "pointer": "/records/5/data/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/data/content"
+    },
+    {
+      "pointer": "/records/4/data/tool_calls/0/function/arguments",
+      "expect": "keep",
+      "value": "{\"command\": \"cd \\\"{workspace}\\\" && python3 tests/check_calculator.py\"}",
+      "input_pointer": "/records/4/data/tool_calls/0/function/arguments"
+    }
+  ],
+  "workflow-openclaw-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/0/message/content/0/arguments/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "edit",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{workspace}/src/calculator.py",
+      "input_pointer": "/records/2/message/content/0/arguments/path",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/edits",
+      "expect": "keep",
+      "value": [
+        {
+          "oldText": "return value + 1",
+          "newText": "return value * 2"
+        }
+      ],
+      "input_pointer": "/records/2/message/content/0/arguments/edits"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "exec",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "keep",
+      "value": "python3 tests/check_calculator.py",
+      "input_pointer": "/records/4/message/content/0/arguments/command"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/workdir",
+      "expect": "rewrite",
+      "value": "{workspace}",
+      "input_pointer": "/records/4/message/content/0/arguments/workdir",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>"
+    }
+  ],
+  "workflow-openclaw-calculator-plain": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read",
+      "input_pointer": "/records/0/message/content/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/message/content"
+    },
+    {
+      "pointer": "/records/0/message/content/0/arguments",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py"
+      },
+      "input_pointer": "/records/0/message/content/0/arguments"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "edit",
+      "input_pointer": "/records/2/message/content/0/name"
+    },
+    {
+      "pointer": "/records/3/message/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/message/content"
+    },
+    {
+      "pointer": "/records/2/message/content/0/arguments",
+      "expect": "keep",
+      "value": {
+        "path": "{workspace}/src/calculator.py",
+        "edits": [
+          {
+            "oldText": "return value + 1",
+            "newText": "return value * 2"
+          }
+        ]
+      },
+      "input_pointer": "/records/2/message/content/0/arguments"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "exec",
+      "input_pointer": "/records/4/message/content/0/name"
+    },
+    {
+      "pointer": "/records/5/message/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/message/content"
+    },
+    {
+      "pointer": "/records/4/message/content/0/arguments",
+      "expect": "keep",
+      "value": {
+        "command": "python3 tests/check_calculator.py",
+        "workdir": "{workspace}"
+      },
+      "input_pointer": "/records/4/message/content/0/arguments"
+    }
+  ],
+  "workflow-workbuddy-calculator-encrypted-public": [
+    {
+      "pointer": "/records/0/message/content/0/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/name"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/output"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/path",
+      "expect": "rewrite",
+      "value": "{\"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/0/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/name",
+      "expect": "keep",
+      "value": "edit_block",
+      "input_pointer": "/records/2/name"
+    },
+    {
+      "pointer": "/records/3/message/content/0/content",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/output"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/file_path",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/calculator.py\", \"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\"}",
+      "input_pointer": "/records/2/arguments",
+      "replacement_pattern": "<(?:workspace|private-file-[1-9][0-9]*)>/src/calculator\\.py"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/old_string",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/calculator.py\", \"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\"}",
+      "input_pointer": "/records/2/arguments",
+      "replacement": "return value + 1"
+    },
+    {
+      "pointer": "/records/2/message/content/0/input/new_string",
+      "expect": "rewrite",
+      "value": "{\"file_path\": \"{workspace}/src/calculator.py\", \"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\"}",
+      "input_pointer": "/records/2/arguments",
+      "replacement": "return value * 2"
+    },
+    {
+      "pointer": "/records/4/message/content/0/name",
+      "expect": "keep",
+      "value": "start_process",
+      "input_pointer": "/records/4/name"
+    },
+    {
+      "pointer": "/records/5/message/content/0/content",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/output"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/command",
+      "expect": "rewrite",
+      "value": "{\"command\": \"cd \\\"{workspace}\\\" && python3 tests/check_calculator.py\", \"timeout_ms\": 10000}",
+      "input_pointer": "/records/4/arguments",
+      "replacement_pattern": "cd\\ \"<(?:workspace|private-file-[1-9][0-9]*)>\"\\ \\&\\&\\ python3\\ tests/check_calculator\\.py"
+    },
+    {
+      "pointer": "/records/4/message/content/0/input/timeout_ms",
+      "expect": "rewrite",
+      "value": "{\"command\": \"cd \\\"{workspace}\\\" && python3 tests/check_calculator.py\", \"timeout_ms\": 10000}",
+      "input_pointer": "/records/4/arguments",
+      "replacement": 10000
+    }
+  ],
+  "workflow-workbuddy-calculator-plain": [
+    {
+      "pointer": "/records/0/name",
+      "expect": "keep",
+      "value": "read_file",
+      "input_pointer": "/records/0/name"
+    },
+    {
+      "pointer": "/records/1/output",
+      "expect": "keep",
+      "value": "def double(value):\n    return value + 1\n",
+      "input_pointer": "/records/1/output"
+    },
+    {
+      "pointer": "/records/0/arguments",
+      "expect": "keep",
+      "value": "{\"path\": \"{workspace}/src/calculator.py\"}",
+      "input_pointer": "/records/0/arguments"
+    },
+    {
+      "pointer": "/records/2/name",
+      "expect": "keep",
+      "value": "edit_block",
+      "input_pointer": "/records/2/name"
+    },
+    {
+      "pointer": "/records/3/output",
+      "expect": "keep",
+      "value": "Updated src/calculator.py\n",
+      "input_pointer": "/records/3/output"
+    },
+    {
+      "pointer": "/records/2/arguments",
+      "expect": "keep",
+      "value": "{\"file_path\": \"{workspace}/src/calculator.py\", \"new_string\": \"return value * 2\", \"old_string\": \"return value + 1\"}",
+      "input_pointer": "/records/2/arguments"
+    },
+    {
+      "pointer": "/records/4/name",
+      "expect": "keep",
+      "value": "start_process",
+      "input_pointer": "/records/4/name"
+    },
+    {
+      "pointer": "/records/5/output",
+      "expect": "keep",
+      "value": "calculator checks passed\n",
+      "input_pointer": "/records/5/output"
+    },
+    {
+      "pointer": "/records/4/arguments",
+      "expect": "keep",
+      "value": "{\"command\": \"cd \\\"{workspace}\\\" && python3 tests/check_calculator.py\", \"timeout_ms\": 10000}",
+      "input_pointer": "/records/4/arguments"
+    }
+  ],
+  "incident-stdlib-import": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 181,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 181,
+      "end": 221,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 221,
+      "end": 223,
+      "expect": "keep"
+    }
+  ],
+  "incident-relative-artifact-links": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 147,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 147,
+      "end": 187,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 187,
+      "end": 188,
+      "expect": "keep"
+    }
+  ],
+  "incident-ppt-enum-references": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 365,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 365,
+      "end": 405,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 405,
+      "end": 407,
+      "expect": "keep"
+    }
+  ],
+  "incident-project-key-without-marker": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 51,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 51,
+      "end": 107,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 107,
+      "end": 148,
+      "expect": "keep"
+    }
+  ],
+  "incident-beta-flags-and-usage": [
+    {
+      "pointer": "/headers/anthropic-beta",
+      "start": 0,
+      "end": 48,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/headers/authorization",
+      "start": 0,
+      "end": 7,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/headers/authorization",
+      "start": 7,
+      "end": 47,
+      "expect": "protect"
+    }
+  ],
+  "incident-public-reference-urls": [
+    {
+      "pointer": "",
+      "start": 0,
+      "end": 179,
+      "expect": "keep"
+    },
+    {
+      "pointer": "",
+      "start": 179,
+      "end": 219,
+      "expect": "protect"
+    },
+    {
+      "pointer": "",
+      "start": 219,
+      "end": 220,
+      "expect": "keep"
+    }
+  ],
+  "incident-claude-native-identities": [
+    {
+      "pointer": "/records/0/uuid",
+      "expect": "keep",
+      "value": "7ac42168-239d-4e75-96b1-5c2e803fa947",
+      "input_pointer": "/records/0/uuid"
+    },
+    {
+      "pointer": "/records/1/parentUuid",
+      "expect": "keep",
+      "value": "7ac42168-239d-4e75-96b1-5c2e803fa947",
+      "input_pointer": "/records/1/parentUuid"
+    },
+    {
+      "pointer": "/records/0/sessionId",
+      "expect": "keep",
+      "value": "6e52a197-3d84-4fb6-b8c2-91a765df203e",
+      "input_pointer": "/records/0/sessionId"
+    },
+    {
+      "pointer": "/records/1/sessionId",
+      "expect": "keep",
+      "value": "6e52a197-3d84-4fb6-b8c2-91a765df203e",
+      "input_pointer": "/records/1/sessionId"
+    },
+    {
+      "pointer": "/records/0/message/content/0/id",
+      "expect": "keep",
+      "value": "toolu_01Vn8Qm4Rz6Kb2Hs9Wx5Et7P",
+      "input_pointer": "/records/0/message/content/0/id"
+    },
+    {
+      "pointer": "/records/1/message/content/0/tool_use_id",
+      "expect": "keep",
+      "value": "toolu_01Vn8Qm4Rz6Kb2Hs9Wx5Et7P",
+      "input_pointer": "/records/1/message/content/0/tool_use_id"
+    },
+    {
+      "pointer": "/records/0/message/content/0/input/command",
+      "expect": "rewrite",
+      "value": "printf '%s\\n' '7ac42168-239d-4e75-96b1-5c2e803fa947'",
+      "input_pointer": "/records/0/message/content/0/input/command",
+      "replacement_pattern": "printf\\ '%s\\\\n'\\ '(?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})'"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content",
+      "expect": "rewrite",
+      "value": "Copied private correlation value: 7ac42168-239d-4e75-96b1-5c2e803fa947",
+      "input_pointer": "/records/1/message/content/0/content",
+      "replacement_pattern": "Copied\\ private\\ correlation\\ value:\\ (?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})"
+    }
+  ],
+  "incident-codex-call-linkage": [
+    {
+      "pointer": "/records/0/payload/call_id",
+      "expect": "keep",
+      "value": "call_V9qB3nR7mK2xH8pL4sW6cF1a",
+      "input_pointer": "/records/0/payload/call_id"
+    },
+    {
+      "pointer": "/records/1/payload/call_id",
+      "expect": "keep",
+      "value": "call_V9qB3nR7mK2xH8pL4sW6cF1a",
+      "input_pointer": "/records/1/payload/call_id"
+    },
+    {
+      "pointer": "/records/0/payload/arguments",
+      "expect": "rewrite",
+      "value": "{\"cmd\":\"printf '%s\\\\n' 'call_V9qB3nR7mK2xH8pL4sW6cF1a'\",\"workdir\":\"/workspace/demo\"}",
+      "input_pointer": "/records/0/payload/arguments",
+      "replacement_pattern": "\\{\"cmd\":\"printf\\ '%s\\\\\\\\n'\\ '(?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})'\",\"workdir\":\"/workspace/demo\"\\}"
+    },
+    {
+      "pointer": "/records/1/payload/output",
+      "expect": "rewrite",
+      "value": "Private correlation value: call_V9qB3nR7mK2xH8pL4sW6cF1a",
+      "input_pointer": "/records/1/payload/output",
+      "replacement_pattern": "Private\\ correlation\\ value:\\ (?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})"
+    }
+  ],
+  "incident-claude-duplicated-image": [
+    {
+      "pointer": "/records/1/message/content/0/content/0/source/data",
+      "expect": "keep",
+      "value": "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",
+      "input_pointer": "/records/1/message/content/0/content/0/source/data"
+    },
+    {
+      "pointer": "/records/1/toolUseResult/file/base64",
+      "expect": "keep",
+      "value": "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",
+      "input_pointer": "/records/1/toolUseResult/file/base64"
+    },
+    {
+      "pointer": "/records/1/message/content/0/content/1/text",
+      "expect": "rewrite",
+      "value": "The preview renderer returned this temporary API token: ghp_Q8wE4rT7yU2iO9pA5sD3fG6hJ1kL0zXcVbNm",
+      "input_pointer": "/records/1/message/content/0/content/1/text",
+      "replacement_pattern": "The\\ preview\\ renderer\\ returned\\ this\\ temporary\\ API\\ token:\\ (?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})"
+    }
+  ],
+  "incident-mcp-image-carrier-equivalence": [
+    {
+      "pointer": "/mcp_result/content/0/type",
+      "start": 0,
+      "end": 5,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/mcp_result/content/0/mimeType",
+      "start": 0,
+      "end": 9,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/mcp_result/content/0/data",
+      "start": 0,
+      "end": 4836,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/mcp_result/content/1/type",
+      "start": 0,
+      "end": 4,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/mcp_result/content/1/text",
+      "start": 0,
+      "end": 56,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/mcp_result/content/1/text",
+      "start": 56,
+      "end": 96,
+      "expect": "protect"
+    },
+    {
+      "pointer": "/rendered_input/type",
+      "start": 0,
+      "end": 11,
+      "expect": "keep"
+    },
+    {
+      "pointer": "/rendered_input/image_url",
+      "start": 0,
+      "end": 4858,
+      "expect": "keep"
+    }
+  ],
+  "incident-foreign-placeholder-literals": [
+    {
+      "pointer": "/records/0/message/content",
+      "expect": "rewrite",
+      "value": "A teammate shared already-protected history: {{AGIT_SECRET_V1:10000000-0000-4000-8000-000000000001:sec_10000000000000000000000000000002}} and {{AGIT_SECRET_V2:20000000-0000-4000-8000-000000000001:20000000-0000-4000-8000-000000000002}}.\nThe new deployment credential is ghp_Q8wE4rT7yU2iO9pA5sD3fG6hJ1kL0zXcVbNm.\n",
+      "input_pointer": "/records/0/message/content",
+      "replacement_pattern": "A\\ teammate\\ shared\\ already\\-protected\\ history:\\ \\{\\{AGIT_SECRET_V1:10000000\\-0000\\-4000\\-8000\\-000000000001:sec_10000000000000000000000000000002\\}\\}\\ and\\ \\{\\{AGIT_SECRET_V2:20000000\\-0000\\-4000\\-8000\\-000000000001:20000000\\-0000\\-4000\\-8000\\-000000000002\\}\\}\\.\\\nThe\\ new\\ deployment\\ credential\\ is\\ (?:‹secret:[a-z0-9-]+:[a-z2-7]{12}›|\\{\\{AGIT_SECRET_V[12]:[^{}]+\\}\\})\\.\\\n"
     }
   ]
 }

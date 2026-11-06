@@ -1,17 +1,24 @@
 {
   "schema_version": 1,
-  "dataset_version": "1.0.1",
-  "annotation_version": 2,
+  "dataset_version": "1.5.0",
+  "annotation_version": 3,
   "offset_unit": "Unicode code points in decoded JSON strings",
   "seed": null,
   "files": {
-    "annotations/synthetic.json": "b45f2e5672b365947c3135387d523b236db68ae30d66c94d4ede87745d687d25",
-    "cases/synthetic.json": "f5c319d80e22f8cda2d9bd4e2913f2363393ff1ce2054fed517d3aba3005e7c1",
-    "generate.py": "23483d43ce932c2d94fc55db2cf73975cf0164573c63dd3ffc8ecb7cd8494bfd",
-    "profiles/all.json": "639d250ca350ae38c3938eda0037a760bcce1203a35c900bcf6e46074c1cd102",
-    "profiles/default.json": "0f2ca050827a95152dda47473958550d2fa0b71446769a8bb70026120681e5df",
-    "profiles/entropy.json": "9bb38ab990c08a70ac0be31f091f2b7240700f1c54a66616a187d83339d02f5e"
+    "annotations/synthetic.json": "c8efbad03d7d9cee62207371a4265ed6bee02f0d84c6277023ee60c5b3e4c233",
+    "cases/synthetic.json": "c1002079a9026f5d49800bb40222b1fb135400d52025d518841f8d29ff91a072",
+    "catalog.py": "d8a2a4834e15888d1d2f94c388974c60c5f6feb2d031e2bea08fe9077ffbe616",
+    "fixtures/signing-private.pem": "c83dd9b4e27e13223c7ed1389a089ce0791da6ef8d33aaa6ee5eb9f2f11c0588",
+    "fixtures/signing-public.pem": "72a1e4d5fc8ae499e6abd4a8bf60006bf7317929130f256f5443e4705baa77c8",
+    "generate.py": "7c9fc8b5c179af958c83b83d205f4cde67ca2ad0d66171ff32ef0f4956f8fbfe",
+    "incidents.py": "2019787cff945cc4ce605b2c7017a695b56e0207ac42d61d8b7c4afe2d9c9272",
+    "profiles/all.json": "1541e613c0fb620a3eb03e6d7712b965c389e8671599ab61240214271b8a1f32",
+    "profiles/default.json": "4b44bb4329ef6f551e5f382a3c5c2b976fcc9ae3baaa0df0a1a52ab5f3cc5df6",
+    "profiles/entropy.json": "f243662f960daf07ba3d7f0d7afdbe8485dd50791db6a5e648a00728ca58d97d",
+    "scenarios.py": "f1a3c5202272145e440db0ccbdd422eac0e7750bcc2badf92c0d83bdcccafbf1",
+    "validate_fixtures.py": "f53c20a75da406391fcc25172531eb0942449146248fb895d05dc83f19c71d86",
+    "workflows.py": "521ed74df5d5d3fd69bedaf3e0c108868cbb556770eb3af2e2d221a3f4ef4951"
   },
-  "dataset_sha256": "758b1189d01e917dd81cedc80570f437ad05bd4d4836a89b001fd8b0c2f4d81f",
-  "provenance": "Reconstructed synthetic contracts; historical private audit artifacts were not imported."
+  "dataset_sha256": "78e4172a4619605bda626b7ab32e75d3f182eb30c13fb6112a48e1a90c62f7df",
+  "provenance": "Fixed boundary and workflow fixtures with independent expectations and public format references; no real session data."
 }
