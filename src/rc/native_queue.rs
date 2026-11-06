@@ -166,13 +166,7 @@ impl Request {
     }
 
     pub(crate) fn message(&self) -> String {
-        match &self.username {
-            Some(username) => format!(
-                "[AgentGit workspace message from @{username}]\n{}",
-                self.message
-            ),
-            None => self.message.clone(),
-        }
+        crate::rc::native_inbox::labelled(self.username.as_deref(), &self.message)
     }
 }
 
