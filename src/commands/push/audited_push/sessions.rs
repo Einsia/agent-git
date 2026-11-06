@@ -896,6 +896,7 @@ pub(super) fn run(
         projected.session_manifest(),
         &intent.visibility,
         &selected.remote,
+        projected.policy_check(),
     ).with_context(|| {
             // The parts before this one are acknowledged and stay published, and a rerun plans only
             // what the Hub lacks, so the message names them instead of saying nothing was published.

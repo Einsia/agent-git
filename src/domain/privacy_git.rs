@@ -221,11 +221,54 @@ impl ProjectedHistory {
 
     pub fn verify_source(&self, source: &Repo) -> Result<()> {
         self.source.verify(source, &self.branches)?;
-        ensure!(
-            effective_policy(source, &self.additional_policies)?.digest()? == self.policy_digest,
-            "privacy policy changed after preview"
-        );
+        self.policy_check().verify()?;
         self.plan.verify(&self.repo, &self.branches)
+    }
+
+    /// What tells, just before each receive, whether this computer's privacy rules for the
+    /// repository are still the ones this publication was prepared under.
+    pub(crate) fn policy_check(&self) -> PolicyCheck {
+        PolicyCheck {
+            source_root: self.source_root.clone(),
+            additional: self.additional_policies.clone(),
+            digest: self.policy_digest.clone(),
+        }
+    }
+}
+
+/// Said when this computer's privacy rules for a repository changed after an upload was
+/// prepared under them; a caller that sees it may prepare the whole upload again.
+pub(crate) const POLICY_CHANGED: &str =
+    "this computer's privacy settings for the repository changed while this was uploading";
+
+/// The privacy rules a publication was prepared under. A receive sent after they changed would
+/// carry content protected by rules the person has since replaced, so each receive checks them
+/// first; the Hub cannot, since what it holds is whichever device declared last.
+#[derive(Clone)]
+pub(crate) struct PolicyCheck {
+    source_root: std::path::PathBuf,
+    additional: Vec<super::privacy::mandatory::MandatoryPolicy>,
+    digest: String,
+}
+
+impl PolicyCheck {
+    /// The rules of the repository at `source_root` as they stand now.
+    #[cfg(test)]
+    pub(crate) fn current(source_root: &std::path::Path) -> Result<Self> {
+        Ok(Self {
+            source_root: source_root.to_owned(),
+            additional: Vec::new(),
+            digest: effective_policy(&Repo::at(source_root), &[])?.digest()?,
+        })
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        ensure!(
+            effective_policy(&Repo::at(&self.source_root), &self.additional)?.digest()?
+                == self.digest,
+            "{POLICY_CHANGED}"
+        );
+        Ok(())
     }
 }
 

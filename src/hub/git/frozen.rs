@@ -422,6 +422,7 @@ impl FrozenPublication {
         policy_digest: &str,
         manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
+        rules: Option<crate::domain::privacy_git::PolicyCheck>,
     ) -> Result<crate::hub::privacy::publication::PublicationPolicy> {
         manifest.validate()?;
         let declared = manifest
@@ -458,6 +459,7 @@ impl FrozenPublication {
             policy_digest,
             manifest,
             visibility,
+            rules,
         )
     }
 

@@ -40,6 +40,8 @@ pub(crate) struct PublicationPolicy {
     mandatory_policy_digest: String,
     receiver_scope: String,
     session_manifest: SessionPublicationManifest,
+    /// This computer's rules the publication was prepared under, checked before each receipt.
+    rules: Option<crate::domain::privacy_git::PolicyCheck>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -127,6 +129,7 @@ impl PublicationPolicy {
         policy_digest: &str,
         manifest: &SessionPublicationManifest,
         visibility: &str,
+        rules: Option<crate::domain::privacy_git::PolicyCheck>,
     ) -> Result<Self> {
         manifest.validate()?;
         validate_digest(policy_digest)?;
@@ -175,6 +178,7 @@ impl PublicationPolicy {
             mandatory_policy_digest: strategy.mandatory_policy_digest,
             receiver_scope: format!("sessions:{visibility}:{}", manifest.repository_id),
             session_manifest: manifest.clone(),
+            rules,
         })
     }
 
@@ -198,6 +202,7 @@ impl PublicationPolicy {
             mandatory_policy_digest: self.mandatory_policy_digest.clone(),
             receiver_scope: self.receiver_scope.clone(),
             session_manifest,
+            rules: self.rules.clone(),
         })
     }
 
@@ -227,6 +232,9 @@ impl PublicationPolicy {
         after: &BTreeMap<String, String>,
         asks: ReceiveAsks,
     ) -> Result<ReceiveReceipt> {
+        if let Some(rules) = &self.rules {
+            rules.verify()?;
+        }
         let binding = self.binding(before, after)?;
         let mut request = serde_json::to_value(&binding)?;
         request["manifest"] = serde_json::to_value(&self.session_manifest)?;
@@ -392,6 +400,7 @@ mod tests {
                 snapshots: vec![plain('b'), plain('c'), plain('d')],
                 preserved_commits: vec!["a".repeat(40)],
             },
+            rules: None,
         };
         let stage = policy
             .scoped(&["b".repeat(40), "c".repeat(40)].into_iter().collect())
@@ -461,6 +470,7 @@ mod tests {
             mandatory_policy_digest: digest_bytes(&serde_json::to_vec(&mandatory).unwrap()),
             receiver_scope: format!("sessions:private:{}", manifest.repository_id),
             session_manifest: manifest.clone(),
+            rules: None,
         };
         let before = BTreeMap::from([("refs/heads/legacy".into(), "a".repeat(40))]);
         let mut after = before.clone();
@@ -496,6 +506,7 @@ mod tests {
             &expected.policy_digest,
             &manifest,
             "private",
+            None,
         )
         .unwrap();
         let receipt = policy
@@ -579,6 +590,42 @@ mod tests {
         );
     }
 
+    /// A receipt is asked for only while this computer's privacy rules for the repository are the
+    /// ones the publication was prepared under. Once they change, `confirm` refuses with
+    /// [`crate::domain::privacy_git::POLICY_CHANGED`] before the Hub is asked for anything, so a
+    /// receive never carries content protected by rules the person has since replaced. The Hub
+    /// cannot tell: what it holds is whichever device declared its rules last.
+    #[test]
+    fn a_receipt_is_refused_once_this_computers_rules_change() {
+        let work = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(work.path()).unwrap();
+        let rules = crate::domain::privacy_git::PolicyCheck::current(work.path()).unwrap();
+        let mut policy = crate::domain::privacy::PrivacyPolicy::load(&repo).unwrap();
+        policy.memory_allow.push("decisions.md".into());
+        policy.save(&repo).unwrap();
+        let publication = PublicationPolicy {
+            path: "api/agents/alice/app/privacy".into(),
+            policy_digest: digest_bytes(b"policy"),
+            mandatory_policy_digest: digest_bytes(b"mandatory"),
+            receiver_scope: "sessions:private:00000000-0000-0000-0000-000000000001".into(),
+            session_manifest: SessionPublicationManifest {
+                version: SESSION_ENVELOPE_VERSION,
+                repository_id: "00000000-0000-0000-0000-000000000001".into(),
+                snapshots: vec![],
+                preserved_commits: vec!["a".repeat(40)],
+            },
+            rules: Some(rules),
+        };
+        // No Hub answers here: a request that went out would fail with another error.
+        let client = Client::for_hub_with_token("http://127.0.0.1:9", "synthetic-session-token");
+        let before = BTreeMap::from([("refs/heads/work".into(), "a".repeat(40))]);
+        let refused = match publication.confirm(&client, &before, &before, ReceiveAsks::default()) {
+            Ok(_) => panic!("the rules changed after the publication was prepared"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert_eq!(refused, crate::domain::privacy_git::POLICY_CHANGED);
+    }
+
     #[test]
     fn receipt_requires_every_confirmed_binding_and_a_safe_header() {
         let policy = PublicationPolicy {
@@ -592,6 +639,7 @@ mod tests {
                 snapshots: vec![],
                 preserved_commits: vec!["a".repeat(40)],
             },
+            rules: None,
         };
         let binding = Binding {
             snapshot_digest: digest_bytes(b"snapshot"),
