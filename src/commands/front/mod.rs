@@ -906,12 +906,28 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+/// The runtimes a folder lists, counts and uploads by itself: each tells agit when a turn ends.
+const LISTED: &[&str] = &["claude-code", "codex"];
+
+/// The runtimes `agit save` finds: the listed ones, and OpenCode, which tells agit nothing when a
+/// turn ends, so a save, or its agent's `agit commit`, is the only thing that saves it.
+const SAVED: &[&str] = &["claude-code", "codex", "opencode"];
+
 /// Claude Code and Codex conversations that ran in `root` or below it, except in a directory
 /// below that is set up on its own (those are that directory's), and in the git worktrees its
 /// policy covers, newest first.
 pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
+    sessions_of_in(LISTED, root)
+}
+
+/// [`sessions_in`] for `agit save`, OpenCode's conversations included.
+pub(crate) fn sessions_to_save_in(root: &Path) -> Result<Vec<FolderSession>> {
+    sessions_of_in(SAVED, root)
+}
+
+fn sessions_of_in(runtimes: &[&'static str], root: &Path) -> Result<Vec<FolderSession>> {
     let worktrees = super::project::covered_worktrees(root);
-    sessions_where(|cwd, _| {
+    sessions_where(runtimes, |cwd, _| {
         (cwd.starts_with(root)
             && super::project::bound_root(cwd).is_none_or(|bound| root.starts_with(bound)))
             || (worktrees.iter().any(|worktree| cwd.starts_with(worktree))
@@ -1023,17 +1039,18 @@ pub(crate) fn held_sessions(root: &Path) -> Result<Vec<String>> {
     Ok(held.into_iter().collect())
 }
 
-/// Every Claude Code and Codex conversation modified since `since`, newest first.
+/// Every conversation `agit save` finds that was modified since `since`, newest first.
 pub(crate) fn sessions_since(since: std::time::SystemTime) -> Result<Vec<FolderSession>> {
-    sessions_where(|_, modified| modified >= since)
+    sessions_where(SAVED, |_, modified| modified >= since)
 }
 
 fn sessions_where(
+    runtimes: &[&'static str],
     keep: impl Fn(&Path, std::time::SystemTime) -> bool,
 ) -> Result<Vec<FolderSession>> {
     let store = Store::open().ok().flatten();
     let mut sessions = Vec::new();
-    for runtime in ["claude-code", "codex"] {
+    for &runtime in runtimes {
         let adapter = adapter::get(runtime)?;
         if !adapter.available() {
             continue;
@@ -1073,9 +1090,9 @@ fn sessions_where(
     Ok(sessions)
 }
 
-/// One conversation, wherever it ran.
+/// One conversation `agit save` can find, wherever it ran.
 pub(crate) fn sessions_where_id(runtime: &str, id: &str) -> Result<Option<FolderSession>> {
-    Ok(sessions_where(|_, _| true)?
+    Ok(sessions_where(SAVED, |_, _| true)?
         .into_iter()
         .find(|s| s.runtime == runtime && s.id == id))
 }

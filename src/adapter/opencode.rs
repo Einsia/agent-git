@@ -286,6 +286,43 @@ fn list_all(con: &Connection) -> Option<Vec<Listed>> {
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Every session in OpenCode's database, or an error when the database is there but cannot be
+/// read in full. Deciding which conversations already exist must not take an unreadable store, or
+/// one in a layout this version does not know, for an empty one: a conversation missing from the
+/// answer would later count as new. Only a database that does not exist holds no sessions; one
+/// whose path cannot be looked at is unread, not absent.
+#[cfg(feature = "cli")]
+pub(crate) fn every_session_in_full() -> Result<Vec<SessionRef>> {
+    let Some(db) = db_path() else {
+        return Ok(vec![]);
+    };
+    let unread = || {
+        format!(
+            "OpenCode's session database {} cannot be read in full",
+            db.display()
+        )
+    };
+    match std::fs::symlink_metadata(&db) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error).with_context(unread),
+        Ok(_) => {}
+    }
+    let con = open(&db).with_context(unread)?;
+    if !schema_ok(&con) {
+        bail!("{}", unread());
+    }
+    let cache = cache_dir()?;
+    let listed = con
+        .prepare(&format!("{LIST_COLS} ORDER BY time_created"))
+        .and_then(|mut statement| {
+            statement
+                .query_map([], row_to_listed)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .with_context(unread)?;
+    Ok(listed.into_iter().map(|l| to_ref(l, &cache)).collect())
+}
+
 fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
     SessionRef {
         title: None,
