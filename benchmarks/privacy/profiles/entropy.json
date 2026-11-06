@@ -3,6 +3,14 @@
   "case_ids": [
     "bare-entropy-default",
     "bare-entropy-opt-in",
-    "entropy-source-identifiers"
+    "entropy-source-identifiers",
+    "incident-stdlib-import",
+    "incident-relative-artifact-links",
+    "incident-ppt-enum-references",
+    "incident-public-reference-urls",
+    "incident-claude-native-identities",
+    "incident-codex-call-linkage",
+    "incident-claude-duplicated-image",
+    "incident-mcp-image-carrier-equivalence"
   ]
 }

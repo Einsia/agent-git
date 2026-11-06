@@ -11,8 +11,9 @@ import subprocess
 import time
 
 from sources import BenchError
+from contracts import protected_ranges, policy_record_contracts, validate_stream, validate_workspace_files
 
-ADAPTER_VERSION = 1
+ADAPTER_VERSION = 6
 SESSION = 'agit-' + 'a' * 40
 TOKEN = re.compile(r'‹(?:secret|custom):[a-z0-9-]+:[a-z2-7]{12}›|\{\{AGIT_SECRET_V[12]:[^{}]+\}\}')
 ACTIVE = set()
@@ -64,7 +65,10 @@ def version(binary, root):
 
 
 class Worker:
-    def __init__(self, binary, root, entropy=False, policy=None):
+    def __init__(self, binary, root, entropy=False, policy=None, workspace_files=None):
+        validate_workspace_files({} if workspace_files is None else workspace_files)
+        if workspace_files and policy is None:
+            raise BenchError('Workspace fixture requires a synthetic repository')
         self.root = root
         self.root.mkdir(parents=True)
         self.env = clean_env(root)
@@ -78,6 +82,10 @@ class Worker:
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
             (self.repo / '.git/agit').mkdir()
             (self.repo / 'src').mkdir()
+            for relative, content in (workspace_files or {}).items():
+                target = self.repo / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
             config = json.loads(dumps(policy).replace('{workspace}', str(self.repo)))
             config['workspace'] = str(self.repo)
             (self.repo / '.git/agit/privacy-policy.json').write_text(dumps(config))
@@ -142,59 +150,40 @@ class Worker:
         self.rules(case)
 
     def run(self, case, prepared=False):
+        validate_stream(case)
         if not prepared:
             self.prepare(case)
         value = case['input']
         if self.repo:
             value = json.loads(dumps(value).replace('{workspace}', str(self.repo)))
         if case['layer'] == 'policy':
-            log = ''.join(json.dumps({'_source': 'claude-code', '_session_id': SESSION,
+            runtime = case['runtime']
+            log = ''.join(json.dumps({'_source': runtime, '_session_id': SESSION,
                                  '_object_hash': hashlib.sha256(dumps(record).encode()).hexdigest()[:40],
                                  'content': json.loads(dumps(record))}, ensure_ascii=False, separators=(',', ':')) + '\n' for record in value['records'])
-            metadata = {'session': SESSION, 'runtime': 'claude-code',
-                        'cwd': str(self.repo) if self.repo else '/bench/workspace', **value.get('metadata', {})}
+            metadata = {'session': SESSION, 'cwd': str(self.repo) if self.repo else '/bench/workspace',
+                        **value.get('metadata', {}), 'runtime': runtime}
             if case.get('mode') == 'plain':
                 response = self.request('protect_envelopes', log)
                 if response['status'] != 'complete':
                     return {'status': response['status'], 'reason': response.get('reason')}
                 records = [json.loads(line)['content'] for line in response['content'].splitlines()]
                 return {'status': 'complete', 'output': {'records': records, 'metadata': metadata},
-                        'contracts': {'records_preserved': len(records) == len(value['records'])}}
-            response = self.request('project_publication', dumps({'branch': None, 'log': log, 'view': log,
+                        'contracts': policy_record_contracts(case, value, {'records': records})}
+            response = self.request('project_publication', dumps({'branch': case.get('branch'), 'log': log, 'view': log,
                                                                  'metadata': metadata, 'additional': []}))
             if response['status'] != 'complete':
                 return {'status': response['status'], 'reason': response.get('reason')}
             projected = json.loads(response['content'])
             output = {'records': [json.loads(line)['content'] for line in projected['log'].splitlines()],
                       'metadata': projected['metadata']}
-            shape_valid = all(
-                isinstance(record, dict) and record.get('type') in ('user', 'assistant')
-                and isinstance(record.get('message'), dict)
-                and record['message'].get('role') == record['type']
-                and isinstance(record['message'].get('content'), list)
-                and bool(record['message']['content']) for record in output['records'])
-            expected_calls = sum(b.get('type') == 'tool_use' for record in value['records']
-                                 for b in (record.get('message', {}).get('content', [])
-                                           if isinstance(record.get('message', {}).get('content'), list) else []))
-            expected_results = sum(b.get('type') == 'tool_result' for record in value['records']
-                                   for b in (record.get('message', {}).get('content', [])
-                                             if isinstance(record.get('message', {}).get('content'), list) else []))
-            calls, results = [], []
-            for record in output['records']:
-                blocks = record.get('message', {}).get('content', [])
-                if isinstance(blocks, list):
-                    calls.extend(b['id'] for b in blocks if b.get('type') == 'tool_use' and 'id' in b)
-                    results.extend(b['tool_use_id'] for b in blocks if b.get('type') == 'tool_result' and 'tool_use_id' in b)
             return {'status': 'complete', 'output': output, 'policy_report': projected['report'],
-                    'contracts': {'public_record_shape': shape_valid,
-                                  'paired_calls': len(calls) == len(set(calls)) == expected_calls
-                                  and len(results) == expected_results and all(i in calls for i in results),
-                                  'view_matches_log': projected['view'] == projected['log'],
-                                  'records_preserved': len(output['records']) == len(value['records'])}}
+                    'contracts': {**policy_record_contracts(case, value, output),
+                                  'view_matches_log': projected['view'] == projected['log']}}
         mode = 'protect_text' if isinstance(value, str) else 'protect_jsonl'
         text = value if isinstance(value, str) else dumps(value) + '\n'
         if case.get('stream_cuts'):
-            pending, context, protected_parts, offset = '', '', [], 0
+            pending, context, protected_parts, offset = '', case.get('context', ''), [], 0
             for cut in [*case['stream_cuts'], len(text)]:
                 pending += text[offset:cut]
                 offset = cut
@@ -203,10 +192,13 @@ class Worker:
                     return {'status': 'partial', 'reason': response.get('reason')}
                 consumed = response.get('consumed')
                 raw = pending.encode()
-                if not isinstance(consumed, int) or not 0 <= consumed <= len(raw):
+                if type(consumed) is not int or not 0 <= consumed <= len(raw):
                     raise BenchError('Invalid stream consumption coordinate')
-                context += raw[:consumed].decode()
-                pending = raw[consumed:].decode()
+                try:
+                    context += raw[:consumed].decode()
+                    pending = raw[consumed:].decode()
+                except UnicodeDecodeError as error:
+                    raise BenchError('Stream consumption splits a UTF-8 character') from error
                 protected_parts.append(response['content'])
             response = self.request('protect_text', pending, context)
             response = {**response, 'content': ''.join(protected_parts) + response['content']}
@@ -216,22 +208,32 @@ class Worker:
             return {'status': 'partial' if response['status'] == 'complete' else response['status'],
                     'reason': response.get('reason'), 'output': response['content']}
         protected = response['content']
+        whole = self.request(mode, text, case.get('context', '')) if case.get('stream_cuts') else None
         restored = self.request('hydrate_text' if isinstance(value, str) else 'hydrate_jsonl', protected)
         repeated = self.request(mode, protected)
         output = protected if isinstance(value, str) else json.loads(protected)
         restored_value = restored['content'] if isinstance(value, str) else json.loads(restored['content'])
         repeated_value = repeated['content'] if isinstance(value, str) else json.loads(repeated['content'])
         mappings = {}
-        for token in set(TOKEN.findall(protected)):
+        for token in set(TOKEN.findall(protected + (whole['content'] if whole else ''))):
             hydrated = self.request('hydrate_text', token)
             if hydrated['status'] != 'complete' or hydrated['content'] == token:
                 raise BenchError('Cannot recover a synthetic placeholder for range alignment')
             mappings[token] = hydrated['content']
+        contracts = {'restoration': restored['status'] == 'complete' and not restored.get('reason') and restored_value == value,
+                     'idempotence': repeated['status'] == 'complete' and not repeated.get('reason') and repeated_value == output}
+        if whole:
+            contracts['stream_equivalence'] = False
+            if whole['status'] == 'complete' and not whole.get('reason'):
+                try:
+                    contracts['stream_equivalence'] = (protected_ranges(text, protected, mappings, TOKEN)
+                        == protected_ranges(text, whole['content'], mappings, TOKEN))
+                except (ValueError, KeyError):
+                    pass
         return {'status': 'complete', 'output': output, 'mappings': mappings,
                 'detection': None,
                 'range_source': 'verified dictionary recovery, not detector telemetry',
-                'contracts': {'restoration': restored['status'] == 'complete' and restored_value == value,
-                              'idempotence': repeated['status'] == 'complete' and repeated_value == output}}
+                'contracts': contracts}
 
 
 def telemetry(binary, root, request):
@@ -247,7 +249,7 @@ def telemetry(binary, root, request):
         if process.returncode:
             return None
         value = json.loads(out)
-        if value.get('schema_version') != 1:
+        if not isinstance(value, dict) or value.get('schema_version') != 1:
             raise BenchError('Unsupported detector telemetry schema')
         return value
     finally:
