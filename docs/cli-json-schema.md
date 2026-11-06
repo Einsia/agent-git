@@ -127,6 +127,14 @@ Unknown or unavailable comparisons use null counts. A failed inspection uses
 counts repositories outside the shared display budget. Status neither fetches
 missing objects nor treats the primary checkout's HEAD as every branch's sync state.
 
+## Session order in status
+
+`sessions.items` lists the sessions that ran in the current folder first, marked
+`in_current_folder: true`, then the others; within each part, active claims come
+ahead of superseded ones. `offset`, `limit` and `next_offset` page that order. The
+text view's page holds every session of the current folder whatever its limit, so
+the budget applies only to the others, and it names the command for the next page.
+
 ## Pending native activity in status
 
 Default status inspects bounded native evidence for displayed, uniquely claimed

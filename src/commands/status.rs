@@ -138,15 +138,16 @@ pub fn run(args: Args) -> CmdResult {
     if super::json::requested() {
         return structured(&args);
     }
-    let limit = args.limit.unwrap_or(8) as usize;
     let s = ui::theme::symbols();
+    let cwd = std::env::current_dir()?;
     let ClaimInventory {
         store,
         mut links,
         issues: link_issues,
     } = claim_inventory(config::store_root()?);
-    // Active claims remain ahead of recovery history without using filesystem timestamps.
-    links.sort_by_key(|link| !link.is_active());
+    let in_folder = order(&mut links, &cwd);
+    // The display budget never cuts the current folder's sessions; it applies to the rest.
+    let limit = (args.limit.unwrap_or(8) as usize).max(in_folder.saturating_sub(args.offset));
     let page = observe_page(
         store.as_ref(),
         &links,
@@ -158,7 +159,6 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
     ui::section("who am I");
-    let cwd = std::env::current_dir()?;
     match super::context::from_env_with_claims(&links, inventory_complete) {
         Ok(Some(c)) => {
             println!("  {} @ {}", c.repo, c.branch);
@@ -242,11 +242,30 @@ pub fn run(args: Args) -> CmdResult {
                 &page.rows
             )
         );
-        let remaining = links
-            .len()
-            .saturating_sub(args.offset.saturating_add(limit));
+        let leading = in_folder.saturating_sub(args.offset).min(page.rows.len());
+        if leading > 0 && in_folder < links.len() {
+            println!(
+                "{}",
+                ui::dim(&if leading == 1 {
+                    "this folder's session is listed first".to_owned()
+                } else {
+                    format!("this folder's {leading} sessions are listed first")
+                })
+            );
+        }
+        let next = args.offset.saturating_add(limit);
+        let remaining = links.len().saturating_sub(next);
         if remaining > 0 {
-            println!("{}", ui::dim(&format!("… {remaining} more")));
+            let page_size = args
+                .limit
+                .map(|limit| format!(" --limit {limit}"))
+                .unwrap_or_default();
+            println!(
+                "{}",
+                ui::dim(&format!(
+                    "… {remaining} more; next page: `agit status --offset {next}{page_size}`"
+                ))
+            );
         }
         print_privacy_waits(&links);
         print_publication_waits(&links);
@@ -454,6 +473,35 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
+/// Puts the sessions that ran in the folder of `cwd` first, then active claims ahead of recovery
+/// history within each part, without using filesystem timestamps, and returns how many lead.
+///
+/// The folder follows the front door's rule; a home directory or filesystem root has none, so
+/// nothing leads there.
+fn order(links: &mut Vec<link::Link>, cwd: &std::path::Path) -> usize {
+    let folder = super::front::folder(cwd).ok();
+    let (mut here, mut rest): (Vec<_>, Vec<_>) = std::mem::take(links)
+        .into_iter()
+        .partition(|link| folder.as_deref().is_some_and(|folder| ran_in(link, folder)));
+    here.sort_by_key(|link| !link.is_active());
+    rest.sort_by_key(|link| !link.is_active());
+    let leading = here.len();
+    here.append(&mut rest);
+    *links = here;
+    leading
+}
+
+/// Whether a claim's recorded working directory is `folder` or below it, as written or once
+/// symlinks resolve: `folder` is canonical, and the runtime may record either form.
+fn ran_in(link: &link::Link, folder: &std::path::Path) -> bool {
+    link.cwd
+        .as_deref()
+        .map(std::path::Path::new)
+        .is_some_and(|cwd| {
+            cwd.starts_with(folder) || cwd.canonicalize().is_ok_and(|cwd| cwd.starts_with(folder))
+        })
+}
+
 /// In a git worktree its main checkout's policy covers, how many sessions from before that
 /// coverage wait for `agit save --all`; `None` anywhere else.
 fn worktree_left_out(cwd: &std::path::Path) -> Option<usize> {
@@ -542,7 +590,7 @@ fn structured(args: &Args) -> CmdResult {
         issues: link_issues,
     } = claim_inventory(config::store_root()?);
 
-    links.sort_by_key(|link| !link.is_active());
+    let in_folder = order(&mut links, &cwd);
     let limit = args.limit.unwrap_or(100) as usize;
     let page = observe_page(
         store.as_ref(),
@@ -563,10 +611,11 @@ fn structured(args: &Args) -> CmdResult {
     let publication_waits = crate::rc::supervisor::archive_recovery::publication_waits();
     let items: Vec<_> = links
         .iter()
+        .enumerate()
         .skip(args.offset)
         .take(limit)
         .zip(page.rows)
-        .map(|(link, detail)| {
+        .map(|((index, link), detail)| {
             let target = match (&link.owner, &link.agent, &link.branch) {
                 (Some(owner), Some(repo), Some(branch)) => Some(format!("{owner}/{repo}@{branch}")),
                 _ => None,
@@ -589,8 +638,8 @@ fn structured(args: &Args) -> CmdResult {
             serde_json::json!({
                 "runtime": link.source, "session_id": link.session_id,
                 "owner": link.owner, "repository_name": link.agent, "branch": link.branch,
-                "target": target, "cwd": link.cwd, "active": link.is_active(),
-                "superseded_by": link.superseded_by,
+                "target": target, "cwd": link.cwd, "in_current_folder": index < in_folder,
+                "active": link.is_active(), "superseded_by": link.superseded_by,
                 "last_commit": (detail[4] != "—").then_some(&detail[4]),
                 "pending_activity": detail[5], "local_instance": detail[6],
                 "project": detail[7], "publication_wait": publication_wait,
