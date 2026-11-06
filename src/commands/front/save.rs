@@ -135,7 +135,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
     }
     let root = super::folder(&std::env::current_dir()?)?;
     let on = crate::commands::project::uploads_automatically(&root) == Some(true);
-    let here = super::sessions_in(&root)?;
+    let here = super::sessions_to_save_in(&root)?;
     let mut left_out = 0;
     let mut dropped = 0;
     let chosen: Vec<FolderSession> = match &args.session {

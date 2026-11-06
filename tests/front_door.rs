@@ -403,6 +403,72 @@ impl Lab {
         std::fs::write(native.join(format!("{id}.jsonl")), text).unwrap();
     }
 
+    /// An OpenCode conversation of one finished turn that ran in `cwd`, in OpenCode's own
+    /// database, with a stand-in `opencode` so the runtime counts as installed.
+    fn opencode_conversation(&self, cwd: &std::path::Path, id: &str, prompt: &str) {
+        std::fs::write(self.bin.join("opencode"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(self.bin.join("opencode.cmd"), "@exit /b 0\r\n").unwrap();
+        let data = self.home.join(".local/share/opencode");
+        std::fs::create_dir_all(&data).unwrap();
+        let database = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
+        database.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        ).unwrap();
+        let cwd = cwd.to_str().unwrap();
+        database
+            .execute("INSERT INTO project VALUES ('global', ?1)", [cwd])
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO session VALUES (?1, 'global', NULL, ?2, 100, 150, '1.18.13')",
+                [id, cwd],
+            )
+            .unwrap();
+        for (message, created, body) in [
+            (
+                "u1",
+                110,
+                serde_json::json!({"role":"user", "time":{"created":110}}),
+            ),
+            (
+                "a1",
+                120,
+                serde_json::json!({"role":"assistant", "parentID":"u1", "finish":"stop", "time":{"created":120}}),
+            ),
+        ] {
+            database
+                .execute(
+                    "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![message, id, created, body.to_string()],
+                )
+                .unwrap();
+        }
+        for (part, message, created, body) in [
+            (
+                "u1text",
+                "u1",
+                111,
+                serde_json::json!({"type":"text", "text":prompt}),
+            ),
+            (
+                "a1text",
+                "a1",
+                121,
+                serde_json::json!({"type":"text", "text":"Done."}),
+            ),
+        ] {
+            database
+                .execute(
+                    "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![part, message, id, created, body.to_string()],
+                )
+                .unwrap();
+        }
+    }
+
     /// Binds `dir` on its own to `repo`, as `agit bind` records it.
     fn bind(&self, dir: &std::path::Path, repo: &str) {
         use sha2::{Digest, Sha256};
@@ -1043,4 +1109,53 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
         "{document}"
     );
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
+
+/// `agit save` finds an OpenCode conversation in a folder that is on, though OpenCode tells agit
+/// nothing when a turn ends, and keeps the folder's earlier history out as it does for the other
+/// runtimes. The folder was bound without earlier history by a policy that never recorded OpenCode's
+/// conversations, so the one already there counts as earlier: a plain save leaves it out and says
+/// so, and naming it or `--all` takes it, as an OpenCode session. The lab's Hub accepts no upload,
+/// so what is pinned is which conversation each save takes. A save that looked only at the
+/// runtimes a folder uploads by itself finds nothing to name; one that did not count OpenCode as
+/// earlier takes it in the plain save.
+#[test]
+fn a_save_finds_an_opencode_conversation_and_keeps_earlier_history_out() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    lab.turn_on(&dir, "me/notes");
+    lab.opencode_conversation(&dir, "ses_save_opencode", "Plan the release");
+    let save = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"].clone()
+    };
+    let taken = |value: &serde_json::Value| -> Vec<(String, String)> {
+        value["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                Some((
+                    session["runtime"].as_str()?.to_owned(),
+                    session["session_id"].as_str()?.to_owned(),
+                ))
+            })
+            .collect()
+    };
+
+    let plain = save(&["--json", "save"]);
+    assert!(taken(&plain).is_empty(), "{plain}");
+    assert_eq!(plain["left_out"], 1, "{plain}");
+    for args in [
+        &["--json", "save", "ses_save_opencode"][..],
+        &["--json", "save", "--all"],
+    ] {
+        let value = save(args);
+        assert_eq!(
+            taken(&value),
+            [("opencode".to_owned(), "ses_save_opencode".to_owned())],
+            "{args:?}: {value}"
+        );
+    }
 }

@@ -100,6 +100,11 @@ struct Project {
     /// asks for earlier sessions (`agit save --all`, `--today`) lets them in.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     earlier: BTreeSet<String>,
+    /// Whether `earlier` holds the OpenCode conversations that ran here before the binding. A
+    /// policy bound without it never looked for them, so every OpenCode conversation there counts
+    /// as earlier until it is saved into this repository.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    earlier_opencode: bool,
     last_result: Option<serde_json::Value>,
     /// The repository's own push.auto override as it stood before bind turned automatic push
     /// on; absent when bind did not turn it on. Unbind puts it back, so a binding never leaves
@@ -822,6 +827,7 @@ pub(crate) fn policy_for_test(
             .map(|(runtime, session)| key(runtime, session))
             .collect(),
         earlier: BTreeSet::new(),
+        earlier_opencode: false,
         last_result: None,
         push_auto_before: None,
     })
@@ -962,6 +968,53 @@ fn candidates(project: &Project) -> Result<Vec<Candidate>> {
         }
     }
     Ok(result)
+}
+
+/// The OpenCode conversations of the project, found the way [`candidates`] finds the others, from
+/// a complete reading of OpenCode's store. A project never uploads them by itself: OpenCode says
+/// nothing when a turn ends, so only `agit save` takes them, and bind records them only to keep
+/// its earlier ones out of a plain save.
+fn saved_only_candidates(project: &Project) -> Result<Vec<Candidate>> {
+    let worktrees = crate::domain::worktree::of(&project.root);
+    let mut result = Vec::new();
+    for session in crate::adapter::opencode::every_session_in_full()? {
+        let Some(cwd) = session
+            .cwd
+            .and_then(|p| PathBuf::from(p).canonicalize().ok())
+        else {
+            continue;
+        };
+        let near = cwd.starts_with(&project.root)
+            || worktrees.iter().any(|worktree| cwd.starts_with(worktree));
+        if near && includes(project, &cwd)? {
+            result.push(Candidate {
+                runtime: "opencode".into(),
+                session_id: session.id,
+                cwd,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// The OpenCode conversations a bind without earlier history records, and whether OpenCode's
+/// store was read in full. One that cannot be read leaves the policy unmarked, so every OpenCode
+/// conversation there keeps counting as earlier ([`opencode_earlier`]) once the store is readable.
+fn opencode_history(project: &Project) -> (Vec<Candidate>, bool) {
+    match saved_only_candidates(project) {
+        Ok(found) => (found, true),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+/// Whether an OpenCode conversation counts as earlier history of a folder bound without it. One
+/// saved into the project's repository is the project's. A policy that never recorded OpenCode's
+/// earlier conversations fails closed: every other OpenCode conversation counts as earlier, so a
+/// plain save never takes one the person kept out by binding without history.
+fn opencode_earlier(project: &Project, session_id: &str) -> bool {
+    project.history == History::None
+        && !claimed_here(project, "opencode", session_id)
+        && (!project.earlier_opencode || project.earlier.contains(&key("opencode", session_id)))
 }
 
 fn checkout(project: &Project) -> Result<Repo> {
@@ -1540,6 +1593,7 @@ pub fn run(args: Args) -> CmdResult {
                         root: root.clone(),
                         history: History::None,
                         earlier: BTreeSet::new(),
+                        earlier_opencode: false,
                         last_result: None,
                         // The worktree's own policy replaced nothing; the main checkout keeps its
                         // record.
@@ -1647,6 +1701,7 @@ fn bind(
         history,
         excluded: BTreeSet::new(),
         earlier: BTreeSet::new(),
+        earlier_opencode: false,
         last_result: None,
         push_auto_before: None,
     };
@@ -1698,8 +1753,11 @@ fn bind(
         // session already claimed in this repository keeps publishing here. Those of the
         // folder's git worktrees stay out by when the worktree was covered, recorded below.
         let store = Store::at(config::store_root()?);
+        let (opencode, read) = opencode_history(&project);
+        project.earlier_opencode = read;
         project.earlier.extend(
             rows.iter()
+                .chain(&opencode)
                 .filter(|s| s.cwd.starts_with(&root))
                 .filter(|s| {
                     link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
@@ -2170,6 +2228,9 @@ pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Pat
         session_id: session_id.into(),
         cwd: cwd.to_path_buf(),
     };
+    if runtime == "opencode" {
+        return opencode_earlier(&project, session_id);
+    }
     project.earlier.contains(&key(runtime, session_id))
         || before_covered(&project, &candidate, false).unwrap_or(true)
         || codex_unhooked(&project, &candidate)
@@ -4777,6 +4838,7 @@ mod tests {
             // Candidate discovery never reads the developer's own transcripts.
             .env("CLAUDE_CONFIG_DIR", home.path().join("claude"))
             .env("CODEX_HOME", home.path().join("codex"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
             .output()
             .unwrap();
         assert!(
@@ -4804,6 +4866,7 @@ mod tests {
             history: History::All,
             excluded: BTreeSet::new(),
             earlier: BTreeSet::new(),
+            earlier_opencode: false,
             last_result: None,
             push_auto_before: None,
         }
@@ -5166,6 +5229,94 @@ mod tests {
         policy.auto_upload = false;
         save(&policy).unwrap();
         assert!(announced("fresh", &inside).is_none());
+    }
+
+    /// An OpenCode database holding `sessions`, each started in `cwd`.
+    fn opencode_database(path: &Path, cwd: &Path, sessions: &[&str]) {
+        let database = rusqlite::Connection::open(path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+                 CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+            )
+            .unwrap();
+        let cwd = cwd.to_str().unwrap();
+        database
+            .execute("INSERT INTO project VALUES ('global', ?1)", [cwd])
+            .unwrap();
+        for session in sessions {
+            database
+                .execute(
+                    "INSERT INTO session VALUES (?1, 'global', NULL, ?2, 100, 150, '1.18.13')",
+                    [session, &cwd],
+                )
+                .unwrap();
+        }
+    }
+
+    /// A bind without earlier history records the folder's OpenCode conversations only from a
+    /// complete reading of OpenCode's store. A store it cannot read, the database or the path to
+    /// it, leaves the policy unmarked, so a conversation that was there keeps counting as earlier
+    /// once the store reads again; only a database that does not exist reads as empty. A
+    /// complete reading counts what was there and nothing started later. Marking the policy after
+    /// an unread store lets those conversations into a plain save; failing closed after a complete
+    /// reading would keep every later one out as well.
+    #[test]
+    fn opencode_history_is_recorded_only_from_a_complete_reading() {
+        if !isolated("opencode_history_is_recorded_only_from_a_complete_reading") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        policy.history = History::None;
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("opencode");
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("opencode.db");
+
+        let (found, read) = opencode_history(&policy);
+        assert!(found.is_empty() && read, "no database holds no sessions");
+
+        // A database path that cannot be looked at for any reason but its absence reads as unread,
+        // not empty: here a file stands where OpenCode's folder belongs, which every user, root
+        // included, is refused with "not a directory". Windows reports that case as not found.
+        #[cfg(unix)]
+        {
+            fs::remove_dir(&data).unwrap();
+            fs::write(&data, b"").unwrap();
+            let (found, read) = opencode_history(&policy);
+            assert!(
+                found.is_empty() && !read,
+                "a path it cannot look at is not an empty store"
+            );
+            fs::remove_file(&data).unwrap();
+            fs::create_dir_all(&data).unwrap();
+        }
+
+        fs::write(&database, b"not a database").unwrap();
+        let (found, read) = opencode_history(&policy);
+        assert!(found.is_empty() && !read);
+        policy.earlier_opencode = read;
+        fs::remove_file(&database).unwrap();
+        opencode_database(&database, &policy.root, &["ses_before"]);
+        assert!(opencode_earlier(&policy, "ses_before"));
+
+        let (found, read) = opencode_history(&policy);
+        assert!(read);
+        assert_eq!(
+            found
+                .iter()
+                .map(|c| c.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_before"]
+        );
+        policy.earlier_opencode = read;
+        policy
+            .earlier
+            .extend(found.iter().map(|c| key(&c.runtime, &c.session_id)));
+        assert!(opencode_earlier(&policy, "ses_before"));
+        assert!(!opencode_earlier(&policy, "ses_after"));
     }
 
     /// A Claude Code conversation the project uploads records its memory baseline as it starts,
