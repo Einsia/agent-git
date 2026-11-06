@@ -55,10 +55,6 @@ pub const RUNTIMES: &[&str] = &[
     "workbuddy",
 ];
 
-/// The runtimes whose user messages are left out entirely, because their records carry no marker
-/// that tells the person's words apart from context the runtime injected in the user's role.
-pub const USER_MESSAGES_WITHHELD: &[&str] = &["hermes", "openclaw"];
-
 /// The runtimes whose user messages are published with only the request inside their
 /// `<user_query>` wrapper; a user message without one is left out.
 pub const USER_QUERY_ONLY: &[&str] = &["cursor", "workbuddy"];
@@ -70,6 +66,8 @@ pub struct Classifier {
     opencode_roles: HashMap<String, String>,
     /// The same for the ordered judgement of kinds: each message id's hash, and its role.
     message_roles: HashMap<u64, Host>,
+    /// Whether the Hermes session header seen last says the owner's own console.
+    hermes_local: bool,
 }
 
 /// The role of the OpenCode message a part belongs to.
@@ -107,6 +105,13 @@ enum Kind {
         host: Host,
         class: RecordClass,
     },
+    /// A Hermes session header: whether the session is the owner's own console.
+    HermesSession { local: bool, class: RecordClass },
+    /// A Hermes row: its class in a session from the owner's own console, and in any other.
+    HermesRow {
+        local: RecordClass,
+        otherwise: RecordClass,
+    },
     /// An OpenCode part: its message id's hash, and its class under an assistant message, under
     /// a user message and under any other.
     OpencodePart {
@@ -125,6 +130,22 @@ pub fn record_kind(source: &str, content: &Value) -> RecordKind {
             content,
         )))
     };
+    if source == "hermes"
+        && let Some(record) = content
+            .as_object()
+            .filter(|record| !is_agit_marker(record) && recovered_evidence(record).is_none())
+    {
+        return RecordKind(match hermes_local_session(record) {
+            Some(local) => Kind::HermesSession {
+                local,
+                class: class_from(None, content),
+            },
+            None => Kind::HermesRow {
+                local: class_from(hermes(record, true), content),
+                otherwise: class_from(hermes(record, false), content),
+            },
+        });
+    }
     let Some(record) = content
         .as_object()
         .filter(|record| source == "opencode" && !is_agit_marker(record))
@@ -184,6 +205,17 @@ impl Classifier {
     pub fn class_of(&mut self, kind: RecordKind) -> RecordClass {
         match kind.0 {
             Kind::Fixed(class) => class,
+            Kind::HermesSession { local, class } => {
+                self.hermes_local = local;
+                class
+            }
+            Kind::HermesRow { local, otherwise } => {
+                if self.hermes_local {
+                    local
+                } else {
+                    otherwise
+                }
+            }
             Kind::OpencodeHeader {
                 message,
                 host,
@@ -225,7 +257,13 @@ impl Classifier {
             "cursor" => cursor(record),
             "codex" => codex(record),
             "opencode" => self.opencode(record),
-            "hermes" => hermes(record),
+            "hermes" => {
+                if let Some(local) = hermes_local_session(record) {
+                    self.hermes_local = local;
+                    return None;
+                }
+                hermes(record, self.hermes_local)
+            }
             "openclaw" => openclaw(record),
             "workbuddy" => workbuddy(record),
             _ => None,
@@ -1005,23 +1043,208 @@ fn opencode_typed_part(record: &Map<String, Value>) -> Option<Value> {
 
 // ---- Hermes, OpenClaw, WorkBuddy ------------------------------------------------------------
 
-/// Hermes: active assistant and tool messages.
-fn hermes(record: &Map<String, Value>) -> Option<Value> {
+/// Hermes: active assistant and tool messages, and the person's own messages where the session
+/// is the owner's own console (`local`, as the session's header records it).
+fn hermes(record: &Map<String, Value>, local: bool) -> Option<Value> {
     let data = record.get("data")?;
-    let kept = record.get("type").and_then(Value::as_str) == Some("hermes_message")
-        && data["active"] != 0
-        && matches!(data["role"].as_str(), Some("assistant" | "tool"));
-    kept.then(|| Value::Object(record.clone()))
+    if record.get("type").and_then(Value::as_str) != Some("hermes_message") || data["active"] == 0 {
+        return None;
+    }
+    match data["role"].as_str()? {
+        "assistant" | "tool" => Some(Value::Object(record.clone())),
+        "user" => hermes_typed(data, local),
+        _ => None,
+    }
 }
 
-/// OpenClaw: assistant messages and tool results.
+/// Whether a Hermes session header says the session is the owner's own console. Hermes records
+/// where each session came from (`local` for its console; a platform's name for a gateway such as
+/// Telegram or Discord, whose user rows can be other people's).
+fn hermes_local_session(record: &Map<String, Value>) -> Option<bool> {
+    (record.get("type").and_then(Value::as_str) == Some("hermes_session")).then(|| {
+        record
+            .get("data")
+            .is_some_and(|data| data["source"] == "local")
+    })
+}
+
+/// A Hermes user row holds what the person typed when the gateway took it in as their message: it
+/// carries the platform's message id and nothing of what Hermes adds itself, except one thing.
+/// When the person mentions a file (`@file:`), Hermes appends the file's text to the same row
+/// after [`HERMES_ATTACHED`], so only the text before it is theirs. That is cut off only when
+/// everything after the marker is file blocks of the one shape Hermes v0.22.5 writes; any other
+/// attachment, or text the cut can't account for, withholds the whole row. Hermes writes its
+/// compaction summary as a user row with `_compressed_summary` set and no platform id. A column
+/// this rule doesn't know, or one it knows Hermes sets for its own additions, withholds the row
+/// too. Only a session from the owner's own console publishes these rows; on any other platform
+/// they can be other people's messages. What publishes is the row's time, order and typed text,
+/// marked `session_source: local` in place of the platform's id.
+const HERMES_ATTACHED: &str = "\n\n--- Attached Context ---\n\n";
+
+/// The fields of a Hermes user row as it publishes.
+const HERMES_PUBLISHED: &[&str] = &[
+    "session_id",
+    "role",
+    "timestamp",
+    "active",
+    "display_order",
+    "message_uid",
+    "_compressed_summary",
+    "session_source",
+    "content",
+];
+
+fn hermes_typed(data: &Value, local: bool) -> Option<Value> {
+    // Published once already: its own mark says where it came from.
+    let republished = data["session_source"] == "local"
+        && data
+            .as_object()?
+            .keys()
+            .all(|key| HERMES_PUBLISHED.contains(&key.as_str()));
+    // The columns of Hermes v0.22.5's messages table; any other one set withholds the row.
+    const KNOWN: &[&str] = &[
+        "id",
+        "session_id",
+        "role",
+        "content",
+        "effect_disposition",
+        "timestamp",
+        "token_count",
+        "finish_reason",
+        "platform_message_id",
+        "observed",
+        "_compressed_summary",
+        "active",
+        "compacted",
+        "display_metadata",
+        "display_identity",
+        "display_order",
+        "message_uid",
+    ];
+    const UNSET: &[&str] = &[
+        "tool_call_id",
+        "tool_calls",
+        "tool_name",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "api_content",
+        "display_kind",
+        "absorbed_message_uids",
+        "tool_call_uids",
+        "tool_call_uid",
+    ];
+    let taken_in = local
+        && data["platform_message_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty());
+    let typed = data["_compressed_summary"] == 0
+        && (taken_in || republished)
+        && UNSET
+            .iter()
+            .all(|key| data.get(*key).is_none_or(Value::is_null))
+        && data.as_object()?.iter().all(|(key, value)| {
+            KNOWN.contains(&key.as_str())
+                || UNSET.contains(&key.as_str())
+                || (republished && key == "session_source")
+                || value.is_null()
+        });
+    if !typed {
+        return None;
+    }
+    let content = data["content"].as_str()?;
+    let typed = match content.split_once(HERMES_ATTACHED) {
+        None => content,
+        Some((typed, attached)) => {
+            hermes_file_blocks(attached)?;
+            typed
+        }
+    };
+    let text = typed_text(typed)?;
+    let mut kept = Map::new();
+    for key in HERMES_PUBLISHED {
+        if let Some(value) = data.get(*key) {
+            kept.insert((*key).into(), value.clone());
+        }
+    }
+    // Where it came from stays with it, so publishing it again keeps it.
+    kept.insert("session_source".into(), Value::String("local".into()));
+    kept.insert("content".into(), Value::String(text));
+    Some(serde_json::json!({"type":"hermes_message","data":kept}))
+}
+
+/// `Some` when `attached` is nothing but file blocks as Hermes v0.22.5 writes them after
+/// [`HERMES_ATTACHED`]: a `📄 @file:<name> (<n> tokens)` line, then the file's text in one fence.
+fn hermes_file_blocks(attached: &str) -> Option<()> {
+    let mut rest = attached;
+    loop {
+        rest = rest.trim_start_matches('\n');
+        if rest.is_empty() {
+            return Some(());
+        }
+        let block = rest.strip_prefix("📄 @file:")?;
+        let (header, body) = block.split_once('\n')?;
+        if !header.ends_with(" tokens)") || header.contains("```") {
+            return None;
+        }
+        let body = body.strip_prefix("```")?;
+        let (_language, text) = body.split_once('\n')?;
+        let end = text.find("\n```")?;
+        rest = &text[end + 4..];
+        if !(rest.is_empty() || rest.starts_with('\n')) {
+            return None;
+        }
+    }
+}
+
+/// OpenClaw: assistant messages, tool results, and the person's own messages.
 fn openclaw(record: &Map<String, Value>) -> Option<Value> {
-    let kept = record.get("type").and_then(Value::as_str) == Some("message")
-        && matches!(
-            record.get("message")?["role"].as_str(),
-            Some("assistant" | "toolResult")
-        );
-    kept.then(|| Value::Object(record.clone()))
+    if record.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    match record.get("message")?["role"].as_str()? {
+        "assistant" | "toolResult" => Some(Value::Object(record.clone())),
+        "user" => openclaw_typed(record),
+        _ => None,
+    }
+}
+
+/// An OpenClaw user message holds what the person typed when it is the owner's own message as
+/// OpenClaw took it in: a string, marked as the owner's, keyed as a user message, and nothing
+/// else. OpenClaw keeps the context it supplies in events of their own and its compaction summary
+/// in a `compaction` event. Any other field or shape withholds it; what publishes is the message
+/// with its text through `typed_text`.
+fn openclaw_typed(record: &Map<String, Value>) -> Option<Value> {
+    const FIELDS: &[&str] = &[
+        "role",
+        "content",
+        "timestamp",
+        "__openclaw",
+        "idempotencyKey",
+    ];
+    let message = record.get("message")?.as_object()?;
+    let typed = message.keys().all(|key| FIELDS.contains(&key.as_str()))
+        && message.get("__openclaw") == Some(&serde_json::json!({"senderIsOwner": true}))
+        && message
+            .get("idempotencyKey")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.ends_with(":user"));
+    if !typed {
+        return None;
+    }
+    let text = typed_text(message.get("content")?.as_str()?)?;
+    let mut kept = Map::new();
+    for key in ["type", "id", "parentId", "timestamp"] {
+        if let Some(value) = record.get(key) {
+            kept.insert(key.into(), value.clone());
+        }
+    }
+    let mut published = message.clone();
+    published.insert("content".into(), Value::String(text));
+    kept.insert("message".into(), Value::Object(published));
+    Some(Value::Object(kept))
 }
 
 /// WorkBuddy: assistant messages, reasoning, tool calls and their results, and user messages

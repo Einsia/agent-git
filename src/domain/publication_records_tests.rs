@@ -22,9 +22,15 @@ fn class(source: &str, record: &Value) -> RecordClass {
 /// changes nothing.
 fn assert_stable(source: &str, record: &Value) {
     if let Some(kept) = published(source, record) {
-        assert_eq!(class(source, &kept), RecordClass::Conversation, "{kept}");
-        assert_eq!(published(source, &kept).as_ref(), Some(&kept), "{kept}");
+        assert_republishes(source, &kept);
     }
+}
+
+/// `kept`, a record as it was published, is published again unchanged and as conversation. A
+/// published record the rule now drops fails here, rather than passing unnoticed.
+fn assert_republishes(source: &str, kept: &Value) {
+    assert_eq!(published(source, kept).as_ref(), Some(kept), "{kept}");
+    assert_eq!(class(source, kept), RecordClass::Conversation, "{kept}");
 }
 
 /// Records of each kind a Claude Code 2.1.311 transcript holds, with the person's memory and
@@ -612,7 +618,7 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
     for runtime in RUNTIMES {
         assert!(covered.contains(runtime), "{runtime} has no case");
     }
-    for runtime in USER_MESSAGES_WITHHELD.iter().chain(USER_QUERY_ONLY) {
+    for runtime in USER_QUERY_ONLY {
         assert!(RUNTIMES.contains(runtime));
     }
 }
@@ -1445,5 +1451,202 @@ fn a_tool_output_of_another_shape_follows_one_rule_for_claude_and_codex() {
         let kept = published("claude-code", &result).unwrap();
         assert_eq!(kept["message"]["content"][0]["content"], output, "{result}");
         assert_stable("claude-code", &result);
+    }
+}
+
+/// Real Hermes v0.22.5 rows (a session with a file mention and a compaction, canary words only).
+const HERMES_ROWS: &str =
+    include_str!("../../tests/fixtures/runtime-samples/hermes-0.22.5-messages.jsonl");
+/// Real OpenClaw 2026.10.9 transcript events from the same kind of session.
+const OPENCLAW_EVENTS: &str =
+    include_str!("../../tests/fixtures/runtime-samples/openclaw-2026.10.9-events.jsonl");
+
+fn sample(text: &str) -> Vec<Value> {
+    text.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn published_user_texts(
+    source: &str,
+    records: &[Value],
+    text: fn(&Value) -> &Value,
+) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| {
+            assert_stable(source, record);
+            published(source, record)
+        })
+        .filter_map(|kept| text(&kept).as_str().map(str::to_owned))
+        .collect()
+}
+
+/// `row` as it publishes in a Hermes session from `source`, judged after that session's header.
+fn hermes_in(header: &Value, source: &str, row: &Value) -> Option<Value> {
+    let mut header = header.clone();
+    header["data"]["source"] = json!(source);
+    let mut classifier = Classifier::default();
+    assert_eq!(classifier.published("hermes", &header), None);
+    classifier.published("hermes", row)
+}
+
+/// Hermes publishes the person's own words, in a session from the owner's own console as Hermes
+/// records it: a user row the gateway took in, with the platform's id and nothing Hermes adds. The
+/// file text Hermes appends to a mentioning row stays out, and so does its compaction summary; a
+/// row with any other field set is withheld. On any other platform no user row publishes.
+#[test]
+fn hermes_publishes_only_the_words_the_person_typed() {
+    let records = sample(HERMES_ROWS);
+    let (header, rows) = records.split_first().unwrap();
+    assert_eq!(header["data"]["source"], "local");
+    let in_order: Vec<(&str, &Value)> = records.iter().map(|record| ("hermes", record)).collect();
+    let typed: Vec<String> = published_sequence(in_order.clone())
+        .into_iter()
+        .flatten()
+        .filter(|kept| kept["data"]["role"] == "user")
+        .map(|kept| kept["data"]["content"].as_str().unwrap().to_owned())
+        .collect();
+    // Rows a compaction replaced are inactive and stay out, as before; their copies publish.
+    assert_eq!(
+        typed,
+        [
+            "CANARY-HERMES-10 a fourth prompt",
+            "CANARY-HERMES-11 a prompt after compression"
+        ]
+    );
+    // Each published row, the person's two included, is published again unchanged and as
+    // conversation, on its own and without its session's header.
+    let mut typed_rows = 0;
+    for kept in published_sequence(in_order).into_iter().flatten() {
+        assert_republishes("hermes", &kept);
+        typed_rows += usize::from(kept["data"]["role"] == "user");
+        let out = kept.to_string();
+        assert!(!out.contains("README-1"), "{out}");
+        assert!(!out.contains("CONTEXT COMPACTION"), "{out}");
+        if kept["data"]["role"] == "user" {
+            assert!(kept["data"].get("platform_message_id").is_none(), "{out}");
+        }
+    }
+    assert_eq!(typed_rows, 2);
+    // The file mention, in a session not yet compacted: the typed words only.
+    let mut mention = rows
+        .iter()
+        .find(|row| {
+            row["data"]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("@file:"))
+        })
+        .unwrap()
+        .clone();
+    mention["data"]["active"] = json!(1);
+    let kept = hermes_in(header, "local", &mention).unwrap();
+    assert_eq!(
+        kept["data"]["content"],
+        "CANARY-HERMES-8 please look at @file:README.md and tell me what it says"
+    );
+    assert_republishes("hermes", &kept);
+    // Only the one attachment shape the samples show is cut off; anything else after the marker,
+    // or a column the rule doesn't know, withholds the whole row.
+    let content = mention["data"]["content"].as_str().unwrap().to_owned();
+    let (typed_part, _) = content
+        .split_once("\n\n--- Attached Context ---\n\n")
+        .unwrap();
+    for attached in [
+        "🖼️ @image:photo.png (12 tokens)\n```\nIMAGE_DATA\n```",
+        "🔗 @url:https://example.test (40 tokens)\n```\nPAGE_TEXT\n```",
+        "📁 @folder:src (30 tokens)\n```\nFOLDER_LIST\n```",
+        "📄 @file:README.md (9 tokens)\n```markdown\nReadme line.\n```\nTRAILING_TEXT",
+        "📄 @file:README.md (9 tokens)\nno fence",
+    ] {
+        let mut other = mention.clone();
+        other["data"]["content"] = json!(format!(
+            "{typed_part}\n\n--- Attached Context ---\n\n{attached}"
+        ));
+        assert_eq!(hermes_in(header, "local", &other), None, "{attached}");
+    }
+    let mut unknown = mention.clone();
+    unknown["data"]["attachments"] = json!(["photo.png"]);
+    assert_eq!(hermes_in(header, "local", &unknown), None);
+    unknown["data"]["attachments"] = Value::Null;
+    assert!(
+        hermes_in(header, "local", &unknown).is_some(),
+        "an unset column changes nothing"
+    );
+    let typed = rows
+        .iter()
+        .find(|row| row["data"]["content"] == "CANARY-HERMES-11 a prompt after compression")
+        .unwrap();
+    assert!(hermes_in(header, "local", typed).is_some());
+    // Another platform's session, or one judged without its header: no user row publishes, while
+    // the replies still do.
+    for source in ["telegram", "discord", "slack", "whatsapp", "email", "cli"] {
+        assert_eq!(hermes_in(header, source, typed), None, "{source}");
+    }
+    assert_eq!(published("hermes", typed), None);
+    let reply = rows
+        .iter()
+        .find(|row| row["data"]["role"] == "assistant" && row["data"]["active"] == 1)
+        .unwrap();
+    assert!(hermes_in(header, "telegram", reply).is_some());
+    for (field, value) in [
+        ("platform_message_id", Value::Null),
+        ("_compressed_summary", json!(1)),
+        ("api_content", json!("injected")),
+        ("tool_calls", json!("[]")),
+        ("display_kind", json!("notice")),
+        ("session_source", json!("telegram")),
+    ] {
+        let mut other = typed.clone();
+        other["data"][field] = value;
+        assert_eq!(hermes_in(header, "local", &other), None, "{field}");
+    }
+}
+
+/// OpenClaw publishes the person's own words: a user message with string content marked as the
+/// owner's and keyed as a user message, and nothing else. Its compaction and the context events it
+/// supplies stay out; a message with any other field or shape is withheld.
+#[test]
+fn openclaw_publishes_only_the_words_the_person_typed() {
+    let events = sample(OPENCLAW_EVENTS);
+    fn user(kept: &Value) -> &Value {
+        if kept["message"]["role"] == "user" {
+            &kept["message"]["content"]
+        } else {
+            &Value::Null
+        }
+    }
+    let texts = published_user_texts("openclaw", &events, user);
+    assert_eq!(
+        texts,
+        [
+            "CANARY-OPENCLAW-7 please list the files",
+            "CANARY-OPENCLAW-8 please look at README.md and tell me what it says",
+            "CANARY-OPENCLAW-9 a third prompt",
+            "CANARY-OPENCLAW-10 a prompt after compaction",
+            "CANARY-OPENCLAW-11 a prompt after the gateway compaction",
+        ]
+    );
+    for event in &events {
+        if event["type"] != "message" {
+            assert_eq!(published("openclaw", event), None, "{event}");
+        }
+    }
+    let typed = events
+        .iter()
+        .find(|event| event["message"]["content"] == "CANARY-OPENCLAW-9 a third prompt")
+        .unwrap();
+    for (field, value) in [
+        ("__openclaw", json!({"senderIsOwner": false})),
+        ("idempotencyKey", json!("k:system")),
+        (
+            "content",
+            json!([{"type":"text","text":"CANARY-OPENCLAW-9 a third prompt"}]),
+        ),
+        ("attachments", json!([])),
+    ] {
+        let mut other = typed.clone();
+        other["message"][field] = value;
+        assert_eq!(published("openclaw", &other), None, "{field}");
     }
 }
