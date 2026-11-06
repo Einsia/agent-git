@@ -11,7 +11,12 @@ use std::{
 mod startup_cache;
 
 fn command(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+    command_from(Path::new(env!("CARGO_BIN_EXE_agit")), root, args)
+}
+
+/// [`command`] run from the agit at `exe`.
+fn command_from(exe: &Path, root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(exe);
     let path = std::iter::once(root.join("bin"))
         .chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -62,12 +67,47 @@ impl Drop for Stop<'_> {
     }
 }
 
-/// A fresh daemon recovers the standard archive without a viewer, prompt, or runtime launch.
-/// Disabled publication retains the durable job across another daemon restart.
-#[test]
-fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
+/// A completed turn on disk and its archive job, for a daemon to recover: a landed repository
+/// whose branch does not yet hold the turn, the native transcript, and the roster and workspace
+/// rows that bind it. The job is written by [`CompletedTurn::queue`], so a test decides when the
+/// daemon may see it.
+struct CompletedTurn {
+    repo: std::path::PathBuf,
+    branch: &'static str,
+    transcript: std::path::PathBuf,
+    text: String,
+    job_path: std::path::PathBuf,
+    job: String,
+}
+
+impl CompletedTurn {
+    fn queue(&self) {
+        std::fs::write(&self.job_path, &self.job).unwrap();
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn head(&self) -> String {
+        self.git(&["rev-parse", &format!("refs/heads/{}", self.branch)])
+    }
+}
+
+fn completed_turn(root: &Path) -> CompletedTurn {
     let cwd = root.join("workspace");
     let home = root.join("agit-home");
     let rc = home.join("desktop-rc");
@@ -178,7 +218,7 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
     let jobs = rc.join("pending-archives");
     std::fs::create_dir_all(&jobs).unwrap();
     let job_path = jobs.join(filename);
-    std::fs::write(&job_path, job.to_string()).unwrap();
+    let job = job.to_string();
     // The conversation runs in a project the device's RC workspace binds, as a Hub-started one does.
     std::fs::write(
         rc.join("workspaces.json"),
@@ -191,6 +231,33 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
             "agit_session":lineage,"expected_agent_id":repository_id,"prior_threads":[],"ever_dangerous":false
         }}
     }).to_string()).unwrap();
+    CompletedTurn {
+        repo,
+        branch,
+        transcript,
+        text,
+        job_path,
+        job,
+    }
+}
+
+/// A fresh daemon recovers the standard archive without a viewer, prompt, or runtime launch.
+/// Disabled publication retains the durable job across another daemon restart.
+#[test]
+fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let rc = root.join("agit-home").join("desktop-rc");
+    let turn = completed_turn(&root);
+    turn.queue();
+    let (repo, branch, transcript, text, job_path) = (
+        turn.repo.clone(),
+        turn.branch,
+        turn.transcript.clone(),
+        turn.text.clone(),
+        turn.job_path.clone(),
+    );
+    let git = |args: &[&str]| turn.git(args);
     let before = git(&["rev-parse", &format!("refs/heads/{branch}")]);
     let _stop = Stop(&root);
     for pass in 0..2 {
@@ -260,6 +327,61 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
                 .unwrap()
                 .status
                 .success()
+        );
+    }
+}
+
+/// A daemon whose executable an upgrade replaces while it runs still settles its work: every
+/// subprocess it starts for it (landing, the commit, its privacy worker) runs the daemon's own
+/// build, not what now sits at the installed path. One that started from the path would run the
+/// new binary's arguments and replies as its own, or find nothing there once the file is renamed
+/// over, and the turn would stay unsettled until the daemon is replaced.
+#[test]
+fn a_binary_replaced_under_a_running_daemon_still_settles_its_turns() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let turn = completed_turn(&root);
+    let installed = root.join("install").join("agit");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_agit"), &installed).unwrap();
+    let before = turn.head();
+    let _stop = Stop(&root);
+    let started = command_from(&installed, &root, &["rc", "local", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // The upgrade renames another program over the installed path; it records every start.
+    let ran = root.join("replacement-ran");
+    let replacement = root.join("install").join(".agit-new");
+    std::fs::write(
+        &replacement,
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\nexit 1\n", ran.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&replacement, &installed).unwrap();
+    turn.queue();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while turn.head() == before {
+        assert!(
+            Instant::now() < deadline,
+            "the replaced daemon did not settle the turn:\n{}",
+            daemon_output(&root.join("agit-home").join("desktop-rc"))
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Only the installation watch, which looks for the new build on purpose, may run it.
+    for line in std::fs::read_to_string(&ran).unwrap_or_default().lines() {
+        assert!(
+            line.starts_with("rc local "),
+            "a subprocess for the work ran the replaced binary: {line}"
         );
     }
 }

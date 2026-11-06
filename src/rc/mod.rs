@@ -86,6 +86,7 @@ pub(crate) mod folder_cutoff;
 pub mod grants;
 pub mod harness;
 pub mod identity;
+pub(crate) mod images;
 pub mod journal;
 pub(crate) mod lease;
 pub mod lifecycle;

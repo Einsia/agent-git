@@ -177,7 +177,7 @@ impl Request {
                     source.generation.to_string(),
                 ]);
             }
-            let exe = std::env::current_exe().map_err(|_| {
+            let exe = crate::infra::own_image::own_image().map_err(|_| {
                 Failure::Invalid(RpcError::new(
                     ErrorCode::Internal,
                     "capture program is unavailable",
@@ -187,6 +187,10 @@ impl Request {
                 tokio::process::Command::from(crate::infra::background::command(&exe));
             command
                 .args(args)
+                .env(
+                    crate::infra::own_image::PARENT_BUILD,
+                    crate::infra::own_image::BUILD,
+                )
                 .env(
                     crate::rc::capture::CAPTURE_ENV,
                     serde_json::to_string(

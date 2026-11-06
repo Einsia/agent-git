@@ -14,14 +14,7 @@ type SocketSink = Pin<Box<dyn Sink<Message, Error = anyhow::Error> + Send>>;
 type SocketSource = Pin<Box<dyn Stream<Item = crate::Result<Message>> + Send>>;
 
 pub fn worker_executable() -> crate::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(format!("/proc/{}/exe", std::process::id()).into())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(std::env::current_exe()?)
-    }
+    Ok(crate::infra::own_image::own_image()?)
 }
 
 pub async fn connect(

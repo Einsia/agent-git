@@ -91,13 +91,16 @@ fn worker_executable() -> std::io::Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("AGIT_TEST_PRIVACY_WORKER") {
         return Ok(path.into());
     }
-    std::env::current_exe()
+    crate::infra::own_image::own_image()
 }
 
 impl Process {
     fn start() -> crate::Result<Self> {
         let mut command = Command::new(worker_executable()?);
-        command.arg(worker::WORKER);
+        command.arg(worker::WORKER).env(
+            crate::infra::own_image::PARENT_BUILD,
+            crate::infra::own_image::BUILD,
+        );
         Self::spawn(command)
     }
 
@@ -1592,7 +1595,7 @@ pub fn schedule_sync(hub: &str) {
         return;
     }
     let started = (|| -> crate::Result<Child> {
-        let mut command = Command::new(std::env::current_exe()?);
+        let mut command = crate::infra::own_image::command()?;
         command
             .args([worker::SYNC, hub])
             .stdin(Stdio::null())

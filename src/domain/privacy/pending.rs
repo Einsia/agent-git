@@ -87,6 +87,16 @@ fn now() -> u64 {
 /// wait ends by itself. A reason about this device's rules or about the content does not end by
 /// waiting, so it names what the person can do; any other reason is the worker's state, and the
 /// next attempt retries.
+/// Whether a wait's reason says the privacy worker could not run at all: it did not start, broke,
+/// or is held back after either. Such a wait ends by itself on a later attempt; one that keeps
+/// recurring points at a fault `agit doctor` names.
+pub fn worker_unavailable(reason: &str) -> bool {
+    matches!(reason, "spawn_failed" | "backoff" | "protocol_error")
+}
+
+/// What to do when a [`worker_unavailable`] wait keeps recurring.
+pub const WORKER_UNAVAILABLE_STEP: &str = "if it keeps failing, run `agit doctor`";
+
 pub fn steps(reason: &str) -> Option<Vec<String>> {
     match reason {
         "device_rules" => Some(super::service::unreadable_rule_hints().unwrap_or_else(|_| {

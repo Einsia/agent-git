@@ -185,7 +185,7 @@ pub(crate) async fn prepare(
     }
     let lineage = job.session()?;
     let repo = crate::rc::capture::require(&lineage)?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::infra::own_image::own_image()?;
     let mut land_args = crate::commands::rc::land_argv(
         &lineage.slug(),
         lineage.agent_id(),
@@ -443,7 +443,7 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
     );
     let lineage = job.session()?;
     let repo = crate::rc::capture::require(&lineage)?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::infra::own_image::own_image()?;
     let saved = Entry::load(&repo, &request)?.context("archive publication intent is missing")?;
     if saved.publication.is_none() {
         let mut result = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
@@ -501,6 +501,10 @@ fn command(
     let mut command = tokio::process::Command::new(exe);
     command
         .args(args)
+        .env(
+            crate::infra::own_image::PARENT_BUILD,
+            crate::infra::own_image::BUILD,
+        )
         .current_dir(&job.cwd)
         .env("AGIT_SESSION", &job.lineage)
         .env("AGIT_LOCAL_AGENT_ID", lineage.agent_id())

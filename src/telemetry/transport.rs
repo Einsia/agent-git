@@ -275,10 +275,9 @@ pub(crate) fn spawn_worker(hub: &str) {
     if state::override_reason(hub).is_some() || state::debug(hub) {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(mut command) = crate::infra::own_image::command() else {
         return;
     };
-    let mut command = std::process::Command::new(exe);
     command
         .arg("--internal-telemetry-flush")
         .env("AGIT_HUB_URL", hub)
