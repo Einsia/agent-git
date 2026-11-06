@@ -249,9 +249,10 @@ pub fn run(args: Args) -> CmdResult {
         if remaining > 0 {
             println!("{}", ui::dim(&format!("… {remaining} more")));
         }
-        print_privacy_waits(&links);
         print_publication_waits(&links);
     }
+    // Also with no links yet: a conversation waiting for its first landing has none.
+    print_privacy_waits(&links);
 
     if !inventory_complete {
         ui::warning("status is incomplete: some local session claims cannot be inspected");
@@ -905,6 +906,32 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
             if entry.turns == 1 { "" } else { "s" },
             if ends.is_none() {
                 ", and the next settlement tries again"
+            } else {
+                ""
+            },
+        ));
+        for step in ends.into_iter().flatten() {
+            if !steps.contains(&step) {
+                steps.push(step);
+            }
+        }
+    }
+    // A conversation the daemon observes has no link until its first landing, and a landing
+    // that waited for the privacy check left none: its wait shows here, so it never stalls
+    // unseen.
+    for (session, entry) in &waiting {
+        if links.iter().any(|link| &link.session_id == session) {
+            continue;
+        }
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
+        let ends = crate::domain::privacy::pending::steps(&entry.reason);
+        ui::warning(&format!(
+            "a conversation not saved yet ({}): privacy check pending ({}) since {}{}",
+            crate::domain::link::short(session),
+            entry.reason,
+            ui::ago(since),
+            if ends.is_none() {
+                "; the next attempt tries again"
             } else {
                 ""
             },

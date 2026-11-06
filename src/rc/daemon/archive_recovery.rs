@@ -12,6 +12,15 @@ const BATCH: usize = 16;
 /// A privacy wait can end by itself (a deadline, a worker back-off) without anything recording
 /// that it did, so a job waiting on one is attempted again after this long.
 const PRIVACY_RECHECK: Duration = Duration::from_secs(30 * 60);
+/// A wait whose reason is only that the worker did not answer in time (see
+/// [`crate::domain::privacy::service::transient`]) is asked again this many times, this far
+/// apart, before its job parks: a finished turn is not held for the recheck because the worker
+/// was slow to start once. The spacing outlasts the worker's own back-off after a failure.
+pub(super) const QUICK_TRIES: u32 = 3;
+pub(super) const QUICK_DELAY: Duration = Duration::from_secs(10);
+/// Held through each quick try, by recovery and by observation alike, so a loaded machine never
+/// has more than one of them waiting on the worker at a time.
+pub(super) static QUICK_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Reading the automatic-publication setting starts Git, so a job waiting for it to be turned
 /// on reads it this often rather than every cycle.
 const PUSH_RECHECK: Duration = Duration::from_secs(60);
@@ -158,6 +167,15 @@ async fn recover(
         for job in recovery_batch(jobs) {
             let Some(_work) = admission.enter() else {
                 return;
+            };
+            // A quick try that finds another one waiting on the worker keeps its place.
+            let _quick = if schedule.in_quick(&job) {
+                match QUICK_GATE.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => continue,
+                }
+            } else {
+                None
             };
             let Some(outcome) = attempt(&daemon, &job, &mut stop).await else {
                 return;
@@ -453,6 +471,8 @@ impl Park {
 struct Schedule {
     /// One capture's jobs share an attempt, so they share its delay.
     retry: HashMap<String, Retry>,
+    /// The quick tries each capture has used since its last success.
+    quick: HashMap<String, u32>,
     /// Jobs that wait for their claim or for state outside the job.
     parked: HashMap<String, Park>,
     /// Jobs this daemon has considered; the schedule starts empty after a restart.
@@ -468,6 +488,24 @@ impl Schedule {
         self.parked.retain(|id, _| ids.contains(id));
         self.seen.retain(|id| ids.contains(id));
         self.retry.retain(|capture, _| captures.contains(capture));
+        self.quick.retain(|capture, _| captures.contains(capture));
+    }
+
+    /// Whether the next attempt of `job` is one of its quick tries.
+    fn in_quick(&self, job: &Job) -> bool {
+        self.quick
+            .get(&job.capture_key())
+            .is_some_and(|tries| (1..=QUICK_TRIES).contains(tries))
+            && !self.parked.contains_key(&job.filename())
+    }
+
+    /// Whether `job`, waiting for the privacy check as `evidence` records, still has a quick try.
+    fn quick_try(&self, job: &Job, evidence: &Evidence) -> bool {
+        evidence.privacy.as_ref().is_some_and(|wait| {
+            wait.refused_bytes.is_none()
+                && crate::domain::privacy::service::transient(&wait.reason)
+                && self.quick.get(&job.capture_key()).copied().unwrap_or(0) < QUICK_TRIES
+        })
     }
 
     /// Jobs whose automatic-publication setting is due to be read again.
@@ -489,7 +527,7 @@ impl Schedule {
                 return false;
             }
             self.parked.remove(&id);
-        } else if unseen && evidence.privacy.is_some() {
+        } else if unseen && evidence.privacy.is_some() && !self.quick_try(job, evidence) {
             // The privacy wait is durable and the schedule is not: after a restart, an attempt
             // at once would meet the same wait.
             self.parked.insert(
@@ -507,6 +545,7 @@ impl Schedule {
         let error = match outcome {
             Outcome::Published => {
                 self.retry.remove(&job.capture_key());
+                self.quick.remove(&job.capture_key());
                 self.parked.remove(&job.filename());
                 return;
             }
@@ -525,7 +564,30 @@ impl Schedule {
                     until: Until::Claim,
                 })
             }
+            Class::Waits(Waiting::Privacy) if self.quick_try(job, &evidence) => {
+                let tries = self.quick.entry(job.capture_key()).or_default();
+                *tries += 1;
+                eprintln!(
+                    "agitd: completed turn archive waits for the privacy worker ({}, turn {}); quick try {tries} of {QUICK_TRIES} in {}s",
+                    job.logical,
+                    job.turn_id,
+                    QUICK_DELAY.as_secs()
+                );
+                self.parked.remove(&job.filename());
+                self.retry.insert(
+                    job.capture_key(),
+                    Retry {
+                        failures: 0,
+                        at: now + retry_delay(QUICK_DELAY),
+                    },
+                );
+                return;
+            }
             Class::Waits(Waiting::Privacy) => {
+                // Its quick tries, if it had any, are spent until the archive succeeds.
+                if let Some(tries) = self.quick.get_mut(&job.capture_key()) {
+                    *tries = QUICK_TRIES + 1;
+                }
                 eprintln!(
                     "agitd: completed turn archive waits for the privacy check ({}, turn {}); `agit status` names the reason",
                     job.logical, job.turn_id
@@ -911,16 +973,16 @@ mod tests {
         assert_eq!(Class::of(&Interrupted::Yielded.into()), Class::Yielded);
     }
 
-    /// A privacy wait parks its job instead of backing off: it is attempted again when the
-    /// session's wait changes or ends, or after the recheck (never for a refused record), and a
-    /// restart that finds the wait recorded does not attempt at once. A schedule that treated
-    /// the wait as a transient failure would be due again within a minute.
+    /// A privacy wait that a retry meets again parks its job instead of backing off: it is
+    /// attempted again when the session's wait changes or ends, or after the recheck (never for a
+    /// refused record), and a restart that finds the wait recorded does not attempt at once. A
+    /// schedule that treated the wait as a transient failure would be due again within a minute.
     #[test]
     fn privacy_waits_park_until_the_wait_ends_and_across_a_restart() {
         let root = tempfile::tempdir().unwrap();
         let job = crate::rc::archive_jobs::tests::fixture(root.path());
         let wait = pending::Waiting {
-            reason: "deadline".into(),
+            reason: "findings_cap".into(),
             turns: 1,
             since: 0,
             refused_bytes: None,
@@ -956,6 +1018,81 @@ mod tests {
         assert!(!restarted.due(&job, &waiting, start));
         assert!(!restarted.due(&job, &waiting, start + PRIVACY_RECHECK / 2));
         assert!(restarted.due(&job, &claimed(Some("claim")), start));
+    }
+
+    /// A wait whose reason is only that the worker did not answer in time is asked again a few
+    /// times, a short delay apart, and only then parks; one whose reason a retry meets again parks
+    /// at once, as does a refused record. A restart that finds a transient wait recorded tries
+    /// at once. A schedule that parked every wait would hold a finished turn for the recheck
+    /// because the worker was slow to start once.
+    #[test]
+    fn a_worker_that_did_not_answer_in_time_is_asked_again_shortly_before_the_job_parks() {
+        let root = tempfile::tempdir().unwrap();
+        let job = crate::rc::archive_jobs::tests::fixture(root.path());
+        let waiting = |reason: &str, refused_bytes: Option<u64>| Evidence {
+            privacy: Some(pending::Waiting {
+                reason: reason.into(),
+                turns: 1,
+                since: 0,
+                refused_bytes,
+            }),
+            ..claimed(Some("claim"))
+        };
+        let slow = waiting("deadline", None);
+        let error =
+            || Outcome::Failed(anyhow::Error::from(Waiting::Privacy).context("archive recovery"));
+        let start = Instant::now();
+
+        let mut schedule = Schedule::default();
+        assert!(schedule.due(&job, &slow, start));
+        let mut now = start;
+        for _ in 0..QUICK_TRIES {
+            schedule.record(&job, error(), slow.clone(), now);
+            assert!(!schedule.due(&job, &slow, now + QUICK_DELAY / 2));
+            now += QUICK_DELAY;
+            assert!(schedule.due(&job, &slow, now));
+        }
+        schedule.record(&job, error(), slow.clone(), now);
+        assert!(!schedule.due(&job, &slow, now + QUICK_DELAY));
+        assert!(!schedule.due(&job, &slow, now + PRIVACY_RECHECK / 2));
+        assert!(schedule.due(&job, &slow, now + PRIVACY_RECHECK));
+        schedule.record(&job, Outcome::Published, claimed(Some("claim")), now);
+        schedule.record(&job, error(), slow.clone(), now);
+        assert!(schedule.due(&job, &slow, now + QUICK_DELAY));
+
+        for lasting in [waiting("device_rules", None), waiting("deadline", Some(1))] {
+            let mut schedule = Schedule::default();
+            schedule.record(&job, error(), lasting.clone(), start);
+            assert!(!schedule.due(&job, &lasting, start + QUICK_DELAY));
+            assert!(!schedule.due(&job, &lasting, start + PRIVACY_RECHECK / 2));
+        }
+
+        let mut restarted = Schedule::default();
+        assert!(restarted.due(&job, &slow, start));
+        let lasting = waiting("legacy_rules", None);
+        assert!(!Schedule::default().due(&job, &lasting, start));
+
+        use crate::domain::privacy::service::transient;
+        for reason in [
+            "deadline",
+            "lock_busy",
+            "backoff",
+            "spawn_failed",
+            "store_busy",
+            "protocol_error",
+            "source_incomplete",
+        ] {
+            assert!(transient(reason), "{reason}");
+        }
+        for reason in [
+            "device_rules",
+            "legacy_rules",
+            "oversize",
+            "findings_cap",
+            "unknown",
+        ] {
+            assert!(!transient(reason), "{reason}");
+        }
     }
 
     /// A job committed locally while automatic publication is off is not landed and committed

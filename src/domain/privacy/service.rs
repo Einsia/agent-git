@@ -540,6 +540,23 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
     }
 }
 
+/// Whether a wait reported under `reason` (a [`reason_name`]) can pass when the worker is asked
+/// again shortly: it was busy, starting, backing off, out of budget, garbled its reply, or could
+/// not load the whole policy yet. The other reasons, and one this build doesn't know, name
+/// something the person has to change.
+pub fn transient(reason: &str) -> bool {
+    matches!(
+        reason,
+        "deadline"
+            | "lock_busy"
+            | "backoff"
+            | "spawn_failed"
+            | "store_busy"
+            | "protocol_error"
+            | "source_incomplete"
+    )
+}
+
 fn skipped(text: &str, reason: Reason) -> Outcome {
     let mut outcome = Outcome::skipped(text);
     outcome.reason = Some(reason);

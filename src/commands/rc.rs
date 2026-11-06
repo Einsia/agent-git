@@ -505,11 +505,30 @@ fn land(args: LandArgs) -> CmdResult {
     let created_tip = created.then(|| created_tip(&repo, &args.branch)).flatten();
     super::migration::finish_external_history_update(&repo, history_update)?;
     if created {
-        declare_or_remove(&repo, &args.branch, &lk, created_tip.as_deref())?;
+        privacy_wait(
+            &lk,
+            declare_or_remove(&repo, &args.branch, &lk, created_tip.as_deref()),
+        )?;
     }
 
     crate::domain::link::write(&store, &lk)?;
     Ok(ExitCode::Ok)
+}
+
+/// `result`, after recording a privacy wait it ended on under the conversation's claim, where
+/// `agit status` and the daemon that asked for this landing read it.
+fn privacy_wait<T>(link: &crate::domain::link::Link, result: crate::Result<T>) -> crate::Result<T> {
+    if let Err(error) = &result
+        && let Some(pending) = error.downcast_ref::<crate::domain::privacy::service::Pending>()
+    {
+        crate::domain::privacy::pending::record(
+            &link.session_id,
+            crate::domain::privacy::service::reason_name(pending.reason),
+            1,
+            None,
+        );
+    }
+    result
 }
 
 fn land_local(args: LandArgs) -> CmdResult {
@@ -565,7 +584,10 @@ fn land_local(args: LandArgs) -> CmdResult {
         let created_tip = created.then(|| created_tip(&repo, &args.branch)).flatten();
         super::migration::finish_external_history_update(&repo, history_update)?;
         if created {
-            declare_or_remove(&repo, &args.branch, &link, created_tip.as_deref())?;
+            privacy_wait(
+                &link,
+                declare_or_remove(&repo, &args.branch, &link, created_tip.as_deref()),
+            )?;
         }
     } else if let Some(recovery) = history_update {
         recovery.clear()?;

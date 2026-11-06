@@ -296,3 +296,36 @@ fn status_checks_visible_repository_aliases_even_after_migration_completed() {
         assert_visible_checkout_recovery_guard(fixture.path(), &home, &original);
     }
 }
+
+/// A conversation that waits for the privacy check before its first landing has no session link
+/// yet, and `agit status` still shows the wait: what ends it, or that the next attempt tries
+/// again. A status that listed only linked waits would leave such a conversation stalled unseen.
+#[test]
+fn a_wait_before_a_conversations_first_landing_shows_in_status() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("agit");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("privacy-pending.json"),
+        serde_json::json!({
+            "native-slow-0001": {"reason": "deadline", "turns": 1, "since": 0},
+            "native-rule-0002": {"reason": "findings_cap", "turns": 1, "since": 0},
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = status(&home, "http://127.0.0.1:9", &["status"]);
+    assert_success(&output);
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("a conversation not saved yet (")
+            && said.contains("privacy check pending (deadline)")
+            && said.contains("; the next attempt tries again"),
+        "{said}"
+    );
+    assert!(
+        said.contains("privacy check pending (findings_cap)")
+            && said.contains("`agit scan` shows where they are"),
+        "{said}"
+    );
+}
