@@ -1099,7 +1099,9 @@ const REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 const REPLY_TAIL_BYTES: u64 = 1 << 20;
 
 /// Whether the transcript's end holds conversation after its last completed turn, or does not yet
-/// hold the prompt that opened the turn the Stop ended.
+/// hold the prompt that opened the turn the Stop ended. A transcript not written yet awaits it too:
+/// a one-turn `claude -p` creates its transcript only after the Stop hook runs, and that file is
+/// also what says where the conversation started, so settling before it exists captures nothing.
 ///
 /// Claude Code runs Stop hooks before its transcript writer flushes the turn's final reply. A
 /// Stop that settled what it reads would leave the turn unsettled, and after the last turn before
@@ -1110,8 +1112,9 @@ const REPLY_TAIL_BYTES: u64 = 1 << 20;
 /// wait, which finds its prompt further back.
 fn tail_awaits_reply(transcript: &std::path::Path, prompt: Option<&str>) -> bool {
     use std::io::{Read as _, Seek as _};
-    let Ok(mut file) = std::fs::File::open(transcript) else {
-        return false;
+    let mut file = match std::fs::File::open(transcript) {
+        Ok(file) => file,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
     let Ok(len) = file.metadata().map(|meta| meta.len()) else {
         return false;
@@ -1286,12 +1289,15 @@ mod tests {
     /// The Stop hook reads only the transcript's end, so an unanswered record longer than that
     /// window (a pasted image, a large tool result) is cut where the read starts. A check that
     /// judged only the records it could parse would find none, settle at once, and leave the
-    /// last turn before `/exit` unsettled.
+    /// last turn before `/exit` unsettled. A Stop that arrives before the transcript exists waits
+    /// for it the same way; a check that took a missing transcript for an answered turn would
+    /// settle at once, find no start directory, and capture nothing.
     #[test]
-    fn an_unanswered_record_longer_than_the_read_window_still_awaits_its_reply() {
+    fn a_turn_its_transcript_does_not_hold_yet_awaits_its_reply() {
         use std::io::Write as _;
         let temp = tempfile::tempdir().unwrap();
         let transcript = temp.path().join("session.jsonl");
+        assert!(super::tail_awaits_reply(&transcript, Some("prompt-1")));
         let text = "x".repeat(super::REPLY_TAIL_BYTES as usize);
         let prompt = serde_json::json!({"type":"user","message":{"role":"user","content":text}});
         std::fs::write(&transcript, format!("{prompt}\n")).unwrap();
