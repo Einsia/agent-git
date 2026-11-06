@@ -8985,7 +8985,9 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
 /// same name after the upload, and a turn another computer adds on top of the Hub tip, are still a
 /// divergence. Taking the record's word without checking that the branch holds the turn continues
 /// the new branch over the published one; mapping any Hub tip that descends from a published turn
-/// continues past the other computer's turn.
+/// continues past the other computer's turn. A branch that tracks the Hub's is held to have
+/// integrated its tracking ref when that ref is the published form of a turn it holds; read as a
+/// commit to merge in, the uploader is told to merge its own turn.
 #[test]
 fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
     const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000005";
@@ -9120,6 +9122,27 @@ fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
         "{pulled}"
     );
     assert_eq!(head(), turn);
+    // With the branch tracking the Hub's, its tracking ref names the published form, a sibling of
+    // the turn, and run and resume still take it as the turn: read as a tip to merge in, the
+    // computer that uploaded would be told to merge its own turn.
+    repo.git(&["branch", "--quiet", "--set-upstream-to=origin/talk", "talk"])
+        .unwrap();
+    assert_eq!(
+        repo.git(&["rev-parse", "talk@{upstream}"]).unwrap().trim(),
+        published
+    );
+    for args in CONTINUE {
+        let output = run(args);
+        assert_success(&output);
+        assert!(
+            !said(&output).contains("not integrated"),
+            "{args:?}: {}",
+            said(&output)
+        );
+        assert_eq!(head(), turn, "{args:?}");
+    }
+    repo.git(&["branch", "--quiet", "--unset-upstream", "talk"])
+        .unwrap();
 
     // `talk` deleted here and started again under its name, as `agit branch rm` and
     // `agit new -b talk` leave it: the Hub tip publishes a turn this branch does not hold.

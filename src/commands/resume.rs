@@ -1637,6 +1637,13 @@ impl ResumeTracking {
         let Some(oid) = &self.oid else {
             return Ok(true);
         };
+        // After an upload that leaves records out, the tracking ref names the turn's published
+        // form, a sibling of the local turn rather than an ancestor; the accepted publication
+        // record says which local commit it stands for, and that commit is what must be held.
+        let projections = crate::domain::privacy_git::Projections::open(repo);
+        if super::pull::published_from(repo, &projections, branch, head, oid).is_some() {
+            return Ok(true);
+        }
         let (status, _, error) =
             repo.git_status_local(&["merge-base", "--is-ancestor", oid, head])?;
         match status {
