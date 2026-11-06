@@ -2485,6 +2485,18 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     );
     assert_eq!(previews(), before + 1);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
+    // Pushing the kept-back branch yourself is how the person learns why it is kept back: it
+    // names the reason and sends nothing, not even a preview.
+    let before = previews();
+    let asked = run(&["--yes", "push", "alice/app@work"]);
+    assert!(!asked.status.success(), "{asked:?}");
+    assert!(
+        text(&asked)
+            .contains("will not be uploaded from this computer: the conversation was dropped"),
+        "{asked:?}"
+    );
+    assert_eq!(previews(), before);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), published);
     fs::remove_file(&withheld).unwrap();
 
     // A push in parts whose retry is not the publication the `--yes` was given for: the repository

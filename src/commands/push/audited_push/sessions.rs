@@ -27,7 +27,8 @@ pub(super) fn run(
         for (branch, verdict) in branches.iter().zip(verdicts) {
             if let Some(reason) = verdict {
                 anyhow::bail!(
-                    "`{slug}@{branch}` will not be uploaded from this computer: {}",
+                    "`{slug}@{branch}` {}: {}",
+                    crate::commands::push::WITHHELD_HERE,
                     reason.describe()
                 );
             }

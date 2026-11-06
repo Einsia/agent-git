@@ -365,7 +365,7 @@ fn publish(mut args: Args) -> CmdResult {
                     None => reason.describe().to_owned(),
                 };
                 ui::error(&format!(
-                    "`{}@{branch}` will not be uploaded from this computer: {why}.",
+                    "`{}@{branch}` {WITHHELD_HERE}: {why}.",
                     checkout.slug(),
                 ));
                 ui::hint("its local history stays; nothing was sent to the Hub");
@@ -594,6 +594,10 @@ fn acknowledged_unchanged(
 /// How a push says that a session branch is larger than the Hub accepts. Project capture reads it
 /// in a failed child's message to tell the person why, so it is one fixed phrase.
 pub(crate) const OVERSIZED: &str = "holds more event entries than the Hub accepts";
+
+/// How a push says that a folder's capture rule keeps a branch back, read by project capture as
+/// [`OVERSIZED`] is; the next turn meets it again.
+pub(crate) const WITHHELD_HERE: &str = "will not be uploaded from this computer";
 
 /// How a push says that a session branch builds on a session withdrawn on the Hub, read by
 /// project capture as [`OVERSIZED`] is.
