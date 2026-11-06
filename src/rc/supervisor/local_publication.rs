@@ -35,9 +35,7 @@ impl Session {
                 .agit_session
                 .as_ref()
                 .context("capture binding is missing")?;
-            let Some(destination) =
-                crate::rc::capture::destination(&repo, lineage, &crate::infra::config::hub_url())?
-            else {
+            let Some(destination) = crate::rc::capture::destination(&repo, lineage)? else {
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Configuration);
                 status.reason = Some(Reason::DestinationMissing);
@@ -46,11 +44,6 @@ impl Session {
             ensure!(
                 lineage.agent_id() == local_agent_id,
                 "RC source repository identity changed"
-            );
-            ensure!(
-                destination.identity.hub
-                    == crate::hub::identity::normalize_hub(&crate::infra::config::hub_url())?,
-                "RC publication Hub changed"
             );
             let native_session_id = self
                 .driver
@@ -66,6 +59,15 @@ impl Session {
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Configuration);
                 status.reason = Some(Reason::PushDisabled);
+                return Ok(None);
+            }
+            // The status a child that cannot sign in reports below: the source stays here, and
+            // the next publication tries again.
+            if let Err(refusal) = destination.require_sign_in() {
+                tracing_note(&format!("{refusal:#}"));
+                status.readiness = Readiness::SetupRequired;
+                status.stage = Some(Stage::Consent);
+                status.reason = Some(Reason::ConsentRequired);
                 return Ok(None);
             }
             let mut request = SupervisorPushRequest {
@@ -101,14 +103,7 @@ impl Session {
             }
             let mut result = tempfile::NamedTempFile::new_in(repo.common_dir()?)?;
             result.write_all(&serde_json::to_vec(&request)?)?;
-            push.env(
-                crate::hub::identity::EXPECTED_AGENT_ID_ENV,
-                &request.destination.agent_id,
-            )
-            .env(
-                crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
-                result.path(),
-            );
+            direct(&mut push, &request, result.path());
             Ok(Some((repo, request, result)))
         })();
         let changed = Frame::notification(
@@ -211,6 +206,27 @@ impl Session {
             self.finish_publication_outcome(publish.await);
         }
     }
+}
+
+/// Makes `push`, an automatic publication child, carry out `request` and answer in `result`. The
+/// child resolves every Hub it calls from [`crate::infra::config::HUB_URL_ENV`], which names the
+/// request's destination Hub here, whichever Hub this process defaults to. Left on the default
+/// Hub, a child would send a turn recorded for another Hub there. Every supervised publication
+/// child is pointed through here.
+pub(super) fn direct(
+    push: &mut tokio::process::Command,
+    request: &SupervisorPushRequest,
+    result: &std::path::Path,
+) {
+    push.env(crate::infra::config::HUB_URL_ENV, &request.destination.hub)
+        .env(
+            crate::hub::identity::EXPECTED_AGENT_ID_ENV,
+            &request.destination.agent_id,
+        )
+        .env(
+            crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
+            result,
+        );
 }
 
 pub(super) fn result_receipt(

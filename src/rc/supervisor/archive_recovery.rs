@@ -313,6 +313,7 @@ pub(crate) async fn prepare(
         anyhow::bail!("archive commit does not cover the completed native turn");
     }
     let destination = publication_target(&repo, &lineage, &job.runtime, &job.native)?;
+    destination.require_sign_in()?;
     let mut request = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::now_v7().to_string(),
@@ -364,13 +365,8 @@ fn publication_target_by(
     native: &str,
     authority: Authority,
 ) -> crate::Result<crate::rc::capture::PublicationDestination> {
-    let destination = crate::rc::capture::destination_by(
-        repo,
-        lineage,
-        &crate::infra::config::hub_url(),
-        authority,
-    )?
-    .context("archive publication destination is not configured")?;
+    let destination = crate::rc::capture::destination_by(repo, lineage, authority)?
+        .context("archive publication destination is not configured")?;
     if !crate::commands::auto_push::publication_allowed(repo, &destination.repository)? {
         return Err(Waiting::PushDisabled.into());
     }
@@ -400,7 +396,6 @@ pub(crate) struct PublicationWait {
 /// and the identities without writing either.
 pub(crate) fn publication_waits()
 -> crate::Result<std::collections::BTreeMap<(String, String), PublicationWait>> {
-    let hub = crate::infra::config::hub_url();
     let mut waits = std::collections::BTreeMap::new();
     for (namespace, job) in crate::rc::archive_jobs::observe()? {
         let authority = Authority::Saved(namespace);
@@ -416,8 +411,7 @@ pub(crate) fn publication_waits()
         if !waiting {
             continue;
         }
-        let Ok(Some(destination)) =
-            crate::rc::capture::destination_by(&repo, &lineage, &hub, authority)
+        let Ok(Some(destination)) = crate::rc::capture::destination_by(&repo, &lineage, authority)
         else {
             continue;
         };
@@ -455,14 +449,7 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
         result.write_all(&serde_json::to_vec(&request)?)?;
         let mut push = command(&exe, &job, &lineage, &[]);
         crate::commands::auto_push::automatic_push(push.as_std_mut(), &job.lineage);
-        push.env(
-            crate::hub::identity::EXPECTED_AGENT_ID_ENV,
-            &request.destination.agent_id,
-        )
-        .env(
-            crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
-            result.path(),
-        );
+        local_publication::direct(&mut push, &request, result.path());
         let output = guarded_output(&mut state, lease, push)
             .await
             .context("archive publication was cancelled")?;

@@ -1279,6 +1279,7 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
         std::env::set_var("AGIT_HOME", home.path());
     }
     crate::rc::select_local_authority();
+    sign_in(&crate::infra::config::hub_url());
     let mut fixture = SettlementFixture::new(true);
     let selected = home.path().join("repos/desktop-fixture/project");
     std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
@@ -1591,6 +1592,225 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                     .count();
             }
             assert_eq!(notices, 1);
+        });
+    });
+}
+
+/// Saves a sign-in for `hub` in the selected home, as `agit login` leaves one.
+#[cfg(unix)]
+fn sign_in(hub: &str) {
+    crate::infra::credentials::save(
+        hub,
+        &crate::infra::credentials::HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: "fixture-access".into(),
+            access_expires_at: "2999-01-01T00:00:00Z".into(),
+            refresh_token: "fixture-refresh".into(),
+            refresh_expires_at: "2999-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+}
+
+/// On a computer signed in to two Hubs, a turn uploads to the Hub its destination records and
+/// to no other, whichever of the two the daemon defaults to; a destination on a Hub this computer
+/// holds no sign-in for is refused with the one line that names that Hub, and nothing is sent to
+/// either. Each fake Hub is a bare repository git reaches at that Hub's address. The child stands
+/// in for `agit __push-automatic`: it records which Hub its environment names, sends its one
+/// request there, and its receipt names that Hub, as every Hub request of the real child follows
+/// [`crate::infra::config::HUB_URL_ENV`]. A supervisor that leaves the child on the daemon's
+/// default Hub sends the dev turn to the default Hub; one that compares the destination with the
+/// default Hub refuses the dev turn; one that falls back to the default Hub without a sign-in
+/// uploads the last turn there.
+#[cfg(unix)]
+#[test]
+fn a_turn_uploads_only_to_the_hub_its_destination_records() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::settle_tests::a_turn_uploads_only_to_the_hub_its_destination_records",
+    ) {
+        return;
+    }
+    const DEFAULT: &str = "https://default.hub.invalid";
+    const DEV: &str = "https://dev.hub.invalid";
+    const UNSIGNED: &str = "https://elsewhere.hub.invalid";
+    let home = tempfile::tempdir().unwrap();
+    // Process isolation keeps this home and default Hub away from every other test.
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path());
+        std::env::set_var(crate::infra::config::HUB_URL_ENV, DEFAULT);
+    }
+    crate::rc::select_local_authority();
+    sign_in(DEFAULT);
+    sign_in(DEV);
+    let hubs = home.path().join("hubs");
+    let (default_hub, dev_hub) = (hubs.join("default.git"), hubs.join("dev.git"));
+    std::fs::create_dir_all(&hubs).unwrap();
+    for hub in [&default_hub, &dev_hub] {
+        fixture_git(&["init", "-q", "--bare", hub.to_str().unwrap()]);
+    }
+    let calls = home.path().join("child-hubs");
+    let mut fixture = SettlementFixture::new(true);
+    let selected = home.path().join("repos/desktop-fixture/project");
+    std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    std::fs::rename(&fixture.repo, &selected).unwrap();
+    let mut script = std::fs::read_to_string(&fixture.exe)
+        .unwrap()
+        .replace(fixture.repo.to_str().unwrap(), selected.to_str().unwrap());
+    fixture.repo = selected;
+    let mut rewrite = |from: &str, to: &str| {
+        assert_eq!(script.matches(from).count(), 1, "{from} in {script}");
+        script = script.replace(from, to);
+    };
+    rewrite(
+        "__push-automatic|push)\n",
+        &format!(
+            "__push-automatic|push)\n    printf '%s\\n' \"$AGIT_HUB_URL\" >> '{}'\n",
+            calls.display()
+        ),
+    );
+    rewrite(
+        " push -q origin ",
+        &format!(
+            " -c url.{}.insteadOf={DEV}/alice/photo.git -c url.{}.insteadOf={DEFAULT}/alice/photo.git push -q \"$AGIT_HUB_URL/alice/photo.git\" ",
+            dev_hub.display(),
+            default_hub.display(),
+        ),
+    );
+    rewrite(&format!("\"hub\":\"{DEFAULT}\""), "\"hub\":\"__HUB__\"");
+    rewrite(
+        "s/__PUBLISHED__/$published/g\"",
+        "s/__PUBLISHED__/$published/g; s|__HUB__|$AGIT_HUB_URL|g\"",
+    );
+    std::fs::write(&fixture.exe, script).unwrap();
+    let received = |hub: &std::path::Path| {
+        fixture_git(&[
+            "--git-dir",
+            hub.to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+        ])
+    };
+    let children = || std::fs::read_to_string(&calls).unwrap_or_default();
+    let publication = |frames: &[Frame]| {
+        frames
+            .iter()
+            .rev()
+            .find(|frame| frame.method() == method::SESSION_PUBLICATION_CHANGED)
+            .expect("the settlement reports its publication")
+            .params
+            .as_ref()
+            .unwrap()["publication"]
+            .clone()
+    };
+    crate::rc::with_agit_home(home.path(), || {
+        let local_id = "00000000-0000-0000-0000-000000000002";
+        let remote_id = "6f35cd22-85ae-4ed5-a106-2d9069d6b346";
+        let repo = crate::domain::repo::Repo::at(&fixture.repo);
+        let state = crate::rc::state_dir("desktop-rc").unwrap();
+        std::fs::write(
+            state.join("identity.json"),
+            serde_json::json!({
+                "machine_fingerprint":"fixture", "display_name":"Fixture", "created_at":"fixture"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        repo.git(&["config", "agit.desktopIdentity", local_id])
+            .unwrap();
+        repo.git(&["config", "agit.desktopAuthority", "local:fixture"])
+            .unwrap();
+        repo.set_auto_push(Some(true)).unwrap();
+        let lineage = crate::rc::lineage::AgitSession::new(
+            "desktop-fixture/project",
+            local_id,
+            &fixture.branch,
+        )
+        .unwrap();
+        // The capture's destination: its repository pin and its confirmed publication target.
+        let route = |hub: &str| {
+            let identity = crate::hub::identity::RemoteIdentity::new(hub, remote_id).unwrap();
+            let pinned = crate::hub::identity::read(&repo).unwrap().unwrap();
+            crate::hub::identity::rebind(&repo, &pinned, &identity).unwrap();
+            repo.git(&[
+                "config",
+                "agit.desktopPublication",
+                &serde_json::json!({
+                    "version":1, "local_agent_id":local_id, "repository":"alice/photo",
+                    "identity":identity,
+                })
+                .to_string(),
+            ])
+            .unwrap();
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut session, mut out, _notes, authority, _) = fixture.session();
+            session.agit_session = Some(lineage.clone());
+            authority.send_modify(|state| {
+                state.local_owner = true;
+                state.agent_identity_v1 = false;
+            });
+
+            route(DEV);
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            let dev_turn = fixture.head();
+            assert_eq!(children(), format!("{DEV}\n"));
+            assert_eq!(
+                received(&dev_hub),
+                format!("{dev_turn} refs/heads/{}", fixture.branch)
+            );
+            assert_eq!(received(&default_hub), "", "the default Hub is never asked");
+            assert_eq!(publication(&frames)["progress"], "awaiting_ack");
+
+            route(DEFAULT);
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            let default_turn = fixture.head();
+            assert_ne!(default_turn, dev_turn);
+            assert_eq!(children(), format!("{DEV}\n{DEFAULT}\n"));
+            assert_eq!(
+                received(&default_hub),
+                format!("{default_turn} refs/heads/{}", fixture.branch)
+            );
+            assert_eq!(
+                received(&dev_hub),
+                format!("{dev_turn} refs/heads/{}", fixture.branch),
+                "the dev Hub receives nothing of the default Hub's turn"
+            );
+            assert_eq!(publication(&frames)["progress"], "awaiting_ack");
+
+            route(UNSIGNED);
+            let sent = (children(), received(&default_hub), received(&dev_hub));
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert_ne!(fixture.head(), default_turn, "the turn is saved here");
+            assert_eq!(
+                (children(), received(&default_hub), received(&dev_hub)),
+                sent,
+                "no child starts and no Hub receives anything"
+            );
+            let refused = publication(&frames);
+            assert_eq!(refused["readiness"], "setup_required");
+            assert_eq!(refused["reason"], "consent_required");
+            assert!(
+                session.publication_retry.next.is_some(),
+                "the turn is tried again once this computer can sign in"
+            );
+            let refusal = crate::rc::capture::destination(&repo, &lineage)
+                .unwrap()
+                .unwrap()
+                .require_sign_in()
+                .unwrap_err();
+            assert_eq!(
+                format!("{refusal:#}"),
+                format!(
+                    "not uploaded: this computer isn't signed in to {UNSIGNED}; `AGIT_HUB_URL={UNSIGNED} agit login` signs in without changing the default Hub"
+                )
+            );
         });
     });
 }

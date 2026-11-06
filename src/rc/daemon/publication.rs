@@ -236,7 +236,7 @@ impl Prepared {
     ) -> Result<Value, RpcError> {
         let grant = self.authority.publication_grant()?;
         let lineage = self.lineage.clone();
-        let (native, runtime, hub) = (
+        let (native, runtime, issuer) = (
             self.native.clone(),
             self.runtime.clone(),
             grant.target.owner.issuer.clone(),
@@ -244,7 +244,15 @@ impl Prepared {
         let (repo_path, destination, records) = blocking(move || {
             let path = lineage.repo_dir()?;
             let repo = Repo::open(&path).context("publication repository is missing")?;
-            let destination = crate::rc::capture::destination(&repo, &lineage, &hub)?;
+            let destination = crate::rc::capture::destination(&repo, &lineage)?;
+            // A grant speaks for the Hub that issued it, so it confirms publications on that Hub
+            // alone; one Hub's grant never vouches for a capture another Hub receives.
+            if let Some(destination) = &destination {
+                ensure!(
+                    destination.identity.hub == crate::hub::identity::normalize_hub(&issuer)?,
+                    "publication Hub differs from the grant's"
+                );
+            }
             let records = Entry::records(&repo, lineage.branch(), &native, &runtime)?;
             Ok((path, destination, records))
         })
@@ -267,6 +275,10 @@ impl Prepared {
                 || crate::rc::folder_cutoff::holds_back(&repo, &runtime, &native)
             {
                 return Ok(Some(crate::protocol::PublicationReason::PushDisabled));
+            }
+            // Before any request: without a sign-in there, the destination's Hub is not asked.
+            if target.require_sign_in().is_err() {
+                return Ok(Some(crate::protocol::PublicationReason::ConsentRequired));
             }
             if !crate::commands::push::automatic_publication_consent(
                 &repo,
@@ -355,11 +367,10 @@ impl Prepared {
                 device_id: credential.device.id.clone(),
                 credential_epoch: credential.device.credential_epoch,
             };
-            let (path, request, lineage, hub) = (
+            let (path, request, lineage) = (
                 repo_path.clone(),
                 entry.request().clone(),
                 self.lineage.clone(),
-                destination.identity.hub.clone(),
             );
             let authority = self.authority.clone();
             let expected_destination = destination.clone();
@@ -367,7 +378,7 @@ impl Prepared {
             let notification = blocking(move || {
                 let repo = Repo::open(&path).context("publication repository is missing")?;
                 ensure!(
-                    checked_destination(&repo, &lineage, &hub)? == expected_destination,
+                    checked_destination(&repo, &lineage)? == expected_destination,
                     "publication destination changed"
                 );
                 authority.publication_grant()?;
@@ -437,7 +448,7 @@ impl Prepared {
                 blocking(move || {
                     let repo = Repo::open(&path).context("publication repository is missing")?;
                     ensure!(
-                        checked_destination(&repo, &lineage, &hub)? == expected_destination,
+                        checked_destination(&repo, &lineage)? == expected_destination,
                         "publication destination changed"
                     );
                     let current = store::load_in(&directory, &hub)?
@@ -564,13 +575,8 @@ fn current_coverage(daemon: &Daemon, capture: &agit_peer::publication::Capture) 
     )
 }
 
-fn checked_destination(
-    repo: &Repo,
-    lineage: &AgitSession,
-    hub: &str,
-) -> crate::Result<Destination> {
-    crate::rc::capture::destination(repo, lineage, hub)?
-        .context("publication destination is missing")
+fn checked_destination(repo: &Repo, lineage: &AgitSession) -> crate::Result<Destination> {
+    crate::rc::capture::destination(repo, lineage)?.context("publication destination is missing")
 }
 
 async fn blocking<T: Send + 'static>(
