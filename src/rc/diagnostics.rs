@@ -41,6 +41,15 @@ pub(crate) fn event(event: &str, metadata: Value) {
     }
 }
 
+/// Waits, up to `timeout`, until every event recorded so far is written. The log outlives the
+/// daemon's last task, so lines still queued when the process exits are lost: a planned exit then
+/// reads like a crash.
+pub(crate) fn settle(timeout: Duration) {
+    if let Some(log) = DAEMON_LOG.get() {
+        log.settle(timeout);
+    }
+}
+
 /// The newest daemon log in each daemon namespace (the desktop daemon's first), for `agit
 /// doctor`. Nothing is created: a namespace without a log has none to name.
 pub(super) fn newest_logs() -> Vec<PathBuf> {
@@ -120,6 +129,9 @@ struct Inner {
     path: PathBuf,
     sequence: AtomicU64,
     dropped: Arc<AtomicU64>,
+    /// Lines handed to the writer, and lines it has finished with, written or not.
+    queued: AtomicU64,
+    handled: Arc<AtomicU64>,
 }
 
 impl Log {
@@ -139,9 +151,11 @@ impl Log {
         let writer_path = path.clone();
         let dropped = Arc::new(AtomicU64::new(0));
         let lost = dropped.clone();
+        let handled = Arc::new(AtomicU64::new(0));
+        let finished = handled.clone();
         let worker = std::thread::Builder::new()
             .name("agitd-diagnostics".into())
-            .spawn(move || drain(file, &writer_path, receive, limit, retry, &lost))?;
+            .spawn(move || drain(file, &writer_path, receive, limit, retry, &lost, &finished))?;
         Ok(Self(Arc::new(Inner {
             sender: Some(sender),
             _worker: Some(worker),
@@ -149,7 +163,17 @@ impl Log {
             path,
             sequence: AtomicU64::new(0),
             dropped,
+            queued: AtomicU64::new(0),
+            handled,
         })))
+    }
+
+    pub(super) fn settle(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let queued = self.0.queued.load(Ordering::Acquire);
+        while self.0.handled.load(Ordering::Acquire) < queued && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -165,6 +189,8 @@ impl Log {
         line.push(b'\n');
         if line.len() > 8192 || self.0.sender.as_ref().unwrap().try_send(line).is_err() {
             self.0.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.0.queued.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -284,42 +310,64 @@ fn drain(
     limit: u64,
     retry: Duration,
     dropped: &AtomicU64,
+    handled: &AtomicU64,
 ) {
     let mut file = Some((file, 0_u64));
     let mut suspended_until = None::<Instant>;
     for line in receive {
-        if file.is_none() {
-            if suspended_until.is_some_and(|until| Instant::now() < until) {
-                dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            file = appended_file(path)
-                .and_then(|file| Ok((file.metadata()?.len(), file)))
-                .map(|(bytes, file)| (file, bytes))
-                .ok();
-        }
-        let written = file.as_mut().map(|(current, bytes)| {
-            if *bytes > 0 && *bytes + line.len() as u64 > limit {
-                *current = rotate(path)?;
-                *bytes = 0;
-            }
-            current.write_all(&line)?;
-            *bytes += line.len() as u64;
-            Ok::<_, std::io::Error>(())
-        });
-        if !matches!(written, Some(Ok(()))) {
-            if suspended_until.is_none() {
-                eprintln!("agitd: diagnostic writer suspended: {written:?}");
-            }
-            file = None;
-            suspended_until = Some(Instant::now() + retry);
-            dropped.fetch_add(1, Ordering::Relaxed);
-        } else {
-            suspended_until = None;
-        }
+        write_line(
+            &mut file,
+            &mut suspended_until,
+            path,
+            &line,
+            limit,
+            retry,
+            dropped,
+        );
+        handled.fetch_add(1, Ordering::AcqRel);
     }
     if let Some((mut file, _)) = file {
         let _ = file.flush();
+    }
+}
+
+fn write_line(
+    file: &mut Option<(File, u64)>,
+    suspended_until: &mut Option<Instant>,
+    path: &Path,
+    line: &[u8],
+    limit: u64,
+    retry: Duration,
+    dropped: &AtomicU64,
+) {
+    if file.is_none() {
+        if suspended_until.is_some_and(|until| Instant::now() < until) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        *file = appended_file(path)
+            .and_then(|file| Ok((file.metadata()?.len(), file)))
+            .map(|(bytes, file)| (file, bytes))
+            .ok();
+    }
+    let written = file.as_mut().map(|(current, bytes)| {
+        if *bytes > 0 && *bytes + line.len() as u64 > limit {
+            *current = rotate(path)?;
+            *bytes = 0;
+        }
+        current.write_all(line)?;
+        *bytes += line.len() as u64;
+        Ok::<_, std::io::Error>(())
+    });
+    if !matches!(written, Some(Ok(()))) {
+        if suspended_until.is_none() {
+            eprintln!("agitd: diagnostic writer suspended: {written:?}");
+        }
+        *file = None;
+        *suspended_until = Some(Instant::now() + retry);
+        dropped.fetch_add(1, Ordering::Relaxed);
+    } else {
+        *suspended_until = None;
     }
 }
 
@@ -386,6 +434,23 @@ mod tests {
                 assert_eq!(value["metadata"]["method"], "turn.start");
             }
         }
+    }
+
+    /// Settling waits until every line recorded so far is on disk, with the writer still running:
+    /// the daemon's log is never closed, so what is still queued when the process exits is lost
+    /// and a planned exit reads like a crash. A settle that returns at once leaves those lines
+    /// queued.
+    #[test]
+    fn settling_writes_every_recorded_line_without_closing_the_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = Log::open_in(directory.path(), "fixture", FILE_BYTES, WRITE_RETRY).unwrap();
+        for sequence in 0..200 {
+            log.record("fixture.event", json!({ "sequence": sequence }));
+        }
+        log.settle(Duration::from_secs(10));
+        let contents =
+            std::fs::read_to_string(directory.path().join("diagnostics-fixture.jsonl")).unwrap();
+        assert_eq!(contents.lines().count(), 200);
     }
 
     /// A writer that hits a failed write resumes once writing works again, and its later lines

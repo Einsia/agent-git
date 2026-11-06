@@ -4,6 +4,7 @@ use crate::rc::admission::{Admission, Frozen};
 pub(super) struct SafeStopRequest {
     pub instance_id: String,
     pub build_id: String,
+    pub replacing_with: Option<String>,
     pub deadline: std::time::Instant,
     pub reply: std::sync::mpsc::SyncSender<control::Reply>,
     pub written: tokio::sync::oneshot::Receiver<()>,
@@ -21,6 +22,25 @@ impl From<RestartRefusal> for control::Reply {
             RestartRefusal::InstanceChanged => Self::InstanceChanged,
             RestartRefusal::Busy(blockers) => Self::Busy { blockers },
         }
+    }
+}
+
+impl Live {
+    /// A conversation on a runtime only the daemon runs that has sat idle past [`IDLE_DETACH`]
+    /// with nothing queued or pending: an upgrade may end it, and it continues with the next
+    /// message.
+    pub(super) fn idle_detachable(&self) -> bool {
+        !self.shared_executor
+            && self.started_process
+            && self.info.status == SessionStatus::Idle
+            && self.status_since.elapsed() >= IDLE_DETACH
+            && self.tx.capacity() == COMMAND_QUEUE_CAPACITY
+            && !self.rpc_guard_sensitive
+            && self.pending_mode.is_none()
+            && self.confirmed_turn_guards.is_empty()
+            && self.inflight_turn_guard.is_none()
+            && self.approval_requests.is_empty()
+            && !self.ended
     }
 }
 
@@ -51,6 +71,7 @@ impl Daemon {
         let held: Vec<&str> = self
             .sessions
             .iter()
+            .filter(|(_, live)| !live.idle_detachable())
             .filter(|(_, live)| {
                 !live.shared_executor
                     || live.info.status != SessionStatus::Idle
@@ -126,6 +147,7 @@ mod tests {
         let mut request = SafeStopRequest {
             instance_id: state.identity.instance_id.clone(),
             build_id: state.identity.build_id.clone(),
+            replacing_with: None,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
             reply,
             written,
@@ -209,6 +231,7 @@ mod tests {
         let request = SafeStopRequest {
             instance_id: state.identity.instance_id.clone(),
             build_id: state.identity.build_id.clone(),
+            replacing_with: None,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
             reply,
             written,
@@ -242,5 +265,111 @@ mod tests {
             state.prepare_safe_stop(&request, &admission, false, || false),
             Err(RestartRefusal::Busy(_))
         ));
+    }
+
+    /// An upgrade ends a conversation on a runtime only the daemon runs once it has sat idle past
+    /// [`IDLE_DETACH`], and the conversation then tells a subscriber it was paused for the update,
+    /// with nothing else. One idle for less, or waiting for an approval, still holds the upgrade.
+    /// An upgrade that waits on every idle conversation is held for ever by one forgotten
+    /// conversation; one that ends a young or busy one cuts someone off; one that ends it silently
+    /// leaves the person thinking it was lost.
+    #[test]
+    fn an_upgrade_ends_only_long_idle_conversations_and_says_they_were_paused() {
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use crate::protocol::PermissionMode;
+                    let long_ago = std::time::Instant::now()
+                        .checked_sub(IDLE_DETACH + std::time::Duration::from_secs(1))
+                        .unwrap();
+                    let mut roster = Roster::default();
+                    let mut sessions = HashMap::new();
+                    let mut receivers = vec![];
+                    for (id, status, since) in [
+                        ("agit-left", SessionStatus::Idle, long_ago),
+                        (
+                            "agit-reading",
+                            SessionStatus::Idle,
+                            std::time::Instant::now(),
+                        ),
+                        ("agit-asking", SessionStatus::AwaitingApproval, long_ago),
+                    ] {
+                        roster.sessions.insert(
+                            id.into(),
+                            super::super::tests::rpc_test_roster_entry(id, PermissionMode::Default),
+                        );
+                        let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+                        receivers.push(rx);
+                        let mut live =
+                            super::super::tests::rpc_test_live(id, 1, tx, PermissionMode::Default);
+                        live.info.status = status;
+                        live.status_since = since;
+                        sessions.insert(id.to_string(), live);
+                    }
+                    let daemon = super::super::tests::rpc_test_daemon(sessions, roster);
+                    let mut state = daemon.lock().await;
+                    let (reply, _received) = std::sync::mpsc::sync_channel(1);
+                    let (_written, written) = tokio::sync::oneshot::channel();
+                    let request = SafeStopRequest {
+                        instance_id: state.identity.instance_id.clone(),
+                        build_id: state.identity.build_id.clone(),
+                        replacing_with: None,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                        reply,
+                        written,
+                    };
+                    let admission = Admission::default();
+                    match state.prepare_safe_stop(&request, &admission, false, || false) {
+                        Err(RestartRefusal::Busy(blockers)) => {
+                            let held = blockers.join("; ");
+                            assert!(held.contains("agit-reading"), "{held}");
+                            assert!(held.contains("agit-asking"), "{held}");
+                            assert!(!held.contains("agit-left"), "{held}");
+                        }
+                        Err(other) => panic!("{other:?}"),
+                        Ok(_) => {
+                            panic!("an idle conversation under the bound let the upgrade through")
+                        }
+                    }
+                    state.sessions.retain(|id, _| id == "agit-left");
+                    let frozen = state
+                        .prepare_safe_stop(&request, &admission, false, || false)
+                        .unwrap_or_else(|reply| panic!("{reply:?}"));
+                    drop(frozen);
+                    state.stop_cause = StopCause::Upgrade;
+                    state.shutdown().await;
+                    let saved = Roster::load();
+                    assert_eq!(saved.paused.keys().collect::<Vec<_>>(), ["agit-left"]);
+                    assert!(saved.interrupted.is_empty(), "nothing was cut");
+                    assert_eq!(saved.sessions["agit-left"].thread_id, "thread-agit-left");
+
+                    let (frames, _) = mpsc::channel(1);
+                    let mut subscribe = Frame::request(
+                        method::SESSION_SUBSCRIBE,
+                        serde_json::json!({"session_id": "agit-left"}),
+                    );
+                    subscribe.caller = Some(super::super::tests::claim("viewer", "ws-a"));
+                    let data = state
+                        .dispatch(&subscribe, &frames)
+                        .await
+                        .unwrap_err()
+                        .data
+                        .unwrap();
+                    assert_eq!(
+                        data["paused"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        ["at"]
+                    );
+                    assert!(data.get("interrupted").is_none());
+                })
+        });
     }
 }

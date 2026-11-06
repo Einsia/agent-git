@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
         native_source: None,
         interrupt_fenced: None,
         interrupted: None,
+        paused: None,
         agent: None,
         branch: None,
         status: SessionStatus::Idle,

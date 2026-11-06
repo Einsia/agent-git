@@ -78,6 +78,7 @@ pub(super) fn harness_test_session_with_channels(
         info: SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "session-turn-test".into(),
@@ -3541,7 +3542,9 @@ async fn a_codex_session_refuses_a_non_owner_turn_at_delivery() {
 /// runtime is asked once. A runtime that exits on the interrupt without ending the turn still
 /// leaves a turn the stop cut, never one that ended on its own, which would be receipted and
 /// archived as if nobody had stopped it. A supervisor that ends at once leaves the runtime to be
-/// killed mid-tool, and the conversation ends in a call whose result never comes.
+/// killed mid-tool, and the conversation ends in a call whose result never comes. An idle
+/// conversation an upgrade ends is not interrupted at all: an interrupt there writes a record that
+/// becomes the transcript's newest leaf, and resuming would continue from it instead of the turn.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
@@ -3552,6 +3555,7 @@ async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
             r#"printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'"#,
         ),
         ("exits", "exit 0"),
+        ("idle", "exit 0"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let written = directory.path().join("written");
@@ -3561,11 +3565,18 @@ async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
         );
         let mut driver =
             crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_running(&script);
-        driver.set_test_current_turn("turn-cut");
+        let idle = case == "idle";
+        if !idle {
+            driver.set_test_current_turn("turn-cut");
+        }
         let (mut session, mut out, _notes) = harness_test_session_with_channels(
             AnyDriver::ClaudeCode(Box::new(driver)),
             "claude-code",
-            SessionStatus::Running,
+            if idle {
+                SessionStatus::Idle
+            } else {
+                SessionStatus::Running
+            },
         );
         // Longer than the test waits: ending by the grace instead of by the turn's end fails it.
         session.stop_turn_grace = std::time::Duration::from_secs(60);
@@ -3574,7 +3585,14 @@ async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
             session.run_inner(&mut command_rx).await;
             session
         });
-        commands.send(Command::Shutdown).await.unwrap();
+        commands
+            .send(if idle {
+                Command::ShutdownUnattended
+            } else {
+                Command::Shutdown
+            })
+            .await
+            .unwrap();
         drop(commands);
 
         let mut ended = None;
@@ -3599,18 +3617,21 @@ async fn a_stop_interrupts_the_running_turn_and_ends_after_it() {
         let mut session = worker.await.unwrap();
         assert!(session.stop_requested, "{case}");
         if case == "answers" {
-            let ended = ended.expect("the cut turn announces its end");
+            let ended = ended.clone().expect("the cut turn announces its end");
             assert_eq!(ended.turn_id, "turn-cut");
             assert_eq!(ended.outcome, PTurnOutcome::Interrupted);
             assert_eq!(session.info.status, SessionStatus::Ended);
         }
         let _ = session.driver.shutdown().await;
         let interrupts = std::fs::read_to_string(&written)
-            .unwrap()
+            .unwrap_or_default()
             .lines()
             .filter(|line| line.contains(r#""subtype":"interrupt""#))
             .count();
-        assert_eq!(interrupts, 1, "{case}");
+        assert_eq!(interrupts, usize::from(!idle), "{case}");
+        if idle {
+            assert!(ended.is_none(), "no turn ended");
+        }
     }
 }
 

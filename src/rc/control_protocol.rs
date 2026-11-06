@@ -10,6 +10,10 @@ pub enum Request {
     StopIfIdle {
         instance_id: String,
         build_id: String,
+        /// The build that takes over, so the daemon's log can say it was replaced rather than end
+        /// as if it crashed. A daemon that predates the field ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacing_with: Option<String>,
     },
     ReloadSecrets,
     /// A Claude Code terminal loaded this conversation; `pid` is its process, and `loaded` the

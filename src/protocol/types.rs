@@ -778,6 +778,14 @@ pub struct Interruption {
     pub cause: InterruptionCause,
 }
 
+/// A conversation agit ended between turns so it could update. Nothing was cut; it continues
+/// with the next message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pause {
+    /// When it was ended (RFC 3339).
+    pub at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterruptionCause {
@@ -795,6 +803,9 @@ pub struct SessionInfo {
     /// Set on a conversation that is not running when its last turn was cut by agit stopping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupted: Option<Interruption>,
+    /// Set on a conversation that is not running because agit ended it between turns to update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<Pause>,
     /// Which process writes this Claude Code conversation, and why the web may not send now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<LeaseView>,

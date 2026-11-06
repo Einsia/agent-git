@@ -212,6 +212,9 @@ pub struct Roster {
     /// again. Kept on this computer; only the interruption itself is shown to the web.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) interrupted: BTreeMap<String, crate::protocol::Interruption>,
+    /// Conversations an update ended between turns, by logical id, until they run again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) paused: BTreeMap<String, crate::protocol::Pause>,
     /// Explicitly observed native sessions retain collection after their viewers disconnect.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub(crate) observed: BTreeSet<String>,
@@ -370,6 +373,7 @@ impl Roster {
         Roster {
             open_turns: BTreeMap::new(),
             interrupted: BTreeMap::new(),
+            paused: BTreeMap::new(),
             observed: BTreeSet::new(),
             captures: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -1414,6 +1418,7 @@ mod tests {
         crate::protocol::SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
+            paused: None,
             lease: None,
             publication: None,
             session_id: "agit-started".into(),

@@ -296,6 +296,7 @@ fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Ou
     match control::ask(&Request::StopIfIdle {
         instance_id: identity.instance_id.clone(),
         build_id: identity.build_id.clone(),
+        replacing_with: Some(super::build_identity::BUILD_ID.into()),
     })? {
         Reply::Stopping => {}
         Reply::Busy { blockers } => return deferred(blockers.join("; ")),

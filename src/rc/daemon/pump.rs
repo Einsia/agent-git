@@ -51,6 +51,7 @@ impl Daemon {
             term_tx: None,
             online: false,
             stop_cause: StopCause::Person,
+            replaced_by: None,
 
             settlement: settlement_tx.clone(),
             started_at: std::time::Instant::now(),
@@ -131,12 +132,14 @@ impl Daemon {
                         control::Request::StopIfIdle {
                             instance_id,
                             build_id,
+                            replacing_with,
                         } => {
                             let (reply, received) = std::sync::mpsc::sync_channel(1);
                             let budget = std::time::Duration::from_secs(2);
                             let request = restart::SafeStopRequest {
                                 instance_id,
                                 build_id,
+                                replacing_with,
                                 deadline: std::time::Instant::now() + budget,
                                 reply,
                                 written: written_rx,
@@ -856,7 +859,11 @@ impl Daemon {
                         Ok(frozen) => {
                             if request.reply.send(control::Reply::Stopping).is_ok() {
                                 frozen.commit();
-                                d.lock().await.stop_cause = StopCause::Unattended;
+                                {
+                                    let mut state = d.lock().await;
+                                    state.stop_cause = StopCause::Upgrade;
+                                    state.replaced_by = request.replacing_with.clone();
+                                }
                                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), request.written).await;
                                 begin_daemon_stop(&mut stopping, &link_stopping, &session_rpc_stop_tx, shutdown_deadline.as_mut());
                             }
@@ -917,6 +924,19 @@ impl Daemon {
         // to start resends it from there. Anyone who changes settlement's "delivered" test
         // back to inferring it from git reachability loses this whole argument again.
         g.shutdown().await;
+        crate::rc::diagnostics::event(
+            "daemon.stopped",
+            serde_json::json!({
+                "reason": match g.stop_cause {
+                    StopCause::Person => "stopped",
+                    StopCause::Unattended => "terminated",
+                    StopCause::Upgrade => "replaced_by_upgrade",
+                },
+                "to_build": g.replaced_by.as_deref().map(crate::rc::diagnostics::id),
+            }),
+        );
+        // The log's writer is not joined when the process exits; what is still queued is lost.
+        crate::rc::diagnostics::settle(std::time::Duration::from_secs(2));
         #[cfg(windows)]
         control::clear_pidfile();
         Ok(())
@@ -1030,6 +1050,16 @@ impl Daemon {
                     turn.stopped_by_person = self.stop_cause == StopCause::Person;
                 }
                 recorded = true;
+            } else if self.stop_cause == StopCause::Upgrade
+                && live.idle_detachable()
+                && self.roster.get(id).is_some()
+            {
+                // Ended between turns for the update: the person coming back is told it was
+                // paused, not lost.
+                self.roster
+                    .paused
+                    .insert(id.clone(), crate::protocol::Pause { at: at.clone() });
+                recorded = true;
             }
         }
         if recorded && let Err(error) = self.roster.save() {
@@ -1080,12 +1110,27 @@ impl Daemon {
         // A turn this stop cuts is recorded before the sessions end: after the restart the web can
         // say the conversation was interrupted, not only that it is not running.
         self.record_stopped_turns();
+        // A planned replacement says so for every conversation it ends, before it goes: without
+        // it the log stops mid-session and reads like a crash.
+        if self.stop_cause == StopCause::Upgrade {
+            for (id, live) in &self.sessions {
+                crate::rc::diagnostics::event(
+                    "session.ended",
+                    serde_json::json!({
+                        "session_id": crate::rc::diagnostics::id(id),
+                        "generation": live.generation,
+                        "reason": "replaced_by_upgrade",
+                        "to_build": self.replaced_by.as_deref().map(crate::rc::diagnostics::id),
+                    }),
+                );
+            }
+        }
         let _ = tokio::time::timeout(FLEET_EXIT_GRACE, async {
             let mut tasks = vec![];
             for (_, l) in self.sessions.drain() {
                 let _ = l.tx.try_send(match self.stop_cause {
                     StopCause::Person => Command::Shutdown,
-                    StopCause::Unattended => Command::ShutdownUnattended,
+                    StopCause::Unattended | StopCause::Upgrade => Command::ShutdownUnattended,
                 });
                 drop(l.tx);
                 tasks.push(l.task);
