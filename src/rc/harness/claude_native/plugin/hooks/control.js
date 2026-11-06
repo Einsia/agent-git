@@ -74,8 +74,8 @@ const CHECKING = "Checking with agit whether another process still writes this c
 // before it hands the conversation over, or another terminal): a definite answer, so no timer
 // releases it. Any failure of native-control other than not_current_writer still expires after
 // 30 s (LEASE_UNKNOWN_MS).
-const NOT_WRITER = "Not sent yet: another process still writes this conversation. Your input "
-  + "waits here until that process ends or hands the conversation to this terminal.";
+const NOT_WRITER = "Not sent yet: another Claude Code is still open on this conversation. Close "
+  + "it and this terminal can write; your input waits here.";
 const UNREACHABLE = "agit couldn't check whether another process writes this conversation, so "
   + "your input is sent as usual.";
 const STALE = (session) => "This terminal continues an older branch of this conversation, without "
