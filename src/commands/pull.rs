@@ -169,6 +169,8 @@ pub fn run(args: Args) -> CmdResult {
     let mut diverged = false;
     let store = Store::open_or_init()?;
     let slug = format!("{owner}/{name}");
+    // The accepted publication record, read once for every branch this pull compares.
+    let mut projections = None;
     for b in &want {
         // Fetch changes only remote-tracking refs. The local branch comparison and fast-forward
         // share the materialization/settlement lock so a prepare cannot straddle two branch tips.
@@ -183,11 +185,29 @@ pub fn run(args: Args) -> CmdResult {
             ));
             continue;
         }
+        // The published form of a local commit stands for that commit (see `published_from`).
+        let compared = repo
+            .git_opt(&[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{b}^{{commit}}"),
+            ])
+            .zip(repo.git_opt(&[
+                "rev-parse",
+                "--verify",
+                &format!("refs/remotes/origin/{b}^{{commit}}"),
+            ]))
+            .and_then(|(local, remote)| {
+                let projections = projections
+                    .get_or_insert_with(|| crate::domain::privacy_git::Projections::open(&repo));
+                published_from(&repo, projections, b, &local, &remote)
+            })
+            .unwrap_or_else(|| format!("origin/{b}"));
         match repo.git_opt(&[
             "rev-list",
             "--left-right",
             "--count",
-            &format!("{b}...origin/{b}"),
+            &format!("{b}...{compared}"),
         ]) {
             Some(counts) => {
                 let mut it = counts.split_whitespace();
@@ -399,6 +419,27 @@ pub(super) fn align_to_published(
     Ok(alignment)
 }
 
+/// The local commit the Hub's tip `remote` of `branch` publishes, when the accepted publication
+/// record names `remote` as the published form of `local` or of one of its ancestors.
+///
+/// A publication that leaves records out sends each turn's published form, a commit other than
+/// the local one, and records which local commit it stands for. Counted as it stands, every turn
+/// this computer uploaded reads as a turn made somewhere else, and a session continued in one
+/// place is refused as continued in two. A Hub tip that no record names, or that publishes a
+/// commit this branch doesn't hold, is compared as it stands: a turn added on the Hub is still
+/// one made elsewhere.
+fn published_from(
+    repo: &Repo,
+    projections: &crate::domain::privacy_git::Projections,
+    branch: &str,
+    local: &str,
+    remote: &str,
+) -> Option<String> {
+    let source = projections.source(branch, remote)?;
+    repo.git_opt(&["merge-base", "--is-ancestor", &source, local])?;
+    Some(source)
+}
+
 /// The decision of [`align_to_published`] for two tips read under the branch lock.
 fn compare_with_published(
     repo: &Repo,
@@ -407,6 +448,10 @@ fn compare_with_published(
     local: &str,
     remote: String,
 ) -> crate::Result<Alignment> {
+    let projections = crate::domain::privacy_git::Projections::open(repo);
+    if published_from(repo, &projections, branch, local, &remote).is_some() {
+        return Ok(Alignment::Current);
+    }
     let counts = repo.git(&[
         "rev-list",
         "--left-right",

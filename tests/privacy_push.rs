@@ -8777,6 +8777,213 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
 }
 
+/// A turn published without the records plain publication leaves out reaches the Hub as another
+/// commit on the same parent, and the accepted publication record names the turn it publishes.
+/// `agit run`, `agit resume` and `agit pull` take that Hub tip as the turn: the branch continues as
+/// it is and reads as up to date. Compared as raw tips, the turn and its published form count as
+/// one turn here and one on the Hub, and the session is refused right after its own upload. The
+/// Hub tip stands for the turn only on a branch that holds it: a branch started again under the
+/// same name after the upload, and a turn another computer adds on top of the Hub tip, are still a
+/// divergence. Taking the record's word without checking that the branch holds the turn continues
+/// the new branch over the published one; mapping any Hub tip that descends from a published turn
+/// continues past the other computer's turn.
+#[test]
+fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
+    const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000005";
+    const REMADE: &str = "eeeeeeee-0000-4000-8000-000000000006";
+    const CONTINUE: [&[&str]; 2] = [
+        &["resume", "alice/app@talk", "--no-launch"],
+        &["run", "alice/app@talk", "--no-launch"],
+    ];
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [30; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let said = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    // Settles the first turn of session `id` on a `talk` started from main.
+    let settle = |id: char, records: &[serde_json::Value]| {
+        let mut session = meta::Meta::new(
+            format!("agit-{}", id.to_string().repeat(40)),
+            "claude-code".into(),
+            work.to_string_lossy().into_owned(),
+        );
+        session.turn = Some(1);
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        let log = transcript::wrap_lines(&text, "claude-code", &session.session);
+        repo.git(&["checkout", "--quiet", "-B", "talk", "main"])
+            .unwrap();
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Turn 1").unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let head = || git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+
+    let turn = settle(
+        'f',
+        &[
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u1","parentUuid":null,
+                "message":{"role":"user","content":"Rename the flag."}}),
+            // Instructions the runtime put into the model's context: plain publication leaves
+            // this record out.
+            json!({"type":"attachment","sessionId":NATIVE,"cwd":work,"uuid":"u2","parentUuid":"u1",
+                "attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":"Project rules."}}),
+            json!({"type":"assistant","sessionId":NATIVE,"cwd":work,"uuid":"u3","parentUuid":"u2",
+                "message":{"role":"assistant","content":[{"type":"text","text":"Renamed."}]}}),
+        ],
+    );
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(published, turn, "the Hub holds the turn's published form");
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{published}^")]),
+        git(repo.root(), &["rev-parse", &format!("{turn}^")])
+    );
+    for args in CONTINUE {
+        let output = run(args);
+        assert_success(&output);
+        assert!(
+            !said(&output).contains("diverged"),
+            "{args:?}: {}",
+            said(&output)
+        );
+        assert_eq!(head(), turn, "{args:?}");
+    }
+    let pulled = run(&["pull", "alice/app"]);
+    assert_success(&pulled);
+    let pulled = said(&pulled);
+    assert!(
+        pulled.contains("talk is up to date") && !pulled.contains("diverged"),
+        "{pulled}"
+    );
+    assert_eq!(head(), turn);
+
+    // `talk` deleted here and started again under its name, as `agit branch rm` and
+    // `agit new -b talk` leave it: the Hub tip publishes a turn this branch does not hold.
+    let remade = settle(
+        'e',
+        &[
+            json!({"type":"user","sessionId":REMADE,"cwd":work,"uuid":"u1","parentUuid":null,
+                "message":{"role":"user","content":"Start over."}}),
+            json!({"type":"assistant","sessionId":REMADE,"cwd":work,"uuid":"u2","parentUuid":"u1",
+                "message":{"role":"assistant","content":[{"type":"text","text":"Started."}]}}),
+        ],
+    );
+    for args in CONTINUE {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {}", said(&output));
+        assert!(
+            said(&output).contains("diverged from the published tip"),
+            "{args:?}: {}",
+            said(&output)
+        );
+        assert_eq!(head(), remade, "{args:?}");
+    }
+
+    // The uploaded turn back on `talk`, and a turn another computer uploads on top of its
+    // published form.
+    repo.git(&["checkout", "--quiet", "-B", "talk", &turn])
+        .unwrap();
+    let elsewhere = git(
+        &remote,
+        &[
+            "-c",
+            "user.name=Laptop Writer",
+            "-c",
+            "user.email=laptop@example.invalid",
+            "commit-tree",
+            &format!("{published}^{{tree}}"),
+            "-p",
+            &published,
+            "-m",
+            "Turn 2",
+        ],
+    );
+    git(&remote, &["update-ref", "refs/heads/talk", &elsewhere]);
+    for args in CONTINUE {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {}", said(&output));
+        assert!(
+            said(&output).contains("diverged from the published tip"),
+            "{args:?}: {}",
+            said(&output)
+        );
+        assert_eq!(head(), turn, "{args:?}");
+    }
+    let pulled = run(&["pull", "alice/app"]);
+    assert_eq!(pulled.status.code(), Some(4), "{}", said(&pulled));
+    assert!(
+        said(&pulled).contains("talk truly diverged"),
+        "{}",
+        said(&pulled)
+    );
+    assert_eq!(head(), turn);
+}
+
 /// The publication summary says how many records the upload adds that keep parts the privacy check
 /// left out, too large or with too many findings, each counted in the upload that first carries
 /// it. A session goes on publishing its whole LOG, so a count over each snapshot would repeat an
