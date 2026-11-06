@@ -1131,11 +1131,16 @@ pub(crate) enum UploadFailure {
     Refused,
     /// A folder's capture rule keeps the branch from this computer's uploads.
     Withheld,
+    /// The publication rules changed while it uploaded, and again on the second try.
+    RulesChanged,
     Other,
 }
 
 impl UploadFailure {
     fn of(error: &anyhow::Error, project: &Project, candidate: &Candidate) -> Self {
+        if error.is::<RulesChanged>() {
+            return Self::RulesChanged;
+        }
         let reported = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<ChildFailed>())
@@ -1214,6 +1219,9 @@ impl UploadFailure {
             Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
             Self::Withheld => {
                 "this computer keeps the conversation from uploading, so no later turn sends it either; pushing its branch yourself says why and what to do"
+            }
+            Self::RulesChanged => {
+                "the rules for publishing to this repository changed while it was uploading, so the upload didn't finish; the turn stays saved here, and the next turn or `agit save` uploads what's left"
             }
             Self::Other => "it could not be completed on this computer; the next turn tries again",
         }
@@ -1471,19 +1479,22 @@ fn sync_one(
     Ok((branch, head))
 }
 
-/// Runs an upload, and once more when the Hub refused its preview as stale: it refuses a preview
-/// made against privacy settings that changed before it was used, as an earlier upload in the same
-/// run can change them, and a second preview is all it needs. A second stale refusal is told in
-/// the person's words, without the Hub's internal terms; any other failure is passed on as it is.
+/// Runs an upload, and once more, from the start, when it was prepared under publication rules
+/// that changed before it was sent: the Hub refuses a preview or a receive whose rules no longer
+/// hold, and the upload refuses a receive when this computer's privacy settings changed under it.
+/// The second run decides everything again, consent and visibility included, so it never sends
+/// under rules the first one was not judged by. A second such refusal is [`RulesChanged`]; any
+/// other failure is passed on as it is.
 fn retry_stale<T>(mut upload: impl FnMut() -> Result<T>) -> Result<T> {
-    let stale =
-        |error: &anyhow::Error| format!("{error:#}").contains("is stale; create a new preview");
+    let stale = |error: &anyhow::Error| {
+        let said = format!("{error:#}");
+        said.contains("create a new preview")
+            || said.contains(crate::domain::privacy_git::POLICY_CHANGED)
+    };
     match upload() {
         Err(error) if stale(&error) => upload().map_err(|again| {
             if stale(&again) {
-                anyhow::anyhow!(
-                    "the repository's privacy settings changed while this was uploading; run `agit save` again"
-                )
+                RulesChanged.into()
             } else {
                 again
             }
@@ -1491,6 +1502,20 @@ fn retry_stale<T>(mut upload: impl FnMut() -> Result<T>) -> Result<T> {
         result => result,
     }
 }
+
+/// An upload whose publication rules changed while it ran, twice: on the Hub (who may read it, or
+/// what it requires) or on this computer. Parts a staged upload had sent before the refusal stay
+/// published; the rest waits on this computer for the next upload.
+#[derive(Debug)]
+struct RulesChanged;
+
+impl std::fmt::Display for RulesChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UploadFailure::RulesChanged.describe())
+    }
+}
+
+impl std::error::Error for RulesChanged {}
 
 /// Whether the branch records any turn. A claim alone leaves its log empty; a branch whose log
 /// cannot be read is left for the push to judge.
@@ -7327,55 +7352,64 @@ mod tests {
         );
     }
 
-    /// A stale preview is retried once and then told in the person's words. An implementation
-    /// that gave up at once fails a batch upload whose earlier session changed the settings; one
-    /// that wrapped every second failure would blame the settings for a network error and still
-    /// print the Hub's "policy digest".
+    /// An upload prepared under publication rules that changed before it was sent is run once more
+    /// from the start, whichever side refused it: the Hub at the preview or at the receive, or
+    /// this computer at the receive. A second such refusal is told in the person's words, as an
+    /// upload outcome of its own; any other failure is passed on as it is. An implementation that
+    /// retried only the preview refusal leaves a turn refused at the receive on this computer
+    /// without a word; one that wrapped every second failure blames the rules for a network error.
     #[test]
-    fn a_stale_preview_is_retried_once_and_then_told_plainly() {
-        let stale = || {
-            anyhow::anyhow!(
-                "publication did not complete (publication preview policy digest is stale; create a new preview)"
-            )
-        };
-        let mut calls = 0;
-        assert_eq!(
-            retry_stale(|| {
+    fn an_upload_whose_rules_changed_runs_once_more_and_then_says_so() {
+        for refusal in [
+            "publication did not complete (publication preview policy digest is stale; create a new preview)",
+            "publication did not complete (HTTP 409 conflict: publication strategy changed; create a new preview)",
+            crate::domain::privacy_git::POLICY_CHANGED,
+        ] {
+            let stale = || anyhow::anyhow!("{refusal}");
+            let mut calls = 0;
+            assert_eq!(
+                retry_stale(|| {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(stale())
+                    } else {
+                        Ok("uploaded")
+                    }
+                })
+                .unwrap(),
+                "uploaded",
+                "{refusal}"
+            );
+            let mut calls = 0;
+            let twice = retry_stale(|| -> Result<()> {
                 calls += 1;
-                if calls == 1 {
+                Err(stale())
+            })
+            .unwrap_err();
+            assert_eq!(calls, 2, "{refusal}");
+            assert!(twice.is::<RulesChanged>(), "{refusal}");
+            let said = format!("{twice:#}");
+            assert!(
+                said.contains("changed while it was uploading, so the upload didn't finish")
+                    && said.contains("the next turn or `agit save` uploads what's left"),
+                "{said}"
+            );
+            assert!(!said.contains("nothing was sent"), "{said}");
+            assert!(
+                !said.contains("digest") && !said.contains("preview"),
+                "{said}"
+            );
+            let other = retry_stale(|| -> Result<()> {
+                calls += 1;
+                if calls == 3 {
                     Err(stale())
                 } else {
-                    Ok("uploaded")
+                    Err(anyhow::anyhow!("the Hub did not answer"))
                 }
             })
-            .unwrap(),
-            "uploaded"
-        );
-        let mut calls = 0;
-        let twice = retry_stale(|| -> Result<()> {
-            calls += 1;
-            Err(stale())
-        })
-        .unwrap_err();
-        assert_eq!(calls, 2);
-        let said = format!("{twice:#}");
-        assert!(
-            said.contains(
-                "privacy settings changed while this was uploading; run `agit save` again"
-            ),
-            "{said}"
-        );
-        assert!(!said.contains("digest"), "{said}");
-        let other = retry_stale(|| -> Result<()> {
-            calls += 1;
-            if calls == 3 {
-                Err(stale())
-            } else {
-                Err(anyhow::anyhow!("the Hub did not answer"))
-            }
-        })
-        .unwrap_err();
-        assert_eq!(format!("{other:#}"), "the Hub did not answer");
+            .unwrap_err();
+            assert_eq!(format!("{other:#}"), "the Hub did not answer", "{refusal}");
+        }
     }
 
     /// A failure saved while git's own summary of a refused push still led the message is read

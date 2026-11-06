@@ -22,18 +22,20 @@ impl CompleteInspection {
     /// Every receive batch binds the same reviewed session manifest and its exact ref transition.
     /// `held` is the advertisement the manifest's held history was read from; a receipt whose
     /// listing no longer has its branch heads is refused.
-    pub fn publish_with_session_receipts(
+    pub(crate) fn publish_with_session_receipts(
         self,
         policy_digest: &str,
         manifest: &crate::domain::session_privacy::SessionPublicationManifest,
         visibility: &str,
         held: &crate::hub::git::RemoteRefs,
+        rules: crate::domain::privacy_git::PolicyCheck,
     ) -> Result<PublicationReport> {
         let preparing = crate::ui::publication::stage("Preparing publication authority");
         let policy = self.prepared.publication.session_privacy_policy(
             policy_digest,
             manifest,
             visibility,
+            Some(rules),
         )?;
         let heads = held
             .refs
