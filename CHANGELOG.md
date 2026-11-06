@@ -8,6 +8,43 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.43] - 2026-11-06
+
+### Changed
+
+- Sessions you published encrypted now continue as plain at their next push: new turns upload the way a plain session's
+  do, earlier turns show no more than they did before, files the session changed while encrypted are not uploaded, and
+  the originals stay on this computer.
+- A session whose history includes an encrypted snapshot publishes what was already published, or is refused with
+  nothing uploaded, instead of always being refused.
+- `agit privacy mode … encrypted` and `agit privacy access grant` are retired; they say why and change nothing. Access
+  you already gave to originals stays for earlier snapshots, and `agit privacy access show` and `revoke` keep working.
+
+### Fixed
+
+- OpenCode conversations that `agit save` takes are no longer all withheld as "agit cannot verify where the
+  conversation started".
+- An automatic upload refused because the repository's publication rules changed while it ran is tried once more from
+  the start; if it's refused again, agit says so, and the turn uploads with the next one or `agit save`.
+- When a conversation's automatic upload stops, the message at the end of the turn now says why accurately: it points at
+  `agit status` only when status shows the privacy check it is waiting for, and says so when this computer keeps the
+  conversation from uploading.
+- A one-turn `claude -p` conversation in a folder set up with `agit on` is now saved and uploaded when its turn ends,
+  instead of only when another conversation starts there.
+- `agit resume` and `agit run` no longer refuse a session as "continued in two places" right after its own upload, when
+  the upload left records out.
+- `agit status` lists the current folder's sessions first and never cuts them from the page, and says how to see the
+  rest when the list is longer.
+- A message from a colleague to a conversation running in a terminal names its sender once.
+- Switching a fully saved Claude Code conversation to another agent with `agit resume --as` or `agit run --as` no longer
+  refuses it as unsettled when `agit commit` has nothing to save.
+- `agit status` no longer keeps listing an upload as waiting for the privacy check after it has landed on the Hub under
+  another repository name.
+- `agit run --as codex` and `agit new --as codex` no longer record other Codex conversations into their branch; a branch
+  an earlier version may have mixed stays on this computer until you fork it at your own last turn or lift the hold.
+- A computer signed in to more than one Hub now uploads each relayed turn to the Hub its workspace belongs to, instead of
+  retrying "publication Hub changed" forever.
+
 ## [0.2.42] - 2026-11-06
 
 ### Added
