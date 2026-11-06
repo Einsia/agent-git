@@ -299,9 +299,13 @@ pub fn privacy_entropy_replace() -> bool {
         .is_some_and(|value| value == "replace")
 }
 
+/// The environment variable that names the Hub, ahead of `hub.url` (see [`hub_url`]). A child
+/// started with it set sends every Hub request there.
+pub const HUB_URL_ENV: &str = "AGIT_HUB_URL";
+
 /// The config keys an environment variable overrides, and the variable.
 const ENV_OVERRIDES: [(&str, &str); 2] = [
-    ("hub.url", "AGIT_HUB_URL"),
+    ("hub.url", HUB_URL_ENV),
     (SecretKeystore::KEY, SecretKeystore::ENV),
 ];
 

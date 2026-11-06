@@ -251,25 +251,42 @@ fn select(
     Ok(Some(lineage))
 }
 
+/// Where a capture publishes. Its `identity` names the one Hub its uploads go to, whichever Hub
+/// this process defaults to: a computer signed in to several Hubs keeps each capture on the Hub
+/// its destination records, and an upload that went to the default Hub instead would put a
+/// conversation recorded for one Hub on another.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PublicationDestination {
     pub repository: String,
     pub identity: RemoteIdentity,
 }
 
+impl PublicationDestination {
+    /// Refuses unless this computer holds a stored sign-in for the destination's Hub. There is no
+    /// other Hub to fall back to, so without one nothing is sent anywhere. Callers judge the
+    /// person's own off switches first: a turned-off destination waits as turned off, whatever
+    /// its sign-in.
+    pub(crate) fn require_sign_in(&self) -> Result<()> {
+        let hub = &self.identity.hub;
+        ensure!(
+            crate::infra::credentials::load_checked(hub)?.is_some(),
+            "not uploaded: this computer isn't signed in to {hub}; `AGIT_HUB_URL={hub} agit login` signs in without changing the default Hub"
+        );
+        Ok(())
+    }
+}
+
 pub(crate) fn destination(
     repo: &Repo,
     lineage: &AgitSession,
-    hub: &str,
 ) -> Result<Option<PublicationDestination>> {
-    destination_by(repo, lineage, hub, Authority::Process)
+    destination_by(repo, lineage, Authority::Process)
 }
 
 /// Where `lineage`'s capture publishes, its device-local repository verified against `authority`.
 pub(crate) fn destination_by(
     repo: &Repo,
     lineage: &AgitSession,
-    hub: &str,
     authority: Authority,
 ) -> Result<Option<PublicationDestination>> {
     let kind = lineage
@@ -298,10 +315,6 @@ pub(crate) fn destination_by(
             identity,
         },
     };
-    ensure!(
-        destination.identity.hub == identity::normalize_hub(hub)?,
-        "publication Hub changed"
-    );
     Ok(Some(destination))
 }
 

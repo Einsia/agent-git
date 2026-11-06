@@ -911,12 +911,15 @@ fn verify_agent_location(hub: &str, owner: &str, name: &str, remote: &RemoteAgen
 }
 
 /// Unattended delivery rechecks account and destination authority; push validates each snapshot.
+/// It asks `expected`'s own Hub with that Hub's sign-in, whichever Hub this process defaults to,
+/// so [`publication_consent_with_client`]'s Hub check holds for a destination on any Hub.
 pub(crate) fn automatic_publication_consent(
     repo: &Repo,
     repository: &str,
     expected: &RemoteIdentity,
 ) -> Result<bool> {
-    let client = Client::from_env_with_timeout(std::time::Duration::from_secs(5));
+    let client =
+        Client::for_stored_hub_with_timeout(&expected.hub, std::time::Duration::from_secs(5));
     automatic_publication_consent_with_client(repo, repository, expected, &client)
 }
 

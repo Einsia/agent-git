@@ -4251,10 +4251,7 @@ impl Session {
                 return;
             }
         };
-        push.env(
-            crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV,
-            result_file.path(),
-        );
+        local_publication::direct(&mut push, &request, result_file.path());
         let publish = publish_settlement(
             self.settlement.clone(),
             lease,
