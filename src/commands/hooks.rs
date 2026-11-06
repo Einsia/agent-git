@@ -782,6 +782,7 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
 
     // The session a launch started, already linked by another path: the launch's claim is its
     // own, so it is retired here rather than left for another session to take.
+    let mut own_launch = false;
     if rt == "codex"
         && has_binding
         && let (Some(id), Some((slug, branch))) = (launch_env(), &env_session)
@@ -790,6 +791,23 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
                 && super::context::slug_of_link(link).as_deref() == Some(slug.as_str())
         })
     {
+        // That launch's claim still fits this very session: it is the one agit started.
+        own_launch = match (origin, start) {
+            (Some(origin), Some(start)) => link::launch::open(
+                &store,
+                rt,
+                &id,
+                link::launch::Taker {
+                    slug,
+                    branch,
+                    origin,
+                    start,
+                    session_id: &ev.session_id,
+                    continues: continues.as_deref(),
+                },
+            ),
+            _ => false,
+        };
         link::launch::retire(&store, rt, &id, slug, branch, &ev.session_id);
     }
     let decision = if launch_claim && !has_binding {
@@ -826,6 +844,7 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
                 if !taken {
                     return Some(serde_json::json!({ "systemMessage": link::launch::NOTICE }));
                 }
+                own_launch = true;
                 Some(link::launch::CLAIMED_BY.to_owned())
             } else {
                 None
@@ -875,10 +894,51 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
     {
         let _ = super::project::record_memory_start(rt, &ev.session_id, origin);
     }
-    // Nothing here reaches the model: an agent that needs this conversation's state runs agit,
-    // which names it from the runtime's own session variable. Only the person is told where a
-    // conversation the folder uploads goes, and who can read it there, or, when they resume one
-    // the folder holds back, that it is not uploaded.
+    // The team memory reaches a Codex session agit itself started for this branch, as context
+    // Codex gives the model as a developer message; any other session (a codex the person
+    // started, one under another launch's variables) gets none.
+    let memory = env_session
+        .as_ref()
+        .filter(|_| own_launch)
+        .and_then(|(slug, branch)| codex_memory(slug, branch));
+    with_memory_context(upload_announcement(rt, ev, origin), memory)
+}
+
+/// The team memory index for a Codex session of `slug`@`branch`, from the repository's copy on
+/// this computer; `None` when there is none or it can't be read.
+fn codex_memory(slug: &str, branch: &str) -> Option<String> {
+    let (owner, name) = super::parse_slug(slug).ok()?;
+    let repo =
+        crate::domain::repo::Repo::open(crate::infra::config::repo_dir(&owner, &name).ok()?)?;
+    super::memory::codex_instructions(&repo, branch, slug)
+        .ok()
+        .flatten()
+}
+
+/// `response` with `memory` added as the session's additional context, the event name set as the
+/// hook protocol needs it.
+fn with_memory_context(
+    response: Option<serde_json::Value>,
+    memory: Option<String>,
+) -> Option<serde_json::Value> {
+    let Some(memory) = memory else {
+        return response;
+    };
+    let mut response = response.unwrap_or_else(|| serde_json::json!({}));
+    response["hookSpecificOutput"]["hookEventName"] =
+        serde_json::Value::String("SessionStart".into());
+    response["hookSpecificOutput"]["additionalContext"] = serde_json::Value::String(memory);
+    Some(response)
+}
+
+/// What the person is told when a session starts: where a conversation the folder uploads goes,
+/// and who can read it there, or, when they resume one the folder holds back, that it is not
+/// uploaded. None of it reaches the model.
+fn upload_announcement(
+    rt: &'static str,
+    ev: &Event,
+    origin: Option<&std::path::Path>,
+) -> Option<serde_json::Value> {
     if !announces_upload(rt, ev.source) {
         return None;
     }

@@ -63,6 +63,8 @@ pub fn run(args: Args) -> CmdResult {
     let removed = credentials::remove(&hub)?;
     revoke_saved_meanwhile(&removed, &mut attempted, false);
     if removed.records > 0 {
+        // Codex's copies of memory made under this account leave the device with it.
+        crate::commands::memory::forget_codex_mirrors();
         ui::success(&format!("logged out of {hub}"));
         // Say outright that the store is untouched — a user may fear that signing out loses
         // sessions.
@@ -88,6 +90,8 @@ pub fn run(args: Args) -> CmdResult {
 /// gets its local half deleted only, and says plainly that the server-side row expires on its own.
 fn run_all() -> CmdResult {
     let forgot = credentials::forget_pending()?;
+    // Codex's copies of memory made under these accounts leave the device with them.
+    crate::commands::memory::forget_codex_mirrors();
     let all = credentials::all_checked()?;
     let mut attempted = HashSet::new();
     for (host, cred) in &all {
