@@ -152,6 +152,14 @@ fn completed_turn(root: &Path) -> CompletedTurn {
         &format!("local:{machine}"),
     ]);
     git(&["config", "agit.autoPush", "false"]);
+    // As an earlier agit left it: a main line committed under the local owner's name, which the
+    // repository's configuration still carries.
+    agit::domain::meta::write(&repo, &agit::domain::meta::Meta::new_file_line()).unwrap();
+    git(&["config", "user.name", "desktop-fixture"]);
+    git(&["config", "user.email", "desktop-fixture@agit.local"]);
+    git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "agit: init (main file line)"]);
     let transcript_dir = runtime_home
         .join(".claude/projects")
         .join(agit::adapter::claude_code::slug_for(&cwd));
@@ -293,6 +301,25 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
                         && view.contains("tool_result")
                 );
                 assert!(job_path.exists(), "unpublished work must remain durable");
+                // Every commit the line adds to main, the land's and the recovered turn's, carries
+                // the repository's own identity, though an earlier agit left another in its
+                // configuration: no machine or local owner name, and no account email.
+                let headers = git(&[
+                    "log",
+                    "--format=%an <%ae>%n%cn <%ce>",
+                    &format!("refs/heads/main..{head}"),
+                ]);
+                assert!(!headers.is_empty());
+                for line in headers.lines() {
+                    assert_eq!(
+                        line,
+                        "agit-00000000-0000-0000-0000-000000000002 \
+                         <00000000-0000-0000-0000-000000000002@agit.local>",
+                        "{headers}"
+                    );
+                }
+                assert!(!headers.contains("000000000001"), "{headers}");
+                assert!(!headers.contains("desktop-fixture"), "{headers}");
                 assert_eq!(
                     std::fs::read_to_string(&transcript).unwrap(),
                     text,
