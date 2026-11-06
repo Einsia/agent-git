@@ -428,7 +428,7 @@ pub(super) fn align_to_published(
 /// place is refused as continued in two. A Hub tip that no record names, or that publishes a
 /// commit this branch doesn't hold, is compared as it stands: a turn added on the Hub is still
 /// one made elsewhere.
-fn published_from(
+pub(super) fn published_from(
     repo: &Repo,
     projections: &crate::domain::privacy_git::Projections,
     branch: &str,
