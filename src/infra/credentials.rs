@@ -54,6 +54,57 @@ impl HubCredential {
     pub fn refresh_expired(&self) -> bool {
         expired(&self.refresh_expires_at)
     }
+
+    /// Whether this sign-in can still be renewed: its refresh token hasn't expired and the Hub
+    /// hasn't refused it (see [`record_refused`]). A command that judges the sign-in without
+    /// asking the Hub asks this; a refused sign-in judged by its expiry alone reads as signed in
+    /// while every renewal is refused.
+    pub fn renewable(&self) -> bool {
+        !self.refresh_expired() && !self.refused()
+    }
+
+    /// Whether the Hub refused this credential's refresh token.
+    pub fn refused(&self) -> bool {
+        let Some(path) = self.hub.as_deref().and_then(|hub| refused_path(hub).ok()) else {
+            return false;
+        };
+        std::fs::read(&path).is_ok_and(|recorded| {
+            recorded.trim_ascii() == token_digest(&self.refresh_token).as_bytes()
+        })
+    }
+}
+
+/// Where the digest of a refresh token the Hub refused for `hub` is kept: beside its credential,
+/// written the same private way.
+fn refused_path(hub: &str) -> Result<PathBuf> {
+    Ok(crate::infra::config::credentials_path(hub)?.with_extension("refused"))
+}
+
+fn token_digest(token: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+/// Records that the Hub refused `refused`'s refresh token, so no command sends it again. The
+/// credential itself stays: saving on this computer needs its account name. It is recorded only
+/// while the credential on disk still holds that token: a sibling process that renewed in the
+/// meantime saved a pair this record must not condemn. Saving another refresh token, or removing
+/// the credential, removes the record with it.
+pub fn record_refused(hub: &str, refused: &HubCredential) -> Result<()> {
+    let authority = HubAuthority::parse(hub)?;
+    let dir = crate::infra::config::credentials_dir()?;
+    let _guard = mutation_guard(&dir)?;
+    if load_from(&dir, &authority)?
+        .is_some_and(|current| current.refresh_token == refused.refresh_token)
+    {
+        let digest = format!("{}\n", token_digest(&refused.refresh_token));
+        write_private(
+            &refused_path(hub)?,
+            digest.as_bytes(),
+            "the refused sign-in",
+        )?;
+    }
+    Ok(())
 }
 
 fn expired(ts: &str) -> bool {
@@ -410,6 +461,15 @@ pub(crate) fn refresh_guard(hub: &str) -> Result<std::fs::File> {
 pub fn save_at(path: &Path, cred: &HubCredential) -> Result<()> {
     let body = format!("{}\n", serde_json::to_string_pretty(cred)?);
     write_private(path, body.as_bytes(), "saved Hub credentials")?;
+    // A saved refresh token other than the refused one came from the Hub since the refusal: a
+    // renewal, a new sign-in or another account's. The same token saved again, with account
+    // details added, is still refused.
+    let refused = path.with_extension("refused");
+    if std::fs::read(&refused)
+        .is_ok_and(|recorded| recorded.trim_ascii() != token_digest(&cred.refresh_token).as_bytes())
+    {
+        let _ = std::fs::remove_file(&refused);
+    }
     // File metadata invalidates the tokenless sidecar if another writer replaces the credential.
     #[cfg(feature = "cli")]
     let _ = save_account_cache(path, cred.account_id.as_deref());
@@ -562,6 +622,7 @@ fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<Removed> {
     let paths = record_paths(dir)?;
     let mut removed = Removed::default();
     let _ = std::fs::remove_file(canonical.with_extension("identity"));
+    let _ = std::fs::remove_file(canonical.with_extension("refused"));
     let saved = std::fs::symlink_metadata(&canonical)
         .is_ok_and(|metadata| metadata.is_file())
         .then(|| load_at(&canonical))
@@ -651,6 +712,7 @@ pub fn remove_all() -> Result<Removed> {
     for path in record_paths(&dir)? {
         let cred = recognized_record(&path, false);
         let _ = std::fs::remove_file(path.with_extension("identity"));
+        let _ = std::fs::remove_file(path.with_extension("refused"));
         std::fs::remove_file(&path).map_err(|_| anyhow!("cannot remove saved Hub credentials"))?;
         removed.records += 1;
         removed.bound.extend(cred);
@@ -682,7 +744,7 @@ pub fn current_email() -> Option<String> {
 }
 
 pub fn is_logged_in() -> bool {
-    current().is_some_and(|c| !c.refresh_expired())
+    current().is_some_and(|c| c.renewable())
 }
 
 #[cfg(unix)]

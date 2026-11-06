@@ -343,8 +343,21 @@ pub fn run_with_output(mut args: Args, json: bool) -> CmdResult {
         let (dest_owner, dest_name) = crate::input_argument(super::parse_slug(repo))?;
         let me = owner.as_deref().unwrap_or_default();
         // When the destination is not your own name, ask the hub's write-permission gate; being
-        // unable to ask is an error, not "no permission".
-        match super::writability(me, &dest_owner, &dest_name)? {
+        // unable to ask is an error, not "no permission". A destination this computer already
+        // holds, pinned to a repository on this Hub, was let in when it arrived here: a version
+        // saved into it stays on this computer, and a push asks the gate again before it sends
+        // anything. So saving into it never waits for the Hub to answer, signed out included.
+        let writability = match super::writability(me, &dest_owner, &dest_name) {
+            Ok(writability) => writability,
+            Err(_) if held_here(&dest_owner, &dest_name)? => {
+                ui::hint(&format!(
+                    "the Hub couldn't be asked whether you may push to {repo}; this saves on this computer, and `agit push` asks again"
+                ));
+                super::Writability::Granted
+            }
+            Err(error) => return Err(error),
+        };
+        match writability {
             super::Writability::Mine | super::Writability::Granted => {}
             super::Writability::Creatable => {
                 creation_notice = Some(format!(
@@ -1708,6 +1721,16 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
             Ok(Pick::Explained(ExitCode::Interactive))
         }
     }
+}
+
+/// Whether this computer holds `owner/name`'s checkout, pinned to a repository on the Hub it
+/// talks to now.
+fn held_here(owner: &str, name: &str) -> crate::Result<bool> {
+    let Some(repo) = Repo::open(config::repo_dir(owner, name)?) else {
+        return Ok(false);
+    };
+    let hub = crate::hub::identity::normalize_hub(&config::hub_url())?;
+    Ok(crate::hub::identity::read(&repo)?.is_some_and(|pinned| pinned.hub == hub))
 }
 
 /// Why the stores of these runtimes exist but cannot be read.

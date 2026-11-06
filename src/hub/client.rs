@@ -207,6 +207,28 @@ const REFRESH_SETTLE_STEP: Duration = Duration::from_millis(100);
 /// up for long on a credential that is genuinely dead.
 const REFRESH_SETTLE_POLLS: usize = 20;
 
+/// How long one sign-in renewal may wait for the Hub's answer, whatever this client's patience
+/// allows otherwise. A renewal whose answer is lost is sent again at once with the same refresh
+/// token, and the Hub answers a just-replaced token with the pair it already gave only for a short
+/// window after the rotation, so both attempts together must end inside that window. A deadline a
+/// background client sets for itself can be shorter than a slow Hub's commit, so it never bounds a
+/// renewal.
+const RENEWAL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// What one renewal of a refresh token came to.
+enum Renewal {
+    /// The Hub answered with a new pair.
+    Renewed(super::TokenPair),
+    /// The Hub refused the refresh token and asked for a new sign-in. Sending it again changes
+    /// nothing.
+    Refused(anyhow::Error),
+    /// No answer to read: a timeout, a dropped connection, an answer that can't be read, or a
+    /// server error a gateway may have sent while the Hub went on. The Hub may have rotated.
+    Unanswered(anyhow::Error),
+    /// Any other answer: the token stays, and nothing is recorded about it.
+    Failed(anyhow::Error),
+}
+
 /// The in-process renewal gate: one client exchanges a token at a time (see
 /// [`Client::try_refresh`]).
 fn refresh_gate() -> &'static std::sync::Mutex<()> {
@@ -706,7 +728,7 @@ impl Client {
         // time they get in the one that went first has persisted the new pair, so they adopt
         // it — two clients never spend the same single-use refresh token.
         let _gate = refresh_gate().lock().unwrap_or_else(|e| e.into_inner());
-        if cred.refresh_expired() {
+        if !cred.renewable() {
             if !self.adopt_newer_from_disk(&cred).unwrap_or(false) {
                 return Ok(false);
             }
@@ -726,17 +748,22 @@ impl Client {
             Ok(false) => {}
             Err(_) => return Ok(false),
         }
-        if cred.refresh_expired() {
+        if !cred.renewable() {
             return Ok(false);
         }
 
-        // The refresh endpoint carries no auth header — the access token is the expired one.
-        let pair: super::TokenPair = match self.post_public(
-            "api/auth/refresh",
-            &serde_json::json!({ "refresh_token": cred.refresh_token }),
-        ) {
-            Ok(p) => p,
-            Err(error) => {
+        let pair = match self.renew(&cred.refresh_token) {
+            Renewal::Renewed(pair) => pair,
+            Renewal::Refused(error) => {
+                if self.wait_for_a_sibling_to_land(&cred) {
+                    return Ok(true);
+                }
+                // Unrecorded, the next command asks again and is refused again; the refusal is
+                // what this command reports either way.
+                let _ = credentials::record_refused(&self.base, &cred);
+                return Err(error);
+            }
+            Renewal::Unanswered(error) | Renewal::Failed(error) => {
                 if self.wait_for_a_sibling_to_land(&cred) {
                     return Ok(true);
                 }
@@ -785,7 +812,7 @@ impl Client {
                 && (ours.account_id.is_none() || disk.account_id == ours.account_id),
             "the saved Hub identity changed"
         );
-        if disk.access_token == ours.access_token || disk.refresh_expired() {
+        if disk.access_token == ours.access_token || !disk.renewable() {
             return Ok(false);
         }
         *self.token.borrow_mut() = Some(disk.access_token.clone());
@@ -809,6 +836,68 @@ impl Client {
             std::thread::sleep(REFRESH_SETTLE_STEP);
         }
         false
+    }
+
+    /// Exchanges `refresh_token` for a new pair, sending it once more at once when no answer comes:
+    /// the Hub may have rotated, and within its window it answers the same token with the same
+    /// pair. The token is kept until a pair arrives. Each attempt is bounded by
+    /// [`RENEWAL_DEADLINE`].
+    fn renew(&self, refresh_token: &str) -> Renewal {
+        const PATH: &str = "api/auth/refresh";
+        if let Err(error) = self.ensure_destination() {
+            return Renewal::Failed(error);
+        }
+        let body = serde_json::json!({ "refresh_token": refresh_token });
+        let attempt = || {
+            self.forget_probes();
+            crate::telemetry::allow_uploads();
+            let mut outcome = None;
+            // The refresh endpoint carries no auth header — the access token is the expired one.
+            let _ = crate::telemetry::measure(crate::telemetry::Operation::HubRequest, || {
+                let renewal = match self
+                    .agent
+                    .post(self.url(PATH))
+                    .config()
+                    .timeout_global(Some(RENEWAL_DEADLINE))
+                    .build()
+                    .send_json(&body)
+                {
+                    Err(error) => Renewal::Unanswered(self.explain(error, PATH)),
+                    Ok(resp) if resp.status() == 401 => {
+                        let error = self.api_error(resp, PATH);
+                        // Only the Hub's own refusal ends the sign-in; a 401 that does not ask
+                        // for a new sign-in may come from something in front of the Hub.
+                        if error.downcast_ref::<ApiError>().is_some_and(|api| {
+                            api.remedies().contains(&Remediation::Authenticate {})
+                        }) {
+                            Renewal::Refused(error)
+                        } else {
+                            Renewal::Failed(error)
+                        }
+                    }
+                    Ok(resp) if resp.status().is_server_error() => {
+                        Renewal::Unanswered(self.api_error(resp, PATH))
+                    }
+                    Ok(resp) if !resp.status().is_success() => {
+                        Renewal::Failed(self.api_error(resp, PATH))
+                    }
+                    Ok(resp) => match super::json_response::read::<super::TokenPair>(resp) {
+                        Ok(pair) => Renewal::Renewed(pair),
+                        Err(error) => Renewal::Unanswered(error.context(format!(
+                            "the JSON returned by hub {PATH} could not be parsed"
+                        ))),
+                    },
+                };
+                let landed = matches!(renewal, Renewal::Renewed(_));
+                outcome = Some(renewal);
+                if landed { Ok(()) } else { Err(()) }
+            });
+            outcome.expect("the attempt ran")
+        };
+        match attempt() {
+            Renewal::Unanswered(_) => attempt(),
+            renewal => renewal,
+        }
     }
 
     /// The decision, so that "this call is deliberately unauthenticated" is visible in the code.
@@ -1931,6 +2020,11 @@ mod tests {
                 }
                 let req = String::from_utf8_lossy(&buf).into_owned();
                 let (status, encoding, body) = answer(&req);
+                // Status 0 closes the connection without an answer, as a lost response does.
+                if status == 0 {
+                    seen.push(req);
+                    continue;
+                }
                 let encoding = encoding
                     .map(|value| format!("Content-Encoding: {value}\r\n"))
                     .unwrap_or_default();
@@ -2176,7 +2270,7 @@ mod tests {
     #[test]
     fn refresh_service_failure_is_not_reported_as_expired_login() {
         let _home = CredentialTestHome::new();
-        let (base, hub) = fake_hub(2, |request| {
+        let (base, hub) = fake_hub(3, |request| {
             if request.starts_with("POST /api/auth/refresh ") {
                 (
                     503,
@@ -2200,7 +2294,69 @@ mod tests {
             credentials::load(&base).unwrap().refresh_token,
             cred.refresh_token
         );
-        assert_eq!(hub.join().unwrap().len(), 2);
+        assert!(credentials::load(&base).unwrap().renewable());
+        assert_eq!(hub.join().unwrap().len(), 3);
+    }
+
+    /// A renewal whose answer is lost is sent again at once with the same refresh token, and the
+    /// pair that attempt gets is saved and used, as the Hub answers a just-replaced token for a
+    /// short window after it rotated. A renewal the Hub refuses is recorded: the sign-in no
+    /// longer counts as renewable, also once account details are saved with the same token, and
+    /// the next command sends that token no more. A client that
+    /// gave up on the lost answer fails the request with the old pair kept; one that recorded
+    /// nothing sends the refused token again on every later command, so the second command here
+    /// would reach for a fourth connection the Hub never accepts.
+    #[test]
+    fn a_lost_renewal_is_sent_again_and_a_refused_one_never_is() {
+        let _home = CredentialTestHome::new();
+        let renewals = std::sync::atomic::AtomicUsize::new(0);
+        let (base, hub) = fake_hub(4, move |request| {
+            if request.starts_with("POST /api/auth/refresh ") {
+                assert!(request.contains("rt-old"), "{request}");
+                if renewals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return (0, String::new());
+                }
+                return (
+                    200,
+                    serde_json::to_string(&new_pair(&request_hub(request), "alice")).unwrap(),
+                );
+            }
+            if request.contains("Bearer at-new") {
+                (200, "{}".into())
+            } else {
+                (401, r#"{"error":"expired","kind":"unauthorized"}"#.into())
+            }
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        Client::for_credential(&base, &cred).logout().unwrap();
+        assert_eq!(credentials::load(&base).unwrap().access_token, "at-new");
+        assert_eq!(hub.join().unwrap().len(), 4);
+
+        let refusal = r#"{"error":"refresh token invalid or expired","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#;
+        let (base, hub) = fake_hub(3, move |request| {
+            assert!(
+                !request.starts_with("POST /api/auth/refresh ") || request.contains("rt-old"),
+                "{request}"
+            );
+            (401, refusal.into())
+        });
+        let cred = old_pair(&base, "alice");
+        credentials::save(&base, &cred).unwrap();
+        let first = Client::for_credential(&base, &cred).logout().unwrap_err();
+        assert_eq!(first.downcast_ref::<ApiError>().unwrap().status, 401);
+        let saved = credentials::load(&base).unwrap();
+        assert_eq!(saved.refresh_token, "rt-old", "the account name stays");
+        assert!(!saved.renewable());
+        // Account details saved with the same token leave it refused.
+        assert!(credentials::save_verified_account(&base, &saved, "alice-account").unwrap());
+        let saved = credentials::load(&base).unwrap();
+        assert_eq!(saved.account_id.as_deref(), Some("alice-account"));
+        assert!(!saved.renewable());
+        let second = Client::for_credential(&base, &saved).logout().unwrap_err();
+        assert_eq!(second.downcast_ref::<ApiError>().unwrap().status, 401);
+        let seen = hub.join().unwrap();
+        assert!(seen[2].starts_with("POST /api/auth/logout "), "{}", seen[2]);
     }
 
     #[test]

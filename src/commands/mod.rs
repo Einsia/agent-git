@@ -728,7 +728,7 @@ fn lands_on(remote_url: &str, hub: &str, me: Option<&str>, agent: &str) -> bool 
 /// Hub can credit visits that arrive through a pasted link. An expired sign-in names nobody.
 pub(crate) fn link_sharer(hub: &str) -> Option<String> {
     crate::infra::credentials::load(hub)
-        .filter(|credential| !credential.refresh_expired())
+        .filter(|credential| credential.renewable())
         .map(|credential| credential.username)
 }
 

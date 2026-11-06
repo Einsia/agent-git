@@ -1165,7 +1165,7 @@ pub(crate) fn signed_in_account() -> Option<String> {
     credentials::load_checked(&config::hub_url())
         .ok()
         .flatten()
-        .filter(|c| !c.refresh_expired())
+        .filter(|c| c.renewable())
         .map(|c| c.username)
 }
 
