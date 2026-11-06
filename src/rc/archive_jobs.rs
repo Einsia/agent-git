@@ -336,21 +336,7 @@ impl Job {
         let Ok(text) = std::str::from_utf8(&bytes) else {
             return Ok(None);
         };
-        // Only Claude Code's turn end is read again: the end its jobs record can lie past the
-        // reply. Past settlement's end the prefix may hold nothing that begins or continues a
-        // turn, as settlement itself judges it: no later execution ended there, and nothing
-        // there awaits a reply. Otherwise a turn the archive doesn't hold would count as covered.
-        if self.runtime != "claude-code" {
-            return Ok(None);
-        }
-        let Some(end) = completed_end(&self.runtime, &self.native, &self.transcript, text)? else {
-            return Ok(None);
-        };
-        let ended = crate::adapter::claude_code::ended_turn_boundary(text).unwrap_or(0) as u64;
-        if ended > end || crate::adapter::claude_code::awaits_reply(text) {
-            return Ok(None);
-        }
-        Ok(Some(end))
+        covered_end(&self.runtime, &self.native, &self.transcript, text)
     }
 
     pub(crate) fn remove(&self) -> crate::Result<()> {
@@ -441,6 +427,32 @@ pub(crate) fn publication_confirmed(
 /// Where the last turn of `text`, a prefix of the native transcript `transcript` of the
 /// conversation `native` of `runtime`, ended, as settlement cuts it: the runtime's own turn end,
 /// or for Claude Code a completion receipt past it.
+/// Where settlement ends the last turn of `text`, a prefix of the native transcript `transcript`
+/// of the conversation `native` of `runtime`, when nothing past that end begins or continues a
+/// turn as settlement itself judges it: no later execution ended there, and nothing there awaits a
+/// reply. Whatever else follows it (the Stop hooks' summary, cost and prompt bookkeeping, a draft
+/// left in the prompt) settlement never lands, so a record of the conversation up to this end
+/// covers it. Only Claude Code's end is read this way, since what it writes after a reply varies;
+/// `None` for any other runtime, and when no turn ended or one is open past it.
+pub(crate) fn covered_end(
+    runtime: &str,
+    native: &str,
+    transcript: &Path,
+    text: &str,
+) -> crate::Result<Option<u64>> {
+    if runtime != "claude-code" {
+        return Ok(None);
+    }
+    let Some(end) = completed_end(runtime, native, transcript, text)? else {
+        return Ok(None);
+    };
+    let ended = crate::adapter::claude_code::ended_turn_boundary(text).unwrap_or(0) as u64;
+    if ended > end || crate::adapter::claude_code::awaits_reply(text) {
+        return Ok(None);
+    }
+    Ok(Some(end))
+}
+
 pub(crate) fn completed_end(
     runtime: &str,
     native: &str,
