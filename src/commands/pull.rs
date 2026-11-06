@@ -19,6 +19,7 @@
 
 use super::CmdResult;
 use crate::domain::link;
+use crate::domain::privacy_git::hub_turns::{self, BroughtOver, NewerTurns};
 use crate::domain::repo::Repo;
 use crate::domain::store::Store;
 #[cfg(windows)]
@@ -248,10 +249,37 @@ pub fn run(args: Args) -> CmdResult {
                             }
                             continue;
                         }
+                        match hub_turns::bring_over(&repo, b, &local_head, &remote_head, behind) {
+                            Ok(newer @ (NewerTurns::Built(_) | NewerTurns::Recorded { .. })) => {
+                                let taken = match &newer {
+                                    NewerTurns::Built(built) => take_newer_turns(&repo, b, built)
+                                        .map(|()| brought_over(built.turns)),
+                                    NewerTurns::Recorded { head, turns } => {
+                                        fast_forward_to(&repo, b, head)
+                                            .map(|()| format!("fast-forwarded +{turns}"))
+                                    }
+                                    NewerTurns::Refused | NewerTurns::None => continue,
+                                };
+                                match taken {
+                                    Ok(said) => ui::info(format_args!("{b}: {said}")),
+                                    Err(error) => {
+                                        ui::error(&format!("{b}: {error:#}"));
+                                        diverged = true;
+                                    }
+                                }
+                                continue;
+                            }
+                            Ok(NewerTurns::Refused) => ui::error(&format!("{b}: {NEWER_ON_HUB}")),
+                            Ok(NewerTurns::None) => ui::error(&format!(
+                                "{b} truly diverged: this session continued in two places (local +{ahead} / remote +{behind})."
+                            )),
+                            Err(error) => {
+                                ui::error(&format!("{b}: {error:#}"));
+                                diverged = true;
+                                continue;
+                            }
+                        }
                         diverged = true;
-                        ui::error(&format!(
-                            "{b} truly diverged: this session continued in two places (local +{ahead} / remote +{behind})."
-                        ));
                         match remote_point(&repo, b) {
                             Some(sha) => {
                                 eprintln!("  two ways out (origin/{b} is at {sha}):");
@@ -380,6 +408,8 @@ pub(super) enum Alignment {
     Current,
     /// Fast-forwarded by this many commits to the published tip `to`.
     FastForwarded { to: String, commits: usize },
+    /// This many turns another computer added on the Hub were brought onto the branch.
+    BroughtOver { turns: usize },
     /// Both sides moved; the refusal and the ways out are already printed.
     Diverged,
 }
@@ -440,6 +470,30 @@ fn published_from(
     Some(source)
 }
 
+/// Said when the Hub's tip adds turns from another computer on top of the published form of the
+/// branch's tip, and they can't be brought over as the Hub holds them.
+const NEWER_ON_HUB: &str = "The Hub has a newer turn from another computer on top of what you uploaded. It can't be brought over here as the Hub holds it, so neither side is continued.";
+
+/// Said once the Hub's newer turns are on the branch.
+pub(super) fn brought_over(turns: usize) -> String {
+    if turns == 1 {
+        "The Hub has a newer turn from another computer on top of what you uploaded; it's brought over here, and this continues from it.".into()
+    } else {
+        format!(
+            "The Hub has {turns} newer turns from another computer on top of what you uploaded; they're brought over here, and this continues from them."
+        )
+    }
+}
+
+/// Records each commit of `built` as published by the Hub turn it holds, then moves `branch` onto
+/// it. The record comes first: stopped in between, the branch is still below commits the record
+/// names, and the next continuation only fast-forwards it ([`NewerTurns::Recorded`]). Moved first,
+/// a branch whose record was never written reads as continued in two places.
+fn take_newer_turns(repo: &Repo, branch: &str, built: &BroughtOver) -> crate::Result<()> {
+    built.record(repo)?;
+    fast_forward_to(repo, branch, &built.head)
+}
+
 /// The decision of [`align_to_published`] for two tips read under the branch lock.
 fn compare_with_published(
     repo: &Repo,
@@ -471,9 +525,26 @@ fn compare_with_published(
             }
         }
         (ahead, behind) => {
-            ui::error(&format!(
-                "`{branch}` diverged from the published tip: this session continued in two places (local +{ahead} / remote +{behind}) — not continuing either side."
-            ));
+            match hub_turns::bring_over(repo, branch, local, &remote, behind)? {
+                NewerTurns::Built(built) => {
+                    take_newer_turns(repo, branch, &built)?;
+                    return Ok(Alignment::BroughtOver { turns: built.turns });
+                }
+                // Already recorded, the commits above the branch publish as the Hub tip: the
+                // branch only moves up, whether a bring-over stopped before moving it or the
+                // branch was put back.
+                NewerTurns::Recorded { head, turns } => {
+                    fast_forward_to(repo, branch, &head)?;
+                    return Ok(Alignment::FastForwarded {
+                        to: head,
+                        commits: turns,
+                    });
+                }
+                NewerTurns::Refused => ui::error(NEWER_ON_HUB),
+                NewerTurns::None => ui::error(&format!(
+                    "`{branch}` diverged from the published tip: this session continued in two places (local +{ahead} / remote +{behind}) — not continuing either side."
+                )),
+            }
             match remote_point(repo, branch) {
                 Some(sha) if !crate::domain::meta::is_file_line_at(repo, local) => {
                     eprintln!("  two ways out (origin/{branch} is at {sha}):");

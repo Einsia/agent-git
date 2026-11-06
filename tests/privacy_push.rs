@@ -8982,10 +8982,8 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
 /// it is and reads as up to date. Compared as raw tips, the turn and its published form count as
 /// one turn here and one on the Hub, and the session is refused right after its own upload. The
 /// Hub tip stands for the turn only on a branch that holds it: a branch started again under the
-/// same name after the upload, and a turn another computer adds on top of the Hub tip, are still a
-/// divergence. Taking the record's word without checking that the branch holds the turn continues
-/// the new branch over the published one; mapping any Hub tip that descends from a published turn
-/// continues past the other computer's turn.
+/// same name after the upload is still a divergence. Taking the record's word without checking that
+/// the branch holds the turn continues the new branch over the published one.
 #[test]
 fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
     const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000005";
@@ -9142,45 +9140,364 @@ fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
         );
         assert_eq!(head(), remade, "{args:?}");
     }
+}
 
-    // The uploaded turn back on `talk`, and a turn another computer uploads on top of its
-    // published form.
-    repo.git(&["checkout", "--quiet", "-B", "talk", &turn])
+/// A turn another computer published on top of what this computer uploaded is brought onto the
+/// branch as the Hub holds it, after the turns this computer ran, which keep their bytes. Resume
+/// continues from it, and the next push sends only the turn after it, on top of the Hub's. It is
+/// brought over only when this computer's own publication of it gives the Hub's lines: a turn
+/// holding a value this computer protects is refused, and nothing moves. A branch with a turn of
+/// its own that isn't uploaded continued in two places, and is refused as that. Stopped after the
+/// record is written and before the branch moves, the next resume fast-forwards it, and brings over
+/// a turn the Hub gained meanwhile on top of the recorded one. Fast-forwarding
+/// onto the Hub's tip replaces the turns run here with their published forms. Bringing the turn
+/// over without recording it leaves the next push to publish it again beside the Hub's. Taking the
+/// published form of an older local commit continues past this computer's own turn. Not finishing a
+/// recorded bring-over, or building a later Hub turn only on the branch's tip, reads the branch as
+/// continued in two places.
+#[test]
+fn a_newer_turn_from_another_computer_is_brought_over_as_the_hub_holds_it() {
+    const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000007";
+    const PROTECTED: &str = "laptop-deploy-key-7f3a9c41d2";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let command = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .args(args);
+        command
+    };
+    let run = |args: &[&str]| command(args).stdin(Stdio::null()).output().unwrap();
+    let said = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
         .unwrap();
-    let elsewhere = git(
-        &remote,
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let session_id = format!("agit-{}", "f".repeat(40));
+    let lines = |records: &[serde_json::Value]| {
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        transcript::wrap_lines(&text, "claude-code", &session_id)
+    };
+    let turn_meta = |turn: u32| {
+        let mut session = meta::Meta::new(
+            session_id.clone(),
+            "claude-code".into(),
+            work.to_string_lossy().into_owned(),
+        );
+        session.turn = Some(turn);
+        session
+    };
+    // Settles turn `turn` on the checked-out `talk`, holding all of `log`.
+    let settle = |log: &str, turn: u32| {
+        write_snapshot(repo.root(), log, log).unwrap();
+        meta::write(repo.root(), &turn_meta(turn)).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("Turn {turn}")).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let head = || git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+    let log_of =
+        |root: &Path, commit: &str| git(root, &["cat-file", "blob", &format!("{commit}:LOG")]);
+    let user = |uuid: &str, parent: &str, text: &str| {
+        json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":uuid,"parentUuid":parent,
+            "message":{"role":"user","content":text}})
+    };
+    let assistant = |uuid: &str, parent: &str, text: &str| {
+        json!({"type":"assistant","sessionId":NATIVE,"cwd":work,"uuid":uuid,"parentUuid":parent,
+            "message":{"role":"assistant","content":[{"type":"text","text":text}]}})
+    };
+
+    // Two turns here, both uploaded. Plain publication leaves the instructions record out, so the
+    // Hub holds each turn's published form, a commit other than the local one.
+    let mut records = vec![
+        json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u1","parentUuid":null,
+            "message":{"role":"user","content":"Rename the flag."}}),
+        json!({"type":"attachment","sessionId":NATIVE,"cwd":work,"uuid":"u2","parentUuid":"u1",
+            "attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":"Project rules."}}),
+        assistant("u3", "u2", "Renamed."),
+    ];
+    repo.git(&["checkout", "--quiet", "-B", "talk", "main"])
+        .unwrap();
+    settle(&lines(&records), 1);
+    records.extend([
+        user("u4", "u3", "Now the tests."),
+        assistant("u5", "u4", "Updated the tests."),
+    ]);
+    let uploaded = settle(&lines(&records), 2);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(
+        published, uploaded,
+        "the Hub holds the turns' published forms"
+    );
+
+    // Another computer adds turn 3 to the Hub's branch: the published LOG, one more exchange.
+    let laptop = temp.path().join("laptop");
+    git(
+        temp.path(),
         &[
-            "-c",
-            "user.name=Laptop Writer",
-            "-c",
-            "user.email=laptop@example.invalid",
-            "commit-tree",
-            &format!("{published}^{{tree}}"),
-            "-p",
-            &published,
-            "-m",
-            "Turn 2",
+            "clone",
+            "--quiet",
+            "--branch",
+            "talk",
+            remote.to_str().unwrap(),
+            laptop.to_str().unwrap(),
         ],
     );
-    git(&remote, &["update-ref", "refs/heads/talk", &elsewhere]);
+    // The other computer's turn `number` on the Hub commit `on`, holding `records`.
+    let laptop_turn = |on: &str, records: &[serde_json::Value], number: u32| {
+        git(&laptop, &["fetch", "--quiet", "origin"]);
+        git(&laptop, &["checkout", "--quiet", "-B", "talk", on]);
+        let (log, _) = storage::materialize_pair_at(&laptop, on).unwrap();
+        let log = format!("{log}{}", lines(records));
+        write_snapshot(&laptop, &log, &log).unwrap();
+        let mut session = meta::read_at_ref(&Repo::at(&laptop), "HEAD").unwrap();
+        session.turn = Some(number);
+        meta::write(&laptop, &session).unwrap();
+        git(&laptop, &["add", "LOG", "VIEW", "events", "session"]);
+        git(
+            &laptop,
+            &[
+                "-c",
+                "user.name=Laptop Writer",
+                "-c",
+                "user.email=laptop@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                &format!("Turn {number}"),
+            ],
+        );
+        let turn = git(&laptop, &["rev-parse", "HEAD"]);
+        git(&laptop, &["push", "--quiet", "--force", "origin", "talk"]);
+        turn
+    };
+    let elsewhere = |said: &str| {
+        laptop_turn(
+            &published,
+            &[user("u6", "u5", said), assistant("u7", "u6", "Shipped.")],
+            3,
+        )
+    };
+    let refused = |expected: &str, at: &str| {
+        let output = run(&["resume", "alice/app@talk", "--no-launch"]);
+        assert_eq!(output.status.code(), Some(4), "{}", said(&output));
+        assert!(said(&output).contains(expected), "{}", said(&output));
+        assert_eq!(head(), at);
+    };
+
+    // A value this computer protects, in the other computer's turn: publishing it from here would
+    // change the line, so it isn't brought over, and nothing moves.
+    let mut add = command(&["secrets", "add", "deploy", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(PROTECTED.as_bytes())
+        .unwrap();
+    assert_success(&add.wait_with_output().unwrap());
+    elsewhere(&format!("Ship it with {PROTECTED}."));
+    refused(
+        "The Hub has a newer turn from another computer on top of what you uploaded.",
+        &uploaded,
+    );
+
+    // A turn of this computer's own that isn't uploaded: the session continued in two places.
+    let turn = elsewhere("Ship it.");
+    let mut own = records.clone();
+    own.extend([
+        user("u6", "u5", "Hold on."),
+        assistant("u7", "u6", "Holding."),
+    ]);
+    let unpublished = settle(&lines(&own), 3);
+    refused("continued in two places", &unpublished);
+    repo.git(&["checkout", "--quiet", "-B", "talk", &uploaded])
+        .unwrap();
+
+    let output = run(&["resume", "alice/app@talk", "--no-launch"]);
+    assert_success(&output);
+    assert!(
+        said(&output).contains(
+            "The Hub has a newer turn from another computer on top of what you uploaded; it's brought over here"
+        ),
+        "{}",
+        said(&output)
+    );
+    let brought = head();
+    assert_eq!(
+        git(repo.root(), &["rev-parse", &format!("{brought}^")]),
+        uploaded
+    );
+    let (here, there) = (log_of(repo.root(), &brought), log_of(&remote, &turn));
+    let (ours, theirs) = (log_of(repo.root(), &uploaded), log_of(&remote, &published));
+    assert_eq!(
+        here.strip_prefix(&ours).map(str::trim),
+        there.strip_prefix(&theirs).map(str::trim),
+        "the turns run here keep their records, and the Hub's turn follows as the Hub holds it"
+    );
+    for id in there.strip_prefix(&theirs).unwrap().split_whitespace() {
+        let path = meta::event_path(id).unwrap();
+        assert_eq!(
+            git(repo.root(), &["rev-parse", &format!("{brought}:{path}")]),
+            git(&remote, &["rev-parse", &format!("{turn}:{path}")])
+        );
+    }
+    // Stopped after the record was written and before the branch moved, which leaves the branch
+    // and its checkout at the uploaded turn: the next resume moves it.
+    repo.git(&["checkout", "--quiet", "-B", "talk", &uploaded])
+        .unwrap();
+    let output = run(&["resume", "alice/app@talk", "--no-launch"]);
+    assert_success(&output);
+    assert!(
+        said(&output).contains("fast-forwarded `talk` +1 to the published tip"),
+        "{}",
+        said(&output)
+    );
+    assert_eq!(head(), brought);
+    // Stopped there again, and meanwhile the other computer adds another turn on the Hub: the next
+    // resume moves the branch over the recorded turn and brings the new one over on top of it.
+    repo.git(&["checkout", "--quiet", "-B", "talk", &uploaded])
+        .unwrap();
+    let again = laptop_turn(
+        &turn,
+        &[
+            user("u8", "u7", "Ship it again."),
+            assistant("u9", "u8", "Shipped again."),
+        ],
+        4,
+    );
+    let output = run(&["resume", "alice/app@talk", "--no-launch"]);
+    assert_success(&output);
+    assert!(
+        said(&output).contains("it's brought over here"),
+        "{}",
+        said(&output)
+    );
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "refs/heads/talk^"]),
+        brought
+    );
+    let (brought, turn) = (head(), again);
+    let there = log_of(&remote, &turn);
+    const CONTINUE: [&[&str]; 2] = [
+        &["resume", "alice/app@talk", "--no-launch"],
+        &["run", "alice/app@talk", "--no-launch"],
+    ];
     for args in CONTINUE {
         let output = run(args);
-        assert_eq!(output.status.code(), Some(4), "{args:?}: {}", said(&output));
+        assert_success(&output);
         assert!(
-            said(&output).contains("diverged from the published tip"),
+            !said(&output).contains("Hub has"),
             "{args:?}: {}",
             said(&output)
         );
-        assert_eq!(head(), turn, "{args:?}");
+        assert_eq!(head(), brought, "{args:?}");
     }
     let pulled = run(&["pull", "alice/app"]);
-    assert_eq!(pulled.status.code(), Some(4), "{}", said(&pulled));
+    assert_success(&pulled);
     assert!(
-        said(&pulled).contains("talk truly diverged"),
+        said(&pulled).contains("talk is up to date"),
         "{}",
         said(&pulled)
     );
-    assert_eq!(head(), turn);
+
+    // The next turn here goes up on top of the Hub's turn, adding only its own records.
+    let (log, _) = storage::materialize_pair_at(repo.root(), &brought).unwrap();
+    let next = format!(
+        "{log}{}",
+        lines(&[
+            user("u10", "u9", "Add a changelog line."),
+            assistant("u11", "u10", "Added.")
+        ])
+    );
+    // Resume leaves the checkout on the file line, so the turn is settled on its own commit.
+    repo.git(&["checkout", "--quiet", "--detach", &brought])
+        .unwrap();
+    let next = settle(&next, 5);
+    repo.git(&["update-ref", "refs/heads/talk", &next, &brought])
+        .unwrap();
+    let push = run(&["--yes", "push", "alice/app@talk"]);
+    assert_success(&push);
+    let pushed = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{pushed}^")]),
+        turn,
+        "{}\nHub: {}\nhere: {}\nbrought {brought}, next {next}",
+        said(&push),
+        git(
+            &remote,
+            &["log", "--format=%H %P %s", "-6", "refs/heads/talk"]
+        ),
+        git(
+            repo.root(),
+            &["log", "--format=%H %P %s", "-6", "refs/heads/talk"]
+        ),
+    );
+    let added = log_of(&remote, &pushed);
+    let added = added
+        .strip_prefix(&there)
+        .unwrap()
+        .split_whitespace()
+        .count();
+    assert_eq!(added, 2, "only the new turn's two records are sent");
 }
 
 /// The publication summary says how many records the upload adds that keep parts the privacy check
