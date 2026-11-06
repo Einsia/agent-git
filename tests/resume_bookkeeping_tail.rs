@@ -260,9 +260,9 @@ fn commit_a_runtime_switch_and_a_merge_agree_on_what_is_unsettled() {
 /// snapshot, two copies of the last prompt, mode, permission mode, the latch, the stop-hook
 /// summary, the turn duration, two cost states and a file-history snapshot. In 2.1.314: the
 /// stop-hook summary, the turn duration, a copy of the last prompt and two cost states. Commit finds nothing new in them, so a merge and a runtime
-/// switch proceed. A turn after them still refuses the switch, a copy of a prompt never settled
-/// refuses it, and a record of a type this build does not know refuses both by its type alone,
-/// with the command that fixes it.
+/// switch proceed, also when the copy holds a prompt no settled turn holds. A turn after them
+/// still refuses the switch, and a record of a type this build does not know refuses both by its
+/// type alone, with the command that fixes it.
 #[test]
 fn claude_code_2_1_311_to_2_1_314_exit_records_leave_a_merge_free() {
     for (version, capture, records) in [
@@ -344,16 +344,17 @@ fn exit_records_leave_a_merge_free(version: &str, capture: &str, records: usize)
         "{version}: {text}"
     );
 
-    // A copy of a prompt no settled turn holds is not left behind.
+    // A copy of a prompt no settled turn holds, as a draft left in the prompt or a copy cut
+    // short is, begins no turn: commit finds nothing new, so the switch proceeds too. A switch
+    // that refused it would send the person to a commit that cannot clear it.
     let lab = Lab::new();
     lab.append(&exit(&lab, "a prompt that was never settled"));
-    let refused = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
-    let text = combined(&refused);
-    assert!(!refused.status.success(), "{version}: {text}");
-    assert!(
-        text.contains("already has unsettled content"),
-        "{version}: {text}"
-    );
+    let commit = lab.output(&["commit", SID]);
+    let text = combined(&commit);
+    assert!(text.contains("nothing new since"), "{version}: {text}");
+    let switched = lab.output(&["resume", "alice/qa@work", "--as", "codex", "--no-launch"]);
+    let text = combined(&switched);
+    assert!(switched.status.success(), "{version}: {text}");
 
     // A type this build does not know is refused by its name, cut short, and nothing else of it
     // is shown.

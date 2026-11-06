@@ -1922,12 +1922,39 @@ fn live_tail(
     };
     let adapter = adapter::get(&link.source)?;
     let settled = &live[..live.len() - tail.len()];
-    adapter::judge_tail(
+    let judged = adapter::judge_tail(
         adapter.as_ref(),
         |window| Ok(adapter::settled_end(settled, window).into()),
         added,
         tail,
-    )
+    )?;
+    if judged != adapter::Tail::Unsettled {
+        return Ok(judged);
+    }
+    // What settlement would land is decided by where it ends the last turn, as the archive
+    // decides it: a tail that begins at or past that end, with no turn begun or continued after
+    // it, is what `agit commit` finds nothing new in, whatever bookkeeping or prompt draft it
+    // holds. Judged by its records alone, such a tail can be refused while commit has nothing to
+    // settle, and the refusal's own advice then never clears it.
+    // A record still being written is not judged by where settlement ends.
+    let whole = added.is_empty()
+        || (added.ends_with('\n')
+            && added
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
+    let covered = match link.resolve().filter(|_| whole) {
+        Some(transcript) => {
+            crate::rc::archive_jobs::covered_end(&link.source, &link.session_id, &transcript, live)?
+                .is_some_and(|end| end <= settled.len() as u64)
+        }
+        None => false,
+    };
+    Ok(if covered {
+        adapter::Tail::Settled
+    } else {
+        judged
+    })
 }
 
 /// The live text past the committed envelopes, counted with the same parseable-line ruler as
