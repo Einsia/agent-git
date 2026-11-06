@@ -36,6 +36,8 @@ agit merge --continue | --abort
 | `--status` | Show the open merge transaction |
 | `--continue` | Validate the summary and commit the merge |
 | `--resolved <path>` | With `--continue`, acknowledge the current contents of this conflicted file-line path; repeat for each path |
+| `--keep-mine <path>` / `--take-theirs <path>` | With `--continue`, resolve a conflicted file-line path with the target's or the source's version |
+| `--edit <path>` | Open a conflicted file-line path in your editor with both sides marked; confirm it with `--continue --resolved <path>` |
 | `--abort` | Cancel the transaction; a visible Archive landing is completed without rollback |
 | `pick <refs>` | Select source turns/events |
 | `drop <refs>` | Remove picks |

@@ -1276,7 +1276,7 @@ const DISTILLED_FILE: &str = "Distilled-File: ";
 
 /// Whether `value` is a full git object id. A trailer on main is written by whoever can push
 /// there and reaches git as an argument: a value starting with "-" or naming a ref must not.
-fn is_object_id(value: &str) -> bool {
+pub(in crate::commands) fn is_object_id(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -1456,24 +1456,28 @@ fn merge_memory(
 /// One change between two versions of a file, as `git diff -U0` reports it: `len` lines of the
 /// older version from the 0-based line `at` replaced by `lines`, which start at the 1-based line
 /// `new_at` of the newer version.
-struct Hunk {
-    at: usize,
-    len: usize,
-    new_at: usize,
-    lines: Vec<String>,
+pub(in crate::commands) struct Hunk {
+    pub at: usize,
+    pub len: usize,
+    pub new_at: usize,
+    pub lines: Vec<String>,
 }
 
 impl Hunk {
     /// Whether two changes from the same version touch the same or adjacent lines and differ:
     /// the rule `git merge-file` conflicts by.
-    fn clashes(&self, other: &Hunk) -> bool {
+    pub(in crate::commands) fn clashes(&self, other: &Hunk) -> bool {
         let apart = self.at + self.len < other.at || other.at + other.len < self.at;
         let same = self.at == other.at && self.len == other.len && self.lines == other.lines;
         !apart && !same
     }
 }
 
-fn hunks(primary: &Repo, old: &[u8], new: &[u8]) -> crate::Result<Vec<Hunk>> {
+pub(in crate::commands) fn hunks(
+    primary: &Repo,
+    old: &[u8],
+    new: &[u8],
+) -> crate::Result<Vec<Hunk>> {
     let dir = tempfile::tempdir()?;
     let (old_path, new_path) = (dir.path().join("old"), dir.path().join("new"));
     std::fs::write(&old_path, old)?;
