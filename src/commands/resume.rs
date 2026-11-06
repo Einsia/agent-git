@@ -795,13 +795,18 @@ fn compare_cwd_state(recorded: &meta::CwdState, current: &meta::CwdState) -> Cwd
 /// A missing snapshot is expected for sessions created before cwd-state persistence. A cwd
 /// outside Git is also not an error: there is no trustworthy state to compare, so resume warns
 /// and continues. A known, unequal pair and an uncomparable pair both need a user decision.
+///
+/// When the session is also about to be converted to another runtime with losses, the one
+/// question this asks shows what the conversion keeps and loses, and a choice to continue covers
+/// the conversion too: [`Decided::Asked`] tells [`confirm_conversion`] not to ask again.
 fn cwd_resume_decision(
     repo: &Repo,
     snapshot: &meta::Meta,
     cwd: &Path,
-) -> crate::Result<CwdResumeDecision> {
+    conversion: (&str, &str),
+) -> crate::Result<(CwdResumeDecision, Decided)> {
     if snapshot.cwd_state.is_none() {
-        return Ok(CwdResumeDecision::Continue);
+        return Ok((CwdResumeDecision::Continue, Decided::NotAsked));
     }
     let Some(current) = meta::cwd_state_of(cwd) else {
         ui::warning(&format!(
@@ -809,7 +814,7 @@ fn cwd_resume_decision(
             cwd.display()
         ));
         ui::hint("use `agit resume --cwd <git-checkout>` to compare the recorded repository state");
-        return Ok(CwdResumeDecision::Continue);
+        return Ok((CwdResumeDecision::Continue, Decided::NotAsked));
     };
     let mut local_snapshot = snapshot.clone();
     crate::domain::privacy::service::hydrate_metadata(repo.root(), &mut local_snapshot);
@@ -817,7 +822,7 @@ fn cwd_resume_decision(
     let recorded = snapshot.cwd_state.as_ref().expect("recorded state exists");
     let comparison = compare_cwd_state(recorded, &current);
     if comparison == CwdStateComparison::Equal {
-        return Ok(CwdResumeDecision::Continue);
+        return Ok((CwdResumeDecision::Continue, Decided::NotAsked));
     }
 
     match comparison {
@@ -840,7 +845,7 @@ fn cwd_resume_decision(
     eprintln!("  current state:  {}", display_cwd_state(&current));
 
     if std::env::var_os("AGIT_YES").is_some() {
-        return Ok(CwdResumeDecision::Continue);
+        return Ok((CwdResumeDecision::Continue, Decided::NotAsked));
     }
 
     if !ui::prompt::can_ask() {
@@ -851,6 +856,8 @@ fn cwd_resume_decision(
         .into());
     }
 
+    let (from, to) = conversion;
+    describe_conversion(from, to);
     let options = [
         "continue anyway",
         "continue and inject an environment notice",
@@ -861,17 +868,26 @@ fn cwd_resume_decision(
         CwdStateComparison::Unknown => "the cwd state cannot be compared — choose how to resume",
         CwdStateComparison::Equal => unreachable!(),
     };
-    match ui::prompt::select(prompt, &options)? {
-        Some(0) => Ok(CwdResumeDecision::Continue),
-        Some(1) => Ok(CwdResumeDecision::Inject(
+    let decision = match ui::prompt::select(prompt, &options)? {
+        Some(0) => CwdResumeDecision::Continue,
+        Some(1) => CwdResumeDecision::Inject(
             cwd_state_notice(snapshot, cwd, recorded, Some(&current))
                 .expect("a differing or unknown state has an environment notice"),
-        )),
+        ),
         Some(_) | None => {
             println!("cancelled.");
-            Ok(CwdResumeDecision::Cancel)
+            CwdResumeDecision::Cancel
         }
-    }
+    };
+    Ok((decision, Decided::Asked))
+}
+
+/// Whether the person was already asked how to resume, with what a conversion keeps and loses
+/// in front of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decided {
+    Asked,
+    NotAsked,
 }
 
 fn report_environment_notice(runtime: &str, notice: Option<&str>) {
@@ -1045,15 +1061,16 @@ pub(crate) fn archive_launch_context(
     let system_prompt = if file {
         None
     } else {
-        match cwd_resume_decision(repo, &snapshot, &cwd)? {
+        let (decision, decided) =
+            cwd_resume_decision(repo, &snapshot, &cwd, (&snapshot.runtime, &runtime))?;
+        let prompt = match decision {
             CwdResumeDecision::Continue => None,
             CwdResumeDecision::Inject(prompt) => Some(prompt),
             CwdResumeDecision::Cancel => return Ok(None),
-        }
+        };
+        confirm_conversion(&snapshot.runtime, &runtime, decided)?;
+        prompt
     };
-    if !file {
-        confirm_conversion(&snapshot.runtime, &runtime)?;
-    }
     Ok(Some(ArchiveLaunch {
         runtime,
         cwd,
@@ -1239,18 +1256,6 @@ fn resume_branch_for(
 
     // `cwd_state` is an observation, not a checkout instruction. Compare it before either
     // native reuse or VIEW materialization so both resume paths receive the same context.
-    let system_prompt = match cwd_resume_decision(repo, &snap, &cwd)? {
-        CwdResumeDecision::Continue => None,
-        CwdResumeDecision::Inject(prompt) => Some(prompt),
-        CwdResumeDecision::Cancel => return Ok(None),
-    };
-
-    // Prompts cannot hold the branch lock: a runtime waiting to settle must remain able to
-    // finish while the operator decides. The selected snapshot must still be current afterward.
-    let branch_guard = link::lock_branch(&store, slug, branch)?;
-    require_resume_state(repo, branch, &head, &tracking)?;
-
-    // ── Memory: the branch's memory merges into the target runtime's memory dir (both paths) ──
     let from = snap.runtime.as_str();
     let requested_runtime = args
         .as_runtime
@@ -1266,6 +1271,19 @@ fn resume_branch_for(
                 .and_then(|runtime| adapter::normalize(runtime).ok())
         })
         .unwrap_or(from);
+    let (decision, decided) = cwd_resume_decision(repo, &snap, &cwd, (from, to_runtime))?;
+    let system_prompt = match decision {
+        CwdResumeDecision::Continue => None,
+        CwdResumeDecision::Inject(prompt) => Some(prompt),
+        CwdResumeDecision::Cancel => return Ok(None),
+    };
+
+    // Prompts cannot hold the branch lock: a runtime waiting to settle must remain able to
+    // finish while the operator decides. The selected snapshot must still be current afterward.
+    let branch_guard = link::lock_branch(&store, slug, branch)?;
+    require_resume_state(repo, branch, &head, &tracking)?;
+
+    // ── Memory: the branch's memory merges into the target runtime's memory dir (both paths) ──
     // ── The fast-path test: continue the local native session ──
     let switches_rt = requested_runtime.is_some_and(|runtime| runtime != from);
     // VIEW is only a projection of the committed LOG. Validate the evidence carrier even when the
@@ -1443,7 +1461,7 @@ fn resume_branch_for(
     };
 
     drop(branch_guard);
-    confirm_conversion(from, to_runtime)?;
+    confirm_conversion(from, to_runtime, decided)?;
     let _branch_guard = link::lock_branch(&store, slug, branch)?;
     require_resume_state(repo, branch, &head, &tracking)?;
     let current = link::active_for_branch(&store, owner, agent, branch);
@@ -1679,20 +1697,33 @@ fn require_resume_head(repo: &Repo, branch: &str, head: &str) -> crate::Result<(
     Ok(())
 }
 
-fn confirm_conversion(from: &str, to: &str) -> crate::Result<()> {
-    if adapter::is_lossy_conversion(from, to) {
+/// What a conversion from `from` to `to` keeps and loses, when it loses anything.
+fn describe_conversion(from: &str, to: &str) -> bool {
+    let lossy = adapter::is_lossy_conversion(from, to);
+    if lossy {
         println!("  cross-runtime ({from} → {to}) via IR:");
         println!(
             "  kept: messages, tool calls; arguments and paired outputs when recoverable from the source transcript, thinking (best effort)"
         );
         println!("  lost: encrypted reasoning, vendor encodings, compact boundaries");
-        if ui::prompt::can_ask() && std::env::var("AGIT_YES").is_err() {
-            match ui::prompt::confirm("proceed?", false)? {
-                Some(true) => {}
-                _ => {
-                    println!("cancelled.");
-                    anyhow::bail!("cancelled by user");
-                }
+    }
+    lossy
+}
+
+/// Asks before a conversion that loses anything, unless the person already chose to continue
+/// at a question that showed what it loses ([`cwd_resume_decision`]): asking twice makes the
+/// second question's default undo the first answer.
+fn confirm_conversion(from: &str, to: &str, decided: Decided) -> crate::Result<()> {
+    if decided == Decided::Asked {
+        return Ok(());
+    }
+    if describe_conversion(from, to) && ui::prompt::can_ask() && std::env::var("AGIT_YES").is_err()
+    {
+        match ui::prompt::confirm("proceed?", false)? {
+            Some(true) => {}
+            _ => {
+                println!("cancelled.");
+                anyhow::bail!("cancelled by user");
             }
         }
     }
@@ -3529,7 +3560,14 @@ mod tests {
         });
 
         assert!(matches!(
-            super::cwd_resume_decision(&Repo::at(dir.path()), &snapshot, dir.path()).unwrap(),
+            super::cwd_resume_decision(
+                &Repo::at(dir.path()),
+                &snapshot,
+                dir.path(),
+                ("claude-code", "claude-code")
+            )
+            .unwrap()
+            .0,
             super::CwdResumeDecision::Continue
         ));
     }
