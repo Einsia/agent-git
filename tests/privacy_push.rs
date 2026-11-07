@@ -1029,7 +1029,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert!(offered.contains("For the agent:"), "{offered}");
     assert!(offered.contains("`agit on --repo alice/app`"), "{offered}");
     assert!(
-        offered.contains("(private: only its members can read it)"),
+        offered.contains("(private: only you and people you add can read it)"),
         "{offered}"
     );
     let progress = String::from_utf8_lossy(&published.stderr);

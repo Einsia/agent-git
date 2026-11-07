@@ -323,21 +323,62 @@ fn record_audience(root: &Path, audience: &Audience) -> Result<()> {
     Ok(())
 }
 
-/// Whether `owner` is an organization, from the account's point of view: its own namespace is
-/// not, an organization the Hub shows it is, and anything else is unknown. The Hub answers "not
-/// found" for an organization the account is not a member of, so that answer settles nothing.
-fn owner_is_org(client: &crate::hub::Client, owner: &str, account: &str) -> Option<bool> {
+/// Whether `owner` is an organization, from the account's point of view, and whether every member
+/// of it reads its private repositories, both from one answer of the Hub so that a known
+/// organization never comes with a base permission a second request failed to fetch. The
+/// account's own namespace is no organization, one the Hub shows is, and anything else is unknown.
+/// The Hub answers "not found" for an organization the account is not a member of, so that answer
+/// settles nothing.
+pub(crate) fn owner_audience(
+    client: &crate::hub::Client,
+    owner: &str,
+    account: &str,
+) -> (Option<bool>, Option<bool>) {
     if owner == account {
-        return Some(false);
+        return (Some(false), None);
     }
-    client.get_org(owner).ok().map(|_| true)
+    match client.get_org(owner) {
+        Ok(org) => (Some(true), Some(org.members_read())),
+        Err(_) => (None, None),
+    }
 }
 
 /// Whether every member of `owner` reads its private repositories; `None` when the owner is no
-/// organization the caller belongs to, or the Hub does not say.
+/// organization the caller belongs to, or the Hub didn't answer. A Hub without the base
+/// permission doesn't name one, and there membership alone reads nothing.
 fn members_read(client: &crate::hub::Client, owner: &str) -> Option<bool> {
-    let org = client.get_org(owner).ok()?;
-    org.base_permission.is_some().then(|| org.members_read())
+    client.get_org(owner).ok().map(|org| org.members_read())
+}
+
+/// Who can read `repository`, as the Hub said; `None` when it has not said its visibility. An
+/// organization's repository can also be granted to people outside it, so they are named beside
+/// its members. A private repository whose owner the Hub didn't place, an organization or the
+/// person, or whose organization's base permission it didn't say, is said to be readable by the
+/// people with access to it, which never says fewer readers than there are.
+pub(crate) fn readers(
+    repository: &str,
+    visibility: Option<&str>,
+    org: Option<bool>,
+    members_read: Option<bool>,
+) -> Option<String> {
+    let owner = repository.split('/').next().unwrap_or_default();
+    Some(match (visibility?, org) {
+        ("public", _) => "public: anyone can read it".to_owned(),
+        ("private", Some(true)) if members_read == Some(true) => {
+            format!(
+                "private to {owner}: every member of {owner}, and the people granted access, can read it"
+            )
+        }
+        ("private", Some(true)) if members_read == Some(false) => {
+            format!("private to {owner}: its owners and the people granted access can read it")
+        }
+        ("private", Some(true)) => {
+            format!("private to {owner}: the people with access to {repository} can read it")
+        }
+        ("private", Some(false)) => "private: only you and people you add can read it".to_owned(),
+        ("private", None) => format!("private: the people with access to {repository} can read it"),
+        (visibility, _) => visibility.to_owned(),
+    })
 }
 
 pub(crate) fn root(path: &Path) -> Result<PathBuf> {
@@ -1967,14 +2008,11 @@ fn bind(
     } else {
         None
     };
-    let org = owner_is_org(&client, &owner, &project.account);
+    let (org, members_read) = owner_audience(&client, &owner, &project.account);
     let audience = Audience {
         visibility: Some(remote.visibility.clone()),
         org,
-        members_read: org
-            .unwrap_or(false)
-            .then(|| members_read(&client, &owner))
-            .flatten(),
+        members_read,
     };
     println!(
         "Project: {} -> {repository} ({})",
@@ -4114,14 +4152,16 @@ pub(crate) fn automatic_upload(
             let (owner, name) = super::parse_slug(&project.repository).ok()?;
             let remote = client.get_agent(&owner, &name).ok()?;
             (remote.agent_id == project.identity.agent_id).then(|| {
-                let org = recorded
-                    .org
-                    .or_else(|| owner_is_org(&client, &owner, &project.account));
-                // Owners change the base permission, so it is asked for every time.
-                let members_read = if org == Some(true) {
-                    members_read(&client, &owner).or(recorded.members_read)
-                } else {
-                    None
+                let (org, members_read) = match recorded.org {
+                    // Owners change the base permission, so it is asked for every time. Unasked,
+                    // only a recorded "every member reads it" stands, which says no fewer readers.
+                    Some(true) => (
+                        Some(true),
+                        members_read(&client, &owner)
+                            .or(recorded.members_read.filter(|read| *read)),
+                    ),
+                    Some(false) => (Some(false), None),
+                    None => owner_audience(&client, &owner, &project.account),
                 };
                 Audience {
                     visibility: Some(remote.visibility),
@@ -7603,5 +7643,106 @@ mod tests {
             Saved::upload_failed("the Hub did not answer".into()),
             Saved::Failed(_)
         ));
+    }
+
+    /// Whether the owner is an organization and whether its members read the repository come from
+    /// one answer of the Hub: a request after it that fails can't leave a known organization with
+    /// an unknown base permission. Not knowing it never names fewer readers than there are.
+    #[test]
+    fn the_owners_audience_comes_from_one_answer_of_the_hub() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Answers the first request with `first`, and fails every later one.
+        let ask = |first: String, owner: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(AtomicUsize::new(0));
+            let done = Arc::new(AtomicBool::new(false));
+            let server = {
+                let (requests, done) = (requests.clone(), done.clone());
+                std::thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !done.load(Ordering::Acquire) {
+                        assert!(Instant::now() < deadline, "the lookup did not finish");
+                        let mut connection = match listener.accept() {
+                            Ok((connection, _)) => connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(error) => panic!("connection failed: {error}"),
+                        };
+                        connection.set_nonblocking(false).unwrap();
+                        connection
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let mut buffer = [0; 1024];
+                            let count = connection.read(&mut buffer).unwrap();
+                            assert_ne!(count, 0, "the request was truncated");
+                            bytes.extend_from_slice(&buffer[..count]);
+                        }
+                        let request = String::from_utf8(bytes).unwrap();
+                        assert!(request.starts_with("GET /api/orgs/acme "), "{request}");
+                        let (status, body) = if requests.fetch_add(1, Ordering::AcqRel) == 0 {
+                            first.split_once('\n').unwrap()
+                        } else {
+                            ("500 Internal Server Error", r#"{"error":"down"}"#)
+                        };
+                        write!(
+                            connection,
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                })
+            };
+            let answer = owner_audience(&crate::hub::Client::for_hub(&base), owner, "alice");
+            done.store(true, Ordering::Release);
+            server.join().unwrap();
+            (answer, requests.load(Ordering::Acquire))
+        };
+        let org = |base: &str| match base {
+            "" => "200 OK\n{\"name\":\"acme\",\"role\":\"member\"}".to_owned(),
+            base => format!(
+                "200 OK\n{{\"name\":\"acme\",\"role\":\"member\",\"base_permission\":\"{base}\"}}"
+            ),
+        };
+        assert_eq!(ask(org("read"), "acme"), ((Some(true), Some(true)), 1));
+        assert_eq!(ask(org("write"), "acme"), ((Some(true), Some(true)), 1));
+        assert_eq!(ask(org("none"), "acme"), ((Some(true), Some(false)), 1));
+        // A Hub without the base permission doesn't name one, and there membership reads nothing.
+        assert_eq!(ask(org(""), "acme"), ((Some(true), Some(false)), 1));
+        // Not a member, or no answer: neither is known.
+        assert_eq!(
+            ask("404 Not Found\n{\"error\":\"not found\"}".into(), "acme").0,
+            (None, None)
+        );
+        // The account's own namespace is asked about nothing.
+        assert_eq!(ask("unused\n".into(), "alice"), ((Some(false), None), 0));
+
+        let private =
+            |org, members_read| readers("acme/widget", Some("private"), org, members_read);
+        assert_eq!(
+            private(Some(true), Some(true)).unwrap(),
+            "private to acme: every member of acme, and the people granted access, can read it"
+        );
+        assert_eq!(
+            private(Some(true), Some(false)).unwrap(),
+            "private to acme: its owners and the people granted access can read it"
+        );
+        assert_eq!(
+            private(Some(true), None).unwrap(),
+            "private to acme: the people with access to acme/widget can read it"
+        );
+        assert_eq!(
+            private(None, None).unwrap(),
+            "private: the people with access to acme/widget can read it"
+        );
     }
 }
