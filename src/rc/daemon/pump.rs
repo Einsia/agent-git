@@ -348,7 +348,7 @@ impl Daemon {
         // archive jobs are queued before archive recovery starts.
         #[cfg(unix)]
         d.lock().await.recover_open_turns().await;
-        let _archive_recovery = archive_recovery::start(
+        let archive_recovery = archive_recovery::start(
             d.clone(),
             admission.clone(),
             session_rpc_stop_tx.subscribe(),
@@ -924,21 +924,20 @@ impl Daemon {
         // get one. Nobody drains the outbound queue on the shutdown path, so the only
         // option is to cut it, or the process is left with a task that never exits.
         tail_task.abort();
-        let mut g = d.lock().await;
-        // Transport is already torn down above, while the **exit settlement** that runs in
-        // `shutdown()` still commits, pushes and emits `commit.settled` — that notification
-        // has no consumer left, so it can never get the hub's acknowledgement. This is not a
-        // bug (waiting on a notification that cannot be delivered only hangs shutdown), but
-        // it means "the push succeeded" on this path is **never** the same as "the hub took
-        // the notification": git's remote-tracking ref has advanced while the notification
-        // stayed on this machine. So the notification side carries its own durable
-        // watermark — see `supervisor::unacked_settlement_path`: the receipt persists before
-        // the push and is removed only once the hub really acknowledges, and the next daemon
-        // to start resends it from there. Anyone who changes settlement's "delivered" test
-        // back to inferring it from git reachability loses this whole argument again.
-        g.shutdown().await;
-        crate::rc::diagnostics::event(
-            "daemon.stopped",
+        let stopped = {
+            let mut g = d.lock().await;
+            // Transport is already torn down above, while the **exit settlement** that runs in
+            // `shutdown()` still commits, pushes and emits `commit.settled` — that notification
+            // has no consumer left, so it can never get the hub's acknowledgement. This is not a
+            // bug (waiting on a notification that cannot be delivered only hangs shutdown), but
+            // it means "the push succeeded" on this path is **never** the same as "the hub took
+            // the notification": git's remote-tracking ref has advanced while the notification
+            // stayed on this machine. So the notification side carries its own durable
+            // watermark — see `supervisor::unacked_settlement_path`: the receipt persists before
+            // the push and is removed only once the hub really acknowledges, and the next daemon
+            // to start resends it from there. Anyone who changes settlement's "delivered" test
+            // back to inferring it from git reachability loses this whole argument again.
+            g.shutdown().await;
             serde_json::json!({
                 "reason": match g.stop_cause {
                     StopCause::Person => "stopped",
@@ -946,8 +945,13 @@ impl Daemon {
                     StopCause::Upgrade => "replaced_by_upgrade",
                 },
                 "to_build": g.replaced_by.as_deref().map(crate::rc::diagnostics::id),
-            }),
-        );
+            })
+        };
+        // Archive recovery heard the stop with everything else and lets the stage it has in
+        // flight finish; returning without waiting for it would abort that stage at once. The
+        // daemon's lock is released first, since the stage's last step takes it.
+        archive_recovery.finish().await;
+        crate::rc::diagnostics::event("daemon.stopped", stopped);
         // The log's writer is not joined when the process exits; what is still queued is lost.
         crate::rc::diagnostics::settle(std::time::Duration::from_secs(2));
         #[cfg(windows)]

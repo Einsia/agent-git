@@ -24,6 +24,10 @@ pub(super) static QUICK_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::c
 /// Reading the automatic-publication setting starts Git, so a job waiting for it to be turned
 /// on reads it this often rather than every cycle.
 const PUSH_RECHECK: Duration = Duration::from_secs(60);
+/// How long a stop lets the archive stage in flight finish. Aborting a stage kills its Git, which
+/// can leave the checkout's index lock behind and refuse every later attempt at that
+/// conversation; past this the stage is aborted anyway, inside the daemon's own exit bound.
+pub(super) const STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// `delay`, or, in a debug build whose `AGIT_TEST_ARCHIVE_RETRY_MS` names a shorter one, that:
 /// a test that runs the daemon waits for a retry in milliseconds rather than in the minutes a
@@ -40,6 +44,21 @@ pub(super) fn retry_delay(delay: Duration) -> Duration {
 }
 
 pub(super) struct Worker(Vec<tokio::task::JoinHandle<()>>);
+
+impl Worker {
+    /// Waits, after a stop, for observation and recovery to end, at most [`STOP_GRACE`] from now;
+    /// dropping the worker then aborts what is left. A worker dropped without this aborts a stage
+    /// in flight the moment the daemon returns, whatever its own grace says.
+    pub(super) async fn finish(mut self) {
+        let deadline = Instant::now() + STOP_GRACE;
+        for task in &mut self.0 {
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         for task in &self.0 {
@@ -62,7 +81,7 @@ impl std::ops::Deref for Recovering {
     }
 }
 
-// Recovery keeps its admission until completion or shutdown. A wall-clock cutoff can kill Git
+// Recovery keeps its admission until completion or a stop. A wall-clock cutoff can kill Git
 // while it owns the index, leaving the durable retry unable to acquire repository locks.
 async fn until_stopped<T>(
     stop: &mut tokio::sync::watch::Receiver<bool>,
@@ -263,21 +282,36 @@ async fn attempt(
     }
 }
 
-/// Runs one stage on its own task: a panic fails the attempt instead of ending recovery, and
-/// shutdown aborts the stage together with its subprocesses.
+/// Runs one stage on its own task: a panic fails the attempt instead of ending recovery. After a
+/// stop no stage starts, and the one in flight gets [`STOP_GRACE`] to finish before it is aborted
+/// together with its subprocesses. `None` means the daemon is stopping and the stage didn't end.
 async fn run<T: Send + 'static>(
     stop: &mut tokio::sync::watch::Receiver<bool>,
     stage: impl std::future::Future<Output = crate::Result<T>> + Send + 'static,
 ) -> Option<crate::Result<T>> {
-    let task = tokio::spawn(stage);
-    let abort = task.abort_handle();
-    match until_stopped(stop, task).await {
-        None => {
-            abort.abort();
-            None
+    if *stop.borrow() {
+        return None;
+    }
+    /// Aborts the stage when its attempt is dropped: a task's handle alone only detaches it, and
+    /// the stage would outlive the worker that a stopping daemon has stopped waiting for.
+    struct AbortStage(tokio::task::AbortHandle);
+    impl Drop for AbortStage {
+        fn drop(&mut self) {
+            self.0.abort();
         }
-        Some(Ok(result)) => Some(result),
-        Some(Err(error)) => Some(Err(anyhow::anyhow!(
+    }
+    let mut task = tokio::spawn(stage);
+    let _abort_stage = AbortStage(task.abort_handle());
+    let joined = match until_stopped(stop, &mut task).await {
+        Some(joined) => joined,
+        None => match tokio::time::timeout(STOP_GRACE, &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => return None,
+        },
+    };
+    match joined {
+        Ok(result) => Some(result),
+        Err(error) => Some(Err(anyhow::anyhow!(
             "archive recovery stage did not complete: {error}"
         ))),
     }
@@ -751,34 +785,73 @@ mod tests {
         );
     }
 
-    /// Long local transactions keep restart admission until completion; shutdown still cancels.
+    /// Long local transactions keep restart admission until completion. A stop starts no stage
+    /// and gives the one in flight [`STOP_GRACE`] to finish, keeping its result; only past that
+    /// is it aborted, and the daemon's wait for its worker ends there too, even when the worker's
+    /// own deadline comes first. A recovery that aborted the stage the moment the stop came, or a
+    /// daemon that dropped its worker without waiting, would kill Git while it can hold the
+    /// checkout's index lock; a stage only detached when its worker is aborted would outlive it.
     #[tokio::test(start_paused = true)]
-    async fn archive_completion_outlives_request_budgets_but_observes_shutdown() {
+    async fn a_stop_lets_the_archive_stage_in_flight_finish_within_its_grace() {
         let admission = crate::rc::admission::Admission::default();
         let work = admission.enter().unwrap();
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let running = tokio::spawn(async move {
             let _work = work;
-            until_stopped(&mut stopped, async {
-                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                "committed"
+            run(&mut stopped, async {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                Ok("committed")
             })
             .await
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        tokio::time::advance(Duration::from_secs(61)).await;
         assert!(!running.is_finished());
         assert!(admission.freeze().is_err());
-        assert_eq!(running.await.unwrap(), Some("committed"));
+        assert_eq!(running.await.unwrap().unwrap().unwrap(), "committed");
         assert!(admission.freeze().is_ok());
 
         let mut stopped = stop.subscribe();
-        let running =
-            tokio::spawn(
-                async move { until_stopped(&mut stopped, std::future::pending::<()>()).await },
-            );
+        let running = tokio::spawn(async move {
+            run(&mut stopped, async {
+                tokio::time::sleep(STOP_GRACE / 2).await;
+                Ok("committed")
+            })
+            .await
+        });
+        tokio::task::yield_now().await;
         stop.send(true).unwrap();
-        assert_eq!(running.await.unwrap(), None);
+        assert_eq!(running.await.unwrap().unwrap().unwrap(), "committed");
+
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stopped = stop.subscribe();
+        let marker = started.clone();
+        let after = run(&mut stopped, async move {
+            marker.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(after.is_none());
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let (dropped, aborted) = tokio::sync::oneshot::channel::<()>();
+        let worker = Worker(vec![tokio::spawn(async move {
+            let _ = run(&mut stopped, async move {
+                let _dropped = dropped;
+                std::future::pending::<crate::Result<()>>().await
+            })
+            .await;
+        })]);
+        tokio::task::yield_now().await;
+        stop.send(true).unwrap();
+        let started = Instant::now();
+        worker.finish().await;
+        assert!(started.elapsed() >= STOP_GRACE);
+        assert!(
+            matches!(tokio::time::timeout(STOP_GRACE, aborted).await, Ok(Err(_))),
+            "the stage outliving the grace is aborted"
+        );
     }
 
     /// Recovery and a native attachment cannot hold the same capture writer concurrently.
