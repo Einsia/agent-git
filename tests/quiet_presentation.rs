@@ -1508,10 +1508,14 @@ fn quiet_init_preserves_binding_visibility_and_existing_file_refusals() {
     }
 }
 
+/// Personal memory enters a new main only as the person chooses each file at a terminal. With no
+/// terminal nothing is adopted, and `--yes` adopts nothing either: an agent passes it to get past a
+/// question, and here it would publish the person's own files with nobody choosing them. Each
+/// found file is named, and no printed line suggests the flag.
 #[test]
-fn quiet_seed_keeps_explicit_asset_consent_and_refused_candidates() {
+fn quiet_seed_adopts_nothing_personal_without_a_choice_and_names_what_it_found() {
     for mode in ["flag", "", "1"] {
-        for consent in [false, true] {
+        for yes in [false, true] {
             let lab = Lab::new();
             lab.signed_in();
             std::fs::write(
@@ -1520,28 +1524,24 @@ fn quiet_seed_keeps_explicit_asset_consent_and_refused_candidates() {
             )
             .unwrap();
             let mut command = lab.quiet_command(&["init", "quiet", "--seed", "--no-bind"], mode);
-            if consent {
-                command.arg("--yes");
+            if yes {
+                command.arg("--yes").env("AGIT_YES", "1");
             }
             let output = success(command.output().unwrap());
             let adopted = lab
                 .repo()
                 .git_bytes(&["show", "refs/heads/main:AGENTS.md"])
                 .unwrap();
-            if consent {
-                silent(output);
-                assert_eq!(adopted, b"SYNTHETIC-PROJECT-ASSET\n");
-            } else {
-                assert!(
-                    String::from_utf8_lossy(&output.stdout).contains("found AGENTS.md"),
-                    "{output:?}"
-                );
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("nothing adopted"),
-                    "{output:?}"
-                );
-                assert_ne!(adopted, b"SYNTHETIC-PROJECT-ASSET\n");
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(stdout.contains("found AGENTS.md"), "{output:?}");
+            assert!(stderr.contains("nothing adopted"), "{output:?}");
+            for line in stdout.lines().chain(stderr.lines()) {
+                assert!(!line.contains("-y"), "{line}");
             }
+            assert_ne!(adopted, b"SYNTHETIC-PROJECT-ASSET\n");
             assert_eq!(
                 std::fs::read(lab.root.path().join("AGENTS.md")).unwrap(),
                 b"SYNTHETIC-PROJECT-ASSET\n"

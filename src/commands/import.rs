@@ -1188,7 +1188,7 @@ fn place_resolved_branch(
                 None => {
                     ui::error("refusing to move the claim without confirmation");
                     ui::hint(&format!(
-                        "inspect the recorded identity, then pass `-y` only if you intend to claim `{next}`"
+                        "inspect the recorded identity, then run it at a terminal to confirm moving the claim to `{next}`"
                     ));
                     return Ok(Placed::Refused(ExitCode::Interactive));
                 }
@@ -2293,7 +2293,7 @@ fn attach(
         (Some(saved), Some(destination)) => {
             println!("{} {session} is already saved at {saved}", ui::dim(s.idle));
             ui::hint(&format!(
-                "importing into {destination} moves its future turns there; confirm when asked, or pass `-y` to move it without a prompt"
+                "importing into {destination} moves its future turns there; confirm it when asked, at a terminal"
             ));
         }
         (Some(saved), None) => {

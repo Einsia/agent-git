@@ -2268,7 +2268,11 @@ fn distill_cmd(
             Some(true) => chosen.push(item.clone()),
             Some(false) => {}
             None => {
-                ui::error("distilling needs confirmation; pass `-y` to apply every change listed.");
+                // A yes here would also overwrite others' lines on main unasked, so the way on that
+                // is named is a terminal, never the flag.
+                ui::error(
+                    "distilling needs confirmation; run it at a terminal to confirm each change.",
+                );
                 for item in &wanted {
                     println!(
                         "  {} memory/{}",

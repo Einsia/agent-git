@@ -563,24 +563,24 @@ pub(crate) fn find_seed_assets(cwd: &Path) -> Vec<(PathBuf, PathBuf)> {
 /// The ways assets enter the repo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seed {
-    /// The user has explicitly said "take all of it" (`-y`).
-    All,
-    /// A tty is there: ask item by item.
+    /// A tty is there and nothing answered for the person: ask item by item.
     AskEach,
-    /// Nothing to ask on and no explicit authorization: take nothing.
+    /// No one to ask, or `-y` given: take nothing.
     Nothing,
+    /// `-y` given: take nothing, and say that `-y` doesn't choose these.
+    NotByYes,
 }
 
-/// A non-interactive run **takes nothing by default**.
+/// Personal memory enters the repo **only by the person's own choice of each file**.
 ///
 /// This is not fastidiousness: personal memory (CLAUDE.md, `.claude/skills/`) can hold private
-/// content, and `--seed` says only "willing to take assets in", not "this one too" — the design
-/// requires item-by-item confirmation before anything enters the repo, and with no way to ask,
-/// the only safe answer is to take nothing. `-y` is the explicit "take all of it" action; with it
-/// there is nothing left to ask (under a tty too — that is exactly what `-y` means).
+/// content, and main is published, so `--seed` says only "willing to take assets in", not "this
+/// one too". With no way to ask, the only safe answer is to take nothing. `-y` doesn't answer for
+/// the person either: an agent passes it to get past a question, and here it would publish the
+/// person's own files with nobody choosing them.
 fn seed_policy(tty: bool, yes: bool) -> Seed {
     match (yes, tty) {
-        (true, _) => Seed::All,
+        (true, _) => Seed::NotByYes,
         (false, true) => Seed::AskEach,
         (false, false) => Seed::Nothing,
     }
@@ -592,27 +592,20 @@ fn pick_assets(found: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
         std::env::var_os("AGIT_YES").is_some(),
     );
     if policy != Seed::AskEach {
-        let take = policy == Seed::All;
         for (dst, src) in found {
-            let notice = format!(
-                "  {} {} (from {})",
-                if take { "adopt" } else { "found" },
-                dst.display(),
-                src.display()
-            );
-            if take {
-                ui::info(notice);
-            } else {
-                println!("{notice}");
-            }
+            println!("  found {} (from {})", dst.display(), src.display());
         }
-        if !take {
-            ui::hint(
-                "nothing adopted: personal memory can carry private content and there’s no TTY to confirm item by item — re-run with `-y` to take all of it",
-            );
-            return vec![];
-        }
-        return found.to_vec();
+        let how = "add one to main yourself with `agit file --into <owner/repo>@main add <file> --to <path>`, then commit and push it";
+        ui::hint(&if policy == Seed::NotByYes {
+            format!(
+                "nothing adopted: a yes given in advance doesn't choose personal memory, which can carry private content; run this again at a terminal, without the yes flag, to choose each file, or {how}"
+            )
+        } else {
+            format!(
+                "nothing adopted: personal memory can carry private content; run this at a terminal to choose each file, or {how}"
+            )
+        });
+        return vec![];
     }
     use crate::ui::prompt;
     let labels: Vec<String> = found
@@ -659,30 +652,23 @@ mod tests {
     }
 
     /// "Personal memory can carry private content and is never collected silently" — a
-    /// non-interactive `--seed` takes nothing.
+    /// non-interactive `--seed` takes nothing, and neither does `-y`, at a terminal or not.
     ///
     /// This pins the answer for a run with no tty. An implementation that takes everything there
     /// instead lets CI, pipelines and every agent-driven call (none of them a tty) fold
     /// CLAUDE.md and the whole skills directory into a repo that gets pushed, with nobody
-    /// confirming.
+    /// confirming. One that took everything on `-y` lets an agent do the same by passing the flag
+    /// a hint names.
     #[test]
-    fn seeding_without_a_tty_takes_nothing_unless_explicitly_confirmed() {
+    fn seeding_takes_only_what_the_person_chooses_at_a_terminal() {
         assert_eq!(seed_policy(false, false), Seed::Nothing);
-        assert_eq!(
-            seed_policy(false, true),
-            Seed::All,
-            "`-y` is the explicit action"
-        );
+        assert_eq!(seed_policy(false, true), Seed::NotByYes);
         assert_eq!(
             seed_policy(true, false),
             Seed::AskEach,
             "a tty means asking item by item"
         );
-        assert_eq!(
-            seed_policy(true, true),
-            Seed::All,
-            "`-y` means not asking again"
-        );
+        assert_eq!(seed_policy(true, true), Seed::NotByYes);
     }
 
     /// Asset discovery recognizes the places the design names.

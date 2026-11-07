@@ -229,6 +229,26 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
         ],
     ));
 
+    // With no terminal to confirm at, distill stops and names the terminal; no line suggests the
+    // flag that would also overwrite others' lines unasked.
+    let unconfirmed = agit(&home, &claude, &["distill", "--into", &into]);
+    assert!(!unconfirmed.status.success(), "{unconfirmed:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unconfirmed.stdout),
+        String::from_utf8_lossy(&unconfirmed.stderr)
+    );
+    assert!(
+        said.contains(
+            "distilling needs confirmation; run it at a terminal to confirm each change."
+        ),
+        "{said}"
+    );
+    for line in said.lines() {
+        assert!(!line.contains("-y"), "{line}");
+    }
+    assert!(repo.show("refs/heads/main", "memory/mine.md").is_none());
+
     // distill -y: into main, after which everything is in sync.
     let distilled = agit(&home, &claude, &["distill", "-y", "--into", &into]);
     ok(&distilled);

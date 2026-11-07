@@ -2318,13 +2318,14 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     assert!(!has_branch("partial"), "{partial:?}");
 }
 
-/// A repository created by an import takes the memory and skills assets of the session's own
-/// folder, wherever the command runs, and so does one created from a privacy copy. Discovery
-/// finds a session outside the current folder without its cwd, so an import that fell back to the
-/// command's folder, or a privacy copy that recorded it as its own, would put that folder's
-/// personal memory on the main line, which the first push publishes.
+/// A repository created by an import looks for the memory and skills assets in the session's own
+/// folder, wherever the command runs, and so does one created from a privacy copy; its main line
+/// takes none of them by the yes flag. Discovery finds a session outside the current folder
+/// without its cwd, so an import that fell back to the command's folder, or a privacy copy that
+/// recorded it as its own, would name that folder's personal memory instead, and one that took
+/// what it found would put it on the main line, which the first push publishes.
 #[test]
-fn an_import_seeds_the_main_line_from_the_session_folder_not_the_command_folder() {
+fn an_import_looks_for_main_line_memory_in_the_session_folder_and_takes_none_by_yes() {
     let lab = Lab::new(1);
     let (id, _) = &lab.sources[0];
     fs::write(lab.work.join("AGENTS.md"), "SYNTHETIC-PROJECT-RULES\n").unwrap();
@@ -2347,25 +2348,30 @@ fn an_import_seeds_the_main_line_from_the_session_folder_not_the_command_folder(
             .output()
             .unwrap();
         assert!(import.status.success(), "{repo}: {import:?}");
-        let main = |path: &str| {
+        let said = String::from_utf8_lossy(&import.stdout);
+        assert!(said.contains("found AGENTS.md (from "), "{repo}: {said}");
+        for name in ["CLAUDE.md", "SKILL.md"] {
+            assert!(!said.contains(name), "{repo}: {said}");
+        }
+        let main = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
                 .arg(lab.store.join("repos/me").join(repo))
-                .args(["show", &format!("main:{path}")])
+                .args(args)
                 .output()
                 .unwrap()
         };
-        let rules = main("AGENTS.md");
-        assert!(rules.status.success(), "{repo}: {rules:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&rules.stdout),
-            "SYNTHETIC-PROJECT-RULES\n",
-            "{repo}"
+        // The main line's own AGENTS.md is its scaffold, never the session folder's.
+        let rules = main(&["show", "main:AGENTS.md"]);
+        assert!(rules.status.success(), "{repo}: no main line: {rules:?}");
+        assert!(
+            !String::from_utf8_lossy(&rules.stdout).contains("SYNTHETIC-PROJECT-RULES"),
+            "{repo}: AGENTS.md was adopted"
         );
-        for personal in ["CLAUDE.md", "skills/private/SKILL.md"] {
+        for asset in ["CLAUDE.md", "skills/private/SKILL.md"] {
             assert!(
-                !main(personal).status.success(),
-                "{repo}: {personal} was adopted"
+                !main(&["show", &format!("main:{asset}")]).status.success(),
+                "{repo}: {asset} was adopted"
             );
         }
     }
