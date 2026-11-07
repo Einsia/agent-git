@@ -29,10 +29,15 @@ final class Notifier {
         String(text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: true).first ?? Substring(text))
     }
 
-    func post(key: String, title: String, body: String) {
+    /// `delivered` runs on the main queue once the notification is shown, or at once when this key
+    /// was already shown within the window.
+    func post(key: String, title: String, body: String, delivered: (() -> Void)? = nil) {
         guard available, !inFlight.contains(key) else { return }
         let stamps = defaults.dictionary(forKey: Self.stampsKey) as? [String: Double] ?? [:]
-        if let last = stamps[key], Date().timeIntervalSince1970 - last < Self.window { return }
+        if let last = stamps[key], Date().timeIntervalSince1970 - last < Self.window {
+            delivered?()
+            return
+        }
         inFlight.insert(key)
 
         let center = UNUserNotificationCenter.current()
@@ -42,20 +47,21 @@ final class Notifier {
         let request = UNNotificationRequest(identifier: key, content: content, trigger: nil)
         let deliver = { [weak self] in
             center.add(request) { error in
-                DispatchQueue.main.async { self?.delivered(key, error == nil) }
+                DispatchQueue.main.async { self?.finished(key, error == nil, delivered) }
             }
         }
         if asked { return deliver() }
         asked = true
         center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             if granted { return deliver() }
-            DispatchQueue.main.async { self?.delivered(key, false) }
+            DispatchQueue.main.async { self?.finished(key, false, delivered) }
         }
     }
 
-    private func delivered(_ key: String, _ ok: Bool) {
+    private func finished(_ key: String, _ ok: Bool, _ delivered: (() -> Void)?) {
         inFlight.remove(key)
         guard ok else { return }
+        delivered?()
         let now = Date().timeIntervalSince1970
         var stamps = defaults.dictionary(forKey: Self.stampsKey) as? [String: Double] ?? [:]
         stamps = stamps.filter { now - $0.value < Self.window }

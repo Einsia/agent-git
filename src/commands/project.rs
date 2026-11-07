@@ -4827,8 +4827,9 @@ fn folder_json(
     })
 }
 
-/// Reads local state only and changes none of it: no lock is taken, so a listing never delays
-/// or turns away a capture worker.
+/// Reads local state only and changes none of it. It takes no lock a capture worker waits on; the
+/// upload records are read as `agit status` reads them, which looks at a running upload's lock for
+/// an instant, so an upload starting meanwhile waits that instant and is never turned away.
 fn listing() -> Result<serde_json::Value> {
     let (mut folders, policies_complete) = listed()?;
     let sessions_complete = assign_sessions(&mut folders)?;
@@ -4846,6 +4847,9 @@ fn listing() -> Result<serde_json::Value> {
         // Public automatic uploads switched on with no person answering, for the menu bar to
         // tell the person once each.
         "public_switched_on_unattended": super::push::unattended(),
+        // Branches whose newest automatic upload didn't go through, for the menu bar to show as
+        // soon as they are recorded: an upload runs after its turn's end, which can't say it.
+        "uploads_not_through": super::status::uploads_not_through_json(),
     }))
 }
 

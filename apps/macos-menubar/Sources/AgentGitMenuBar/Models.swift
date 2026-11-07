@@ -33,6 +33,44 @@ struct ProjectList: Decodable {
     /// Public automatic uploads switched on with nobody at a terminal or in this app, such as by
     /// an agent; absent from an agit that predates the record.
     let publicSwitchedOnUnattended: [UnattendedSwitchOn]?
+    /// Branches whose newest automatic upload didn't go through, as `agit status` lists them;
+    /// absent from an agit that predates the upload records.
+    let uploadsNotThrough: UploadsNotThrough?
+}
+
+/// `uploads_not_through`: what agit recorded of automatic uploads that didn't go through, and
+/// what it couldn't read, so an empty list never stands for records it could not open.
+struct UploadsNotThrough: Decodable {
+    let items: [UploadNotThrough]
+    let unreadable: [Unreadable]
+
+    struct Unreadable: Decodable, Equatable {
+        /// A repository, a branch as `owner/repo@branch`, or the repositories as a whole.
+        let of: String
+        let error: String
+    }
+}
+
+/// One branch whose newest automatic upload didn't go through. It carries nothing of the
+/// conversation: the branch, the class of what happened in agit's words, and the command that
+/// shows what to do.
+struct UploadNotThrough: Decodable, Equatable {
+    /// `owner/repo@branch`.
+    let target: String
+    /// `failed`, `ended` or `unrecorded`.
+    let state: String
+    /// The failure's class when it failed.
+    let reason: String?
+    let description: String
+    let command: String
+
+    /// The branch and what happened to it: a later upload of the branch that didn't go through
+    /// the same way is the same entry, so it is not told again. Only a digest is kept.
+    var key: String { Notifier.key("not-through", target, state, reason ?? "") }
+    /// The repository part of `target`; a repository's name holds no `@`.
+    var repository: String { String(target.prefix { $0 != "@" }) }
+    /// The description as a sentence: agit writes it to follow a colon.
+    var sentence: String { description.prefix(1).uppercased() + description.dropFirst() + "." }
 }
 
 struct UnattendedSwitchOn: Decodable, Equatable {

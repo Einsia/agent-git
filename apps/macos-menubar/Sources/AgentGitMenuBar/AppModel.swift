@@ -20,7 +20,7 @@ enum Health {
 struct Problem: Identifiable, Equatable {
     enum Fix: Equatable {
         case signIn, retry(String), allowAutoUpload(String), chooseCLI, checkAgain, dismiss(String)
-        case acknowledge(String), none
+        case acknowledge(String), copy(String), none
     }
 
     let id: String
@@ -135,6 +135,10 @@ final class AppModel: ObservableObject {
     @Published var notice: String?
     /// Public automatic uploads switched on with no person answering, not yet acknowledged here.
     @Published private(set) var unattended: [UnattendedSwitchOn] = []
+    /// Branches whose newest automatic upload didn't go through, as agit last listed them.
+    @Published private(set) var notThrough: [UploadNotThrough] = []
+    /// What agit couldn't read of its upload records, so a short list says it may be short.
+    @Published private(set) var notThroughUnreadable: [UploadsNotThrough.Unreadable] = []
 
     private var timer: Timer?
     private let notifier = Notifier()
@@ -156,6 +160,7 @@ final class AppModel: ObservableObject {
     private static let historyKey = "uploadHistory"
     private static let pausedKey = "pausedFolders"
     private static let acknowledgedKey = "acknowledgedPublicSwitchOns"
+    private static let notThroughKey = "uploadsNotThroughSeen"
     private static let hooksRepairedKey = "hooksRepairedFor"
     private static let permissionHookAskedKey = "permissionHookAskedFor"
     private static let repairRetry: TimeInterval = 600
@@ -241,6 +246,21 @@ final class AppModel: ObservableObject {
                 id: "upload:\(folder.folder)",
                 title: "Uploads from \(folder.name) are failing",
                 detail: folder.lastUpload?.error, fix: .retry(folder.folder)))
+        }
+        for item in notThrough {
+            problems.append(Problem(
+                id: "not-through:\(item.target)",
+                title: "\(item.target): an upload didn't go through",
+                detail: "\(item.sentence)\nIn a terminal, \(item.command) shows what to do.",
+                fix: .copy(item.command)))
+        }
+        if !notThroughUnreadable.isEmpty {
+            let what = notThroughUnreadable.map { "\($0.of): \($0.error)" }
+            problems.append(Problem(
+                id: "not-through-unreadable",
+                title: "Some records of uploads couldn't be read",
+                detail: (["An upload that didn't go through may be missing here."] + what).joined(separator: "\n"),
+                fix: .checkAgain))
         }
         for switchOn in unattended {
             // An agent may switch a public upload on by itself; the person learns it here, and
@@ -521,6 +541,7 @@ final class AppModel: ObservableObject {
             listed = Date()
             incomplete = list.incomplete
             folders = list.folders.sorted { ($0.isOn ? 0 : 1, $0.name) < ($1.isOn ? 0 : 1, $1.name) }
+            announce(list.uploadsNotThrough)
             observe(list.folders)
             tell(list.publicSwitchedOnUnattended ?? [])
         } catch {
@@ -542,6 +563,56 @@ final class AppModel: ObservableObject {
                 body: "New conversations upload to \(switchOn.repository) (public: anyone can read them). Turn it off in the AgentGit menu bar.")
         }
         unattended = fresh
+    }
+
+    /// When this app first saw an entry of `uploads_not_through`, and whether its notification was
+    /// shown. Kept across restarts by `UploadNotThrough.key`, a digest.
+    private struct Sighting: Codable {
+        let since: Double
+        var told: Bool
+    }
+
+    private var sightings: [String: Sighting] {
+        get {
+            defaults.data(forKey: Self.notThroughKey)
+                .flatMap { try? JSONDecoder().decode([String: Sighting].self, from: $0) } ?? [:]
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Self.notThroughKey) }
+    }
+
+    /// Shows each branch whose newest automatic upload didn't go through, and notifies it once,
+    /// when it appears: an entry agit still lists is not told again, after a restart or a poll that
+    /// couldn't read its record either, and one that cleared and comes back is. One not shown, such as before notifications are
+    /// allowed, is tried again at the next poll.
+    private func announce(_ found: UploadsNotThrough?) {
+        let items = found?.items ?? []
+        let seen = sightings
+        // An answer that couldn't read every record, or that carries no list at all, may leave out
+        // an entry that is still there; its sighting stays, so it isn't told again once it is read.
+        let complete = found.map { $0.unreadable.isEmpty } ?? false
+        var now: [String: Sighting] = complete ? [:] : seen
+        for item in items {
+            now[item.key] = seen[item.key] ?? Sighting(since: Date().timeIntervalSince1970, told: false)
+        }
+        sightings = now
+        for item in items {
+            guard let sighting = now[item.key], !sighting.told else { continue }
+            let key = item.key
+            // A notification can show on the lock screen, so it names no repository or branch: a
+            // private repository's name is private, and a branch's is often the conversation's first
+            // words. The menu row says which.
+            notifier.post(
+                key: Notifier.key("not-through", key, String(sighting.since)),
+                title: "An upload from this Mac didn't go through",
+                body: "Open AgentGit in the menu bar to see which, and what to do."
+            ) { [weak self] in
+                guard let self, var current = self.sightings[key] else { return }
+                current.told = true
+                self.sightings[key] = current
+            }
+        }
+        notThrough = items
+        notThroughUnreadable = found?.unreadable ?? []
     }
 
     /// The person has seen an unattended switch-on; it is not shown again.
@@ -568,11 +639,14 @@ final class AppModel: ObservableObject {
                 history = Array(history.prefix(Self.historyLimit))
                 if let data = try? JSONEncoder().encode(history) { defaults.set(data, forKey: Self.historyKey) }
             }
-            if !last.ok && folder.isOn {
+            // A failure a branch's own entry tells is not told twice; that entry names the branch
+            // and what to do.
+            if !last.ok && folder.isOn && !notThrough.contains(where: { $0.repository == folder.repository }) {
+                // Named nowhere on the lock screen either; the folder's row carries the reason.
                 notifier.post(
                     key: Notifier.key("upload", folder.folder, last.error ?? ""),
-                    title: "Upload refused in \(folder.name)",
-                    body: last.error.map(Notifier.firstLine) ?? "agit could not upload the last conversation.")
+                    title: "An upload from this Mac was refused",
+                    body: "Open AgentGit in the menu bar to see where and why.")
             }
         }
     }

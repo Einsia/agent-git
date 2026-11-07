@@ -1157,8 +1157,9 @@ fn print_uploads_not_through() {
     }
 }
 
-/// [`print_uploads_not_through`] for `status --json`.
-fn uploads_not_through_json() -> serde_json::Value {
+/// [`print_uploads_not_through`] for `status --json`, and for `project list --json`, which the menu
+/// bar reads on every poll: both answer from the same records, in the same shape.
+pub(crate) fn uploads_not_through_json() -> serde_json::Value {
     let found = uploads_not_through();
     serde_json::json!({
         "items": found.items.iter().map(|(target, undone)| serde_json::json!({
