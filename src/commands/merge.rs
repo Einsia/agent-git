@@ -15,7 +15,8 @@
 //!    `agit merge pick/drop/summary` to select and write the summary, and direct edits to the
 //!    shared files.
 //! 4. **Land**: once `--continue` validates, a two-parent merge commit is created (expected-head
-//!    CAS): all of B's objects fold into A's log; the VIEW gains `__merge_start__`, the selected
+//!    CAS): B's records fold into A's log, less a leading part proven to be A's own history
+//!    (see [`shared`]); the VIEW gains `__merge_start__`, the selected
 //!    B-side events (original envelopes; the origin marking is the `_session_id`),
 //!    `merge_summary`, `__merge_end__`; the merge agent's own exploration turns never enter the
 //!    VIEW; the reconciliation of shared files in the worktree goes into the tree with them.
@@ -27,6 +28,7 @@
 pub mod archive;
 mod file_pull;
 mod file_reconciliation;
+pub(crate) mod shared;
 
 pub(super) use file_pull::reconcile as pull_files;
 
@@ -1154,7 +1156,7 @@ fn continue_tx(
     // worktree only the ref moves.
     let repo = checkout.unwrap_or(repo);
 
-    let (tree, msg) = match merge_tree(
+    let (tree, msg, landed) = match merge_tree(
         &repo,
         &base.repo,
         &tx,
@@ -1214,6 +1216,9 @@ fn continue_tx(
         Some(&tx.target_head),
         false,
     );
+    if let Some(landed) = landed {
+        println!("{}", ui::dim(&landed_line(landed)));
+    }
     if !target_is_file_line {
         println!(
             "{}",
@@ -1317,7 +1322,7 @@ fn merge_tree(
     shared: &[String],
     target_is_file_line: bool,
     resolved: &[String],
-) -> crate::Result<Option<(String, String)>> {
+) -> crate::Result<Option<(String, String, Option<Landed>)>> {
     anyhow::ensure!(
         resolved.is_empty() || (target_is_file_line && tx.generation.is_some()),
         "--resolved requires a generated file-line merge transaction"
@@ -1332,7 +1337,9 @@ fn merge_tree(
         };
         super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
         let base_tree = super::plumbing::tree_overlay_worktree(repo, &tx.target_head, shared)?;
-        return land_session_merge(repo, tx, prepared, &base_tree).map(Some);
+        let landed = prepared.landed;
+        return land_session_merge(repo, tx, prepared, &base_tree)
+            .map(|(tree, msg)| Some((tree, msg, Some(landed))));
     }
     super::plumbing::ensure_v1_namespace_available_at(source_repo, src_head)?;
     super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
@@ -1377,7 +1384,7 @@ fn merge_tree(
         tx.target,
         tx.summary_text()
     );
-    Ok(Some((tree, msg)))
+    Ok(Some((tree, msg, None)))
 }
 
 /// The session line's log/VIEW surgery: all plumbing, no worktree action.
@@ -1389,6 +1396,43 @@ fn merge_tree(
 struct PreparedSessionMerge {
     metadata: meta::Meta,
     files: std::collections::BTreeMap<String, Vec<u8>>,
+    landed: Landed,
+}
+
+/// What a session merge brings into the target.
+#[derive(Debug, Clone, Copy, Default)]
+struct Landed {
+    /// The source's turns the merge records, `None` when its records can't be read as turns.
+    turns: Option<usize>,
+    /// The events picked into what the session continues with.
+    picked: usize,
+}
+
+/// What a session merge brought in: the source's turns it records, which the session's page
+/// shows, and the events picked into what the session continues with.
+fn landed_line(landed: Landed) -> String {
+    let recorded = match landed.turns {
+        Some(1) => "1 new turn from the source is recorded in this session".to_owned(),
+        Some(turns) => format!("{turns} new turns from the source are recorded in this session"),
+        None => "the source's new records are recorded in this session".to_owned(),
+    };
+    let picked = match landed.picked {
+        1 => "1 event picked into what it continues with".to_owned(),
+        picked => format!("{picked} events picked into what it continues with"),
+    };
+    format!("  {recorded}; {picked}")
+}
+
+/// How many user prompts, each opening a turn, `log` holds.
+fn prompts(log: &str) -> Option<usize> {
+    let session = transcript::display::parse(log).ok()?;
+    Some(
+        session
+            .events
+            .iter()
+            .filter(|event| event.kind == crate::adapter::EventKind::UserPrompt)
+            .count(),
+    )
 }
 
 /// A published envelope authenticates its exact projection and cannot accompany edited content.
@@ -1463,10 +1507,34 @@ fn prepare_session_merge(
             return Ok(None);
         }
     };
-    let b_lines: Vec<&str> = b_log.lines().collect();
+    let b_lines = shared::lines(&b_log);
+    // The source's leading records that are provably the target's own history go in once: they
+    // are already in the target's LOG. With no proof, all of the source's records go in.
+    let own = match frozen_source {
+        Some(_) => shared::Shared::default(),
+        None => shared::shared_prefix(
+            target_repo,
+            source_repo,
+            &tx.target,
+            &tx.target_head,
+            src_head,
+            &tx.base,
+            &shared::lines(&a_log),
+            &b_lines,
+        ),
+    };
+    let a_view_lines: std::collections::HashSet<String> =
+        shared::lines(&a_view).into_iter().collect();
     let mut picked_lines: Vec<&str> = Vec::with_capacity(picked.len());
     for gi in &picked {
         match b_lines.get(*gi) {
+            // A pick of the target's own record names the target's line, once.
+            Some(_) if *gi < own.lines() => {
+                let original = &own.originals[*gi];
+                if !a_view_lines.contains(original) && !picked_lines.contains(&original.as_str()) {
+                    picked_lines.push(original);
+                }
+            }
             Some(l) => picked_lines.push(l),
             // A selection pointing at a line the source log does not have = the refs recorded
             // in the transaction no longer match the source (the source was rewritten). Dropping
@@ -1496,10 +1564,8 @@ fn prepare_session_merge(
         new_log.push('\n');
     }
     new_log.push_str(&mark_start);
-    new_log.push_str(&b_log);
-    if !b_log.is_empty() && !b_log.ends_with('\n') {
-        new_log.push('\n');
-    }
+    let recorded = b_lines[own.lines()..].concat();
+    new_log.push_str(&recorded);
     new_log.push_str(&summary_line);
     new_log.push_str(&mark_end);
 
@@ -1510,7 +1576,6 @@ fn prepare_session_merge(
     new_view.push_str(&mark_start);
     for l in &picked_lines {
         new_view.push_str(l);
-        new_view.push('\n');
     }
     new_view.push_str(&summary_line);
     new_view.push_str(&mark_end);
@@ -1527,7 +1592,14 @@ fn prepare_session_merge(
         return Ok(None);
     }
     let files = storage::snapshot_files(&new_log, &new_view)?;
-    Ok(Some(PreparedSessionMerge { metadata: s, files }))
+    Ok(Some(PreparedSessionMerge {
+        metadata: s,
+        files,
+        landed: Landed {
+            turns: prompts(&recorded),
+            picked: picked_lines.len(),
+        },
+    }))
 }
 
 fn land_session_merge(
@@ -2184,13 +2256,58 @@ mod tests {
         );
     }
 
+    /// Two continuations of one session carry its earlier turns once after a merge: the source's
+    /// copy of the history the two share is the target's own, in the LOG and in the VIEW.
+    #[test]
+    fn a_merge_records_the_shared_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&dir.path().join("r")).unwrap();
+        let head = |repo: &Repo| repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        birth(&repo);
+        settle_turn(&repo, &fake_claim('a'), 1, &["the shared first turn"]);
+        let base = head(&repo);
+        settle_turn(&repo, &fake_claim('a'), 2, &["the laptop turn"]);
+        let target_head = head(&repo);
+        repo.git(&["checkout", "-q", "-b", "b", &base]).unwrap();
+        settle_turn(&repo, &fake_claim('a'), 2, &["the desktop turn"]);
+        let src_head = head(&repo);
+        repo.git(&["checkout", "-q", "main"]).unwrap();
+        let tx = Tx {
+            mode: Some(crate::domain::mergetx::Mode::Manual),
+            exploration: None,
+            generation: None,
+            target: "main".into(),
+            source: "b".into(),
+            source_repo: None,
+            source_branch: None,
+            base,
+            target_head: target_head.clone(),
+            source_head: src_head.clone(),
+            picked: vec!["b#1".into(), "b#2".into()],
+            summary: Some("both continuations".into()),
+        };
+        let (tree, _, landed) = merge_tree(&repo, &repo, &tx, &src_head, &[], false, &[])
+            .unwrap()
+            .unwrap();
+        let commit =
+            crate::commands::plumbing::commit_tree(&repo, &tree, &[&target_head], "t").unwrap();
+        let log = repo.show(&commit, meta::LOG_FILE).unwrap();
+        let view = repo.show(&commit, meta::VIEW_FILE).unwrap();
+        for text in [&log, &view] {
+            assert_eq!(text.matches("the shared first turn").count(), 1, "{text}");
+            assert_eq!(text.matches("the laptop turn").count(), 1, "{text}");
+            assert_eq!(text.matches("the desktop turn").count(), 1, "{text}");
+        }
+        assert_eq!(landed.unwrap().picked, 1);
+    }
+
     /// Picked events land in the VIEW for real, carrying their origin marking, between the two
     /// markers.
     #[test]
     fn picked_events_land_in_the_view_with_their_origin() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#2".into()];
-        let (tree, _) = merge_tree(
+        let (tree, _, _) = merge_tree(
             &f.repo,
             &f.repo,
             &f.tx,
@@ -2238,7 +2355,7 @@ mod tests {
     fn picks_merge_dedupe_and_keep_log_order() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#1..#2".into(), "b#1.1".into()];
-        let (tree, _) = merge_tree(
+        let (tree, _, _) = merge_tree(
             &f.repo,
             &f.repo,
             &f.tx,
@@ -2329,7 +2446,7 @@ mod tests {
     #[test]
     fn a_merge_that_picks_nothing_still_lands_its_summary() {
         let f = two_branches();
-        let (tree, msg) = merge_tree(
+        let (tree, msg, _) = merge_tree(
             &f.repo,
             &f.repo,
             &f.tx,
@@ -2354,7 +2471,7 @@ mod tests {
     fn the_log_takes_all_of_b_even_when_the_view_takes_one() {
         let mut f = two_branches();
         f.tx.picked = vec!["b#2".into()];
-        let (tree, _) = merge_tree(
+        let (tree, _, _) = merge_tree(
             &f.repo,
             &f.repo,
             &f.tx,
@@ -2450,7 +2567,7 @@ mod tests {
             picked: vec!["source#1".into()],
             summary: Some("take the source conclusion".into()),
         };
-        let (tree, _) = merge_tree(&target, &source, &tx, &source_head, &[], false, &[])
+        let (tree, _, _) = merge_tree(&target, &source, &tx, &source_head, &[], false, &[])
             .unwrap()
             .unwrap();
         crate::commands::plumbing::import_commit_graph(&target, &source, &source_head).unwrap();
@@ -2583,7 +2700,7 @@ mod tests {
             vec![meta::ATTRS_FILE, "AGENTS.md", "memory/team.md"]
         );
 
-        let (tree, _) = merge_tree(
+        let (tree, _, _) = merge_tree(
             &f.repo,
             &f.repo,
             &f.tx,

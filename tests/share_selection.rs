@@ -896,3 +896,174 @@ fn legacy_view_only_synthetic_lines_require_the_writer_shape() {
     save("legacy-foreign", &(valid + &envelope("FOREIGN-REAL-EVENT")));
     f.refuse_without_upload(&["me/paper@legacy-foreign", "--public"], None);
 }
+
+/// A session whose merge recorded its own history again is refused a share, and pointed at the
+/// repair's listing. The repaired copy leaves out exactly that copy, keeps each replayed commit's
+/// message, authors and dates, leaves the merged branch as it was, and shares.
+#[test]
+fn a_repaired_copy_of_a_merged_session_shares() {
+    let f = Fixture::new("unselected");
+    let claim = format!("agit-{}", "b".repeat(40));
+    let record = |raw: Value| transcript::wrap_lines(&format!("{raw}\n"), "claude-code", &claim);
+    let prompt = |text: &str| {
+        record(
+            json!({"type":"user","sessionId":"native-fixture","message":{"role":"user","content":text}}),
+        )
+    };
+    let call = record(
+        json!({"type":"assistant","sessionId":"native-fixture","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_shared","name":"Grep","input":{"pattern":"needle"}}]}}),
+    );
+    let head = |repo: &Repo| repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+    let settle = |log: &str, view: &str, turn: u32, message: &str| {
+        storage::write_snapshot(f.repo.root(), log, view).unwrap();
+        let mut snapshot = meta::Meta::new(
+            claim.clone(),
+            "claude-code".into(),
+            f.home().to_string_lossy().into(),
+        );
+        snapshot.turn = Some(turn);
+        meta::write(f.repo.root(), &snapshot).unwrap();
+        f.repo.add_all().unwrap();
+        f.repo.commit(message).unwrap();
+    };
+    f.repo.git(&["checkout", "-b", "merged", "chosen"]).unwrap();
+    let mut shared = f.repo.show("HEAD", meta::LOG_FILE).unwrap();
+    shared.push_str(&(prompt("SHARED-PROMPT") + &call));
+    settle(&shared, &shared, 2, "shared turn");
+    let base = head(&f.repo);
+    let laptop = shared.clone() + &prompt("LAPTOP-TURN");
+    settle(&laptop, &laptop, 3, "laptop turn");
+    let target = head(&f.repo);
+    f.repo.git(&["checkout", "-b", "desktop", &base]).unwrap();
+    let desktop = shared.clone() + &prompt("DESKTOP-TURN");
+    settle(&desktop, &desktop, 3, "desktop turn");
+    let source = head(&f.repo);
+    // A merge as an earlier agit wrote it: the whole source LOG inside the block.
+    f.repo.git(&["checkout", "merged"]).unwrap();
+    let start =
+        agit::commands::merge::marker_envelope("__merge_start__", "claude-code", &claim, "desktop");
+    let end =
+        agit::commands::merge::marker_envelope("__merge_end__", "claude-code", &claim, "desktop");
+    let summary = agit::commands::merge::summary_envelope("both computers", "claude-code", &claim);
+    let log = format!("{laptop}{start}{desktop}{summary}{end}");
+    let view = format!("{laptop}{start}{summary}{end}");
+    storage::write_snapshot(f.repo.root(), &log, &view).unwrap();
+    let mut snapshot = meta::read_at_ref(&f.repo, &target).unwrap();
+    snapshot.kind = meta::Kind::Merge;
+    meta::write(f.repo.root(), &snapshot).unwrap();
+    f.repo.add_all().unwrap();
+    let tree = f.repo.git(&["write-tree"]).unwrap();
+    let merge = f
+        .repo
+        .git(&[
+            "-c",
+            "user.name=Merger",
+            "-c",
+            "user.email=merger@example.test",
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            &target,
+            "-p",
+            &source,
+            "-m",
+            "agit: merge desktop → merged",
+        ])
+        .unwrap();
+    f.repo
+        .git(&["update-ref", "refs/heads/merged", merge.trim()])
+        .unwrap();
+    f.repo.git(&["checkout", "-q", "main"]).unwrap();
+
+    let refused = f.run(&["me/paper@merged", "--public"], None);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        said.contains("agit repair merges me/paper@merged --dry-run"),
+        "{said}"
+    );
+
+    let listed = f.run_command(
+        "repair",
+        &["merges", "me/paper@merged", "--dry-run", "--json"],
+        None,
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let stdout = String::from_utf8(listed.stdout).unwrap();
+    for text in ["SHARED-PROMPT", "VISIBLE-SAVED", "DESKTOP-TURN"] {
+        assert!(
+            !stdout.contains(text),
+            "the listing names no record text: {stdout}"
+        );
+    }
+    let listing: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let listing = &listing["result"]["value"];
+    let merges = listing["merges"].as_array().expect(&stdout);
+    assert_eq!(merges.len(), 1, "{listing}");
+    assert_eq!(merges[0]["proof"]["common"], json!(base));
+    assert_eq!(
+        merges[0]["dropped"].as_array().unwrap().len(),
+        shared.lines().count(),
+        "{listing}"
+    );
+    assert!(
+        f.repo
+            .git_opt(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/heads/merged-repaired"
+            ])
+            .is_none(),
+        "a dry run writes nothing"
+    );
+
+    let repaired = f.run_command("repair", &["merges", "me/paper@merged"], None);
+    assert!(repaired.status.success(), "{repaired:?}");
+    assert_eq!(
+        head_of(&f.repo, "merged"),
+        merge.trim(),
+        "the merged branch is unchanged"
+    );
+    let copy = head_of(&f.repo, "merged-repaired");
+    let shown = |commit: &str| {
+        f.repo
+            .git(&[
+                "show",
+                "-s",
+                "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI%n%B",
+                commit,
+            ])
+            .unwrap()
+    };
+    assert_eq!(shown(&copy), shown(merge.trim()));
+    assert_eq!(
+        f.repo
+            .git(&["rev-parse", &format!("{copy}^1"), &format!("{copy}^2")])
+            .unwrap(),
+        f.repo.git(&["rev-parse", &target, &source]).unwrap()
+    );
+    let log = f.repo.show(&copy, meta::LOG_FILE).unwrap();
+    for text in [
+        "SHARED-PROMPT",
+        "LAPTOP-TURN",
+        "DESKTOP-TURN",
+        "VISIBLE-SAVED",
+    ] {
+        assert_eq!(log.matches(text).count(), 1, "{text}: {log}");
+    }
+    assert_eq!(
+        meta::read_at_ref(&f.repo, &copy).unwrap().session,
+        claim,
+        "the copy keeps its session"
+    );
+
+    f.success(&["me/paper@merged-repaired", "--public"], None);
+}
+
+fn head_of(repo: &Repo, branch: &str) -> String {
+    repo.git(&["rev-parse", &format!("refs/heads/{branch}")])
+        .unwrap()
+        .trim()
+        .to_owned()
+}

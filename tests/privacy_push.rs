@@ -9770,6 +9770,353 @@ fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
     assert_eq!(head(), turn);
 }
 
+/// A merge whose source grew from the Hub's plain copy of the target's own turn records that turn
+/// once. The copy leaves a record out, so it is another commit with fewer records; the accepted
+/// publication record and the pairwise event map prove which of the target's records each of its
+/// events stands for. Appended again, they read as a second first turn on the session's page.
+#[test]
+fn a_merge_from_the_hubs_copy_records_the_shared_turn_once() {
+    const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000007";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let claim = format!("agit-{}", "f".repeat(40));
+    let wrap = |records: &[serde_json::Value]| {
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        transcript::wrap_lines(&text, "claude-code", &claim)
+    };
+    let settle = |log: &str, view: &str, turn: u32| {
+        let mut session = meta::Meta::new(
+            claim.clone(),
+            "claude-code".into(),
+            work.to_string_lossy().into_owned(),
+        );
+        session.turn = Some(turn);
+        write_snapshot(repo.root(), log, view).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("Turn {turn}")).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    repo.git(&["checkout", "--quiet", "-B", "talk", "main"])
+        .unwrap();
+    let first = wrap(&[
+        json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u1","parentUuid":null,
+            "message":{"role":"user","content":"SHARED-PROMPT"}}),
+        // Instructions the runtime put into the model's context: plain publication leaves this
+        // record out.
+        json!({"type":"attachment","sessionId":NATIVE,"cwd":work,"uuid":"u2","parentUuid":"u1",
+            "attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":"Project rules."}}),
+        json!({"type":"assistant","sessionId":NATIVE,"cwd":work,"uuid":"u3","parentUuid":"u2",
+            "message":{"role":"assistant","content":[{"type":"text","text":"SHARED-ANSWER"}]}}),
+    ]);
+    let turn = settle(&first, &first, 1);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(published, turn, "the Hub holds the turn's published form");
+    git(
+        repo.root(),
+        &[
+            "fetch",
+            "--quiet",
+            &remote.to_string_lossy(),
+            "+refs/heads/talk:refs/remotes/origin/talk",
+        ],
+    );
+    let pairs = agit::domain::privacy_git::published_events(&repo, "talk", &published)
+        .unwrap()
+        .expect("the accepted record maps the Hub's copy");
+    assert_eq!(pairs.len(), 2, "the left-out record has no public event");
+
+    // This computer goes on from its turn; another one went on from the Hub's copy.
+    let laptop = first.clone()
+        + &wrap(&[
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u4","parentUuid":"u3",
+            "message":{"role":"user","content":"LAPTOP-TURN"}}),
+        ]);
+    let target = settle(&laptop, &laptop, 2);
+    repo.git(&["checkout", "--quiet", "-B", "desk", &published])
+        .unwrap();
+    let copy = repo.show(&published, meta::LOG_FILE).unwrap();
+    assert!(!copy.contains("Project rules."), "{copy}");
+    let desktop = copy
+        + &wrap(&[
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u5","parentUuid":"u3",
+            "message":{"role":"user","content":"DESKTOP-TURN"}}),
+        ]);
+    let source = settle(&desktop, &desktop, 2);
+    repo.git(&["checkout", "--quiet", "talk"]).unwrap();
+    agit::domain::mergetx::lock(
+        repo.root(),
+        &agit::domain::mergetx::Tx {
+            mode: Some(agit::domain::mergetx::Mode::Manual),
+            exploration: None,
+            generation: None,
+            target: "talk".into(),
+            source: "alice/app@desk".into(),
+            source_repo: Some("alice/app".into()),
+            source_branch: Some("desk".into()),
+            base: git(repo.root(), &["merge-base", &target, &source]),
+            target_head: target.clone(),
+            source_head: source.clone(),
+            picked: vec!["alice/app@desk#1".into(), "alice/app@desk#2".into()],
+            summary: Some("both computers".into()),
+        },
+    )
+    .unwrap();
+    let landed = run(&["merge", "--into", "alice/app@talk", "--continue"]);
+    assert_success(&landed);
+    let merged = git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(merged, target, "the merge landed");
+    let log = repo.show(&merged, meta::LOG_FILE).unwrap();
+    let view = repo.show(&merged, meta::VIEW_FILE).unwrap();
+    for text in [&log, &view] {
+        for record in [
+            "SHARED-PROMPT",
+            "SHARED-ANSWER",
+            "LAPTOP-TURN",
+            "DESKTOP-TURN",
+        ] {
+            assert_eq!(text.matches(record).count(), 1, "{record}: {text}");
+        }
+    }
+}
+
+/// Two computers on one session, each with its own copy of the repository: this one uploaded its
+/// three turns, and the other went on from the Hub's copy of them. Merging the other computer's
+/// line here, before this repository has fetched that copy, records this computer's turns once,
+/// its third included, and the other computer's turn once.
+#[test]
+fn a_merge_from_another_computers_line_records_this_computers_turns_once() {
+    const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000008";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [32; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let claim = format!("agit-{}", "f".repeat(40));
+    let wrap = |records: &[serde_json::Value]| {
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        transcript::wrap_lines(&text, "claude-code", &claim)
+    };
+    let settle = |log: &str, view: &str, turn: u32| {
+        let mut session = meta::Meta::new(
+            claim.clone(),
+            "claude-code".into(),
+            work.to_string_lossy().into_owned(),
+        );
+        session.turn = Some(turn);
+        write_snapshot(repo.root(), log, view).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("Turn {turn}")).unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    repo.git(&["checkout", "--quiet", "-B", "talk", "main"])
+        .unwrap();
+    let first = wrap(&[
+        json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"u1","parentUuid":null,
+            "message":{"role":"user","content":"SHARED-PROMPT"}}),
+        // Instructions the runtime put into the model's context: plain publication leaves this
+        // record out.
+        json!({"type":"attachment","sessionId":NATIVE,"cwd":work,"uuid":"u2","parentUuid":"u1",
+            "attachment":{"type":"instructions","path":"/work/CLAUDE.md","content":"Project rules."}}),
+        json!({"type":"assistant","sessionId":NATIVE,"cwd":work,"uuid":"u3","parentUuid":"u2",
+            "message":{"role":"assistant","content":[{"type":"text","text":"SHARED-ANSWER"}]}}),
+    ]);
+    let mut log = first.clone();
+    settle(&log, &log, 1);
+    for (turn, text) in [(2, "LAPTOP-TURN-2"), (3, "LAPTOP-TURN-3")] {
+        log += &wrap(&[
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":format!("t{turn}"),
+            "parentUuid":"u3","message":{"role":"user","content":text}}),
+        ]);
+        settle(&log, &log, turn);
+    }
+    let target = git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert!(
+        repo.git_opt(&["cat-file", "-e", &format!("{published}^{{commit}}")])
+            .is_none(),
+        "this repository holds only its own turns, not the Hub's copy"
+    );
+    // The other computer's repository: the Hub's line, and a turn on top of it.
+    let other_root = home.join("repos/alice/desk");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            &remote.to_string_lossy(),
+            &other_root.to_string_lossy(),
+        ],
+    );
+    let other = Repo::open(&other_root).unwrap();
+    other.git(&["config", "user.name", "Desk Writer"]).unwrap();
+    other
+        .git(&["config", "user.email", "desk@example.invalid"])
+        .unwrap();
+    other
+        .git(&["checkout", "--quiet", "-B", "desk", "origin/talk"])
+        .unwrap();
+    let copy = other.show("HEAD", meta::LOG_FILE).unwrap();
+    let desktop = copy
+        + &wrap(&[
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":"d4","parentUuid":"t3",
+            "message":{"role":"user","content":"DESKTOP-TURN-4"}}),
+        ]);
+    write_snapshot(other.root(), &desktop, &desktop).unwrap();
+    other.add_all().unwrap();
+    other.commit("Turn 4").unwrap();
+    let source = git(other.root(), &["rev-parse", "HEAD"]);
+    agit::domain::mergetx::lock(
+        repo.root(),
+        &agit::domain::mergetx::Tx {
+            mode: Some(agit::domain::mergetx::Mode::Manual),
+            exploration: None,
+            generation: None,
+            target: "talk".into(),
+            source: "alice/desk@desk".into(),
+            source_repo: Some("alice/desk".into()),
+            source_branch: Some("desk".into()),
+            base: String::new(),
+            target_head: target.clone(),
+            source_head: source.clone(),
+            picked: vec![],
+            summary: Some("both computers".into()),
+        },
+    )
+    .unwrap();
+    let landed = run(&["merge", "--into", "alice/app@talk", "--continue"]);
+    assert_success(&landed);
+    let merged = git(repo.root(), &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(merged, target, "the merge landed");
+    let log = repo.show(&merged, meta::LOG_FILE).unwrap();
+    for record in [
+        "SHARED-PROMPT",
+        "LAPTOP-TURN-2",
+        "LAPTOP-TURN-3",
+        "DESKTOP-TURN-4",
+    ] {
+        assert_eq!(log.matches(record).count(), 1, "{record}: {log}");
+    }
+}
+
 /// The publication summary says how many records the upload adds that keep parts the privacy check
 /// left out, too large or with too many findings, each counted in the upload that first carries
 /// it. A session goes on publishing its whole LOG, so a count over each snapshot would repeat an

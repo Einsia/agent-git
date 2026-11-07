@@ -39,6 +39,8 @@ mod frozen;
 pub(crate) mod modes;
 mod published;
 #[cfg(test)]
+mod published_events_tests;
+#[cfg(test)]
 mod receipt_tests;
 pub mod sessions;
 mod state;
@@ -335,6 +337,149 @@ impl Projections {
             .find(|entry| entry.public == public && entry.source != entry.public)
             .map(|entry| entry.source.clone())
     }
+}
+
+/// Whether an accepted record is a plain publication anyone reading the branch sees, as a
+/// bring-over of the Hub's turns records it too: no recipient's copy, no delivery.
+fn plain_copy(entry: &accepted::Mapping) -> bool {
+    entry.plain && entry.recipient.is_none() && !entry.delivered
+}
+
+/// The Hub commits the accepted record names as plain publications of `branch`'s local commits, each
+/// as (public commit, local commit).
+pub fn published_copies(repo: &Repo, branch: &str) -> Vec<(String, String)> {
+    let Some(identity) = crate::hub::identity::read(repo).ok().flatten() else {
+        return Vec::new();
+    };
+    let Ok(ledger) = accepted::Ledger::open(repo, &identity) else {
+        return Vec::new();
+    };
+    ledger
+        .accepted(branch)
+        .filter(|entry| plain_copy(entry) && entry.public != entry.source)
+        .map(|entry| (entry.public.clone(), entry.source.clone()))
+        .collect()
+}
+
+/// The events the Hub's `public` commit on `branch` publishes, as (public event id, local event id)
+/// pairs in LOG order, from the accepted publication record of a plain publication.
+///
+/// A plain publication keeps each record its rule keeps, in order, and leaves the others out; a
+/// record it changes (protected text, a placeholder) keeps its place under another id. So the
+/// public LOG names the source LOG's kept records one for one, and each pair is checked: the same
+/// event, or the same record as its runtime names it, which protection never rewrites. `None`
+/// when no accepted plain publication names `public`, or when any pair fails: then nothing says
+/// which record a public event stands for, and nothing is guessed.
+pub fn published_events(
+    repo: &Repo,
+    branch: &str,
+    public: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    published_events_from(repo, &[repo], branch, public)
+}
+
+/// [`published_events`] with the Hub's commit `public` read from the first of `holders` that has
+/// it: a merge source that grew from the Hub's copy holds that copy before the target has fetched
+/// it. The accepted record and the local commit it names are `repo`'s.
+pub fn published_events_from(
+    repo: &Repo,
+    holders: &[&Repo],
+    branch: &str,
+    public: &str,
+) -> Result<Option<Vec<(String, String)>>> {
+    use super::{publication_records, storage};
+    let Some(identity) = crate::hub::identity::read(repo).ok().flatten() else {
+        return Ok(None);
+    };
+    let ledger = accepted::Ledger::open(repo, &identity)?;
+    let Some(source) = ledger
+        .accepted(branch)
+        .find(|entry| entry.public == public && plain_copy(entry))
+        .map(|entry| entry.source.clone())
+    else {
+        return Ok(None);
+    };
+    let records = |holder: &Repo,
+                   commit: &str|
+     -> Result<Vec<(String, crate::domain::transcript::Envelope)>> {
+        frozen::record_lines(&storage::materialize_at(
+            holder.root(),
+            commit,
+            meta::LOG_FILE,
+        )?)
+        .into_iter()
+        .map(|line| {
+            let envelope = storage::parse_legacy_envelope_line(&line)?;
+            Ok((storage::canonical_event_id(&line), envelope))
+        })
+        .collect()
+    };
+    let local = records(repo, &source)?;
+    let Some(holder) = holders.iter().find(|holder| {
+        holder
+            .git_opt(&["cat-file", "-e", &format!("{public}^{{commit}}")])
+            .is_some()
+    }) else {
+        return Ok(None);
+    };
+    let published = records(holder, public)?;
+    let kept = publication_records::published_sequence(
+        local
+            .iter()
+            .map(|(_, envelope)| (envelope.source.as_str(), &envelope.content)),
+    );
+    let kept = local
+        .into_iter()
+        .zip(&kept)
+        .filter(|(_, kept)| kept.is_some())
+        .map(|(record, _)| record)
+        .collect::<Vec<_>>();
+    Ok(paired(&kept, &published))
+}
+
+/// Each published event with the kept record it stands for, when every pair checks: the same
+/// event, or the same record as its runtime names it. Equal counts alone prove nothing: a rule that
+/// keeps one record more and another less shifts every pair after them.
+fn paired(
+    kept: &[(String, crate::domain::transcript::Envelope)],
+    published: &[(String, crate::domain::transcript::Envelope)],
+) -> Option<Vec<(String, String)>> {
+    (kept.len() == published.len()
+        && kept
+            .iter()
+            .zip(published)
+            .all(|((local_id, local), (public_id, public))| {
+                local_id == public_id || same_record(local, public)
+            }))
+    .then(|| {
+        published
+            .iter()
+            .zip(kept)
+            .map(|((public, _), (local, _))| (public.clone(), local.clone()))
+            .collect()
+    })
+}
+
+/// Whether two envelopes carry the same record as its runtime names it: a Claude Code record by
+/// its `uuid` and `type`. Other runtimes name no record apart from its text, so only the same
+/// event matches.
+fn same_record(
+    local: &crate::domain::transcript::Envelope,
+    public: &crate::domain::transcript::Envelope,
+) -> bool {
+    fn named(envelope: &crate::domain::transcript::Envelope) -> Option<(&str, &str)> {
+        Some((
+            envelope.content["uuid"]
+                .as_str()
+                .filter(|uuid| !uuid.is_empty())?,
+            envelope.content["type"].as_str()?,
+        ))
+    }
+    local.source == "claude-code"
+        && local.source == public.source
+        && local.session_id == public.session_id
+        && named(local).is_some()
+        && named(local) == named(public)
 }
 
 /// Destination refs publications to `identity` leave out because the Hub refused them as

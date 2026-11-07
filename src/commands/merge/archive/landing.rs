@@ -478,7 +478,7 @@ fn land_with_resolved(
     };
     let base = plumbing::tree_overlay_worktree(request.repo, binding.target_head(), &shared)?;
     let (ordinary_tree, file_commit, candidate, tree) = if binding.file_target.is_some() {
-        let (ordinary_tree, message) = merge::merge_tree(
+        let (ordinary_tree, message, _) = merge::merge_tree(
             request.repo,
             request.source_repo,
             &tx,
