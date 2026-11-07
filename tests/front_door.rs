@@ -404,10 +404,9 @@ impl Lab {
     }
 
     /// An OpenCode conversation of one finished turn that ran in `cwd`, in OpenCode's own
-    /// database, with a stand-in `opencode` so the runtime counts as installed.
+    /// database, with no `opencode` command on PATH: an app, an editor or a PATH set only in new
+    /// shells runs it, and its database is all agit sees.
     fn opencode_conversation(&self, cwd: &std::path::Path, id: &str, prompt: &str) {
-        std::fs::write(self.bin.join("opencode"), "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::write(self.bin.join("opencode.cmd"), "@exit /b 0\r\n").unwrap();
         let data = self.home.join(".local/share/opencode");
         std::fs::create_dir_all(&data).unwrap();
         let database = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
@@ -1156,8 +1155,9 @@ fn a_conversation_saved_elsewhere_is_said_so_and_no_retry_is_offered() {
 }
 
 /// `agit save` finds an OpenCode conversation in a folder that is on, though OpenCode tells agit
-/// nothing when a turn ends, and keeps the folder's earlier history out as it does for the other
-/// runtimes. The folder was bound without earlier history by a policy that never recorded OpenCode's
+/// nothing when a turn ends and no `opencode` command is on PATH, and keeps the folder's earlier
+/// history out as it does for the other runtimes. A save that listed only runtimes whose command
+/// it can find on PATH leaves the conversation out of every save, even one that names it. The folder was bound without earlier history by a policy that never recorded OpenCode's
 /// conversations, so the one already there counts as earlier: a plain save leaves it out and says
 /// so, and naming it or `--all` takes it, as an OpenCode session. The lab's Hub accepts no upload,
 /// so what is pinned is which conversation each save takes. A save that looked only at the

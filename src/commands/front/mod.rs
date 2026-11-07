@@ -1091,10 +1091,16 @@ fn sessions_where(
     let mut sessions = Vec::new();
     for &runtime in runtimes {
         let adapter = adapter::get(runtime)?;
-        if !adapter.available() {
-            continue;
-        }
-        for session in adapter.all_session_choices()? {
+        // A runtime's conversations are in its own store, there whether or not its command is on
+        // this shell's PATH: an app, an editor or a PATH set only in new shells may run it. A store
+        // that can't be read is left out only for a runtime agit can't find either, which may be
+        // what an old install left behind.
+        let choices = match adapter.all_session_choices() {
+            Ok(choices) => choices,
+            Err(_) if !adapter.available() => continue,
+            Err(error) => return Err(error),
+        };
+        for session in choices {
             let cwd = session
                 .cwd
                 .clone()
@@ -1139,9 +1145,6 @@ fn in_a_gone_folder(query: &str) -> Option<(&'static str, String, String)> {
         let Ok(adapter) = adapter::get(runtime) else {
             continue;
         };
-        if !adapter.available() {
-            continue;
-        }
         for session in adapter.all_session_choices().unwrap_or_default() {
             if !session.id.starts_with(query) {
                 continue;
