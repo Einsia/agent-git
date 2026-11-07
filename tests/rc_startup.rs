@@ -294,6 +294,35 @@ async fn crashed_owner_recovers_with_a_reused_live_pid() {
     std::fs::remove_file(socket).unwrap();
 }
 
+/// The names of the variables process `pid` runs with.
+#[cfg(unix)]
+fn environment_names(pid: u64) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    let text = std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect::<Vec<_>>();
+    #[cfg(not(target_os = "linux"))]
+    let text = {
+        let shown = Command::new("ps")
+            .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&shown.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    text.iter()
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+/// An explicit start brings the owner daemon up outbound only and later starts reuse it. The
+/// daemon keeps none of the flags of the command that started it: every RC runtime it starts runs
+/// the agent's tools in its environment, for other people's turns too, so a daemon that kept
+/// `AGIT_YES` from `agit -y …` would confirm every agit command those agents run.
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_daemon() {
@@ -304,7 +333,9 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
     let local = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::from(command(home))
-            .args(["rc", "local", "start", "--detach", "--json"])
+            .args([
+                "-y", "-q", "--no-tui", "rc", "local", "start", "--detach", "--json",
+            ])
             .output(),
     )
     .await
@@ -324,6 +355,11 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
         serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
     };
     let before = status();
+    let names = environment_names(before["pid"].as_u64().expect("the daemon's pid"));
+    assert!(names.iter().any(|name| name == "AGIT_HOME"), "{names:?}");
+    for flag in ["AGIT_YES", "AGIT_QUIET", "AGIT_TUI"] {
+        assert!(!names.iter().any(|name| name == flag), "{names:?}");
+    }
     let pending = || {
         std::fs::read_dir(home.join("desktop-rc"))
             .unwrap()
@@ -413,6 +449,70 @@ async fn explicit_start_enables_inbound_without_pairing_and_reuses_the_owner_dae
             .unwrap()
             .status
             .success()
+    );
+}
+
+/// A command that becomes the daemon itself (`agit -y rc start` with no daemon running) keeps none
+/// of its flags for the runtimes the daemon starts. A stand-in Claude Code notes the flag variables
+/// each time it is asked for its version: first by the command, which still holds `-y`, `-q` and
+/// `--no-tui`, then by the daemon the command has become. A daemon that kept them would confirm
+/// every agit command its sessions' agents run.
+#[cfg(unix)]
+#[test]
+fn a_command_that_becomes_the_daemon_drops_its_flags() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::{Duration, Instant};
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path();
+    startup_cache::seed(home);
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let asked = home.join("asked");
+    let claude = bin.join("claude");
+    std::fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  \
+             echo \"yes=${{AGIT_YES-}} quiet=${{AGIT_QUIET-}} tui=${{AGIT_TUI-}}\" >> '{}'\n  \
+             echo '2.1.310 (Claude Code)'\nfi\n",
+            asked.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut start = command(home);
+    start
+        .args(["-y", "-q", "--no-tui", "rc", "start"])
+        .env("PATH", path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _daemon = OwnedChild(start.spawn().unwrap());
+    let _cleanup = Stop(home);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let lines = loop {
+        let lines: Vec<String> = std::fs::read_to_string(&asked)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if lines.len() >= 2 || Instant::now() >= deadline {
+            break lines;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("yes=1 quiet=1 tui=0"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("yes= quiet= tui="),
+        "{lines:?}"
     );
 }
 
