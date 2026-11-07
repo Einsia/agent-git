@@ -730,8 +730,10 @@ pub(super) fn require_remote_ancestry(
         // the Hub's line, so `pull` cannot fast-forward it. Otherwise the counts decide, or,
         // without the Hub's tip here, whether the last fetched remote branch holds the head.
         let accepted = ledger.inherited_immutable(branch, head.oid())?;
-        let position = if accepted.is_some_and(|entry| entry.public != entry.source) {
-            Position::BehindProjected
+        let position = if let Some(entry) = accepted.filter(|entry| entry.public != entry.source) {
+            Position::BehindProjected {
+                encrypted: entry.recipient.is_some(),
+            }
         } else if accepted.is_some()
             || difference.is_some_and(|(ahead, _)| ahead == 0)
             || source
@@ -773,8 +775,9 @@ pub(crate) const DIVERGED: &str = "has diverged from this checkout";
 enum Position {
     /// Nothing here is unpublished, and the Hub's commits can be fast-forwarded onto it.
     Behind,
-    /// Nothing here is unpublished, but its published copy is a projection of it.
-    BehindProjected,
+    /// Nothing here is unpublished, but its published copy is a projection of it: sealed to a
+    /// recipient when `encrypted`, and plain otherwise.
+    BehindProjected { encrypted: bool },
     /// Both sides have commits the other does not.
     Diverged,
     /// Both sides of a file line have commits the other does not, and `pull` merges them; `same`
@@ -810,7 +813,13 @@ fn remote_movement(
                 "remote branch {branch} {state} (Hub tip {tip}), and this checkout has nothing new on it\n  → bring the Hub's turns here: `agit pull {target}`"
             )
         }
-        Position::BehindProjected => format!(
+        // The Hub's newer turn sits on a published copy, which is a different commit from this
+        // checkout's own, so neither copy can be fast-forwarded onto the other: the way on is a
+        // separate checkout of the Hub's copy, with this one kept for its originals.
+        Position::BehindProjected { encrypted: false } => format!(
+            "remote branch {branch}: the Hub has a newer turn from another computer on top of what this checkout uploaded (Hub tip {tip}), and this checkout has nothing new on it\n  → continue from the Hub's copy: keep this checkout, which holds your own turns as they ran, and clone {repository} into a separate checkout"
+        ),
+        Position::BehindProjected { encrypted: true } => format!(
             "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and this checkout has nothing new on it; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
         ),
         Position::DivergedFiles { same } => {

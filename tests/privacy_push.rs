@@ -9341,6 +9341,8 @@ fn a_diverged_file_line_is_offered_pull_and_told_when_the_files_match() {
 /// continues past the other computer's turn. A branch that tracks the Hub's is held to have
 /// integrated its tracking ref when that ref is the published form of a turn it holds; read as a
 /// commit to merge in, the uploader is told to merge its own turn.
+/// Pushing then names the other computer's turn and a separate checkout of the Hub's copy; worded
+/// for an encrypted publication, it describes a copy this plain session never had.
 #[test]
 fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
     const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000005";
@@ -9555,6 +9557,19 @@ fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
         said(&pulled).contains("talk truly diverged"),
         "{}",
         said(&pulled)
+    );
+    assert_eq!(head(), turn);
+    // Nothing here is new, so push names the Hub's turn as the other computer's and points at a
+    // separate checkout of the Hub's copy, never at an encrypted copy this plain session never had.
+    let pushed = run(&["--yes", "push", "alice/app@talk"]);
+    assert!(!pushed.status.success(), "{}", said(&pushed));
+    let refusal = said(&pushed);
+    assert!(
+        refusal.contains(
+            "the Hub has a newer turn from another computer on top of what this checkout uploaded"
+        ) && refusal.contains("clone alice/app into a separate checkout")
+            && !refusal.contains("encrypted"),
+        "{refusal}"
     );
     assert_eq!(head(), turn);
 }
