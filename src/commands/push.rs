@@ -703,10 +703,15 @@ pub(crate) fn branch_list_unread(
 pub(crate) const FILE_IN_HISTORY: &str =
     "so nothing was published. It is in this branch's history:";
 
+/// How a push says a value in a file of the branch's unpublished history stops it, and that the
+/// same push meets it again until the value is removed.
+pub(crate) const VALUE_IN_UNPUBLISHED: &str = "which nothing has published yet";
+
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
         FILE_IN_HISTORY,
+        VALUE_IN_UNPUBLISHED,
         REFUSED_AGAIN,
         UPGRADE_FIRST,
         UPGRADE_FIRST_ELSEWHERE,

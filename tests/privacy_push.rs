@@ -10467,3 +10467,693 @@ fn a_retry_after_a_lost_answer_says_the_branch_is_on_the_hub() {
     assert!(!tagged.contains("already up to date"), "{tagged}");
     assert_eq!(refs(), before);
 }
+
+/// A push of main after a distill sends main's own commits and files and nothing of a session: a
+/// session branch never pushed, in a repository whose automatic upload is off, stays on this
+/// computer. The remote's whole object store is read after the push, so a session record that
+/// reached it by any path, reachable or not, is found.
+#[test]
+fn a_main_push_after_a_distill_sends_nothing_of_a_session() {
+    main_push_after_a_distill(false);
+}
+
+/// The same with the never-pushed turn tagged, by `agit tag`, by an annotated tag and by a
+/// lightweight one: a main push names those tags as left out and sends none of them, nor the turn
+/// they point at.
+#[test]
+fn a_main_push_after_a_distill_sends_no_tag_of_an_unpushed_turn() {
+    main_push_after_a_distill(true);
+}
+
+fn main_push_after_a_distill(tagged: bool) {
+    const MARKER: &str = "session-only-marker-7f3a";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "tag.gpgsign", "false"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    assert_success(&run(&[
+        "config",
+        "--repo",
+        "alice/app",
+        "push.auto",
+        "false",
+    ]));
+
+    // A session branch with a memory file, never pushed.
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    session.committer_account =
+        Some(agit::domain::session_privacy::AccountIdentity::new(&hub.base, "account-1").unwrap());
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":format!("keep this here: {MARKER}")}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(
+        repo.root().join("memory/decisions.md"),
+        "---\nname: decisions\n---\nuid, not user_id\n",
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn 1").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert!(git(&remote, &["for-each-ref", "refs/heads/talk"]).is_empty());
+    if tagged {
+        assert_success(&run(&["tag", "ms-talk", "alice/app@talk"]));
+        repo.git(&["tag", "-a", "annotated-talk", "-m", "turn 1", "talk"])
+            .unwrap();
+        repo.git(&["tag", "light-talk", "talk"]).unwrap();
+    }
+
+    assert_success(&run(&[
+        "privacy",
+        "policy",
+        "allow-memory",
+        "--repo",
+        "alice/app",
+        "--",
+        "decisions.md",
+    ]));
+    assert_success(&run(&[
+        "distill",
+        "decisions.md",
+        "-y",
+        "--into",
+        "alice/app@talk",
+    ]));
+    let main = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+    assert_eq!(
+        git(
+            repo.root(),
+            &["show", "refs/heads/main:memory/decisions.md"]
+        ),
+        "---\nname: decisions\n---\nuid, not user_id"
+    );
+
+    let objects = || {
+        git(
+            &remote,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+        )
+        .lines()
+        .map(|line| {
+            let (oid, kind) = line.split_once(' ').unwrap();
+            (oid.to_owned(), kind.to_owned())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = objects();
+    let pushed = run(&["--yes", "push", "alice/app@main"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&pushed.stdout),
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let after = objects();
+    let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+    for (oid, kind) in &after {
+        if !before.contains_key(oid) {
+            *kinds.entry(kind.as_str()).or_default() += 1;
+        }
+    }
+    eprintln!(
+        "tagged: {tagged}; push succeeded: {}; new objects on the Hub by kind: {kinds:?}",
+        pushed.status.success()
+    );
+    // Nothing on the Hub holds the session's text, a session record's path, or a commit main
+    // doesn't hold.
+    for (oid, kind) in &after {
+        match kind.as_str() {
+            "blob" => {
+                let body = git(&remote, &["cat-file", "-p", oid]);
+                assert!(
+                    !body.contains(MARKER),
+                    "a session record reached the Hub: {oid}"
+                );
+            }
+            "tree" => {
+                let entries = git(&remote, &["ls-tree", "--name-only", oid]);
+                for name in entries.lines() {
+                    assert!(
+                        ![meta::EVENTS_DIR, meta::LOG_FILE, meta::VIEW_FILE].contains(&name),
+                        "a session record's path reached the Hub: {name} in {oid}"
+                    );
+                }
+            }
+            "commit" => {
+                git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
+            }
+            _ => {}
+        }
+    }
+    assert!(git(&remote, &["for-each-ref", "refs/heads/talk"]).is_empty());
+    // The only tags on the Hub are agit's own version tags of main's commits: `agit-<oid>` naming
+    // the commit it points at. None of the person's tags of the unpushed turn went up.
+    for line in git(
+        &remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/tags",
+        ],
+    )
+    .lines()
+    {
+        let (name, oid) = line.split_once(' ').unwrap();
+        assert_eq!(
+            name.strip_prefix("refs/tags/agit-"),
+            Some(oid),
+            "{line}: {said}"
+        );
+        git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
+    }
+    assert_success(&pushed);
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/main"]),
+        main,
+        "{said}"
+    );
+}
+
+/// A main push after a distill in a repository of many sessions sends only main: one session
+/// branch published and fetched back (so its Hub version tags and remote-tracking ref are here)
+/// with a later turn never pushed, and one session branch never pushed, each turn carrying a local
+/// `agit-<oid>` version tag. Nothing of the unpushed turns, and no tag the person didn't push,
+/// reaches the Hub; every new commit is main's; the only new tags are main's own version tags.
+#[test]
+fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
+    const PUBLISHED: &str = "published-turn-marker-1c2d";
+    const LATER: &str = "unpushed-later-turn-marker-3e4f";
+    const LOCAL: &str = "never-pushed-branch-marker-5a6b";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let said = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "tag.gpgsign", "false"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let account =
+        agit::domain::session_privacy::AccountIdentity::new(&hub.base, "account-1").unwrap();
+    let turn = |branch: &str, id: char, texts: &[&str], memory: Option<&str>| {
+        let mut session = meta::Meta::new(
+            format!("agit-{}", id.to_string().repeat(40)),
+            "claude-code".into(),
+            String::new(),
+        );
+        session.committer_account = Some(account.clone());
+        let lines: String = texts
+            .iter()
+            .map(|text| {
+                format!(
+                    "{}\n",
+                    json!({"type":"user","message":{"role":"user","content":text}})
+                )
+            })
+            .collect();
+        let log = transcript::wrap_lines(&lines, "claude-code", &session.session);
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        if let Some(text) = memory {
+            fs::create_dir_all(repo.root().join("memory")).unwrap();
+            fs::write(repo.root().join("memory/decisions.md"), text).unwrap();
+        }
+        repo.add_all().unwrap();
+        repo.commit(&format!("turn on {branch}")).unwrap();
+        let oid = git(repo.root(), &["rev-parse", "HEAD"]);
+        repo.git(&["tag", &format!("agit-{oid}"), &oid]).unwrap();
+        oid
+    };
+
+    // A session published and fetched back: its Hub version tags and remote-tracking ref are here.
+    repo.git(&["checkout", "-b", "pub1"]).unwrap();
+    turn("pub1", 'e', &[PUBLISHED], None);
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@pub1"]));
+    assert_success(&run(&["fetch", "alice/app"]));
+    git(repo.root(), &["rev-parse", "refs/remotes/origin/pub1"]);
+    // A later turn on it, never pushed.
+    repo.git(&["checkout", "pub1"]).unwrap();
+    turn("pub1", 'e', &[PUBLISHED, LATER], None);
+    repo.git(&["checkout", "main"]).unwrap();
+    // A session branch never pushed, holding the memory file.
+    repo.git(&["checkout", "-b", "local1"]).unwrap();
+    turn(
+        "local1",
+        'f',
+        &[LOCAL],
+        Some("---\nname: decisions\n---\nuid, not user_id\n"),
+    );
+    repo.git(&["checkout", "main"]).unwrap();
+
+    assert_success(&run(&[
+        "privacy",
+        "policy",
+        "allow-memory",
+        "--repo",
+        "alice/app",
+        "--",
+        "decisions.md",
+    ]));
+    assert_success(&run(&[
+        "distill",
+        "decisions.md",
+        "-y",
+        "--into",
+        "alice/app@local1",
+    ]));
+    let main = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+
+    let objects = || {
+        git(
+            &remote,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+        )
+        .lines()
+        .map(|line| {
+            let (oid, kind) = line.split_once(' ').unwrap();
+            (oid.to_owned(), kind.to_owned())
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let refs = || {
+        git(
+            &remote,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>()
+    };
+    let objects_before = objects();
+    let refs_before = refs();
+    let pushed = run(&["--yes", "push", "alice/app@main"]);
+    let pushed_said = said(&pushed);
+    let objects_after = objects();
+    let refs_after = refs();
+    let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+    for (oid, kind) in &objects_after {
+        if !objects_before.contains_key(oid) {
+            *kinds.entry(kind.as_str()).or_default() += 1;
+        }
+    }
+    let built: Vec<&str> = pushed_said
+        .lines()
+        .filter(|line| {
+            line.contains("heads batch")
+                || line.contains("snapshots")
+                || line.contains("from commit")
+        })
+        .collect();
+    eprintln!(
+        "push succeeded: {}; new objects on the Hub by kind: {kinds:?}; publication lines: {built:#?}",
+        pushed.status.success()
+    );
+    for (oid, kind) in &objects_after {
+        if objects_before.contains_key(oid) {
+            continue;
+        }
+        match kind.as_str() {
+            "blob" => {
+                let body = git(&remote, &["cat-file", "-p", oid]);
+                assert!(
+                    !body.contains(LATER) && !body.contains(LOCAL) && !body.contains(PUBLISHED),
+                    "a session record reached the Hub through main: {oid}"
+                );
+            }
+            "tree" => {
+                for name in git(&remote, &["ls-tree", "--name-only", oid]).lines() {
+                    assert!(
+                        ![meta::EVENTS_DIR, meta::LOG_FILE, meta::VIEW_FILE].contains(&name),
+                        "a session record's path reached the Hub through main: {name} in {oid}"
+                    );
+                }
+            }
+            "commit" => {
+                git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
+            }
+            _ => {}
+        }
+    }
+    for line in refs_after.difference(&refs_before) {
+        let (name, oid) = line.split_once(' ').unwrap();
+        if name == "refs/heads/main" {
+            assert_eq!(oid, main, "{pushed_said}");
+            continue;
+        }
+        assert_eq!(
+            name.strip_prefix("refs/tags/agit-"),
+            Some(oid),
+            "{line}: {pushed_said}"
+        );
+        git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
+    }
+    for line in refs_before.difference(&refs_after) {
+        let name = line.split_once(' ').unwrap().0;
+        assert_eq!(name, "refs/heads/main", "{line} moved: {pushed_said}");
+    }
+    assert_success(&pushed);
+}
+
+/// A file line's own `session/meta.json` is judged as agit's record: the committer agit writes
+/// there, this computer's signed-in account, doesn't refuse main even when today's check would
+/// replace its value (a distill writes it), while a flagged value in a free-text field of the
+/// record, or in a key the record doesn't define, still refuses. The refusal names the person's
+/// own commit and how to remove the value.
+#[test]
+fn a_file_lines_record_is_judged_as_agits_record() {
+    const ACCOUNT: &str = "acct-7f3a9c2e5b1d4a6f80c2";
+    const FLAGGED: &str = "password=Sup3rS3cretValue42";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some(ACCOUNT.into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let command = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .args(args);
+        command
+    };
+    let run = |args: &[&str]| command(args).stdin(Stdio::null()).output().unwrap();
+    let said = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    // Today's check replaces the account id: it was registered after showing up somewhere.
+    let mut child = command(&["secrets", "add", "hub-account", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(ACCOUNT.as_bytes())
+        .unwrap();
+    let added = child.wait_with_output().unwrap();
+    assert!(added.status.success(), "{added:?}");
+
+    // A distill writes this computer's account into main's record, and main still goes up.
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"note the decision"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(
+        repo.root().join("memory/decisions.md"),
+        "---\nname: decisions\n---\nuid, not user_id\n",
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn 1").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_success(&run(&[
+        "privacy",
+        "policy",
+        "allow-memory",
+        "--repo",
+        "alice/app",
+        "--",
+        "decisions.md",
+    ]));
+    assert_success(&run(&[
+        "distill",
+        "decisions.md",
+        "-y",
+        "--into",
+        "alice/app@talk",
+    ]));
+    assert!(
+        git(repo.root(), &["show", "refs/heads/main:session/meta.json"]).contains(ACCOUNT),
+        "the distill records the committer"
+    );
+    let distilled = run(&["--yes", "push", "alice/app@main"]);
+    assert_success(&distilled);
+    let published = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
+
+    // A flagged value in a free-text field of the record still refuses, naming this computer's
+    // own commit and how to remove it.
+    let mut record = meta::Meta::new_file_line();
+    record.milestone = Some(FLAGGED.into());
+    meta::write(repo.root(), &record).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Milestone").unwrap();
+    let mine = git(repo.root(), &["rev-parse", "--short=12", "HEAD"]);
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let text = said(&refused);
+    for expected in [
+        format!(
+            "`session/meta.json` (from commit {mine}) holds a value today's privacy check replaces"
+        ),
+        format!(
+            "Remove the value from `session/meta.json` in commit {mine} and the commits after it on main, which nothing has published yet, or keep main local."
+        ),
+    ] {
+        assert!(text.contains(&expected), "{expected}: {text}");
+    }
+    assert!(!text.contains("agit scan"), "{text}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
+
+    // So does one in a key the record doesn't define: that file isn't agit's record.
+    repo.git(&["reset", "--hard", "-q", &published]).unwrap();
+    let mut fields: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(repo.root().join("session/meta.json")).unwrap())
+            .unwrap();
+    fields["notes"] = json!(FLAGGED);
+    fs::write(
+        repo.root().join("session/meta.json"),
+        serde_json::to_string_pretty(&fields).unwrap(),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Notes").unwrap();
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        said(&refused).contains("holds a value today's privacy check replaces"),
+        "{refused:?}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
+
+    // The record's bytes at any other path are a person's file: a copy of main's record that
+    // carries the account, added beside a changed record in the same commit, still refuses, and
+    // the refusal names the copy.
+    repo.git(&["reset", "--hard", "-q", &published]).unwrap();
+    let mut record = meta::Meta::new_file_line();
+    record.committer_account =
+        Some(agit::domain::session_privacy::AccountIdentity::new(&hub.base, ACCOUNT).unwrap());
+    record.title = Some("Team memory".into());
+    meta::write(repo.root(), &record).unwrap();
+    fs::copy(
+        repo.root().join("session/meta.json"),
+        repo.root().join("z-copy.json"),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Record and its copy").unwrap();
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        said(&refused).contains("`z-copy.json` (from commit"),
+        "{refused:?}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
+}
