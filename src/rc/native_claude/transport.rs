@@ -1489,6 +1489,7 @@ mod tests {
                             dangerous: false,
                             permission_mode: None,
                             attach_only: false,
+                            project_share: false,
                         },
                     )
                     .unwrap();

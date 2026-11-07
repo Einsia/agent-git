@@ -807,6 +807,7 @@ mod tests {
                 guard_attempts: Default::default(),
                 prior_threads: vec![],
                 ever_dangerous: false,
+                project_share: false,
             },
         );
         assert!(state.reserve_archive(&job).is_some());
@@ -829,6 +830,7 @@ mod tests {
             dangerous: false,
             permission_mode: None,
             attach_only: false,
+            project_share: false,
         };
         let refused = state.require_launch_slot(&alias.info, &spec).unwrap_err();
         assert_eq!(refused.error.data.as_ref().unwrap()["retryable"], true);
@@ -864,6 +866,7 @@ mod tests {
                 guard_attempts: Default::default(),
                 prior_threads: vec![],
                 ever_dangerous: false,
+                project_share: false,
             },
         );
         drop(state);

@@ -590,6 +590,7 @@ impl Daemon {
                 guard_attempts: Default::default(),
                 prior_threads: vec![],
                 ever_dangerous: info.dangerous,
+                project_share: false,
             },
         };
         let changed_danger = info.dangerous && !entry.ever_dangerous;
@@ -1193,6 +1194,7 @@ mod tests {
                         dangerous: false,
                         permission_mode: None,
                         attach_only: false,
+                        project_share: false,
                     },
                 )
                 .err()

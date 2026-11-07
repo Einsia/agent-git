@@ -433,6 +433,7 @@ mod tests {
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),
             attach_only: false,
+            project_share: false,
         };
         let mut driver = CodexDriver::launch_shared(spec.clone(), &source)
             .await

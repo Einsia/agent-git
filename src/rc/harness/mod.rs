@@ -351,6 +351,8 @@ pub struct LaunchSpec {
     /// Join a conversation that already runs in a terminal, never launch one: when no terminal
     /// can be attached at driver selection, the launch is refused with `AttachOnlyNotRunning`.
     pub attach_only: bool,
+    /// A project the owner shared with a group (`rc::project_share`), recorded on its roster row.
+    pub project_share: bool,
 }
 
 impl LaunchSpec {

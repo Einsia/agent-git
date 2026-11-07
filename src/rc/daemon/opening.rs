@@ -592,6 +592,7 @@ impl Daemon {
                 .map(|entry| entry.prior_threads.clone())
                 .unwrap_or_default(),
             ever_dangerous: spawn.info.dangerous,
+            project_share: spawn.spec.project_share,
         };
         if let Err(error) = self.roster.record(id, entry) {
             self.roster = previous;
@@ -1014,6 +1015,7 @@ mod tests {
             dangerous: false,
             permission_mode: info.permission_mode,
             attach_only: false,
+            project_share: false,
         };
         let (frames, _) = mpsc::channel(1);
         let spawn = state

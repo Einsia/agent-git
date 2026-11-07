@@ -366,6 +366,7 @@ impl Daemon {
                         guard_attempts: Default::default(),
                         prior_threads: Vec::new(),
                         ever_dangerous,
+                        project_share: false,
                     };
                     if let Err(error) = self.roster.record(&logical, entry) {
                         self.roster = previous;
@@ -675,6 +676,8 @@ impl Daemon {
                 // anyone but the owner.
                 permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
                 attach_only: p.attach_only,
+                // A shared project resumes held to the repository, as it was started.
+                project_share: entry.project_share,
             };
             let spawn = self.prepare_spawn(
                 info,
@@ -958,6 +961,8 @@ impl Daemon {
             // takeover.
             permission_mode: Some(inherited_mode),
             attach_only: p.attach_only,
+            // A conversation registered as a shared project stays one when taken over.
+            project_share: prior.as_ref().is_some_and(|entry| entry.project_share),
         };
         let spawn = self.prepare_spawn(
             info,
@@ -1231,6 +1236,21 @@ impl Daemon {
         frames: &mpsc::Sender<Frame>,
         authority: &crate::rc::authority::Guard,
     ) -> Result<SessionOpening, RpcError> {
+        // A shared project is started for a group member, never for the owner, and only in Claude
+        // Code.
+        let project_share = crate::rc::project_share::origin(p.origin.as_deref())?;
+        if project_share && caller.is_owner() {
+            return Err(crate::rc::project_share::refused(
+                "a shared project's session is started for someone else, not the owner; nothing was started",
+                "share_owner",
+            ));
+        }
+        if project_share && p.runtime != "claude-code" {
+            return Err(crate::rc::project_share::refused(
+                "a shared project runs only in Claude Code; nothing was started",
+                "share_runtime_unsupported",
+            ));
+        }
         if p.prompt.is_some() {
             crate::rc::harness::CodexUnconfined::check(&p.runtime, caller.is_owner())?;
         }
@@ -1288,6 +1308,7 @@ impl Daemon {
                 prompt: p.prompt.clone(),
                 by: p.by.clone(),
                 permission_mode: mode,
+                project_share,
             };
             if !retry_spec.same_launch_as(&intent.spec) {
                 return Err(conflicting_start_error());
@@ -1409,6 +1430,7 @@ impl Daemon {
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
             attach_only: false,
+            project_share,
         };
 
         let Some(start_id) = start_id else {
@@ -1439,6 +1461,7 @@ impl Daemon {
             prompt: p.prompt.clone(),
             by: p.by.clone(),
             permission_mode: mode,
+            project_share,
         };
 
         match self.roster.claim_start(&start_id, start_spec, info.clone()) {
@@ -1646,6 +1669,7 @@ impl Daemon {
                             guard_attempts: Default::default(),
                             prior_threads: vec![],
                             ever_dangerous: true,
+                            project_share: false,
                         },
                     )
                     .map_err(|error| {

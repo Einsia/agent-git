@@ -103,6 +103,10 @@ pub struct Entry {
     /// not of what it is doing now.
     #[serde(default)]
     pub ever_dangerous: bool,
+    /// A project the owner shared with a group (`rc::project_share`). Like `ever_dangerous` it is
+    /// never cleared: a share session stays one across restarts and resumes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_share: bool,
 }
 
 impl Entry {
@@ -140,6 +144,10 @@ pub struct StartSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
     pub permission_mode: crate::protocol::PermissionMode,
+    /// Started as a shared project (`rc::project_share`). A record written before this field reads
+    /// as an ordinary start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_share: bool,
 }
 
 impl StartSpec {
@@ -153,6 +161,7 @@ impl StartSpec {
             && self.expected_agent_id == other.expected_agent_id
             && self.prompt == other.prompt
             && self.permission_mode == other.permission_mode
+            && self.project_share == other.project_share
     }
 }
 
@@ -555,6 +564,7 @@ impl Roster {
             }
             // Re-recording never clears the monotonic bit.
             entry.ever_dangerous = entry.ever_dangerous || old.ever_dangerous;
+            entry.project_share = entry.project_share || old.project_share;
             entry.guard_attempts.extend(old.guard_attempts.clone());
         }
         self.sessions.insert(logical_id.to_string(), entry);
@@ -888,6 +898,50 @@ mod tests {
         });
     }
 
+    /// A shared project's mark is never washed out: recording its row again without the mark,
+    /// as a resume or takeover that misread it would, keeps it, and it survives a restart's read
+    /// of the roster file. A row written before the mark existed reads as no share.
+    #[test]
+    fn a_shared_projects_mark_survives_rerecording_and_restart() {
+        let mut r = Roster::default();
+        let shared = Entry {
+            native_source: None,
+            runtime: "claude-code".into(),
+            thread_id: "t1".into(),
+            cwd: "/srv/app".into(),
+            workspace_id: "ws-a".into(),
+            project_id: None,
+            agit_session: None,
+            expected_agent_id: None,
+            permission_mode: None,
+            guard_attempts: Default::default(),
+            ever_dangerous: false,
+            project_share: true,
+            prior_threads: vec![],
+        };
+        r.record("agit-share", shared.clone()).unwrap();
+        r.record(
+            "agit-share",
+            Entry {
+                thread_id: "t2".into(),
+                project_share: false,
+                ..shared.clone()
+            },
+        )
+        .unwrap();
+        assert!(r.get("agit-share").unwrap().project_share);
+
+        let restarted: Roster = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert!(restarted.get("agit-share").unwrap().project_share);
+
+        let older: Roster = serde_json::from_value(serde_json::json!({
+            "sessions":{"agit-old":{"runtime":"claude-code", "thread_id":"t3", "cwd":"/srv/app",
+                "workspace_id":"ws-a"}}
+        }))
+        .unwrap();
+        assert!(!older.get("agit-old").unwrap().project_share);
+    }
+
     /// When two workspaces each bind the same folder, each resolves to its own
     /// row.
     ///
@@ -913,6 +967,7 @@ mod tests {
             permission_mode: None,
             guard_attempts: Default::default(),
             ever_dangerous: false,
+            project_share: false,
             prior_threads: vec![],
         };
         // `agit-a` sorts first by key, so without the workspace test it is always found first.
@@ -959,6 +1014,7 @@ mod tests {
             permission_mode: None,
             guard_attempts: Default::default(),
             ever_dangerous: true,
+            project_share: false,
             prior_threads: vec![],
         };
         r.record("agit-crashed", unbound.clone()).unwrap();
@@ -1032,6 +1088,7 @@ mod tests {
                 permission_mode: Some(crate::protocol::PermissionMode::Bypass),
                 guard_attempts: Default::default(),
                 ever_dangerous: true,
+                project_share: false,
                 // Claude Code rotated the session id: the old transcript is still on
                 // disk, carrying the same context.
                 prior_threads: vec!["t0".into()],
@@ -1082,6 +1139,7 @@ mod tests {
                 permission_mode: None,
                 guard_attempts: Default::default(),
                 ever_dangerous: true,
+                project_share: false,
                 prior_threads: vec![],
             },
         )
@@ -1129,6 +1187,7 @@ mod tests {
                 permission_mode: None,
                 guard_attempts: Default::default(),
                 ever_dangerous: true,
+                project_share: false,
                 prior_threads: vec![],
             },
         )
@@ -1178,6 +1237,7 @@ mod tests {
                         guard_attempts: Default::default(),
                         prior_threads: vec![],
                         ever_dangerous: false,
+                        project_share: false,
                     },
                 )
                 .unwrap();
@@ -1310,6 +1370,7 @@ mod tests {
                 permission_mode: None,
                 guard_attempts: Default::default(),
                 ever_dangerous: false,
+                project_share: false,
                 prior_threads: vec![],
             },
         )
@@ -1338,6 +1399,7 @@ mod tests {
             permission_mode: None,
             guard_attempts: Default::default(),
             ever_dangerous: false,
+            project_share: false,
             prior_threads: vec![],
         };
         r.record("agit-1", unclaimed.clone()).unwrap();
@@ -1383,6 +1445,7 @@ mod tests {
             permission_mode: None,
             guard_attempts: Default::default(),
             ever_dangerous: true,
+            project_share: false,
             prior_threads: vec![],
         };
         r.record("agit-X", base.clone()).unwrap();
@@ -1453,6 +1516,7 @@ mod tests {
             prompt: Some("fix it".into()),
             by: Some("alice".into()),
             permission_mode: crate::protocol::PermissionMode::Default,
+            project_share: false,
         }
     }
 
@@ -1649,6 +1713,7 @@ mod tests {
             ]),
             prior_threads: vec![],
             ever_dangerous: true,
+            project_share: false,
         };
 
         assert_eq!(
@@ -1690,6 +1755,7 @@ mod tests {
             )]),
             prior_threads: vec![],
             ever_dangerous: true,
+            project_share: false,
         };
 
         let encoded = serde_json::to_vec(&entry).unwrap();
