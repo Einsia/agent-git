@@ -4212,6 +4212,130 @@ fn an_explicit_save_with_automatic_upload_off_reports_what_the_hub_received() {
     assert!(!swept.contains("\"uploaded\""), "{swept}");
 }
 
+/// A conversation whose transcript no longer continues what its branch holds, rewound in the
+/// runtime say, isn't saved there, and no retry is offered, since saving again meets the same
+/// refusal. The step the save names keeps both histories, and run exactly as printed it imports the
+/// conversation onto a branch of its own.
+#[test]
+fn a_rewound_conversation_names_the_import_that_keeps_both_and_the_import_works() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        state.with_extension("json"),
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // A stand-in `claude`, so the runtime counts as installed and its conversations are found.
+    let bin = lab.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let id = "dddddddd-0000-4000-8000-000000000019";
+    lab.append_turn(id, 1, "plan the release", "done");
+    let save = || {
+        let out = lab
+            .agit(&["--json", "save", id])
+            .env("PATH", &path)
+            .env_remove("AGIT_YES")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    save();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let branch = agit::domain::link::get(&store, "claude-code", id)
+        .and_then(|link| link.branch)
+        .expect("the first save claimed the conversation");
+    // Rewound in the runtime: its first prompt is another now.
+    fs::remove_file(lab.transcript(id)).unwrap();
+    lab.append_turn(id, 1, "plan another release", "done");
+
+    let document = save();
+    let value = &document["result"]["value"];
+    let session = &value["sessions"][0];
+    assert_eq!(session["status"], "failed", "{document}");
+    assert!(
+        session["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&format!(
+                "its transcript no longer continues what einsia/qa@{branch} holds"
+            ))),
+        "{document}"
+    );
+    assert!(value["next"].is_null(), "{document}");
+    let keep_both = session["keep_both"].as_str().unwrap_or_default().to_owned();
+    let words = shlex::split(&keep_both).unwrap_or_default();
+    assert_eq!(
+        words.first().map(String::as_str),
+        Some("agit"),
+        "{document}"
+    );
+    assert!(!words.iter().any(|word| word == "-y"), "{keep_both}");
+    // Run as printed, import asks to move the claim; with no terminal to ask at, it refuses and
+    // says the -y that would.
+    let words: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+    let asked = lab
+        .agit(&words)
+        .env("PATH", &path)
+        .env_remove("AGIT_YES")
+        .output()
+        .unwrap();
+    assert!(!asked.status.success(), "{keep_both}: {asked:?}");
+    assert!(
+        String::from_utf8_lossy(&asked.stderr)
+            .contains("refusing to move the claim without confirmation"),
+        "{asked:?}"
+    );
+    assert_eq!(
+        agit::domain::link::get(&store, "claude-code", id).and_then(|link| link.branch),
+        Some(branch.clone())
+    );
+    // Confirmed, it moves the claim, and the conversation goes on there.
+    let ran = lab
+        .agit(&[&["-y"], &words[..]].concat())
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{keep_both}: {ran:?}");
+    assert_eq!(
+        agit::domain::link::get(&store, "claude-code", id).and_then(|link| link.branch),
+        Some(format!("{branch}-2"))
+    );
+}
+
 /// `agit save` doesn't offer a conversation whose folder no longer exists, a removed worktree say.
 /// Named by its ID, it isn't "not found" either: the save says where it ran, and saves nothing.
 #[test]

@@ -3082,6 +3082,15 @@ pub(crate) enum Saved {
     Failed(String),
     /// Left where it was for a reason saving again does not change; the reason says what does.
     Refused(String),
+    /// Saved where this save doesn't upload it: in another repository or branch (`saved_in`, when
+    /// known), or it ran in a folder set up on its own (`why`). Nothing failed.
+    Elsewhere {
+        saved_in: Option<String>,
+        why: Option<String>,
+    },
+    /// Its transcript no longer continues what `branch` holds, so its new turns can't go on that
+    /// branch; `keep_both` imports it onto a branch of its own, which nothing does by itself.
+    Rewritten { branch: String, keep_both: String },
 }
 
 impl Saved {
@@ -3093,6 +3102,50 @@ impl Saved {
             Self::Failed(message)
         }
     }
+
+    /// [`Self::upload_failed`] for `candidate`, which names the step that keeps both histories
+    /// when its transcript no longer continues its branch.
+    fn upload_failed_for(project: &Project, candidate: &Candidate, message: String) -> Self {
+        if message.contains(super::commit::NOT_CONTINUED) {
+            let store = config::store_root().map(Store::at);
+            if let Some(branch) = store
+                .ok()
+                .and_then(|store| link::get(&store, &candidate.runtime, &candidate.session_id))
+                .and_then(|link| link.branch)
+                && let Ok(repo) = checkout(project)
+            {
+                let free = free_branch(&repo, &branch);
+                // The whole id: import looks a runtime's conversation up by it. The import is
+                // independent, since the transcript no longer continues what is settled. It
+                // carries no -y: import asks whether to move the claim to the new branch, and a
+                // -y there would also answer what else an import may ask, its seeding of personal
+                // memory among them. Each argument is quoted for the shell: a branch name may
+                // hold `;` or `$(`.
+                return Self::Rewritten {
+                    keep_both: format!(
+                        "agit import --from {} --into {} --independent -- {}",
+                        super::import::selection_arg(&candidate.runtime),
+                        super::import::selection_arg(&format!("{}@{free}", project.repository)),
+                        super::import::selection_arg(&candidate.session_id)
+                    ),
+                    branch,
+                };
+            }
+        }
+        Self::upload_failed(message)
+    }
+}
+
+/// The first `<branch>-N`, from 2, that is neither a branch here nor one this checkout has seen on
+/// the Hub.
+fn free_branch(repo: &Repo, branch: &str) -> String {
+    (2..)
+        .map(|n| format!("{branch}-{n}"))
+        .find(|name| {
+            !repo.has_ref(&format!("refs/heads/{name}"))
+                && !repo.has_ref(&format!("refs/remotes/origin/{name}"))
+        })
+        .expect("an unbounded range has a free name")
 }
 
 /// Uploads these sessions of the project deciding for the folder at `root` now, after any
@@ -3143,9 +3196,9 @@ pub(crate) fn save_now(
             )));
             continue;
         }
-        let outcome = match save_one(project, candidate, earlier || named) {
+        let outcome = match save_one(project.clone(), candidate.clone(), earlier || named) {
             Ok(outcome) => outcome,
-            Err(error) => Saved::upload_failed(format!("{error:#}")),
+            Err(error) => Saved::upload_failed_for(&project, &candidate, format!("{error:#}")),
         };
         // A conversation the person saved themselves no longer stays out of the folder's uploads
         // because it predates `agit rc start --here` (see `rc::folder_cutoff`).
@@ -3195,7 +3248,10 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         ));
     }
     if let Some(why) = bound_apart(&project, &candidate)? {
-        return Ok(Saved::Refused(why));
+        return Ok(Saved::Elsewhere {
+            saved_in: None,
+            why: Some(why),
+        });
     }
     let finished = adapter::get(&candidate.runtime)
         .ok()
@@ -3205,7 +3261,10 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         })
         .is_some_and(|session| crate::domain::turn::completed_count(&session) > 0);
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
-        return Ok(Saved::Refused(format!("it is saved in {source}")));
+        return Ok(Saved::Elsewhere {
+            saved_in: Some(source),
+            why: None,
+        });
     }
     if !finished {
         let _guard = lock(&project.root)?;
@@ -3213,7 +3272,10 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         // claim must not take a session that binding now keeps.
         let project = read(&project.root)?.context("folder is not set up")?;
         if let Some(why) = bound_apart(&project, &candidate)? {
-            return Ok(Saved::Refused(why));
+            return Ok(Saved::Elsewhere {
+                saved_in: None,
+                why: Some(why),
+            });
         }
         verify(&project)?;
         let (branch, opens) = publication(&project, &candidate)?;
@@ -3222,14 +3284,18 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
     }
     let store = Store::at(config::store_root()?);
     if let Placement::Foreign(source) = placement(&project, &candidate)? {
-        return Ok(Saved::Refused(format!("it is saved in {source}")));
+        return Ok(Saved::Elsewhere {
+            saved_in: Some(source),
+            why: None,
+        });
     }
     if !capture_candidate(project.clone(), candidate.clone(), let_in, false)? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
-        return Ok(Saved::Refused(
-            why.unwrap_or_else(|| "it is saved in another repository".into()),
-        ));
+        return Ok(Saved::Elsewhere {
+            saved_in: None,
+            why,
+        });
     }
     if let Some(link) = link::get(&store, &candidate.runtime, &candidate.session_id)
         && let Some(branch) = link.branch.clone()
@@ -3242,7 +3308,9 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
         && last["session_id"] == candidate.session_id.as_str()
         && last["ok"] == false
     {
-        return Ok(Saved::upload_failed(
+        return Ok(Saved::upload_failed_for(
+            &after,
+            &candidate,
             last["error"].as_str().unwrap_or("unknown error").to_owned(),
         ));
     }
@@ -5081,6 +5149,90 @@ mod tests {
         }
     }
 
+    /// A save whose conversation's transcript no longer continues its branch names the step that
+    /// keeps both, on the first branch name free here and on the Hub as this checkout last saw
+    /// it, and offers no retry: saving again meets the same refusal. Any other failure is told as
+    /// it was.
+    #[test]
+    fn a_transcript_that_no_longer_continues_its_branch_names_the_step_that_keeps_both() {
+        if !isolated(
+            "a_transcript_that_no_longer_continues_its_branch_names_the_step_that_keeps_both",
+        ) {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let policy = project(work.path());
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        git(
+            repo.root(),
+            &["commit", "-q", "--allow-empty", "-m", "base"],
+        );
+        git(repo.root(), &["branch", "talk"]);
+        git(repo.root(), &["branch", "talk-2"]);
+        git(
+            repo.root(),
+            &["update-ref", "refs/remotes/origin/talk-3", "HEAD"],
+        );
+        let id = "dddddddd-0000-4000-8000-000000000051";
+        let store = Store::at(config::store_root().unwrap());
+        let mut claim = link::Link::new("claude-code", id, Some(work.path()));
+        claim.owner = Some("alice".into());
+        claim.agent = Some("app".into());
+        claim.branch = Some("talk".into());
+        link::write(&store, &claim).unwrap();
+        let candidate = Candidate {
+            runtime: "claude-code".into(),
+            session_id: id.into(),
+            cwd: policy.root.clone(),
+        };
+        let saved = Saved::upload_failed_for(
+            &policy,
+            &candidate,
+            format!(
+                "`agit import` failed: {}",
+                super::super::commit::NOT_CONTINUED
+            ),
+        );
+        let Saved::Rewritten { branch, keep_both } = saved else {
+            panic!("a transcript that no longer continues its branch is not told as such");
+        };
+        assert_eq!(branch, "talk");
+        assert_eq!(
+            shlex::split(&keep_both).unwrap(),
+            [
+                "agit",
+                "import",
+                "--from",
+                "claude-code",
+                "--into",
+                "alice/app@talk-4",
+                "--independent",
+                "--",
+                id
+            ],
+            "{keep_both}"
+        );
+        assert!(matches!(
+            Saved::upload_failed_for(&policy, &candidate, "the Hub did not answer".into()),
+            Saved::Failed(_)
+        ));
+        // A branch name a shell would split or run stays one argument.
+        claim.branch = Some("topic;echo $(id)".into());
+        link::write(&store, &claim).unwrap();
+        let Saved::Rewritten { keep_both, .. } = Saved::upload_failed_for(
+            &policy,
+            &candidate,
+            super::super::commit::NOT_CONTINUED.into(),
+        ) else {
+            panic!("a transcript that no longer continues its branch is not told as such");
+        };
+        assert_eq!(
+            shlex::split(&keep_both).unwrap().get(5).map(String::as_str),
+            Some("alice/app@topic;echo $(id)-2"),
+            "{keep_both}"
+        );
+    }
+
     /// Runs git in `dir`, with no configuration but its own.
     fn git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -6608,8 +6760,14 @@ mod tests {
             false,
         )
         .unwrap();
-        let [Saved::Refused(why)] = saved.as_slice() else {
-            panic!("the nested session was not refused");
+        let [
+            Saved::Elsewhere {
+                saved_in: None,
+                why: Some(why),
+            },
+        ] = saved.as_slice()
+        else {
+            panic!("the nested session was not left to its own folder");
         };
         assert!(why.contains("set up on its own"), "{why}");
         assert!(why.contains("nested"), "{why}");

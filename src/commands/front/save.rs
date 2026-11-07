@@ -380,6 +380,13 @@ fn link(repository: &str, branch: &str) -> String {
     super::session_link(repository, branch).unwrap_or_else(|| super::repository_link(repository))
 }
 
+/// Why a conversation whose transcript no longer continues its branch isn't uploaded.
+fn not_continued(repository: &str, branch: &str) -> String {
+    format!(
+        "its transcript no longer continues what {repository}@{branch} holds, so its new turns can't go on that branch"
+    )
+}
+
 fn report(
     rows: &[Row],
     turned_on: &[(PathBuf, String)],
@@ -389,7 +396,12 @@ fn report(
 ) -> CmdResult {
     let failed = rows
         .iter()
-        .filter(|r| matches!(r.outcome, Saved::Failed(_) | Saved::Refused(_)))
+        .filter(|r| {
+            matches!(
+                r.outcome,
+                Saved::Failed(_) | Saved::Refused(_) | Saved::Rewritten { .. }
+            )
+        })
         .count();
     // A refusal says its own way forward; saving again only meets it again.
     let retry = rows.iter().any(|r| matches!(r.outcome, Saved::Failed(_)));
@@ -400,7 +412,11 @@ fn report(
                 let (status, branch, error) = match &r.outcome {
                     Saved::Uploaded(b) => ("uploaded", Some(b), None),
                     Saved::Pending(b) => ("pending", Some(b), None),
-                    Saved::Failed(e) | Saved::Refused(e) => ("failed", None, Some(e)),
+                    Saved::Failed(e) | Saved::Refused(e) => ("failed", None, Some(e.clone())),
+                    Saved::Elsewhere { .. } => ("elsewhere", None, None),
+                    Saved::Rewritten { branch, .. } => {
+                        ("failed", None, Some(not_continued(&r.repository, branch)))
+                    }
                 };
                 serde_json::json!({
                     "title": r.title,
@@ -412,10 +428,25 @@ fn report(
                     "link": match &r.outcome {
                         Saved::Uploaded(b) => Some(link(&r.repository, b)),
                         Saved::Pending(_) => Some(super::repository_link(&r.repository)),
-                        Saved::Failed(_) | Saved::Refused(_) => None,
+                        Saved::Failed(_)
+                        | Saved::Refused(_)
+                        | Saved::Elsewhere { .. }
+                        | Saved::Rewritten { .. } => None,
                     },
                     "branch": branch,
                     "error": error,
+                    "saved_in": match &r.outcome {
+                        Saved::Elsewhere { saved_in, .. } => saved_in.as_deref(),
+                        _ => None,
+                    },
+                    "why": match &r.outcome {
+                        Saved::Elsewhere { why, .. } => why.as_deref(),
+                        _ => None,
+                    },
+                    "keep_both": match &r.outcome {
+                        Saved::Rewritten { keep_both, .. } => Some(keep_both.as_str()),
+                        _ => None,
+                    },
                     "was_dropped": r.was_dropped,
                 })
             })
@@ -488,6 +519,30 @@ fn report(
                         ui::truncate(&row.title, 60),
                         ui::truncate(error, 400)
                     ));
+                }
+                // Saved elsewhere is no failure, and saving again changes nothing.
+                Saved::Elsewhere {
+                    saved_in: Some(saved_in),
+                    ..
+                } => println!(
+                    "\"{}\" is already saved in {saved_in}, so it isn't uploaded here",
+                    ui::truncate(&row.title, 60)
+                ),
+                Saved::Elsewhere { why: Some(why), .. } => println!(
+                    "\"{}\" isn't uploaded here: {why}",
+                    ui::truncate(&row.title, 60)
+                ),
+                Saved::Elsewhere { .. } => println!(
+                    "\"{}\" is already saved in another repository, so it isn't uploaded here",
+                    ui::truncate(&row.title, 60)
+                ),
+                Saved::Rewritten { branch, keep_both } => {
+                    ui::error(&format!(
+                        "could not upload \"{}\": {}",
+                        ui::truncate(&row.title, 60),
+                        not_continued(&row.repository, branch)
+                    ));
+                    ui::hint(&format!("to keep both: `{keep_both}`"));
                 }
             }
         }
