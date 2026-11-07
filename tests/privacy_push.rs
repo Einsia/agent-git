@@ -8976,6 +8976,130 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
 }
 
+/// A file line that diverged from the Hub's, as when two people distill the same memory into
+/// main, is refused with `pull` as the way out: pull merges a file line's files and stops only
+/// where both sides changed the same lines. When the Hub's tip is here and holds exactly the
+/// same files, the refusal says so. Offering only a fork or a merge by hand left a person
+/// merging two mains that held the same files.
+#[test]
+fn a_diverged_file_line_is_offered_pull_and_told_when_the_files_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let published = git(&remote, &["rev-parse", "refs/heads/main"]);
+
+    // A teammate's distill lands on the Hub, and the same files are distilled here.
+    let theirs = git(
+        &remote,
+        &[
+            "-c",
+            "user.name=Teammate",
+            "-c",
+            "user.email=teammate@example.invalid",
+            "commit-tree",
+            &format!("{published}^{{tree}}"),
+            "-p",
+            &published,
+            "-m",
+            "Teammate's distill",
+        ],
+    );
+    git(&remote, &["update-ref", "refs/heads/main", &theirs]);
+    repo.git(&["commit", "--allow-empty", "-m", "Distill here"])
+        .unwrap();
+    let mine = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+
+    // Before a fetch the Hub's tip isn't here, so nothing is said about its files or counted.
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    for expected in [
+        "remote branch main has diverged from this checkout (each side has commits the other does not;",
+        "→ bring the Hub's changes in: `agit pull alice/app@main` (it merges the files and stops only where both sides changed the same lines), then `agit push alice/app@main`",
+    ] {
+        assert!(said.contains(expected), "{expected}: {said}");
+    }
+    assert!(!said.contains("same files"), "{said}");
+    assert!(!said.contains("agit fork"), "{said}");
+
+    assert_success(&run(&["fetch", "alice/app"]));
+    let refused = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    for expected in [
+        "(local +1 / Hub +1; Hub tip ",
+        ", but both sides hold the same files; local unpublished commits are kept",
+        "→ bring the Hub's line in: `agit pull alice/app@main`, then `agit push alice/app@main`",
+    ] {
+        assert!(said.contains(expected), "{expected}: {said}");
+    }
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), theirs);
+
+    // The two commands it names are the whole way: the pull merges, and the push publishes both.
+    assert_success(&run(&["pull", "alice/app@main"]));
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let merged = git(&remote, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(merged, git(repo.root(), &["rev-parse", "refs/heads/main"]));
+    for side in [&mine, &theirs] {
+        git(&remote, &["merge-base", "--is-ancestor", side, &merged]);
+    }
+}
+
 /// A turn published without the records plain publication leaves out reaches the Hub as another
 /// commit on the same parent, and the accepted publication record names the turn it publishes.
 /// `agit run`, `agit resume` and `agit pull` take that Hub tip as the turn: the branch continues as

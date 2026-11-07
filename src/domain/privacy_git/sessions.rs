@@ -744,6 +744,15 @@ pub(super) fn require_remote_ancestry(
                 .is_some()
         {
             Position::Behind
+        } else if meta::is_file_line_at(&source, head.oid()) {
+            // Only objects already here decide "same files": the Hub's tip is compared when a
+            // fetch brought it, and nothing is claimed about it otherwise.
+            let tree = |commit: &str| {
+                source.git_opt(&["rev-parse", "--verify", &format!("{commit}^{{tree}}")])
+            };
+            Position::DivergedFiles {
+                same: tree(remote_head).is_some_and(|theirs| tree(head.oid()) == Some(theirs)),
+            }
         } else {
             Position::Diverged
         };
@@ -764,11 +773,16 @@ enum Position {
     BehindProjected,
     /// Both sides have commits the other does not.
     Diverged,
+    /// Both sides of a file line have commits the other does not, and `pull` merges them; `same`
+    /// when the Hub's tip is here and holds exactly this head's files.
+    DivergedFiles { same: bool },
 }
 
 /// Why the Hub refused this branch, followed by the commands that resolve it, one `→` line each.
 /// A behind checkout only needs the Hub's turns; a diverged one must either publish its own line
-/// under a new branch or merge the Hub's line in, and a merge needs the Hub's objects first.
+/// under a new branch or merge the Hub's line in, and a merge needs the Hub's objects first. A
+/// diverged file line is not a conversation to keep beside another: `pull` fetches and merges its
+/// files, and stops only where both sides changed the same lines.
 fn remote_movement(
     repository: &str,
     branch: &str,
@@ -795,6 +809,21 @@ fn remote_movement(
         Position::BehindProjected => format!(
             "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and this checkout has nothing new on it; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
         ),
+        Position::DivergedFiles { same } => {
+            let state = match counts {
+                Some((ahead, behind)) => format!("local +{ahead} / Hub +{behind}"),
+                None => "each side has commits the other does not".into(),
+            };
+            if same {
+                format!(
+                    "remote branch {branch} has diverged from this checkout ({state}; Hub tip {tip}), but both sides hold the same files; local unpublished commits are kept\n  → bring the Hub's line in: `agit pull {target}`, then `agit push {target}`"
+                )
+            } else {
+                format!(
+                    "remote branch {branch} has diverged from this checkout ({state}; Hub tip {tip}); local unpublished commits are kept\n  → bring the Hub's changes in: `agit pull {target}` (it merges the files and stops only where both sides changed the same lines), then `agit push {target}`"
+                )
+            }
+        }
         Position::Diverged => {
             let state = match counts {
                 Some((ahead, behind)) => format!("local +{ahead} / Hub +{behind}"),
