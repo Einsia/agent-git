@@ -209,7 +209,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     let refusal = String::from_utf8_lossy(&refused.stderr);
     assert!(
         refusal.contains(
-            "your memory allowlist for drh/qa on this computer is empty: memory files stay on this computer until you allow them (agit privacy policy allow-memory --repo drh/qa -- mine.md)"
+            "your memory allowlist for drh/qa on this computer is empty: memory files stay on this computer until you allow them. `agit privacy policy allow-memory --repo drh/qa -- mine.md` would let agit collect mine.md; it is then saved to drh/qa and uploaded with the branch."
         ),
         "{refusal}"
     );
@@ -656,5 +656,65 @@ fn two_sessions_distilling_one_file_keep_both_changes_or_stop() {
             "uid as account_id",
             "snake_case, no abbreviations"
         )
+    );
+}
+
+/// A file named for distill that has nothing to carry says which way: one the branch never got,
+/// with the allowlist sentence and what allowing does when the policy keeps it on this computer,
+/// or one unchanged against main. "already matches main, or never existed" left a person whose
+/// memory was written to another folder, and whose allowlist was empty, guessing which.
+#[test]
+fn distill_says_why_a_file_has_nothing_to_carry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo, claude, _mem) = fixture(tmp.path());
+    let into = format!("{REPO}@s1");
+    let refused = |file: &str| {
+        let out = agit(&home, &claude, &["distill", file, "--into", &into]);
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let unchanged = refused("team.md");
+    assert!(
+        unchanged.contains(
+            "memory/team.md on `s1` already matches main, or hasn't changed since `s1` left main: there is nothing to carry."
+        ),
+        "{unchanged}"
+    );
+
+    let absent = refused("decisions.md");
+    assert!(
+        absent.contains(
+            "memory/decisions.md isn't on `s1`: no turn collected it from the runtime's memory folder."
+        ),
+        "{absent}"
+    );
+    assert!(
+        absent.contains("agit memory status --into")
+            && absent.contains("drh/qa@s1")
+            && absent.contains("shows where it is"),
+        "{absent}"
+    );
+    assert!(!absent.contains("allow-memory"), "{absent}");
+
+    agit::domain::privacy::PrivacyPolicy::default()
+        .save(&repo)
+        .unwrap();
+    let kept = refused("decisions.md");
+    assert!(
+        kept.contains(
+            "memory/decisions.md isn't on `s1`: no turn collected it from the runtime's memory folder."
+        ),
+        "{kept}"
+    );
+    assert!(
+        kept.contains(
+            "your memory allowlist for drh/qa on this computer is empty: memory files stay on this computer until you allow them. `agit privacy policy allow-memory --repo drh/qa -- decisions.md` would let agit collect decisions.md; it is then saved to drh/qa and uploaded with the branch."
+        ),
+        "{kept}"
+    );
+    assert!(
+        repo.show("refs/heads/main", "memory/decisions.md")
+            .is_none()
     );
 }

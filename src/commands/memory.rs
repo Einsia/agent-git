@@ -230,7 +230,10 @@ fn memory_exclusion(
         .as_deref()
         .unwrap_or("privacy policy excluded the candidate");
     let authorization = if decision.rule == "repository.memory_allow" {
-        format!("; allow with `{}`", allow_memory_command(slug, name))
+        format!(
+            "; `{}` would let agit collect it, and it would then be saved to {slug} and uploaded with the branch",
+            allow_memory_command(slug, name)
+        )
     } else {
         String::new()
     };
@@ -1712,7 +1715,16 @@ pub fn distill(
 /// computer: a teammate's entries do not cover their files.
 fn empty_allowlist(slug: &str, file: &str) -> String {
     format!(
-        "your memory allowlist for {slug} on this computer is empty: memory files stay on this computer until you allow them ({})",
+        "your memory allowlist for {slug} on this computer is empty: memory files stay on this computer until you allow them. {}",
+        allowing(slug, file, file)
+    )
+}
+
+/// The command that allows `file` with what it does: agit then collects `it`, and the file goes
+/// into `slug` and up with the branch. A hint toward a looser policy says what loosening it means.
+fn allowing(slug: &str, file: &str, it: &str) -> String {
+    format!(
+        "`{}` would let agit collect {it}; it is then saved to {slug} and uploaded with the branch.",
         allow_memory_command(slug, file)
     )
 }
@@ -1741,10 +1753,41 @@ fn not_distillable(
         empty_allowlist(slug, name)
     } else {
         format!(
-            "memory/{name} is not on your memory allowlist for {slug} on this computer: it stays on this computer until you allow it ({})",
-            allow_memory_command(slug, name)
+            "memory/{name} is not on your memory allowlist for {slug} on this computer: it stays on this computer until you allow it. {}",
+            allowing(slug, name, "it")
         )
     })
+}
+
+/// Why `memory/{name}`, named for distill, has nothing to carry. A file the branch never got is told
+/// as such, with what keeps it on this computer when the privacy policy does: "already matches
+/// main, or never existed" leaves the person guessing which, and a file kept back by an empty
+/// allowlist reads as one that was never written.
+fn explain_not_pending(target: &Target, branch_tip: &str, name: &str) {
+    let branch = target.branch.as_str();
+    let on_branch = target
+        .primary
+        .git_opt(&["cat-file", "-e", &format!("{branch_tip}:{TREE_DIR}/{name}")])
+        .is_some();
+    if on_branch {
+        ui::error(&format!(
+            "memory/{name} on `{branch}` already matches main, or hasn't changed since `{branch}` left main: there is nothing to carry."
+        ));
+        return;
+    }
+    ui::error(&format!(
+        "memory/{name} isn't on `{branch}`: no turn collected it from the runtime's memory folder."
+    ));
+    let kept = crate::domain::privacy::PrivacyPolicy::load(&target.primary)
+        .ok()
+        .and_then(|privacy| not_distillable(&privacy, &target.slug, name, branch));
+    match kept {
+        Some(reason) => ui::hint(&reason),
+        None => ui::hint(&format!(
+            "`agit memory status --into {}` shows where it is",
+            shell_word(&format!("{}@{branch}", target.slug))
+        )),
+    }
 }
 
 /// A reminder of how many items on this branch are not distilled into main yet. It fails
@@ -2127,9 +2170,7 @@ fn distill_cmd(
     let pending = plan.items.clone();
     for p in paths.iter().chain(take_mine) {
         if !pending.iter().any(|item| item.name() == p) {
-            ui::error(&format!(
-                "memory/{p} is not a pending change on `{branch}` (already matches main, or never existed)."
-            ));
+            explain_not_pending(target, &plan.branch_tip, p);
             return Ok(ExitCode::Ref);
         }
     }
@@ -3233,7 +3274,9 @@ mod tests {
         let mut privacy = crate::domain::privacy::PrivacyPolicy::default();
         let refusal = not_distillable(&privacy, SLUG, "team notes.md", "s1").unwrap();
         assert!(
-            refusal.ends_with("(agit privacy policy allow-memory --repo me/qa -- 'team notes.md')"),
+            refusal.ends_with(
+                "`agit privacy policy allow-memory --repo me/qa -- 'team notes.md'` would let agit collect team notes.md; it is then saved to me/qa and uploaded with the branch."
+            ),
             "{refusal}"
         );
         privacy
