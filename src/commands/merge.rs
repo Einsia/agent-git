@@ -1168,6 +1168,16 @@ fn continue_tx(
         Some(v) => v,
         None => return Ok(ExitCode::Precondition),
     };
+    // What the person added at the start of a `main` this computer started on its own was
+    // confirmed when agit couldn't say who reads the repository, so this merge doesn't upload it
+    // by itself: the person's own push does.
+    let carried = if target_is_file_line {
+        file_reconciliation::started_here(&repo, &tx.target_head, src_head)?
+            .map(|started| started.carried)
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
     super::echo::emit(
         "merge",
         &[
@@ -1209,13 +1219,23 @@ fn continue_tx(
         &tx.target_head[..9.min(tx.target_head.len())],
         &src_head[..9.min(src_head.len())]
     ));
-    super::auto_push::after_settlement(
-        repo.root(),
-        &slug,
-        &tx.target,
-        Some(&tx.target_head),
-        false,
-    );
+    if carried.is_empty() {
+        super::auto_push::after_settlement(
+            repo.root(),
+            &slug,
+            &tx.target,
+            Some(&tx.target_head),
+            false,
+        );
+    } else {
+        println!(
+            "{}",
+            ui::dim(&format!(
+                "  `agit push {slug}@{}` publishes them.",
+                tx.target
+            ))
+        );
+    }
     if let Some(landed) = landed {
         println!("{}", ui::dim(&landed_line(landed)));
     }
@@ -1343,7 +1363,17 @@ fn merge_tree(
     }
     super::plumbing::ensure_v1_namespace_available_at(source_repo, src_head)?;
     super::plumbing::import_commit_graph(repo, source_repo, src_head)?;
-    let tree = match file_reconciliation::tree(repo, &tx.target_head, src_head, shared, resolved) {
+    let tree = match file_reconciliation::base_of(repo, &tx.target_head, src_head, &tx.base)
+        .and_then(|base| {
+            file_reconciliation::tree(
+                repo,
+                &tx.target_head,
+                src_head,
+                base.as_deref(),
+                shared,
+                resolved,
+            )
+        }) {
         Ok(tree) => tree,
         Err(error) => {
             ui::error(&format!(

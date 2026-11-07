@@ -312,6 +312,18 @@ pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this checkout's accepted publication record names `commit`, as a local commit it
+/// published or as a published one, on any branch. A checkout with no Hub identity has published
+/// nothing.
+pub fn ever_published(repo: &Repo, commit: &str) -> Result<bool> {
+    let Some(identity) = crate::hub::identity::read(repo)? else {
+        return Ok(false);
+    };
+    Ok(accepted::Ledger::open(repo, &identity)?
+        .every_accepted()
+        .any(|entry| entry.source == commit || entry.public == commit))
+}
+
 /// A checkout's accepted publication record, read once to answer for each of its branches. Read
 /// per branch instead, a repository with many published sessions costs a Hub identity lookup and a
 /// record read for every one of them.
