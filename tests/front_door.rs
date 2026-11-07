@@ -1111,6 +1111,50 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
 }
 
+/// A conversation already saved in another repository is said to be saved there, in a plain line,
+/// not reported as an upload that failed, and saving again isn't offered: it changes nothing. Shown
+/// as an error with a retry, it reads as agit broken, and the retry meets the same answer.
+#[test]
+fn a_conversation_saved_elsewhere_is_said_so_and_no_retry_is_offered() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    lab.turn_on(&dir, "me/notes");
+    let id = "17171717-1717-4171-8171-171717171717";
+    lab.conversation(&dir, id, "Plan the move");
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let mut claim = agit::domain::link::Link::new("claude-code", id, Some(&dir));
+    claim.owner = Some("other".into());
+    claim.agent = Some("place".into());
+    claim.branch = Some("work".into());
+    agit::domain::link::write(&store, &claim).unwrap();
+
+    let out = lab.agit(&dir, &["save", id]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(
+        stdout.contains(
+            "\"Plan the move\" is already saved in other/place@work, so it isn't uploaded here"
+        ),
+        "{stdout}{stderr}"
+    );
+    assert!(!stderr.contains("could not upload"), "{stderr}");
+    assert!(!stderr.contains("again to retry"), "{stderr}");
+
+    let out = lab.agit(&dir, &["--json", "save", id]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let value = &document["result"]["value"];
+    assert_eq!(value["sessions"][0]["status"], "elsewhere", "{document}");
+    assert_eq!(
+        value["sessions"][0]["saved_in"], "other/place@work",
+        "{document}"
+    );
+    assert!(value["next"].is_null(), "{document}");
+    assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
+
 /// `agit save` finds an OpenCode conversation in a folder that is on, though OpenCode tells agit
 /// nothing when a turn ends, and keeps the folder's earlier history out as it does for the other
 /// runtimes. The folder was bound without earlier history by a policy that never recorded OpenCode's

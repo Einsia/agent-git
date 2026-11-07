@@ -65,6 +65,11 @@ use std::path::Path;
 /// Private handoff from the strict RC commit entry point to its supervisor.
 /// The file is written only after a real transcript settlement has published
 /// its branch ref; a zero exit without this result is therefore a true no-op.
+/// The refusal of a settlement whose native transcript no longer continues the branch's
+/// settled content; `agit save` reads it to name the step that keeps both.
+pub(crate) const NOT_CONTINUED: &str =
+    "the native transcript does not continue this branch's settled content";
+
 pub(crate) const SUPERVISOR_RESULT_ENV: &str = "AGIT_RC_SUPERVISOR_COMMIT_RESULT";
 
 /// A private readiness marker; it proves frozen input, never successful publication.
@@ -2808,7 +2813,7 @@ fn settle_bytes(
         let Some(retained) =
             crate::domain::privacy::continuity::retain_prefix(&committed, &comparable, &text)?
         else {
-            ui::error("the native transcript does not continue this branch's settled content");
+            ui::error(NOT_CONTINUED);
             ui::hint(
                 "import the changed session onto a separate branch to preserve both histories",
             );
