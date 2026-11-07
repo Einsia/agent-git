@@ -257,6 +257,21 @@ pub fn runtime_sessions() -> Vec<RuntimeSession> {
 /// A candidate list omits every session that already has a link, so "the only unsaved session"
 /// is easily taken for the current one when the current one is already saved. This names the
 /// current conversation and its next command instead. `None` when the environment names none.
+/// The one line saying `target` (`owner/repo@branch`) isn't the conversation running in this
+/// terminal: only when exactly one is known here and it is saved somewhere else. Nothing is said
+/// when nothing is known.
+pub(crate) fn not_this_terminal(target: &str, sessions: &[RuntimeSession]) -> Option<String> {
+    let [one] = sessions else {
+        return None;
+    };
+    let saved = one.target.as_deref()?;
+    (saved != target).then(|| {
+        format!(
+            "{target} is not the conversation running in this terminal, which is saved at {saved}"
+        )
+    })
+}
+
 pub fn runtime_session_note(sessions: &[RuntimeSession]) -> Option<String> {
     use crate::ui::session::shell_arg;
     match sessions {
@@ -393,6 +408,38 @@ pub const NEED_INTERACTIVE: ExitCode = ExitCode::Interactive;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A target is named as not this terminal's conversation only when exactly one conversation
+    /// runs here and it is saved somewhere else; with none known, or several, nothing is said.
+    #[test]
+    fn only_a_known_other_conversation_is_named_as_not_this_terminal() {
+        let here = |target: Option<&str>| RuntimeSession {
+            variable: "CLAUDE_CODE_SESSION_ID",
+            runtime: "claude-code",
+            session_id: "s".into(),
+            managed: target.is_some(),
+            target: target.map(Into::into),
+            project: None,
+        };
+        let today = [here(Some("sim-priya/parley@today"))];
+        assert_eq!(
+            not_this_terminal("sim-priya/parley@yesterday", &today).as_deref(),
+            Some(
+                "sim-priya/parley@yesterday is not the conversation running in this terminal, which is saved at sim-priya/parley@today"
+            )
+        );
+        assert_eq!(not_this_terminal("sim-priya/parley@today", &today), None);
+        assert_eq!(not_this_terminal("sim-priya/parley@yesterday", &[]), None);
+        assert_eq!(
+            not_this_terminal("sim-priya/parley@yesterday", &[here(None)]),
+            None
+        );
+        let several = [here(Some("a/b@one")), here(Some("a/b@two"))];
+        assert_eq!(
+            not_this_terminal("sim-priya/parley@yesterday", &several),
+            None
+        );
+    }
 
     #[test]
     fn a_runtime_claim_only_vetoes_a_stale_environment_target() {

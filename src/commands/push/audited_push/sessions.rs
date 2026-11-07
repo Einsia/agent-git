@@ -671,9 +671,7 @@ pub(super) fn run(
             // alone leaves open whether the Hub has them.
             let held = on_the_hub(&part_branches);
             if left_out_tags.is_empty() {
-                ui::info(format_args!(
-                    "{repository}: already up to date; {held} on the Hub."
-                ));
+                super::super::report_nothing_new(&repo, slug, &repository, branches, &held);
             } else {
                 ui::info(format_args!(
                     "{repository}: {held} already on the Hub; nothing new to upload."
@@ -1243,7 +1241,7 @@ fn record_published_tags(repo: &Repo, projected: &ProjectedHistory) {
 }
 
 /// The branches a push found already on the Hub, with their verb: by name when they are few.
-fn on_the_hub(branches: &[String]) -> String {
+pub(in crate::commands::push) fn on_the_hub(branches: &[String]) -> String {
     match branches {
         [branch] => format!("{branch} is"),
         [_, _] | [_, _, _] => format!("{} are", branches.join(", ")),

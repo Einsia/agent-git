@@ -15,6 +15,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 mod sessions;
+pub(super) use sessions::on_the_hub;
 
 struct Destination {
     intent: Intent,

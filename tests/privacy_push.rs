@@ -4874,6 +4874,47 @@ fn a_milestone_and_tag_reach_the_hub_with_their_turn() {
         git(&remote, &["rev-parse", "refs/tags/ms-aside"])
     );
 
+    // Pushed again with nothing new, the branch is named as the session it is: its first turn and
+    // when its last turn was. The JSON a script reads carries none of the prompt's words.
+    let first = git(
+        repo.root(),
+        &[
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--format=%s",
+            "refs/heads/aside",
+            "--",
+            "LOG",
+        ],
+    )
+    .lines()
+    .find(|subject| !subject.starts_with("agit: "))
+    .unwrap()
+    .to_owned();
+    let again = run(&["--yes", "push", "alice/app@aside"]);
+    assert_success(&again);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(
+        said.contains(&format!(
+            "Nothing new to upload: aside is on the Hub as the session \"{first}\" (last turn today "
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("already up to date"), "{said}");
+    let scripted = run(&["--json", "--yes", "push", "alice/app@aside"]);
+    assert_success(&scripted);
+    let json = String::from_utf8_lossy(&scripted.stdout);
+    assert!(
+        json.contains("Nothing new to upload: aside is on the Hub (last turn today "),
+        "{json}"
+    );
+    assert!(!json.contains(&first), "{json}");
+
     // A settlement that lands no turn because the privacy check cannot run says the milestone
     // was not recorded rather than losing it, and the same command lands it once the check runs.
     // A plain file where the privacy directory belongs keeps the worker from processing anything.
