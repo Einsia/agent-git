@@ -3321,7 +3321,7 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
     let runtime = bin.join("codex");
     fs::write(
         &runtime,
-        "#!/bin/sh\nprintf '%s\\0' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"$@\" > \"$AGIT_TEST_MERGE_LAUNCH\"\nprintf '%s' \"$AGIT_MERGE_GENERATION\" > \"$AGIT_TEST_MERGE_LAUNCH.generation\"\n",
+        "#!/bin/sh\nprintf '%s\\0' \"$AGIT_SESSION\" \"$AGIT_MERGE_TX\" \"yes=${AGIT_YES-}\" \"$@\" > \"$AGIT_TEST_MERGE_LAUNCH\"\nprintf '%s' \"$AGIT_MERGE_GENERATION\" > \"$AGIT_TEST_MERGE_LAUNCH.generation\"\n",
     )
     .unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3394,9 +3394,10 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
         .filter(|part| !part.is_empty())
         .map(|part| std::str::from_utf8(part).unwrap())
         .collect();
+    // The merge agent's tools run in this process: `AGIT_YES` from the merge command stays out.
     assert_eq!(
-        &arguments[..3],
-        &["einsia/qa@work", "einsia/qa@work", "resume"]
+        &arguments[..4],
+        &["einsia/qa@work", "einsia/qa@work", "yes=", "resume"]
     );
     assert!(arguments.last().unwrap().contains("as the merge agent"));
     assert!(arguments.last().unwrap().contains(&source));
@@ -3437,7 +3438,7 @@ fn interactive_merge_launches_for_diverged_tracking_after_settlement() {
         successor.link.materialized_from.as_deref(),
         Some(tx.target_head.as_str())
     );
-    assert_eq!(arguments[3], binding.native.session_id);
+    assert_eq!(arguments[4], binding.native.session_id);
     let installed = resume_json_snapshot(&lab.home.join(".codex/sessions"));
     let transcript = installed
         .iter()

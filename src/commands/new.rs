@@ -416,10 +416,7 @@ pub fn run(args: Args) -> CmdResult {
         }
         return Ok(ExitCode::Ok);
     }
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .status()?;
+    let status = super::resume::runtime_launch(&cmd).status()?;
     Ok(match status.code() {
         Some(0) | None => ExitCode::Ok,
         Some(_) => ExitCode::Precondition,

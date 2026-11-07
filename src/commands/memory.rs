@@ -863,8 +863,9 @@ pub fn codex_instructions(
     }
     Ok(Some(format!(
         "Team memory for {slug}@{branch}: copies of the shared memory files are in {}. \
-         Read the ones that bear on the task before relying on what they say; changes made there \
-         are not kept.\n{}",
+         Each line below names a file and its first heading, not what the file says: read the \
+         ones that bear on the task before answering from them; changes made there are not \
+         kept.\n{}",
         folder.display(),
         index.join("\n")
     )))
