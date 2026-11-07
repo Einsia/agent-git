@@ -93,6 +93,9 @@ struct Hub {
     /// The next repository creation finds the name taken: the repository appears, as one made
     /// by someone else between the push's lookup and its creation, and the Hub answers 409.
     taken_on_create: Arc<AtomicBool>,
+    /// The next receive is applied, but its answer is lost: the client gets a 502, as when a
+    /// proxy gives up on a push the Hub went on to take.
+    lose_receive_answer: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -165,6 +168,8 @@ impl Hub {
         let refusing_with = Arc::clone(&refuse_with);
         let taken_on_create = Arc::new(AtomicBool::new(false));
         let taking = Arc::clone(&taken_on_create);
+        let lose_receive_answer = Arc::new(AtomicBool::new(false));
+        let losing_answer = Arc::clone(&lose_receive_answer);
         let publicize_when = Arc::new(Mutex::new(None::<String>));
         let publicizing = Arc::clone(&publicize_when);
         let resolver_hub = base.clone();
@@ -711,6 +716,16 @@ impl Hub {
                     let header = std::str::from_utf8(&response.stdout[..split]).unwrap();
                     assert!(!header.contains("Status:"), "{header}");
                     let body = &response.stdout[split + 4..];
+                    if method == "POST"
+                        && target.ends_with("/git-receive-pack")
+                        && losing_answer.swap(false, Ordering::AcqRel)
+                    {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
                     // Access probes may close after the response headers.
                     let _ = write!(
                         stream,
@@ -751,6 +766,7 @@ impl Hub {
             write_on_refusal,
             refuse_with,
             taken_on_create,
+            lose_receive_answer,
             stop,
             worker: Some(worker),
         }
@@ -9419,4 +9435,136 @@ fn a_repository_that_appears_before_its_creation_is_asked_about_again() {
         git(&remote, &["rev-parse", "refs/heads/main"]),
         git(repo.root(), &["rev-parse", "HEAD"])
     );
+}
+
+/// A push whose answer was lost, as when a proxy answers 502 for a push the Hub went on to take,
+/// leaves the person not knowing whether the Hub has it. Its retry finds nothing to send and says
+/// that the branch is on the Hub, also when a local tag it leaves out means there is still
+/// something the Hub lacks: "nothing new to upload" alone left open whether the failed push had
+/// reached it.
+#[test]
+fn a_retry_after_a_lost_answer_says_the_branch_is_on_the_hub() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let said = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "tag.gpgsign", "false"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"hello"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn 1").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    fs::write(repo.root().join("README.md"), "Shared file, merged").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Take main's decisions").unwrap();
+    let merged = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+    hub.lose_receive_answer.store(true, Ordering::Release);
+    let failed = run(&["--yes", "push", "alice/app@main"]);
+    assert!(!failed.status.success(), "{failed:?}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), merged);
+
+    let refs = || {
+        git(
+            &remote,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
+    };
+    let before = refs();
+    let retried = run(&["--yes", "push", "alice/app@main"]);
+    assert_success(&retried);
+    assert!(
+        said(&retried).contains("alice/app: already up to date; main is on the Hub."),
+        "{retried:?}"
+    );
+    assert_eq!(refs(), before);
+
+    // A tag the push leaves out still keeps the repository from being up to date, and the branch
+    // is named as on the Hub all the same.
+    assert_success(&run(&["tag", "ms-talk", "alice/app@talk"]));
+    let tagged = run(&["--yes", "push", "alice/app@main"]);
+    assert_success(&tagged);
+    let tagged = said(&tagged);
+    assert!(
+        tagged.contains("alice/app: main is already on the Hub; nothing new to upload.")
+            && tagged.contains("tag ms-talk is not uploaded"),
+        "{tagged}"
+    );
+    assert!(!tagged.contains("already up to date"), "{tagged}");
+    assert_eq!(refs(), before);
 }
