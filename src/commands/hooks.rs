@@ -1230,6 +1230,22 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     let failure = (!await_reply && rt == "claude-code")
         .then(|| failure_line(rt, &ev.session_id))
         .flatten();
+    // Its settlement may go on detached, so a turn that can't be saved for want of a sign-in is
+    // told now, beside any upload failure, in the same message.
+    let signed_out = (!await_reply && matches!(rt, "claude-code" | "workbuddy"))
+        .then(|| {
+            Store::open()
+                .ok()
+                .flatten()
+                .and_then(|store| link::get(&store, rt, &ev.session_id))
+                .and_then(|lk| super::commit::signed_out(&lk))
+                .map(|line| format!("agit: {line}"))
+        })
+        .flatten();
+    let failure = match (failure, signed_out) {
+        (Some(failure), Some(line)) => Some(format!("{failure}\n{line}")),
+        (failure, line) => failure.or(line),
+    };
     // A Codex turn settles here, as the turn ends: whatever keeps it from being saved is told to
     // the person now, in the turn it concerns, beside the one-time line about a branch an older
     // agit linked it to.
@@ -1359,7 +1375,8 @@ fn settle_event(
         return Ok(());
     };
     // A save refused by its rules comes back as an exit status, after saying why. An archive
-    // settlement answers for itself, as the hook exits.
+    // settlement answers for itself, as the hook exits. What a refusal says goes into the turn's
+    // message, so no settlement error names a record's text or a value protection matched.
     let archive = lk.merge_archive.is_some();
     let (code, said) = crate::ui::recording_errors(|| super::commit::settle_from_link(&store, lk));
     if code? != crate::ExitCode::Ok && !archive {
