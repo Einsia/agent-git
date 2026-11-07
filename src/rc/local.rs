@@ -47,6 +47,7 @@ pub struct Args {
     #[command(subcommand)]
     action: Action,
 }
+
 #[derive(Subcommand)]
 enum Action {
     /// Read Hub catalog data using this device's existing Agit credentials.
@@ -196,7 +197,37 @@ fn rpc_path() -> crate::Result<PathBuf> {
     Ok(super::control::socket_path()?.with_extension("rpc"))
 }
 
+/// Runs the local daemon in this process. The daemon outlives the command that starts it, and every
+/// RC runtime it starts runs the agent's tools in its environment, for other people's turns too, so
+/// it keeps none of one command's flags (`AGIT_YES`, `AGIT_QUIET`, `AGIT_TUI`): [`spawn_daemon`]
+/// starts it without them, and a command that would become the daemon while holding them
+/// (`agit -y rc start`, `agit -y rc local start`) leaves them behind here first.
 pub fn start_foreground() -> crate::Result<()> {
+    let invocation = crate::commands::resume::INVOCATION_ONLY;
+    if invocation
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        // Changing this process's environment is unsound once it runs other threads, which the
+        // command that got here may have. Unix replaces the process with the daemon itself, started
+        // without them, as `spawn_daemon` starts it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            let mut daemon = std::process::Command::new(std::env::current_exe()?);
+            daemon.args(["rc", "local", "start"]);
+            for name in invocation {
+                daemon.env_remove(name);
+            }
+            // `exec` returns only when it could not replace the process.
+            return Err(anyhow::Error::new(daemon.exec()).context("the daemon could not start"));
+        }
+        #[cfg(windows)]
+        for name in invocation {
+            // SAFETY: Windows serializes every access to a process's environment block.
+            unsafe { std::env::remove_var(name) };
+        }
+    }
     let _guard = super::daemon_guard::install();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -251,6 +282,10 @@ pub(super) fn spawn_daemon() -> crate::Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        // The daemon outlives this command and keeps none of its flags; see `start_foreground`.
+        for name in crate::commands::resume::INVOCATION_ONLY {
+            command.env_remove(name);
+        }
         // Detachment is process ownership, not a promise made by the SSH channel.
         #[cfg(unix)]
         unsafe {

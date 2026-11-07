@@ -153,12 +153,13 @@ async fn wait_ready() -> crate::Result<NamedPipeClient> {
 /// The daemon must not retain the launcher's inheritable SSH pipe handles.
 pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
     use std::mem::{size_of, size_of_val};
+    use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     use windows_sys::Win32::System::Threading::{
-        CREATE_BREAKAWAY_FROM_JOB, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-        STARTUPINFOEXW, UpdateProcThreadAttribute,
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
     };
     let duplicate = |file: &std::fs::File| -> io::Result<security::Handle> {
         let mut handle = std::ptr::null_mut();
@@ -241,6 +242,28 @@ pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
     arguments.push(&executable);
     arguments.push("\" rc local start");
     let mut command_line = security::wide(arguments)?;
+    // The daemon outlives this command and keeps none of its flags; see `start_foreground`.
+    // The block is this process's environment without them, sorted by name as Windows requires.
+    let mut variables: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| {
+            !crate::commands::resume::INVOCATION_ONLY
+                .iter()
+                .any(|flag| name.eq_ignore_ascii_case(flag))
+        })
+        .collect();
+    variables.sort_by_key(|(name, _)| name.to_string_lossy().to_uppercase());
+    let mut environment: Vec<u16> = Vec::new();
+    for (name, value) in &variables {
+        environment.extend(name.encode_wide());
+        environment.push(u16::from(b'='));
+        environment.extend(value.encode_wide());
+        environment.push(0);
+    }
+    // A block ends with an empty string: two NULs even when it holds no variable.
+    if variables.is_empty() {
+        environment.push(0);
+    }
+    environment.push(0);
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -257,8 +280,11 @@ pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            DETACHED_PROCESS | breakaway | EXTENDED_STARTUPINFO_PRESENT,
-            std::ptr::null(),
+            DETACHED_PROCESS
+                | breakaway
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
             std::ptr::null(),
             &startup.StartupInfo,
             &mut process,
