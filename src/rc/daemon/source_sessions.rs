@@ -275,6 +275,7 @@ impl Daemon {
             dangerous: false,
             permission_mode: mode,
             attach_only: p.attach_only,
+            project_share: false,
         };
         context.validate().map_err(unavailable)?;
         let spawn = self.prepare_spawn(

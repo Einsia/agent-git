@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         dangerous: false,
         permission_mode,
         attach_only: false,
+        project_share: false,
     };
 
     let (ftx, mut frx) = mpsc::channel::<Frame>(4096);

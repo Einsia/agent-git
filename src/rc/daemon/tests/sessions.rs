@@ -50,6 +50,7 @@ fn watch_danger_uses_the_logical_roster_identity_and_workspace() {
                 guard_attempts: Default::default(),
                 prior_threads: vec![],
                 ever_dangerous: true,
+                project_share: false,
             },
         )
         .unwrap();
@@ -102,6 +103,7 @@ fn an_unaccounted_dangerous_start_locks_unknown_threads_to_the_owner() {
             guard_attempts: Default::default(),
             prior_threads: vec![],
             ever_dangerous: true,
+            project_share: false,
         }
     }
     let mut roster = crate::rc::roster::Roster::default();
@@ -993,6 +995,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                     dangerous: true,
                     permission_mode: Some(crate::protocol::PermissionMode::Bypass),
                     attach_only: false,
+                    project_share: false,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -1084,6 +1087,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     attach_only: false,
+                    project_share: false,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -1155,6 +1159,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     attach_only: false,
+                    project_share: false,
                 };
                 let watched = danger::judge(
                     &state.roster,
@@ -1304,6 +1309,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
                 prompt: Some("inspect".into()),
                 by: Some("old display name".into()),
                 permission_mode: crate::protocol::PermissionMode::Default,
+                project_share: false,
             },
             state: roster::StartState::Completed {
                 result: expected.clone(),
@@ -1329,6 +1335,7 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
                 prompt: Some("inspect".into()),
                 by: Some("renamed display name".into()),
                 permission_mode: Some(crate::protocol::PermissionMode::Default),
+                origin: None,
             },
             &claim("owner", "ws-a"),
             &frames,
@@ -1384,6 +1391,7 @@ fn a_prewrite_failure_before_launch_releases_the_start_reservation() {
                             prompt: None,
                             by: None,
                             permission_mode: Some(crate::protocol::PermissionMode::Bypass),
+                            origin: None,
                         },
                         &claim("owner", "ws-a"),
                         &frames,
@@ -1491,6 +1499,7 @@ fn a_missing_harness_binary_releases_the_start_reservation_for_a_retry() {
                     prompt: None,
                     by: None,
                     permission_mode: Some(crate::protocol::PermissionMode::Plan),
+                    origin: None,
                 };
 
                 // An executable that certainly does not exist on this machine.
@@ -1614,6 +1623,7 @@ fn a_harness_binary_without_an_execute_bit_releases_the_start_reservation_for_a_
                     prompt: None,
                     by: None,
                     permission_mode: Some(crate::protocol::PermissionMode::Plan),
+                    origin: None,
                 };
 
                 // The contents are a perfectly normal harness stand-in; only the execute bit
@@ -1793,6 +1803,7 @@ fn a_launch_that_crossed_os_spawn_keeps_the_start_pending_for_inspection() {
                     prompt: None,
                     by: None,
                     permission_mode: Some(crate::protocol::PermissionMode::Plan),
+                    origin: None,
                 };
 
                 // A properly installed harness: spawn always succeeds. The failure happens in
@@ -3096,6 +3107,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         dangerous: false,
         permission_mode: Some(crate::protocol::PermissionMode::Plan),
         attach_only: false,
+        project_share: false,
     };
     let (frames, _frames_rx) = mpsc::channel(4);
 
@@ -3667,6 +3679,7 @@ async fn subscribing_to_a_dormant_conversation_asks_for_resume_without_leaking_o
                     guard_attempts: Default::default(),
                     prior_threads: vec![],
                     ever_dangerous: false,
+                    project_share: false,
                 },
             )
             .unwrap();
@@ -3993,6 +4006,7 @@ async fn a_non_owners_opening_prompt_into_codex_launches_nothing() {
                 prompt: Some("inspect".into()),
                 by: None,
                 permission_mode: Some(crate::protocol::PermissionMode::Plan),
+                origin: None,
             },
             &claim("operator", "ws-a"),
             &frames,
@@ -4202,4 +4216,239 @@ async fn a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn() 
         unconfined
     );
     assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
+}
+
+/// A shared project's start (`origin = "project_share"`) launches only a group member's Claude Code
+/// session, marked as a share: an origin this device doesn't know is refused `origin_unknown`, the
+/// owner's start `share_owner`, and one in another runtime `share_runtime_unsupported`, each before
+/// anything is reserved or launched. A start without an origin is no share.
+#[test]
+fn a_shared_project_starts_only_a_group_members_claude_code_session() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path().canonicalize().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let start = |runtime: &str, origin: Option<&str>| SessionStart {
+                    model: None,
+                    start_id: None,
+                    workspace_id: "ws-a".into(),
+                    project_id: "project-a".into(),
+                    runtime: runtime.into(),
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                    prompt: None,
+                    by: None,
+                    permission_mode: Some(crate::protocol::PermissionMode::Default),
+                    origin: origin.map(Into::into),
+                };
+                let outcome =
+                    |state: &mut Daemon, runtime: &str, origin: Option<&str>, role: &str| {
+                        match state.prepare_start_session(
+                            start(runtime, origin),
+                            &claim(role, "ws-a"),
+                            &frames,
+                            &Default::default(),
+                        ) {
+                            Ok(SessionOpening::Launch(spawn, _)) => Ok(spawn.spec.project_share),
+                            Ok(SessionOpening::Ready(_)) => panic!("nothing to replay"),
+                            Err(error) => {
+                                assert_eq!(error.code, ErrorCode::Forbidden as i32);
+                                let data = error.data.unwrap();
+                                assert_eq!(data["outcome"], "not_sent");
+                                Err(data["reason"].as_str().unwrap().to_owned())
+                            }
+                        }
+                    };
+                let share = Some(crate::rc::project_share::ORIGIN);
+
+                assert_eq!(
+                    outcome(&mut state, "claude-code", Some("group_chat"), "operator"),
+                    Err("origin_unknown".into())
+                );
+                assert_eq!(
+                    outcome(&mut state, "claude-code", share, "owner"),
+                    Err("share_owner".into())
+                );
+                assert_eq!(
+                    outcome(&mut state, "codex", share, "operator"),
+                    Err("share_runtime_unsupported".into())
+                );
+                assert_eq!(
+                    outcome(&mut state, "opencode", share, "operator"),
+                    Err("share_runtime_unsupported".into())
+                );
+                assert!(state.opening_sessions.is_empty(), "nothing reserved");
+                assert!(state.sessions.is_empty(), "nothing launched");
+
+                assert_eq!(
+                    outcome(&mut state, "claude-code", share, "operator"),
+                    Ok(true)
+                );
+                assert_eq!(
+                    outcome(&mut state, "claude-code", None, "operator"),
+                    Ok(false)
+                );
+                assert_eq!(outcome(&mut state, "claude-code", None, "owner"), Ok(false));
+            });
+    });
+}
+
+/// A conversation recorded as a shared project opens as one again when it is brought back: a resume
+/// of its logical id and a takeover of its native thread both launch it marked as a share, read
+/// from its roster row; a row without the mark launches none.
+#[test]
+fn a_shared_project_stays_shared_when_resumed_or_taken_over() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path().canonicalize().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for shared in [true, false] {
+                    let roster: Roster = serde_json::from_value(serde_json::json!({
+                        "sessions":{"logical":{"runtime":"claude-code", "thread_id":"native-cc",
+                            "cwd":cwd, "workspace_id":"ws-a", "project_share":shared}}
+                    }))
+                    .unwrap();
+                    let daemon = rpc_test_daemon(HashMap::new(), roster);
+                    let mut state = daemon.lock().await;
+                    state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+                    let (frames, _frames_rx) = mpsc::channel(1);
+                    let resume_of = |session: &str| SessionResume {
+                        project_id: None,
+                        workspace_id: "ws-a".into(),
+                        session_id: session.into(),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: false,
+                    };
+                    let marked = |opening: Result<SessionOpening, RpcError>| match opening {
+                        Ok(SessionOpening::Launch(spawn, _)) => spawn.spec.project_share,
+                        Ok(SessionOpening::Ready(_)) => panic!("nothing to replay"),
+                        Err(error) => panic!("{error:?}"),
+                    };
+
+                    let resumed = state.prepare_resume_session(
+                        resume_of("logical"),
+                        &claim("owner", "ws-a"),
+                        &frames,
+                        &Default::default(),
+                    );
+                    assert_eq!(marked(resumed), shared, "resume");
+                    // The resume reserved this conversation's launch; the takeover is asked apart.
+                    state.opening_sessions.clear();
+
+                    let taken_over = state.prepare_local_takeover(
+                        LocatedLocal {
+                            title: None,
+                            gist: None,
+                            labels_withheld: None,
+                            runtime: "claude-code".into(),
+                            cwd: cwd.clone(),
+                            project_id: Some("project-a".into()),
+                            likely_active: false,
+                        },
+                        resume_of("native-cc"),
+                        &claim("owner", "ws-a"),
+                        &frames,
+                    );
+                    assert_eq!(marked(taken_over), shared, "takeover");
+                }
+            });
+    });
+}
+
+/// A start key is one launch: retried with the share origin added or dropped, it is refused as a
+/// conflicting start, never answered with the session the other kind of start made; retried as it
+/// was, it replays. A record from before shares reads as an ordinary start.
+#[tokio::test]
+async fn a_start_key_retried_with_another_origin_conflicts() {
+    let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3181";
+    for recorded in [false, true] {
+        let mut roster = Roster::default();
+        roster.starts.insert(
+            start_id.into(),
+            roster::StartIntent {
+                spec: roster::StartSpec {
+                    model: None,
+                    workspace_id: "ws-a".into(),
+                    project_id: "project-a".into(),
+                    runtime: "claude-code".into(),
+                    cwd: "/already-resolved".into(),
+                    agit_session: None,
+                    expected_agent_id: None,
+                    prompt: Some("inspect".into()),
+                    by: None,
+                    permission_mode: crate::protocol::PermissionMode::Default,
+                    project_share: recorded,
+                },
+                state: roster::StartState::Completed {
+                    result: SessionStartResult {
+                        start_id: Some(start_id.into()),
+                        session: serde_json::from_value(serde_json::json!({
+                            "session_id":"agit-earlier","workspace_id":"ws-a",
+                            "runtime":"claude-code","status":"idle","last_seq":0,
+                            "dangerous":false,"created_at":"now","updated_at":"now"
+                        }))
+                        .unwrap(),
+                    },
+                },
+            },
+        );
+        let daemon = rpc_test_daemon(HashMap::new(), roster);
+        let mut state = daemon.lock().await;
+        set_connection_features(&state.settlement, 1, false, true);
+        let (frames, _frames_rx) = mpsc::channel(1);
+        for retried in [false, true] {
+            let outcome = state.prepare_start_session(
+                SessionStart {
+                    model: None,
+                    start_id: Some(start_id.into()),
+                    workspace_id: "ws-a".into(),
+                    project_id: "project-a".into(),
+                    runtime: "claude-code".into(),
+                    agent: None,
+                    expected_agent_id: None,
+                    branch: None,
+                    prompt: Some("inspect".into()),
+                    by: None,
+                    permission_mode: Some(crate::protocol::PermissionMode::Default),
+                    origin: retried.then(|| crate::rc::project_share::ORIGIN.into()),
+                },
+                &claim("operator", "ws-a"),
+                &frames,
+                &Default::default(),
+            );
+            match outcome {
+                Ok(SessionOpening::Ready(_)) => {
+                    assert_eq!(retried, recorded, "a retry with another origin replayed")
+                }
+                Ok(SessionOpening::Launch(..)) => panic!("a recorded start launched again"),
+                Err(error) => {
+                    assert_ne!(retried, recorded, "{error:?}");
+                    assert_eq!(error.code, ErrorCode::MalformedFrame as i32, "{error:?}");
+                }
+            }
+        }
+    }
+    let older: roster::StartSpec = serde_json::from_value(serde_json::json!({
+        "workspace_id":"ws-a","project_id":"project-a","runtime":"claude-code",
+        "cwd":"/x","permission_mode":"default"
+    }))
+    .unwrap();
+    assert!(!older.project_share);
 }

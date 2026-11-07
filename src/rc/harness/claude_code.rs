@@ -1991,6 +1991,7 @@ mod tests {
             dangerous: false,
             permission_mode: None,
             attach_only: false,
+            project_share: false,
         };
         let env = session_env(&spec);
         let args = argv(&spec, "sid", false);
@@ -2238,6 +2239,7 @@ mod tests {
             dangerous: false,
             permission_mode: None,
             attach_only: false,
+            project_share: false,
         };
         let args = argv(&spec, "sid", spec.resume_from.is_some());
         assert!(
@@ -2266,6 +2268,7 @@ mod tests {
             dangerous: true,
             permission_mode: None,
             attach_only: false,
+            project_share: false,
         };
         let mut fresh = spec(None);
         let refused = admit_mode(&mut fresh, true).err().unwrap();
@@ -2309,6 +2312,7 @@ mod tests {
             dangerous: false,
             permission_mode: None,
             attach_only: false,
+            project_share: false,
         };
         assert!(
             !reopen(&spec).unwrap(),
@@ -3481,6 +3485,7 @@ for line in sys.stdin:
             dangerous,
             permission_mode,
             attach_only: false,
+            project_share: false,
         };
         assert_eq!(spec(true, None).effective_mode(), PermissionMode::Bypass);
         assert_eq!(

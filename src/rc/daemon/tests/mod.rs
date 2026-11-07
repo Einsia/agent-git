@@ -126,6 +126,7 @@ pub(super) fn rpc_test_roster_entry(
         guard_attempts: Default::default(),
         prior_threads: vec![],
         ever_dangerous: false,
+        project_share: false,
     }
 }
 

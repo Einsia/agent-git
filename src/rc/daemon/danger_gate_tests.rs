@@ -283,6 +283,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                         guard_attempts: Default::default(),
                         prior_threads: vec![],
                         ever_dangerous: false,
+                        project_share: false,
                     },
                 );
                 let live = Live {
@@ -653,6 +654,7 @@ fn an_attached_terminal_stays_owner_only_to_drive() {
                     dangerous: false,
                     permission_mode: None,
                     attach_only: false,
+                    project_share: false,
                 },
             )
             .map_err(|error| format!("{error:?}"))

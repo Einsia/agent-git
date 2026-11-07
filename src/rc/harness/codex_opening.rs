@@ -438,6 +438,7 @@ mod tests {
                 dangerous: true,
                 permission_mode: Some(PermissionMode::Bypass),
                 attach_only: false,
+                project_share: false,
             },
             &source,
         )
@@ -517,6 +518,7 @@ mod tests {
             dangerous: false,
             permission_mode: Some(PermissionMode::Plan),
             attach_only: false,
+            project_share: false,
         };
         let mut first = CodexDriver::launch_shared(spec.clone(), &source)
             .await

@@ -535,6 +535,10 @@ pub struct SessionStart {
     /// Permission mode to launch under. Omitted = [`PermissionMode::Default`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// Where the session comes from, set only by the Hub: `project_share` for a project the owner
+    /// shared with a group (`rc::project_share`). Any other value is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

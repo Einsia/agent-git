@@ -463,6 +463,7 @@ impl Daemon {
                         permission_mode,
                         guard_attempts,
                         ever_dangerous: info.dangerous,
+                        project_share: false,
                         // `record` carries the prior row's old thread id over.
                         prior_threads: vec![],
                     },
@@ -923,6 +924,7 @@ mod bound_lineage_tests {
             guard_attempts: Default::default(),
             prior_threads: vec![],
             ever_dangerous: false,
+            project_share: false,
         }
     }
 

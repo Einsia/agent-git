@@ -1400,6 +1400,7 @@ fn a_legacy_roster_lineage_never_adopts_the_current_slug_identity() {
         guard_attempts: Default::default(),
         prior_threads: vec![],
         ever_dangerous: false,
+        project_share: false,
     };
     assert_eq!(
         resume_lineage(

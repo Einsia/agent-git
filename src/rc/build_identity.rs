@@ -51,6 +51,10 @@ pub const RPC_FEATURES: &[&str] = &[
     // with no folder only inside a project an RC workspace binds. Queued turns are judged again
     // before they are saved, and every automatic push is held to the same rule.
     "observed-capture-consent-v1",
+    // session.start takes origin project_share: a project the owner shared with a group, started
+    // only in Claude Code and never for the owner, and recorded as such through resume and
+    // takeover. Any other origin is refused (`rc::project_share`).
+    "project-share-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
