@@ -1336,10 +1336,23 @@ fn archive_role_loss_cannot_be_hidden_by_quiet_signed_out_hooks() {
             output.status.success(),
             "ordinary signed-out {entry}: {output:?}"
         );
-        assert!(
-            output.stdout.is_empty() && output.stderr.is_empty(),
-            "{output:?}"
-        );
+        // The Codex turn's end says it isn't saved and how to sign in, and nothing of the branch
+        // or of an archive role. The older `agit commit --from-hook` entry answers to no one and
+        // stays quiet.
+        if entry == "installed" {
+            let said: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|error| panic!("{entry}: {error}: {output:?}"));
+            assert_eq!(
+                said["systemMessage"],
+                serde_json::json!(
+                    "agit: this turn isn't saved: this computer isn't signed in to agit. `agit login` signs in."
+                ),
+                "{output:?}"
+            );
+        } else {
+            assert!(output.stdout.is_empty(), "{output:?}");
+        }
+        assert!(output.stderr.is_empty(), "{output:?}");
         assert_eq!(lab.facts(), before);
     }
     private_write(&path, b"{unreadable native metadata");

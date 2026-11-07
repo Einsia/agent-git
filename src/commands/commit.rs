@@ -684,6 +684,21 @@ fn within_folder(path: &std::path::Path, folder: &std::path::Path) -> bool {
     canonical(path).starts_with(canonical(folder))
 }
 
+/// Why a conversation that holds a branch isn't saved while this computer isn't signed in. It
+/// names nothing of the branch, its repository or an archive role.
+pub(crate) const SIGNED_OUT: &str =
+    "this turn isn't saved: this computer isn't signed in to agit. `agit login` signs in.";
+
+/// [`SIGNED_OUT`] for the conversation `lk` links, when it holds a branch outside an archive role
+/// and this computer has no account to record it under.
+pub(crate) fn signed_out(lk: &Link) -> Option<&'static str> {
+    (lk.agent.is_some()
+        && lk.branch.is_some()
+        && lk.merge_archive.is_none()
+        && matches!(owner_for_recording(true), Ok(None)))
+    .then_some(SIGNED_OUT)
+}
+
 pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     if let Some(code) = delegated_settlement(true)? {
         return Ok(code);
@@ -702,6 +717,9 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
         if lk.merge_archive.is_some() {
             return archive::checked(Err(anyhow::anyhow!("archive settlement requires sign-in")));
         }
+        // A conversation holding a branch isn't saved without an account to record it under, and
+        // a Codex turn's end says so; it names nothing of the branch.
+        anyhow::ensure!(lk.agent.is_none() || lk.branch.is_none(), SIGNED_OUT);
         return Ok(ExitCode::Ok);
     };
     if let Some(code) = archive::settle(store, &lk)? {

@@ -1982,3 +1982,54 @@ fn codex_links_an_older_agit_made_hold_their_branch_until_confirmed() {
     confirm("fresh", K);
     assert!(!held("fresh"));
 }
+
+/// A Claude Code turn that ends while this computer isn't signed in to agit says, to the person
+/// and as its stop goes on, that it isn't saved: the hook exits 0 with the line as its message,
+/// and blocks nothing, so nothing reaches the model and the turn doesn't go on.
+#[test]
+fn a_signed_out_claude_code_turn_says_it_isnt_saved() {
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "A turn 1", "A answer 1"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    lab.append(A, &lab.turn(A, 2, "A turn 2", "A answer 2"));
+    fs::remove_dir_all(lab.agit_home.join("credentials")).unwrap();
+    let mut child = lab
+        .agit(&["hooks", "settle"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({"session_id":A,"transcript_path":lab.transcript(A),
+                "hook_event_name":"Stop","cwd":lab.work})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let said: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|error| panic!("{error}: {out:?}"));
+    assert_eq!(
+        said["systemMessage"],
+        serde_json::json!(
+            "agit: this turn isn't saved: this computer isn't signed in to agit. `agit login` signs in."
+        ),
+        "{out:?}"
+    );
+    assert!(said.get("decision").is_none(), "{said}");
+}
