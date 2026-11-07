@@ -652,12 +652,9 @@ impl OpenCodeEngine {
                 Some(source) => source,
                 None => OpenCode.lookup_native_readonly(&id, Limits::default())?,
             };
-            crate::adapter::opencode::validate_rc_session(&source.path, &id, &cwd)?;
             Ok::<_, anyhow::Error>((
                 source.clone(),
-                OpenCode
-                    .snapshot_native_readonly(&source, Limits::default())?
-                    .bytes,
+                crate::adapter::opencode::read_authorized(&source, Limits::default(), &cwd)?.bytes,
             ))
         })
         .await??;

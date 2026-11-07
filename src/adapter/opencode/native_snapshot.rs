@@ -5,7 +5,9 @@ use super::super::native_snapshot::{
     self as native, Budget, Limits, Result, Snapshot, Source, Unavailable,
 };
 use super::CanonicalRecord;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rusqlite::{Connection, OpenFlags, Row};
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 
@@ -29,20 +31,12 @@ pub(super) fn lookup(database: &Path, id: &str, limits: Limits) -> Result<Source
     if limits.lookup_entries == 0 {
         return Err(Unavailable::BudgetExceeded);
     }
-    let connection = open(database)?;
-    let mut statement = connection
-        .prepare("SELECT id FROM session WHERE id = ?1")
+    let mut connection = open(database)?;
+    let transaction = connection
+        .transaction()
         .map_err(|_| Unavailable::Database)?;
-    let mut rows = statement.query([id]).map_err(|_| Unavailable::Database)?;
-    let Some(row) = rows.next().map_err(|_| Unavailable::Database)? else {
-        return Err(Unavailable::NotFound);
-    };
-    if text(row, 0)? != id {
-        return Err(Unavailable::Database);
-    }
-    if rows.next().map_err(|_| Unavailable::Database)?.is_some() {
-        return Err(Unavailable::Ambiguous);
-    }
+    super::Layout::detect(&transaction)?.route(&transaction, id)?;
+    transaction.commit().map_err(|_| Unavailable::Database)?;
     Ok(Source {
         runtime: "opencode",
         session_id: id.to_owned(),
@@ -63,6 +57,24 @@ pub(super) fn read(source: &Source, limits: Limits) -> Result<Snapshot> {
     let bytes = materialize(&transaction, &source.session_id, limits)?;
     transaction.commit().map_err(|_| Unavailable::Database)?;
     native::finish(source.clone(), bytes, limits)
+}
+
+#[cfg(feature = "rc")]
+pub(crate) fn read_authorized(
+    source: &Source,
+    limits: Limits,
+    cwd: &Path,
+) -> crate::Result<Snapshot> {
+    if source.runtime != "opencode" || !source.database {
+        return Err(Unavailable::Unsupported.into());
+    }
+    native::validate_id(&source.session_id, limits)?;
+    let mut connection = open(&source.path)?;
+    let transaction = connection.transaction()?;
+    super::validate_rc_connection(&transaction, &source.session_id, cwd)?;
+    let bytes = materialize(&transaction, &source.session_id, limits)?;
+    transaction.commit()?;
+    Ok(native::finish(source.clone(), bytes, limits)?)
 }
 
 fn text<'a>(row: &'a Row<'_>, column: usize) -> Result<&'a str> {
@@ -139,6 +151,7 @@ struct OrderedRecord {
 
 struct Records {
     entries: Vec<OrderedRecord>,
+    source_records: usize,
     output_bytes: usize,
     limits: Limits,
     budget: Budget,
@@ -148,6 +161,7 @@ impl Records {
     fn new(limits: Limits) -> Self {
         Self {
             entries: Vec::new(),
+            source_records: 0,
             output_bytes: 0,
             limits,
             budget: Budget::new(limits.working_bytes),
@@ -161,9 +175,10 @@ impl Records {
         id: &str,
         record: CanonicalRecord<'_>,
     ) -> Result<()> {
-        if self.entries.len() >= self.limits.records {
+        if self.source_records >= self.limits.records {
             return Err(Unavailable::BudgetExceeded);
         }
+        self.source_records += 1;
         if self.entries.len() == self.entries.capacity() {
             let capacity = self
                 .entries
@@ -236,10 +251,11 @@ impl Records {
 }
 
 pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> Result<Vec<u8>> {
-    let layout = super::layout(connection).ok_or(Unavailable::Database)?;
+    let route = super::Layout::detect(connection)?.route(connection, id)?;
+    let v2 = route.table == super::storage::SessionTable::V2;
     let mut output = Records::new(limits);
     {
-        let mut statement = connection.prepare("SELECT id, project_id, parent_id, directory, time_created, version FROM session WHERE id = ?1")
+        let mut statement = connection.prepare(&format!("SELECT id, project_id, parent_id, directory, time_created, version FROM {} WHERE id = ?1", route.table.name()))
             .map_err(|_| Unavailable::Database)?;
         let mut rows = statement.query([id]).map_err(|_| Unavailable::Database)?;
         let Some(row) = rows.next().map_err(|_| Unavailable::Database)? else {
@@ -251,7 +267,7 @@ pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> 
         }
         let created = integer(row, 4)?;
         output.push(
-            created,
+            if v2 { i64::MIN } else { created },
             0,
             session,
             CanonicalRecord::Meta {
@@ -267,37 +283,283 @@ pub(super) fn materialize(connection: &Connection, id: &str, limits: Limits) -> 
             return Err(Unavailable::Ambiguous);
         }
     }
-    if layout.parts {
+    if !route.projected {
         materialize_parts(connection, id, &mut output)?;
     }
-    if layout.projected {
+    if route.projected {
+        if route.split_parts {
+            let orphaned: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_part p WHERE p.session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_message m WHERE m.id = p.message_id AND m.session_id = p.session_id AND m.type = 'assistant'))",
+                [id], |row| row.get(0),
+            ).map_err(|_| Unavailable::Database)?;
+            if orphaned {
+                return Err(Unavailable::Database);
+            }
+        }
         let mut statement = connection
-            .prepare("SELECT id, session_id, type, seq, time_created, data FROM session_message WHERE session_id = ?1")
+            .prepare("SELECT id, session_id, type, seq, time_created, data FROM session_message WHERE session_id = ?1 ORDER BY seq")
             .map_err(|_| Unavailable::Database)?;
         let mut rows = statement.query([id]).map_err(|_| Unavailable::Database)?;
+        let mut previous = None;
         while let Some(row) = rows.next().map_err(|_| Unavailable::Database)? {
             let message = text(row, 0)?;
             if text(row, 1)? != id {
                 return Err(Unavailable::Database);
             }
             let seq = integer(row, 3)?;
+            if seq < 0 || previous.is_some_and(|prior| seq <= prior) {
+                return Err(Unavailable::Database);
+            }
+            previous = Some(seq);
             let created = integer(row, 4)?;
+            let kind = text(row, 2)?;
+            let data = text(row, 5)?;
+            let hydrated = if route.split_parts {
+                hydrate_parts(connection, id, message, kind, data, &mut output)?
+            } else {
+                None
+            };
+            let data = hydrated.as_deref().unwrap_or(data);
+            let media = hydrate_media(connection, kind, data, &mut output)?;
             output.push(
-                created,
+                if v2 { seq } else { created },
                 super::PROJECTED_ORDER,
                 &super::projected_tiebreak(seq),
                 CanonicalRecord::Projected {
                     id: message,
                     session: id,
-                    kind: text(row, 2)?,
+                    kind,
                     seq,
                     created,
-                    data: text(row, 5)?,
+                    data: media.as_deref().unwrap_or(data),
                 },
             )?;
         }
     }
     output.finish()
+}
+
+/// OpenCode prepends ordered split parts to any inline content left on the message.
+fn hydrate_parts(
+    connection: &Connection,
+    session: &str,
+    message: &str,
+    kind: &str,
+    data: &str,
+    output: &mut Records,
+) -> Result<Option<String>> {
+    let mut statement = connection.prepare(
+        "SELECT session_id, ordinal, type, data FROM session_part WHERE message_id = ?1 ORDER BY ordinal"
+    ).map_err(|_| Unavailable::Database)?;
+    let mut rows = statement
+        .query([message])
+        .map_err(|_| Unavailable::Database)?;
+    let mut content = Vec::new();
+    let mut previous = None;
+    while let Some(row) = rows.next().map_err(|_| Unavailable::Database)? {
+        if kind != "assistant" || text(row, 0)? != session {
+            return Err(Unavailable::Database);
+        }
+        let ordinal = integer(row, 1)?;
+        if ordinal < 0 || previous.is_some_and(|prior| ordinal <= prior) {
+            return Err(Unavailable::Database);
+        }
+        previous = Some(ordinal);
+        if output.source_records >= output.limits.records {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        output.source_records += 1;
+        let raw = text(row, 3)?;
+        output.budget.reserve(
+            raw.len()
+                .checked_mul(32)
+                .ok_or(Unavailable::BudgetExceeded)?,
+        )?;
+        let part: serde_json::Value =
+            serde_json::from_str(raw).map_err(|_| Unavailable::Database)?;
+        if part["type"].as_str() != Some(text(row, 2)?) {
+            return Err(Unavailable::Database);
+        }
+        content.push(part);
+    }
+    if content.is_empty() {
+        return Ok(None);
+    }
+    output.budget.reserve(
+        data.len()
+            .checked_mul(32)
+            .ok_or(Unavailable::BudgetExceeded)?,
+    )?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(data).map_err(|_| Unavailable::Database)?;
+    let fields = value.as_object_mut().ok_or(Unavailable::Database)?;
+    if let Some(inline) = fields.remove("content") {
+        let serde_json::Value::Array(inline) = inline else {
+            return Err(Unavailable::Database);
+        };
+        content.extend(inline);
+    }
+    fields.insert("content".into(), serde_json::Value::Array(content));
+    serialize_hydrated(&value, output).map(Some)
+}
+
+fn serialize_hydrated(value: &serde_json::Value, output: &mut Records) -> Result<String> {
+    let mut buffer = Buffer {
+        bytes: Vec::new(),
+        limit: output.limits.bytes.saturating_sub(output.output_bytes),
+        budget: &mut output.budget,
+        failure: None,
+    };
+    if serde_json::to_writer(&mut buffer, value).is_err() {
+        return Err(buffer.failure.unwrap_or(Unavailable::Database));
+    }
+    String::from_utf8(buffer.bytes).map_err(|_| Unavailable::Database)
+}
+
+/// Media references are local database keys; portable snapshots must carry their bytes.
+fn hydrate_media(
+    connection: &Connection,
+    kind: &str,
+    data: &str,
+    output: &mut Records,
+) -> Result<Option<String>> {
+    if !matches!(kind, "user" | "assistant") || (!data.contains("media:") && !data.contains("\\u"))
+    {
+        return Ok(None);
+    }
+    output.budget.reserve(
+        data.len()
+            .checked_mul(32)
+            .ok_or(Unavailable::BudgetExceeded)?,
+    )?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(data).map_err(|_| Unavailable::Database)?;
+    let mut changed = false;
+    if kind == "user" {
+        for file in value
+            .get_mut("files")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            changed |= hydrate_file(connection, file, false, output)?;
+        }
+    } else {
+        for part in value
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if part["type"] != "tool" {
+                continue;
+            }
+            for item in part
+                .get_mut("state")
+                .and_then(|state| state.get_mut("content"))
+                .and_then(serde_json::Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if item["type"] == "file" {
+                    changed |= hydrate_file(connection, item, true, output)?;
+                }
+            }
+        }
+    }
+    if changed {
+        serialize_hydrated(&value, output).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn hydrate_file(
+    connection: &Connection,
+    file: &mut serde_json::Value,
+    tool: bool,
+    output: &mut Records,
+) -> Result<bool> {
+    let Some(hash) = file["uri"]
+        .as_str()
+        .and_then(|uri| uri.strip_prefix("media:"))
+    else {
+        return Ok(false);
+    };
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Unavailable::Database);
+    }
+    if !super::storage::table_exists(connection, "blob")? {
+        return Err(Unavailable::Database);
+    }
+    if output.source_records >= output.limits.records {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    output.source_records += 1;
+    let mut statement = connection
+        .prepare("SELECT hash, bytes, data FROM blob WHERE hash = ?1")
+        .map_err(|_| Unavailable::Database)?;
+    let mut rows = statement.query([hash]).map_err(|_| Unavailable::Database)?;
+    let row = rows
+        .next()
+        .map_err(|_| Unavailable::Database)?
+        .ok_or(Unavailable::Database)?;
+    let raw = row
+        .get_ref(2)
+        .map_err(|_| Unavailable::Database)?
+        .as_blob()
+        .map_err(|_| Unavailable::Database)?;
+    if text(row, 0)? != hash || usize::try_from(integer(row, 1)?).ok() != Some(raw.len()) {
+        return Err(Unavailable::Database);
+    }
+    let mime = file["mime"].as_str().ok_or(Unavailable::Database)?;
+    let prefix = if tool {
+        mime.len()
+            .checked_add("data:;base64,".len())
+            .ok_or(Unavailable::BudgetExceeded)?
+    } else {
+        0
+    };
+    let encoded_len = base64::encoded_len(raw.len(), true)
+        .and_then(|len| len.checked_add(prefix))
+        .ok_or(Unavailable::BudgetExceeded)?;
+    if encoded_len > output.limits.bytes.saturating_sub(output.output_bytes) {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    output.budget.reserve(
+        raw.len()
+            .checked_add(encoded_len)
+            .ok_or(Unavailable::BudgetExceeded)?,
+    )?;
+    if hex::encode(Sha256::digest(raw)) != hash {
+        return Err(Unavailable::Database);
+    }
+    let mut encoded = String::new();
+    encoded
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| Unavailable::BudgetExceeded)?;
+    if tool {
+        encoded.push_str("data:");
+        encoded.push_str(mime);
+        encoded.push_str(";base64,");
+    }
+    STANDARD.encode_string(raw, &mut encoded);
+    if rows.next().map_err(|_| Unavailable::Database)?.is_some() {
+        return Err(Unavailable::Ambiguous);
+    }
+    if tool {
+        file["uri"] = encoded.into();
+    } else {
+        file.as_object_mut()
+            .ok_or(Unavailable::Database)?
+            .remove("uri");
+        file["data"] = encoded.into();
+    }
+    Ok(true)
 }
 
 fn materialize_parts(connection: &Connection, id: &str, output: &mut Records) -> Result<()> {

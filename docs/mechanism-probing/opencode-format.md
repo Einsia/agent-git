@@ -13,7 +13,90 @@
 > isolated scratch `HOME`+`XDG_DATA_HOME`, and neither the real database nor the real HOME was
 > touched by any probe.
 
-## 0. Conclusion in two sentences
+## 0. Storage generations and routing
+
+The sections below that name OpenCode 1.18.13 and 1.19.5 describe classic and
+transitional storage, not the released OpenCode V2 contract. The adapter routes by
+schema and selected identity, not by the version recorded on a migrated session.
+
+- Classic: `session` indexes `message` and `part`.
+- Transitional: `session` indexes projected `session_message` rows as well as
+  classic conversations. A selected projected conversation does not append classic rows.
+- V2: `session_v2` indexes `session_message`; the message foreign key targets
+  `session_v2`. `session_part` optionally stores assistant content by message and ordinal.
+
+For an identity present in both session tables, the V2 row is authoritative. This
+choice precedes project, directory and parent filtering. A failed V2 read does not
+fall back to stale classic content. Listing, explicit lookup, cache materialization,
+native snapshots, status snapshots and RC authorization share the storage router.
+RC authorization and its corresponding snapshot run in one read transaction.
+
+V2 messages follow `seq`, independently of wall-clock timestamps. Assistant part
+rows are prepended in ordinal order to inline `data.content`, matching OpenCode's
+`SessionHistory.withParts`. Their owner must match the selected message and session.
+The resulting canonical record remains `kind: session_message`, so downstream IR,
+privacy and archive readers share the same whole-message representation.
+
+User files and tool results may reference `blob` rows as `media:<sha256>`,
+including results stored in `session_part`. The snapshot reader loads those bytes
+in the same transaction as the messages, checks their recorded size and hash, and
+embeds user files as base64 data and tool files as data URIs. Referenced rows and
+their raw and encoded bytes count against snapshot budgets. Missing or corrupt
+media makes the snapshot unavailable rather than substituting a placeholder or
+saving a reference that cannot be restored on another machine.
+
+Publication applies a separate attachment boundary: user files are omitted, and
+tool files other than images and PDFs become text notices. This applies to both
+inline and split results and to classic tool attachments. A data URI must agree
+with the declared visual MIME type. Encoded text and configuration files therefore
+cannot bypass sensitive-value scanning; local snapshots and restoration retain
+their original bytes.
+
+Database selection honors `OPENCODE_DB`: absolute paths select that file; relative
+paths resolve under the OpenCode XDG data directory. `:memory:` has no inspectable
+local file. Without an override, the default is `opencode.db` in that directory.
+
+V2 restoration uses `opencode session import --standalone --directory <cwd> <file>`
+with native whole-message transfers. Session and message IDs are reminted; completed
+tools and compaction messages retain their native content. Import conflict behavior
+depends on the target release; agit never assumes a failed import is a successful retry.
+A successful import must be readable
+through the storage router before agit reports it installed. Classic targets retain
+their classic transfer protocol. Cross-generation classic input is explicitly
+converted, with original message fields retained as transfer metadata.
+Complete import readback uses the same capture budget as ordinary materialization;
+the smaller inspection budget must not reject an already imported capture.
+Classic conversion projects text, reasoning, completed or failed tools, file
+attachments and compaction summaries; other classic fields remain metadata rather
+than executable V2 content. Unfinished assistants and tools are refused instead of
+being marked complete. URI attachments remain URI references; inline base64 files
+retain their bytes in the transfer.
+
+Status inspection still has its independent database-image budget. A supported
+layout does not make an oversized database eligible for that bounded reader; it
+reports unavailable rather than an empty conversation.
+
+Changing a native session from classic rows to V2 projection is not an append to
+its previously saved byte stream. Existing continuity and archive identity checks
+must reject incompatible baselines rather than duplicate migrated context. Import
+the migrated conversation independently when its saved native baseline no longer matches.
+
+Sources: the installed V2 CLI help and isolated import, the local SQLite schema,
+[V2 troubleshooting](https://opencode.ai/v2/docs/troubleshooting),
+[V2 CLI paths](https://opencode.ai/v2/docs/cli), and upstream
+[`session/sql.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/sql.ts),
+[`session/history.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/history.ts),
+[`session/transfer.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/transfer.ts).
+
+The optional installed-runtime contract check uses isolated homes and synthetic
+messages, without a model request:
+
+```sh
+OPENCODE_TEST_BINARY=/absolute/path/to/opencode cargo test --locked --lib \
+  adapter::opencode::transfer::tests::installed_v2_import_is_discoverable_and_preserves_native_context -- --ignored
+```
+
+## 0.1 Classic storage observations
 
 **OpenCode is readable and writable; the capability is `Resumable`.** Sessions live in a single
 SQLite database (the jsonl-layout era is over), but the official byte path is complete:
@@ -58,7 +141,7 @@ not; a listing query must not depend on it, and the `schema_ok` defensive check 
 `resolve(session_id)` is therefore a direct PK lookup [observed]: `SELECT … FROM session WHERE
 id = ?`, O(log n).
 
-### 1.1 Sessions driven through the v2 API (`session_message`)
+### 1.1 Transitional 1.x sessions driven through the v2 API (`session_message`)
 
 [observed] on OpenCode 1.19.5 in an isolated `HOME`, with a local OpenAI-compatible stub as the
 only provider: a session created and prompted through `opencode serve`'s v2 HTTP API
@@ -91,8 +174,8 @@ agent-switched / model-switched / system: bookkeeping
 
 The rows are a projection of the `event` table's `session.next.*` events. A `session_message`
 table without `type`/`seq` belongs to OpenCode versions that never wrote it (the migration that
-added `seq` emptied it), so agit treats such a table as absent. No published OpenCode build has a
-`session_v2` table.
+added `seq` emptied it), so agit treats such an empty table as absent. Released V2
+uses the separate `session_v2` index described in section 0.
 
 ## 2. Row model and part-type inventory
 

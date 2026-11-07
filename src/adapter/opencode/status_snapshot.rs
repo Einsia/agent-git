@@ -605,7 +605,12 @@ pub(crate) fn read(id: &str, limits: Limits) -> Result<Vec<u8>> {
     let bytes = acquire(&path, deadline)?;
     query(bytes, id, limits, deadline)
 }
-fn query(bytes: Vec<u8>, id: &str, limits: Limits, deadline: Instant) -> Result<Vec<u8>> {
+pub(super) fn query(
+    bytes: Vec<u8>,
+    id: &str,
+    limits: Limits,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
     let mut db = Connection::open_in_memory().map_err(database_error)?;
     db.set_limit(Limit::SQLITE_LIMIT_LENGTH, limits.bytes as i32);
     db.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 16 * 1024);
@@ -652,31 +657,25 @@ fn query(bytes: Vec<u8>, id: &str, limits: Limits, deadline: Instant) -> Result<
                 if context.database_name == Some("main")
                     && matches!(
                         table_name,
-                        "session" | "message" | "part" | "session_message" | "sqlite_master"
+                        "session"
+                            | "session_v2"
+                            | "message"
+                            | "part"
+                            | "session_message"
+                            | "session_part"
+                            | "blob"
+                            | "sqlite_master"
                     ) =>
             {
                 hooks::Authorization::Allow
             }
+            hooks::AuthAction::Pragma {
+                pragma_name: "foreign_key_list",
+                pragma_value: Some("session_message"),
+            } => hooks::Authorization::Allow,
             _ => hooks::Authorization::Deny,
         }
     }));
-    {
-        let mut statement=db.prepare("SELECT name, type, rootpage FROM sqlite_schema WHERE name IN ('session','message','part','session_message')").map_err(database_error)?;
-        let mut rows = statement.query([]).map_err(database_error)?;
-        let mut names = std::collections::BTreeSet::new();
-        while let Some(row) = rows.next().map_err(database_error)? {
-            let name: String = row.get(0).map_err(database_error)?;
-            let kind: String = row.get(1).map_err(database_error)?;
-            let root: i64 = row.get(2).map_err(database_error)?;
-            if kind != "table" || root <= 0 || !names.insert(name) {
-                return Err(Unavailable::Database);
-            }
-        }
-        let parts = names.contains("message") && names.contains("part");
-        if !names.contains("session") || !(parts || names.contains("session_message")) {
-            return Err(Unavailable::Database);
-        }
-    }
     let result = super::native_snapshot::materialize(&db, id, limits);
     clock(deadline)?;
     if exhausted.load(std::sync::atomic::Ordering::Relaxed) {

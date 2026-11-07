@@ -761,7 +761,7 @@ mod tests {
                 std::fs::create_dir_all(&bin).unwrap();
                 let shim = bin.join("opencode");
                 std::fs::write(&shim, concat!(
-                    "#!/bin/sh\nset -eu\n[ \"$#\" -eq 2 ]\n[ \"$1\" = import ]\n",
+                    "#!/bin/sh\nset -eu\nif [ \"$1\" = --version ]; then echo 1.19.5; exit 0; fi\n[ \"$#\" -eq 2 ]\n[ \"$1\" = import ]\n",
                     "export AGIT_FILE_OPENCODE_IMPORT_PAYLOAD=\"$2\"\n",
                     "exec \"$AGIT_FILE_OPENCODE_TEST_EXECUTABLE\" --exact commands::merge::archive::preparation::tests::file_opencode_import_probe --nocapture\n",
                 )).unwrap();
@@ -777,6 +777,7 @@ mod tests {
                     .env("USERPROFILE", home.path())
                     .env("AGIT_HOME", home.path().join("agit"))
                     .env("XDG_DATA_HOME", home.path().join("data"))
+                    .env_remove("OPENCODE_DB")
                     .env("PATH", std::env::join_paths(paths).unwrap())
                     .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
                     .env("GIT_CONFIG_NOSYSTEM", "1")
