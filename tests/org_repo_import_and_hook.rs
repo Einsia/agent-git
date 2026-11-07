@@ -4212,6 +4212,103 @@ fn an_explicit_save_with_automatic_upload_off_reports_what_the_hub_received() {
     assert!(!swept.contains("\"uploaded\""), "{swept}");
 }
 
+/// `agit save` doesn't offer a conversation whose folder no longer exists, a removed worktree say.
+/// Named by its ID, it isn't "not found" either: the save says where it ran, and saves nothing.
+#[test]
+fn a_named_conversation_whose_folder_is_gone_says_where_it_ran() {
+    let lab = Lab::new();
+    let id = "dddddddd-0000-4000-8000-000000000009";
+    let removed = lab.work.join("removed-worktree");
+    let conversation = |id: &str, folder: &std::path::Path| {
+        let transcript = lab
+            .home
+            .join(".claude/projects")
+            .join(agit::adapter::claude_code::slug_for(folder))
+            .join(format!("{id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let cwd = folder.to_string_lossy();
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "user", "sessionId": id, "cwd": cwd, "uuid": format!("{id}-u1"),
+                    "timestamp": "2026-08-29T00:00:01.000Z",
+                    "message": {"role": "user", "content": "tidy the branch"}
+                }),
+                serde_json::json!({
+                    "type": "assistant", "sessionId": id, "cwd": cwd, "uuid": format!("{id}-a1"),
+                    "timestamp": "2026-08-29T00:00:01.500Z",
+                    "message": {"role": "assistant", "stop_reason": "end_turn", "content": [{"type": "text", "text": "done"}]}
+                })
+            ),
+        )
+        .unwrap();
+    };
+    fs::create_dir_all(&removed).unwrap();
+    conversation(id, &removed);
+    fs::remove_dir_all(&removed).unwrap();
+    // A stand-in `claude`, so the runtime counts as installed and its conversations are found.
+    let bin = lab.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    let out = lab
+        .agit(&["save", &id[..8]])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(&format!(
+            "Claude Code conversation dddddddd ran in {}, which no longer exists, so agit doesn't save it from here",
+            removed.display()
+        )),
+        "{said}"
+    );
+    assert!(!said.contains("no session in"), "{said}");
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    assert!(agit::domain::link::get(&store, "claude-code", id).is_none());
+    // A query that names nothing is still not found.
+    let out = lab
+        .agit(&["save", "ffffffff"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no session in"),
+        "{out:?}"
+    );
+    // A folder that can't be resolved for another reason isn't said to be gone: here a file
+    // stands where a folder of its path should be, as a parent without search permission would
+    // stop it too. The access may only need restoring.
+    #[cfg(unix)]
+    {
+        let blocked = "eeeeeeee-0000-4000-8000-000000000009";
+        fs::write(lab.work.join("notes.txt"), "a file").unwrap();
+        conversation(blocked, &lab.work.join("notes.txt/sub"));
+        let out = lab
+            .agit(&["save", &blocked[..8]])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!said.contains("no longer exists"), "{said}");
+        assert!(said.contains("no session in"), "{said}");
+    }
+}
+
 /// `push.auto` off holds before the repository has a checkout here, so the first background save
 /// into it asks the Hub nothing either, and the turn is saved.
 #[test]
