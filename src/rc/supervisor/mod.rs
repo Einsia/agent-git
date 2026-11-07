@@ -347,7 +347,9 @@ pub(in crate::rc) async fn guarded_output(
     if !settlement_lease_is_current(state, lease) {
         return None;
     }
-    command.kill_on_drop(true);
+    // On Unix the group guard below ends the child with the rest of its group. A kill on drop
+    // would SIGKILL the child first, a Git among them, before it can remove its locks.
+    command.kill_on_drop(cfg!(windows));
     // **stdout/stderr must be taken over explicitly.**
     //
     // tokio's `Command` **inherits** the parent's stdio by default, and `wait_with_output()`
@@ -391,19 +393,30 @@ pub(in crate::rc) async fn guarded_output(
     };
 
     #[cfg(unix)]
-    let mut group = ProcessGroupGuard(child.id().map(|id| id as i32));
+    let pgid = child.id().map(|id| id as i32);
     let mut wait = Box::pin(child.wait_with_output());
+    // Declared after `wait`, so a dropped operation ends the group before the child is let go.
+    #[cfg(unix)]
+    let mut group = ProcessGroupGuard(pgid);
     loop {
         tokio::select! {
             biased;
             changed = state.changed() => {
                 if changed.is_err() || !settlement_lease_is_current(state, lease) {
+                    // A lease that ended fences the operation: it is ended, never let finish.
                     #[cfg(unix)]
                     {
-                        if let Some(pgid) = group.0.take() {
-                            unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                        // The guard stays armed through the wait: if this operation is dropped
+                        // during it, what ignores SIGTERM still gets the SIGKILL.
+                        match group.0 {
+                            Some(pgid) => {
+                                end_group(pgid, &mut wait).await;
+                                group.disarm();
+                            }
+                            None => {
+                                let _ = (&mut wait).await;
+                            }
                         }
-                        let _ = (&mut wait).await;
                     }
                     #[cfg(windows)]
                     {
@@ -629,9 +642,58 @@ async fn unpushed_local_head(
     (!unreachable.is_empty()).then(|| head.to_string())
 }
 
+/// What a `commit.failed` event says about a settlement that stopped. The event can leave this
+/// computer, and a Git lock's path names the repository and the session branch, so a failure that
+/// names one is told by its class and where to find the file.
+fn settlement_failure_detail(reason: &str, stderr: &str) -> String {
+    if stderr.contains("index.lock") {
+        return format!(
+            "{reason}: a stale checkout lock on this computer keeps this conversation's archive from finishing; `agit doctor` names the file"
+        );
+    }
+    format!("{reason}: {}", stderr.trim())
+}
+
+/// How long a settlement subprocess's group gets to exit after SIGTERM before SIGKILL. Git
+/// removes the lock files it holds when it is terminated, not when it is killed, and an index lock
+/// left in a checkout refuses every later attempt at that conversation.
+#[cfg(unix)]
+const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether any process of group `pgid` is left.
+#[cfg(unix)]
+fn group_alive(pgid: i32) -> bool {
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// Ends group `pgid`, whose leader `wait` reaps, and polls `wait` to completion exactly once:
+/// SIGTERM first, so Git removes its locks, and SIGKILL for whatever outlives
+/// [`TERMINATE_GRACE`]. The group is signalled again only while a member is left, so a group id
+/// the system reuses afterwards is never touched.
+#[cfg(unix)]
+async fn end_group<F: std::future::Future + Unpin>(pgid: i32, wait: &mut F) {
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    let deadline = tokio::time::Instant::now() + TERMINATE_GRACE;
+    let reaped = tokio::time::timeout_at(deadline, &mut *wait).await.is_ok();
+    while group_alive(pgid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if group_alive(pgid) {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    if !reaped {
+        let _ = wait.await;
+    }
+}
+
 /// `kill_on_drop` stops the direct child. Settlement commands can be waiting on
-/// git grandchildren, so on Unix the lease also owns the process group. Windows
-/// uses a suspended-at-birth kill-on-close Job Object in [`guarded_output`].
+/// git grandchildren, so on Unix the lease also owns the process group, and ends it as
+/// [`end_group`] does when the operation is dropped. Windows uses a suspended-at-birth
+/// kill-on-close Job Object in [`guarded_output`].
 #[cfg(unix)]
 struct ProcessGroupGuard(Option<i32>);
 
@@ -647,10 +709,22 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if let Some(pgid) = self.0 {
             // Negative pid targets the process group created above. ESRCH is
-            // expected when the child won the race and already exited.
+            // expected when the child won the race and already exited. Nothing can wait here, so
+            // the SIGKILL for a member that outlives the grace comes from a thread of its own.
             unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+                libc::kill(-pgid, libc::SIGTERM);
             }
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + TERMINATE_GRACE;
+                while group_alive(pgid) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if group_alive(pgid) {
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
+            });
         }
     }
 }
@@ -4151,10 +4225,8 @@ impl Session {
                     self.publication_retry.failed();
                 }
                 if lease.local_owner {
-                    let detail = format!(
-                        "{reason}: {}",
-                        String::from_utf8_lossy(&commit.stderr).trim()
-                    );
+                    let detail =
+                        settlement_failure_detail(reason, &String::from_utf8_lossy(&commit.stderr));
                     let scrubbed = self.redactor.scrub(&detail);
                     if self.reported_settlement_failure.as_deref() != Some(scrubbed.text.as_str()) {
                         self.emit("commit.failed", serde_json::json!({"session_id":self.info.session_id,"error":scrubbed.text})).await;

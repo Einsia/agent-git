@@ -69,6 +69,162 @@ async fn busy_settlement_executable_retries_only_under_its_current_lease() {
     assert!(!marker.exists(), "revoked authority must prevent startup");
 }
 
+/// A settlement stopped by a Git lock is told by its class alone, in the event that can leave this
+/// computer: the lock's path names the repository and the session branch. A failure of any other
+/// kind keeps what the command said.
+#[test]
+fn a_stale_lock_is_reported_without_its_path() {
+    let path = "/home/person/.agit/repos/acme/secret-project/.git/worktrees/fix-payroll/index.lock";
+    let detail = settlement_failure_detail(
+        "strict commit failed",
+        &format!("error {path} is left from a Git process that was stopped"),
+    );
+    assert!(detail.contains("stale checkout lock"), "{detail}");
+    assert!(
+        !detail.contains("secret-project") && !detail.contains("fix-payroll"),
+        "{detail}"
+    );
+    assert_eq!(
+        settlement_failure_detail("strict commit failed", " the privacy check couldn't run \n"),
+        "strict commit failed: the privacy check couldn't run"
+    );
+}
+
+/// A settlement whose lease ends, or whose operation is dropped, ends its process group with
+/// SIGTERM before SIGKILL, so a Git in it removes the index lock it holds. A group killed outright
+/// leaves that lock in the checkout, and every later attempt there is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_ended_settlement_lets_git_remove_its_index_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        command
+            .current_dir(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
+    };
+    std::fs::write(repo.join("file"), "one").unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-qm", "one"],
+    ] {
+        assert!(git(args).status().unwrap().success());
+    }
+    let hook = repo.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let lock = repo.join(".git/index.lock");
+    // `commit -a` holds the index lock while its pre-commit hook runs.
+    let commit = || {
+        std::fs::write(repo.join("file"), uuid::Uuid::new_v4().to_string()).unwrap();
+        tokio::process::Command::from(git(&["commit", "-a", "-qm", "two"]))
+    };
+    let held = |lock: std::path::PathBuf| async move {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !lock.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Git holds the index lock while its hook runs");
+    };
+    let lease = SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    };
+    let (state_tx, state) = tokio::sync::watch::channel(lease);
+
+    let mut watching = state.clone();
+    let mut running = Box::pin(guarded_output(&mut watching, lease, commit()));
+    tokio::select! {
+        _ = &mut running => panic!("the hook keeps the commit running"),
+        _ = held(lock.clone()) => {}
+    }
+    state_tx.send_modify(|state| state.epoch += 1);
+    assert!(running.await.is_none());
+    assert!(
+        !lock.exists(),
+        "the lease's end killed Git before it removed its lock"
+    );
+
+    let lease = *state_tx.borrow();
+    let mut watching = state.clone();
+    let mut running = Box::pin(guarded_output(&mut watching, lease, commit()));
+    tokio::select! {
+        _ = &mut running => panic!("the hook keeps the commit running"),
+        _ = held(lock.clone()) => {}
+    }
+    drop(running);
+    tokio::time::timeout(TERMINATE_GRACE * 2, async {
+        while lock.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dropping the operation killed Git before it removed its lock");
+}
+
+/// A settlement whose lease ended is still ended when its operation is dropped while the group is
+/// being terminated: a process that ignores SIGTERM gets the SIGKILL. A guard released before that
+/// wait is over would leave such a process writing past the end of its lease.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_group_ignoring_sigterm_is_killed_when_ending_it_is_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let script = format!(
+        "trap '' TERM; echo $$ > {path}.tmp; mv {path}.tmp {path}; while :; do sleep 1; done",
+        path = pid_file.display()
+    );
+    let mut command = tokio::process::Command::new("sh");
+    command.args(["-c", &script]);
+    let lease = SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    };
+    let (state_tx, state) = tokio::sync::watch::channel(lease);
+    let mut watching = state.clone();
+    let mut running = Box::pin(guarded_output(&mut watching, lease, command));
+    let pid = tokio::select! {
+        _ = &mut running => panic!("the script keeps running"),
+        pid = async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    break text.trim().parse::<i32>().unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        } => pid,
+    };
+    state_tx.send_modify(|state| state.epoch += 1);
+    // The group has its SIGTERM and is being waited for when the operation goes away.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut running)
+            .await
+            .is_err()
+    );
+    drop(running);
+    tokio::time::timeout(TERMINATE_GRACE * 3, async {
+        while group_alive(pid) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("nothing was left to kill what ignores SIGTERM");
+}
+
 /// Successful no-ops and concurrent HEAD changes cannot establish settlement ownership.
 /// An unchanged HEAD is eligible only when that exact source commit is pending.
 #[cfg(unix)]

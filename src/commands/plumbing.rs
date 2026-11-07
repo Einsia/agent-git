@@ -1303,9 +1303,44 @@ fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Re
             .map(|upgrade| (upgrade, target_is_v1)),
     )
     .map_err(|failure| failure.error)
-    .with_context(|| format!("cannot recover checkout transaction for {refname} at {current}"))?;
+    .with_context(|| format!("cannot recover checkout transaction for {refname} at {current}"))
+    .map_err(|error| match checkout_git_path(repo, "index.lock") {
+        Ok(lock) if lock.exists() => error.context(stale_index_lock(&lock)),
+        _ => error,
+    })?;
     remove_recovered_checkout_metadata(repo, &path, &journal)?;
     Ok(true)
+}
+
+/// What a person reads when `lock`, Git's index lock, keeps an interrupted checkout transaction
+/// from finishing: which file, why it is there, and the one step that clears it. Nothing removes
+/// the file by itself, since nothing proves that no other Git is writing that index.
+pub(crate) fn stale_index_lock(lock: &std::path::Path) -> String {
+    format!(
+        "{} is left from a Git process that was stopped while it wrote a conversation's checkout \
+         in agit's store; when no agit or git command is running, delete that file, and agit \
+         finishes that conversation's archive by itself",
+        lock.display()
+    )
+}
+
+/// The index locks that keep interrupted checkout transactions in `repo` or its linked worktrees
+/// from finishing, as [`stale_index_lock`] describes them.
+pub(crate) fn stuck_checkout_locks(repo: &Repo) -> Vec<std::path::PathBuf> {
+    let Ok(common) = repo.common_dir() else {
+        return Vec::new();
+    };
+    let linked = std::fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path());
+    std::iter::once(common.clone())
+        .chain(linked)
+        .filter(|dir| dir.join(CHECKOUT_JOURNAL_NAME).is_file())
+        .map(|dir| dir.join("index.lock"))
+        .filter(|lock| lock.exists())
+        .collect()
 }
 
 fn remove_recovered_checkout_metadata(
@@ -5555,6 +5590,32 @@ mod tests {
             assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
             assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
         }
+    }
+
+    /// An interrupted transaction that a leftover index lock keeps from finishing says which
+    /// file, why, and the one step, in its error and in what `agit doctor` lists; once the file
+    /// is gone the transaction finishes. Recovery removes nothing by itself, so a lock that a live
+    /// Git still holds is never taken from it.
+    #[test]
+    fn a_leftover_index_lock_is_named_with_its_one_step_and_never_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, old, new) = checkout_crash_fixture(directory.path());
+        crash_checkout_subprocess(&repo, &old, &new, "after_ref_cas", true);
+        let lock = checkout_git_path(&repo, "index.lock").unwrap();
+        std::fs::write(&lock, "").unwrap();
+
+        let error = format!("{:#}", recover_interrupted_checkout(&repo).unwrap_err());
+        assert!(
+            error.starts_with(&stale_index_lock(&lock)),
+            "the plain explanation leads: {error}"
+        );
+        assert!(lock.exists());
+        assert_eq!(stuck_checkout_locks(&repo), vec![lock.clone()]);
+
+        std::fs::remove_file(&lock).unwrap();
+        assert!(recover_interrupted_checkout(&repo).unwrap());
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
+        assert!(stuck_checkout_locks(&repo).is_empty());
     }
 
     #[test]
