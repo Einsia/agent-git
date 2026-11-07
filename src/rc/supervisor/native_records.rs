@@ -170,6 +170,7 @@ impl NativeRecords {
                 object_hash: hash,
                 raw,
                 raw_truncated,
+                privacy_pending: None,
             });
         }
         self.initialized = true;

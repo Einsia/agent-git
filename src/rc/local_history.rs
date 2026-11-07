@@ -321,16 +321,15 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
         Some(Failure::Unsupported) => ("unsupported", false, false),
         Some(Failure::Busy) => ("busy", true, false),
         Some(Failure::Withheld("unsupported_scalar")) => {
-            privacy = Some("unsupported_scalar");
             ("privacy_value_unsupported", false, false)
         }
-        Some(Failure::Withheld(withheld @ ("device_rules" | "legacy_rules"))) => {
-            privacy = Some(*withheld);
+        Some(Failure::Withheld("device_rules" | "legacy_rules")) => {
             ("privacy_rules_unavailable", false, false)
         }
         Some(Failure::Withheld(withheld)) => {
             reason = Some("privacy_check_pending");
-            privacy = Some(*withheld);
+            privacy = Some(*withheld)
+                .filter(|withheld| crate::domain::privacy::service::worker_state(withheld));
             ("busy", true, false)
         }
         Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
@@ -376,16 +375,12 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
             _ => ("read_failed", true, false),
         },
     };
-    // Native paths and parser excerpts are not part of the remote error contract.
+    // Native paths and parser excerpts are not part of the remote error contract, and neither is
+    // why the privacy check refused: that is about the record or the person's rules, and every
+    // viewer of the workspace reads this. Only the worker's own state goes as `privacy_reason`.
     let mut result = RpcError::new(
         ErrorCode::RuntimeUnavailable,
-        if kind == "privacy_rules_unavailable" {
-            super::protection::Unavailable.to_string()
-        } else if kind == "privacy_value_unsupported" {
-            "History contains a blocked numeric or boolean data value; use a string value or review the privacy rule before reloading history".into()
-        } else {
-            format!("History read failed ({kind})")
-        },
+        format!("History read failed ({kind})"),
     );
     let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
     if let Some(reason) = reason {
@@ -1087,7 +1082,10 @@ mod tests {
     /// Clients act on `retryable` and `restart` alone: a transient condition must be retried
     /// silently and a permanent one shown. A policy refusal reported as retryable keeps a client
     /// retrying forever, and a refreshing catalog reported as missing shows a conversation as
-    /// gone.
+    /// gone. Every viewer of the workspace reads these errors, so a privacy refusal names its kind
+    /// and, while the check is pending, only the worker's own state: an error that named a
+    /// refusal drawn from the record or the person's rules would tell viewers what a record holds
+    /// or whose rules apply.
     #[test]
     fn history_errors_tell_transient_from_permanent_conditions() {
         let flags = |error: anyhow::Error| {
@@ -1115,8 +1113,10 @@ mod tests {
         let unavailable = anyhow::anyhow!("private path or parser excerpt")
             .context(super::super::protection::Unavailable);
         let response = rpc_error(unavailable);
-        assert!(response.message.contains("restore access"));
-        assert!(!response.message.contains("private path"));
+        assert_eq!(
+            response.message,
+            "History read failed (privacy_rules_unavailable)"
+        );
         assert_eq!(response.data.as_ref().unwrap()["retryable"], false);
         assert_eq!(response.data.as_ref().unwrap()["restart"], false);
         assert_eq!(
@@ -1129,6 +1129,21 @@ mod tests {
             flags(Failure::Missing.into()),
             ("source_missing".to_owned(), false, true, None)
         );
+        for (withheld, kind, reason) in [
+            ("unsupported_scalar", "privacy_value_unsupported", None),
+            ("device_rules", "privacy_rules_unavailable", None),
+            ("legacy_rules", "privacy_rules_unavailable", None),
+            ("findings_cap", "busy", None),
+            ("source_incomplete", "busy", None),
+            ("store_busy", "busy", Some("store_busy")),
+            ("spawn_failed", "busy", Some("spawn_failed")),
+        ] {
+            let response = rpc_error(Failure::Withheld(withheld).into());
+            let data = response.data.unwrap();
+            assert_eq!(data["kind"], kind, "{withheld}");
+            assert_eq!(data["privacy_reason"].as_str(), reason, "{withheld}");
+            assert_eq!(response.message, format!("History read failed ({kind})"));
+        }
     }
 
     #[test]

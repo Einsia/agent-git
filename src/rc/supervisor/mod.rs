@@ -4909,6 +4909,7 @@ pub(crate) fn items_from_lines_tracked(
         // retain the committed envelope's original hash so live reconciliation
         // still works.
         let object_hash = projected_object_hash(&raw, &scrubbed_raw, secret_projection);
+        let mut privacy_pending = None;
         let events = if scrubbed_raw.get("protection_error").is_some() {
             let marker = if scrubbed.permanent {
                 scrubbed_raw["protection_error"]
@@ -4927,6 +4928,11 @@ pub(crate) fn items_from_lines_tracked(
                     continue;
                 }
                 pending_marker_emitted = true;
+                privacy_pending = Some(crate::domain::privacy::service::reason_name(
+                    scrubbed.reason,
+                ))
+                .filter(|reason| crate::domain::privacy::service::worker_state(reason))
+                .map(str::to_owned);
                 redact::PROTECTION_ERROR_TEXT.to_owned()
             };
             vec![crate::adapter::Event::text(
@@ -4975,6 +4981,7 @@ pub(crate) fn items_from_lines_tracked(
                     serde_json::Value::Null
                 },
                 raw_truncated: truncated,
+                privacy_pending: privacy_pending.clone(),
             });
         }
     }

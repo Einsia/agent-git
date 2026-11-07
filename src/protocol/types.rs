@@ -1224,6 +1224,12 @@ pub struct ItemCompleted {
     pub raw: Value,
     #[serde(default)]
     pub raw_truncated: bool,
+    /// On the marker a record shows while its privacy check is still pending, why it waits, when
+    /// that is the privacy worker's own state on the device: `lock_busy`, `backoff`,
+    /// `store_busy`, `spawn_failed`, `deadline` or `protocol_error`. Never set from anything
+    /// about the record or the person's rules, and never on an item that carries content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_pending: Option<String>,
 }
 
 /// Cap for `ItemCompleted::raw` on the live path (bytes). Tool results can be
@@ -1610,6 +1616,7 @@ mod tests {
             object_hash: hash.clone(),
             raw: raw.clone(),
             raw_truncated: false,
+            privacy_pending: None,
         };
         let s = serde_json::to_string(&ic).unwrap();
         let back: ItemCompleted = serde_json::from_str(&s).unwrap();

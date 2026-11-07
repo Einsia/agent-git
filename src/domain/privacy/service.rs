@@ -578,6 +578,18 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
     }
 }
 
+/// Whether `reason` (a [`reason_name`]) is the privacy worker's own state on this device (busy,
+/// backing off, unable to start, out of time, or garbled) and so may be told to a viewer on
+/// another computer. A reason drawn from the record or from the person's rules stays here, for
+/// `agit status`: told to every viewer of a workspace, it would say what a record holds or that
+/// another account's rules apply.
+pub fn worker_state(reason: &str) -> bool {
+    matches!(
+        reason,
+        "lock_busy" | "backoff" | "store_busy" | "spawn_failed" | "deadline" | "protocol_error"
+    )
+}
+
 /// Whether a wait reported under `reason` (a [`reason_name`]) can pass when the worker is asked
 /// again shortly: it was busy, starting, backing off, out of budget, garbled its reply, or could
 /// not load the whole policy yet. The other reasons, and one this build doesn't know, name
