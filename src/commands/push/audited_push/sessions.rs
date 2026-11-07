@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::domain::privacy_git::sessions::SessionPublicationPlan;
-use crate::domain::repo::publication::{PublicationPlan, is_raw_ancestor};
+use crate::domain::repo::publication::{PublicationPlan, carries_main, is_raw_ancestor};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
@@ -268,7 +268,6 @@ pub(super) fn run(
         crate::hub::git::PUBLICATION_REF_READ,
     )
     .map_err(|cause| crate::commands::push::branch_list_unread(&repository, cause))?;
-    let implicit_main = !args.all && !branches.iter().any(|branch| branch == "main");
     // A branch the Hub refused as withdrawn stays in this checkout and out of later
     // publications, or every push would meet the same refusal. Naming it asks again, since the
     // withdrawal may have been restored, and so asks again for every refused version tag, even
@@ -321,12 +320,14 @@ pub(super) fn run(
             too_large.push((branch.to_owned(), limit));
             continue;
         }
-        // A session push cannot require reconciling an independently advanced shared-file line.
-        // Explicit selections still admit main through the ordinary publication checks.
         if branch == "main"
-            && implicit_main
-            && let Some(remote_head) = remote.refs.get(head.name())
-            && !is_raw_ancestor(&repo, remote_head, head.oid())?
+            && !carries_main(
+                &repo,
+                branches,
+                args.all,
+                remote.refs.get(head.name()).map(String::as_str),
+                head.oid(),
+            )?
         {
             #[cfg(windows)]
             use crate::ui::quote_powershell_argument as quote_arg;

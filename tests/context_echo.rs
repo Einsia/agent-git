@@ -1142,8 +1142,10 @@ fn merge_recon_reports_source_and_destination_only_after_both_resolve() {
     assert_eq!(lab.git(&lab.repo, &["show-ref"]), before);
 }
 
+/// A scan of a named branch checks what its push would send, says so, and leaves out evidence on
+/// a branch that push doesn't carry; the repository named alone, or `--all`, checks every branch.
 #[test]
-fn scan_notice_reports_repository_scope_and_finds_evidence_on_an_unselected_branch() {
+fn scan_notice_reports_its_scope_and_finds_evidence_where_that_scope_reaches() {
     let lab = Lab::new();
     notice(
         lab.run(Some(NEWEST), &["scan", SELECTED, "--secrets"]),
@@ -1163,21 +1165,50 @@ fn scan_notice_reports_repository_scope_and_finds_evidence_on_an_unselected_bran
         !lab.git(&lab.repo, &["log", "refs/heads/selected", "--format=%B"])
             .contains(synthetic_key)
     );
+    // `selected`'s push sends it and main, which don't hold the commit on `newest`.
     let output = lab.run(Some(NEWEST), &["scan", SELECTED, "--secrets"]);
-    assert!(!output.status.success(), "{output:?}");
+    assert!(output.status.success(), "{output:?}");
     let text = String::from_utf8(output.stdout).unwrap();
+    let mut lines = text.lines();
     assert_eq!(
-        text.lines().next(),
+        lines.next(),
         Some("target: repo=alice/context (via explicit arguments)")
     );
-    assert!(text.contains("aws-access-token"), "{text}");
-    assert_eq!(
-        text.lines()
-            .filter(|line| line.starts_with("target: "))
-            .count(),
-        1,
+    assert!(
+        lines.next().is_some_and(|line| line.starts_with(
+            "Scanned what `agit push alice/context@selected` would send: selected and main, "
+        )),
         "{text}"
     );
+    assert!(!text.contains("aws-access-token"), "{text}");
+    // `newest`'s push, the repository named alone and `--all` all reach it.
+    for (args, scope) in [
+        (
+            vec!["scan", NEWEST, "--secrets"],
+            "Scanned what `agit push alice/context@newest` would send: newest and main, ",
+        ),
+        (
+            vec!["scan", REPO, "--secrets"],
+            "Scanned all of alice/context: ",
+        ),
+        (
+            vec!["scan", SELECTED, "--secrets", "--all"],
+            "Scanned all of alice/context: ",
+        ),
+    ] {
+        let output = lab.run(Some(NEWEST), &args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(scope), "{args:?}: {text}");
+        assert!(text.contains("aws-access-token"), "{args:?}: {text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("target: "))
+                .count(),
+            1,
+            "{text}"
+        );
+    }
     failed_without_notice(lab.run(
         Some(NEWEST),
         &["scan", SELECTED, "alice/context@absent", "--secrets"],

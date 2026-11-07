@@ -511,6 +511,60 @@ enum Depth<'a> {
     Tips,
 }
 
+/// Whether a person's publication of `branches` sends `main` with them, where the Hub's `main` is
+/// at `remote_main` (`None` when it has none, or wasn't asked) and this checkout's at
+/// `local_main`. One that names main, or every branch, does. A session push carries main only
+/// when it fast-forwards the Hub's: it cannot reconcile a shared-file line that advanced on its
+/// own, and leaves main as on the Hub instead. `agit scan` asks the same question, so it checks
+/// what the push would send.
+pub(crate) fn carries_main(
+    repo: &Repo,
+    branches: &[String],
+    all: bool,
+    remote_main: Option<&str>,
+    local_main: &str,
+) -> Result<bool> {
+    if all || branches.iter().any(|branch| branch == "main") {
+        return Ok(true);
+    }
+    match remote_main {
+        Some(remote_main) => is_raw_ancestor(repo, remote_main, local_main),
+        None => Ok(true),
+    }
+}
+
+/// The branches a person's `agit push` of `branches` sends, where the Hub's refs are `remote` (by
+/// name; empty when the Hub wasn't asked): the plan's heads as [`PublicationPlan::freeze_tips`]
+/// selects them, with `main` as [`carries_main`] decides. A branch the Hub refused before is
+/// asked for again when the person names it, so it is sent.
+pub(crate) fn sent_branches(
+    repo: &Repo,
+    branches: &[String],
+    remote: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    let plan = PublicationPlan::freeze_tips(repo, branches)?;
+    let mut sent = Vec::new();
+    for head in plan.heads() {
+        let branch = head
+            .name()
+            .strip_prefix("refs/heads/")
+            .context("invalid publication branch")?;
+        if branch == "main"
+            && !carries_main(
+                repo,
+                branches,
+                false,
+                remote.get(head.name()).map(String::as_str),
+                head.oid(),
+            )?
+        {
+            continue;
+        }
+        sent.push(branch.to_owned());
+    }
+    Ok(sent)
+}
+
 /// Whether `ancestor` is reachable from `descendant` through raw parent pointers, however long
 /// the history between them. Replacement objects, grafts, the shallow file and the commit-graph
 /// cache are ignored, as for a captured ancestry, so a local overlay cannot make a commit appear

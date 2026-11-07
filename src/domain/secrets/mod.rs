@@ -743,8 +743,16 @@ impl Destination {
     }
 
     /// The rev range to enumerate: every local branch, minus what the destination has.
+    #[cfg(test)]
     fn revs(&self) -> Vec<String> {
         let mut v = vec!["--branches".to_string()];
+        v.extend(self.not_held());
+        v
+    }
+
+    /// What subtracts the destination's history from a rev range: nothing when it wasn't asked.
+    fn not_held(&self) -> Vec<String> {
+        let mut v = Vec::new();
         if let Destination::Advertised(tips) = self
             && !tips.is_empty()
         {
@@ -766,6 +774,9 @@ pub struct ScanPlan {
     /// The destination of this publish.
     pub dest: Destination,
     pub limits: ScanLimits,
+    /// The branches one `agit push` would send, when the scan answers for that push; `None`
+    /// scans every local branch, which is what any push of this repository may send.
+    pub branches: Option<Vec<String>>,
 }
 
 impl ScanPlan {
@@ -779,6 +790,42 @@ impl ScanPlan {
         ScanPlan {
             dest,
             limits: ScanLimits::DEFAULT,
+            branches: None,
+        }
+    }
+
+    /// What the push of exactly `branches` sends: their history the destination doesn't hold,
+    /// the tags they reach, and the working tree only where one of them is checked out.
+    pub fn of_branches(dest: Destination, branches: Vec<String>) -> ScanPlan {
+        ScanPlan {
+            branches: Some(branches),
+            ..ScanPlan::to(dest)
+        }
+    }
+
+    /// The rev range to enumerate: the selected branches, or every local branch, minus what the
+    /// destination has.
+    fn revs(&self) -> Vec<String> {
+        let mut revisions = match &self.branches {
+            Some(branches) => branches
+                .iter()
+                .map(|branch| format!("refs/heads/{branch}"))
+                .collect(),
+            None => vec!["--branches".to_string()],
+        };
+        revisions.extend(self.dest.not_held());
+        revisions
+    }
+
+    /// Whether the checkout's working tree is part of what this scan answers for: always for
+    /// the whole repository, and for a push only when it has one of that push's branches
+    /// checked out, since a push sends commits, not a checkout.
+    pub fn scans_worktree(&self, repo: &crate::domain::repo::Repo) -> bool {
+        match &self.branches {
+            None => true,
+            Some(branches) => repo
+                .current_branch()
+                .is_some_and(|current| branches.contains(&current)),
         }
     }
 }
@@ -3453,26 +3500,23 @@ pub fn in_publish_surface(rel: &str) -> bool {
 /// one is an inline annotation, the way out for the blob in history is rewriting history, and
 /// collapsing them into one drops one of the two ways out.
 ///
-/// # Why it takes no ref argument
+/// # Why it takes a set of branches, not a ref
 ///
-/// Because the publish surface is not a function of "the ref the user typed on the command line".
-/// One `agit push` pushes `refs_to_push(branches, has_main)` plus the tags they reach — `-b` can
-/// be given several times, `--all` is everything with updates, and main is appended
-/// unconditionally whenever it exists locally.
+/// Because what one push sends is not "the ref the user typed on the command line": a session
+/// branch's push also carries `main` when it fast-forwards the Hub's
+/// ([`crate::domain::repo::publication::carries_main`]), with the tags they reach. Scanning per
+/// ref is wrong in both directions:
 ///
-/// Scanning per ref is wrong in both directions:
-///
-/// * **Missing**: `agit scan other` checks only `other`'s tree, while `agit push -b other` also
-///   carries `main`. With the secret in a current file on `main` and `other` clean, a standalone
-///   scan says clean while push stops it — and the user cannot reproduce locally why they were
-///   refused.
+/// * **Missing**: a scan of `other` alone says clean while the push of `other` also sends the
+///   secret on `main`.
 /// * **Duplicated**: hanging the repository-level paths inside a per-ref loop makes
 ///   `agit scan main other` scan and report the same hits twice, each stamped with that round's
 ///   target, pointing at a ref that has nothing to do with them.
 ///
-/// The only thing that varies is the **destination** ([`ScanPlan::dest`]), and that is not a ref:
-/// it answers "what does the far side already have", while the `--branches` side does not change
-/// by a word.
+/// So the plan names the whole set of branches one push sends
+/// ([`crate::domain::repo::publication::sent_branches`], [`ScanPlan::of_branches`]), scanned
+/// once, or no set at all for every local branch. The **destination** ([`ScanPlan::dest`])
+/// answers "what does the far side already have" either way.
 pub fn scan_agent_repo(
     repo: &crate::domain::repo::Repo,
     plan: &ScanPlan,
@@ -3573,11 +3617,12 @@ fn scan_agent_repo_selected_inner(
     // The working tree and the history objects have to use one provenance view. Source events
     // imported by a merge appear both in the current events/** and in a history blob; supplying
     // the identity to the second pass alone still leaves the working-tree pass false-positive.
-    let tag_branches = match frozen {
-        Some(_) => Vec::new(),
-        None => tag_scan_branches(repo)?,
+    let tag_branches = match (frozen, &plan.branches) {
+        (Some(_), _) => Vec::new(),
+        (None, Some(branches)) => branches.clone(),
+        (None, None) => tag_scan_branches(repo)?,
     };
-    let revisions = plan.dest.revs();
+    let revisions = plan.revs();
     let revision_args: Vec<&str> = revisions.iter().map(String::as_str).collect();
     let (history, tags, branch_identities) = match frozen {
         Some((commits, tag_objects)) => (
@@ -3605,14 +3650,16 @@ fn scan_agent_repo_selected_inner(
     // (see the bookkeeping paragraph below). The cost is that a non-UTF-8 file counts at its size
     // on disk — which is exactly the memory it really takes.
     let mut spent: u64 = 0;
+    let worktree = plan.scans_worktree(repo);
     for entry in walkdir::WalkDir::new(repo.root())
         .into_iter()
         .filter_entry(|e| {
-            e.path()
-                .strip_prefix(repo.root())
-                .ok()
-                .map(|r| r.as_os_str().is_empty() || in_publish_surface(&r.to_string_lossy()))
-                .unwrap_or(false)
+            worktree
+                && e.path()
+                    .strip_prefix(repo.root())
+                    .ok()
+                    .map(|r| r.as_os_str().is_empty() || in_publish_surface(&r.to_string_lossy()))
+                    .unwrap_or(false)
         })
         .filter_map(std::result::Result::ok)
     {
@@ -3746,7 +3793,7 @@ fn is_lfs_worktree_file(repo: &crate::domain::repo::Repo, path: &str) -> crate::
 ///
 /// All three selectors are decided only by "what this push will send", independent of which
 /// snapshot is currently checked out and of which ref was typed on the command line. So one
-/// **single function** issues them, and the rev range comes from [`Destination::revs`] alone — a
+/// **single function** issues them, and the rev range comes from `ScanPlan::revs` alone — a
 /// mismatch where blobs are scanned over the unpushed range while commits are scanned over the
 /// full history reports hits the user has no way to act on, and the other half of a mismatch is
 /// sooner or later a miss.
@@ -3865,7 +3912,7 @@ fn scan_publish_objects(
 /// # Tags need **a second enumeration**
 ///
 /// Adding `"tag"` to the `kind` test alone says nothing: the selector is `--branches` (see
-/// [`Destination::revs`]) and an annotated tag object is **unreachable** from a branch —
+/// `ScanPlan::revs`) and an annotated tag object is **unreachable** from a branch —
 /// `rev-list --objects --branches` lists no tag at all. So this enumerates again under the same
 /// test [`scan_tag_objects`] uses (`for-each-ref --merged <branches…> refs/tags`).
 ///
@@ -4058,14 +4105,14 @@ impl std::error::Error for BudgetSpent {}
 ///
 /// `--objects` lists the reachable commits / trees / blobs (the blob line also carries a path).
 /// `--branches` covers every local branch — sharing a source with [`tag_scan_branches`]:
-/// `agit push --all` can push any of them, and `push::refs_to_push` appends main unconditionally
-/// whenever it exists locally, so the scan surface is a superset of the publish surface.
+/// `agit push --all` can push any of them, so the scan surface is a superset of the publish
+/// surface. A plan of one push's branches ([`ScanPlan::of_branches`]) lists those instead.
 ///
 /// The subtracted half comes from [`Destination`] — **what the destination itself reported**, not
 /// the local remote-tracking refs. Tracking refs describe the remote of the last fetch/push; they
 /// do not change when the hub is switched or the remote is deleted and recreated, and in that
 /// state this push sends the whole history (see [`Destination`] for the observed case). The
-/// selector comes from [`Destination::revs`] alone, and the commit path uses the same one (a test
+/// selector comes from `ScanPlan::revs` alone, and the commit path uses the same one (a test
 /// written once on each path produces, inside one push, the mismatch "commits scanned over the
 /// unpushed range, blobs scanned over the full history").
 ///
@@ -4677,29 +4724,19 @@ fn stream_tag_object_oids(
     })
 }
 
-/// The tag scan surface is **always** every local branch, independent of whether the caller is
-/// `agit push` or `agit scan`, and independent of what the destination subtracted.
-///
-/// # Why it does not follow the entry point's ref
-///
-/// The publish surface for tags does not split by ref in the first place: `agit push` pushes
-/// `tags_to_push(refs_to_push(branches, has_main))`, and `refs_to_push` appends main
-/// unconditionally whenever it exists locally. So even with `agit scan <some ref>`, a push may
-/// still send a tag on another branch.
-///
-/// Both entry points go through this one function rather than each passing a branch set of its
-/// own: **the contract is guaranteed by a single source, not by remembering to change two
-/// places**.
+/// The tag scan surface of a whole-repository scan: every local branch, independent of what the
+/// destination subtracted. A scan of one push's branches takes the tags those branches reach,
+/// from the same set as its history.
 fn tag_scan_branches(repo: &crate::domain::repo::Repo) -> crate::Result<Vec<String>> {
     local_branches(repo)
 }
 
 /// Every local branch name.
 ///
-/// The widest answer to "what may this repo push": `agit push --all` can push any of them, and
-/// `push::refs_to_push` also appends `main` unconditionally. Taking this set as the scan surface
-/// makes it **a superset of the publish surface** — the direction is right, a few extra tags only
-/// mean a few extra reports, and a miss is what is unacceptable.
+/// The widest answer to "what may this repo push": `agit push --all` can push any of them.
+/// Taking this set as the scan surface makes it **a superset of the publish surface** — the
+/// direction is right, a few extra tags only mean a few extra reports, and a miss is what is
+/// unacceptable.
 fn local_branches(repo: &crate::domain::repo::Repo) -> crate::Result<Vec<String>> {
     // Failing to list is **not** "there are no branches".
     //
@@ -4725,17 +4762,17 @@ fn local_branches(repo: &crate::domain::repo::Repo) -> crate::Result<Vec<String>
 ///
 /// Only the ones **this push really sends** are scanned: rescanning what the destination already
 /// has does nothing but stop the user on history they cannot change. The range shares a source
-/// with the blob path (both come from [`Destination::revs`]) and is not assembled again here —
+/// with the blob path (both come from `ScanPlan::revs`) and is not assembled again here —
 /// written once on each path, one push shows the mismatch "commits scanned over the unpushed
 /// range, blobs scanned over the full history", and the other half of a mismatch is sooner or
 /// later a miss.
 ///
-/// # Why the range is `--branches` and not the current branch
+/// # Why the range is `--branches` or one push's branches, never the current branch
 ///
-/// `agit push` pushes `refs_to_push(branches, has_main)` — `-b` may be given several times,
-/// `--all` is everything with updates, and main is appended unconditionally whenever it exists
-/// locally. So pushing from a session branch sends an unpushed commit message on main that
-/// carries a secret, while the local scan says clean.
+/// Pushing a session branch also sends an unpushed commit message on `main` when it fast-forwards
+/// the Hub's, so a scan of the current branch alone would say clean about a secret the push sends.
+/// The range is every local branch, or exactly the branches one push sends
+/// ([`ScanPlan::of_branches`]).
 ///
 /// This is **one bug on two levels** with the tag path: both levels depend on the same invariant
 /// (the scan surface covers every branch), and giving branch coverage to only one of them does
@@ -9430,6 +9467,7 @@ mod tests {
 
         // 2. Budget pressed below it: **no object is read**, and it says so.
         let plan = ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 budget_bytes: total / 2,
@@ -9525,6 +9563,7 @@ mod tests {
         // 1. Budget pressed to that one tree's size: blobs plus commits add up to far less, so
         //    only counting the tree crosses the line.
         let plan = ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 budget_bytes: wide_bytes,
@@ -9631,6 +9670,7 @@ mod tests {
 
         let repo = crate::domain::repo::Repo::at(d.path());
         let plan = ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 max_object_bytes: 4 * 1024,
@@ -9690,6 +9730,7 @@ mod tests {
 
         let repo = crate::domain::repo::Repo::at(d.path());
         let plan = ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 max_object_bytes: 4 * 1024,
@@ -9739,6 +9780,7 @@ mod tests {
 
         let repo = crate::domain::repo::Repo::at(d.path());
         let plan = ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 max_object_bytes: 4 * 1024,
@@ -9827,6 +9869,7 @@ mod tests {
         std::fs::write(d.path().join("blob.bin"), vec![0xFFu8; per as usize]).unwrap();
         let repo = crate::domain::repo::Repo::at(d.path());
         let plan = |budget: u64| ScanPlan {
+            branches: None,
             dest: Destination::Unknown,
             limits: ScanLimits {
                 budget_bytes: budget,
