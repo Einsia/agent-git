@@ -26,24 +26,10 @@ const MEDIA_HEADERS: [(&str, &[u8]); 9] = [
     ("application/zip", &[b'P', b'K', 0x03, 0x04]),
 ];
 
-pub(crate) fn base64_media_payload(text: &str, start: usize) -> bool {
-    let before = &text[..start];
-    let Some(carrier) = before
-        .rfind("data:")
-        .map(|at| &before[at + "data:".len()..])
-    else {
-        return false;
-    };
-    let Some(parameters) = carrier.strip_suffix(";base64,") else {
-        return false;
-    };
-    if parameters
-        .bytes()
-        .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b'<' | b'>'))
-    {
-        return false;
-    }
-    let media_type = parameters.split(';').next().unwrap_or_default();
+/// Whether `payload`, base64 declared as `media_type`, is binary media this module can verify: the
+/// type is one [`MEDIA_HEADERS`] names, and the decoded leading bytes are that type's header. A
+/// label alone proves nothing, since text can be declared as anything.
+pub(crate) fn verified_media(media_type: &str, payload: &str) -> bool {
     let Some((_, header)) = MEDIA_HEADERS
         .iter()
         .find(|(declared, _)| declared.eq_ignore_ascii_case(media_type))
@@ -52,7 +38,7 @@ pub(crate) fn base64_media_payload(text: &str, start: usize) -> bool {
     };
     let mut sextets = [0u8; 16];
     let mut count = 0;
-    for byte in text[start..].bytes() {
+    for byte in payload.bytes() {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
@@ -77,6 +63,27 @@ pub(crate) fn base64_media_payload(text: &str, start: usize) -> bool {
         decoded[group * 3 + 2] = (chunk[2] << 6) | chunk[3];
     }
     decoded.starts_with(header)
+}
+
+pub(crate) fn base64_media_payload(text: &str, start: usize) -> bool {
+    let before = &text[..start];
+    let Some(carrier) = before
+        .rfind("data:")
+        .map(|at| &before[at + "data:".len()..])
+    else {
+        return false;
+    };
+    let Some(parameters) = carrier.strip_suffix(";base64,") else {
+        return false;
+    };
+    if parameters
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b'<' | b'>'))
+    {
+        return false;
+    }
+    let media_type = parameters.split(';').next().unwrap_or_default();
+    verified_media(media_type, &text[start..])
 }
 
 pub(crate) fn jsonl_chunks(

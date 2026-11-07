@@ -80,6 +80,11 @@ fn main() {
             "omitted containers stay omitted in stored envelopes",
             omitted_containers_stay_omitted_in_stored_envelopes,
         ),
+        (
+            "an attachment's placeholder through the service",
+            an_attachments_placeholder_is_restored_through_the_service,
+        ),
+        // Last: it leaves the worker unable to process anything for the cases after it.
         ("an unprocessed text", unprocessed_text_is_withheld),
     ];
     for (name, case) in cases {
@@ -132,6 +137,27 @@ fn omitted_containers_stay_omitted_in_stored_envelopes(_home: &Path) {
     assert_eq!(
         protected.object_hash,
         transcript::object_hash(&protected.content)
+    );
+}
+
+/// A file attached as base64 text, which protection encoded again with a placeholder inside, comes
+/// back whole through the service's own entry. The placeholder is not visible outside the base64,
+/// so a restoration that skipped text showing no placeholder would hand the protected attachment
+/// back as if it were restored.
+fn an_attachments_placeholder_is_restored_through_the_service(_home: &Path) {
+    use agit::domain::privacy::{projector::Mode, service};
+    use base64::Engine as _;
+    let secret = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
+    let file = base64::engine::general_purpose::STANDARD.encode(format!("API_KEY={secret}\n"));
+    let record = serde_json::json!({"type":"file","mime":"text/plain","data":file});
+    let protected =
+        service::protect_for_commit(None, &format!("{record}\n"), Mode::ProtectJsonl).unwrap();
+    assert!(!protected.contains(&file), "{protected}");
+    let restored = service::transform(None, &protected, Mode::HydrateJsonl);
+    assert!(service::passed(&restored), "{:?}", restored.reason);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(restored.content.trim_end()).unwrap(),
+        record
     );
 }
 

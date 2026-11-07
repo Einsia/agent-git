@@ -159,32 +159,242 @@ fn open_key_block(text: &str) -> Option<usize> {
     (!FOOTER.is_match(&lower[start..])).then_some(start)
 }
 
-/// Whether an object is a base64 source: its `type` is "base64" and it names a `media_type`.
-/// Only such an object's `data` is media; a `data` field anywhere else, such as in tool output,
-/// is content and is protected like any other string.
-pub(crate) fn base64_source(object: &serde_json::Map<String, Value>) -> bool {
-    object.get("type").and_then(Value::as_str) == Some("base64")
-        && object.get("media_type").is_some_and(Value::is_string)
+/// The field of `object` that carries a base64 payload, and the type that payload is declared as:
+/// a base64 source's `data` beside its `media_type`, an MCP result's `data` or `blob` beside its
+/// `mimeType`, and a file's `data` beside its `mime`. A field anywhere else, such as `data` in
+/// tool output, is an ordinary string.
+pub(crate) fn carrier(object: &serde_json::Map<String, Value>) -> Option<(&'static str, String)> {
+    let declared = |name: &str| object.get(name).and_then(Value::as_str).map(str::to_owned);
+    if object.get("type").and_then(Value::as_str) == Some("base64")
+        && let Some(media_type) = declared("media_type")
+    {
+        return Some(("data", media_type));
+    }
+    for (label, field) in [("mimeType", "data"), ("mimeType", "blob"), ("mime", "data")] {
+        if let Some(media_type) = declared(label)
+            && object.get(field).is_some_and(Value::is_string)
+        {
+            return Some((field, media_type));
+        }
+    }
+    None
 }
 
-/// Whether a string value is a base64 media payload: the `data` of a base64 source
-/// (`source_data`), or a base64 data URI. Such a payload is never scanned or replaced: encoded
-/// bytes carry no readable credential, and a placeholder in them would only corrupt the image,
-/// document or font.
-pub(crate) fn media_payload(source_data: bool, text: &str) -> bool {
-    const SHORTEST: usize = 256;
-    let payload = match text.strip_prefix("data:") {
-        Some(uri) => match uri.find(";base64,") {
-            Some(at) if at <= 128 => &uri[at + ";base64,".len()..],
-            _ => return false,
-        },
-        None if source_data => text,
-        None => return false,
-    };
-    payload.len() >= SHORTEST
-        && payload
+/// What a string carries, judged by its declared type and its bytes.
+pub(crate) enum Payload {
+    /// An ordinary string: not a base64 carrier, or not valid base64.
+    Plain,
+    /// Binary that is not text: never scanned or replaced, since a placeholder in it would only
+    /// corrupt the image, document or font. A short string that decodes to bytes that aren't text
+    /// is not taken for binary: a credential is short and can be valid base64, so it is checked
+    /// as the string it is.
+    Binary,
+    /// Text carried as base64: `prefix` is the data URI's header, or empty for a carrier field,
+    /// and `decoded` the text. It is checked as the text it is.
+    Text { prefix: String, decoded: String },
+    /// Declared as text, but not valid base64 or its bytes are not UTF-8: it can't be checked, so
+    /// it is not published.
+    Unreadable,
+}
+
+/// What a record keeps in place of a payload declared as text that can't be read as text.
+pub(crate) const UNREADABLE_TEXT: &str =
+    "[content omitted: encoded text the privacy check cannot read]";
+
+/// What `text` carries: a base64 data URI, or the payload of a carrier field declared as
+/// `declared` (see [`carrier`]). Only binary media whose decoded header proves its declared type
+/// is left as it is unread. Any other payload is decoded: bytes that are UTF-8 are text, whatever
+/// the label says, so a mislabel can't hide them. A payload of any length is decoded, as a
+/// credential fits in far less than media does. A payload declared as text that doesn't decode is
+/// unreadable like one whose bytes aren't text: part of it may still decode to a value.
+pub(crate) fn payload(text: &str, declared: Option<&str>) -> Payload {
+    /// The shortest payload of undeclared bytes taken for binary.
+    const SHORTEST_BINARY: usize = 256;
+    let (prefix, media_type, encoded) = match text.strip_prefix("data:").and_then(|uri| {
+        let at = uri.find(";base64,").filter(|at| *at <= 128)?;
+        let parameters = &uri[..at];
+        (!parameters
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+/=\r\n".contains(&byte))
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\\' | b'<' | b'>')))
+        .then(|| (at + "data:;base64,".len(), parameters))
+    }) {
+        Some((end, parameters)) => (
+            &text[..end],
+            parameters.split(';').next().unwrap_or_default(),
+            &text[end..],
+        ),
+        None => match declared {
+            Some(media_type) => ("", media_type, text),
+            None => return Payload::Plain,
+        },
+    };
+    if super::detector::verified_media(media_type, encoded) {
+        return Payload::Binary;
+    }
+    let Some(bytes) = decoded_bytes(encoded) else {
+        return if textual(media_type) {
+            Payload::Unreadable
+        } else {
+            Payload::Plain
+        };
+    };
+    match String::from_utf8(bytes) {
+        Ok(decoded) => Payload::Text {
+            prefix: prefix.to_owned(),
+            decoded,
+        },
+        Err(_) if textual(media_type) => Payload::Unreadable,
+        Err(_) if encoded.len() >= SHORTEST_BINARY => Payload::Binary,
+        Err(_) => Payload::Plain,
+    }
+}
+
+/// How many readings of a wrapped payload, longest first, [`text_spans`] decodes before it takes the
+/// longest. Text after a payload adds one reading for each line it starts with base64 alone.
+const WRAP_TRIES: usize = 8;
+
+/// The data URIs inside `text` declared as a text type: each one's range, and where its payload
+/// starts. A payload with no label beside it is not found here: nothing says it is text. A payload
+/// that runs up to a line break may go on with the base64 that starts the next line, as a tool
+/// wraps it, and so on; the span ends at the longest of those readings that decodes as text, of
+/// the last [`WRAP_TRIES`] tried. When none does, it takes them all and is replaced whole, so text
+/// after a wrapped payload can never end it early and leave the rest unread.
+fn text_spans(text: &str) -> Vec<(Range<usize>, usize)> {
+    static SPAN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"data:([a-zA-Z0-9.+-]{1,64}/[a-zA-Z0-9.+-]{1,64})(?:;[^;,\s"'\\<>]{1,40})*;base64,[A-Za-z0-9+/]+={0,2}"#,
+        )
+        .expect("the data URI pattern is valid")
+    });
+    if !text.contains(";base64,") {
+        return Vec::new();
+    }
+    let readable = |encoded: &str| {
+        decoded_bytes(encoded).is_some_and(|bytes| std::str::from_utf8(&bytes).is_ok())
+    };
+    let mut spans: Vec<(Range<usize>, usize)> = Vec::new();
+    for found in SPAN.captures_iter(text) {
+        let Some(span) = found.get(0) else { continue };
+        if !textual(&found[1])
+            || spans
+                .last()
+                .is_some_and(|(last, _)| span.start() < last.end)
+        {
+            continue;
+        }
+        let Some(at) = span.as_str().find(";base64,") else {
+            continue;
+        };
+        let payload = span.start() + at + ";base64,".len();
+        let mut wrapped = span.end();
+        let mut ends = vec![wrapped];
+        while !text[payload..wrapped].ends_with('=') {
+            let rest = &text[wrapped..];
+            let line_break = if rest.starts_with("\r\n") {
+                2
+            } else if rest.starts_with('\n') {
+                1
+            } else {
+                break;
+            };
+            let next = &text[wrapped + line_break..];
+            let run = next
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+                .count();
+            let padding = next[run..]
+                .bytes()
+                .take(2)
+                .take_while(|byte| *byte == b'=')
+                .count();
+            if run + padding == 0 {
+                break;
+            }
+            wrapped += line_break + run + padding;
+            ends.push(wrapped);
+        }
+        let end = ends
+            .iter()
+            .rev()
+            .take(WRAP_TRIES)
+            .copied()
+            .find(|end| readable(&text[payload..*end]))
+            .unwrap_or(wrapped);
+        spans.push((span.start()..end, payload));
+    }
+    spans
+}
+
+/// The bytes of a base64 payload, whitespace aside and padding optional. `None` when it is not
+/// valid base64.
+fn decoded_bytes(encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let engine = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+    let compact: Vec<u8> = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    engine.decode(&compact).ok()
+}
+
+/// Whether `text` may hold base64 that protection encoded again with a placeholder inside: a data
+/// URI, or a carrier's type label. A placeholder there is not visible in `text` itself, so a
+/// restoration that looks only for visible placeholders must not skip such text.
+pub(crate) fn may_carry_encoded_text(text: &str) -> bool {
+    text.contains(";base64,") || text.contains("media_type") || text.contains("mime")
+}
+
+/// `outcome`, for text whose data URIs `carried` checked or restored first, with what that did.
+fn with_spans(mut outcome: Outcome, carried: Option<Outcome>) -> Outcome {
+    if let Some(carried) = carried {
+        outcome.replacements += carried.replacements;
+        outcome.unresolved += carried.unresolved;
+        if carried.status != Status::Complete {
+            outcome.status = Status::Partial;
+            outcome.reason = outcome.reason.or(carried.reason);
+        }
+    }
+    outcome
+}
+
+/// Whether a declared type says its bytes are text.
+fn textual(media_type: &str) -> bool {
+    let media_type = media_type.to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || media_type.ends_with("+json")
+        || media_type.ends_with("+xml")
+        || matches!(
+            media_type.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-yaml"
+                | "application/yaml"
+        )
+}
+
+/// Whether `text`, declared as `declared` when it is a carrier field, is binary media left as it
+/// is (see [`payload`]).
+pub(crate) fn media_payload(declared: Option<&str>, text: &str) -> bool {
+    matches!(payload(text, declared), Payload::Binary)
+}
+
+/// `text` as `encoded` re-encodes it: under `prefix` when `changed` is the text it now holds, or
+/// exactly as it was when nothing changed, so a payload with nothing to replace keeps its bytes,
+/// line wrapping and padding included.
+pub(crate) fn reencoded(text: &str, prefix: &str, decoded: &str, changed: &str) -> String {
+    if changed == decoded {
+        return text.to_owned();
+    }
+    use base64::Engine as _;
+    format!(
+        "{prefix}{}",
+        base64::engine::general_purpose::STANDARD.encode(changed)
+    )
 }
 
 fn floor_boundary(text: &str, mut at: usize) -> usize {
@@ -277,7 +487,7 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
         raw: &RawValue,
         value: &Value,
         base: usize,
-        source_data: bool,
+        declared: Option<&str>,
         fields: &mut Vec<EncodedField>,
     ) -> crate::Result<()> {
         match value {
@@ -298,21 +508,25 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
                 fields.push(EncodedField {
                     range: start..start + raw.get().len(),
                     escapes,
-                    media: media_payload(source_data, text),
+                    media: media_payload(declared, text),
                 });
             }
             Value::Array(values) => {
                 let raw: Vec<&RawValue> = serde_json::from_str(raw.get())?;
                 for (raw, value) in raw.into_iter().zip(values) {
-                    collect(raw, value, base, false, fields)?;
+                    collect(raw, value, base, None, fields)?;
                 }
             }
             Value::Object(values) => {
                 let raw: std::collections::BTreeMap<String, &RawValue> =
                     serde_json::from_str(raw.get())?;
-                let source = base64_source(values);
+                let carried = carrier(values);
                 for (key, value) in values {
-                    collect(raw[key], value, base, source && key == "data", fields)?;
+                    let declared = carried
+                        .as_ref()
+                        .filter(|(field, _)| field == key)
+                        .map(|(_, media_type)| media_type.as_str());
+                    collect(raw[key], value, base, declared, fields)?;
                 }
             }
             _ => {}
@@ -321,7 +535,7 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
     }
     let raw = serde_json::from_str::<&RawValue>(text)?;
     let mut fields = Vec::new();
-    collect(raw, value, text.as_ptr() as usize, false, &mut fields)?;
+    collect(raw, value, text.as_ptr() as usize, None, &mut fields)?;
     Ok(fields)
 }
 
@@ -349,7 +563,7 @@ impl Projector {
                 reason: None,
             };
             if matches!(mode, Mode::HydrateText) {
-                outcome = self.hydrate(text);
+                outcome = self.hydrate_text(text);
                 output.write_all(outcome.content.as_bytes())?;
                 outcome.content = String::new();
                 return Ok(outcome);
@@ -372,7 +586,7 @@ impl Projector {
                     output.write_all(body.as_bytes())?;
                 }
             } else {
-                outcome = self.hydrate(body);
+                outcome = self.hydrate_text(body);
                 output.write_all(outcome.content.as_bytes())?;
                 outcome.content = String::new();
             }
@@ -408,7 +622,7 @@ impl Projector {
         );
         if matches!(mode, Mode::ProtectText | Mode::HydrateText) {
             return if hydrate {
-                self.hydrate(text)
+                self.hydrate_text(text)
             } else {
                 self.protect_continuation(context, text)
             };
@@ -476,9 +690,9 @@ impl Projector {
                 };
                 next
             } else if hydrate {
-                self.hydrate(body)
+                self.hydrate_text(body)
             } else {
-                self.protect(body)
+                self.protect_continuation("", body)
             };
             outcome.content.push_str(&next.content);
             if line.ends_with('\n') {
@@ -546,9 +760,10 @@ impl Projector {
         const LONG_LINE: usize = 128 * 1024;
         // A lookahead window is held back and whole lines leave; a line is cut inside only once
         // more than LONG_LINE bytes before the window have no newline. The scan covers `context`
-        // too, so the cut never splits a finding that began in released text. A key block with
-        // no complete footer waits from its BEGIN line on, and nothing leaves while the scan
-        // cannot finish.
+        // too, so the cut never splits a finding that began in released text. A data URI declared
+        // as a text type is held whole too, so the text it carries is checked in one piece. A
+        // key block with no complete footer waits from its BEGIN line on, and nothing leaves
+        // while the scan cannot finish.
         let hold = self.policy.max_literal_bytes.clamp(128, LONG_LINE);
         let boundary = floor_boundary(text, text.len().saturating_sub(hold));
         let mut cut = match text[..boundary].rfind('\n') {
@@ -570,6 +785,11 @@ impl Projector {
             .iter()
             .map(|hit| (hit.start, hit.end))
             .chain(tokens(text).map(|(start, end, _)| (offset + start, offset + end)))
+            .chain(
+                text_spans(text)
+                    .into_iter()
+                    .map(|(span, _)| (offset + span.start, offset + span.end)),
+            )
             .collect();
         // Latest first: once the cut moves back to one span's start, every span that starts
         // before it is still checked against the new cut.
@@ -792,7 +1012,7 @@ impl Projector {
                 retained.push((pointer, field.take()));
             }
         }
-        self.value(value, hydrate, outcome, None, protocol_root, false);
+        self.value(value, hydrate, outcome, None, protocol_root, None);
         for (pointer, original) in retained {
             if let Some(field) = value.pointer_mut(pointer) {
                 *field = original;
@@ -830,18 +1050,23 @@ impl Projector {
             projector: &Projector,
             value: &Value,
             field: Option<&str>,
-            source: bool,
+            declared: Option<&str>,
             keys_only: bool,
         ) -> Option<Batch> {
             match value {
                 Value::Object(values) => {
-                    let source = base64_source(values);
+                    let carried = carrier(values);
                     for (key, value) in values {
                         let batch = projector.policy.scan(key, MAX_FINDINGS);
                         if !batch.complete || !batch.findings.is_empty() {
                             return Some(batch);
                         }
-                        if let Some(batch) = find(projector, value, Some(key), source, keys_only) {
+                        let declared = carried
+                            .as_ref()
+                            .filter(|(field, _)| field == key)
+                            .map(|(_, media_type)| media_type.as_str());
+                        if let Some(batch) = find(projector, value, Some(key), declared, keys_only)
+                        {
                             return Some(batch);
                         }
                     }
@@ -849,11 +1074,56 @@ impl Projector {
                 }
                 Value::Array(values) => values
                     .iter()
-                    .find_map(|value| find(projector, value, field, false, keys_only)),
-                Value::String(text)
-                    if !keys_only && !media_payload(source && field == Some("data"), text) =>
-                {
-                    let batch = projector.field_findings(text, field);
+                    .find_map(|value| find(projector, value, field, None, keys_only)),
+                Value::String(text) if !keys_only => {
+                    // The caller replaces the whole encoded value on any finding, so a finding in
+                    // carried text, or carried text that can't be read, stands for the value.
+                    let batch = match payload(text, declared) {
+                        Payload::Binary => return None,
+                        Payload::Text { decoded, .. } => {
+                            let batch = projector.field_findings(&decoded, field);
+                            if batch.complete && batch.findings.is_empty() {
+                                projector.field_findings(text, field)
+                            } else {
+                                batch
+                            }
+                        }
+                        Payload::Unreadable => Batch {
+                            findings: vec![super::policy::Finding {
+                                start: 0,
+                                end: text.len(),
+                                source: Source::Default,
+                                rule: "unreadable-text",
+                            }],
+                            complete: true,
+                        },
+                        Payload::Plain => {
+                            let batch = projector.field_findings(text, field);
+                            if !batch.complete || !batch.findings.is_empty() {
+                                return Some(batch);
+                            }
+                            text_spans(text)
+                                .into_iter()
+                                .find_map(|(span, payload)| {
+                                    let decoded = decoded_bytes(&text[payload..span.end])
+                                        .and_then(|bytes| String::from_utf8(bytes).ok());
+                                    let Some(decoded) = decoded else {
+                                        return Some(Batch {
+                                            findings: vec![super::policy::Finding {
+                                                start: 0,
+                                                end: text.len(),
+                                                source: Source::Default,
+                                                rule: "unreadable-text",
+                                            }],
+                                            complete: true,
+                                        });
+                                    };
+                                    let batch = projector.field_findings(&decoded, field);
+                                    (!batch.complete || !batch.findings.is_empty()).then_some(batch)
+                                })
+                                .unwrap_or(batch)
+                        }
+                    };
                     (!batch.complete || !batch.findings.is_empty()).then_some(batch)
                 }
                 _ => None,
@@ -863,7 +1133,7 @@ impl Projector {
             return None;
         }
         let decoded: Value = serde_json::from_str(text).ok()?;
-        let mut batch = find(self, &decoded, None, false, keys_only)?;
+        let mut batch = find(self, &decoded, None, None, keys_only)?;
         if let Some(mut finding) = batch.findings.pop() {
             finding.start = 0;
             finding.end = text.len();
@@ -1051,16 +1321,52 @@ impl Projector {
         outcome: &mut Outcome,
         field: Option<&str>,
         protocol_root: bool,
-        in_source: bool,
+        declared: Option<&str>,
     ) {
         match value {
-            Value::String(text)
-                if !hydrate && media_payload(in_source && field == Some("data"), text) => {}
             Value::String(text) => {
-                let next = if hydrate {
-                    self.hydrate(text)
-                } else {
-                    self.protect_field(text, field)
+                let next = match payload(text, declared) {
+                    Payload::Binary => return,
+                    // Carried text is checked and restored as the text it is: only a payload that
+                    // changes is encoded again.
+                    // A string that only looks like base64 is still checked as itself when its
+                    // decoded form holds nothing.
+                    Payload::Text { prefix, decoded } if hydrate => {
+                        let next = self.hydrate_carried(text, &prefix, &decoded);
+                        if next.content == *text && next.status == Status::Complete {
+                            self.hydrate(text)
+                        } else {
+                            next
+                        }
+                    }
+                    Payload::Text { prefix, decoded } => {
+                        let next = self.protect_field(&decoded, field);
+                        if next.content == decoded && next.status == Status::Complete {
+                            self.protect_field(text, field)
+                        } else {
+                            Outcome {
+                                content: reencoded(text, &prefix, &decoded, &next.content),
+                                ..next
+                            }
+                        }
+                    }
+                    // Kept out of the dictionary as well as the record: its bytes are the file.
+                    Payload::Unreadable if !hydrate => {
+                        let mut omitted = Outcome::skipped(UNREADABLE_TEXT);
+                        omitted.status = Status::Complete;
+                        // A change like any replacement: the record is written out again.
+                        omitted.replacements = 1;
+                        omitted
+                    }
+                    Payload::Unreadable | Payload::Plain if hydrate => self.hydrate_text(text),
+                    Payload::Unreadable | Payload::Plain => {
+                        let carried = self.carried_spans(text, false);
+                        let plain = carried
+                            .as_ref()
+                            .map_or(text.as_str(), |carried| &carried.content);
+                        let next = self.protect_field(plain, field);
+                        with_spans(next, carried)
+                    }
                 };
                 *text = next.content;
                 outcome.replacements += next.replacements;
@@ -1072,11 +1378,11 @@ impl Projector {
             }
             Value::Array(values) => {
                 for value in values {
-                    self.value(value, hydrate, outcome, field, false, false);
+                    self.value(value, hydrate, outcome, field, false, None);
                 }
             }
             Value::Object(values) => {
-                let source = base64_source(values);
+                let carried = carrier(values);
                 // Only carrier fields have identity semantics. Nested tool data remains content.
                 for (field, value) in values {
                     if protocol_root
@@ -1109,7 +1415,11 @@ impl Projector {
                     {
                         continue;
                     }
-                    self.value(value, hydrate, outcome, Some(field), false, source);
+                    let declared = carried
+                        .as_ref()
+                        .filter(|(name, _)| name == field)
+                        .map(|(_, media_type)| media_type.as_str());
+                    self.value(value, hydrate, outcome, Some(field), false, declared);
                 }
             }
             _ => {}
@@ -1118,6 +1428,99 @@ impl Projector {
 
     fn protect(&mut self, text: &str) -> Outcome {
         self.protect_field(text, None)
+    }
+
+    /// `text` with each data URI inside it declared as a text type checked, or restored, as the
+    /// text it is: what is replaced is replaced in the decoded text, and only a payload that
+    /// changes is encoded again. Bytes that aren't UTF-8 under a text type are not published.
+    /// Decoding is bounded by the record, which is bounded by the request. `None` when `text`
+    /// holds no such URI.
+    fn carried_spans(&mut self, text: &str, hydrate: bool) -> Option<Outcome> {
+        let spans = text_spans(text);
+        if spans.is_empty() {
+            return None;
+        }
+        let mut outcome = Outcome {
+            content: String::with_capacity(text.len()),
+            status: Status::Complete,
+            replacements: 0,
+            unresolved: 0,
+            consumed: None,
+            unprocessed: 0,
+            omitted: 0,
+            reason: None,
+        };
+        let mut cursor = 0;
+        for (span, payload) in spans {
+            outcome.content.push_str(&text[cursor..span.start]);
+            cursor = span.end;
+            let whole = &text[span.clone()];
+            let decoded = decoded_bytes(&text[payload..span.end])
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+            let Some(decoded) = decoded else {
+                if hydrate {
+                    outcome.content.push_str(whole);
+                } else {
+                    outcome.content.push_str(UNREADABLE_TEXT);
+                    outcome.replacements += 1;
+                }
+                continue;
+            };
+            let prefix = &text[span.start..payload];
+            let next = if hydrate {
+                self.hydrate_carried(whole, prefix, &decoded)
+            } else {
+                let next = self.protect(&decoded);
+                Outcome {
+                    content: reencoded(whole, prefix, &decoded, &next.content),
+                    ..next
+                }
+            };
+            outcome.content.push_str(&next.content);
+            outcome.replacements += next.replacements;
+            outcome.unresolved += next.unresolved;
+            if next.status != Status::Complete {
+                outcome.status = Status::Partial;
+                outcome.reason = outcome.reason.or(next.reason);
+            }
+        }
+        outcome.content.push_str(&text[cursor..]);
+        Some(outcome)
+    }
+
+    /// `whole`, a payload under `prefix` that decodes to `decoded`, with the text it carries
+    /// restored and encoded again, or exactly as it was when nothing in it is restored. Encoding
+    /// grows the text beyond what restoring it charged; a bounded restoration with no room left
+    /// for that keeps the payload as it is.
+    fn hydrate_carried(&mut self, whole: &str, prefix: &str, decoded: &str) -> Outcome {
+        let next = self.hydrate(decoded);
+        let content = reencoded(whole, prefix, decoded, &next.content);
+        let charged = next.content.len().saturating_sub(decoded.len());
+        let grown = content.len().saturating_sub(whole.len());
+        if let Some(remaining) = self.hydration_growth.get() {
+            let Some(left) = remaining.checked_sub(grown.saturating_sub(charged)) else {
+                return Outcome {
+                    content: whole.to_owned(),
+                    status: Status::Partial,
+                    replacements: 0,
+                    unresolved: next.unresolved + next.replacements,
+                    reason: Some(Reason::Oversize),
+                    ..next
+                };
+            };
+            self.hydration_growth.set(Some(left));
+        }
+        Outcome { content, ..next }
+    }
+
+    /// `text` restored, the data URIs inside it declared as a text type included.
+    fn hydrate_text(&mut self, text: &str) -> Outcome {
+        let carried = self.carried_spans(text, true);
+        let plain = carried
+            .as_ref()
+            .map_or(text, |carried| carried.content.as_str());
+        let next = self.hydrate(plain);
+        with_spans(next, carried)
     }
 
     fn scan_encoded(&self, text: &str, decoded: &Value) -> Option<Batch> {
@@ -1213,8 +1616,13 @@ impl Projector {
     /// match across the two, and a finding that begins in `context` is replaced where it
     /// continues into `text`.
     fn protect_continuation(&mut self, context: &str, text: &str) -> Outcome {
+        let carried = self.carried_spans(text, false);
+        let text = carried
+            .as_ref()
+            .map_or(text, |carried| carried.content.as_str());
         if context.is_empty() || text.is_empty() {
-            return self.protect(text);
+            let next = self.protect(text);
+            return with_spans(next, carried);
         }
         let offset = context.len();
         let mut batch = self.policy.scan(&format!("{context}{text}"), MAX_FINDINGS);
@@ -1226,7 +1634,8 @@ impl Projector {
             hit.end -= offset;
             true
         });
-        self.protect_findings(text, batch)
+        let next = self.protect_findings(text, batch);
+        with_spans(next, carried)
     }
 
     /// Replaces `batch`'s findings in `text`, except where they touch a valid placeholder.
@@ -1986,7 +2395,7 @@ mod tests {
         // Unicode is fixture data exercising decoded JSON member names.
         let data = json!({private: "first", "message": [{"type":"assistant","message":{private: "second"}}]});
         let native = json!({"type":"assistant",private:"root","message":{"role":"assistant",private:"message","content":[{"type":"tool_use","id":"call","name":"Inspect",private:"block","input":data}]},"extra":{"type":"message",private:"nested"}});
-        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":format!("{}blockedliteral{}", "A".repeat(256), "B".repeat(256))}});
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":format!("iVBORw0KGgo{}blockedliteral{}", "A".repeat(256), "B".repeat(255))}});
         let result = json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"text","text":"ready"},data,image],"structuredContent":data}]}});
         let mimic =
             json!({"type":"message","id":"item",private:"root","message":{private:"nested"}});
@@ -2155,7 +2564,7 @@ mod tests {
             missing: None,
             hydration_growth: Default::default(),
         };
-        let data = format!("iVBORw0KGgo{}{run}{}", "A".repeat(300), "B".repeat(300));
+        let data = format!("iVBORw0KGgo{}{run}{}", "A".repeat(300), "B".repeat(299));
         let record = json!({"type":"user","message":{"role":"user","content":[
             {"type":"image","source":{"type":"base64","media_type":"image/png","data":data}},
             {"type":"text","text":format!("see {run}")},
@@ -2221,6 +2630,182 @@ mod tests {
             assert_eq!(
                 serde_json::from_str::<Value>(&restored.content).unwrap(),
                 record
+            );
+        }
+    }
+
+    /// Text a record carries as base64 is checked as the text it is, at any length and whatever
+    /// type it is declared as, in each carrier shape: a data URI, whole or inside longer text as a
+    /// tool prints one, a base64 source, an MCP result's `data` and `blob` beside `mimeType`, and
+    /// a file's `data` beside `mime`. A value protection replaces is replaced inside the decoded
+    /// text, which is encoded again, and restoring gives back the record. A payload with nothing
+    /// to replace keeps its bytes, line wrapping included, and text whose bytes aren't UTF-8 is
+    /// not published. A rule that took any
+    /// base64 for media, or that knew only some carriers, would send the value encoded.
+    #[test]
+    fn text_carried_as_base64_is_checked_as_text() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let root = tempfile::tempdir().unwrap();
+        let run = "agitblockedliteral";
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &[super::super::policy::Literal {
+                    value: run,
+                    source: Source::GlobalUser,
+                }],
+                &[],
+                false,
+            )
+            .unwrap(),
+            key: None,
+            complete: true,
+            missing: None,
+            hydration_growth: Default::default(),
+        };
+        let file = engine.encode(format!("API_KEY={run}\n"));
+        let clean = engine.encode("nothing to see here, ".repeat(20));
+        let wrapped = clean
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let unreadable = engine.encode([0xff, 0xfe, 0xfd, 0x80]);
+        let record = json!({"type":"user","message":{"role":"user","content":[
+            {"type":"text","text":format!("data:text/plain;base64,{file}")},
+            {"type":"document","source":{"type":"base64","media_type":"text/plain","data":file}},
+            {"type":"image","mimeType":"image/png","data":file},
+            {"type":"resource","resource":{"uri":"file:///work/.env","mimeType":"text/plain","blob":file}},
+            {"type":"file","mime":"text/plain","data":file},
+            {"type":"text","text":format!("data:text/plain;base64,{wrapped}")},
+            {"type":"file","mime":"text/plain","data":unreadable},
+            {"type":"text","text":format!("the build printed <script src=\"data:text/javascript;base64,{file}\"></script> and exited")},
+            {"type":"text","text":format!("before data:text/plain;base64,{unreadable} after")},
+        ]}});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        assert!(
+            protected.status == Status::Complete,
+            "{}",
+            protected.content
+        );
+        let value: Value = serde_json::from_str(&protected.content).unwrap();
+        let content = &value["message"]["content"];
+        // Line breaks inside a payload are read through, so a payload published still wrapped
+        // fails on what it holds rather than on its shape.
+        let decoded = |encoded: &str| {
+            let encoded: String = encoded
+                .strip_prefix("data:text/plain;base64,")
+                .unwrap_or(encoded)
+                .split_ascii_whitespace()
+                .collect();
+            String::from_utf8(engine.decode(encoded).unwrap()).unwrap()
+        };
+        for carried in [
+            &content[0]["text"],
+            &content[1]["source"]["data"],
+            &content[2]["data"],
+            &content[3]["resource"]["blob"],
+            &content[4]["data"],
+        ] {
+            let text = decoded(carried.as_str().unwrap());
+            assert!(
+                text.starts_with("API_KEY=") && !text.contains(run),
+                "{carried}: {text}"
+            );
+        }
+        assert_eq!(content[5], record["message"]["content"][5]);
+        assert_eq!(content[6]["data"], UNREADABLE_TEXT);
+        let printed = content[7]["text"].as_str().unwrap();
+        let span = printed
+            .strip_prefix("the build printed <script src=\"data:text/javascript;base64,")
+            .and_then(|rest| rest.strip_suffix("\"></script> and exited"))
+            .expect("the text around the payload stays");
+        let text = decoded(span);
+        assert!(
+            text.starts_with("API_KEY=") && !text.contains(run),
+            "{text}"
+        );
+        assert_eq!(
+            content[8]["text"],
+            format!("before {UNREADABLE_TEXT} after")
+        );
+
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        let restored: Value = serde_json::from_str(&restored.content).unwrap();
+        for index in [0, 1, 2, 3, 4, 5, 7] {
+            assert_eq!(
+                restored["message"]["content"][index], record["message"]["content"][index],
+                "{index}"
+            );
+        }
+
+        // Text protected and restored as text, rather than as a record, keeps the same rule.
+        let printed = format!("the build printed data:text/javascript;base64,{file} and exited");
+        let protected = projector.transform(&printed, Mode::ProtectText);
+        let span = protected
+            .content
+            .strip_prefix("the build printed data:text/javascript;base64,")
+            .and_then(|rest| rest.strip_suffix(" and exited"))
+            .expect("the text around the payload stays");
+        let text = decoded(span);
+        assert!(
+            text.starts_with("API_KEY=") && !text.contains(run),
+            "{text}"
+        );
+        let restored = projector.transform(&protected.content, Mode::HydrateText);
+        assert_eq!(restored.content, printed);
+
+        // A payload a tool wrapped onto the next line goes on there, and the text after it stays.
+        let wrapped = engine.encode(format!("prefix {run} suffix"));
+        let (first, second) = wrapped.split_at(12);
+        let record = json!({"type":"text","text":format!("tool output: data:text/plain;base64,{first}\n{second} end")});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        let value: Value = serde_json::from_str(&protected.content).unwrap();
+        let span = value["text"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tool output: data:text/plain;base64,")
+            .and_then(|rest| rest.strip_suffix(" end"))
+            .expect("the text around the payload stays");
+        let text = decoded(span);
+        assert!(text.starts_with("prefix ") && !text.contains(run), "{text}");
+
+        // Plain text after a wrapped payload doesn't end the payload at its first line.
+        let tail = engine.encode(format!("prefix {run} tail"));
+        let (first, second) = tail.split_at(12);
+        let record = json!({"type":"text","text":format!("tool output: data:text/plain;base64,{first}\n{second}\nDone.")});
+        let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+        let value: Value = serde_json::from_str(&protected.content).unwrap();
+        let span = value["text"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("tool output: data:text/plain;base64,")
+            .and_then(|rest| rest.strip_suffix("\nDone."))
+            .expect("the text around the payload stays");
+        let text = decoded(span);
+        assert!(text.starts_with("prefix ") && !text.contains(run), "{text}");
+
+        // Bytes left out are a change on their own: the record is written without them. A payload
+        // declared as text that doesn't decode is left out too, wrapped past what is tried or
+        // cut short, since part of it may still decode to a value.
+        let lines = "\nZ".repeat(WRAP_TRIES + 1);
+        for record in [
+            json!({"type":"file","mime":"text/plain","data":unreadable}),
+            json!({"type":"text","text":format!("before data:text/plain;base64,{unreadable} after")}),
+            json!({"type":"text","text":format!("tool output: data:text/plain;base64,{first}\n{second}{lines}")}),
+            json!({"type":"text","text":format!("tool output: data:text/plain;base64,{tail}Z")}),
+            json!({"type":"file","mime":"text/plain","data":format!("{tail}Z")}),
+        ] {
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert!(
+                protected.content.contains(UNREADABLE_TEXT)
+                    && !protected.content.contains(&unreadable)
+                    && !protected.content.contains(first),
+                "{}",
+                protected.content
             );
         }
     }

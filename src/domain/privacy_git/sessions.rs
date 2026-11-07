@@ -2440,8 +2440,13 @@ fn conversation_commit(
         .values()
         .flatten()
         .filter(|line| {
-            use crate::domain::privacy::service::{CROWDED_TEXT, OMITTED_TEXT};
-            line.contains(OMITTED_TEXT) || line.contains(CROWDED_TEXT)
+            use crate::domain::privacy::{
+                projector::UNREADABLE_TEXT,
+                service::{CROWDED_TEXT, OMITTED_TEXT},
+            };
+            line.contains(OMITTED_TEXT)
+                || line.contains(CROWDED_TEXT)
+                || line.contains(UNREADABLE_TEXT)
         })
         .map(|line| meta::event_path(&storage::event_id(line)?))
         .collect::<Result<BTreeSet<_>>>()?;

@@ -656,6 +656,7 @@ fn transform_inner(
         mode,
         Mode::HydrateText | Mode::HydrateJsonl | Mode::HydrateEnvelopes
     ) && !super::detector::placeholder::may_contain_token(text)
+        && !super::projector::may_carry_encoded_text(text)
     {
         return Outcome {
             content: text.into(),
@@ -943,7 +944,9 @@ fn hydrate_event(
 ) -> Result<Outcome, Failure> {
     use super::hydration::{CHUNK_BYTES, Command};
     use crate::domain::storage::MAX_EVENT_BYTES;
-    if !super::detector::placeholder::may_contain_token(text) {
+    if !super::detector::placeholder::may_contain_token(text)
+        && !super::projector::may_carry_encoded_text(text)
+    {
         return Ok(Outcome {
             content: text.into(),
             status: Status::Complete,
@@ -1115,7 +1118,7 @@ fn protect_oversized_line(
         return Ok(protected);
     };
     let mut strings = Vec::new();
-    oversized_strings(&record, &mut String::new(), None, false, &mut strings);
+    oversized_strings(&record, &mut String::new(), None, None, &mut strings);
     let encoded = |text: &str| serde_json::Value::from(text).to_string().len();
     // Media always stays here; then the largest strings, until the rest fits one request.
     strings.sort_by_key(|part| (!part.media, std::cmp::Reverse(part.bytes)));
@@ -1194,20 +1197,42 @@ fn protect_oversized_line(
                 .filter(|field| field.len() <= 128 && field.is_ascii())
                 .map(|field| format!("{field} = "))
                 .unwrap_or_default();
-            let windows = protect_windows(process, repo, &lead, text, remaining)?;
-            if windows.reason == Some(Reason::Oversize) {
-                // No cut in any window that fits a request leaves a finding whole: the string
-                // is omitted rather than holding the session back for good.
+            // Text carried as base64 is checked as the text it is, as in a record that fits.
+            let (unreadable, carried) =
+                match super::projector::payload(text, part.declared.as_deref()) {
+                    super::projector::Payload::Text { prefix, decoded } => {
+                        (false, Some((prefix, decoded)))
+                    }
+                    super::projector::Payload::Unreadable => (true, None),
+                    _ => (false, None),
+                };
+            if unreadable {
                 omitted.push(part.pointer.clone());
-                serde_json::Value::from(OMITTED_TEXT)
-            } else if !passed(&windows) {
-                return Ok(skipped(
-                    line,
-                    windows.reason.unwrap_or(Reason::SourceIncomplete),
-                ));
+                serde_json::Value::from(super::projector::UNREADABLE_TEXT)
             } else {
-                replacements += windows.replacements;
-                serde_json::Value::from(windows.content)
+                let input = carried
+                    .as_ref()
+                    .map_or(text, |(_, decoded)| decoded.as_str());
+                let windows = protect_windows(process, repo, &lead, input, remaining)?;
+                if windows.reason == Some(Reason::Oversize) {
+                    // No cut in any window that fits a request leaves a finding whole: the
+                    // string is omitted rather than holding the session back for good.
+                    omitted.push(part.pointer.clone());
+                    serde_json::Value::from(OMITTED_TEXT)
+                } else if !passed(&windows) {
+                    return Ok(skipped(
+                        line,
+                        windows.reason.unwrap_or(Reason::SourceIncomplete),
+                    ));
+                } else {
+                    replacements += windows.replacements;
+                    serde_json::Value::from(match &carried {
+                        Some((prefix, decoded)) => {
+                            super::projector::reencoded(text, prefix, decoded, &windows.content)
+                        }
+                        None => windows.content,
+                    })
+                }
             }
         };
     }
@@ -1357,17 +1382,19 @@ fn collect_containers(
 struct OversizedString {
     pointer: String,
     field: Option<String>,
+    /// The type a carrier field declares the string as.
+    declared: Option<String>,
     bytes: usize,
     media: bool,
 }
 
-/// Strings in `value` large enough to matter for an oversized record. `in_source` says `value`
-/// sits in a base64 source object, whose `data` is media.
+/// Strings in `value` large enough to matter for an oversized record. `declared` is the type a
+/// carrier field declares `value` as (see [`super::projector::carrier`]).
 fn oversized_strings(
     value: &serde_json::Value,
     pointer: &mut String,
     field: Option<&str>,
-    in_source: bool,
+    declared: Option<&str>,
     out: &mut Vec<OversizedString>,
 ) {
     const SMALLEST: usize = 1024;
@@ -1375,24 +1402,29 @@ fn oversized_strings(
         serde_json::Value::String(text) if text.len() >= SMALLEST => out.push(OversizedString {
             pointer: pointer.clone(),
             field: field.map(str::to_owned),
+            declared: declared.map(str::to_owned),
             bytes: value.to_string().len(),
-            media: super::projector::media_payload(in_source && field == Some("data"), text),
+            media: super::projector::media_payload(declared, text),
         }),
         serde_json::Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 let at = pointer.len();
                 pointer.push_str(&format!("/{index}"));
-                oversized_strings(value, pointer, None, false, out);
+                oversized_strings(value, pointer, None, None, out);
                 pointer.truncate(at);
             }
         }
         serde_json::Value::Object(values) => {
-            let source = super::projector::base64_source(values);
+            let carried = super::projector::carrier(values);
             for (key, value) in values {
                 let at = pointer.len();
                 pointer.push('/');
                 pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
-                oversized_strings(value, pointer, Some(key), source, out);
+                let declared = carried
+                    .as_ref()
+                    .filter(|(field, _)| field == key)
+                    .map(|(_, media_type)| media_type.as_str());
+                oversized_strings(value, pointer, Some(key), declared, out);
                 pointer.truncate(at);
             }
         }
