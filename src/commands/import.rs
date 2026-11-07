@@ -1322,7 +1322,7 @@ fn birth_session_branch(
     // `push` cannot read the workspace meta. `main` is also where shared memory/skills live, and
     // only a session branch grown off its head can snapshot those shared files into its tree at
     // creation.
-    if repo.commit_count() == 0 {
+    if repo.commit_count() == 0 && !start_from_hub_main(&repo, owner, agent, author)? {
         create_main_file_line(&repo, author, lk)?;
     }
 
@@ -1519,6 +1519,101 @@ pub(super) fn birth_base(repo: &Repo) -> Option<String> {
         return Some("main".into());
     }
     (repo.commit_count() > 0).then(|| "HEAD".to_string())
+}
+
+/// Starts an empty checkout's `main` at the Hub's `main` of the same repository, so a second
+/// member's first save shares the history every other member has. A `main` made here instead is a
+/// root of its own: the two never meet, and the repository's `main` reads as diverged on this
+/// computer from then on. Only `main` is fetched, only with the person's own sign-in, into agit's
+/// checkout. Whether the Hub answers that the repository is missing or that this account can't read
+/// it, the result is the same new `main`, and its line never tells the two apart. In the account's
+/// own namespace a missing repository is only one its first push creates, so nothing is said there.
+/// False when a new `main` is to be made here.
+fn start_from_hub_main(repo: &Repo, owner: &str, name: &str, author: &str) -> crate::Result<bool> {
+    let slug = format!("{owner}/{name}");
+    // A first save waits on every read here, and holds its branch and session locks meanwhile, so
+    // each read gives up as resume's look at the Hub does.
+    let look = std::time::Duration::from_secs(20);
+    let client = crate::hub::Client::from_env_with_timeout(look);
+    // The read goes out only with the person's own sign-in; signed out, nothing is asked.
+    let Some(account) = client.credential_username() else {
+        return Ok(false);
+    };
+    // A save made in the background, as a folder's capture is, makes no Hub request for a
+    // destination whose automatic upload is off: only the person's own commands read it then.
+    if std::env::var_os(super::auto_push::AUTOMATIC_ENV).is_some()
+        && !super::auto_push::publication_allowed(repo, &slug)?
+    {
+        return Ok(false);
+    }
+    let unreachable = || {
+        ui::warning(&format!(
+            "couldn't reach the Hub to start from {slug}'s main; started one here. If {slug} already has a main on the Hub, pushing this one will be refused as diverged."
+        ));
+        Ok(false)
+    };
+    let remote = match client.get_agent(owner, name) {
+        Ok(remote) => remote,
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<crate::hub::client::ApiError>()
+                    .is_some_and(|api| matches!(api.status, 401 | 403 | 404))
+            }) =>
+        {
+            if account != owner {
+                ui::warning(&format!(
+                    "couldn't start from {slug}'s main on the Hub: it isn't there or you can't read it, so a new main was started here. If you should have access, ask the repository's owner."
+                ));
+            }
+            return Ok(false);
+        }
+        Err(_) => return unreachable(),
+    };
+    let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &remote.agent_id)?;
+    // The reads name the address itself: the checkout is bound to the repository only once its main
+    // is taken, since one left with an origin it didn't start from is read from on every later
+    // resume.
+    let read = |args: &[&str]| crate::hub::git::capture_for_remote(repo, args, &identity, look);
+    let Ok(listed) = read(&["ls-remote", &remote.clone_url, "refs/heads/main"]) else {
+        return unreachable();
+    };
+    // A repository `agit on` created holds no `main` until its first push.
+    if listed.trim().is_empty() {
+        return Ok(false);
+    }
+    if read(&[
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        &remote.clone_url,
+        "+refs/heads/main:refs/remotes/origin/main",
+    ])
+    .is_err()
+    {
+        return unreachable();
+    }
+    let main = repo.git(&["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"])?;
+    if !crate::domain::meta::is_file_line_at(repo, &main) {
+        repo.git(&["update-ref", "-d", "refs/remotes/origin/main"])?;
+        return Ok(false);
+    }
+    crate::hub::identity::pin(repo, &identity)?;
+    repo.set_remote(&remote.clone_url)?;
+    repo.git(&["update-ref", "refs/heads/main", &main])?;
+    if repo.current_branch().as_deref() != Some("main") {
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    }
+    repo.git(&["reset", "--hard", "-q", "refs/heads/main"])?;
+    // Commits made here carry the same author fields as on a `main` made here.
+    let (author_name, author_email) = super::commit::commit_author(repo, author)?;
+    repo.git(&["config", "user.name", &author_name])?;
+    repo.git(&["config", "user.email", &author_email])?;
+    println!(
+        "{}",
+        ui::dim(&format!("  started from {slug}'s main on the Hub"))
+    );
+    Ok(true)
 }
 
 /// The `main` file line of a repo created here: the scaffold plus the memory / skills assets of
