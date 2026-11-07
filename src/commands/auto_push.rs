@@ -50,6 +50,20 @@ pub(crate) fn publication_allowed(repo: &Repo, repository: &str) -> crate::Resul
         && !publication_explicitly_off(repository)?)
 }
 
+/// Whether this process is a background child saving into `repository` while automatic upload is
+/// off for it here, so it has no reason to ask the Hub anything.
+pub(super) fn background_with_upload_off(repository: &str) -> crate::Result<bool> {
+    if std::env::var_os(AUTOMATIC_ENV).is_none() {
+        return Ok(false);
+    }
+    let (owner, name) = super::parse_slug(repository)?;
+    match Repo::open(crate::infra::config::repo_dir(&owner, &name)?) {
+        Some(repo) => Ok(!publication_allowed(&repo, repository)?),
+        // No checkout yet: off as recorded for it, or for every repository without a setting.
+        None => publication_explicitly_off(repository),
+    }
+}
+
 /// Which setting keeps [`publication_allowed`] from letting `repo` publish to a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Off {
@@ -159,8 +173,12 @@ pub(super) fn after_settlement(
         return;
     }
     let repo = Repo::at(directory);
-    match repo.auto_push_enabled() {
-        Ok(false) => return,
+    // Off means no attempt at all, so nothing is sent and nothing is recorded or said about it.
+    match publication_allowed(&repo, slug) {
+        Ok(false) => {
+            super::upload_outcome::clear_failure_with_upload_off(slug, branch);
+            return;
+        }
         Ok(true) => {}
         Err(error) => {
             ui::warning(&format!(
@@ -323,7 +341,7 @@ fn every_background_push_is_spawned_as_automatic() {
         ),
         (
             "src/commands/project.rs",
-            r#"let args = vec!["push".into(), target, "--yes".into()];"#,
+            r#"let args = vec!["push".into(), target];"#,
             "the person's own save",
         ),
         (

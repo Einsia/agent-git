@@ -250,7 +250,8 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         );
     }
     // Admitted commands report updates outside JSON capture, keeping notices on process stderr.
-    if !skip_update && startup.allows_nudge() {
+    // A background upload has nobody to tell, and with automatic upload off asks the Hub nothing.
+    if !skip_update && startup.allows_nudge() && !matches!(command, Commands::PushAutomatic(_)) {
         commands::upgrade::maybe_startup_nudge(command_name);
     }
     // A hook's output reaches its runtime, and hooks run where setup already happened. The command

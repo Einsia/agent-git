@@ -196,6 +196,7 @@ pub fn run(args: Args) -> CmdResult {
     }
     print_upload_waits();
     print_uploads_not_through();
+    print_automatic_upload_off();
     print_held_branches();
 
     // ── Local store ──
@@ -730,6 +731,7 @@ fn structured(args: &Args) -> CmdResult {
         })),
         "upload_waits": upload_waits_json(),
         "uploads_not_through": uploads_not_through_json(),
+        "automatic_upload_off": automatic_upload_off(),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,
             "limit": limit, "next_offset": (next < links.len()).then_some(next),
@@ -1134,6 +1136,31 @@ fn inspect_command(target: &str) -> String {
     #[cfg(not(windows))]
     use crate::ui::session::shell_arg as quote_arg;
     format!("agit push {}", quote_arg(target))
+}
+
+/// Repositories a folder here would upload to by itself, while the repository's own setting keeps
+/// automatic upload off. The setting wins, and this says so: the folder's setting alone would read
+/// as though its turns were on their way.
+fn automatic_upload_off() -> Vec<String> {
+    super::clone::list_local()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(owner, name, path)| {
+            let repository = format!("{owner}/{name}");
+            let repo = Repo::open(&path)?;
+            (super::project::binds_with_automatic_upload(&repository)
+                && !super::auto_push::publication_allowed(&repo, &repository).ok()?)
+            .then_some(repository)
+        })
+        .collect()
+}
+
+fn print_automatic_upload_off() {
+    for repository in automatic_upload_off() {
+        println!(
+            "  {repository}: automatic upload is off: turns are saved here; `agit push {repository}` publishes them"
+        );
+    }
 }
 
 /// [`uploads_not_through`] as `agit status` shows it.

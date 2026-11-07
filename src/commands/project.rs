@@ -81,6 +81,18 @@ pub enum History {
     None,
 }
 
+fn last_result_without_refusal<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+    Ok(
+        Option::<serde_json::Value>::deserialize(deserializer)?.filter(|last| {
+            !last["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(super::auto_push::DISABLED_FOR_REPOSITORY))
+        }),
+    )
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Project {
@@ -105,6 +117,9 @@ struct Project {
     /// as earlier until it is saved into this repository.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     earlier_opencode: bool,
+    /// The newest upload's result. A refusal an agit that still attempted uploads with `push.auto`
+    /// off saved here is not read back: nothing failed.
+    #[serde(default, deserialize_with = "last_result_without_refusal")]
     last_result: Option<serde_json::Value>,
     /// The repository's own push.auto override as it stood before bind turned automatic push
     /// on; absent when bind did not turn it on. Unbind puts it back, so a binding never leaves
@@ -1497,6 +1512,15 @@ fn sync_one(
     {
         return Err(LeftOut.into());
     }
+    // Off means no automatic attempt at all: the turn is saved, and nothing is sent, recorded or
+    // said. A save the person asks for is still their upload: it goes as their own push, which
+    // tells them how it went.
+    let uploads_automatically =
+        project.auto_upload && super::auto_push::publication_allowed(&repo, &project.repository)?;
+    if project.auto_upload && !uploads_automatically && automatic {
+        super::upload_outcome::clear_failure_with_upload_off(&project.repository, &branch);
+        return Err(PublicationOff.into());
+    }
     // Read before the push: a commit saved while it runs may not be in it, and is not counted as
     // uploaded.
     let head = repo.git_opt(&[
@@ -1505,7 +1529,7 @@ fn sync_one(
         "--quiet",
         &format!("refs/heads/{branch}^{{commit}}"),
     ]);
-    let pushed = if project.auto_upload {
+    let pushed = if uploads_automatically {
         super::upload_outcome::recorded(
             super::upload_outcome::Place::of(&project.repository, &branch),
             head.as_deref().unwrap_or_default(),
@@ -1520,8 +1544,10 @@ fn sync_one(
         .map_err(anyhow::Error::new)
         .and_then(|pushed| pushed)
     } else {
-        // The person asked for this save: their push, which tells them how it went.
-        let args = vec!["push".into(), target, "--yes".into()];
+        // The person asked for this save: their push, which tells them how it went. Nothing here
+        // answers its questions for them, creating the repository or making it public among them:
+        // without a person to ask, the push refuses and names the command that asks.
+        let args = vec!["push".into(), target];
         retry_stale(|| child(&args, &candidate.cwd, false))
     };
     pushed?;
@@ -1599,6 +1625,19 @@ impl std::error::Error for NothingSettled {}
 /// report it again.
 #[derive(Debug)]
 struct LeftOut;
+
+/// Automatic publication is off for the project's repository, so its turns stay on this computer
+/// until the person publishes them or turns it on.
+#[derive(Debug)]
+struct PublicationOff;
+
+impl std::fmt::Display for PublicationOff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(super::auto_push::DISABLED_FOR_REPOSITORY)
+    }
+}
+
+impl std::error::Error for PublicationOff {}
 
 impl std::fmt::Display for LeftOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2967,7 +3006,7 @@ fn capture_candidate(
     let result = sync_one(&project, &candidate, automatic);
     if result
         .as_ref()
-        .is_err_and(|e| e.is::<NothingSettled>() || e.is::<LeftOut>())
+        .is_err_and(|e| e.is::<NothingSettled>() || e.is::<LeftOut>() || e.is::<PublicationOff>())
     {
         return Ok(true);
     }
@@ -3057,6 +3096,15 @@ pub(crate) fn save_now(
             )));
             continue;
         }
+        // `--all` and `--today` sweep earlier sessions, and leave out a repository whose automatic
+        // upload is off: the person uploads one of those by naming it.
+        if earlier && !named && automatic_upload_off(&project)? {
+            saved.push(Saved::Refused(format!(
+                "automatic upload is off for {}; to upload this one, name it: `agit save {}`",
+                project.repository, session_id
+            )));
+            continue;
+        }
         let outcome = match save_one(project, candidate, earlier || named) {
             Ok(outcome) => outcome,
             Err(error) => Saved::upload_failed(format!("{error:#}")),
@@ -3074,6 +3122,18 @@ pub(crate) fn save_now(
         let _ = spawn_capture(root);
     }
     Ok(saved)
+}
+
+/// Whether automatic upload is off for the project's repository on this computer: in its checkout
+/// here, or as recorded or set for every repository when it has none yet.
+fn automatic_upload_off(project: &Project) -> Result<bool> {
+    match checkout(project) {
+        Ok(repo) => Ok(!super::auto_push::publication_allowed(
+            &repo,
+            &project.repository,
+        )?),
+        Err(_) => super::auto_push::publication_explicitly_off(&project.repository),
+    }
 }
 
 /// Why a folder below the project's that is bound on its own keeps this session.
@@ -3613,6 +3673,15 @@ pub(crate) fn exclusion(slug: &str, branch: &str) -> Result<Option<Exclusion>> {
 /// Whether a project on this machine is bound to `slug`, so `project drop` can act on its branches.
 pub(crate) fn binds(slug: &str) -> bool {
     policies().is_ok_and(|projects| projects.iter().any(|p| p.repository == slug))
+}
+
+/// Whether a folder here is set to upload to `slug` by itself.
+pub(crate) fn binds_with_automatic_upload(slug: &str) -> bool {
+    policies().is_ok_and(|projects| {
+        projects
+            .iter()
+            .any(|p| p.repository == slug && p.enabled && p.auto_upload)
+    })
 }
 
 /// Withholds the branch for good, then releases its current claims: the branch keeps its local
@@ -4809,16 +4878,6 @@ fn folder_json(
             )
         })
         .count();
-    // The refusal a disabled `push.auto` produced says nothing once the folder uploads again;
-    // shown as its last result, it reads as a failure that no longer exists.
-    let shown = last.as_ref().filter(|last| {
-        !(state == "on"
-            && !last.ok
-            && last
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains(super::auto_push::DISABLED_FOR_REPOSITORY)))
-    });
     serde_json::json!({
         "folder": folder.root,
         "state": state,
@@ -4826,7 +4885,7 @@ fn folder_json(
         "repository_url": repository_url,
         "auto_push": auto_push,
         "queued": queued,
-        "last_upload": shown.map(|last| serde_json::json!({
+        "last_upload": last.as_ref().map(|last| serde_json::json!({
             "at": last.at, "ok": last.ok, "error": last.error, "session_id": last.session_id,
         })),
         "sessions_here": folder.sessions.len(),

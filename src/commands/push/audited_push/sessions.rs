@@ -147,10 +147,9 @@ pub(super) fn run(
         );
         let confirmed = yes.answers()
             || ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
-                crate::commands::InteractionRequired(
-                "cross-Hub delivery requires confirmation; use --yes or an interactive terminal"
-                    .into(),
-            )
+                crate::commands::InteractionRequired(format!(
+                    "cross-Hub delivery requires confirmation: run `{retry_command}` at an interactive terminal"
+                ))
             })?;
         if !confirmed {
             ui::info("Cross-Hub delivery cancelled.");
@@ -193,9 +192,10 @@ pub(super) fn run(
             true
         } else {
             ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
-                crate::commands::InteractionRequired(
-                    "first publication requires confirmation of repository creation; use --yes or an interactive terminal".into(),
-                )
+                // Named so the person answers it: a flag that answers it would be one an agent runs.
+                crate::commands::InteractionRequired(format!(
+                    "first publication requires confirmation of repository creation: run `{retry_command}` at an interactive terminal"
+                ))
             })?
         };
         if !confirmed {

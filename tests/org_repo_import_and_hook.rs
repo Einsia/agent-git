@@ -57,6 +57,14 @@ fn fake_hub(
             }
             let req = String::from_utf8_lossy(&buf).into_owned();
             let line = req.lines().next().unwrap_or_default().to_string();
+            // What was asked, for a test that counts requests to say which.
+            if let Ok(mut log) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(clone_url.with_file_name("hub-requests.log"))
+            {
+                let _ = writeln!(log, "{line}");
+            }
             let authed =
                 !signed_out.exists() && req.to_ascii_lowercase().contains("authorization: bearer ");
             let path = line
@@ -160,6 +168,30 @@ fn fake_hub(
         }
     });
     base
+}
+
+struct StatisticsSink {
+    host: String,
+}
+
+impl StatisticsSink {
+    fn each(&self) -> [(&str, &str); 2] {
+        [
+            ("AGIT_TELEMETRY_HOST", self.host.as_str()),
+            ("AGIT_TELEMETRY_KEY", "test_key"),
+        ]
+    }
+}
+
+/// The Hub was asked nothing since `asked`, a version probe included, and statistics stayed home.
+/// A flush runs detached, so it gets time to arrive.
+fn assert_nothing_sent(lab: &Lab, asked: &str, statistics: &TcpListener, told: &str) {
+    assert_eq!(lab.hub_log(), asked, "{told}");
+    let settled = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < settled {
+        assert!(statistics.accept().is_err(), "statistics were sent: {told}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 struct Lab {
@@ -280,6 +312,31 @@ impl Lab {
             .write_all(payload.to_string().as_bytes())
             .unwrap();
         child.wait_with_output().unwrap()
+    }
+
+    /// Everything the stand-in Hub was asked so far, version probes included.
+    fn hub_log(&self) -> String {
+        fs::read_to_string(self.clone_url.with_file_name("hub-requests.log")).unwrap_or_default()
+    }
+
+    /// Statistics turned on, with a local sink to send them to.
+    fn statistics_sink(&self) -> (TcpListener, StatisticsSink) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let telemetry = self.agit_home.join("telemetry");
+        fs::create_dir_all(&telemetry).unwrap();
+        fs::write(
+            telemetry.join("preferences.json"),
+            serde_json::json!({
+                "preference": "enabled", "generation": 1, "device_id": uuid::Uuid::new_v4(),
+                "decision_source": "explicit_enable",
+                "notice_version": agit::telemetry::state::NOTICE_VERSION,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (listener, StatisticsSink { host })
     }
 
     fn transcript(&self, session_id: &str) -> std::path::PathBuf {
@@ -3888,6 +3945,337 @@ fn a_folder_never_uploads_a_conversation_with_no_finished_turn() {
     assert!(claim.branch.is_some(), "{claim:?}");
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&policy).unwrap()).unwrap();
     assert!(state["last_result"].is_null(), "{state}");
+}
+
+/// With the repository's `push.auto` off, a folder with automatic upload on still saves each turn,
+/// and that is all: the Hub hears nothing, statistics included, and no attempt is recorded or told.
+/// A worker that tried anyway would leave its refusal in the project's state and an upload record,
+/// and one that reached the Hub first would count here.
+#[test]
+fn with_automatic_upload_off_a_folder_saves_and_contacts_nothing() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    let policy = state.with_extension("json");
+    // The refusal an earlier agit left here goes too.
+    fs::write(
+        &policy,
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")],
+            "last_result": {"at": "2026-11-06T00:00:00Z", "ok": false, "session_id": SID,
+                "error": "push failed: automatic publication is disabled for this repository"},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let requests = lab.hub_requests.load(Ordering::SeqCst);
+    let (statistics, sink) = lab.statistics_sink();
+    let asked = lab.hub_log();
+
+    let fresh = "dddddddd-0000-4000-8000-000000000006";
+    lab.append_turn(fresh, 1, "work on it", "done");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.with_extension("capture"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let sink = sink.each();
+    let stopped = lab.hook("settle", fresh, &[], &sink);
+    assert!(stopped.status.success(), "{stopped:?}");
+    drop(lock);
+    let worker = lab
+        .agit(&["--quiet", "project", "capture"])
+        .arg(&lab.work)
+        .envs(sink.iter().copied())
+        .output()
+        .unwrap();
+    assert!(worker.status.success(), "{worker:?}");
+
+    let told = format!(
+        "{}{}{}{}",
+        String::from_utf8_lossy(&stopped.stdout),
+        String::from_utf8_lossy(&stopped.stderr),
+        String::from_utf8_lossy(&worker.stdout),
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    assert!(!told.contains("automatic upload"), "{told}");
+    assert!(!told.contains("disabled"), "{told}");
+    assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests, "{told}");
+    assert_nothing_sent(&lab, &asked, &statistics, &told);
+    // The turn is saved, on the branch the conversation was given.
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claim = agit::domain::link::get(&store, "claude-code", fresh).expect("the turn is saved");
+    let branch = claim.branch.expect("the turn is saved on a branch");
+    assert!(
+        checkout
+            .git(&["log", "--format=%s", &format!("refs/heads/{branch}")])
+            .unwrap()
+            .contains("work on it"),
+    );
+    // No attempt left a record, and the earlier refusal is gone once saved over or read past.
+    assert!(!lab.agit_home.join("projects/uploads").exists());
+    // Status says the setting once, and nothing failed.
+    let status = lab.agit(&["status"]).output().unwrap();
+    let said = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        said.contains(
+            "einsia/qa: automatic upload is off: turns are saved here; `agit push einsia/qa` publishes them"
+        ),
+        "{status:?}"
+    );
+    assert!(!said.contains("failed"), "{status:?}");
+    assert!(!said.contains("didn't go through"), "{status:?}");
+    let listed = lab.agit(&["--json", "project", "list"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("disabled for this repository"),
+        "{listed:?}"
+    );
+    // The sink is live: a flush of what ordinary commands queue does reach it, so its silence above
+    // counts.
+    let ordinary = lab
+        .agit(&["status"])
+        .envs(sink.iter().copied())
+        .output()
+        .unwrap();
+    assert!(ordinary.status.success(), "{ordinary:?}");
+    let flush = lab
+        .agit(&["--internal-telemetry-flush"])
+        .envs(sink.iter().copied())
+        .output()
+        .unwrap();
+    assert!(flush.status.success(), "{flush:?}");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while statistics.accept().is_err() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the statistics sink never heard anything"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// An explicit save is the person's own upload, even with the repository's automatic upload off,
+/// and what it reports is what the Hub received. This Hub takes no upload, so the save must not
+/// say the conversation was uploaded or link to it there, must create no repository, must meet the
+/// refusal `agit push` meets and name no flag that answers for the person, and must leave the
+/// setting off. A sweep of earlier sessions leaves the repository out and says to name the session.
+/// A save that skipped the upload as the background does, then read the empty result as success,
+/// would claim an upload that never happened.
+#[test]
+fn an_explicit_save_with_automatic_upload_off_reports_what_the_hub_received() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        state.with_extension("json"),
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let id = "dddddddd-0000-4000-8000-000000000007";
+    lab.append_turn(id, 1, "plan the release", "done");
+    // A stand-in `claude`, so the runtime counts as installed and its conversations are found.
+    let bin = lab.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    let out = lab
+        .agit(&["--json", "save", id])
+        .env("PATH", &path)
+        .env_remove("AGIT_YES")
+        .output()
+        .unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let session = document["result"]["value"]["sessions"][0].clone();
+    assert_eq!(session["session_id"], id, "{document}");
+    assert_ne!(session["status"], "uploaded", "{document}");
+    assert!(session["link"].is_null(), "{document}");
+    let asked = lab.hub_log();
+    assert!(
+        !asked.contains("POST /api/agents"),
+        "no repository is created: {asked}"
+    );
+    assert!(
+        !asked.contains("POST /einsia/qa.git/git-receive-pack"),
+        "nothing is received: {asked}"
+    );
+    let saved_why = session["error"].as_str().unwrap_or_default().to_owned();
+    assert!(!saved_why.is_empty(), "{document}");
+    assert!(
+        !saved_why.contains("--yes") && !saved_why.contains(" -y"),
+        "{saved_why}"
+    );
+    // It went the way `agit push` goes, and met the same refusal there.
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let branch = agit::domain::link::get(&store, "claude-code", id)
+        .and_then(|link| link.branch)
+        .unwrap_or_else(|| panic!("the save saved the conversation on a branch: {document}"));
+    let pushed = lab
+        .agit(&["--json", "push", &format!("einsia/qa@{branch}")])
+        .env_remove("AGIT_YES")
+        .output()
+        .unwrap();
+    assert!(!pushed.status.success(), "{pushed:?}");
+    let pushed: serde_json::Value = serde_json::from_slice(&pushed.stdout).unwrap();
+    let push_why = pushed["diagnostics"]["stderr"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|line| line["level"] == "error")
+        .and_then(|line| line["message"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(!push_why.is_empty(), "{pushed}");
+    assert!(
+        saved_why.contains(&push_why),
+        "save: {saved_why}\npush: {push_why}"
+    );
+    // The setting is as it was: the next turn's upload stays off.
+    assert!(!checkout.auto_push_enabled().unwrap());
+    let policy: serde_json::Value =
+        serde_json::from_slice(&fs::read(state.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(policy["auto_upload"], true, "{policy}");
+
+    // A sweep of earlier sessions leaves this repository out and says to name the session.
+    lab.append_turn(
+        "dddddddd-0000-4000-8000-000000000008",
+        1,
+        "write the notes",
+        "done",
+    );
+    let swept = lab
+        .agit(&["--json", "save", "--all"])
+        .env("PATH", &path)
+        .env_remove("AGIT_YES")
+        .output()
+        .unwrap();
+    let swept = String::from_utf8_lossy(&swept.stdout).into_owned();
+    assert!(
+        swept.contains("automatic upload is off for einsia/qa; to upload this one, name it"),
+        "{swept}"
+    );
+    assert!(!swept.contains("\"uploaded\""), "{swept}");
+}
+
+/// `push.auto` off holds before the repository has a checkout here, so the first background save
+/// into it asks the Hub nothing either, and the turn is saved.
+#[test]
+fn with_automatic_upload_off_a_first_background_save_contacts_nothing() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let off = lab
+        .agit(&["config", "--repo", "einsia/qa", "push.auto", "false"])
+        .output()
+        .unwrap();
+    assert!(off.status.success(), "{off:?}");
+    assert!(Repo::open(lab.repo("einsia", "qa")).is_none());
+    let asked = lab.hub_log();
+
+    let saved = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .env("AGIT_AUTO_PUSH", "1")
+        .output()
+        .unwrap();
+    assert!(saved.status.success(), "{saved:?}");
+
+    assert_eq!(lab.hub_log(), asked, "{saved:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).expect("the save made the checkout");
+    assert!(checkout.git(&["rev-parse", "refs/heads/work"]).is_ok());
+    assert!(!lab.agit_home.join("projects/uploads").exists());
+}
+
+/// The turn-end path: a conversation with its own branch and `push.auto` off settles its turn and
+/// asks the Hub nothing, records nothing and says nothing about uploading.
+#[test]
+fn with_automatic_upload_off_a_turn_end_contacts_nothing() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let before = checkout.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    let requests = lab.hub_requests.load(Ordering::SeqCst);
+    let (statistics, sink) = lab.statistics_sink();
+    let asked = lab.hub_log();
+
+    lab.append_turn(SID, 2, "keep going", "ok");
+    let stopped = lab.hook("settle", SID, &[], &sink.each());
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    assert_ne!(
+        checkout.git(&["rev-parse", "refs/heads/work"]).unwrap(),
+        before,
+        "{stopped:?}"
+    );
+    let told = String::from_utf8_lossy(&stopped.stderr);
+    assert_eq!(lab.hub_requests.load(Ordering::SeqCst), requests, "{told}");
+    assert_nothing_sent(&lab, &asked, &statistics, &told);
+    assert!(!lab.agit_home.join("projects/uploads").exists());
+    assert!(!told.contains("automatic"), "{told}");
 }
 
 /// Saving on this computer never waits on the sign-in. While the Hub refuses this device's
