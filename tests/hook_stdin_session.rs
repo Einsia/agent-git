@@ -1350,6 +1350,107 @@ fn a_codex_conversation_gets_the_team_memory_only_from_its_own_launch() {
     assert_eq!(context(&leaked), None, "{leaked}");
 }
 
+/// A runtime agit launches runs the agent's tools in its own process, so the agit commands they run
+/// get the launch's variables and never this command's own flags: `agit -y -q --no-tui new` and
+/// `agit -y -q --no-tui resume` reach the runtime with `AGIT_SESSION` (and, for Codex, its
+/// `AGIT_LAUNCH`) and without `AGIT_YES`, `AGIT_QUIET` or `AGIT_TUI`. A Codex whose help offers
+/// `--no-daemon` is launched with it, outside its shared background server, whose hooks hold the
+/// variables of whatever started that server; one without the flag is launched as before. A launch
+/// that kept `-y` would confirm every agit command the agent runs, pushes included; a launch into the
+/// shared server would leave the conversation without its branch and its team memory.
+#[cfg(unix)]
+#[test]
+fn a_launched_runtime_gets_its_launch_but_not_this_commands_flags() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const E: &str = "eeeeeeee-0000-4000-8000-000000000005";
+    let lab = Lab::new();
+    lab.run(&["init", "qa"]);
+    lab.append(E, &lab.turn(E, 1, "E turn 1", "E answer 1"));
+    lab.run(&[
+        "import",
+        E,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@resumed",
+        "--independent",
+    ]);
+    let args = lab.home.join("launched.args");
+    let names = lab.home.join("launched.env");
+    // A stand-in runtime: it answers `--help` as a Codex with or without the flag, and otherwise
+    // records its arguments and the names of the AGIT variables it was started with.
+    let stand_in = |name: &str, help: &str| -> std::ffi::OsString {
+        let bin = lab.home.join(format!("bin-{name}-{}", help.len()));
+        fs::create_dir_all(&bin).unwrap();
+        let program = bin.join(name);
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --help ]; then printf '{help}'; exit 0; fi\n\
+                 printf '%s\\n' \"$@\" > '{}'\n\
+                 env | sed -n 's/^\\(AGIT_[A-Z_]*\\)=.*/\\1/p' > '{}'\n",
+                args.display(),
+                names.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap()
+    };
+    let launched = |path: std::ffi::OsString, command: &[&str]| -> (Vec<String>, Vec<String>) {
+        let _ = fs::remove_file(&args);
+        let _ = fs::remove_file(&names);
+        let out = lab.agit(command).env("PATH", path).output().unwrap();
+        assert!(out.status.success(), "{command:?}: {out:?}");
+        let lines = |file: &std::path::Path| -> Vec<String> {
+            fs::read_to_string(file)
+                .unwrap_or_else(|error| panic!("{command:?} reached no runtime: {error}"))
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        (lines(&args), lines(&names))
+    };
+    let flags = ["-y", "-q", "--no-tui"];
+    let without_flags = |names: &[String], command: &str| {
+        for flag in ["AGIT_YES", "AGIT_QUIET", "AGIT_TUI"] {
+            assert!(
+                !names.iter().any(|name| name == flag),
+                "{command}: {names:?}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name == "AGIT_SESSION"),
+            "{command}: {names:?}"
+        );
+    };
+
+    for (branch, help, expected) in [
+        (
+            "offered",
+            "  --no-daemon\\n      Run without the shared background server\\n",
+            vec!["--no-daemon"],
+        ),
+        ("older", "Usage: codex [OPTIONS] [PROMPT]\\n", vec![]),
+    ] {
+        let command = [&flags[..], &["new", "me/qa", "-b", branch, "--as", "codex"]].concat();
+        let (arguments, names) = launched(stand_in("codex", help), &command);
+        assert_eq!(arguments, expected, "{branch}");
+        without_flags(&names, branch);
+        assert!(
+            names.iter().any(|name| name == "AGIT_LAUNCH"),
+            "{branch}: {names:?}"
+        );
+    }
+    let command = [&flags[..], &["resume", "me/qa@resumed"]].concat();
+    let (_, names) = launched(stand_in("claude", ""), &command);
+    without_flags(&names, "resume");
+}
+
 /// Codex runs every conversation's hooks in one shared process, which keeps the variables of
 /// whichever agit launch started it. A fresh Codex conversation holds the branch only its own
 /// launch made a claim for, and only once: a second conversation under the same variables, in the

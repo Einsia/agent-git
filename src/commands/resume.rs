@@ -2697,6 +2697,23 @@ fn wrap_launch(inner: &str, cwd: &Path, slug: &str, branch: &str) -> String {
     )
 }
 
+/// What one agit command's own flags put in its process (`-y`, `-q`, `--tui`, `--no-tui`, `--json`)
+/// so that the agit commands it runs follow them. A runtime agit launches runs the agent's tools in
+/// its own process, and the agit commands those tools run are the agent's, not this command's:
+/// with `AGIT_YES` every one of them would confirm itself, pushes and publications included.
+const INVOCATION_ONLY: [&str; 3] = ["AGIT_YES", "AGIT_QUIET", "AGIT_TUI"];
+
+/// The shell that launches a runtime with `cmd`, without [`INVOCATION_ONLY`]. Every launch of a
+/// runtime goes through it; the person's own environment and the variables `cmd` exports pass.
+pub(crate) fn runtime_launch(cmd: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    for name in INVOCATION_ONLY {
+        command.env_remove(name);
+    }
+    command
+}
+
 /// The finish: print or launch.
 fn finish(res: Resumed, no_launch: bool) -> CmdResult {
     finish_pub(res, no_launch)
@@ -2714,10 +2731,7 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
             let (slug, branch) = &res.session;
             let launch = super::upload_outcome::launching(slug, branch);
             let started = std::time::Instant::now();
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .status();
+            let status = runtime_launch(&cmd).status();
             crate::telemetry::operation(
                 crate::telemetry::Operation::RuntimeLaunch,
                 status.as_ref().is_ok_and(std::process::ExitStatus::success),

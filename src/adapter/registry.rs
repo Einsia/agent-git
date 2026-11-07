@@ -82,13 +82,8 @@ mod tests {
                 .is_none()
         );
         assert!(super::super::get("unknown-runtime").is_err());
-        assert_eq!(
-            super::super::get("cx")
-                .unwrap()
-                .start_command(cwd)
-                .as_deref(),
-            Some("codex")
-        );
+        let codex = super::super::get("cx").unwrap().start_command(cwd).unwrap();
+        assert_eq!(codex.split_whitespace().next(), Some("codex"), "{codex}");
     }
 
     #[cfg(unix)]

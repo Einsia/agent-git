@@ -64,15 +64,13 @@ pub(in crate::commands::merge) fn start(
         &binding.role.branch,
         prompt,
     )?;
-    let mut command = Command::new("sh");
+    let mut command = resume::runtime_launch(
+        resumed
+            .cmd
+            .as_deref()
+            .context("archive command is missing")?,
+    );
     command
-        .arg("-c")
-        .arg(
-            resumed
-                .cmd
-                .as_deref()
-                .context("archive command is missing")?,
-        )
         .env(mergetx::ENV, format!("{slug}@{}", tx.target))
         .env(mergetx::GENERATION_ENV, &binding.role.generation)
         .env(

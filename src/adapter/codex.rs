@@ -49,6 +49,68 @@ pub(crate) fn resume_command(sid: &str, cwd: &Path) -> String {
     format!("codex resume {} --cd '{cwd}'", super::shell_id(sid))
 }
 
+/// Codex's flag for a conversation that runs outside its shared background server.
+const NO_DAEMON: &str = "--no-daemon";
+/// How long `codex --help` may take before that Codex is taken not to have the flag.
+const HELP_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How much of `codex --help` is read for the flag.
+const HELP_BYTES: u64 = 1 << 20;
+
+/// What an agit launch of Codex adds to its command: [`NO_DAEMON`] when the installed Codex has
+/// it. A Codex with a shared background server runs each conversation there, hooks and tools
+/// included, with the environment of whatever started the server. Launched into it, a
+/// conversation carries none of the launch's variables to its session-start hook, so it neither
+/// claims its branch nor receives the team memory; and a server that agit's own launch starts
+/// keeps that launch's variables for every later conversation. With the flag, the conversation
+/// runs in the process agit started, with that launch's variables only.
+fn outside_shared_server() -> &'static str {
+    static FLAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| {
+        if offers_no_daemon() {
+            format!(" {NO_DAEMON}")
+        } else {
+            String::new()
+        }
+    })
+}
+
+/// Whether the `codex` on PATH lists [`NO_DAEMON`] in its help. A Codex that can't be run or
+/// doesn't answer in time is taken not to have it, and is launched as an older Codex is.
+fn offers_no_daemon() -> bool {
+    use std::io::Read as _;
+    let Some(codex) = super::which("codex") else {
+        return false;
+    };
+    let Ok(mut child) = std::process::Command::new(codex)
+        .arg("--help")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let output = child.stdout.take();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(output) = output {
+            let _ = output.take(HELP_BYTES).read_to_end(&mut text);
+        }
+        let _ = sender.send(text);
+    });
+    let answer = receiver.recv_timeout(HELP_ANSWER_LIMIT);
+    // Ended either way: one that hasn't answered is not waited for again.
+    let _ = child.kill();
+    let _ = child.wait();
+    // The flag as a word of its own, not the start of a longer option.
+    answer.is_ok_and(|text| {
+        String::from_utf8_lossy(&text)
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .any(|word| word == NO_DAEMON)
+    })
+}
+
 /// Whether this text holds a `task_started` record, which a rollout writer puts ahead of every
 /// native execution. Such a writer closes each execution with `task_complete` or
 /// `turn_aborted`, so its work after the last of those is unfinished even where none is in the
@@ -848,7 +910,7 @@ impl Adapter for Codex {
     }
 
     fn start_command(&self, _cwd: &Path) -> Option<String> {
-        Some("codex".into())
+        Some(format!("codex{}", outside_shared_server()))
     }
 
     fn requires_turn_end(&self) -> bool {
@@ -863,6 +925,7 @@ impl Adapter for Codex {
         _system: Option<&str>,
     ) -> Option<String> {
         let mut command = resume_command(id, cwd);
+        command.push_str(outside_shared_server());
         #[cfg(feature = "cli")]
         if let Some(provider) = super::codex_provider::resume_override(id, cwd) {
             let value = serde_json::to_string(&provider).ok()?;
