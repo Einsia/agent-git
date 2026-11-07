@@ -15,6 +15,25 @@ pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
+/// Set, a wait for a state lock that lasts longer than [`DIAGNOSED_WAIT`] writes one line to
+/// stderr when it ends: which lock, its path, this process's id and how long it waited. No state
+/// content. It is for finding a hidden holder in a test run, and off otherwise.
+pub const LOCK_DIAGNOSTICS_ENV: &str = "AGIT_DIAGNOSE_LOCK_WAITS";
+const DIAGNOSED_WAIT: Duration = Duration::from_secs(1);
+
+/// Says a long wait for `what` at `path` ended, when [`LOCK_DIAGNOSTICS_ENV`] is set.
+fn diagnose_wait(what: &str, path: &Path, started: Instant, outcome: &str) {
+    let waited = started.elapsed();
+    if waited >= DIAGNOSED_WAIT && std::env::var_os(LOCK_DIAGNOSTICS_ENV).is_some() {
+        eprintln!(
+            "agit lock wait: {what} ({}) process {} waited {:.1}s, {outcome}",
+            path.display(),
+            std::process::id(),
+            waited.as_secs_f64()
+        );
+    }
+}
+
 /// How long a command waits without a word for a lock whose holder may be waiting for input
 /// before it says what it is waiting for (see [`lock_patiently`]).
 pub const LOCK_NOTICE: Duration = Duration::from_secs(2);
@@ -123,12 +142,17 @@ pub fn is_contended(error: &std::io::Error) -> bool {
 /// release it. A lock held past the wait is reported as [`LocalStateError::Contended`] instead of
 /// blocking the command without bound.
 pub fn lock_exclusive(file: &std::fs::File, path: &Path, what: &'static str) -> crate::Result<()> {
-    let deadline = Instant::now() + LOCK_WAIT;
+    let started = Instant::now();
+    let deadline = started + LOCK_WAIT;
     loop {
         match fs2::FileExt::try_lock_exclusive(file) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                diagnose_wait(what, path, started, "acquired");
+                return Ok(());
+            }
             Err(error) if is_contended(&error) => {
                 if Instant::now() >= deadline {
+                    diagnose_wait(what, path, started, "gave up");
                     return Err(LocalStateError::Contended {
                         what,
                         path: path.to_owned(),
@@ -159,10 +183,14 @@ pub fn lock_patiently(
             fs2::FileExt::try_lock_shared(file)
         }
     };
-    let notice = Instant::now() + LOCK_NOTICE;
+    let started = Instant::now();
+    let notice = started + LOCK_NOTICE;
     loop {
         match attempt() {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                diagnose_wait(what, path, started, "acquired");
+                return Ok(());
+            }
             Err(error) if is_contended(&error) && Instant::now() < notice => {
                 std::thread::sleep(LOCK_POLL);
             }
@@ -179,12 +207,18 @@ pub fn lock_patiently(
         "waiting for another agit process to release {what} ({}); it is released when that process exits, so do not delete it{holder}",
         path.display()
     ));
-    if exclusive {
+    let locked = if exclusive {
         fs2::FileExt::lock_exclusive(file)
     } else {
         fs2::FileExt::lock_shared(file)
-    }
-    .map_err(|error| io_failure("cannot lock", path, error))
+    };
+    diagnose_wait(
+        what,
+        path,
+        started,
+        if locked.is_ok() { "acquired" } else { "failed" },
+    );
+    locked.map_err(|error| io_failure("cannot lock", path, error))
 }
 
 /// A lock taken without waiting, released when the guard drops.
