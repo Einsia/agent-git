@@ -79,14 +79,14 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint(&format!("fetch it first: `agit clone {owner}/{name}`"));
         return Ok(ExitCode::Precondition);
     };
-    if repo.remote("origin").is_none() {
+    let client = crate::hub::Client::from_env();
+    if repo.remote("origin").is_none() && !bind_origin(&repo, &client, &owner, &name) {
         ui::error("this repo has no origin remote (never pushed / purely local).");
         ui::hint("create the remote first with `agit push`");
         return Ok(ExitCode::Precondition);
     }
 
     // 1. fetch.
-    let client = crate::hub::Client::from_env();
     let identity =
         match crate::hub::identity::resolve_transport_target(&repo, &client, &owner, &name) {
             Ok(identity) => identity,
@@ -417,6 +417,26 @@ pub(super) fn align_to_published(
     drop(branch_guard);
     super::migration::finish_external_history_update(repo, history_update)?;
     Ok(alignment)
+}
+
+/// Gives `repo`, the checkout of `owner/name` that has no origin yet, the Hub's repository of that
+/// name as its origin, and whether it did. A checkout started while this computer couldn't reach
+/// the Hub, or couldn't read the repository, has none until its first upload, and the pull that
+/// brings the Hub's `main` in comes before that upload. One already bound to another repository
+/// of the Hub is left as it is.
+fn bind_origin(repo: &Repo, client: &crate::hub::Client, owner: &str, name: &str) -> bool {
+    let bound = || -> crate::Result<bool> {
+        let remote = client.get_agent(owner, name)?;
+        let identity = crate::hub::identity::RemoteIdentity::new(client.base(), &remote.agent_id)?;
+        match crate::hub::identity::read(repo)? {
+            Some(pinned) if pinned != identity => return Ok(false),
+            Some(_) => {}
+            None => crate::hub::identity::pin(repo, &identity)?,
+        }
+        repo.set_remote(&remote.clone_url)?;
+        Ok(true)
+    };
+    bound().unwrap_or(false)
 }
 
 /// The local commit the Hub's tip `remote` of `branch` publishes, when the accepted publication

@@ -3956,6 +3956,40 @@ pub(super) fn commit_tree_authored(
     )
 }
 
+/// A commit of `tree` on `parents` with a fixed identity and date, so the same tree and parents
+/// always make the same commit. It is what a merge is drawn against, never a commit of anyone's
+/// history.
+pub(super) fn fixed_commit(
+    repo: &Repo,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+) -> Result<String> {
+    crate::domain::repo::integrity::refuse_damaged_parents(repo, parents)?;
+    // A signature carries the time it was made, so a configured signing key would make every
+    // commit of the same tree another one.
+    let mut args = vec!["commit-tree", "--no-gpg-sign", tree];
+    for parent in parents {
+        args.extend(["-p", *parent]);
+    }
+    args.extend(["-m", message]);
+    Ok(raw_git_with_env(
+        repo,
+        &args,
+        None,
+        &[
+            ("GIT_AUTHOR_NAME", "agit"),
+            ("GIT_AUTHOR_EMAIL", "agit@localhost"),
+            ("GIT_AUTHOR_DATE", "@0 +0000"),
+            ("GIT_COMMITTER_NAME", "agit"),
+            ("GIT_COMMITTER_EMAIL", "agit@localhost"),
+            ("GIT_COMMITTER_DATE", "@0 +0000"),
+        ],
+    )?
+    .trim()
+    .to_string())
+}
+
 fn commit_tree_with_env(
     repo: &Repo,
     tree: &str,

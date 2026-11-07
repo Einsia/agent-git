@@ -129,7 +129,25 @@ fn command(repo: &Repo) -> Command {
     command
 }
 
-fn draft(repo: &Repo, target: &str, source: &str) -> Result<Draft> {
+/// The merge of `target` and `source`, drawn against `base` when one is given; otherwise git finds
+/// their common ancestor itself.
+fn draft(repo: &Repo, target: &str, source: &str, base: Option<&str>) -> Result<Draft> {
+    // The git this runs on may predate `merge-tree --merge-base`, so a given base is the one
+    // parent of a stand-in for each side's tree, and git finds it as theirs.
+    let sides = match base {
+        Some(base) => {
+            let stand_in = |side: &str| {
+                let tree = repo.git(&["rev-parse", "--verify", &format!("{side}^{{tree}}")])?;
+                super::super::plumbing::fixed_commit(repo, &tree, &[base], "agit: merge side")
+            };
+            Some((stand_in(target)?, stand_in(source)?))
+        }
+        None => None,
+    };
+    let (target, source) = match &sides {
+        Some((target, source)) => (target.as_str(), source.as_str()),
+        None => (target, source),
+    };
     let mut child = command(repo)
         .args([
             "merge-tree",
@@ -162,8 +180,120 @@ fn draft(repo: &Repo, target: &str, source: &str) -> Result<Draft> {
     Ok(draft)
 }
 
-pub(super) fn conflicts(repo: &Repo, target: &str, source: &str) -> Result<BTreeSet<String>> {
-    Ok(draft(repo, target, source)?
+/// The subject of the one commit of a `main` this computer started on its own: import's, when the
+/// Hub's `main` couldn't be read, and `agit init`'s.
+const STARTED_HERE: &str = "agit: init (main file line)";
+
+/// A `main` this computer started on its own, which shares no history with the `main` it is
+/// pulled from.
+pub(super) struct StartedHere {
+    /// The fixed base its merge is drawn against: what the start holds exactly as agit's scaffold
+    /// writes it. That takes the other side's version, and what the person added at the start, or
+    /// changed from the scaffold, is carried in.
+    pub(super) base: String,
+    /// The files the person added at its start, or changed from the scaffold, which the merge
+    /// carries in.
+    pub(super) carried: Vec<String>,
+}
+
+/// `target` as a `main` started on this computer, when it shares no history with `source`: a
+/// single root commit with [`STARTED_HERE`]'s subject. `None` for any other shape, and whenever
+/// the two share history, where git finds the base itself. Whether anything ever published
+/// `target` is the caller's to check.
+pub(super) fn started_here(repo: &Repo, target: &str, source: &str) -> Result<Option<StartedHere>> {
+    let related = command(repo)
+        .args(["merge-base", target, source])
+        .stdout(Stdio::null())
+        .status()?;
+    match related.code() {
+        Some(0) => return Ok(None),
+        Some(1) => {}
+        _ => anyhow::bail!("couldn't compare the histories of the two file branches"),
+    }
+    let commit = repo.git(&["rev-list", "--parents", "-n", "1", target])?;
+    if commit.split_whitespace().count() != 1
+        || repo.git(&["log", "-1", "--format=%s", target])? != STARTED_HERE
+    {
+        return Ok(None);
+    }
+    let scaffold = tempfile::tempdir()?;
+    super::super::init::scaffold(scaffold.path())?;
+    // The base holds what the start holds exactly as the scaffold writes it, so the other side's
+    // version of it wins, its removal included. Anything else at the start is the person's,
+    // added: carried in where the other side has nothing there, and a conflict where it has
+    // something else.
+    let held = names(repo.git_bytes_result(&["ls-tree", "-r", "-z", "--name-only", target])?)?;
+    let mut edits = Vec::with_capacity(held.len());
+    for path in held {
+        let written = scaffold.path().join(&path);
+        let written = written
+            .is_file()
+            .then(|| std::fs::read(&written))
+            .transpose()?;
+        let unchanged = match written {
+            Some(written) => {
+                repo.git_bytes_result(&["cat-file", "blob", &format!("{target}:{path}")])?
+                    == written
+            }
+            None => false,
+        };
+        if !unchanged {
+            edits.push((path, None));
+        }
+    }
+    let tree = super::super::plumbing::tree_apply_owned(repo, target, edits)?;
+    let base = super::super::plumbing::fixed_commit(repo, &tree, &[], "agit: scaffold")?;
+    let carried = names(repo.git_bytes_result(&[
+        "diff-tree",
+        "-r",
+        "-z",
+        "--name-only",
+        "--no-renames",
+        &base,
+        target,
+    ])?)?
+    .into_iter()
+    .filter(|path| !meta::is_storage_path(path) && path != meta::ATTRS_FILE)
+    .collect();
+    Ok(Some(StartedHere { base, carried }))
+}
+
+/// The base a transaction's file merge of `target` and `source` is drawn against: the fixed one
+/// [`started_here`] gives when they share no history, which must be the one the transaction
+/// recorded. `None` when they share history, and git finds the base itself.
+pub(super) fn base_of(
+    repo: &Repo,
+    target: &str,
+    source: &str,
+    recorded: &str,
+) -> Result<Option<String>> {
+    let Some(started) = started_here(repo, target, source)? else {
+        return Ok(None);
+    };
+    ensure!(
+        started.base == recorded,
+        "the merge transaction's base is not the one agit draws for a main started here"
+    );
+    Ok(Some(started.base))
+}
+
+/// Paths of a `-z` listing.
+fn names(listing: Vec<u8>) -> Result<Vec<String>> {
+    let text = String::from_utf8(listing).context("file listing is not Unicode")?;
+    Ok(text
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+pub(super) fn conflicts(
+    repo: &Repo,
+    target: &str,
+    source: &str,
+    base: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    Ok(draft(repo, target, source, base)?
         .conflicts
         .into_iter()
         .filter(|path| !meta::is_storage_path(path))
@@ -174,10 +304,11 @@ pub(super) fn tree(
     repo: &Repo,
     target: &str,
     source: &str,
+    base: Option<&str>,
     shared: &[String],
     resolved: &[String],
 ) -> Result<String> {
-    let draft = draft(repo, target, source)?;
+    let draft = draft(repo, target, source, base)?;
     let conflicts: Vec<_> = draft
         .conflicts
         .iter()
@@ -259,6 +390,66 @@ pub(super) fn tree(
 mod tests {
     use super::*;
 
+    /// Only a `main` that is one root commit of agit's start, sharing no history with the other
+    /// side, is drawn against the scaffold; its base holds the scaffold the start didn't change,
+    /// and what the person added or changed is carried.
+    #[test]
+    fn only_a_start_of_its_own_is_drawn_against_the_scaffold() {
+        use crate::commands::plumbing;
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        crate::commands::init::scaffold(repo.root()).unwrap();
+        std::fs::write(repo.root().join("AGENTS.md"), "My instructions\n").unwrap();
+        std::fs::write(repo.root().join("memory/mine.md"), "A fact of mine\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit(STARTED_HERE).unwrap();
+        let start = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let hub_tree = plumbing::tree_apply_owned(
+            &repo,
+            &start,
+            vec![("README.md".into(), Some(b"Shared\n".to_vec()))],
+        )
+        .unwrap();
+        let hub = plumbing::commit_tree(&repo, &hub_tree, &[], "File line").unwrap();
+
+        let started = started_here(&repo, &start, &hub).unwrap().unwrap();
+        assert_eq!(started.carried, ["AGENTS.md", "memory/mine.md"]);
+        let base = repo.ls_tree(&started.base);
+        assert!(base.contains(&"memory/.gitkeep".to_owned()), "{base:?}");
+        assert!(base.contains(&"skills/.gitkeep".to_owned()), "{base:?}");
+        for added in ["AGENTS.md", "memory/mine.md"] {
+            assert!(!base.contains(&added.to_owned()), "{base:?}");
+        }
+        // The same start gives the same base, so a transaction can be continued against it.
+        assert_eq!(
+            started_here(&repo, &start, &hub).unwrap().unwrap().base,
+            started.base
+        );
+        assert!(
+            base_of(&repo, &start, &hub, &started.base)
+                .unwrap()
+                .is_some()
+        );
+        assert!(base_of(&repo, &start, &hub, &hub).is_err());
+
+        // A main that went on after its start, one that isn't agit's start, and one that shares
+        // history with the other side are not.
+        let start_tree = repo
+            .git(&["rev-parse", &format!("{start}^{{tree}}")])
+            .unwrap();
+        let later = plumbing::commit_tree(&repo, &start_tree, &[&start], "later").unwrap();
+        let other = plumbing::commit_tree(&repo, &start_tree, &[], "another root").unwrap();
+        let related = plumbing::commit_tree(&repo, &hub_tree, &[&start], "File line").unwrap();
+        for (target, source) in [(&later, &hub), (&other, &hub), (&start, &related)] {
+            assert!(started_here(&repo, target, source).unwrap().is_none());
+            assert!(
+                base_of(&repo, target, source, &started.base)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
     /// Graph overlays cannot change a file result or conceal an unavailable raw parent.
     #[test]
     fn file_merge_uses_raw_parents_without_shallow_grafts_replacements_or_commit_graph() {
@@ -296,7 +487,7 @@ mod tests {
             repo.git(&["update-ref", "refs/heads/source", &source])
                 .unwrap();
             repo.git(&["update-ref", "HEAD", &target, &base]).unwrap();
-            let expected = tree(&repo, &target, &source, &[], &[]).unwrap();
+            let expected = tree(&repo, &target, &source, None, &[], &[]).unwrap();
             let original_target = repo
                 .git_bytes_result(&["cat-file", "commit", &target])
                 .unwrap();
@@ -361,7 +552,7 @@ mod tests {
                 _ => unreachable!(),
             }
             let refs = repo.git(&["show-ref"]).unwrap();
-            let result = tree(&repo, &target, &source, &[], &[]);
+            let result = tree(&repo, &target, &source, None, &[], &[]);
             if overlay.starts_with("missing-parent") {
                 assert!(result.is_err());
             } else {
@@ -379,7 +570,10 @@ mod tests {
             if let Some((object, bytes, permissions)) = removed {
                 std::fs::write(&object, bytes).unwrap();
                 std::fs::set_permissions(object, permissions).unwrap();
-                assert_eq!(tree(&repo, &target, &source, &[], &[]).unwrap(), expected);
+                assert_eq!(
+                    tree(&repo, &target, &source, None, &[], &[]).unwrap(),
+                    expected
+                );
             }
             assert_eq!(repo.git(&["show-ref"]).unwrap(), refs);
             assert_eq!(

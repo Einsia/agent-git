@@ -1555,7 +1555,7 @@ fn start_from_hub_main(repo: &Repo, owner: &str, name: &str, author: &str) -> cr
     }
     let unreachable = || {
         ui::warning(&format!(
-            "couldn't reach the Hub to start from {slug}'s main; started one here. If {slug} already has a main on the Hub, pushing this one will be refused as diverged."
+            "couldn't reach the Hub to start from {slug}'s main; started one here. If {slug} already has a main on the Hub, `agit pull {slug}@main` brings it in before `agit push`."
         ));
         Ok(false)
     };
@@ -1570,7 +1570,7 @@ fn start_from_hub_main(repo: &Repo, owner: &str, name: &str, author: &str) -> cr
         {
             if account != owner {
                 ui::warning(&format!(
-                    "couldn't start from {slug}'s main on the Hub: it isn't there or you can't read it, so a new main was started here. If you should have access, ask the repository's owner."
+                    "couldn't start from {slug}'s main on the Hub: it isn't there or you can't read it, so a new main was started here. If you should have access, ask the repository's owner, then run `agit pull {slug}@main`."
                 ));
             }
             return Ok(false);

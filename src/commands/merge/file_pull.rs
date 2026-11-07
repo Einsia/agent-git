@@ -36,9 +36,26 @@ pub(in crate::commands) fn reconcile(
             "a merge transaction is already open; inspect it with `agit merge --into {selected} --status`"
         );
     }
-    let base = repo.git(&["merge-base", "--all", target, source]).context(
-        "file branches have no available common ancestor; reconcile their histories explicitly",
-    )?;
+    // A `main` this computer started on its own shares no history with the Hub's; anything else
+    // without a common ancestor is the person's to reconcile.
+    let started = match file_reconciliation::started_here(repo, target, source)? {
+        Some(started)
+            if branch == "main"
+                && !crate::domain::privacy_git::ever_published(repo, target)?
+                && repo
+                    .git(&["for-each-ref", "--contains", target, "refs/remotes"])?
+                    .is_empty() =>
+        {
+            Some(started)
+        }
+        _ => None,
+    };
+    let base = match &started {
+        Some(started) => started.base.clone(),
+        None => repo.git(&["merge-base", "--all", target, source]).context(
+            "file branches have no available common ancestor; reconcile their histories explicitly",
+        )?,
+    };
     anyhow::ensure!(
         !base.is_empty() && !base.contains('\n'),
         "file branches require a unique common ancestor for automatic pull reconciliation"
@@ -53,7 +70,12 @@ pub(in crate::commands) fn reconcile(
     );
     super::super::plumbing::ensure_v1_upgrade_preflight(&checkout, target)?;
     super::super::plumbing::ensure_v1_namespace_available_at(repo, source)?;
-    let conflicts = file_reconciliation::conflicts(repo, target, source)?;
+    let conflicts = file_reconciliation::conflicts(
+        repo,
+        target,
+        source,
+        started.as_ref().map(|started| started.base.as_str()),
+    )?;
     let tx = Tx {
         mode: Some(mergetx::Mode::Manual),
         exploration: None,
@@ -70,6 +92,11 @@ pub(in crate::commands) fn reconcile(
     };
     mergetx::create(repo.root(), &tx)?;
     drop(guard);
+    if let Some(started) = &started {
+        for line in started_here_lines(slug, &started.carried) {
+            println!("{}", ui::dim(&line));
+        }
+    }
     if conflicts.is_empty() {
         return continue_tx(checkout.root(), Some(&target_ref), &[], &Choices::default()).with_context(|| format!(
             "file merge did not finish cleanly; inspect it with `agit merge --into {quoted_target} --status` or cancel its open transaction with `agit merge --into {quoted_target} --abort`"
@@ -114,6 +141,40 @@ pub(in crate::commands) fn reconcile(
         "cancel: `agit merge --into {target_ref} --abort` (checkout edits are kept)"
     ));
     Ok(ExitCode::Precondition)
+}
+
+/// What a pull into a `main` this computer started on its own says before it merges: that the two
+/// share no history, and every file the person added at its start, which the merge carries into a
+/// `main` others read, with who reads it. The person confirmed those files for this repository at
+/// a moment agit couldn't tell them who reads it.
+fn started_here_lines(slug: &str, carried: &[String]) -> Vec<String> {
+    let started =
+        format!("  this computer's main was started here and shares no history with {slug}'s main");
+    if carried.is_empty() {
+        return vec![format!(
+            "{started}; it added nothing of its own, so main continues from the Hub's"
+        )];
+    }
+    let readers = readers_of(slug).unwrap_or_else(|| "visibility not confirmed".to_owned());
+    let mut lines = vec![format!(
+        "{started}; these files you added at its start are merged in ({readers}):"
+    )];
+    lines.extend(
+        carried
+            .iter()
+            .map(|path| format!("    {}", ui::printable(path))),
+    );
+    lines
+}
+
+/// Who can read `slug`, as the Hub says it now; `None` when it doesn't answer.
+fn readers_of(slug: &str) -> Option<String> {
+    let (owner, name) = slug.split_once('/')?;
+    let client = crate::hub::Client::from_env_with_timeout(std::time::Duration::from_secs(20));
+    let remote = client.get_agent(owner, name).ok()?;
+    let account = client.credential_username().unwrap_or_default();
+    let (org, members_read) = crate::commands::project::owner_audience(&client, owner, &account);
+    crate::commands::project::readers(slug, Some(&remote.visibility), org, members_read)
 }
 
 /// The conflicting places of `path` between the pull's two sides, each as its line range in yours,
@@ -243,7 +304,9 @@ pub(in crate::commands) fn apply_choices(
     resolved: &[String],
     exclude: &[&str],
 ) -> crate::Result<Option<Vec<String>>> {
-    let conflicts = file_reconciliation::conflicts(repo, &tx.target_head, source_head)?;
+    let base = file_reconciliation::base_of(repo, &tx.target_head, source_head, &tx.base)?;
+    let conflicts =
+        file_reconciliation::conflicts(repo, &tx.target_head, source_head, base.as_deref())?;
     for path in choices.mine.iter().chain(&choices.theirs) {
         if !conflicts.contains(path) {
             ui::error(&format!(
@@ -591,7 +654,9 @@ pub(in crate::commands) fn edit(
             return Ok(ExitCode::Precondition);
         }
     };
-    let conflicts = file_reconciliation::conflicts(&repo, &tx.target_head, &tx.source_head)?;
+    let base = file_reconciliation::base_of(&repo, &tx.target_head, &tx.source_head, &tx.base)?;
+    let conflicts =
+        file_reconciliation::conflicts(&repo, &tx.target_head, &tx.source_head, base.as_deref())?;
     if !conflicts.contains(path) {
         ui::error(&format!(
             "{} is not a conflicting file of this merge",

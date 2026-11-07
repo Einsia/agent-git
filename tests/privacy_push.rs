@@ -5126,6 +5126,300 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     );
 }
 
+/// A `main` a computer started on its own, when its first save couldn't use the Hub's, shares no
+/// history with the Hub's `main`, so its push is refused as diverged. `agit pull` merges the two:
+/// the scaffold it didn't change follows the Hub's, and the files the person added at its start are
+/// carried in, each named with who reads the repository; one the Hub holds otherwise stops the
+/// pull as any file conflict does. They were confirmed when agit couldn't say who reads it, so the
+/// merge doesn't upload them by itself even with automatic upload on, whether it lands in the pull
+/// or after the person's choice: the person's own push does. A pull that treated the start as any
+/// other line stops at "no common ancestor"; one that uploaded the merge by itself publishes the
+/// files unannounced.
+#[test]
+fn a_pull_brings_the_hubs_main_into_a_main_started_here() {
+    const OPENING: &str = "11111111-0000-4000-8000-0000000000b2";
+    let temp = tempfile::tempdir().unwrap();
+    let desktop = temp.path().join("desktop");
+    let phone = temp.path().join("phone");
+    let tablet = temp.path().join("tablet");
+    let codex_home = temp.path().join("codex");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    for home in [&desktop, &phone, &tablet] {
+        startup_cache::seed(home);
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+    let command_in = |home: &Path, args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", home)
+            .env("CODEX_HOME", &codex_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args);
+        command
+    };
+    let run_in = |home: &Path, args: &[&str]| command_in(home, args).output().unwrap();
+    let said = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let repo = Repo::init(&desktop.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(repo.root().join("memory/team.md"), "A team fact\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@main"]));
+    let hub_main = git(&remote, &["rev-parse", "refs/heads/main"]);
+
+    // Each computer's first save asks the Hub nothing, as a background save with automatic upload
+    // off doesn't, so it starts a main of its own. That start carries what the person confirmed
+    // from their folder; a start made at a terminal takes it item by item, these are made by hand.
+    let sessions = codex_home.join("sessions/2026/11/07");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("rollout-2026-11-07T00-00-00-{OPENING}.jsonl")),
+        [
+            json!({"type":"session_meta", "payload":{"id":OPENING, "cwd":work, "timestamp":"2026-11-07T00:00:00Z"}}),
+            json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text","text":"Note what I know"}]}}),
+            json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"Noted."}]}}),
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let start_alone = |home: &Path, seeded: &[(&str, &str)]| {
+        assert_success(&run_in(
+            home,
+            &["config", "--repo", "alice/app", "push.auto", "false"],
+        ));
+        let captured = command_in(
+            home,
+            &[
+                "import",
+                OPENING,
+                "--from",
+                "codex",
+                "--into",
+                "alice/app@talk",
+                "--independent",
+            ],
+        )
+        .env("AGIT_AUTO_PUSH", "1")
+        .output()
+        .unwrap();
+        assert_success(&captured);
+        let checkout = home.join("repos/alice/app");
+        git(
+            &checkout,
+            &["config", "http.userAgent", TRANSPORT_USER_AGENT],
+        );
+        let alone = git(&checkout, &["rev-parse", "refs/heads/main"]);
+        assert_eq!(
+            git(&checkout, &["log", "-1", "--format=%s", &alone]),
+            "agit: init (main file line)"
+        );
+        let seeding = home.join("seeding");
+        git(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                seeding.to_str().unwrap(),
+                &alone,
+            ],
+        );
+        for (path, text) in seeded {
+            fs::write(seeding.join(path), text).unwrap();
+            git(&seeding, &["add", path]);
+        }
+        git(&seeding, &["commit", "-q", "--amend", "--no-edit"]);
+        let started = git(&seeding, &["rev-parse", "HEAD"]);
+        git(
+            &checkout,
+            &["update-ref", "refs/heads/main", &started, &alone],
+        );
+        git(
+            &checkout,
+            &["worktree", "remove", "--force", seeding.to_str().unwrap()],
+        );
+        let listing = git(&checkout, &["worktree", "list", "--porcelain"]);
+        for entry in listing.split("\n\n") {
+            if entry.lines().any(|line| line == "branch refs/heads/main") {
+                let path = entry
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .trim_start_matches("worktree ");
+                git(
+                    Path::new(path),
+                    &["reset", "-q", "--hard", "refs/heads/main"],
+                );
+            }
+        }
+        // Its push is refused as diverged, and names the pull.
+        let refused = run_in(home, &["--yes", "push", "alice/app@main"]);
+        assert!(!refused.status.success(), "{}", said(&refused));
+        assert!(
+            said(&refused).contains("`agit pull alice/app@main`"),
+            "{}",
+            said(&refused)
+        );
+        assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
+        // Automatic upload is on for the pull, and still nothing reaches the Hub.
+        assert_success(&run_in(
+            home,
+            &["config", "--repo", "alice/app", "push.auto", "true"],
+        ));
+        (checkout, started)
+    };
+    let carried = |paths: &[&str]| {
+        format!(
+            "this computer's main was started here and shares no history with alice/app's main; these files you added at its start are merged in (private: only you and people you add can read it):\n{}",
+            paths
+                .iter()
+                .map(|path| format!("    {path}\n"))
+                .collect::<String>()
+        )
+    };
+
+    // The phone's start has its own version of a file the Hub's main holds: the pull stops at it
+    // as any file pull does, and the person's choice lands the merge, which uploads nothing.
+    let (phone_repo, _) = start_alone(
+        &phone,
+        &[
+            ("CLAUDE.md", "My own notes\n"),
+            ("memory/team.md", "My version of the fact\n"),
+        ],
+    );
+    let stopped = run_in(&phone, &["pull", "alice/app@main"]);
+    assert!(!stopped.status.success(), "{}", said(&stopped));
+    let stopped = said(&stopped);
+    assert!(
+        stopped.contains(&carried(&["CLAUDE.md", "memory/team.md"])),
+        "{stopped}"
+    );
+    assert!(stopped.contains("file changes conflict"), "{stopped}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
+    let landed = run_in(
+        &phone,
+        &[
+            "merge",
+            "--into",
+            "alice/app@main",
+            "--continue",
+            "--take-theirs",
+            "memory/team.md",
+        ],
+    );
+    assert_success(&landed);
+    let landed = said(&landed);
+    assert!(
+        landed.contains("`agit push alice/app@main` publishes them."),
+        "{landed}"
+    );
+    assert!(!landed.contains("automatically pushed"), "{landed}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
+    let phone_main = git(&phone_repo, &["rev-parse", "refs/heads/main"]);
+    let file = |checkout: &Path, commit: &str, path: &str| {
+        git(checkout, &["show", &format!("{commit}:{path}")])
+    };
+    assert_eq!(
+        file(&phone_repo, &phone_main, "memory/team.md"),
+        "A team fact"
+    );
+    assert_eq!(file(&phone_repo, &phone_main, "CLAUDE.md"), "My own notes");
+
+    // The tablet's start adds only files the Hub doesn't hold: the pull merges them in at once.
+    let (tablet_repo, started) = start_alone(
+        &tablet,
+        &[
+            ("CLAUDE.md", "My own notes\n"),
+            ("memory/mine.md", "A fact of mine\n"),
+        ],
+    );
+    let pulled = run_in(&tablet, &["pull", "alice/app@main"]);
+    assert_success(&pulled);
+    let pulled = said(&pulled);
+    assert!(
+        pulled.contains(&carried(&["CLAUDE.md", "memory/mine.md"])),
+        "{pulled}"
+    );
+    assert!(
+        pulled.contains("`agit push alice/app@main` publishes them."),
+        "{pulled}"
+    );
+    assert!(!pulled.contains("automatically pushed"), "{pulled}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
+    let merged = git(&tablet_repo, &["rev-parse", "refs/heads/main"]);
+    assert_eq!(
+        git(&tablet_repo, &["rev-list", "--parents", "-n", "1", &merged]),
+        format!("{merged} {started} {hub_main}")
+    );
+    assert_eq!(file(&tablet_repo, &merged, "README.md"), "Shared file");
+    assert_eq!(file(&tablet_repo, &merged, "memory/team.md"), "A team fact");
+    assert_eq!(file(&tablet_repo, &merged, "CLAUDE.md"), "My own notes");
+    assert_eq!(
+        file(&tablet_repo, &merged, "memory/mine.md"),
+        "A fact of mine"
+    );
+    // The scaffold the tablet didn't change follows the Hub's main, which has none of it.
+    let held = git(&tablet_repo, &["ls-tree", "-r", "--name-only", &merged]);
+    for scaffold in ["AGENTS.md", "memory/.gitkeep", "skills/.gitkeep"] {
+        assert!(!held.lines().any(|path| path == scaffold), "{held}");
+    }
+
+    // The person's push publishes it.
+    assert_success(&run_in(&tablet, &["--yes", "push", "alice/app@main"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), merged);
+}
+
 /// A session whose new history is more than one publication to this Hub can carry is published in
 /// parts within one push: each part declares no more new turns than the Hub admits per request,
 /// the parts together declare every new turn once, and the branch and every turn's version tag
