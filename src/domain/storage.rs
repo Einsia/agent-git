@@ -1179,6 +1179,131 @@ fn read_local_sequence(repo_root: &Path, commit: &str, path: &str) -> Result<Vec
     parse_sequence(&text).with_context(|| format!("invalid v1 sequence {commit}:{path}"))
 }
 
+/// The LOG and VIEW event ids of an immutable local v1 snapshot, read without materializing any
+/// event, or `None` for a v0 snapshot. Every VIEW id must be one the LOG names, as
+/// [`materialize_pair_local`] requires.
+#[cfg(feature = "cli")]
+pub(crate) fn local_v1_sequences(
+    repo_root: &Path,
+    commit: &str,
+) -> Result<Option<(Vec<String>, Vec<String>)>> {
+    immutable_local_oid(commit)?;
+    let meta_bytes = git_blob_with_policy(
+        repo_root,
+        commit,
+        meta::FILE,
+        meta::MAX_BYTES,
+        ReadPolicy::LocalOnly,
+    )?;
+    let snapshot: meta::Meta = serde_json::from_slice(&meta_bytes)
+        .context("invalid session/meta.json at requested ref")?;
+    if snapshot.layout != LayoutVersion::V1 {
+        return Ok(None);
+    }
+    let log = read_local_sequence(repo_root, commit, meta::LOG_FILE)?;
+    let view = read_local_sequence(repo_root, commit, meta::VIEW_FILE)?;
+    let named = log.iter().map(String::as_str).collect::<HashSet<_>>();
+    if let Some(id) = view.iter().find(|id| !named.contains(id.as_str())) {
+        anyhow::bail!("VIEW references event {id} which is not reachable from LOG");
+    }
+    Ok(Some((log, view)))
+}
+
+/// The bounds [`materialize_pair_local`] puts on a v1 snapshot, checked from summed event sizes
+/// by a reader that does not materialize it: the snapshot's distinct event bytes, and the LOG and
+/// the VIEW as they would expand, each within [`MAX_MATERIALIZED_BYTES`]. A snapshot one refuses
+/// is refused by the other.
+#[cfg(feature = "cli")]
+pub(crate) fn check_materialized_bounds(unique: usize, log: usize, view: usize) -> Result<()> {
+    let limit = MAX_MATERIALIZED_BYTES;
+    read_limit(unique <= limit, || {
+        format!("unique event bytes exceed the {limit}-byte snapshot limit")
+    })?;
+    for total in [log, view] {
+        read_limit(total <= limit, || {
+            format!("materialized transcript exceeds the {limit}-byte limit")
+        })?;
+    }
+    validate_pair_result_bound(log, view, limit)
+}
+
+/// The stored size of each event `ids` names in the immutable local snapshot `commit`, read
+/// without their bodies. An event past [`MAX_EVENT_BYTES`], or one that is missing, refuses the
+/// whole read, as materializing the snapshot would.
+#[cfg(feature = "cli")]
+pub(crate) fn local_event_sizes(
+    repo_root: &Path,
+    commit: &str,
+    ids: &[&str],
+) -> Result<Vec<usize>> {
+    immutable_local_oid(commit)?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sizes = inspect_git_event_sizes_with_policy(repo_root, commit, ids, ReadPolicy::LocalOnly)?;
+    validate_event_sizes(ids, &sizes, MAX_EVENT_BYTES)?;
+    Ok(sizes)
+}
+
+/// Each event `ids` names in the immutable local snapshot `commit`, in order, as its validated
+/// envelope line, one at a time: no more than one event is held at once. `sizes` are the ones
+/// [`local_event_sizes`] returned for the same ids. An event whose bytes are not the envelope
+/// its id names, or that changed size since, refuses the read; nothing is fetched.
+#[cfg(feature = "cli")]
+pub(crate) fn for_each_local_event(
+    repo_root: &Path,
+    commit: &str,
+    ids: &[&str],
+    sizes: &[usize],
+    mut each: impl FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    immutable_local_oid(commit)?;
+    anyhow::ensure!(
+        sizes.len() == ids.len(),
+        "event sizes differ from the events"
+    );
+    if ids.is_empty() {
+        return Ok(());
+    }
+    with_event_batch(
+        repo_root,
+        commit,
+        ids,
+        "--batch",
+        ReadPolicy::LocalOnly,
+        Some(sizes),
+        |reader| {
+            let mut body = Vec::new();
+            for (id, expected) in ids.iter().zip(sizes) {
+                let header = read_batch_header(reader)?;
+                let actual = event_size_from_header(commit, id, &header)?;
+                anyhow::ensure!(
+                    actual == *expected,
+                    "event {id} changed size between git batch passes: expected {expected}, found {actual}"
+                );
+                body.clear();
+                body.try_reserve_exact(actual)
+                    .context("cannot allocate an event body")?;
+                body.resize(actual, 0);
+                reader
+                    .read_exact(&mut body)
+                    .with_context(|| format!("cannot read event {id} from git cat-file"))?;
+                let mut separator = [0u8; 1];
+                reader.read_exact(&mut separator)?;
+                anyhow::ensure!(
+                    separator == *b"\n",
+                    "git cat-file --batch omitted the separator after event {id}"
+                );
+                let line = std::str::from_utf8(&body)
+                    .with_context(|| format!("event {id} is not UTF-8"))?;
+                validate_event_for_id(id, line, MAX_EVENT_BYTES)?;
+                each(id, line)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 /// Status keeps all metadata, sequence and event reads inside its page's Git deadline.
 #[cfg(feature = "cli")]
 pub(crate) fn materialize_pair_status(

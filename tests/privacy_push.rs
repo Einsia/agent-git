@@ -3783,8 +3783,9 @@ fn continued_plain_session_declares_only_what_it_adds() {
 /// field finds and a scan of the serialized record does not, so a push that scanned the line would
 /// send it. A line the Hub already holds stays as it was published, even when a value registered
 /// since then is in it, so the LOG still extends the published one; a new line holding that value
-/// gets a placeholder. A push that rechecked published lines would rewrite them, and one that
-/// rechecked none would send the new value. A record protection changed when it was published
+/// gets a placeholder, also where it is added by the second of two snapshots one push carries, which
+/// is projected from the first in the same run. A push that rechecked published lines would
+/// rewrite them, and one that rechecked none would send the new value. A record protection changed when it was published
 /// keeps its published line the same way, in a merge as in a turn; a push that matched lines only
 /// by their unprotected form would protect it again under the newer value and drop the published
 /// line. A file holding such a value refuses its publication by name, with nothing sent; a check
@@ -3952,6 +3953,9 @@ fn plain_publication_carries_only_conversation_records() {
         json!({"type":"user","uuid":"u17","parentUuid":"u16","sessionId":"s","message":{"role":"user","content":format!("const token = \"{QUOTED}\";")}}),
         json!({"type":"user","uuid":"u18","parentUuid":"u17","sessionId":"s","message":{"role":"user","content":format!("ship {REGISTERED} today")}}),
     ]);
+    // The conversation four records earlier is a snapshot of its own, so one push carries two and
+    // projects the later from the earlier in the same run.
+    snapshot("talk", "claude-code", 'c', &claude[..claude.len() - 4]);
     let continued = snapshot("talk", "claude-code", 'c', &claude);
     // An event object the tree holds but its LOG does not name.
     let orphan = repo
@@ -4072,7 +4076,7 @@ fn plain_publication_carries_only_conversation_records() {
         repo.git(&["update-ref", "-d", &tracking]).unwrap();
     }
     assert_eq!(
-        git(&remote, &["rev-parse", &format!("{published}^")]),
+        git(&remote, &["rev-parse", &format!("{published}^^")]),
         clean
     );
     let objects = Command::new("git")

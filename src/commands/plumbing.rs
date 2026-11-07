@@ -271,6 +271,38 @@ pub fn tree_restore_owned(
     tree_edit(repo, base_commitish, edits)
 }
 
+/// What a tree edit puts at its path.
+pub enum Content {
+    /// Bytes stored as a new blob.
+    Bytes(Vec<u8>),
+    /// A blob already in the repository's store, such as one a [`BlobWriter`] wrote.
+    Blob(gix::ObjectId),
+}
+
+/// [`tree_apply_owned`] whose edits may also name blobs already stored, so a caller that wrote
+/// its blobs as it produced them need not hold their bytes until the tree is built.
+pub fn tree_apply_content(
+    repo: &Repo,
+    base_commitish: &str,
+    edits: Vec<(String, Option<Content>)>,
+) -> Result<String> {
+    tree_edit(
+        repo,
+        base_commitish,
+        edits
+            .into_iter()
+            .map(|(path, content)| {
+                let edit = match content {
+                    None => Edit::Remove,
+                    Some(Content::Bytes(bytes)) => Edit::Bytes(bytes),
+                    Some(Content::Blob(id)) => Edit::Entry(gix::object::tree::EntryKind::Blob, id),
+                };
+                (path, edit)
+            })
+            .collect(),
+    )
+}
+
 /// One change [`tree_edit`] makes at a path.
 enum Edit {
     /// A regular file with these bytes.
@@ -329,7 +361,7 @@ fn tree_edit(repo: &Repo, base_commitish: &str, edits: Vec<(String, Edit)>) -> R
                 Edit::Entry(kind, id) => {
                     anyhow::ensure!(
                         objects.has_object(id),
-                        "a restored file's object is missing: {path:?}"
+                        "a tree edit names an object the store lacks: {path:?}"
                     );
                     editor.upsert(path.as_str(), kind, id)?;
                 }
@@ -347,6 +379,31 @@ fn tree_edit(repo: &Repo, base_commitish: &str, edits: Vec<(String, Edit)>) -> R
         }
     }
     Ok(tree.to_string())
+}
+
+/// Writes blobs into one repository's loose store as they are produced, the way
+/// [`tree_apply_owned`] writes its own, so a caller can keep each blob's id instead of its bytes.
+pub struct BlobWriter {
+    objects: gix::Repository,
+    directory: std::path::PathBuf,
+}
+
+impl BlobWriter {
+    pub fn open(repo: &Repo) -> Result<Self> {
+        let objects = open_objects(repo)?;
+        let directory = objects.objects.store_ref().path().to_owned();
+        Ok(Self { objects, directory })
+    }
+
+    /// The id of `bytes` as a blob, written unless the store already holds it.
+    pub fn write(&self, bytes: &[u8]) -> Result<gix::ObjectId> {
+        let kind = gix::object::Kind::Blob;
+        let id = gix::objs::compute_hash(self.objects.object_hash(), kind, bytes)?;
+        if !self.objects.has_object(id) {
+            write_loose_object(&self.directory, &id, kind, bytes)?;
+        }
+        Ok(id)
+    }
 }
 
 /// Writes one object into the loose store under `directory` as Git does: compressed into a

@@ -287,11 +287,28 @@ pub fn published(source: &str, content: &Value) -> Option<Value> {
 pub fn published_sequence<'a>(
     records: impl IntoIterator<Item = (&'a str, &'a Value)>,
 ) -> Vec<Option<Value>> {
-    let mut classifier = Classifier::default();
-    let mut dropped: HashMap<String, Value> = HashMap::new();
-    let mut out = Vec::new();
-    for (source, content) in records {
-        let kept = classifier.published(source, content);
+    let mut sequence = PublishedSequence::default();
+    records
+        .into_iter()
+        .map(|(source, content)| sequence.next(source, content))
+        .collect()
+}
+
+/// [`published_sequence`] one record at a time. A record's result depends only on the records
+/// before it, through the classifier's maps and the left-out records' nearest kept ancestors, so
+/// a sequence fed a LOG's records and then the records appended to it gives each record what
+/// one pass over the longer LOG gives it.
+#[derive(Debug, Default)]
+pub struct PublishedSequence {
+    classifier: Classifier,
+    /// Each left-out record's uuid, and the parent its kept children are linked to instead.
+    dropped: HashMap<String, Value>,
+}
+
+impl PublishedSequence {
+    /// The next record as it is published, or `None` when it is left out.
+    pub fn next(&mut self, source: &str, content: &Value) -> Option<Value> {
+        let kept = self.classifier.published(source, content);
         let ancestor = |field: &str, dropped: &HashMap<String, Value>| {
             content
                 .get(field)
@@ -302,24 +319,23 @@ pub fn published_sequence<'a>(
         match kept {
             None => {
                 if let Some(uuid) = content.get("uuid").and_then(Value::as_str) {
-                    let parent = ancestor("parentUuid", &dropped)
+                    let parent = ancestor("parentUuid", &self.dropped)
                         .or_else(|| content.get("parentUuid").cloned())
                         .unwrap_or(Value::Null);
-                    dropped.insert(uuid.to_owned(), parent);
+                    self.dropped.insert(uuid.to_owned(), parent);
                 }
-                out.push(None);
+                None
             }
             Some(mut kept) => {
                 for field in ["parentUuid", "logicalParentUuid"] {
-                    if let Some(parent) = ancestor(field, &dropped) {
+                    if let Some(parent) = ancestor(field, &self.dropped) {
                         kept[field] = parent;
                     }
                 }
-                out.push(Some(kept));
+                Some(kept)
             }
         }
     }
-    out
 }
 
 /// For a quote of an earlier record that resume made from an encrypted session's original, whether
