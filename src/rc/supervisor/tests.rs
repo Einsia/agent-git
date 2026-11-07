@@ -3197,6 +3197,52 @@ fn assistant_line(lineno: u64, text: &str) -> crate::rc::tail::TailedLine {
     }
 }
 
+/// The marker a held line shows after its notice says why it waits when that is the privacy
+/// worker's own state, and says nothing when the reason comes from the record or from the
+/// person's rules: every viewer of the workspace sees the marker. A marker that carried every
+/// reason would tell viewers what a record holds; one that carried none would leave a wait on a
+/// stuck worker unexplained.
+#[test]
+fn a_held_lines_marker_names_only_the_workers_state() {
+    use crate::domain::privacy::projector::Reason;
+    let notice = std::time::Duration::from_millis(50);
+    let redactor = redact::Redactor::new(redact::Persona::default());
+    redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
+    for (reason, shown) in [
+        (Reason::StoreBusy, Some("store_busy")),
+        (Reason::SpawnFailed, Some("spawn_failed")),
+        (Reason::LockBusy, Some("lock_busy")),
+        (Reason::FindingsCap, None),
+        (Reason::DeviceRules, None),
+        (Reason::SourceIncomplete, None),
+    ] {
+        redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(Some(reason)));
+        let mut held = HeldTail::with_timing(notice, notice * 4);
+        let mut project = |polled| {
+            held.project(
+                "claude-code",
+                &redactor,
+                polled,
+                crate::rc::codex_history::HistoryMode::Model,
+                Release::Retry,
+            )
+            .items
+        };
+        assert!(project(vec![assistant_line(1, "a reply")]).is_empty());
+        std::thread::sleep(notice);
+        let items = project(Vec::new());
+        assert_eq!(items.len(), 1, "{reason:?}");
+        assert_eq!(
+            items[0].event.text.as_deref(),
+            Some(redact::PROTECTION_ERROR_TEXT)
+        );
+        assert_eq!(items[0].privacy_pending.as_deref(), shown, "{reason:?}");
+        assert!(items[0].raw.is_null());
+    }
+    redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(None));
+    redact::WITHHOLD_NATIVE.with(|w| w.set(None));
+}
+
 /// Tailed lines whose privacy check may still pass are held for as many polls as it takes:
 /// nothing from the first such line on shows until it has waited the notice, then its marker
 /// shows once while it is still retried, and once it passes the held lines show in order. The
