@@ -85,7 +85,9 @@ impl RuntimeContext {
                     next_cursor: page.next_cursor,
                     reliable: true,
                 },
-                Err(_) if after.is_none() => {
+                // An index Codex is only holding is waited for, not read around: the rollout files
+                // run oldest first and would carry the pass away from the index for good.
+                Err(error) if after.is_none() && !crate::adapter::codex_index::held(&error) => {
                     super::runtime_files::page(&self.source.home, None, limit)?
                 }
                 Err(error) => return Err(error),
@@ -338,7 +340,7 @@ mod tests {
         let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, model TEXT, reasoning_effort TEXT, approval_mode TEXT, sandbox_policy TEXT)").unwrap();
         for (id, cwd, archived) in [
-            ("a", project.with_file_name("project-other"), 0),
+            ("e", project.with_file_name("project-other"), 0),
             ("b", project.join("nested"), 0),
             ("c", project.to_path_buf(), 1),
             ("d", project.to_path_buf(), 0),
@@ -380,26 +382,27 @@ mod tests {
         let source = registry.register(&home, None, None, None).unwrap();
         let context = RuntimeContext::resolve(&registry, &source.source_id).unwrap();
         let roots = CanonicalRoots::from_untrusted([project]);
+        // Newest first: the unrelated thread leads, and its empty page still moves on.
         let first = context.list_page(&roots, None, 1).unwrap();
         assert!(first.rows.is_empty());
-        assert_eq!(first.next_cursor.as_deref(), Some("a"));
+        assert_eq!(first.next_cursor.as_deref(), Some("e"));
         let second = context
             .list_page(&roots, first.next_cursor.as_deref(), 1)
             .unwrap();
-        assert_eq!(second.rows[0].native_session_id, "b");
-        assert_eq!(
-            second.rows[0].parent_session_ref,
-            Some(source.session_ref(&parent))
-        );
-        assert!(!second.rows[0].technical);
-        assert_eq!(second.next_cursor.as_deref(), Some("b"));
+        assert_eq!(second.rows[0].native_session_id, "d");
+        assert!(second.rows[0].technical);
+        assert_eq!(second.next_cursor.as_deref(), Some("d"));
         let third = context
             .list_page(&roots, second.next_cursor.as_deref(), 1)
             .unwrap();
-        assert_eq!(third.rows[0].native_session_id, "d");
-        assert!(third.rows[0].technical);
+        assert_eq!(third.rows[0].native_session_id, "b");
+        assert_eq!(
+            third.rows[0].parent_session_ref,
+            Some(source.session_ref(&parent))
+        );
+        assert!(!third.rows[0].technical);
         assert!(third.next_cursor.is_none());
-        assert!(context.locate("a", &roots).is_err());
+        assert!(context.locate("e", &roots).is_err());
     }
 
     /// Codex compresses a rollout that has been idle for long enough and keeps naming its plain

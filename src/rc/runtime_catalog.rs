@@ -12,6 +12,13 @@ const SCAN_PAGE: usize = 100;
 /// How soon a source is swept again after a sweep that found a change, and the longest it waits
 /// once its sweeps keep finding none: each unchanged sweep doubles the wait up to this.
 const SWEEP_AGAIN_MS: (i64, i64) = (2000, 30_000);
+/// How soon a page that met Codex's lock on its index is tried again, and how many tries in a row
+/// it gets before its source counts as unavailable. Codex holds that lock while it writes a
+/// running conversation, so a lock is expected and passes; one that doesn't is shown.
+const BUSY_RETRY_MS: i64 = 500;
+const BUSY_TRIES: u32 = 5;
+/// How soon a page that failed for any other reason is tried again.
+const FAILED_RETRY_MS: i64 = 5000;
 /// What this process knows of each source's sweeps, by catalog and source: the sweep in
 /// progress, and how long the next one waits.
 static SWEEPS: std::sync::Mutex<std::collections::BTreeMap<(PathBuf, String), SweepState>> =
@@ -22,6 +29,8 @@ struct SweepState {
     sweep: Option<Sweep>,
     /// The wait after the last complete sweep; `0` before this process completed one.
     idle_ms: i64,
+    /// How many tries in a row have failed since the last page that read.
+    failures: u32,
 }
 
 /// One pass over a source's conversations, page by page: the conversations it has seen so far.
@@ -161,6 +170,26 @@ pub(crate) struct Coverage {
     pub source_id: String,
     pub source_generation: u64,
     pub status: String,
+    /// Why an `unavailable` source is: `busy` while Codex keeps its index locked, `unsupported`
+    /// for an index this build can't read, `source_invalid` for a home that is gone, replaced or
+    /// another account's, and `unreadable` for anything else. A code about this device's copy of
+    /// the runtime's records, never anything read from a conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The reason code for a sweep that failed with `error`.
+fn failure_reason(error: &anyhow::Error) -> &'static str {
+    if crate::adapter::codex_index::held(error) {
+        "busy"
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::adapter::codex_index::UnsupportedIndex>())
+    {
+        "unsupported"
+    } else {
+        "unreadable"
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,7 +310,7 @@ impl Catalog {
         let connection = catalog.connection()?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         ensure!(
-            (0..=2).contains(&version),
+            (0..=3).contains(&version),
             "unsupported runtime catalog schema"
         );
         if version == 0 {
@@ -304,6 +333,24 @@ impl Catalog {
         }
         if version < 2 {
             deltas::initialize(&connection)?;
+        }
+        if version < 3 {
+            // Another process may be adding it at the same moment: the check is inside the lock.
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let added = (|| {
+                let current: i64 =
+                    connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+                if current < 3 {
+                    connection.execute_batch(
+                        "ALTER TABLE sources ADD COLUMN reason TEXT; PRAGMA user_version=3;",
+                    )?;
+                }
+                connection.execute_batch("COMMIT")
+            })();
+            if added.is_err() {
+                let _ = connection.execute_batch("ROLLBACK");
+            }
+            added?;
         }
         Ok(catalog)
     }
@@ -345,7 +392,7 @@ impl Catalog {
         }
         for source in enrolled.iter().filter(|source| source.enabled) {
             changed |= transaction.execute(
-                "INSERT INTO sources VALUES (?1,?2,?3,1,NULL,'scanning',0)
+                "INSERT INTO sources(source_id,generation,scope,epoch,cursor,status,due) VALUES (?1,?2,?3,1,NULL,'scanning',0)
                  ON CONFLICT(source_id) DO UPDATE SET generation=excluded.generation,scope=excluded.scope,
                     epoch=sources.epoch+1,cursor=NULL,status='scanning',due=0
                  WHERE sources.generation!=excluded.generation OR sources.scope!=excluded.scope",
@@ -396,6 +443,7 @@ impl Catalog {
                         changed: false,
                     });
                 }
+                state.failures = 0;
                 let sweep = state.sweep.as_mut().expect("a sweep was just started");
                 let mut changed = false;
                 for row in page.rows {
@@ -474,7 +522,7 @@ impl Catalog {
                     state.idle_ms = wait;
                 }
                 transaction.execute(
-                    "UPDATE sources SET cursor=?2,epoch=?3,status=?4,due=?5 WHERE source_id=?1",
+                    "UPDATE sources SET cursor=?2,epoch=?3,status=?4,due=?5,reason=NULL WHERE source_id=?1",
                     params![
                         source_id,
                         page.next_cursor,
@@ -487,13 +535,43 @@ impl Catalog {
                     bump(&transaction)?;
                 }
             }
-            Err(_) => {
-                state.sweep = None;
-                let changed = transaction.execute("UPDATE sources SET status='unavailable',due=?2 WHERE source_id=?1 AND status!='unavailable'", params![source_id, now + 5000])?;
-                transaction.execute(
-                    "UPDATE sources SET cursor=NULL,epoch=epoch+1,due=?2 WHERE source_id=?1",
-                    params![source_id, now + 5000],
-                )?;
+            Err(error) => {
+                let reason = failure_reason(&error);
+                state.failures += 1;
+                // A sweep this process is in the middle of keeps its place and tries the same
+                // page again: the pages it read stay read. Starting over instead would leave the
+                // pages after a page that keeps failing out of reach.
+                let resuming = cursor.is_some()
+                    && state
+                        .sweep
+                        .as_ref()
+                        .is_some_and(|sweep| sweep.epoch == epoch);
+                let due = now
+                    + if reason == "busy" {
+                        BUSY_RETRY_MS
+                    } else {
+                        FAILED_RETRY_MS
+                    };
+                let mut changed = 0;
+                if reason != "busy" || state.failures >= BUSY_TRIES {
+                    changed = transaction.execute(
+                        "UPDATE sources SET status='unavailable',reason=?2 WHERE source_id=?1
+                         AND (status!='unavailable' OR reason IS NOT ?2)",
+                        params![source_id, reason],
+                    )?;
+                }
+                if resuming {
+                    transaction.execute(
+                        "UPDATE sources SET due=?2 WHERE source_id=?1",
+                        params![source_id, due],
+                    )?;
+                } else {
+                    state.sweep = None;
+                    transaction.execute(
+                        "UPDATE sources SET cursor=NULL,epoch=epoch+1,due=?2 WHERE source_id=?1",
+                        params![source_id, due],
+                    )?;
+                }
                 if changed > 0 {
                     bump(&transaction)?;
                 }
@@ -514,23 +592,24 @@ impl Catalog {
         let mut coverage = Vec::new();
         let mut valid = std::collections::HashSet::new();
         for source in sources.into_iter().filter(|source| source.enabled) {
-            let status: Option<String> = transaction
+            let recorded: Option<(String, Option<String>)> = transaction
                 .query_row(
-                    "SELECT status FROM sources WHERE source_id=?1 AND generation=?2",
+                    "SELECT status,reason FROM sources WHERE source_id=?1 AND generation=?2",
                     params![source.source_id, source.generation],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
             let identity_valid = source.validate().is_ok();
-            let status = if identity_valid {
+            let (status, reason) = if identity_valid {
                 valid.insert((source.source_id.clone(), source.generation));
-                status.unwrap_or_else(|| "scanning".into())
+                recorded.unwrap_or_else(|| ("scanning".into(), None))
             } else {
-                "unavailable".to_owned()
+                ("unavailable".to_owned(), Some("source_invalid".to_owned()))
             };
             coverage.push(Coverage {
                 source_id: source.source_id,
                 source_generation: source.generation,
+                reason: reason.filter(|_| status == "unavailable"),
                 status,
             });
         }
@@ -735,6 +814,28 @@ impl Catalog {
             serde_json::json!({"session_id":request.session_id,"source_id":request.source_id,"source_generation":request.source_generation,"model":settings.model(),"permission_mode":settings.permission_mode}),
         )
     }
+}
+
+/// Each source's sweep status and why it is unavailable, as the daemon last recorded them, by
+/// source id. The catalog is read as it is, never created or rebuilt: a listing must not touch it.
+pub(crate) fn sweep_states()
+-> crate::Result<std::collections::BTreeMap<String, (String, Option<String>)>> {
+    let database = crate::infra::config::agit_home()?
+        .join("runtime-catalog")
+        .join("catalog.sqlite");
+    if !database.exists() {
+        return Ok(Default::default());
+    }
+    let connection =
+        Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_millis(100))?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let reason = if version >= 3 { "reason" } else { "NULL" };
+    let states = connection
+        .prepare(&format!("SELECT source_id,status,{reason} FROM sources"))?
+        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(states)
 }
 
 fn bump(connection: &Connection) -> rusqlite::Result<usize> {
@@ -1200,7 +1301,7 @@ mod tests {
         // A change is written once, at the next sweep, and the sweep after it comes quickly.
         native
             .execute(
-                "UPDATE threads SET first_user_message='another question' WHERE id='thread-000'",
+                "UPDATE threads SET first_user_message='another question' WHERE id='thread-124'",
                 [],
             )
             .unwrap();
@@ -1240,6 +1341,104 @@ mod tests {
             cache.reconcile_at(&roots, later).unwrap();
         }
         assert_eq!(count("SELECT count(*) FROM sessions"), 124);
+    }
+
+    /// A sweep reads a source newest first and keeps its place when a page fails. With more
+    /// threads than a page holds, the first page already lists the newest, also when Codex held
+    /// its index through the first try. A page that meets Codex's lock on its index is tried
+    /// again where it stopped, so the sweep finishes on the next try, and the source shows
+    /// nothing through a short lock; a lock that lasts makes it unavailable with the reason
+    /// "busy", its conversations still listed. A sweep that read oldest first, or that read the
+    /// rollout files when the first page met the lock, would lack the newest after one page; one
+    /// that started over after a failed page would still lack the oldest after the retry; and
+    /// one that gave up at the first lock would show a passing lock as a failure.
+    #[test]
+    fn a_sweep_lists_the_newest_first_and_resumes_where_the_index_was_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        let roots = CanonicalRoots::from_untrusted([project.clone()]);
+        let registry = Registry::at(directory.path().join("registry")).unwrap();
+        let home = directory.path().join("alpha");
+        let _native = native_store(&home, &project, "model");
+        let source = registry.register(&home, None, None, None).unwrap();
+        let cache = Catalog::at(registry, directory.path().join("cache")).unwrap();
+        let listed = |id: &str| cache.lookup(&source.session_ref(id)).unwrap().is_some();
+        let connection = cache.connection().unwrap();
+        let state = || -> (String, Option<String>, bool, i64) {
+            connection
+                .query_row(
+                    "SELECT status,reason,cursor IS NOT NULL,due FROM sources",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap()
+        };
+        // Codex holds its index through the first page: the page is waited for, not read from
+        // the rollout files instead.
+        let codex = Connection::open(home.join("state_1.sqlite")).unwrap();
+        codex.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        cache.reconcile_at(&roots, 0).unwrap();
+        let (status, reason, mid_sweep, due) = state();
+        assert_eq!(
+            (status.as_str(), reason, mid_sweep),
+            ("scanning", None, false)
+        );
+        codex.execute_batch("COMMIT").unwrap();
+        cache.reconcile_at(&roots, due).unwrap();
+        assert!(
+            listed("thread-124"),
+            "the newest thread is on the first page"
+        );
+        assert!(!listed("thread-000"));
+
+        // Codex holds its index while the second page is read, then lets go.
+        codex.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        cache.reconcile_at(&roots, state().3).unwrap();
+        let (status, reason, mid_sweep, due) = state();
+        assert_eq!(
+            (status.as_str(), reason, mid_sweep),
+            ("scanning", None, true)
+        );
+        codex.execute_batch("COMMIT").unwrap();
+        cache.reconcile_at(&roots, due).unwrap();
+        assert!(
+            listed("thread-000"),
+            "the retry read the page the lock stopped"
+        );
+        let (status, _, mid_sweep, due) = state();
+        assert_eq!((status.as_str(), mid_sweep), ("ready", false));
+
+        // The next sweep's second page meets a lock that lasts.
+        cache.reconcile_at(&roots, due).unwrap();
+        codex.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        for _ in 0..BUSY_TRIES {
+            cache.reconcile_at(&roots, state().3).unwrap();
+        }
+        let (status, reason, mid_sweep, due) = state();
+        assert_eq!(
+            (status.as_str(), reason.as_deref(), mid_sweep),
+            ("unavailable", Some("busy"), true)
+        );
+        let mut all = request(None);
+        all.limit = 500;
+        let page = cache.list(&roots, &all).unwrap();
+        assert_eq!(page.coverage[0].reason.as_deref(), Some("busy"));
+        assert_eq!(
+            page.rows.len(),
+            125,
+            "an unavailable source keeps its conversations"
+        );
+        codex.execute_batch("COMMIT").unwrap();
+        cache.reconcile_at(&roots, due).unwrap();
+        let page = cache.list(&roots, &all).unwrap();
+        assert_eq!(
+            (
+                page.coverage[0].status.as_str(),
+                page.coverage[0].reason.as_deref()
+            ),
+            ("ready", None)
+        );
     }
 
     #[test]
