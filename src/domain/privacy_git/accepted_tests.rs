@@ -176,8 +176,9 @@ fn a_new_fork_reuses_accepted_public_ancestors_without_their_projection_cache() 
     published.prepare_acceptance().unwrap();
 }
 
-/// A collaborator's new tip sends a checkout that is only behind to `pull` and a diverged one to
-/// `fork` or `merge`, including when the tip's objects are not local.
+/// A collaborator's new tip sends a checkout that is only behind to `pull`, and a diverged file
+/// line to `pull` too, which merges its files, including when the tip's objects are not local. A
+/// diverged tip that is here and holds the same files is told as such.
 #[test]
 fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
     let temp = tempfile::tempdir().unwrap();
@@ -233,27 +234,40 @@ fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
         assert!(error.contains(diagnosis), "{error}");
         assert!(
             error.contains(
-                "`agit fork team/wiki@wiki -b wiki-local`, then `agit push team/wiki@wiki-local`"
+                "→ bring the Hub's changes in: `agit pull team/wiki@wiki` (it merges the files and stops only where both sides changed the same lines), then `agit push team/wiki@wiki`"
             ),
-            "{error}"
-        );
-        assert!(
-            error.contains(&format!(
-                "`agit fetch team/wiki`, then `agit merge team/wiki@{} --into team/wiki@wiki`",
-                &tip[..12]
-            )),
             "{error}"
         );
         assert!(
             error.contains("local unpublished commits are kept"),
             "{error}"
         );
-        assert!(!error.contains("agit pull"), "{error}");
+        assert!(!error.contains("same files"), "{error}");
+        assert!(!error.contains("agit fork"), "{error}");
         assert!(
             !error.contains(&accepted::Inconsistent.to_string()),
             "{error}"
         );
     }
+    let same = source
+        .git(&[
+            "commit-tree",
+            &format!("{local}^{{tree}}"),
+            "-p",
+            &base,
+            "-m",
+            "The same page",
+        ])
+        .unwrap();
+    let error = check(&same).unwrap_err().to_string();
+    assert!(
+        error.contains("(local +1 / Hub +1; Hub tip ")
+            && error.contains(", but both sides hold the same files; local unpublished commits are kept")
+            && error.contains(
+                "→ bring the Hub's line in: `agit pull team/wiki@wiki`, then `agit push team/wiki@wiki`"
+            ),
+        "{error}"
+    );
     // A Hub tip that is not here leaves this checkout merely behind when the last fetched remote
     // branch already holds its head; reading every unknown tip as divergence would hide `pull`.
     source
