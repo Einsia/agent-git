@@ -45,6 +45,7 @@ agit memory sync --into szh/p1@refund-fix
 - Only Claude Code keeps a per-project memory directory; for other runtimes `sync` is a no-op while `status`/`distill` still work on the branch.
 - A Codex conversation that agit starts (`agit new`, `agit run` or `agit resume` with `--as codex`) is given the branch's memory as an index when it starts: each file's name and first heading, and the folder of copies to read. The index states no decision itself; read the file it names before answering from it. agit starts that Codex outside its shared background server (`--no-daemon`, when the installed Codex has it), since only a conversation in the process agit started carries the launch to its hooks. A `codex` you start yourself gets no index.
 - Files that hit the secret scanner are never collected or distilled; clean them first.
+- `distill` reaches only the session's own repository's `main`, which its questions and result name; it doesn't carry memory into another repository, such as a team's. The `distill` manual shows how to add a file to another repository's main yourself.
 - The repository privacy policy is checked before the secret scanner. Memory is private by default;
   add an explicit pattern with `agit privacy policy allow-memory <pattern> --repo <owner/repo>`
   before a file can enter a branch. A branch restriction can narrow that allowlist, and rejected

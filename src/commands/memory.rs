@@ -107,7 +107,8 @@ pub enum Cmd {
     Status,
     /// Diff of memory files between this branch and main (or one file).
     Diff { path: Option<String> },
-    /// Carry memory changes from this branch into main (locally protected, confirmed one by one).
+    /// Carry memory changes from this branch into its own repository's main (locally protected,
+    /// confirmed one by one).
     Distill {
         /// Only these files (names under memory/). Default: every change against main.
         paths: Vec<String>,
@@ -2232,25 +2233,28 @@ fn distill_cmd(
     }
 
     // Promotion uses the immutable tip in the plan so confirmation and landing select the same bytes.
+    // Every line names the repository whose main it is: the session's own, which may not be where
+    // its team keeps memory.
+    let main = format!("{}'s main", target.slug);
     let mut chosen = Vec::new();
     for item in &wanted {
         let question = match item {
-            Pending::Carry(name) => format!("carry memory/{name} into main?"),
+            Pending::Carry(name) => format!("carry memory/{name} into {main}?"),
             Pending::Merge(name) => {
-                format!("carry memory/{name} into main, merged with the changes on main?")
+                format!("carry memory/{name} into {main}, merged with the changes there?")
             }
             Pending::Clash(name) => {
                 let owners = clash_owners(primary, &sides, &plan.main_tip, name)?;
                 ui::warning(&format!(
-                    "memory/{name}: your lines replace the change {} made on main to the same lines; every other change stays",
+                    "memory/{name}: your lines replace the change {} made on {main} to the same lines; every other change stays",
                     named(&owners)
                 ));
-                format!("carry memory/{name} into main with your lines there?")
+                format!("carry memory/{name} into {main} with your lines there?")
             }
-            Pending::Remove(name) => format!("delete memory/{name} from main?"),
+            Pending::Remove(name) => format!("delete memory/{name} from {main}?"),
             Pending::Conflict(name) => {
                 ui::warning(&format!(
-                    "memory/{name} skipped — {} after this branch forked; edit main by hand",
+                    "memory/{name} skipped — {} after this branch forked; edit {main} by hand",
                     conflict_shape(&sides, name)
                 ));
                 continue;
@@ -2288,7 +2292,7 @@ fn distill_cmd(
     }
     let commit = distill(primary, &plan, &chosen)?.expect("chosen is non-empty");
     ui::success(&format!(
-        "distilled {} change{} from `{branch}` into main ({})",
+        "distilled {} change{} from `{branch}` into {main} ({})",
         chosen.len(),
         if chosen.len() == 1 { "" } else { "s" },
         &commit[..9.min(commit.len())]

@@ -1439,7 +1439,8 @@ pub enum Commands {
     Tag(tag::Args),
     /// Memory between the runtime directory, this session branch and main: status / diff / distill / sync
     Memory(memory::Args),
-    /// Carry memory files from this session branch into main (alias of `memory distill`)
+    /// Carry memory files from this session branch into its own repository's main (alias of
+    /// `memory distill`)
     Distill(memory::DistillArgs),
 
     // ── Inspection ──────────────────────────────────────────────────
