@@ -4907,6 +4907,180 @@ fn a_milestone_and_tag_reach_the_hub_with_their_turn() {
     );
 }
 
+/// A second computer's first save into a repository the Hub already has starts its `main` at the
+/// Hub's `main`. A `main` made there as a root of its own shares no history with the Hub's: the
+/// repository's `main` reads as diverged on that computer from then on, and its push is refused.
+#[test]
+fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
+    const OPENING: &str = "11111111-0000-4000-8000-0000000000b1";
+    let temp = tempfile::tempdir().unwrap();
+    let desktop = temp.path().join("desktop");
+    let laptop = temp.path().join("laptop");
+    let tablet = temp.path().join("tablet");
+    let codex_home = temp.path().join("codex");
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [27; 32]);
+    for home in [&desktop, &laptop, &tablet] {
+        startup_cache::seed(home);
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+    let command_in = |home: &Path, args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", home)
+            .env("CODEX_HOME", &codex_home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args);
+        command
+    };
+    let run_in = |home: &Path, args: &[&str]| command_in(home, args).output().unwrap();
+    let repo = Repo::init(&desktop.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@main"]));
+    let hub_main = git(&remote, &["rev-parse", "refs/heads/main"]);
+
+    // The laptop has no checkout of alice/app; its first save creates one.
+    let sessions = codex_home.join("sessions/2026/11/07");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("rollout-2026-11-07T00-00-00-{OPENING}.jsonl")),
+        [
+            json!({"type":"session_meta", "payload":{"id":OPENING, "cwd":work, "timestamp":"2026-11-07T00:00:00Z"}}),
+            json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text","text":"Check the shared file"}]}}),
+            json!({"type":"response_item", "payload":{"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"It is there."}]}}),
+            json!({"type":"event_msg", "payload":{"type":"task_complete"}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>(),
+    )
+    .unwrap();
+    let import = [
+        "import",
+        OPENING,
+        "--from",
+        "codex",
+        "--into",
+        "alice/app@talk",
+        "--independent",
+    ];
+
+    // A save made in the background, as a folder's capture is, asks the Hub nothing for a
+    // destination whose automatic upload is off on this computer, and starts its own main.
+    assert_success(&run_in(
+        &tablet,
+        &["config", "--repo", "alice/app", "push.auto", "false"],
+    ));
+    let captured = command_in(&tablet, &import)
+        .env("AGIT_AUTO_PUSH", "1")
+        .output()
+        .unwrap();
+    assert_success(&captured);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    assert!(!said.contains("started from"), "{said}");
+    assert!(!said.contains("couldn't"), "{said}");
+    assert_ne!(
+        git(
+            &tablet.join("repos/alice/app"),
+            &["rev-parse", "refs/heads/main"]
+        ),
+        hub_main
+    );
+
+    let imported = run_in(&laptop, &import);
+    assert_success(&imported);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&imported.stdout),
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    assert!(
+        said.contains("started from alice/app's main on the Hub"),
+        "{said}"
+    );
+    assert!(!said.contains("couldn't"), "{said}");
+    let laptop_repo = laptop.join("repos/alice/app");
+    assert_eq!(
+        git(&laptop_repo, &["rev-parse", "refs/heads/main"]),
+        hub_main
+    );
+    assert_eq!(
+        fs::read_to_string(laptop_repo.join("README.md")).unwrap(),
+        "Shared file"
+    );
+    git(
+        &laptop_repo,
+        &["merge-base", "--is-ancestor", &hub_main, "refs/heads/talk"],
+    );
+
+    // The laptop's main is the Hub's, so its push finds nothing to send, and its session goes up
+    // on top of it.
+    git(
+        &laptop_repo,
+        &["config", "http.userAgent", TRANSPORT_USER_AGENT],
+    );
+    let pushed = run_in(&laptop, &["--yes", "push", "alice/app@main"]);
+    assert_success(&pushed);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&pushed.stdout),
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    assert!(said.contains("main is on the Hub"), "{said}");
+    assert_success(&run_in(&laptop, &["--yes", "push", "alice/app@talk"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
+    git(
+        &remote,
+        &["merge-base", "--is-ancestor", &hub_main, "refs/heads/talk"],
+    );
+}
+
 /// A session whose new history is more than one publication to this Hub can carry is published in
 /// parts within one push: each part declares no more new turns than the Hub admits per request,
 /// the parts together declare every new turn once, and the branch and every turn's version tag
