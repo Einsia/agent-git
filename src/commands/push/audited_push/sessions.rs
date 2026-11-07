@@ -666,11 +666,18 @@ pub(super) fn run(
             checking.finish();
             record_published_tags(&repo, &projected);
             // A local tag the Hub lacks means the repository is not up to date, even with
-            // nothing to send.
+            // nothing to send. Either way the branches are named as on the Hub: after a push that
+            // failed, such as one a proxy answered with a 502 after the Hub took it, "nothing new"
+            // alone leaves open whether the Hub has them.
+            let held = on_the_hub(&part_branches);
             if left_out_tags.is_empty() {
-                ui::info(format_args!("{repository}: already up to date."));
+                ui::info(format_args!(
+                    "{repository}: already up to date; {held} on the Hub."
+                ));
             } else {
-                ui::info(format_args!("{repository}: nothing new to upload."));
+                ui::info(format_args!(
+                    "{repository}: {held} already on the Hub; nothing new to upload."
+                ));
                 report_left_out_tags(&left_out_tags);
             }
             return Ok(ExitCode::Ok);
@@ -1226,6 +1233,15 @@ fn record_published_tags(repo: &Repo, projected: &ProjectedHistory) {
         ui::warning(&format!(
             "the session tags published on their turns' public commits could not be recorded ({error:#}); a later fetch may refuse to overwrite them locally"
         ));
+    }
+}
+
+/// The branches a push found already on the Hub, with their verb: by name when they are few.
+fn on_the_hub(branches: &[String]) -> String {
+    match branches {
+        [branch] => format!("{branch} is"),
+        [_, _] | [_, _, _] => format!("{} are", branches.join(", ")),
+        _ => format!("its {} branches are", branches.len()),
     }
 }
 
