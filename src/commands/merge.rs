@@ -231,6 +231,26 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
 
     let target_head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;
     let mut target_head = target_head.trim().to_string();
+    // The Hub's published form of turns this branch already holds brings nothing to merge.
+    // Merged anyway, each of those turns lands a second time beside its original, and every
+    // later upload adds another published copy for the next merge to repeat.
+    if base.repo.root() == repo.root() {
+        let projections = crate::domain::privacy_git::Projections::open(&repo);
+        if super::pull::published_from(
+            &repo,
+            &projections,
+            &target,
+            &target_head,
+            &base.resolved.sha,
+        )
+        .is_some()
+        {
+            ui::info(format_args!(
+                "nothing to merge: {src_ref} is the Hub's published form of turns `{target}` already holds"
+            ));
+            return Ok(ExitCode::Ok);
+        }
+    }
     require_merge_input(&repo, &target_head)?;
     require_merge_input(&base.repo, &base.resolved.sha)?;
     let mut reconnaissance =

@@ -9340,9 +9340,10 @@ fn a_diverged_file_line_is_offered_pull_and_told_when_the_files_match() {
 /// the new branch over the published one; mapping any Hub tip that descends from a published turn
 /// continues past the other computer's turn. A branch that tracks the Hub's is held to have
 /// integrated its tracking ref when that ref is the published form of a turn it holds; read as a
-/// commit to merge in, the uploader is told to merge its own turn.
-/// Pushing then names the other computer's turn and a separate checkout of the Hub's copy; worded
-/// for an encrypted publication, it describes a copy this plain session never had.
+/// commit to merge in, the uploader is told to merge its own turn. `agit merge` of the Hub tip into
+/// the branch says there is nothing to merge. Pushing after another computer's turn names that turn
+/// and a separate checkout of the Hub's copy; worded for an encrypted publication, it describes a
+/// copy this plain session never had.
 #[test]
 fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
     const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000005";
@@ -9476,6 +9477,19 @@ fn run_resume_and_pull_take_a_published_form_as_the_turn_it_publishes() {
         pulled.contains("talk is up to date") && !pulled.contains("diverged"),
         "{pulled}"
     );
+    assert_eq!(head(), turn);
+    // Merging the Hub tip brings nothing: merged anyway, the turn would land a second time beside
+    // its original, and every later upload would add another published copy to merge.
+    let merged = run(&[
+        "merge",
+        &format!("alice/app@{published}"),
+        "--into",
+        "alice/app@talk",
+        "--manual",
+    ]);
+    assert_success(&merged);
+    let merged = said(&merged);
+    assert!(merged.contains("nothing to merge"), "{merged}");
     assert_eq!(head(), turn);
     // With the branch tracking the Hub's, its tracking ref names the published form, a sibling of
     // the turn, and run and resume still take it as the turn: read as a tip to merge in, the
