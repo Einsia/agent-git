@@ -961,27 +961,6 @@ fn upload_announcement(
     Some(serde_json::json!({ "systemMessage": lines.join("\n") }))
 }
 
-/// Who can read `repository`, as the Hub said; `None` when it has not said.
-fn audience(
-    repository: &str,
-    visibility: Option<&str>,
-    org: Option<bool>,
-    members_read: Option<bool>,
-) -> Option<String> {
-    let owner = repository.split('/').next().unwrap_or_default();
-    Some(match (visibility?, org) {
-        ("public", _) => "public: anyone can read it".to_owned(),
-        ("private", Some(true)) if members_read == Some(true) => {
-            format!("private to {owner}: every member of {owner} can read it")
-        }
-        ("private", Some(true)) => {
-            format!("private to {owner}: its owners and the people granted access can read it")
-        }
-        ("private", Some(false)) => "private: only you and people you add can read it".to_owned(),
-        (visibility, _) => visibility.to_owned(),
-    })
-}
-
 /// One line for the person who resumes a conversation the folder holds back as its earlier
 /// history: it is not uploaded, where it would go and who can read it there, and the two ways to
 /// upload it, each of which uploads only this one, without asking again. Without it, a resume in
@@ -997,7 +976,7 @@ fn held_notice(held: &super::project::HeldEarlier, session: &str) -> String {
         None => format!("is from before {folder} was on"),
     };
     let mut destination = held.repository.clone();
-    if let Some(audience) = audience(
+    if let Some(audience) = super::project::readers(
         &held.repository,
         held.visibility.as_deref(),
         held.org,
@@ -1059,7 +1038,7 @@ fn announces_upload(runtime: &str, source: Source) -> bool {
 /// is not the folder it started in, and how to stop the upload. The agent was told nothing, so
 /// stopping is a command the person runs or asks their agent to run.
 fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
-    let audience = audience(
+    let audience = super::project::readers(
         &upload.repository,
         upload.visibility.as_deref(),
         upload.org,
@@ -2009,7 +1988,7 @@ mod tests {
                 repository: "acme/widget".into(),
                 visibility: visibility.map(str::to_owned),
                 org: Some(true),
-                members_read: None,
+                members_read: Some(false),
                 sign_in,
                 worktree: None,
             })
@@ -2036,17 +2015,27 @@ mod tests {
             |visibility: Option<&str>, org: Option<bool>| notice_reading(visibility, org, None);
         assert!(
             notice_reading(Some("private"), Some(true), Some(true))
-                .contains("(private to acme: every member of acme can read it)")
+                .contains("(private to acme: every member of acme, and the people granted access, can read it)")
         );
         assert_eq!(
-            notice(Some("private"), Some(true)),
+            notice_reading(Some("private"), Some(true), Some(false)),
             "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it)."
         );
         assert!(
             notice(Some("private"), Some(false))
                 .contains("(private: only you and people you add can read it)")
         );
-        assert!(notice(Some("private"), None).contains("(private)"));
+        // An owner the Hub didn't place, or an organization whose base permission it didn't say,
+        // is said to be readable by the people with access to it, never fewer readers than there
+        // are.
+        assert!(
+            notice(Some("private"), None)
+                .contains("(private: the people with access to acme/widget can read it)")
+        );
+        assert!(
+            notice(Some("private"), Some(true))
+                .contains("(private to acme: the people with access to acme/widget can read it)")
+        );
         assert!(notice(Some("public"), Some(true)).contains("(public: anyone can read it)"));
         assert!(notice(None, None).contains("(visibility not confirmed)"));
         // A conversation in a git worktree that an on folder covers is told which folder's
@@ -2089,7 +2078,7 @@ mod tests {
         };
         assert_eq!(
             held(None, Some("private")),
-            "agit: this conversation is from before /w/widget was on, so it is not uploaded. To upload it to acme/widget (private to acme: every member of acme can read it): ask your agent to run `agit save`, or run `agit save 3f2a9c1d` in /w/widget."
+            "agit: this conversation is from before /w/widget was on, so it is not uploaded. To upload it to acme/widget (private to acme: every member of acme, and the people granted access, can read it): ask your agent to run `agit save`, or run `agit save 3f2a9c1d` in /w/widget."
         );
         assert_eq!(
             held(Some("/w/widget-tree"), None),

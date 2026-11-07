@@ -22,28 +22,49 @@ use crate::{
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// What a push the person made says to their agent about the folder `root` it ran in: that each
-/// new conversation there and in its subfolders, and in the git `worktrees` it would also cover,
-/// could upload to `repository` by itself, who can read it there, how to stop it, and that the
-/// agent asks the person and waits for a yes. The person's no is
-/// `agit off`, after which nothing suggests it there again.
+/// Who a note after a command is said to: the person at their terminal, or the agent that ran the
+/// command for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reader {
+    Person,
+    Agent,
+}
+
+impl Reader {
+    /// The person when the command runs at their terminal with no agent session around it.
+    pub(crate) fn of_this_process() -> Self {
+        if ui::prompt::can_ask() {
+            Self::Person
+        } else {
+            Self::Agent
+        }
+    }
+}
+
+/// What a push the person made says about the folder `root` it ran in: that each new conversation
+/// there and in its subfolders, and in the git `worktrees` it would also cover, could upload to
+/// `repository` by itself, who can read it there, and how to keep it off. To an agent it adds that
+/// the agent asks the person and waits for a yes; to the person at their terminal it is a note.
+/// Both name every place, each worktree on a line of its own, and the same readers. The person's no
+/// is `agit off`, after which nothing suggests it there again.
 pub(crate) fn automatic_upload_offer(
     root: &Path,
     worktrees: &[PathBuf],
     repository: &str,
     public: bool,
+    readers: &str,
+    reader: Reader,
 ) -> String {
     let folder = ui::tilde(root);
-    // The person hears every place it would cover before they answer.
-    let also = match worktrees {
-        [] => String::new(),
-        [only] => format!(", and also {} (git worktree),", ui::tilde(only)),
-        many => format!(
-            ", and also {} (git worktrees),",
-            many.iter()
-                .map(|w| ui::tilde(w))
-                .collect::<Vec<_>>()
-                .join(", ")
+    // The person hears every place it would cover before they answer, however many there are.
+    let (places, listed) = match worktrees {
+        [] => ("in this folder and its subfolders", String::new()),
+        _ => (
+            "in this folder and its subfolders, and in the git worktrees listed below,",
+            worktrees
+                .iter()
+                .map(|worktree| format!("\n  {}", ui::tilde(worktree)))
+                .collect(),
         ),
     };
     let command = if public {
@@ -51,14 +72,15 @@ pub(crate) fn automatic_upload_offer(
     } else {
         format!("agit on --repo {repository}")
     };
-    let audience = if public {
-        "public: anyone can read it"
-    } else {
-        "private: only its members can read it"
-    };
-    format!(
-        "For the agent: {folder} doesn't upload its conversations by itself. With `{command}`, each new conversation in this folder and its subfolders{also} would upload to {repository} ({audience}) automatically after each turn; `agit off` turns that off again. Ask the person whether they want this, then wait for their reply. Run `{command}` only if they say yes. Any other reply, or none, counts as no: then run `agit off` here, and don't ask again."
-    )
+    let audience = readers;
+    match reader {
+        Reader::Agent => format!(
+            "For the agent: {folder} doesn't upload its conversations by itself. With `{command}`, each new conversation {places} would upload to {repository} ({audience}) automatically after each turn; `agit off` turns that off again. Ask the person whether they want this, then wait for their reply. Run `{command}` only if they say yes. Any other reply, or none, counts as no: then run `agit off` here, and don't ask again.{listed}"
+        ),
+        Reader::Person => format!(
+            "{folder} doesn't upload its conversations by itself. `{command}` would upload each new conversation {places} to {repository} ({audience}) automatically after each turn; `agit off` keeps it off. This note isn't shown again for this folder.{listed}"
+        ),
+    }
 }
 
 /// Says [`automatic_upload_offer`] after a push the person made from `cwd` to `repository`, once
@@ -82,6 +104,11 @@ pub(crate) fn offer_automatic_upload(client: &crate::hub::Client, cwd: &Path, re
     let Ok(remote) = client.get_agent(owner, name) else {
         return;
     };
+    // Who can read it is said as every other line about a destination says it.
+    let account = client.credential_username().unwrap_or_default();
+    let (org, members_read) = super::project::owner_audience(client, owner, &account);
+    let readers = super::project::readers(repository, Some(&remote.visibility), org, members_read)
+        .unwrap_or_else(|| remote.visibility.clone());
     if !matches!(
         super::project::claim_automatic_upload_offer(&root),
         Ok(true)
@@ -96,6 +123,8 @@ pub(crate) fn offer_automatic_upload(client: &crate::hub::Client, cwd: &Path, re
             &super::project::worktrees_covered_from(&root),
             repository,
             remote.visibility == "public",
+            &readers,
+            Reader::of_this_process(),
         )
     );
 }
@@ -1187,17 +1216,20 @@ fn push_access(
 mod tests {
     use super::*;
 
+    const PRIVATE: &str = "private: only you and people you add can read it";
+    const PUBLIC: &str = "public: anyone can read it";
+
     /// The line a push says names what would upload, where, who can read it there and how to stop
     /// it, and has the agent wait for a yes. A public destination is said to be public, and its
     /// command carries --public, which `agit on` needs for one.
     #[test]
     fn the_automatic_upload_offer_says_what_where_who_and_how_to_stop() {
         let root = Path::new("/work/app");
-        let private = automatic_upload_offer(root, &[], "alice/app", false);
+        let private = automatic_upload_offer(root, &[], "alice/app", false, PRIVATE, Reader::Agent);
         for said in [
             "For the agent: /work/app doesn't upload",
             "`agit on --repo alice/app`",
-            "each new conversation in this folder and its subfolders would upload to alice/app (private: only its members can read it) automatically after each turn",
+            "each new conversation in this folder and its subfolders would upload to alice/app (private: only you and people you add can read it) automatically after each turn",
             "`agit off` turns that off again",
             "then wait for their reply",
             "Any other reply, or none, counts as no",
@@ -1206,29 +1238,77 @@ mod tests {
         }
         assert!(!private.contains("--public"), "{private}");
         assert!(!private.contains("git worktree"), "{private}");
-        let public = automatic_upload_offer(root, &[], "alice/site", true);
+        let public = automatic_upload_offer(root, &[], "alice/site", true, PUBLIC, Reader::Agent);
         assert!(
             public.contains("`agit on --repo alice/site --public`"),
             "{public}"
         );
         assert!(public.contains("(public: anyone can read it)"), "{public}");
-        // Every git worktree it would also cover is named in the question itself.
-        let one =
-            automatic_upload_offer(root, &[PathBuf::from("/work/app-fix")], "alice/app", false);
+        // Every git worktree it would also cover is named, each on a line of its own, however
+        // many there are.
+        let worktrees: Vec<PathBuf> = (0..50)
+            .map(|index| PathBuf::from(format!("/work/app-{index}")))
+            .collect();
+        let many =
+            automatic_upload_offer(root, &worktrees, "alice/app", false, PRIVATE, Reader::Agent);
         assert!(
-            one.contains("in this folder and its subfolders, and also /work/app-fix (git worktree), would upload to alice/app"),
-            "{one}"
+            many.contains("in this folder and its subfolders, and in the git worktrees listed below, would upload to alice/app"),
+            "{many}"
         );
-        let two = automatic_upload_offer(
-            root,
-            &[PathBuf::from("/work/a"), PathBuf::from("/work/b")],
-            "alice/app",
-            false,
-        );
-        assert!(
-            two.contains("and also /work/a, /work/b (git worktrees), would upload"),
-            "{two}"
-        );
+        for worktree in &worktrees {
+            assert!(
+                many.contains(&format!("\n  {}", worktree.display())),
+                "{many}"
+            );
+        }
+        assert_eq!(many.lines().count(), 51, "{many}");
+    }
+
+    /// At a person's terminal the same offer is a note to the person: no agent instructions, and
+    /// the same places, worktrees and readers as the agent is told, word for word.
+    #[test]
+    fn the_automatic_upload_offer_speaks_to_a_person_with_the_same_places_and_readers() {
+        let root = Path::new("/work/app");
+        let worktrees = [PathBuf::from("/work/a"), PathBuf::from("/work/b")];
+        for public in [false, true] {
+            let readers = if public { PUBLIC } else { PRIVATE };
+            let destination = format!("to alice/app ({readers})");
+            let person = automatic_upload_offer(
+                root,
+                &worktrees,
+                "alice/app",
+                public,
+                readers,
+                Reader::Person,
+            );
+            let agent = automatic_upload_offer(
+                root,
+                &worktrees,
+                "alice/app",
+                public,
+                readers,
+                Reader::Agent,
+            );
+            for said in [
+                "/work/app doesn't upload its conversations by itself.",
+                "`agit off` keeps it off.",
+                "This note isn't shown again for this folder.",
+                "\n  /work/a\n  /work/b",
+            ] {
+                assert!(person.contains(said), "{said}: {person}");
+            }
+            for shared in [
+                "in this folder and its subfolders, and in the git worktrees listed below,",
+                destination.as_str(),
+                "\n  /work/a\n  /work/b",
+            ] {
+                assert!(person.contains(shared), "{shared}: {person}");
+                assert!(agent.contains(shared), "{shared}: {agent}");
+            }
+            for agent_only in ["For the agent", "Ask the person", "wait for their reply"] {
+                assert!(!person.contains(agent_only), "{agent_only}: {person}");
+            }
+        }
     }
 
     /// The origin is sent to the Hub to find the team's destination. A token a person put into an
