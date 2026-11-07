@@ -214,13 +214,15 @@ pub(super) struct Device {
 }
 
 /// The one question `--here` asks before it binds `folder` to the new private repository
-/// `repository`.
+/// `repository`, which is in the person's own namespace: [`bind_folder`] offers no other. Who can
+/// read it is said as every other line about a destination says it.
 pub(super) fn question(hub: &str, folder: &Path, repository: &str) -> String {
     let folder = crate::ui::tilde(folder);
+    let readers = crate::commands::project::readers(repository, Some("private"), Some(false), None)
+        .unwrap_or_else(|| "private".to_owned());
     format!(
         "Sessions started from now on in {folder} from the web or the relay upload to {repository} \
-         (new, private: only its members can read it); a terminal session does once you open it \
-         on the web.\n\
+         (new, {readers}); a terminal session does once you open it on the web.\n\
          Sessions already in {folder} stay on this computer until you save them (`agit save`).\n\
          To stop the uploads: `agit off {folder}`.\n\
          Turning off Cloud access (`agit rc cloud inbound --hub {hub} --enabled false`) stops the \
@@ -725,7 +727,7 @@ mod tests {
             let folder = Path::new("/work/app");
             let asked = question("https://hub.example", folder, "ada/app");
             for expected in [
-                "ada/app (new, private: only its members can read it)",
+                "ada/app (new, private: only you and people you add can read it)",
                 "Sessions started from now on in /work/app from the web or the relay upload to",
                 "a terminal session does once you open it on the web",
                 "Sessions already in /work/app stay on this computer until you save them",
