@@ -10,6 +10,8 @@ use crate::hub::{
     git::RemoteRefs, identity::RemoteIdentity, privacy::sessions::SessionPrivacyResponse,
 };
 
+#[path = "session_projection.rs"]
+mod projection;
 #[path = "session_sources.rs"]
 mod sources;
 
@@ -1032,6 +1034,7 @@ impl ProjectedHistory {
         // The source commit holding each plain public commit's LOG, for public commits this run
         // writes.
         let mut written = std::collections::HashMap::new();
+        let mut projector = projection::Projector::default();
         let mut imports = crate::commands::plumbing::CommitImports::default();
         let mut completed = BTreeSet::new();
         let mut reused = 0;
@@ -1339,18 +1342,53 @@ impl ProjectedHistory {
                                     &plain_sources,
                                     &plain_publics,
                                 )?;
-                                let conversation = conversation_commit(
-                                    &source,
-                                    oid,
-                                    &parents[oid],
-                                    &public_records,
-                                    Carried {
-                                        projected: published,
-                                        others: &others,
-                                        held_back,
-                                    },
-                                    &mut rechecked,
-                                )?;
+                                let carried = Carried {
+                                    projected: published,
+                                    others: &others,
+                                    held_back,
+                                };
+                                // A snapshot that carries what an encrypted publication below it
+                                // published is projected whole, and the projector starts again
+                                // after it: its records' public form comes from that projection,
+                                // not from the snapshot before it.
+                                let conversation = if carried.projected.is_none()
+                                    && carried.others.is_empty()
+                                    && carried.held_back.is_empty()
+                                {
+                                    let conversation = projector.project(
+                                        &source,
+                                        oid,
+                                        &parents[oid],
+                                        &public_records,
+                                        &mut rechecked,
+                                    )?;
+                                    // Debug builds hold the projector to the whole-LOG projection
+                                    // on every snapshot.
+                                    #[cfg(debug_assertions)]
+                                    ensure!(
+                                        conversation
+                                            == conversation_commit(
+                                                &source,
+                                                oid,
+                                                &parents[oid],
+                                                &public_records,
+                                                Carried::default(),
+                                                &mut rechecked,
+                                            )?,
+                                        "the snapshot projector differs from the whole-LOG projection"
+                                    );
+                                    conversation
+                                } else {
+                                    projector = projection::Projector::default();
+                                    conversation_commit(
+                                        &source,
+                                        oid,
+                                        &parents[oid],
+                                        &public_records,
+                                        carried,
+                                        &mut rechecked,
+                                    )?
+                                };
                                 count_left_out(
                                     &repo,
                                     &public_parents,
