@@ -52,13 +52,11 @@ impl Session {
                 .driver
                 .runtime_thread_id()
                 .context("RC native session is unavailable")?;
-            if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)?
-                || crate::rc::folder_cutoff::holds_back(
-                    &repo,
-                    &self.info.runtime,
-                    &native_session_id,
-                )
-            {
+            // Off means no attempt at all: nothing is sent, recorded or shown.
+            if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)? {
+                return Ok(None);
+            }
+            if crate::rc::folder_cutoff::holds_back(&repo, &self.info.runtime, &native_session_id) {
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Configuration);
                 status.reason = Some(Reason::PushDisabled);

@@ -112,6 +112,17 @@ pub fn check_audit_environment() -> crate::Result<()> {
 /// [`super::auto_push::automatic_push`]: the one place that marks a publication automatic.
 pub fn run_automatic(args: Args) -> CmdResult {
     super::auto_push::mark_automatic();
+    // Before sign-in or any request: with automatic upload off, this child asks the Hub nothing.
+    if let Some((repository, _)) = args.agent.as_deref().and_then(|a| a.split_once('@')) {
+        let (owner, name) = super::parse_slug(repository)?;
+        if let Some(repo) = Repo::open(crate::infra::config::repo_dir(&owner, &name)?) {
+            ensure!(
+                super::auto_push::publication_allowed(&repo, repository)?,
+                "{}",
+                super::auto_push::DISABLED_FOR_REPOSITORY
+            );
+        }
+    }
     run(args)
 }
 

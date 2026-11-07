@@ -1556,7 +1556,15 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
             std::fs::write(&fixture.exe, &retry_script).unwrap();
             repo.git(&["config", "agit.desktopPublication", destination.trim()])
                 .unwrap();
-            settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            // With automatic upload off, nothing about this upload reaches the Hub: no push, and
+            // no word of a publication that needs setting up.
+            let frames = settle_draining(&mut resumed, &mut out, SettlementBoundary::Turn).await;
+            assert!(
+                frames
+                    .iter()
+                    .all(|frame| frame.method() != method::SESSION_PUBLICATION_CHANGED),
+                "{frames:?}"
+            );
             assert_eq!(
                 std::fs::read(fixture.repo.join(".git/push-calls")).unwrap(),
                 pushes

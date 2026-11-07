@@ -347,7 +347,14 @@ pub fn run_with_output(mut args: Args, json: bool) -> CmdResult {
         // holds, pinned to a repository on this Hub, was let in when it arrived here: a version
         // saved into it stays on this computer, and a push asks the gate again before it sends
         // anything. So saving into it never waits for the Hub to answer, signed out included.
-        let writability = match super::writability(me, &dest_owner, &dest_name) {
+        // With automatic upload off, a background save doesn't ask at all, its first save into a
+        // repository with no checkout here included: a push still asks before it sends anything.
+        let asked = if super::auto_push::background_with_upload_off(repo)? {
+            Ok(super::Writability::Granted)
+        } else {
+            super::writability(me, &dest_owner, &dest_name)
+        };
+        let writability = match asked {
             Ok(writability) => writability,
             Err(_) if held_here(&dest_owner, &dest_name)? => {
                 ui::hint(&format!(

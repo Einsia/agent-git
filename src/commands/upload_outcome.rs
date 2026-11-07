@@ -380,6 +380,14 @@ impl Place {
             serde_json::from_slice(&bytes).context("the upload record can't be read")?;
         let told = self.paths.told.clone();
         Ok(match outcome {
+            // An agit that still attempted uploads with `push.auto` off saved its refusal in this
+            // class. With it off nothing is attempted, so this failure says nothing now. Reading
+            // changes nothing: `agit status` and the menu bar's listing read here, and
+            // [`clear_failure_with_upload_off`] removes the record when a turn is saved.
+            Outcome::Failed {
+                reason: UploadFailure::Other,
+                ..
+            } if self.automatic_upload_off() => None,
             Outcome::Failed {
                 reason, attempt, ..
             } => Some((Undone::Failed(reason), attempt, told)),
@@ -388,6 +396,20 @@ impl Place {
             }
             Outcome::Started { .. } | Outcome::Uploaded { .. } => None,
         })
+    }
+
+    /// Whether automatic publication is off for this record's repository, in its checkout here.
+    fn automatic_upload_off(&self) -> bool {
+        let Some((repository, _)) = self.target.split_once('@') else {
+            return false;
+        };
+        let Ok((owner, name)) = super::parse_slug(repository) else {
+            return false;
+        };
+        let Some(repo) = config::repo_dir(&owner, &name).ok().and_then(Repo::open) else {
+            return false;
+        };
+        super::auto_push::publication_allowed(&repo, repository).is_ok_and(|allowed| !allowed)
     }
 
     fn undone(&self) -> crate::Result<Option<Undone>> {
@@ -580,6 +602,25 @@ pub(crate) fn undone_in(
         }
     }
     Ok(found)
+}
+
+/// Removes what an agit that still attempted uploads with `push.auto` off left for this branch: the
+/// class its refusal was saved in. Called where a turn is saved and automatic upload is off.
+pub(crate) fn clear_failure_with_upload_off(repository: &str, branch: &str) {
+    let Ok(place) = Place::of(repository, branch) else {
+        return;
+    };
+    under_write_lock(&place.paths.writing, || {
+        if matches!(
+            read(&place.paths.record),
+            Some(Outcome::Failed {
+                reason: UploadFailure::Other,
+                ..
+            })
+        ) {
+            let _ = std::fs::remove_file(&place.paths.record);
+        }
+    });
 }
 
 /// The Hub acknowledged `repository@branch` at the local commit `source`, whoever pushed it:
@@ -925,6 +966,68 @@ mod tests {
 
     fn at(directory: &Path) -> Paths {
         Paths::of(directory.join("record.json"))
+    }
+
+    /// A failure an agit that still attempted uploads with `push.auto` off recorded goes, along
+    /// with what it would tell, once that agit is replaced; any other failure stays, and so does
+    /// that one while automatic upload is on, when it is a failure that needs telling.
+    #[test]
+    fn a_failure_recorded_with_automatic_upload_off_is_dropped() {
+        const CHILD: &str = "AGIT_UPLOAD_OUTCOME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::upload_outcome::tests::a_failure_recorded_with_automatic_upload_off_is_dropped",
+                ])
+                .env(CHILD, "1")
+                .env("AGIT_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        let recorded = |branch: &str, reason: UploadFailure| {
+            let place = Place::of("alice/app", branch).unwrap();
+            std::fs::create_dir_all(place.paths.record.parent().unwrap()).unwrap();
+            let failed = Outcome::Failed {
+                tip: "t".into(),
+                reason,
+                attempt: "a".into(),
+            };
+            write(&place.paths.record, &failed).unwrap();
+        };
+        let exists = |branch: &str| {
+            Place::of("alice/app", branch)
+                .unwrap()
+                .paths
+                .record
+                .exists()
+        };
+
+        repo.set_auto_push(Some(true)).unwrap();
+        recorded("on", UploadFailure::Other);
+        assert_eq!(
+            unreported("alice/app", "on"),
+            Some(Undone::Failed(UploadFailure::Other))
+        );
+        assert!(exists("on"));
+
+        repo.set_auto_push(Some(false)).unwrap();
+        recorded("off", UploadFailure::Other);
+        recorded("hub", UploadFailure::Hub);
+        assert_eq!(unreported("alice/app", "off"), None);
+        assert!(exists("off"), "reading changes nothing");
+        assert_eq!(
+            unreported("alice/app", "hub"),
+            Some(Undone::Failed(UploadFailure::Hub))
+        );
+        clear_failure_with_upload_off("alice/app", "off");
+        clear_failure_with_upload_off("alice/app", "hub");
+        assert!(!exists("off"));
+        assert!(exists("hub"));
     }
 
     /// Uploads of one branch overlap: a settlement's upload and a save's, or two turns' uploads
