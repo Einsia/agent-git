@@ -70,9 +70,14 @@ pub(super) fn run(args: SourceArgs) -> CmdResult {
             name.as_deref(),
         )?)?,
         SourceAction::List => {
+            // The catalog may not exist yet, or be mid-rebuild: the sources list anyway.
+            let sweeps = crate::rc::runtime_catalog::sweep_states().unwrap_or_default();
             let sources = registry.list()?.into_iter().map(|source| {
                 let error = source.validate().err().map(|error| format!("{error:#}"));
-                serde_json::json!({"source": source, "available": error.is_none(), "error": error})
+                let sweep = sweeps.get(&source.source_id).map(|(status, reason)| {
+                    serde_json::json!({"status": status, "reason": reason})
+                });
+                serde_json::json!({"source": source, "available": error.is_none(), "error": error, "sweep": sweep})
             }).collect::<Vec<_>>();
             serde_json::json!({"sources":sources,"discovery":registry.discovery()?})
         }

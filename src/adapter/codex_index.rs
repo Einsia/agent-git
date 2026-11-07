@@ -91,14 +91,21 @@ pub fn index_path_in(dir: &Path) -> Option<PathBuf> {
 /// Open the index database read-only.
 ///
 /// Read-only matters: Codex may be writing it, and agit must never hold a write lock.
+/// How long a read waits on Codex's own lock on its index, which it holds while it writes a
+/// running conversation's row. It is set as the index is opened, before the schema and column
+/// probes: a probe that meets the lock with no wait reads as a schema Codex doesn't have.
+const INDEX_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 fn open(path: &Path) -> Option<Connection> {
-    Connection::open_with_flags(
+    let con = Connection::open_with_flags(
         path,
         // `SQLITE_OPEN_READ_ONLY` + no create. URI mode keeps parameters like immutable
         // available later, but immutable stays off — it reads torn pages while Codex is writing.
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .ok()
+    .ok()?;
+    con.busy_timeout(INDEX_BUSY_WAIT).ok()?;
+    Some(con)
 }
 
 /// Whether the table and every column needed are present.
@@ -106,13 +113,18 @@ fn open(path: &Path) -> Option<Connection> {
 /// When the schema changes (a Codex upgrade), better to fall back wholesale to scanning files
 /// than to guess from half a schema — that silently yields an incomplete list.
 fn schema_ok(con: &Connection) -> bool {
-    // `archived` must be there too: `threads_for_cwd` uses the composite index through it.
-    con.prepare(
-        "SELECT id, rollout_path, cwd, first_user_message, thread_source, updated_at_ms, \
-         archived FROM threads LIMIT 0",
-    )
-    .is_ok()
+    con.prepare(SCHEMA_PROBE).is_ok()
 }
+
+// `archived` must be there too: `threads_for_cwd` uses the composite index through it.
+const SCHEMA_PROBE: &str = "SELECT id, rollout_path, cwd, first_user_message, thread_source, \
+     updated_at_ms, archived FROM threads LIMIT 0";
+
+/// The index has no `threads` table with the columns a page reads: a Codex this build doesn't
+/// know. A probe that only met Codex's lock is not this; it is the lock's own error.
+#[derive(Debug, thiserror::Error)]
+#[error("native index schema is unsupported")]
+pub struct UnsupportedIndex;
 
 const GIST_SOURCE_CHARS: usize = 4096;
 
@@ -269,7 +281,9 @@ fn all_threads_at(con: &Connection, choices_only: bool) -> Option<Vec<Thread>> {
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// A bounded native index page advances even when workspace admission hides every row.
+/// A bounded native index page advances even when workspace admission hides every row. Pages run
+/// from the newest thread to the oldest: Codex's thread ids sort by when the thread began, so a
+/// pass over the index that is cut short has still read the conversations most likely open.
 pub struct ThreadPage {
     pub threads: Vec<Thread>,
     pub next_cursor: Option<String>,
@@ -283,18 +297,20 @@ pub fn thread_page_in(home: &Path, after: Option<&str>, limit: usize) -> crate::
     );
     let path = index_path_in(home).context("native index is unavailable")?;
     let con = open(&path).context("native index cannot be opened")?;
-    ensure!(schema_ok(&con), "native index schema is unsupported");
-    con.busy_timeout(std::time::Duration::from_millis(100))?;
+    if let Err(error) = con.prepare(SCHEMA_PROBE) {
+        return Err(if busy(&error) {
+            error.into()
+        } else {
+            UnsupportedIndex.into()
+        });
+    }
     let sql = format!(
-        "{} WHERE archived = 0 AND rollout_path IS NOT NULL AND id COLLATE BINARY > ?1 ORDER BY id COLLATE BINARY LIMIT ?2",
+        "{} WHERE archived = 0 AND rollout_path IS NOT NULL AND (?1 IS NULL OR id COLLATE BINARY < ?1) ORDER BY id COLLATE BINARY DESC LIMIT ?2",
         select(&con)
     );
     let mut statement = con.prepare(&sql)?;
     let mut threads: Vec<Thread> = statement
-        .query_map(
-            rusqlite::params![after.unwrap_or(""), limit + 1],
-            row_to_thread,
-        )?
+        .query_map(rusqlite::params![after, limit + 1], row_to_thread)?
         .collect::<rusqlite::Result<_>>()?;
     let more = threads.len() > limit;
     threads.truncate(limit);
@@ -305,6 +321,21 @@ pub fn thread_page_in(home: &Path, after: Option<&str>, limit: usize) -> crate::
         threads,
         next_cursor,
     })
+}
+
+/// Whether `error` is Codex holding its index for a moment rather than anything wrong with it.
+pub fn busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// [`busy`] anywhere in `error`'s chain.
+pub fn held(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(busy))
 }
 
 /// Whether `home` has no native index, for a caller that must tell that from a folder it can't
