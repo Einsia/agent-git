@@ -951,8 +951,67 @@ fn opencode_single_row_messages_follow_the_same_rule() {
         "data":{"text":"fix it"}});
     assert_eq!(published("opencode", &user).unwrap(), user);
     assert_stable("opencode", &user);
+    let mut v2 = user.clone();
+    v2["data"]["metadata"] = json!({"displayText":"PRIVATE_UI_TEXT","agent":"build","comments":["PRIVATE_COMMENT"],"model":{"providerID":"private"}});
+    v2["data"]["agents"] = json!([{"name":"PRIVATE_AGENT"}]);
+    v2["data"]["skills"] = json!([{"name":"PRIVATE_SKILL"}]);
+    v2["data"]["files"] =
+        json!([{"mime":"text/plain","data":"UFJJVkFURV9UT0tFTg==","name":".env"}]);
+    assert_eq!(published("opencode", &v2).unwrap(), user);
+    assert_stable("opencode", &v2);
+    let mut injected = v2.clone();
+    injected["type"] = "synthetic".into();
+    assert_eq!(published("opencode", &injected), None);
+    for key in ["synthetic", "system", "unknown"] {
+        let mut marked = v2.clone();
+        marked["data"][key] = true.into();
+        assert_eq!(published("opencode", &marked), None);
+    }
+    for key in ["metadata", "agents", "skills"] {
+        let mut malformed = v2.clone();
+        malformed["data"][key] = "invalid".into();
+        assert_eq!(published("opencode", &malformed), None);
+    }
     let other = json!({"id":"msg_v5","kind":"session_message","type":"agent-switch","data":{"agent":AGENTS_MD}});
     assert_eq!(published("opencode", &other), None);
+}
+
+/// Encoded tool files must not evade text scanning; only visual payloads survive publication,
+/// and filtering an already published notice must be stable for Hub reads.
+#[test]
+fn opencode_tool_files_do_not_publish_opaque_text_payloads() {
+    let hidden = "UFJJVkFURV9UT0tFTg==";
+    let files = json!([
+        {"type":"file","mime":"text/plain","uri":format!("data:text/plain;base64,{hidden}")},
+        {"type":"file","mime":"application/json","data":hidden},
+        {"type":"file","mime":"application/octet-stream","url":format!("data:application/octet-stream;base64,{hidden}")},
+        {"type":"file","uri":format!("data:;base64,{hidden}")},
+        {"type":"file","mime":"image/png","uri":format!("data:text/plain;base64,{hidden}")},
+        {"type":"file","mime":"image/png","uri":"data:image/png;base64,SU1BR0U="},
+        {"type":"file","mime":"application/pdf","url":"data:application/pdf;base64,UERG"}
+    ]);
+    for field in ["content", "attachments"] {
+        let mut tool = json!({"type":"tool","name":"read","state":{"status":"completed","input":{},"output":"Readable output"}});
+        tool["state"][field] = files.clone();
+        let records = [
+            json!({"kind":"session_message","type":"assistant","data":{"content":[tool.clone()]}}),
+            json!({"kind":"part","data":tool}),
+        ];
+        for record in records {
+            let kept = published("opencode", &record).unwrap();
+            let text = kept.to_string();
+            assert!(!text.contains(hidden));
+            assert!(text.contains("Readable output"));
+            assert!(text.contains("data:image/png;base64,SU1BR0U="));
+            assert!(text.contains("data:application/pdf;base64,UERG"));
+            assert_eq!(
+                text.matches("[Attachment omitted: unsupported file type]")
+                    .count(),
+                5
+            );
+            assert_stable("opencode", &record);
+        }
+    }
 }
 
 /// The ordered judgement of kinds is the judgement of the records: a session's records give the

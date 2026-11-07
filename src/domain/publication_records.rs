@@ -941,7 +941,7 @@ impl Classifier {
             // keep their timing and their text, reasoning and tool items; a compaction keeps its
             // summary. A user row holds what the person sent, and OpenCode writes what it adds as
             // rows of other types: it keeps its timing and its text through `typed_text`, never
-            // its attached files, and a row with any other field is left out.
+            // its attached files or UI metadata. Unknown fields still require provenance review.
             "session_message" => {
                 let data = record.get("data")?.as_object()?;
                 let mut kept_data = Map::new();
@@ -957,7 +957,7 @@ impl Classifier {
                             .filter(|item| {
                                 matches!(item["type"].as_str(), Some("text" | "reasoning" | "tool"))
                             })
-                            .cloned()
+                            .map(opencode_tool_attachments)
                             .collect();
                         kept_data.insert("content".into(), Value::Array(items));
                     }
@@ -965,8 +965,16 @@ impl Classifier {
                         kept_data.insert("summary".into(), data.get("summary")?.clone());
                     }
                     "user" => {
-                        const FIELDS: &[&str] = &["time", "text", "files"];
+                        const FIELDS: &[&str] =
+                            &["time", "text", "files", "metadata", "agents", "skills"];
                         if data.keys().any(|key| !FIELDS.contains(&key.as_str())) {
+                            return None;
+                        }
+                        if data.get("metadata").is_some_and(|value| !value.is_object())
+                            || ["agents", "skills"]
+                                .iter()
+                                .any(|key| data.get(*key).is_some_and(|value| !value.is_array()))
+                        {
                             return None;
                         }
                         if let Some(time) = data.get("time") {
@@ -1022,10 +1030,61 @@ fn opencode_part(record: &Map<String, Value>, host: Host) -> Option<Value> {
         (Host::Assistant, "text") => {
             (data["synthetic"] != true).then(|| Value::Object(record.clone()))
         }
-        (_, "reasoning" | "tool" | "compaction") => Some(Value::Object(record.clone())),
+        (_, "tool") => {
+            let mut kept = record.clone();
+            kept.insert("data".into(), opencode_tool_attachments(data));
+            Some(Value::Object(kept))
+        }
+        (_, "reasoning" | "compaction") => Some(Value::Object(record.clone())),
         (Host::User, "text") => opencode_typed_part(record),
         _ => None,
     }
+}
+
+/// Encoded non-visual files bypass text scanning, so publication keeps only a notice. Native
+/// snapshots retain their bytes for restoration. Tool results can carry files in either layout.
+fn opencode_tool_attachments(value: &Value) -> Value {
+    let mut kept = value.clone();
+    if kept["type"] != "tool" {
+        return kept;
+    }
+    for field in ["content", "attachments"] {
+        let Some(items) = kept
+            .get_mut("state")
+            .and_then(|state| state.get_mut(field))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for item in items {
+            if (field == "attachments" || item["type"] == "file") && !opencode_visual_file(item) {
+                *item = serde_json::json!({"type":"text","text":"[Attachment omitted: unsupported file type]"});
+            }
+        }
+    }
+    kept
+}
+
+fn opencode_visual_file(file: &Value) -> bool {
+    let Some(mime) = file["mime"].as_str() else {
+        return false;
+    };
+    let visual = |mime: &str| mime.starts_with("image/") || mime == "application/pdf";
+    if !visual(mime) {
+        return false;
+    }
+    // A data URL's declaration must agree with the file label; either can carry the real type.
+    ["uri", "url"].iter().all(|field| {
+        file[*field]
+            .as_str()
+            .and_then(|url| url.strip_prefix("data:"))
+            .is_none_or(|data| {
+                data.split_once(',').is_some_and(|(header, _)| {
+                    let declared = header.split(';').next().unwrap_or_default();
+                    declared == mime && visual(declared)
+                })
+            })
+    })
 }
 
 /// A text part of the person's message with its text through [`typed_text`], or `None` when the

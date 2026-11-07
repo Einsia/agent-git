@@ -118,7 +118,6 @@ rc = [
     "dep:tokio-tungstenite",
     "dep:futures-util",
     "dep:portable-pty",
-    "dep:base64",
 ]
 
 # The device-local vault for low-entropy secrets. A backend reusing domain with
@@ -128,7 +127,6 @@ secret-vault = [
     "dep:aes-gcm",
     "dep:x25519-dalek",
     "dep:crypto_box",
-    "dep:base64",
     "dep:keyring",
     "dep:security-framework",
     "dep:zeroize",
@@ -233,7 +231,7 @@ rand = "0.8"
 aes-gcm = { version = "0.10", optional = true }
 x25519-dalek = { version = "2", optional = true }
 crypto_box = { version = "0.9.1", default-features = false, features = ["seal", "salsa20", "std", "rand_core"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 # native store: macOS Keychain / Windows Credential Manager / Unix Secret Service.
 # `v1` is this crate's narrow cross-platform API; the `cli` feature stays off,
 # since it links every alternative store in.

@@ -6,11 +6,11 @@
 //! ~/.local/share/opencode/opencode.db     SQLite, WAL mode (with -wal/-shm companion files)
 //! ```
 //!
-//! The jsonl-layout era is over: a session lives across the four tables `session` / `message` /
-//! `part` / `project`, and its content is the two JSON TEXT columns `message.data` /
-//! `part.data`. The backing store is not a file but a set of database rows, so this adapter
-//! reads in two layers (spec and evidence in docs/mechanism-probing/opencode-format.md; every
-//! §n below refers to it):
+//! Storage routing recognizes classic `session` + `message`/`part`, transitional
+//! `session` + `session_message`, and V2 `session_v2` + `session_message`/`session_part`.
+//! A migrated V2 identity owns its metadata and content even when the classic rows remain.
+//! The backing store is a set of database rows, read in two layers (format evidence lives in
+//! docs/mechanism-probing/opencode-format.md):
 //!
 //! * listing / lookup → query the tables directly (the SQL in §5, millisecond-scale);
 //! * when raw bytes are wanted → **materialize on demand** into a jsonl cache in the canonical
@@ -23,11 +23,9 @@
 //! opencode --session <id>
 //! ```
 //!
-//! Resume **continues in place** (it writes back to the same `session` row), so install never
-//! reuses the original id: every id is reminted into a new copy, then `opencode import <file>`
-//! writes it to the database. import is insert-ignore (§8.2), so it is idempotent and safe to
-//! retry; directory/path/project are rewritten into the cwd context of the import — which is
-//! what makes ownership come out right on its own.
+//! Resume continues in place, so installation mints a new identity and invokes the target
+//! CLI's transfer protocol. V2 uses `opencode session import`;
+//! classic builds use `opencode import`. Both import into the target working directory.
 //!
 //! # Capability: Resumable (§8.3)
 //!
@@ -54,36 +52,31 @@ pub struct OpenCode;
 
 mod compaction_state;
 pub(crate) use compaction_state::CompactionState;
+mod storage;
+mod transfer;
+use storage::{Layout, db_path};
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
-/// Where the session database lives. OpenCode follows XDG: `$XDG_DATA_HOME/opencode/`,
-/// defaulting to `~/.local/share/opencode/` (both spellings occur in practice).
-fn db_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty());
-    match base {
-        Some(x) => Some(x.join("opencode").join("opencode.db")),
-        None => {
-            let home = crate::infra::config::user_home()?;
-            Some(
-                home.join(".local")
-                    .join("share")
-                    .join("opencode")
-                    .join("opencode.db"),
-            )
-        }
-    }
-}
-
 /// RC must not inherit session rules that override its agent's approval policy.
-#[cfg(any(feature = "rc", test))]
+#[cfg(test)]
 pub(crate) fn validate_rc_session(database: &Path, id: &str, cwd: &Path) -> Result<()> {
     let con = open(database).ok_or_else(|| anyhow::anyhow!("OpenCode database cannot be read"))?;
+    let transaction = con.unchecked_transaction()?;
+    validate_rc_connection(&transaction, id, cwd)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(any(feature = "rc", test))]
+pub(super) fn validate_rc_connection(con: &Connection, id: &str, cwd: &Path) -> Result<()> {
+    let route = Layout::detect(con)?.route(con, id)?;
     let (directory, permission): (String, Option<String>) = con
         .query_row(
-            "SELECT directory, permission FROM session WHERE id = ?1",
+            &format!(
+                "SELECT directory, permission FROM {} WHERE id = ?1",
+                route.table.name()
+            ),
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -122,10 +115,7 @@ fn cache_path_in(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.jsonl"))
 }
 
-/// Where the receipt (the export JSON fed to `opencode import`) is kept.
-///
-/// Not a junk file: import is idempotent, so this receipt is the evidence of what was installed,
-/// and it is exactly what the user hands back to `opencode import` to retry by hand.
+/// Receipts retain the exact payload sent to the target runtime's import command.
 fn receipt_dir() -> Result<PathBuf> {
     Ok(crate::infra::config::agit_home()?
         .join("imports")
@@ -148,39 +138,8 @@ fn open(path: &Path) -> Option<Connection> {
     .ok()
 }
 
-/// Where a database keeps conversations. A session started from the classic interface writes
-/// `message`/`part` rows; a session driven through OpenCode's v2 API (§1.1) writes only
-/// `session_message` rows. One database holds both kinds side by side, so a reader that knows
-/// one layout sees the other kind of session as empty.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Layout {
-    pub(super) parts: bool,
-    pub(super) projected: bool,
-}
-
-/// The layouts every needed table and column is present for; None when the `session` index or
-/// both conversation layouts are missing. When the schema changes, better wholly unavailable
-/// than guessing from half a schema (the codex_index rule). A `session_message` table without
-/// its ordering columns predates the projection and has never held rows, so it counts as absent.
-pub(super) fn layout(con: &Connection) -> Option<Layout> {
-    let has = |sql: &str| con.prepare(sql).is_ok();
-    if !has(
-        "SELECT id, project_id, parent_id, directory, time_created, version FROM session LIMIT 0",
-    ) {
-        return None;
-    }
-    let layout = Layout {
-        parts: has("SELECT id, session_id, time_created, data FROM message LIMIT 0")
-            && has("SELECT id, message_id, session_id, time_created, data FROM part LIMIT 0"),
-        projected: has(
-            "SELECT id, session_id, type, seq, time_created, data FROM session_message LIMIT 0",
-        ),
-    };
-    (layout.parts || layout.projected).then_some(layout)
-}
-
 fn schema_ok(con: &Connection) -> bool {
-    layout(con).is_some()
+    Layout::detect(con).is_ok()
 }
 
 /// Why a database that exists cannot be read, named by its session tables so the user can tell
@@ -227,11 +186,10 @@ fn ms_to_systime(ms: i64) -> std::time::SystemTime {
 // ── Listing and lookup (§5) ──────────────────────────────────────────────────
 
 /// The minimal row behind what `sessions_for` / `all_sessions` return. Listing reads only the
-/// `session` table and never touches part content (§9).
+/// selected session index and never touches part content (§9).
 struct Listed {
     id: String,
     directory: Option<String>,
-    time_created: i64,
     time_updated: i64,
     parent_id: Option<String>,
 }
@@ -240,50 +198,46 @@ fn row_to_listed(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listed> {
     Ok(Listed {
         id: r.get(0)?,
         directory: r.get(1)?,
-        time_created: r.get(2)?,
         time_updated: r.get(3)?,
         parent_id: r.get(4)?,
     })
 }
-
-const LIST_COLS: &str = "SELECT id, directory, time_created, time_updated, parent_id FROM session";
 
 /// §5: "belongs to a repo" = an exact `directory = repo` match, merged with a
 /// `project.worktree = repo` fallback (which covers sessions started from a subdirectory — the
 /// directory match misses those). Child sessions (non-empty `parent_id`) are in the full set,
 /// with no visibility filter — `opencode session list` shows only root sessions, but hiding
 /// subagent sessions here only makes `import` / `doctor` blind to them.
-fn list_for_repo(con: &Connection, repo: &str) -> Option<Vec<Listed>> {
-    let exact = {
-        let sql = format!("{LIST_COLS} WHERE directory = ?1");
-        let mut st = con.prepare(&sql).ok()?;
-        let rows = st.query_map([repo], row_to_listed).ok()?;
-        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+fn list_for_repo(con: &Connection, repo: &str) -> Result<Vec<Listed>> {
+    let transaction = con.unchecked_transaction()?;
+    let sessions = Layout::detect(&transaction)?.sessions();
+    let rows = {
+        let mut statement = transaction.prepare(&format!(
+            "WITH selected AS ({sessions}) SELECT s.id, s.directory, s.time_created, s.time_updated, s.parent_id \
+             FROM selected s WHERE s.directory = ?1 OR EXISTS \
+             (SELECT 1 FROM project p WHERE p.id = s.project_id AND p.worktree = ?1) ORDER BY s.time_created, s.id"
+        ))?;
+        statement
+            .query_map([repo], row_to_listed)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let by_worktree = {
-        let sql = "SELECT s.id, s.directory, s.time_created, s.time_updated, s.parent_id \
-                   FROM session s JOIN project p ON p.id = s.project_id WHERE p.worktree = ?1";
-        let mut st = con.prepare(sql).ok()?;
-        let rows = st.query_map([repo], row_to_listed).ok()?;
-        rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
-    };
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<Listed> = vec![];
-    for l in exact.into_iter().chain(by_worktree) {
-        if seen.insert(l.id.clone()) {
-            out.push(l);
-        }
-    }
-    out.sort_by_key(|l| l.time_created);
-    Some(out)
+    transaction.commit()?;
+    Ok(rows)
 }
 
-fn list_all(con: &Connection) -> Option<Vec<Listed>> {
-    let sql = format!("{LIST_COLS} ORDER BY time_created");
-    let mut st = con.prepare(&sql).ok()?;
-    let rows = st.query_map([], row_to_listed).ok()?;
-    Some(rows.filter_map(|r| r.ok()).collect())
+fn list_all(con: &Connection) -> Result<Vec<Listed>> {
+    let transaction = con.unchecked_transaction()?;
+    let sessions = Layout::detect(&transaction)?.sessions();
+    let rows = {
+        let mut statement = transaction.prepare(&format!(
+            "WITH selected AS ({sessions}) SELECT id, directory, time_created, time_updated, parent_id FROM selected ORDER BY time_created, id"
+        ))?;
+        statement
+            .query_map([], row_to_listed)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    transaction.commit()?;
+    Ok(rows)
 }
 
 /// Every session in OpenCode's database, or an error when the database is there but cannot be
@@ -312,14 +266,7 @@ pub(crate) fn every_session_in_full() -> Result<Vec<SessionRef>> {
         bail!("{}", unread());
     }
     let cache = cache_dir()?;
-    let listed = con
-        .prepare(&format!("{LIST_COLS} ORDER BY time_created"))
-        .and_then(|mut statement| {
-            statement
-                .query_map([], row_to_listed)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .with_context(unread)?;
+    let listed = list_all(&con).with_context(unread)?;
     Ok(listed.into_iter().map(|l| to_ref(l, &cache)).collect())
 }
 
@@ -344,14 +291,11 @@ fn session_refs_for_repo(repo: &Path, user_only: bool) -> Result<Vec<SessionRef>
     };
     let want = repo.to_string_lossy().to_string();
     let cache = cache_dir()?;
-    let Some(con) = open(&db) else {
-        return Ok(vec![]);
-    };
-    if !schema_ok(&con) {
+    if !db.try_exists()? {
         return Ok(vec![]);
     }
-    Ok(list_for_repo(&con, &want)
-        .unwrap_or_default()
+    let con = open(&db).context("OpenCode session database cannot be read")?;
+    Ok(list_for_repo(&con, &want)?
         .into_iter()
         .filter(|session| !user_only || session.parent_id.as_deref().is_none_or(str::is_empty))
         .map(|l| to_ref(l, &cache))
@@ -368,17 +312,17 @@ fn session_refs_for_repo(repo: &Path, user_only: bool) -> Result<Vec<SessionRef>
 //   {"id":"msg_...","kind":"session_message","session_id":...,"type":...,"seq":...,"time_created":...,"data":...}
 //
 // Rules: the meta line carries no title/cost/tokens/time_updated (all of them change); `data` is
-// always the TEXT read out of the database **embedded verbatim**, never reserialized — once a row
-// is at rest, rereading it yields identical bytes. Order per §2.3: (time_created, kind, id), with
-// message before part inside the same millisecond (a part's time_created is observed to be
-// strictly greater than its host message's; the kind order is only a fuse). A `session_message`
-// row sorts after both and breaks ties by `seq`, the order OpenCode itself projects them in.
+// embedded verbatim for inline records. Split assistant parts are assembled in ordinal order
+// before inline content and serialized deterministically. Classic and transitional snapshots
+// retain their time-based ordering; V2 messages follow seq after the leading metadata record.
 //
 // Envelope key order comes from serde_json's BTreeMap (alphabetical) — the repo's envelope hash
 // discipline already rests on one serialization shape, determinism is the requirement, and the
 // key order drawn above is only illustrative.
 
 mod native_snapshot;
+#[cfg(feature = "rc")]
+pub(crate) use native_snapshot::read_authorized;
 #[cfg(feature = "cli")]
 pub(crate) mod status_snapshot;
 
@@ -514,6 +458,7 @@ impl CanonicalRecord<'_> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn text(&self) -> String {
         let mut bytes = Vec::new();
         self.write_to(&mut bytes)
@@ -531,160 +476,30 @@ struct Materialized {
 }
 
 fn materialize(con: &Connection, session_id: &str) -> Option<Materialized> {
-    let layout = layout(con)?;
-    let meta = con
+    let transaction = con.unchecked_transaction().ok()?;
+    let route = Layout::detect(&transaction)
+        .ok()?
+        .route(&transaction, session_id)
+        .ok()?;
+    let updated_ms = transaction
         .query_row(
-            "SELECT id, project_id, parent_id, directory, time_created, time_updated, version \
-             FROM session WHERE id = ?1",
+            &format!(
+                "SELECT time_updated FROM {} WHERE id = ?1",
+                route.table.name()
+            ),
             [session_id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            },
+            |row| row.get(0),
         )
         .ok()?;
-    let (id, project_id, parent_id, directory, created_ms, updated_ms, version) = meta;
-
-    // The meta line carries immutable columns only (§4 rule 1): title is generated
-    // asynchronously and changes, cost/tokens/time_updated all change, so none of them go in.
-    let mut lines: Vec<(i64, u8, String, String)> = vec![];
-    lines.push((
-        created_ms,
-        0,
-        id.clone(),
-        CanonicalRecord::Meta {
-            id: &id,
-            project_id: &project_id,
-            parent_id: parent_id.as_deref(),
-            directory: &directory,
-            created: created_ms,
-            version: &version,
-        }
-        .text(),
-    ));
-
-    if layout.parts {
-        materialize_parts(con, &id, &mut lines)?;
-    }
-    if layout.projected {
-        let mut statement = con
-            .prepare(
-                "SELECT id, type, seq, time_created, data FROM session_message \
-                 WHERE session_id = ?1",
-            )
-            .ok()?;
-        let rows = statement
-            .query_map([session_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            })
-            .ok()?;
-        for (mid, kind, seq, tc, data) in rows.filter_map(|r| r.ok()) {
-            lines.push((
-                tc,
-                PROJECTED_ORDER,
-                projected_tiebreak(seq),
-                CanonicalRecord::Projected {
-                    id: &mid,
-                    session: &id,
-                    kind: &kind,
-                    seq,
-                    created: tc,
-                    data: &data,
-                }
-                .text(),
-            ));
-        }
-    }
-
-    // Canonical order (time_created, kind, id) — the kind order (message=0 before part=1) is
-    // only a fuse for rows that share a millisecond.
-    lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut text = lines
-        .into_iter()
-        .map(|(_, _, _, l)| l)
-        .collect::<Vec<_>>()
-        .join("\n");
-    text.push('\n');
+    let bytes = native_snapshot::materialize(
+        &transaction,
+        session_id,
+        super::native_snapshot::Limits::capture(),
+    )
+    .ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    transaction.commit().ok()?;
     Some(Materialized { text, updated_ms })
-}
-
-/// The `message`/`part` rows of one session, as canonical lines with their sort keys.
-fn materialize_parts(
-    con: &Connection,
-    id: &str,
-    lines: &mut Vec<(i64, u8, String, String)>,
-) -> Option<()> {
-    let mut ms = con
-        .prepare("SELECT id, time_created, data FROM message WHERE session_id = ?1")
-        .ok()?;
-    let msg_rows = ms
-        .query_map([id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .ok()?;
-    for row in msg_rows.filter_map(|r| r.ok()) {
-        let (mid, tc, data) = row;
-        lines.push((
-            tc,
-            0,
-            mid.clone(),
-            CanonicalRecord::Message {
-                id: &mid,
-                session: id,
-                created: tc,
-                data: &data,
-            }
-            .text(),
-        ));
-    }
-
-    let mut ps = con
-        .prepare("SELECT id, message_id, time_created, data FROM part WHERE session_id = ?1")
-        .ok()?;
-    let part_rows = ps
-        .query_map([id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })
-        .ok()?;
-    for row in part_rows.filter_map(|r| r.ok()) {
-        let (pid, mid, tc, data) = row;
-        lines.push((
-            tc,
-            1,
-            pid.clone(),
-            CanonicalRecord::Part {
-                id: &pid,
-                message: &mid,
-                session: id,
-                created: tc,
-                data: &data,
-            }
-            .text(),
-        ));
-    }
-    Some(())
 }
 
 // ── canonical → IR (the §9.1 mapping table) ──────────────────────────────────
@@ -1763,9 +1578,7 @@ fn canonical_to_export(content: &str, new_id: &str, cwd: &Path) -> Result<serde_
     }))
 }
 
-/// Rewrites `session_message` rows (§1.1) as the classic messages and parts `opencode import`
-/// accepts: the importer writes only `message`/`part`, and OpenCode's own export of such a
-/// session carries no messages at all.
+/// Converts projected messages for a classic target's `opencode import` protocol.
 ///
 /// A classic user message must name a model, which a projected user row does not carry; it
 /// takes the model of the nearest assistant before it, else the first one in the session.
@@ -2152,22 +1965,25 @@ fn import_payload(content: &str, new_id: &str, cwd: &Path) -> Result<String> {
     Ok(serde_json::to_string_pretty(&v)?)
 }
 
-/// Run the official import once (the command is prepared by the caller; import is idempotent
-/// insert-ignore). On failure, surface stderr and name the receipt file — once the environment is
-/// fixed it can be completed by hand.
-fn run_import(cmd: &mut std::process::Command, file: &Path, cwd: &Path) -> Result<()> {
+/// Import once through the selected CLI contract; a V2 identity conflict is not a successful retry.
+fn run_import(cmd: &mut std::process::Command, file: &Path, cwd: &Path, v2: bool) -> Result<()> {
+    if v2 {
+        cmd.args(["session", "import", "--standalone", "--directory"])
+            .arg(cwd);
+    } else {
+        cmd.arg("import");
+    }
     let out = cmd
-        .arg("import")
         .arg(file)
         .current_dir(cwd)
         .output()
-        .context("failed to run opencode import")?;
+        .context("failed to run OpenCode session import")?;
     if out.status.success() {
         return Ok(());
     }
     bail!(
-        "`opencode import` failed (exit {:?}): {}\n  \
-         the receipt file is at {}; after fixing the environment you can `opencode import` it manually (idempotent).",
+        "OpenCode session import failed (exit {:?}): {}\n  \
+         the import receipt is at {}",
         out.status.code(),
         String::from_utf8_lossy(&out.stderr).trim(),
         file.display()
@@ -2240,14 +2056,11 @@ impl Adapter for OpenCode {
             return Ok(vec![]);
         };
         let cache = cache_dir()?;
-        let Some(con) = open(&db) else {
-            return Ok(vec![]);
-        };
-        if !schema_ok(&con) {
+        if !db.try_exists()? {
             return Ok(vec![]);
         }
-        Ok(list_all(&con)
-            .unwrap_or_default()
+        let con = open(&db).context("OpenCode session database cannot be read")?;
+        Ok(list_all(&con)?
             .into_iter()
             .map(|l| to_ref(l, &cache))
             .collect())
@@ -2323,26 +2136,34 @@ impl Adapter for OpenCode {
         mint_key("ses_")
     }
 
-    /// (1) prepare the export JSON (a full canonical remint, or the rendering unchanged);
-    /// (2) write the receipt; (3) run `opencode import` in the target directory; (4) hand back
-    /// the resume command per §9.
-    ///
-    /// import is idempotent (insert-ignore), so installing the same id again is a safe no-op.
-    /// But **agit mints a new id every time** — resume continues in place (§8.3), and a user's
-    /// existing session is never the target.
+    /// The target CLI selects the transfer protocol; native storage detection selects reads.
     fn install(&self, content: &str, new_id: &str, cwd: &Path) -> Result<Installed> {
         let cli = super::which(self.cli()).context(
             "the `opencode` executable was not found — cannot install.\n  \
-             Once the CLI is installed, the receipt file can be `opencode import`-ed manually to complete the content.",
+             Install the CLI before restoring a session.",
         )?;
-        let payload = import_payload(content, new_id, cwd)?;
+        let v2 = transfer::is_v2(&cli)?;
+        let payload = if v2 {
+            transfer::payload(content, new_id, cwd)?
+        } else {
+            import_payload(content, new_id, cwd)?
+        };
         let dir = receipt_dir()?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
         let path = dir.join(format!("{new_id}.json"));
         std::fs::write(&path, &payload)
             .with_context(|| format!("cannot write {}", path.display()))?;
-        run_import(&mut std::process::Command::new(cli), &path, cwd)?;
+        run_import(&mut std::process::Command::new(cli), &path, cwd, v2)?;
+        let limits = super::native_snapshot::Limits::capture();
+        let source = native_snapshot::lookup(
+            &db_path().context("OpenCode database is unavailable")?,
+            new_id,
+            limits,
+        )
+        .context("OpenCode import did not create the requested native session")?;
+        native_snapshot::read(&source, limits)
+            .context("the imported OpenCode session cannot be read completely")?;
         Ok(Installed {
             next: Next::Resume(format!(
                 "(cd {} && opencode --session {new_id})",
@@ -2378,7 +2199,7 @@ fn install_via(
     if let Some(log) = shim_log {
         cmd.env("SHIM_LOG", log);
     }
-    run_import(&mut cmd, &path, cwd)?;
+    run_import(&mut cmd, &path, cwd, false)?;
     Ok(Installed {
         next: Next::Resume(format!(
             "(cd {} && opencode --session {new_id})",
@@ -3273,12 +3094,19 @@ mod tests {
     fn classic_and_projected_sessions_are_read_from_one_database() {
         let (_d, p) = projected_fixture_db();
         let con = open(&p).unwrap();
-        assert_eq!(
-            layout(&con),
-            Some(Layout {
-                parts: true,
-                projected: true
-            })
+        assert!(
+            !Layout::detect(&con)
+                .unwrap()
+                .route(&con, "ses_one")
+                .unwrap()
+                .projected
+        );
+        assert!(
+            Layout::detect(&con)
+                .unwrap()
+                .route(&con, "ses_v2")
+                .unwrap()
+                .projected
         );
         let classic = materialize(&con, "ses_one").unwrap().text;
         assert!(!classic.contains(PROJECTED));
@@ -3326,6 +3154,297 @@ mod tests {
         assert_eq!(
             detail.output.as_deref(),
             Some("Created file successfully: hello.txt")
+        );
+    }
+
+    fn v2_fixture_db() -> (tempfile::TempDir, PathBuf) {
+        let (dir, path) = projected_fixture_db();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(r#"
+            CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+                directory TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, version TEXT NOT NULL, permission TEXT);
+            INSERT INTO session_v2 SELECT *, NULL FROM session WHERE id='ses_v2';
+            DELETE FROM session WHERE id='ses_v2';
+            INSERT INTO session_v2 VALUES('ses_one','proj2',NULL,'/repo/two',100,900,'2.2.1','[]');
+            INSERT INTO session_message VALUES
+                ('msg_migrated','ses_one','user',1,110,110,'{"text":"V2 authority","time":{"created":110}}');
+            UPDATE session_message SET time_created=900 WHERE id='msg_v1';
+            CREATE TABLE session_part (
+                message_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                type TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(message_id,ordinal),
+                FOREIGN KEY(message_id) REFERENCES session_message(id),
+                FOREIGN KEY(session_id) REFERENCES session_v2(id));
+            INSERT INTO session_part VALUES
+                ('msg_v4','ses_v2',9,'text','{"type":"text","text":"Second split."}'),
+                ('msg_v4','ses_v2',2,'text','{"type":"text","text":"First split."}');
+        "#).unwrap();
+        (dir, path)
+    }
+
+    pub(super) fn media_fixture_db() -> (tempfile::TempDir, PathBuf) {
+        use sha2::{Digest, Sha256};
+        let (dir, path) = v2_fixture_db();
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE blob(hash TEXT PRIMARY KEY, bytes INTEGER, data BLOB);
+            DELETE FROM session_message WHERE session_id='ses_v2' AND id NOT IN ('msg_v1','msg_v4');").unwrap();
+        let raw = b"probe";
+        let hash = hex::encode(Sha256::digest(raw));
+        db.execute(
+            "INSERT INTO blob VALUES (?1, ?2, ?3)",
+            rusqlite::params![hash, raw.len(), raw.as_slice()],
+        )
+        .unwrap();
+        let uri = format!("media:{hash}");
+        let mut user: serde_json::Value = serde_json::from_str(
+            &db.query_row(
+                "SELECT data FROM session_message WHERE id='msg_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        user["files"] = serde_json::json!([{"uri":uri,"mime":"text/plain","name":"probe.txt","source":{"type":"inline"}}]);
+        db.execute(
+            "UPDATE session_message SET data=?1 WHERE id='msg_v1'",
+            [user.to_string()],
+        )
+        .unwrap();
+        let tool = serde_json::json!({"type":"tool","id":"call_media","name":"read","time":{"created":530,"completed":538},"state":{"status":"completed","input":{},"content":[{"type":"file","uri":uri,"mime":"text/plain","name":"result.txt"}]}});
+        db.execute(
+            "INSERT INTO session_part VALUES ('msg_v4','ses_v2',10,'tool',?1)",
+            [tool.to_string()],
+        )
+        .unwrap();
+        let mut assistant: serde_json::Value = serde_json::from_str(
+            &db.query_row(
+                "SELECT data FROM session_message WHERE id='msg_v4'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut inline = tool;
+        inline["id"] = "call_inline".into();
+        assistant["content"].as_array_mut().unwrap().push(inline);
+        db.execute(
+            "UPDATE session_message SET data=?1 WHERE id='msg_v4'",
+            [assistant.to_string()],
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    /// A portable snapshot carries referenced bytes from user files and inline or split tool results.
+    /// Missing, corrupt or over-budget media cannot turn into an apparently complete archive.
+    #[test]
+    fn media_snapshots_are_self_contained_or_unavailable() {
+        use super::super::native_snapshot::{Limits, Unavailable};
+        let (_dir, path) = media_fixture_db();
+        let db = Connection::open(&path).unwrap();
+        let source = native_snapshot::lookup(&path, "ses_v2", Limits::default()).unwrap();
+        let snapshot = native_snapshot::read(&source, Limits::default()).unwrap();
+        let text = String::from_utf8(snapshot.bytes.clone()).unwrap();
+        assert!(!text.contains("media:"));
+        assert_eq!(text.matches("data:text/plain;base64,cHJvYmU=").count(), 2);
+        assert_eq!(materialize(&db, "ses_v2").unwrap().text, text);
+        let payload: serde_json::Value = serde_json::from_str(
+            &transfer::payload(&text, "ses_copy", Path::new("/copy")).unwrap(),
+        )
+        .unwrap();
+        let user = payload["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["type"] == "user")
+            .unwrap();
+        assert_eq!(user["files"][0]["data"], "cHJvYmU=");
+        assert!(user["files"][0].get("uri").is_none());
+        let published = text
+            .lines()
+            .filter_map(|line| {
+                let record: serde_json::Value = serde_json::from_str(line).unwrap();
+                crate::domain::publication_records::published("opencode", &record)
+            })
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!published.contains("cHJvYmU="));
+        assert_eq!(
+            published
+                .matches("[Attachment omitted: unsupported file type]")
+                .count(),
+            2
+        );
+        #[cfg(feature = "cli")]
+        assert_eq!(
+            status_snapshot::query(
+                std::fs::read(&path).unwrap(),
+                "ses_v2",
+                Limits::default(),
+                std::time::Instant::now() + std::time::Duration::from_secs(5)
+            )
+            .unwrap(),
+            snapshot.bytes
+        );
+        assert_eq!(
+            native_snapshot::materialize(
+                &db,
+                "ses_v2",
+                Limits {
+                    bytes: snapshot.bytes.len() - 1,
+                    ..Limits::default()
+                }
+            ),
+            Err(Unavailable::BudgetExceeded)
+        );
+        db.execute("UPDATE blob SET data=x'0001020304'", [])
+            .unwrap();
+        assert_eq!(
+            native_snapshot::read(&source, Limits::default()).unwrap_err(),
+            Unavailable::Database
+        );
+        db.execute("UPDATE blob SET data=?1", [b"probe".as_slice()])
+            .unwrap();
+        db.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        let tx = db.unchecked_transaction().unwrap();
+        assert_eq!(
+            native_snapshot::materialize(&tx, "ses_v2", Limits::default()).unwrap(),
+            snapshot.bytes
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer.execute("DELETE FROM blob", []).unwrap();
+        assert_eq!(
+            native_snapshot::materialize(&tx, "ses_v2", Limits::default()).unwrap(),
+            snapshot.bytes
+        );
+        tx.commit().unwrap();
+        assert!(materialize(&db, "ses_v2").is_none());
+        assert_eq!(
+            native_snapshot::read(&source, Limits::default()).unwrap_err(),
+            Unavailable::Database
+        );
+    }
+
+    /// Identity routing precedes filters and every reader uses the same ordered native content.
+    #[test]
+    fn v2_authority_routes_listing_snapshots_parts_and_permissions_together() {
+        use super::super::native_snapshot::{Limits, Unavailable};
+        let (dir, path) = v2_fixture_db();
+        let db = open(&path).unwrap();
+        let all = list_all(&db).unwrap();
+        assert_eq!(all.iter().filter(|row| row.id == "ses_one").count(), 1);
+        assert!(
+            list_for_repo(&db, "/repo/one")
+                .unwrap()
+                .iter()
+                .all(|row| row.id != "ses_one")
+        );
+        assert!(
+            list_for_repo(&db, "/repo/two")
+                .unwrap()
+                .iter()
+                .any(|row| row.id == "ses_one")
+        );
+        assert!(
+            materialize(&db, "ses_one")
+                .unwrap()
+                .text
+                .contains("V2 authority")
+        );
+        assert!(
+            !materialize(&db, "ses_one")
+                .unwrap()
+                .text
+                .contains("question")
+        );
+        let materialized = materialize(&db, "ses_v2").unwrap();
+        let source = native_snapshot::lookup(&path, "ses_v2", Limits::default()).unwrap();
+        let native = native_snapshot::read(&source, Limits::default()).unwrap();
+        assert_eq!(materialized.text.as_bytes(), native.bytes);
+        assert_eq!(
+            native_snapshot::materialize(
+                &db,
+                "ses_v2",
+                Limits {
+                    records: native.records,
+                    ..Limits::default()
+                }
+            ),
+            Err(Unavailable::BudgetExceeded)
+        );
+        let ir = OpenCode.parse(&materialized.text).unwrap();
+        assert_eq!(
+            ir.events.first().unwrap().text.as_deref(),
+            Some("please write a file")
+        );
+        let replies: Vec<_> = ir
+            .events
+            .iter()
+            .filter(|e| e.kind == EventKind::AssistantReply)
+            .map(|e| e.text.as_deref().unwrap())
+            .collect();
+        assert_eq!(replies, ["First split.", "Second split.", "Done."]);
+        #[cfg(feature = "cli")]
+        assert_eq!(
+            status_snapshot::query(
+                std::fs::read(&path).unwrap(),
+                "ses_v2",
+                Limits::default(),
+                std::time::Instant::now() + std::time::Duration::from_secs(5)
+            )
+            .unwrap(),
+            native.bytes
+        );
+        drop(db);
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE session_message SET seq=-1 WHERE id='msg_migrated'",
+            [],
+        )
+        .unwrap();
+        assert!(materialize(&db, "ses_one").is_none());
+        db.execute(
+            "UPDATE session_message SET seq=1 WHERE id='msg_migrated'",
+            [],
+        )
+        .unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        db.execute(
+            "UPDATE session_v2 SET directory=?1 WHERE id='ses_one'",
+            [cwd.to_str().unwrap()],
+        )
+        .unwrap();
+        validate_rc_session(&path, "ses_one", &cwd).unwrap();
+        db.execute("UPDATE session_v2 SET permission='[{\"action\":\"shell\",\"effect\":\"allow\"}]' WHERE id='ses_one'", []).unwrap();
+        assert!(validate_rc_session(&path, "ses_one", &cwd).is_err());
+        db.execute(
+            "UPDATE session_part SET session_id='ses_one' WHERE ordinal=2",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            native_snapshot::materialize(&db, "ses_v2", Limits::default()),
+            Err(Unavailable::Database)
+        );
+        db.execute(
+            "UPDATE session_part SET session_id='ses_v2' WHERE ordinal=2",
+            [],
+        )
+        .unwrap();
+        db.execute_batch("DROP TABLE message; DROP TABLE part; DROP TABLE session;")
+            .unwrap();
+        assert_eq!(list_all(&db).unwrap().len(), 2);
+        assert!(materialize(&db, "ses_v2").is_some());
+        db.execute_batch("ALTER TABLE session_message RENAME COLUMN seq TO unknown_order;")
+            .unwrap();
+        assert!(list_all(&db).is_err());
+        assert_eq!(
+            native_snapshot::lookup(&path, "ses_one", Limits::default()).unwrap_err(),
+            Unavailable::Database
         );
     }
 

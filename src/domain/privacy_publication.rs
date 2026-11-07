@@ -3027,9 +3027,12 @@ mod tests {
         let session = format!("agit-{}", "a".repeat(40));
         let raw = [
             json!({"id":"msg_v3","kind":"session_message","session_id":"ses_v2","type":"user","seq":8,"time_created":520,
-                "data":{"text":"PUBLIC_USER_ROW","files":[{"uri":"file:///Users/canary/PRIVATE_FILE.md","mime":"text/markdown","name":"PRIVATE_FILE.md"}]}}),
+                "data":{"text":"PUBLIC_USER_ROW","metadata":{"displayText":"PRIVATE_DISPLAY","comments":["PRIVATE_COMMENT"],"agent":"build"},"agents":[],"skills":[{"name":"PRIVATE_SKILL"}],"files":[{"data":"UFJJVkFURV9UT0tFTg==","mime":"text/markdown","name":"PRIVATE_FILE.md"}]}}),
             json!({"id":"msg_v4","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":9,"time_created":530,
-                "data":{"time":{"created":530,"completed":538},"system":"PRIVATE_SYSTEM","content":[{"type":"text","id":"text-0","text":"Done."}]}}),
+                "data":{"time":{"created":530,"completed":538},"system":"PRIVATE_SYSTEM","content":[{"type":"text","id":"text-0","text":"Done."},{"type":"tool","id":"read-file","name":"read","state":{"status":"completed","input":{},"content":[{"type":"file","mime":"application/json","uri":"data:application/json;base64,UFJJVkFURV9UT0tFTg=="}]}}]}}),
+            json!({"id":"msg_injected","kind":"session_message","session_id":"ses_v2","type":"synthetic","seq":10,"data":{"text":"PRIVATE_INJECTION"}}),
+            json!({"id":"msg_next","kind":"session_message","session_id":"ses_v2","type":"user","seq":11,"data":{"text":"PUBLIC_NEXT_REQUEST","metadata":{"displayText":"PRIVATE_DISPLAY"},"agents":[]}}),
+            json!({"id":"msg_final","kind":"session_message","session_id":"ses_v2","type":"assistant","seq":12,"data":{"content":[{"type":"text","text":"Second reply."}]}}),
         ]
         .into_iter()
         .map(|value| format!("{value}\n"))
@@ -3046,7 +3049,7 @@ mod tests {
         )
         .unwrap();
         let records = storage::parse_envelopes(projection.log()).unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 5);
         assert_eq!(records[0].content["message"]["role"], "user");
         assert_eq!(
             records[0].content["message"]["content"][0]["text"],
@@ -3057,6 +3060,41 @@ mod tests {
         assert!(!projection.log().contains("PRIVATE_FILE"));
         assert!(!projection.log().contains("canary"));
         assert!(!projection.log().contains("PRIVATE_SYSTEM"));
+        for hidden in [
+            "PRIVATE_DISPLAY",
+            "PRIVATE_COMMENT",
+            "PRIVATE_SKILL",
+            "PRIVATE_INJECTION",
+            "UFJJVkFURV9UT0tFTg==",
+        ] {
+            assert!(!projection.log().contains(hidden));
+        }
+        let public = transcript::display::parse(projection.log()).unwrap();
+        let groups = crate::domain::turn::groups_of(&public);
+        assert_eq!(groups.len(), 2);
+        let texts: Vec<Vec<_>> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .filter(|&&index| {
+                        matches!(
+                            public.events[index].kind,
+                            crate::adapter::EventKind::UserPrompt
+                                | crate::adapter::EventKind::AssistantReply
+                        )
+                    })
+                    .filter_map(|&index| public.events[index].text.as_deref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                vec!["PUBLIC_USER_ROW", "Done."],
+                vec!["PUBLIC_NEXT_REQUEST", "Second reply."]
+            ]
+        );
     }
 
     #[test]
