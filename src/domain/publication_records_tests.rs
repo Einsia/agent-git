@@ -1014,6 +1014,65 @@ fn opencode_tool_files_do_not_publish_opaque_text_payloads() {
     }
 }
 
+/// A visual tool file is one the filter keeps, and what it holds still goes through the privacy
+/// check plain publication gives every record it publishes. Text carried as
+/// `data:image/png;base64,...` with a credential in it comes out in the file's place with the
+/// credential replaced, encoded again. A check that took the label's word for a visual file would
+/// publish the credential as it was, still encoded.
+#[test]
+fn opencode_visual_tool_file_holding_text_is_checked_as_text() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    if crate::rc::in_isolated_test(
+        "domain::publication_records::tests::opencode_visual_tool_file_holding_text_is_checked_as_text",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    // A unit-test binary cannot host the privacy worker, and here an outcome it did not process
+    // counts as passed: this process checks the record in place as the worker does, so a file
+    // that skipped the check comes back as it was and fails this test.
+    crate::domain::privacy::worker::check_in_process();
+    // SAFETY: this case runs alone in its own process.
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path().join("agit"));
+    }
+    let credential = "AKIA4X7QZ2M5RT6VW3JH";
+    let payload = STANDARD.encode(format!("aws_access_key_id = {credential}\n"));
+    let url = format!("data:image/png;base64,{payload}");
+    let tool = json!({"type":"tool","name":"read","state":{"status":"completed","input":{},"output":"Readable output",
+        "content":[{"type":"file","mime":"image/png","url":url}]}});
+    for (record, file) in [
+        (
+            json!({"kind":"session_message","type":"assistant","data":{"content":[tool.clone()]}}),
+            "/data/content/0/state/content/0/url",
+        ),
+        (
+            json!({"kind":"part","data":tool}),
+            "/data/state/content/0/url",
+        ),
+    ] {
+        let kept = published("opencode", &record).unwrap();
+        assert_eq!(kept.pointer(file), Some(&json!(url)), "{kept}");
+        // As plain publication hands records to the check: one JSON record per line.
+        let protected = crate::domain::privacy::service::protect_for_commit(
+            None,
+            &format!("{kept}\n"),
+            crate::domain::privacy::projector::Mode::ProtectJsonl,
+        )
+        .unwrap_or_else(|_| panic!("the check did not complete for {kept}"));
+        let protected: Value = serde_json::from_str(protected.trim_end()).unwrap();
+        let encoded = protected
+            .pointer(file)
+            .and_then(Value::as_str)
+            .and_then(|url| url.strip_prefix("data:image/png;base64,"))
+            .unwrap_or_else(|| panic!("the file keeps its place: {protected}"));
+        assert_ne!(encoded, payload, "the file went out as it was");
+        let text = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
+        assert!(text.starts_with("aws_access_key_id = "), "{text}");
+        assert!(!text.contains(credential), "{text}");
+    }
+}
+
 /// The ordered judgement of kinds is the judgement of the records: a session's records give the
 /// same classes whether each is read in full in order or reduced to its kind first. An OpenCode
 /// part takes its role from the header before it in both.
