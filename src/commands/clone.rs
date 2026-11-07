@@ -1521,7 +1521,8 @@ pub fn local_store(owner: &str, name: &str) -> crate::Result<Option<Repo>> {
     })
 }
 
-/// List every agent on this machine.
+/// List every agent on this machine, except one this process leaves out (see
+/// [`config::leave_out`]): a loop over every repository never reads it.
 pub fn list_local() -> crate::Result<Vec<(String, String, PathBuf)>> {
     let root = config::repos_dir()?;
     let mut out = vec![];
@@ -1537,7 +1538,7 @@ pub fn list_local() -> crate::Result<Vec<(String, String, PathBuf)>> {
         for name_entry in std::fs::read_dir(oe.path())? {
             let Ok(ne) = name_entry else { continue };
             let p = ne.path();
-            if !p.join(".git").exists() {
+            if !p.join(".git").exists() || config::left_out(&p).is_some() {
                 continue;
             }
             out.push((

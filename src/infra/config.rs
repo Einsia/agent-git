@@ -126,9 +126,44 @@ pub fn repos_dir() -> Result<PathBuf> {
     Ok(agit_home()?.join("repos"))
 }
 
-/// The local path of one repo.
+/// The local path of one repo, refused for a repository this process leaves out.
 pub fn repo_dir(owner: &str, name: &str) -> Result<PathBuf> {
-    Ok(repos_dir()?.join(owner).join(name))
+    let dir = repos_dir()?.join(owner).join(name);
+    refuse_left_out(&dir)?;
+    Ok(dir)
+}
+
+/// Repositories this process must not read, each with the line that says why, keyed by the path
+/// [`repo_dir`] gives. A read-only startup that Git can't inspect a repository for fills it, and
+/// every later lookup of that repository or its worktrees by name is refused with the line: one
+/// whose recovery state is unknown is never read as settled.
+static LEFT_OUT: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Leave the repository at `dir` out of the rest of this process.
+pub fn leave_out(dir: PathBuf, why: String) {
+    let mut left_out = LEFT_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !left_out.iter().any(|(known, _)| *known == dir) {
+        left_out.push((dir, why));
+    }
+}
+
+/// Why the repository at `dir` is left out of this process, if it is.
+pub fn left_out(dir: &std::path::Path) -> Option<String> {
+    LEFT_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(known, _)| known == dir)
+        .map(|(_, why)| why.clone())
+}
+
+fn refuse_left_out(dir: &std::path::Path) -> Result<()> {
+    match left_out(dir) {
+        Some(why) => Err(anyhow::Error::msg(why)),
+        None => Ok(()),
+    }
 }
 
 /// Where the linked worktrees of session branches live.
@@ -140,8 +175,10 @@ pub fn worktrees_dir() -> Result<PathBuf> {
     Ok(agit_home()?.join("worktrees"))
 }
 
-/// The worktree path of one branch: `<worktrees>/<owner>/<name>/<branch>`.
+/// The worktree path of one branch: `<worktrees>/<owner>/<name>/<branch>`, refused for a
+/// repository this process leaves out.
 pub fn worktree_dir(owner: &str, name: &str, branch: &str) -> Result<PathBuf> {
+    refuse_left_out(&repos_dir()?.join(owner).join(name))?;
     Ok(worktrees_dir()?.join(owner).join(name).join(branch))
 }
 

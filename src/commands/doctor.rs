@@ -114,14 +114,22 @@ pub fn run(args: Args) -> CmdResult {
         };
         let repo = repo.local_objects_only();
         if let Err(error) = super::migration::check_readonly_repo_startup(&repo) {
-            match super::migration::interrupted_step(&error) {
-                Some(step) => {
+            match (
+                super::migration::interrupted_step(&error),
+                error.downcast_ref::<super::migration::Uninspectable>(),
+            ) {
+                (Some(step), _) => {
                     ui::error(&error.to_string());
                     ui::hint(step);
+                    return Ok(ExitCode::Precondition);
                 }
-                None => ui::error(&format!("local storage inspection failed: {error:#}")),
+                // A repository Git can't inspect is this check's finding, not a reason to stop.
+                (None, Some(found)) => found.leave_out(),
+                (None, None) => {
+                    ui::error(&format!("local storage inspection failed: {error:#}"));
+                    return Ok(ExitCode::Precondition);
+                }
             }
-            return Ok(ExitCode::Precondition);
         }
         Some((owner, name, path))
     } else {
@@ -291,7 +299,13 @@ pub fn run(args: Args) -> CmdResult {
     }
 
     // ── Local repos ──
+    // One Git can't inspect is named with what Git said; nothing else here reads it.
+    for found in super::migration::uninspectable_repositories() {
+        fatal = true;
+        checks.push((found.repository.clone(), Check::Err(found.finding())));
+    }
     let agents = match &selected {
+        Some((_, _, path)) if config::left_out(path).is_some() => Vec::new(),
         Some(repo) => vec![repo.clone()],
         None => super::clone::list_local()?,
     };

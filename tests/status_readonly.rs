@@ -329,3 +329,183 @@ fn a_wait_before_a_conversations_first_landing_shows_in_status() {
         "{said}"
     );
 }
+
+/// A repository moved away from its linked worktree, with a fresh one made in its old place: the
+/// worktree's `.git` names a registration the fresh repository doesn't have, so Git can't say
+/// where that worktree's storage is, while the moved repository's own checkout reads fine.
+fn moved_from_its_worktree(home: &Path) {
+    let old = home.join("repos/owner/old");
+    let repo = committed_repo(&old);
+    let worktree = home.join("worktrees/owner/old/main");
+    fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    repo.git(&[
+        "worktree",
+        "add",
+        "--detach",
+        worktree.to_str().unwrap(),
+        "HEAD",
+    ])
+    .unwrap();
+    fs::rename(&old, home.join("repos/owner/moved")).unwrap();
+    committed_repo(&old);
+}
+
+fn said(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// Status in a folder whose conversations don't go to a repository Git can't inspect goes on, and
+/// says which repository it leaves out, in which worktree, and how to see Git's answer. A guard
+/// that stopped on every repository would block status everywhere over one it doesn't read.
+#[test]
+fn status_goes_on_past_a_repository_git_cannot_inspect_that_this_folder_does_not_use() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    for args in status_arguments() {
+        let output = status(&home, "http://127.0.0.1:1", &args);
+        assert_success(&output);
+        let said = said(&output);
+        assert!(
+            said.contains("Git couldn't tell where owner/moved's storage is, in its worktree ")
+                && said.contains("worktrees/owner/old/main: ")
+                && said.contains(
+                    "; nothing in this folder goes to owner/moved, so this leaves it out"
+                )
+                && said.contains("see Git's answer in full: `git -C ")
+                && said
+                    .contains(" rev-parse --git-common-dir`; `agit doctor` checks the repository"),
+            "{args:?}: {said}"
+        );
+    }
+}
+
+/// A worktree Git can't inspect doesn't hide pending recovery in another worktree of the same
+/// repository: status stops on the recovery, whichever of the two Git lists first. A check that
+/// gave up on the repository at its first unreadable worktree would leave it out and go on,
+/// reading an interrupted checkout as settled.
+#[test]
+fn pending_recovery_stops_status_even_after_a_worktree_git_cannot_inspect() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let repo = committed_repo(&home.join("repos/owner/both"));
+    for name in ["one", "two"] {
+        let path = home.join("worktrees/owner/both").join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        repo.git(&[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ])
+        .unwrap();
+    }
+    // The first worktree Git lists is the one it can't inspect; the second holds the journal.
+    let listed: Vec<PathBuf> = repo
+        .git(&["worktree", "list", "--porcelain"])
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .skip(1)
+        .map(PathBuf::from)
+        .collect();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    fs::write(
+        listed[0].join(".git"),
+        "gitdir: /nonexistent/agit-fixture/.git/worktrees/gone\n",
+    )
+    .unwrap();
+    let pending = Repo::at(&listed[1]);
+    let git_path = PathBuf::from(
+        pending
+            .git(&["rev-parse", "--git-path", "agit-checkout-transaction.json"])
+            .unwrap(),
+    );
+    let journal = if git_path.is_absolute() {
+        git_path
+    } else {
+        listed[1].join(git_path)
+    };
+    fs::write(&journal, b"pending journal").unwrap();
+    let output = status(&home, "http://127.0.0.1:1", &["status"]);
+    let said = said(&output);
+    assert_eq!(output.status.code(), Some(4), "{said}");
+    assert!(said.contains("pending recovery"), "{said}");
+    assert!(!said.contains("so this leaves it out"), "{said}");
+}
+
+/// Status in a folder bound to a repository Git can't inspect stops and names it: what status
+/// reads there can't be shown as settled.
+#[test]
+fn status_stops_on_a_repository_git_cannot_inspect_that_this_folder_uses() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    let binding = agit::domain::workspace::Workspace {
+        dir: fixture.path().to_string_lossy().into_owned(),
+        repo: "owner/moved".into(),
+    };
+    let path = home.join("workspaces").join(
+        agit::domain::workspace::path_for(fixture.path())
+            .unwrap()
+            .file_name()
+            .unwrap(),
+    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, serde_json::to_string(&binding).unwrap()).unwrap();
+    let output = status(&home, "http://127.0.0.1:1", &["status"]);
+    let said = said(&output);
+    assert_eq!(output.status.code(), Some(4), "{said}");
+    assert!(
+        said.contains(
+            "local storage preparation failed: Git couldn't tell where owner/moved's storage is, in its worktree "
+        ) && said.contains("see Git's answer in full: `git -C "),
+        "{said}"
+    );
+    assert!(!said.contains("so this leaves it out"), "{said}");
+}
+
+/// Once left out at startup, the repository is not read later in the same command: status's
+/// table of repositories lists the fresh one and not the moved one. Without the mark, the table
+/// reads the moved repository's own checkout, which Git can read, and shows it as settled.
+#[test]
+fn a_repository_left_out_at_startup_is_not_read_later_in_the_command() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    let output = status(&home, "http://127.0.0.1:1", &["status"]);
+    assert_success(&output);
+    let table = String::from_utf8_lossy(&output.stdout);
+    assert!(table.contains("owner/old"), "{table}");
+    assert!(!table.contains("owner/moved"), "{table}");
+}
+
+/// `agit doctor` is never stopped by a repository Git can't inspect: it names it as a finding,
+/// with the worktree and the command that shows Git's answer, and runs its other checks.
+#[test]
+fn doctor_names_a_repository_git_cannot_inspect_and_runs_its_other_checks() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    for args in [vec!["doctor"], vec!["doctor", "--repo", "owner/moved"]] {
+        let output = status(&home, "http://127.0.0.1:1", &args);
+        let said = said(&output);
+        assert_eq!(output.status.code(), Some(4), "{args:?}: {said}");
+        assert!(
+            said.contains("owner/moved")
+                && said.contains("Git couldn't tell where its storage is, in its worktree ")
+                && said.contains("; see Git's answer in full: `git -C "),
+            "{args:?}: {said}"
+        );
+        assert!(
+            said.contains("sign-in"),
+            "{args:?}: the other checks ran: {said}"
+        );
+        assert!(!said.contains("local storage"), "{args:?}: {said}");
+    }
+}

@@ -279,6 +279,46 @@ impl std::fmt::Display for GitStreamFailure {
 
 impl std::error::Error for GitStreamFailure {}
 
+/// Git could not say where a checkout's storage is. Its first line on stderr is kept, raw, for a
+/// caller that names the repository to the person; it can name paths on this computer, so it is
+/// not part of this error's own message.
+#[derive(Debug)]
+pub struct StorageUnknown {
+    stderr: Option<String>,
+    status: Option<i32>,
+}
+
+impl StorageUnknown {
+    fn of(output: &std::process::Output) -> Self {
+        Self {
+            stderr: String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned),
+            status: output.status.code(),
+        }
+    }
+
+    /// Git's first non-empty line on stderr, unbounded and as Git wrote it.
+    pub fn stderr_line(&self) -> Option<&str> {
+        self.stderr.as_deref()
+    }
+
+    /// The exit status, when Git exited rather than being stopped.
+    pub fn status(&self) -> Option<i32> {
+        self.status
+    }
+}
+
+impl std::fmt::Display for StorageUnknown {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("local Git inspection could not identify its storage path")
+    }
+}
+
+impl std::error::Error for StorageUnknown {}
+
 #[derive(Debug)]
 pub(crate) struct GitWorktreeFormatUnavailable;
 
@@ -808,10 +848,9 @@ impl Repo {
         run: &mut impl FnMut(Command, usize) -> Result<std::process::Output>,
     ) -> Result<PathBuf> {
         let output = run(self.inspection_command(args), MAX_INSPECTION_OUTPUT_BYTES)?;
-        anyhow::ensure!(
-            output.status.success() && output.stderr.is_empty(),
-            "local Git inspection could not identify its storage path"
-        );
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(StorageUnknown::of(&output).into());
+        }
         let bytes = output
             .stdout
             .strip_suffix(b"\n")
@@ -955,10 +994,9 @@ impl Repo {
         &self,
         output: &std::process::Output,
     ) -> Result<(PathBuf, PathBuf, PathBuf, String)> {
-        anyhow::ensure!(
-            output.status.success() && output.stderr.is_empty(),
-            "local Git inspection could not identify its storage path"
-        );
+        if !output.status.success() || !output.stderr.is_empty() {
+            return Err(StorageUnknown::of(output).into());
+        }
         let text = output
             .stdout
             .strip_suffix(b"\n")
