@@ -476,6 +476,85 @@ fn a_missing_explicit_native_id_is_a_reference_error_without_adoption() {
     }
 }
 
+/// A conversation its runtime lists but agit can't read is named, by id, with what is wrong, and
+/// nothing is adopted. OpenCode lists the sessions here: one whose record agit can't turn into a
+/// transcript, as for a storage format it doesn't read, and one it reads but can't write its copy
+/// of, because agit's cache folder is blocked. Carried on, the import opens the transcript file
+/// that was never written and fails with the system's bare "No such file or directory", which
+/// names neither the conversation nor the cause; told alike, a cache this computer can fix reads
+/// as a wait for another agit. `agit save` shows these lines for the conversation.
+#[test]
+fn a_listed_conversation_agit_cannot_read_is_named_without_adoption() {
+    let lab = Lab::new(0);
+    let data = lab.home.join(".local/share/opencode");
+    fs::create_dir_all(&data).unwrap();
+    let database = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+        )
+        .unwrap();
+    // Listed like any session, but its version is not text, so no transcript can be made of it.
+    database
+        .execute(
+            "INSERT INTO session VALUES ('ses_unreadable', 'global', NULL, ?1, 200, 250, X'00')",
+            [lab.work.to_str().unwrap()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO session VALUES ('ses_readable', 'global', NULL, ?1, 300, 350, '1.18.13')",
+            [lab.work.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(database);
+    let import = |id: &str| {
+        lab.command()
+            .args([
+                "import",
+                id,
+                "--from",
+                "opencode",
+                "--into",
+                "me/qa@work",
+                "--independent",
+            ])
+            .output()
+            .unwrap()
+    };
+    let before = lab.state();
+    let output = import("ses_unreadable");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "agit can't read OpenCode conversation ses_unreadable: it's listed, but its record can't be opened."
+        ) && !stderr.contains("os error"),
+        "{stderr}"
+    );
+    assert_eq!(lab.state(), before);
+
+    // A file where agit's cache folder belongs: the record reads, its copy can't be written.
+    let cache = lab.store.join("cache/opencode");
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    fs::write(&cache, "not a folder").unwrap();
+    let before = lab.state();
+    let output = import("ses_readable");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "agit can't save OpenCode conversation ses_readable: it couldn't write its copy to {}",
+            cache.display()
+        )) && !stderr.contains("format"),
+        "{stderr}"
+    );
+    assert_eq!(lab.state(), before);
+}
+
 #[cfg(any(unix, all(windows, target_env = "msvc")))]
 #[test]
 fn a_missing_explicit_native_id_has_the_same_reference_error_in_json() {

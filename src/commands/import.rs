@@ -1762,6 +1762,8 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
     };
 
     let mut found: Vec<Found> = vec![];
+    // A runtime that lists the session by its full id but can't open it.
+    let mut unreadable_session = None;
     for rt in &runtimes {
         let ad = adapter::get(rt)?;
         // Resolve by full id first (Codex queries the `threads` table, Claude Code globs one
@@ -1778,6 +1780,10 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
         // No hit: look through the list by prefix. This one costs more, and runs only when the
         // user gave a prefix.
         for sr in ad.all_sessions().unwrap_or_default() {
+            if sr.id == selector {
+                unreadable_session = Some(ad.id());
+                continue;
+            }
             if sr.id.starts_with(selector) {
                 found.push(Found {
                     runtime: ad.id(),
@@ -1788,6 +1794,12 @@ fn by_selector(selector: &str, from: Option<&str>) -> crate::Result<Pick> {
         }
     }
 
+    if found.is_empty()
+        && let Some(runtime) = unreadable_session
+    {
+        ui::error(&unreadable_session_line(runtime, selector));
+        return Ok(Pick::Explained(ExitCode::Ref));
+    }
     match found.len() {
         0 => {
             // A store agit cannot read hides its sessions; with the runtime named, that is the
@@ -1830,6 +1842,31 @@ fn held_here(owner: &str, name: &str) -> crate::Result<bool> {
     };
     let hub = crate::hub::identity::normalize_hub(&config::hub_url())?;
     Ok(crate::hub::identity::read(&repo)?.is_some_and(|pinned| pinned.hub == hub))
+}
+
+/// Said of a conversation `runtime` lists under the full id `id` that agit can't open. Any later
+/// step would only fail opening a file that was never written, with no path to act on. A record
+/// agit can't read and a copy it couldn't write are told apart: the second is fixed on this
+/// computer, not by a later agit.
+fn unreadable_session_line(runtime: &str, id: &str) -> String {
+    // A copy agit couldn't write is fixed on this computer; anything else is the record itself.
+    if runtime == "opencode"
+        && let Err(adapter::opencode::Unresolved::Cache(path, error)) =
+            adapter::opencode::cached_transcript(id)
+    {
+        return format!(
+            "agit can't save OpenCode conversation {id}: it couldn't write its copy to {}: {error}.",
+            path.display()
+        );
+    }
+    let shown = if runtime == "opencode" {
+        "OpenCode"
+    } else {
+        runtime
+    };
+    format!(
+        "agit can't read {shown} conversation {id}: it's listed, but its record can't be opened."
+    )
 }
 
 /// Why the stores of these runtimes exist but cannot be read.
