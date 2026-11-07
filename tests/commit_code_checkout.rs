@@ -108,7 +108,12 @@ impl Lab {
         let session = format!("agit-{}", "c".repeat(40));
         let log = transcript::wrap_lines(&prefix, "codex", &session);
         storage::write_snapshot(&repo, &log, &log).unwrap();
-        let mut snapshot = meta::Meta::new(session, "codex".into(), "/fixture".into());
+        // The line records the folder the agent was launched in, as the session's own start does.
+        let mut snapshot = meta::Meta::new(
+            session,
+            "codex".into(),
+            lab.launch.to_string_lossy().into_owned(),
+        );
         snapshot.turn = Some(1);
         meta::write(&repo, &snapshot).unwrap();
         lab.git(&repo, &["add", "-A"]);

@@ -649,6 +649,34 @@ fn settles_in_folder(cwd: Option<&str>, line_cwd: &str) -> bool {
         })
 }
 
+/// Whether agit itself wrote `lk` for its branch, by a writer that answers for the folder: a
+/// launch's claim, taken only in the launch's folder; the person's confirmation; an import that
+/// first bound the link, the person naming the branch (`session_privacy`); agit's own resume
+/// (`materialized_from`). What a turn's settlement adds to a link says nothing about who wrote it.
+fn written_for_branch(lk: &Link) -> bool {
+    matches!(lk.claimed_by.as_deref(), Some("launch" | "confirmed"))
+        || lk.materialized_from.is_some()
+        || lk.session_privacy.is_some()
+}
+
+/// Why a Codex conversation's turns don't settle onto `slug`@`branch`, whichever way the
+/// settlement is asked for: its link names the branch without a writer that answers for the
+/// folder, and it runs outside the folder the branch's line records.
+fn outside_folder(repo: &Repo, slug: &str, branch: &str, lk: &Link) -> Option<String> {
+    let meta = crate::domain::meta::read_at_ref(repo, &format!("refs/heads/{branch}"))?;
+    (lk.source == "codex"
+        && !written_for_branch(lk)
+        && !settles_in_folder(lk.cwd.as_deref(), &meta.cwd))
+    .then(|| {
+        format!(
+            "this turn isn't saved to {slug}@{branch}: this Codex conversation runs outside the \
+             branch's folder, and nothing says it belongs there. If it does, `agit branch confirm \
+             {branch} --repo {slug}` says so; or fork at your own last turn: \
+             `agit fork {slug}@{branch}#<n> -b <new-name>`"
+        )
+    })
+}
+
 /// Whether `path` is `folder` or lies inside it, as the file system resolves them.
 fn within_folder(path: &std::path::Path, folder: &std::path::Path) -> bool {
     let canonical =
@@ -692,20 +720,14 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     // Settle only into a local repo that already exists: exit quietly when it is missing, and
     // never create one out of nowhere under any name — least of all for a link that records a
     // namespace, where a missing checkout is simply missing.
-    let Some(repo) = Repo::open(&dir) else {
-        return Ok(ExitCode::Ok);
-    };
-    // A Codex session settles only into a session line of its own folder: a session elsewhere
-    // that a shared Codex process put on this branch never lands here.
-    if lk.source == "codex"
-        && let Some(meta) = crate::domain::meta::read_at_ref(&repo, &format!("refs/heads/{branch}"))
-        && !settles_in_folder(lk.cwd.as_deref(), &meta.cwd)
-    {
-        crate::warn(&format!(
-            "this Codex conversation runs outside {slug}@{branch}'s folder, so it isn't saved there"
-        ));
-        return Ok(ExitCode::Ok);
+    if Repo::open(&dir).is_none() {
+        anyhow::bail!("this turn isn't saved: {slug} isn't on this computer");
     }
+    // A Codex session settles only into a session line of its own folder, unless agit itself
+    // wrote its link for the branch: a session elsewhere that a shared Codex process put on this
+    // branch never lands here, and one agit continued on another computer, in a folder of its
+    // own, does.
+
     let stop_receipt = observe_stop(&lk);
     settle(
         store,
@@ -2099,6 +2121,16 @@ fn settle(
     owner: &str,
     opts: SettleOpts,
 ) -> CmdResult {
+    // Every way a turn is asked to settle onto a branch passes here, by a hook, by `agit commit`
+    // with a session id, a ref, a bare branch or none, and from the MCP tool or the supervisor,
+    // which run `agit commit`. An import records the branch the person names and is its own
+    // answer.
+    if !opts.historical
+        && let Some(repo) = Repo::open(repo_dir)
+        && let Some(refusal) = outside_folder(&repo, slug, branch, &lk)
+    {
+        anyhow::bail!("{refusal}");
+    }
     let before = super::auto_push::branch_tip(repo_dir, branch);
     let quiet = opts.quiet;
     let result = settle_local(store, repo_dir, slug, branch, lk, owner, opts);
