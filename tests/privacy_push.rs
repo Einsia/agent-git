@@ -8992,6 +8992,219 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
 }
 
+/// An automatic upload the Hub refuses because the conversation also continued on another
+/// computer is told, and stays told: its record names the class, the next turn's end says it in
+/// the class's own words, and `agit status` lists the branch with the command that shows what to
+/// do, in text and in JSON, whatever page of sessions it shows. Another conversation's successful
+/// upload in the same folder hides none of it, and is not told the failure. The refusal repeats on
+/// every turn, so an implementation that classed it as one the next turn gets past, read one
+/// last result for the whole folder, or listed only the rows of the page would leave this
+/// conversation's turns on this computer with nothing said.
+#[cfg(unix)]
+#[test]
+fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
+    const SID: &str = "eeeeeeee-0000-4000-8000-000000000005";
+    const OTHER: &str = "ffffffff-0000-4000-8000-000000000006";
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [32; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let projects = temp
+        .path()
+        .join(".claude/projects")
+        .join(agit::domain::store::slug_for(&work));
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = |session: &str| projects.join(format!("{session}.jsonl"));
+    let add_turn = |session: &str, n: usize| {
+        let cwd = work.to_string_lossy();
+        let records = format!(
+            "{}\n{}\n",
+            json!({"type":"user","sessionId":session,"cwd":cwd,"uuid":format!("{session}-u{n}"),
+                "timestamp":format!("2026-11-02T00:00:{n:02}.000Z"),
+                "message":{"role":"user","content":format!("synthetic prompt {n}")}}),
+            json!({"type":"assistant","sessionId":session,"cwd":cwd,"uuid":format!("{session}-a{n}"),
+                "timestamp":format!("2026-11-02T00:00:{n:02}.500Z"),
+                "message":{"role":"assistant","stop_reason":"end_turn",
+                    "content":[{"type":"text","text":format!("synthetic answer {n}")}]}}),
+        );
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(transcript(session))
+            .unwrap()
+            .write_all(records.as_bytes())
+            .unwrap();
+    };
+    let agit = |args: &[&str], input: Option<String>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        let mut child = command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_YES", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("AGIT_SECRETS_KEYSTORE", "file")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(args)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(input.unwrap_or_default().as_bytes())
+            .unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert_success(&output);
+        output
+    };
+    // A turn's end in Claude Code: its Stop hook, which settles the turn and uploads it.
+    let stop = |session: &str| {
+        let output = agit(
+            &["hooks", "settle", "--runtime", "claude-code"],
+            Some(
+                json!({"session_id":session,"cwd":work,"transcript_path":transcript(session),
+                    "hook_event_name":"Stop"})
+                .to_string(),
+            ),
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    agit(&["push", "alice/app@main"], None);
+    for (session, branch) in [(SID, "alice/app@work"), (OTHER, "alice/app@other")] {
+        add_turn(session, 1);
+        agit(
+            &[
+                "import",
+                session,
+                "--from",
+                "claude-code",
+                "--into",
+                branch,
+                "--independent",
+            ],
+            None,
+        );
+    }
+    agit(&["push", "alice/app@work"], None);
+
+    // The conversation goes on on another computer, whose turn the Hub now holds.
+    let hub_tip = git(&remote, &["rev-parse", "refs/heads/work"]);
+    let tree = git(&remote, &["rev-parse", &format!("{hub_tip}^{{tree}}")]);
+    let elsewhere = git(
+        &remote,
+        &[
+            "-c",
+            "user.name=Source Writer",
+            "-c",
+            "user.email=source@example.invalid",
+            "commit-tree",
+            &tree,
+            "-p",
+            &hub_tip,
+            "-m",
+            "A turn on another computer",
+        ],
+    );
+    git(&remote, &["update-ref", "refs/heads/work", &elsewhere]);
+
+    add_turn(SID, 2);
+    assert!(!stop(SID).contains("systemMessage"));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), elsewhere);
+    // The other conversation in this folder uploads, and is not told this one's failure.
+    add_turn(OTHER, 2);
+    assert!(!stop(OTHER).contains("systemMessage"));
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/other"]),
+        git(repo.root(), &["rev-parse", "refs/heads/other"])
+    );
+
+    add_turn(SID, 3);
+    let said = stop(SID);
+    let message: serde_json::Value =
+        serde_json::from_str(said.lines().next().unwrap_or_default()).unwrap_or_default();
+    assert_eq!(
+        message["systemMessage"],
+        "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them.",
+        "{said}"
+    );
+
+    let status = agit(&["status"], None);
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        shown.contains("uploads that didn't go through")
+            && shown.contains(
+                "alice/app@work: this conversation also continued on another computer, so the Hub has turns this computer doesn't"
+            )
+            && shown.contains("`agit push alice/app@work`")
+            && !shown.contains("alice/app@other:"),
+        "{shown}"
+    );
+    // Past the last page of sessions, the list is the same.
+    let status = agit(&["status", "--json", "--offset", "1000"], None);
+    let value =
+        &serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["result"]["value"];
+    assert_eq!(value["sessions"]["items"], json!([]), "{value}");
+    assert_eq!(
+        value["uploads_not_through"]["items"],
+        json!([{
+            "target": "alice/app@work",
+            "state": "failed",
+            "reason": "diverged",
+            "description": "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them",
+            "command": "agit push alice/app@work",
+        }]),
+        "{value}"
+    );
+}
+
 /// A file line that diverged from the Hub's, as when two people distill the same memory into
 /// main, is refused with `pull` as the way out: pull merges a file line's files and stops only
 /// where both sides changed the same lines. When the Hub's tip is here and holds exactly the

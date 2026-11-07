@@ -195,6 +195,7 @@ pub fn run(args: Args) -> CmdResult {
         );
     }
     print_upload_waits();
+    print_uploads_not_through();
     print_held_branches();
 
     // ── Local store ──
@@ -717,6 +718,7 @@ fn structured(args: &Args) -> CmdResult {
             "command": "agit save --all",
         })),
         "upload_waits": upload_waits_json(),
+        "uploads_not_through": uploads_not_through_json(),
         "store_path": store.as_ref().map(|store| store.root()),
         "sessions": {"items": items, "total": links.len(), "offset": args.offset,
             "limit": limit, "next_offset": (next < links.len()).then_some(next),
@@ -1060,6 +1062,106 @@ fn print_upload_waits() {
     for step in steps {
         ui::hint(&step);
     }
+}
+
+/// Every branch of every checkout here whose newest automatic upload didn't go through, and what
+/// kept some of them from being read. It is read apart from the session page and the branch row
+/// budget: a refused upload is refused again on every turn, and a page that left its branch out
+/// would let it go unseen. Each names only the branch and the class of what happened.
+#[derive(Default)]
+struct UploadsNotThrough {
+    items: Vec<(String, super::upload_outcome::Undone)>,
+    /// What can't be read, a repository or a branch, and why.
+    unreadable: Vec<(String, String)>,
+}
+
+fn uploads_not_through() -> UploadsNotThrough {
+    let mut found = UploadsNotThrough::default();
+    let checkouts = match super::clone::list_local() {
+        Ok(checkouts) => checkouts,
+        Err(error) => {
+            found
+                .unreadable
+                .push(("the repositories here".into(), format!("{error:#}")));
+            return found;
+        }
+    };
+    for (owner, name, path) in checkouts {
+        let repository = format!("{owner}/{name}");
+        let branches = || -> crate::Result<Vec<String>> {
+            Ok(Repo::at(&path)
+                .git(&["for-each-ref", "--format=%(refname)", "refs/heads/"])?
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("refs/heads/"))
+                .map(str::to_owned)
+                .collect())
+        };
+        match super::upload_outcome::undone_in(&repository, branches) {
+            Ok(branches) => {
+                for (branch, undone) in branches {
+                    let target = format!("{repository}@{branch}");
+                    match undone {
+                        Ok(undone) => found.items.push((target, undone)),
+                        Err(error) => found
+                            .unreadable
+                            .push((target, ui::home_shortened(&format!("{error:#}")))),
+                    }
+                }
+            }
+            Err(error) => found
+                .unreadable
+                .push((repository, ui::home_shortened(&format!("{error:#}")))),
+        }
+    }
+    found
+}
+
+/// The command that shows what kept an upload of `target` from going through and what to do.
+fn inspect_command(target: &str) -> String {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    format!("agit push {}", quote_arg(target))
+}
+
+/// [`uploads_not_through`] as `agit status` shows it.
+fn print_uploads_not_through() {
+    let found = uploads_not_through();
+    if found.items.is_empty() && found.unreadable.is_empty() {
+        return;
+    }
+    ui::section("uploads that didn't go through");
+    for (target, undone) in &found.items {
+        println!("  {target}: {}", undone.describe());
+        println!(
+            "    {}",
+            ui::dim(&format!("→ inspect: `{}`", inspect_command(target)))
+        );
+    }
+    for (what, error) in &found.unreadable {
+        println!(
+            "  {what}: the records of its uploads can't be read ({error}), so an upload that didn't go through may be missing here"
+        );
+    }
+}
+
+/// [`print_uploads_not_through`] for `status --json`.
+fn uploads_not_through_json() -> serde_json::Value {
+    let found = uploads_not_through();
+    serde_json::json!({
+        "items": found.items.iter().map(|(target, undone)| serde_json::json!({
+            "target": target,
+            "state": undone.state(),
+            "reason": undone.reason(),
+            "description": undone.describe(),
+            "command": inspect_command(target),
+        })).collect::<Vec<_>>(),
+        "unreadable": found.unreadable.iter().map(|(what, error)| serde_json::json!({
+            "of": what,
+            "error": error,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// [`print_upload_waits`] for `status --json`.

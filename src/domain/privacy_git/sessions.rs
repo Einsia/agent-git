@@ -764,6 +764,10 @@ pub(super) fn require_remote_ancestry(
     Ok(())
 }
 
+/// How a push says that the Hub's copy of a session branch and this checkout's have each moved on
+/// without the other, read by automatic upload as `push::OVERSIZED` is.
+pub(crate) const DIVERGED: &str = "has diverged from this checkout";
+
 /// Where this checkout stands against a Hub branch that its head does not contain.
 #[derive(Clone, Copy)]
 enum Position {
@@ -834,7 +838,7 @@ fn remote_movement(
             let merge_source = quote_arg(&format!("{repository}@{tip}"));
             let peer = quote_arg(repository);
             format!(
-                "remote branch {branch} has diverged from this checkout ({state}; Hub tip {tip}); local unpublished commits are kept\n  → keep both: `agit fork {target} -b {fork_branch}`, then `agit push {fork}`\n  → or merge the Hub's line in: `agit fetch {peer}`, then `agit merge {merge_source} --into {target}`, then `agit push {target}`"
+                "remote branch {branch} {DIVERGED} ({state}; Hub tip {tip}); local unpublished commits are kept\n  → keep both: `agit fork {target} -b {fork_branch}`, then `agit push {fork}`\n  → or merge the Hub's line in: `agit fetch {peer}`, then `agit merge {merge_source} --into {target}`, then `agit push {target}`"
             )
         }
     }

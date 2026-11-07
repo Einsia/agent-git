@@ -313,7 +313,20 @@ pub(crate) async fn prepare(
         anyhow::bail!("archive commit does not cover the completed native turn");
     }
     let destination = publication_target(&repo, &lineage, &job.runtime, &job.native)?;
-    destination.require_sign_in()?;
+    // A destination this computer isn't signed in to is an upload that didn't go through, so it is
+    // recorded as one: told at the turn's end and listed by `agit status`, not only retried.
+    if let Err(error) = destination.require_sign_in() {
+        use crate::commands::upload_outcome::{Place, Refusal, recorded_async};
+        let refusal = Refusal::child(Some(crate::ExitCode::Auth.as_i32()), error.to_string());
+        let _ = recorded_async(
+            Place::of(&lineage.slug(), lineage.branch()),
+            committed.after.clone(),
+            async {},
+            move |()| Some(refusal),
+        )
+        .await;
+        return Err(error);
+    }
     let mut request = SupervisorPushRequest {
         version: 1,
         request_id: uuid::Uuid::now_v7().to_string(),
@@ -450,11 +463,29 @@ pub(crate) async fn publish(prepared: Prepared) -> crate::Result<()> {
         let mut push = command(&exe, &job, &lineage, &[]);
         crate::commands::auto_push::automatic_push(push.as_std_mut(), &job.lineage);
         local_publication::direct(&mut push, &request, result.path());
-        let output = guarded_output(&mut state, lease, push)
-            .await
-            .context("archive publication was cancelled")?;
-        require_success(&output, "publication")?;
-        local_publication::result_receipt(&repo, &request, result.path())?;
+        use crate::commands::upload_outcome::{Place, Refusal, recorded_async};
+        // The publication goes through only with a result receipt the outbox accepts.
+        let (_, published) = recorded_async(
+            Place::of(&lineage.slug(), lineage.branch()),
+            request.source.clone(),
+            async {
+                let output = guarded_output(&mut state, lease, push)
+                    .await
+                    .context("archive publication was cancelled")?;
+                let published = require_success(&output, "publication").and_then(|()| {
+                    local_publication::result_receipt(&repo, &request, result.path())
+                });
+                Ok::<_, anyhow::Error>((output, published))
+            },
+            |pushed| match pushed {
+                Ok((_, Ok(()))) => None,
+                Ok((output, Err(_))) => Some(Refusal::of(output)),
+                Err(_) => Some(Refusal::unexplained()),
+            },
+        )
+        .await
+        .map_err(anyhow::Error::new)??;
+        published?;
     }
     ensure!(
         settlement_lease_is_current(&state, lease),

@@ -139,6 +139,16 @@ use `agit branch --repo <owner/repo> --all` to inspect another repository's refs
 ref does not establish whether the branch has ever been published. Shallow or grafted history
 produces counts only when the immutable parent graph can be reconstructed completely.
 
+The `uploads that didn't go through` section lists every branch of every local Agent repository
+whose newest automatic upload failed, ended before it recorded how it went, or didn't run because
+this computer couldn't record its outcome. It is not bounded by the session page or the branch
+rows. Each entry names only `<owner>/<repo>@<branch>`, the reason from a fixed set, and
+`agit push <owner>/<repo>@<branch>`, which shows what to do; a later upload that goes through, or
+the Hub accepting the branch from any push, removes it. JSON reports the same under
+`uploads_not_through`: `items` hold `target`, `state` (`failed`, `ended` or `unrecorded`),
+`reason` (the failure class, or null), `description` and `command`, and `unreadable` lists what
+couldn't be read, so an empty list never stands for records status could not open.
+
 The merge transaction table shows the retained target, source, pick count and whether a summary
 is ready. It does not print the summary itself, infer that a merge agent is running, or complete
 an interrupted operation. Missing, malformed, changing or oversized transaction evidence is

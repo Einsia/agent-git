@@ -1,14 +1,16 @@
-//! What became of a session branch's newest upload on this computer, and the line that says so
-//! when a session agit launched ends.
+//! What became of a session branch's newest automatic upload on this computer, and the lines that
+//! say so: at the end of a turn, when a session agit launched ends, and in `agit status`.
 //!
 //! An automatic upload runs in the settlement of a turn, which for a session agit launched is a
 //! detached process with no terminal: without a record, a failed upload of such a session is told
-//! to nobody. The record names the branch tip the upload was for, whether the upload is running,
-//! went through or failed, and why in a fixed class, never an error's text. It is local and never
-//! sent, and each upload overwrites it rather than adding to a history. It lives under
-//! `projects/uploads/` in agit's home, beside the projects' capture state, in files named by
-//! digests, so no repository or branch name is in a path. Dropping a branch from uploads removes
-//! its record, and unbinding a project removes every record of its repository.
+//! to nobody. Every automatic upload runs through [`recorded`] or [`recorded_async`], which record
+//! the branch tip the upload is for, whether the upload is running, went through or failed, and
+//! why in a fixed class, never an error's text. An upload whose start can't be recorded doesn't
+//! run, and a note says so instead. The record is local and never sent, and each upload overwrites
+//! it rather than adding to a history. It lives under `projects/uploads/` in agit's home, beside
+//! the projects' capture state, in files named by digests, so no repository or branch name is in a
+//! path. Dropping a branch from uploads removes its record, and unbinding a project removes every
+//! record of its repository.
 //!
 //! A turn whose settlement waits apart from the runtime for its reply has a marker there too, from
 //! its Stop until the turn is on its branch: without it, the end of the session would count that
@@ -37,9 +39,12 @@ enum Outcome {
     Uploaded {
         tip: String,
     },
+    /// `attempt` is the start this failure finished, so the turn-end line tells it once.
     Failed {
         tip: String,
         reason: UploadFailure,
+        #[serde(default)]
+        attempt: String,
     },
 }
 
@@ -63,6 +68,16 @@ fn repository_dir(repository: &str) -> crate::Result<PathBuf> {
     Ok(uploads_dir()?.join(digest(repository)))
 }
 
+/// Where the notes of a repository's uploads that didn't run are kept: in its checkout's Git
+/// directory, which the turn an upload is for was just written to, so a note can be written when
+/// the record can't.
+fn skipped_dir(repository: &str) -> crate::Result<PathBuf> {
+    let (owner, name) = super::parse_slug(repository)?;
+    Ok(config::repo_dir(&owner, &name)?
+        .join(".git")
+        .join("agit-upload-skipped"))
+}
+
 /// The files of one branch's record.
 struct Paths {
     record: PathBuf,
@@ -71,15 +86,65 @@ struct Paths {
     /// Held exclusively while the record is read and replaced, so two uploads that finish
     /// together cannot both read a start and then overwrite each other.
     writing: PathBuf,
+    /// The attempt the turn-end line last told.
+    told: PathBuf,
+}
+
+impl Paths {
+    fn of(record: PathBuf) -> Self {
+        Self {
+            running: record.with_extension("lock"),
+            writing: record.with_extension("write"),
+            told: record.with_extension("told"),
+            record,
+        }
+    }
 }
 
 fn paths(repository: &str, branch: &str) -> crate::Result<Paths> {
-    let base = repository_dir(repository)?.join(digest(branch));
-    Ok(Paths {
-        record: base.with_extension("json"),
-        running: base.with_extension("lock"),
-        writing: base.with_extension("write"),
-    })
+    Ok(Paths::of(
+        repository_dir(repository)?
+            .join(digest(branch))
+            .with_extension("json"),
+    ))
+}
+
+/// Where one branch's upload record is kept, with the note that says an upload of it didn't run.
+pub(crate) struct Place {
+    paths: Paths,
+    skipped: PathBuf,
+    /// `<owner/repo>@<branch>`, which a recorded privacy wait names.
+    target: String,
+}
+
+impl Place {
+    pub(crate) fn of(repository: &str, branch: &str) -> crate::Result<Self> {
+        Ok(Self {
+            paths: paths(repository, branch)?,
+            skipped: skipped_dir(repository)?
+                .join(digest(branch))
+                .with_extension("json"),
+            target: format!("{repository}@{branch}"),
+        })
+    }
+
+    /// A place outside agit's home, for tests that must not write to it.
+    #[cfg(test)]
+    pub(crate) fn at(records: &Path, skipped: &Path) -> Self {
+        Self {
+            paths: Paths::of(records.join("record.json")),
+            skipped: skipped.join("skipped.json"),
+            target: "test/repository@branch".to_owned(),
+        }
+    }
+
+    /// The state the record holds, as it names it.
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> Option<String> {
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&self.paths.record).ok()?).ok()?;
+        record["state"].as_str().map(str::to_owned)
+    }
 }
 
 /// Runs `change` while holding the record's write lock. Without the lock it does not run.
@@ -101,13 +166,18 @@ fn read(record: &Path) -> Option<Outcome> {
     serde_json::from_slice(&std::fs::read(record).ok()?).ok()
 }
 
-fn write(record: &Path, outcome: &Outcome) -> crate::Result<()> {
+/// Replaces the file at `path` whole, whatever it held before.
+fn replace(path: &Path, bytes: &[u8]) -> crate::Result<()> {
     use std::io::Write as _;
-    let directory = record.parent().context("upload record has no directory")?;
+    let directory = path.parent().context("upload record has no directory")?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(&serde_json::to_vec(outcome)?)?;
-    file.persist(record).map_err(|error| error.error)?;
+    file.write_all(bytes)?;
+    file.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+fn write(record: &Path, outcome: &Outcome) -> crate::Result<()> {
+    replace(record, &serde_json::to_vec(outcome)?)
 }
 
 /// Whether some process holds the lock at `path`; looking takes it for an instant only.
@@ -124,58 +194,311 @@ fn held(path: &Path) -> bool {
     }
 }
 
+/// What a push that didn't go through reported, for [`recorded`] to class.
+pub(crate) struct Refusal {
+    exit_code: Option<i32>,
+    message: String,
+    /// The conversation whose capture may hold a privacy wait for this upload.
+    session: Option<String>,
+}
+
+impl Refusal {
+    /// A push child's exit status and the error it reported.
+    pub(crate) fn child(exit_code: Option<i32>, message: String) -> Self {
+        Self {
+            exit_code,
+            message,
+            session: None,
+        }
+    }
+
+    /// The refusal of an upload of `session`'s capture, whose privacy wait it may be.
+    pub(crate) fn of_session(mut self, session: &str) -> Self {
+        self.session = Some(session.to_owned());
+        self
+    }
+
+    /// What a finished push child reported: its own error lines, from its JSON envelope when it
+    /// printed one and from its error output otherwise.
+    pub(crate) fn of(output: &std::process::Output) -> Self {
+        let message = super::auto_push::failure_reason(&output.stdout).map_or_else(
+            || String::from_utf8_lossy(&output.stderr).into_owned(),
+            |(reason, _)| reason,
+        );
+        Self::child(output.status.code(), message)
+    }
+
+    /// A push that ended without a report of its own: it could not start, it was cancelled, or
+    /// what it reported could not be confirmed.
+    pub(crate) fn unexplained() -> Self {
+        Self::child(None, String::new())
+    }
+
+    /// The one place a recorded upload's failure is classed. A policy exit counts as a privacy
+    /// wait only when a wait is recorded for the conversation or for `target`; otherwise the turn
+    /// would tell of a wait that `agit status` can't show.
+    fn class(&self, target: &str) -> UploadFailure {
+        UploadFailure::reported(self.exit_code, &self.message)
+            .waiting_on(self.session.as_deref(), Some(target))
+    }
+}
+
+/// Why an upload that can't be recorded doesn't run, as the end of a launched session says it.
+pub(crate) const UNRECORDED: &str = "this computer couldn't record the upload's outcome";
+
+/// An automatic upload that didn't run, because its start couldn't be recorded: run unrecorded,
+/// a failure of it would be told to nobody. A note says so instead, and the next upload whose start
+/// can be recorded runs as usual.
+#[derive(Debug)]
+pub(crate) struct Unrecorded(anyhow::Error);
+
+impl std::fmt::Display for Unrecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{UNRECORDED}: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for Unrecorded {}
+
+/// Runs the automatic upload `run` of the branch `place` keeps the record of, at `tip`, and
+/// records how it went: `judge` says what `run` reported when it didn't go through. Without a
+/// recorded start it does not run.
+pub(crate) fn recorded<T>(
+    place: crate::Result<Place>,
+    tip: &str,
+    run: impl FnOnce() -> T,
+    judge: impl FnOnce(&T) -> Option<Refusal>,
+) -> Result<T, Unrecorded> {
+    let place = place.map_err(Unrecorded)?;
+    let target = place.target.clone();
+    let upload = place.start(tip).map_err(Unrecorded)?;
+    let ran = run();
+    upload.finish(judge(&ran).map_or(Ok(()), |refusal| Err(refusal.class(&target))));
+    Ok(ran)
+}
+
+/// [`recorded`] for an upload that runs on an async runtime, with the record's reads and writes
+/// on its blocking pool.
+pub(crate) async fn recorded_async<T>(
+    place: crate::Result<Place>,
+    tip: String,
+    run: impl std::future::Future<Output = T>,
+    judge: impl FnOnce(&T) -> Option<Refusal>,
+) -> Result<T, Unrecorded> {
+    let place = place.map_err(Unrecorded)?;
+    let target = place.target.clone();
+    let upload = tokio::task::spawn_blocking(move || place.start(&tip))
+        .await
+        .map_err(|error| Unrecorded(error.into()))?
+        .map_err(Unrecorded)?;
+    let ran = run.await;
+    let result = judge(&ran).map_or(Ok(()), |refusal| Err(refusal.class(&target)));
+    let _ = tokio::task::spawn_blocking(move || upload.finish(result)).await;
+    Ok(ran)
+}
+
+/// The note of an upload that didn't run because its start couldn't be recorded.
+#[derive(Serialize, Deserialize)]
+struct Skipped {
+    tip: String,
+    attempt: String,
+}
+
 /// An upload whose start is recorded. Until it is finished or dropped it holds its lock shared,
 /// which tells a running upload apart from one whose process ended before saying how it went.
-pub(crate) struct Upload {
+struct Upload {
     paths: Paths,
-    started: Outcome,
+    tip: String,
+    attempt: String,
     running: std::fs::File,
 }
 
-/// Records that an upload of `repository@branch` at `tip` starts. Recording never holds an upload
-/// back: `None` means it runs unrecorded.
-pub(crate) fn start(repository: &str, branch: &str, tip: &str) -> Option<Upload> {
-    start_at(paths(repository, branch).ok()?, tip)
+impl Place {
+    /// Records that an upload at `tip` starts, over whatever the record file held, readable or
+    /// not. A start that can't be recorded leaves the note instead; one that can removes it.
+    fn start(self, tip: &str) -> crate::Result<Upload> {
+        let lock = self.note_lock();
+        match self.paths.start(tip) {
+            Ok(upload) => {
+                let remove = || std::fs::remove_file(&self.skipped);
+                let _ = under_write_lock(&lock, remove).unwrap_or_else(remove);
+                Ok(upload)
+            }
+            Err(error) => {
+                let note = Skipped {
+                    tip: tip.to_owned(),
+                    attempt: uuid::Uuid::new_v4().to_string(),
+                };
+                if let Some(directory) = self.skipped.parent() {
+                    let _ = config::create_state_dir(directory);
+                }
+                if let Ok(bytes) = serde_json::to_vec(&note) {
+                    // Without its lock, as on a filesystem that takes none, the note is written
+                    // all the same: an upload that didn't run is told rather than kept quiet.
+                    let write = || replace(&self.skipped, &bytes);
+                    let _ = under_write_lock(&lock, write).unwrap_or_else(write);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Held exclusively while the note is written, or read and removed, so a removal decided on
+    /// one note never takes another written meanwhile. It sits beside the note, which is replaced
+    /// whole on every write, so the lock is never replaced with it.
+    fn note_lock(&self) -> PathBuf {
+        self.skipped.with_extension("lock")
+    }
+
+    /// What the newest automatic upload of the branch left that didn't go through, with the
+    /// attempt it belongs to and where telling it is marked: beside the note for an upload that
+    /// didn't run, as the record's directory may be what kept it from running. An unreadable
+    /// record or note is an error, never nothing.
+    fn newest(&self) -> crate::Result<Option<(Undone, String, PathBuf)>> {
+        match std::fs::read(&self.skipped) {
+            Ok(bytes) => {
+                let attempt = serde_json::from_slice::<Skipped>(&bytes)
+                    .map(|note| note.attempt)
+                    .unwrap_or_default();
+                return Ok(Some((
+                    Undone::Unrecorded,
+                    attempt,
+                    self.skipped.with_extension("told"),
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("the note of an upload that didn't run can't be read");
+            }
+        }
+        let bytes = match std::fs::read(&self.paths.record) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("the upload record can't be read"),
+        };
+        let outcome: Outcome =
+            serde_json::from_slice(&bytes).context("the upload record can't be read")?;
+        let told = self.paths.told.clone();
+        Ok(match outcome {
+            Outcome::Failed {
+                reason, attempt, ..
+            } => Some((Undone::Failed(reason), attempt, told)),
+            Outcome::Started { attempt, .. } if !held(&self.paths.running) => {
+                Some((Undone::Ended, attempt, told))
+            }
+            Outcome::Started { .. } | Outcome::Uploaded { .. } => None,
+        })
+    }
+
+    fn undone(&self) -> crate::Result<Option<Undone>> {
+        Ok(self.newest()?.map(|(undone, ..)| undone))
+    }
+
+    /// [`Place::newest`] once per attempt: telling it marks it told.
+    fn unreported(&self) -> Option<Undone> {
+        let (undone, attempt, told) = self.newest().ok()??;
+        if std::fs::read_to_string(&told).ok().as_deref() == Some(attempt.as_str()) {
+            return None;
+        }
+        let _ = replace(&told, attempt.as_bytes());
+        Some(undone)
+    }
+
+    /// The Hub acknowledged a push of the branch whose commit `covers` a tip when it is that tip
+    /// or a descendant of it. An upload of a covered tip that failed, ended without saying how it
+    /// went or didn't run no longer stands for the branch, so its record or note goes. One of a
+    /// tip the commit doesn't hold stays, as a push frozen before that turn was saved never
+    /// uploaded it; so does the record of an upload still running, whose own outcome is recorded
+    /// over it. Each is read, judged and removed under the lock it is written under, and without
+    /// that lock it stays.
+    fn acknowledge(self, covers: impl Fn(&str) -> bool) {
+        under_write_lock(&self.note_lock(), || {
+            let note = std::fs::read(&self.skipped)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Skipped>(&bytes).ok());
+            if note.is_some_and(|note| covers(&note.tip)) {
+                let _ = std::fs::remove_file(&self.skipped);
+            }
+        });
+        let paths = self.paths;
+        under_write_lock(&paths.writing, || {
+            let stale = match read(&paths.record) {
+                Some(Outcome::Failed { tip, .. }) => covers(&tip),
+                Some(Outcome::Started { tip, .. }) => !held(&paths.running) && covers(&tip),
+                Some(Outcome::Uploaded { .. }) | None => false,
+            };
+            if stale {
+                let _ = std::fs::remove_file(&paths.record);
+            }
+        });
+    }
+
+    /// Whether the newest upload is one at `tip` that didn't run.
+    fn skipped_at(&self, tip: &str) -> bool {
+        std::fs::read(&self.skipped)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Skipped>(&bytes).ok())
+            .is_some_and(|note| note.tip == tip)
+    }
 }
 
-fn start_at(paths: Paths, tip: &str) -> Option<Upload> {
-    config::create_state_dir(paths.record.parent()?).ok()?;
-    let running = config::state_file_options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&paths.running)
-        .ok()?;
-    fs2::FileExt::lock_shared(&running).ok()?;
-    let started = Outcome::Started {
-        tip: tip.to_owned(),
-        attempt: uuid::Uuid::new_v4().to_string(),
-    };
-    under_write_lock(&paths.writing, || write(&paths.record, &started))?.ok()?;
-    Some(Upload {
-        paths,
-        started,
-        running,
-    })
+impl Paths {
+    fn start(self, tip: &str) -> crate::Result<Upload> {
+        let directory = self
+            .record
+            .parent()
+            .context("upload record has no directory")?;
+        config::create_state_dir(directory)
+            .context("the upload records' directory can't be created")?;
+        let running = config::state_file_options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&self.running)
+            .context("the upload's lock can't be opened")?;
+        fs2::FileExt::lock_shared(&running).context("the upload's lock can't be taken")?;
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let started = Outcome::Started {
+            tip: tip.to_owned(),
+            attempt: attempt.clone(),
+        };
+        under_write_lock(&self.writing, || write(&self.record, &started))
+            .context("the upload record's lock can't be taken")?
+            .context("the upload record can't be written")?;
+        Ok(Upload {
+            paths: self,
+            tip: tip.to_owned(),
+            attempt,
+            running,
+        })
+    }
 }
 
 impl Upload {
     /// Records how the upload went, over its own start only: a record another upload started
     /// since, of this tip or another, or one removed because the branch was dropped or its project
     /// unbound, stays as it is.
-    pub(crate) fn finish(self, result: Result<(), UploadFailure>) {
+    fn finish(self, result: Result<(), UploadFailure>) {
         let Self {
             paths,
-            started,
+            tip,
+            attempt,
             running,
         } = self;
-        let tip = started.tip().to_owned();
+        let started = Outcome::Started {
+            tip: tip.clone(),
+            attempt: attempt.clone(),
+        };
         under_write_lock(&paths.writing, || {
             if read(&paths.record).as_ref() == Some(&started) {
                 let outcome = match result {
                     Ok(()) => Outcome::Uploaded { tip },
-                    Err(reason) => Outcome::Failed { tip, reason },
+                    Err(reason) => Outcome::Failed {
+                        tip,
+                        reason,
+                        attempt,
+                    },
                 };
                 let _ = write(&paths.record, &outcome);
             }
@@ -184,11 +507,101 @@ impl Upload {
     }
 }
 
-/// Removes the record of `repository@branch`, or with no branch every record of `repository`.
-/// Each record goes under its write lock, as a finishing upload replaces it, so an upload that
-/// read its own start before the removal cannot write the record back. The lock files stay: they
-/// hold nothing, and removing one that is held would let the next upload lock a new file while
-/// the old holder still writes.
+/// Why a branch's newest automatic upload didn't go through. A class of [`UploadFailure`] is told
+/// in its own words wherever this is, so a new class needs nothing beyond its own description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Undone {
+    /// It ran and failed.
+    Failed(UploadFailure),
+    /// Its process ended before it recorded how it went.
+    Ended,
+    /// It didn't run, because its start couldn't be recorded.
+    Unrecorded,
+}
+
+impl Undone {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Failed(reason) => reason.describe(),
+            Self::Ended => "it stopped before it recorded how it went; the next turn tries again",
+            Self::Unrecorded => {
+                "this computer couldn't record the upload's outcome, so it didn't run; the next turn tries again"
+            }
+        }
+    }
+
+    /// The name `agit status --json` gives the state.
+    pub(crate) fn state(self) -> &'static str {
+        match self {
+            Self::Failed(_) => "failed",
+            Self::Ended => "ended",
+            Self::Unrecorded => "unrecorded",
+        }
+    }
+
+    pub(crate) fn reason(self) -> Option<UploadFailure> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            Self::Ended | Self::Unrecorded => None,
+        }
+    }
+}
+
+/// The newest automatic upload of `repository@branch` when it didn't go through and the turn-end
+/// line has not told it yet; telling it marks it told, so each upload is told once.
+pub(crate) fn unreported(repository: &str, branch: &str) -> Option<Undone> {
+    Place::of(repository, branch).ok()?.unreported()
+}
+
+/// The branches of `repository` whose newest automatic upload didn't go through, or why one's
+/// record can't be read. `branches` lists the checkout's local branches; it is asked only when the
+/// repository has a record or a note, since only a branch's name finds its record.
+pub(crate) fn undone_in(
+    repository: &str,
+    branches: impl FnOnce() -> crate::Result<Vec<String>>,
+) -> crate::Result<Vec<(String, crate::Result<Undone>)>> {
+    let mut any = false;
+    for directory in [repository_dir(repository)?, skipped_dir(repository)?] {
+        match std::fs::read_dir(&directory) {
+            Ok(mut entries) => any |= entries.next().is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("the upload records can't be read"),
+        }
+    }
+    if !any {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for branch in branches()? {
+        match Place::of(repository, &branch).and_then(|place| place.undone()) {
+            Ok(None) => {}
+            Ok(Some(undone)) => found.push((branch, Ok(undone))),
+            Err(error) => found.push((branch, Err(error))),
+        }
+    }
+    Ok(found)
+}
+
+/// The Hub acknowledged `repository@branch` at the local commit `source`, whoever pushed it:
+/// `repository` is the local checkout the branch's uploads are recorded by, whichever repository
+/// on the Hub the push published to. See [`Place::acknowledge`] for what that clears.
+pub(crate) fn acknowledged(repo: &Repo, repository: &str, branch: &str, source: &str) {
+    let Ok(place) = Place::of(repository, branch) else {
+        return;
+    };
+    place.acknowledge(|tip| {
+        tip == source
+            || repo
+                .git_opt(&["merge-base", "--is-ancestor", tip, source])
+                .is_some()
+    });
+}
+
+/// Removes the record of `repository@branch`, or with no branch every record of `repository`,
+/// with the notes of its uploads that didn't run. Each record goes under its write lock, as a
+/// finishing upload replaces it, so an upload that read its own start before the removal cannot
+/// write the record back. The lock files stay: they hold nothing, and removing one that is held
+/// would let the next upload lock a new file while the old holder still writes.
 pub(crate) fn forget(repository: &str, branch: Option<&str>) -> crate::Result<()> {
     let records: Vec<Paths> = match branch {
         Some(branch) => vec![paths(repository, branch)?],
@@ -201,13 +614,9 @@ pub(crate) fn forget(repository: &str, branch: Option<&str>) -> crate::Result<()
                     path.extension()
                         .is_some_and(|extension| extension == "json")
                 })
-                .map(|record| Paths {
-                    running: record.with_extension("lock"),
-                    writing: record.with_extension("write"),
-                    record,
-                })
+                .map(Paths::of)
                 .collect(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error.into()),
         },
     };
@@ -222,8 +631,30 @@ pub(crate) fn forget(repository: &str, branch: Option<&str>) -> crate::Result<()
                     .with_context(|| format!("cannot remove {}", paths.record.display()));
             }
         }
+        let _ = std::fs::remove_file(&paths.told);
     }
-    Ok(())
+    let skipped = skipped_dir(repository).map(|directory| match branch {
+        Some(branch) => {
+            let note = directory.join(digest(branch)).with_extension("json");
+            let _ = std::fs::remove_file(note.with_extension("told"));
+            std::fs::remove_file(note)
+        }
+        // The notes' locks stay, as the records' do.
+        None => match std::fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_none_or(|extension| extension != "lock"))
+                .try_for_each(std::fs::remove_file),
+            Err(error) => Err(error),
+        },
+    });
+    match skipped {
+        Ok(Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).context("cannot remove the notes of uploads that didn't run")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Set on a detached settlement whose Stop hook wrote a marker for it.
@@ -456,17 +887,20 @@ impl Launch {
     /// The record speaks only for the tip it was written for; an older one says nothing about the
     /// turns saved after it.
     fn status(&self, repo: &Repo, tip: &str) -> Status {
-        if let Ok(Paths {
-            record, running, ..
-        }) = paths(&self.repository, &self.branch)
-            && let Some(outcome) = read(&record).filter(|outcome| outcome.tip() == tip)
-        {
-            return match outcome {
-                Outcome::Uploaded { .. } => Status::Uploaded,
-                Outcome::Failed { reason, .. } => Status::Failed(reason.describe()),
-                Outcome::Started { .. } if held(&running) => Status::Uploading,
-                Outcome::Started { .. } => Status::Unknown,
-            };
+        let place = Place::of(&self.repository, &self.branch);
+        if let Ok(place) = &place {
+            if place.skipped_at(tip) {
+                return Status::NotUploaded(UNRECORDED);
+            }
+            if let Some(outcome) = read(&place.paths.record).filter(|outcome| outcome.tip() == tip)
+            {
+                return match outcome {
+                    Outcome::Uploaded { .. } => Status::Uploaded,
+                    Outcome::Failed { reason, .. } => Status::Failed(reason.describe()),
+                    Outcome::Started { .. } if held(&place.paths.running) => Status::Uploading,
+                    Outcome::Started { .. } => Status::Unknown,
+                };
+            }
         }
         match left_out(repo, &self.repository, &self.branch) {
             Some(reason) => Status::NotUploaded(reason),
@@ -490,11 +924,7 @@ mod tests {
     use super::*;
 
     fn at(directory: &Path) -> Paths {
-        Paths {
-            record: directory.join("record.json"),
-            running: directory.join("record.lock"),
-            writing: directory.join("record.write"),
-        }
+        Paths::of(directory.join("record.json"))
     }
 
     /// Uploads of one branch overlap: a settlement's upload and a save's, or two turns' uploads
@@ -507,8 +937,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let record = || read(&at(directory.path()).record);
 
-        let failing = start_at(at(directory.path()), "tip-1").unwrap();
-        let succeeding = start_at(at(directory.path()), "tip-1").unwrap();
+        let failing = at(directory.path()).start("tip-1").unwrap();
+        let succeeding = at(directory.path()).start("tip-1").unwrap();
         failing.finish(Err(UploadFailure::Hub));
         succeeding.finish(Ok(()));
         assert_eq!(
@@ -518,21 +948,152 @@ mod tests {
             })
         );
 
-        let older = start_at(at(directory.path()), "tip-2").unwrap();
-        let newer = start_at(at(directory.path()), "tip-3").unwrap();
+        let older = at(directory.path()).start("tip-2").unwrap();
+        let newer = at(directory.path()).start("tip-3").unwrap();
         older.finish(Err(UploadFailure::Hub));
         assert!(
             matches!(record(), Some(Outcome::Started { tip, .. }) if tip == "tip-3"),
             "an older upload does not overwrite a newer start"
         );
         newer.finish(Err(UploadFailure::TooLarge));
-        assert_eq!(
-            record(),
-            Some(Outcome::Failed {
-                tip: "tip-3".into(),
-                reason: UploadFailure::TooLarge,
-            })
+        assert!(
+            matches!(
+                record(),
+                Some(Outcome::Failed { tip, reason: UploadFailure::TooLarge, .. }) if tip == "tip-3"
+            ),
+            "{:?}",
+            record()
         );
+    }
+
+    /// An automatic upload whose start can't be recorded doesn't run, and that is told rather
+    /// than kept quiet: the turn-end line says it once and `agit status` lists it, until an upload
+    /// whose start is recorded runs as usual. A record file that is corrupt or unreadable is no
+    /// such reason: the start replaces it. A runner that pushed unrecorded would let a failure go
+    /// untold; one that stopped quietly would leave every later turn on this computer with nothing
+    /// said; one that read the record before starting would stop for good on a damaged file.
+    ///
+    /// A failure or a skip stays until the Hub acknowledges a commit that holds its turn. A push
+    /// frozen at an older commit can be acknowledged after a newer turn's upload failed, or while
+    /// a newer turn's skip is being written; clearing on any acknowledgement, or deciding on one
+    /// note and removing another, would erase that turn though it never went up.
+    #[test]
+    fn an_upload_that_cant_be_recorded_doesnt_run_and_says_so() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let records = blocked.join("uploads");
+        let notes = directory.path().join("checkout");
+        let place = || Place::at(&records, &notes);
+        let pushes = std::cell::Cell::new(0);
+        let push = |refusal: Option<Refusal>| {
+            recorded(
+                Ok(place()),
+                "tip-1",
+                || pushes.set(pushes.get() + 1),
+                move |_| refusal,
+            )
+        };
+
+        assert!(push(None).is_err());
+        assert_eq!(pushes.get(), 0, "an upload whose start isn't recorded ran");
+        assert_eq!(place().undone().unwrap(), Some(Undone::Unrecorded));
+        assert_eq!(place().unreported(), Some(Undone::Unrecorded));
+        assert_eq!(place().unreported(), None, "the same skip is told once");
+
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(at(&records).record, b"not a record").unwrap();
+        assert!(push(None).is_ok());
+        assert_eq!(pushes.get(), 1);
+        assert_eq!(place().undone().unwrap(), None);
+        assert_eq!(place().unreported(), None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(at(&records).record, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        let diverged = format!(
+            "remote branch work {}",
+            crate::domain::privacy_git::sessions::DIVERGED
+        );
+        assert!(push(Some(Refusal::child(Some(1), diverged))).is_ok());
+        assert_eq!(pushes.get(), 2);
+        let failed = Some(Undone::Failed(UploadFailure::Diverged));
+        assert_eq!(place().undone().unwrap(), failed);
+        assert_eq!(place().unreported(), failed);
+        assert_eq!(place().unreported(), None);
+
+        // `tip-0` is older than `tip-1`, `tip-1` older than `tip-2`.
+        let holds = |head: &'static str| {
+            move |tip: &str| match head {
+                "tip-0" => tip == "tip-0",
+                "tip-1" => matches!(tip, "tip-0" | "tip-1"),
+                _ => true,
+            }
+        };
+        place().acknowledge(holds("tip-0"));
+        assert_eq!(
+            place().undone().unwrap(),
+            failed,
+            "an older commit's acknowledgement erased a newer turn's failure"
+        );
+        place().acknowledge(holds("tip-1"));
+        assert_eq!(place().undone().unwrap(), None);
+
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, b"").unwrap();
+        assert!(
+            recorded(
+                Ok(place()),
+                "tip-2",
+                || pushes.set(pushes.get() + 1),
+                |_| None
+            )
+            .is_err()
+        );
+        assert_eq!(pushes.get(), 2);
+        place().acknowledge(holds("tip-1"));
+        assert_eq!(place().undone().unwrap(), Some(Undone::Unrecorded));
+        place().acknowledge(holds("tip-2"));
+        std::fs::remove_file(&blocked).unwrap();
+        assert_eq!(place().undone().unwrap(), None);
+
+        // After the acknowledgement of `tip-2` has read its note, a newer turn's upload fails to
+        // be recorded and writes its own; the acknowledgement then clears what it judged. It is
+        // given a bounded time to land first, which a clear outside the note's lock lets it do.
+        std::fs::write(&blocked, b"").unwrap();
+        assert!(
+            recorded(
+                Ok(place()),
+                "tip-2",
+                || pushes.set(pushes.get() + 1),
+                |_| None
+            )
+            .is_err()
+        );
+        let (landed, landing) = std::sync::mpsc::channel();
+        let newer = std::cell::RefCell::new(None);
+        place().acknowledge(|tip| {
+            if newer.borrow().is_none() {
+                let (records, notes, landed) = (records.clone(), notes.clone(), landed.clone());
+                *newer.borrow_mut() = Some(std::thread::spawn(move || {
+                    let skipped = Place::at(&records, &notes).start("tip-3").is_err();
+                    let _ = landed.send(());
+                    skipped
+                }));
+                let _ = landing.recv_timeout(std::time::Duration::from_millis(200));
+            }
+            tip == "tip-2"
+        });
+        assert!(newer.into_inner().unwrap().join().unwrap());
+        assert!(
+            place().skipped_at("tip-3"),
+            "an older commit's acknowledgement cleared a newer turn's note"
+        );
+        assert_eq!(place().undone().unwrap(), Some(Undone::Unrecorded));
     }
 
     /// Dropping a branch or unbinding its project removes its record for good: an upload still
@@ -564,7 +1125,10 @@ mod tests {
             return;
         }
         {
-            let running = start("alice/app", "work", "tip-1").unwrap();
+            let start = |branch: &str, tip: &str| {
+                Place::of("alice/app", branch).unwrap().start(tip).unwrap()
+            };
+            let running = start("work", "tip-1");
             let files = paths("alice/app", "work").unwrap();
             forget("alice/app", Some("work")).unwrap();
             assert!(!files.record.exists());
@@ -575,7 +1139,7 @@ mod tests {
                 "a running upload wrote a forgotten record back"
             );
 
-            let running = start("alice/app", "other", "tip-2").unwrap();
+            let running = start("other", "tip-2");
             forget("alice/app", None).unwrap();
             running.finish(Err(UploadFailure::Hub));
             assert!(!paths("alice/app", "other").unwrap().record.exists());
@@ -583,7 +1147,7 @@ mod tests {
             // A finish that read its own start holds the write lock until it has replaced the
             // record. A removal that does not wait for that lock returns while it is held, and the
             // replacement then writes the forgotten record back.
-            let _running = start("alice/app", "late", "tip-3").unwrap();
+            let _running = start("late", "tip-3");
             let files = paths("alice/app", "late").unwrap();
             let finishing = config::state_file_options()
                 .create(true)

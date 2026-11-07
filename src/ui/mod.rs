@@ -246,6 +246,18 @@ pub fn tilde(p: &std::path::Path) -> String {
     s
 }
 
+/// `text` with every occurrence of $HOME written as `~`. Error text that names paths ends up pasted
+/// into issues, and a full home path carries the account's name.
+#[must_use = "this is a text-shortening function; it returns a string and prints nothing"]
+pub fn home_shortened(text: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && home != "/" => {
+            text.replace(home.trim_end_matches('/'), "~")
+        }
+        _ => text.to_owned(),
+    }
+}
+
 /// Truncates to the given number of characters.
 ///
 /// It counts `chars()` and not bytes — transcripts hold plenty of Chinese, and cutting on bytes

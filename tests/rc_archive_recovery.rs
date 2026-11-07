@@ -250,7 +250,10 @@ fn completed_turn(root: &Path) -> CompletedTurn {
 }
 
 /// A fresh daemon recovers the standard archive without a viewer, prompt, or runtime launch.
-/// Disabled publication retains the durable job across another daemon restart.
+/// Disabled publication retains the durable job across another daemon restart. Once publication
+/// is on, recovery's upload is recorded like any automatic upload: one that fails, here because
+/// nobody is signed in, keeps the job and is listed by `agit status`. A recovery that pushed
+/// without recording would leave that failure in the daemon's log alone.
 #[test]
 fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
     let directory = tempfile::tempdir().unwrap();
@@ -356,6 +359,48 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
                 .success()
         );
     }
+
+    let identity = serde_json::json!({
+        "hub": "http://127.0.0.1:9", "agent_id": "00000000-0000-4000-8000-000000000009",
+    });
+    git(&["config", "agit.autoPush", "true"]);
+    git(&["config", "agit.remoteIdentity", &identity.to_string()]);
+    git(&[
+        "config",
+        "agit.desktopPublication",
+        &serde_json::json!({
+            "version": 1, "local_agent_id": "00000000-0000-0000-0000-000000000002",
+            "repository": "alice/notes", "identity": identity,
+        })
+        .to_string(),
+    ]);
+    let started = command(&root, &["rc", "local", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let listed = loop {
+        let status = command(&root, &["status", "--json"]).output().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_default();
+        let items = value["result"]["value"]["uploads_not_through"]["items"].clone();
+        if items.as_array().is_some_and(|items| !items.is_empty()) {
+            break items;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovery's upload left no record: {}\n{}",
+            String::from_utf8_lossy(&status.stdout),
+            daemon_output(&rc)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(listed[0]["target"], "desktop-fixture/project@conversation");
+    assert_eq!(listed[0]["state"], "failed");
+    assert!(job_path.exists(), "a failed publication keeps its job");
 }
 
 /// A daemon whose executable an upgrade replaces while it runs still settles its work: every

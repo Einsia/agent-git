@@ -1133,6 +1133,16 @@ impl std::fmt::Display for ChildFailed {
 
 impl std::error::Error for ChildFailed {}
 
+/// What a failed push child reported, for its upload's record to class.
+fn refusal(error: &anyhow::Error) -> super::upload_outcome::Refusal {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ChildFailed>())
+        .map_or_else(super::upload_outcome::Refusal::unexplained, |failed| {
+            super::upload_outcome::Refusal::child(failed.exit_code, failed.message.clone())
+        })
+}
+
 /// Why an automatic upload failed, in words that carry nothing of the error itself. The reason is
 /// shown in the conversation, and a Hub response or an error chain can hold URLs with query
 /// tokens, header values or paths.
@@ -1145,6 +1155,8 @@ pub(crate) enum UploadFailure {
     TooLarge,
     BuildsOnWithdrawn,
     Refused,
+    /// The Hub's copy of the branch and this computer's have each moved on without the other.
+    Diverged,
     /// A folder's capture rule keeps the branch from this computer's uploads.
     Withheld,
     /// The publication rules changed while it uploaded, and again on the second try.
@@ -1197,6 +1209,10 @@ impl UploadFailure {
 
     /// The class of a failed `agit push` child, from its exit status and the error it reported.
     pub(crate) fn reported(exit_code: Option<i32>, message: &str) -> Self {
+        // Refused again on every turn until the person chooses how to bring the two lines together.
+        if message.contains(crate::domain::privacy_git::sessions::DIVERGED) {
+            return Self::Diverged;
+        }
         if message.contains(super::push::OVERSIZED) {
             return Self::TooLarge;
         }
@@ -1233,6 +1249,9 @@ impl UploadFailure {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
             Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
+            Self::Diverged => {
+                "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them"
+            }
             Self::Withheld => {
                 "this computer keeps the conversation from uploading, so no later turn sends it either; pushing its branch yourself says why and what to do"
             }
@@ -1466,24 +1485,25 @@ fn sync_one(
         "--quiet",
         &format!("refs/heads/{branch}^{{commit}}"),
     ]);
-    let upload = head
-        .as_deref()
-        .and_then(|head| super::upload_outcome::start(&project.repository, &branch, head));
     let pushed = if project.auto_upload {
-        retry_stale(|| automatic_push(&target, &candidate.cwd))
+        super::upload_outcome::recorded(
+            super::upload_outcome::Place::of(&project.repository, &branch),
+            head.as_deref().unwrap_or_default(),
+            || retry_stale(|| automatic_push(&target, &candidate.cwd)),
+            |pushed| {
+                pushed
+                    .as_ref()
+                    .err()
+                    .map(|error| refusal(error).of_session(&candidate.session_id))
+            },
+        )
+        .map_err(anyhow::Error::new)
+        .and_then(|pushed| pushed)
     } else {
-        // The person asked for this save: their push.
+        // The person asked for this save: their push, which tells them how it went.
         let args = vec!["push".into(), target, "--yes".into()];
         retry_stale(|| child(&args, &candidate.cwd, false))
     };
-    if let Some(upload) = upload {
-        upload.finish(
-            pushed
-                .as_ref()
-                .map(|_| ())
-                .map_err(|error| UploadFailure::of(error, project, candidate)),
-        );
-    }
     pushed?;
     // A publication does not move the local view of the Hub's branches; fetching does, so local
     // status and links can tell that this branch is on the Hub.
@@ -4040,34 +4060,6 @@ pub(crate) fn automatic_upload(
         },
         repository: project.repository,
     })
-}
-
-/// The repository and reason of the last automatic upload by the project that saves this
-/// conversation, when that upload was this conversation's, it failed, and it has not been told
-/// yet. Each failure is told once: the upload runs detached after its turn, so only a later turn
-/// can tell it, and repeating it on every turn would bury the next one.
-pub(crate) fn unreported_failure(
-    runtime: &str,
-    session: &str,
-    origin: &Path,
-) -> Option<(String, UploadFailure)> {
-    let (project, _) = capturing(runtime, session, origin)?;
-    let last = project.last_result.as_ref()?;
-    // The project keeps one last result for every conversation it uploads; another
-    // conversation's failure is not this turn's.
-    if last["ok"] != false || last["session_id"] != session {
-        return None;
-    }
-    let reason = serde_json::from_value::<UploadFailure>(last["reason"].clone()).ok()?;
-    let at = last["at"].as_str()?;
-    let reported = state_path(&project.root).ok()?.with_extension("reported");
-    if fs::read_to_string(&reported).ok().as_deref() == Some(at) {
-        return None;
-    }
-    let mut file = tempfile::NamedTempFile::new_in(home().ok()?).ok()?;
-    file.write_all(at.as_bytes()).ok()?;
-    file.persist(&reported).ok()?;
-    Some((project.repository, reason))
 }
 
 fn caught_path(root: &Path) -> Result<PathBuf> {
@@ -7509,31 +7501,5 @@ mod tests {
             Saved::upload_failed("the Hub did not answer".into()),
             Saved::Failed(_)
         ));
-    }
-
-    /// #293: the project keeps one last result for every conversation it uploads, and a turn of
-    /// one conversation is never told another's failure; that conversation's own turn is, once.
-    #[test]
-    fn another_conversations_upload_failure_is_not_told_on_this_turn() {
-        if !isolated("another_conversations_upload_failure_is_not_told_on_this_turn") {
-            return;
-        }
-        let work = tempfile::tempdir().unwrap();
-        let root = work.path().join("app");
-        fs::create_dir_all(&root).unwrap();
-        let mut policy = project(&root);
-        policy.last_result = Some(serde_json::json!({
-            "at": "2026-01-01T00:00:00Z", "ok": false, "session_id": "failed-session",
-            "error": "x", "reason": "other",
-        }));
-        save(&policy).unwrap();
-        let root = root.canonicalize().unwrap();
-        assert!(unreported_failure("claude-code", "this-session", &root).is_none());
-        let (repository, failure) =
-            unreported_failure("claude-code", "failed-session", &root).expect("its own turn");
-        assert_eq!(repository, "alice/app");
-        assert_eq!(failure, UploadFailure::Other);
-        assert!(failure.describe().ends_with("the next turn tries again"));
-        assert!(unreported_failure("claude-code", "failed-session", &root).is_none());
     }
 }
