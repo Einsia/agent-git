@@ -244,6 +244,17 @@ pub fn run(args: Args) -> CmdResult {
                 &page.rows
             )
         );
+        // A conversation nothing saves says so, with the command that saves it. Turning saving
+        // on for its folder is the person's own choice, not one this line makes for them.
+        for (link, row) in links.iter().skip(args.offset).zip(&page.rows) {
+            if row[5] == sessions::NOT_SAVED {
+                ui::hint(&format!(
+                    "{} isn't saved: nothing asked agit to save this folder's conversations. `agit import {}` saves it.",
+                    link::short(&link.session_id),
+                    link.session_id
+                ));
+            }
+        }
         let leading = in_folder.saturating_sub(args.offset).min(page.rows.len());
         if leading > 0 && in_folder < links.len() {
             println!(
@@ -935,7 +946,7 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
         if let Some(bytes) = entry.refused_bytes {
             ui::warning(&format!(
                 "{}: privacy check refused a record of {} since {}; {} turn{} wait, and settling again does not change that",
-                crate::domain::link::short(&link.session_id),
+                link::short(&link.session_id),
                 super::mib(bytes),
                 ui::ago(since),
                 entry.turns,
@@ -949,7 +960,7 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
         if crate::domain::privacy::pending::worker_unavailable(&entry.reason) {
             ui::warning(&format!(
                 "{}: the privacy check couldn't run since {}; {} turn{} wait and are kept on this computer, and the next attempt tries again",
-                crate::domain::link::short(&link.session_id),
+                link::short(&link.session_id),
                 ui::ago(since),
                 entry.turns,
                 if entry.turns == 1 { "" } else { "s" },
@@ -963,7 +974,7 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
         let ends = crate::domain::privacy::pending::steps(&entry.reason);
         ui::warning(&format!(
             "{}: privacy check pending ({}) since {}; {} turn{} wait{}",
-            crate::domain::link::short(&link.session_id),
+            link::short(&link.session_id),
             entry.reason,
             ui::ago(since),
             entry.turns,

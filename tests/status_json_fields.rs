@@ -381,3 +381,90 @@ fn mcp_commit_without_a_target_settles_nothing_the_environment_names() {
         );
     }
 }
+
+/// A conversation its folder's hook registered with no destination is told by whether anything
+/// saves it. Where nothing does, status says it isn't saved and names `agit import <id>`, the
+/// command that saves it; where the folder's project captures it, it is saved when its turn ends.
+/// Told as an "incomplete claim", neither gives the person anything to act on, and a project
+/// folder's conversation told as not saved would send them to save it a second time.
+#[test]
+fn a_registered_conversation_says_whether_anything_saves_it() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    let folder = |name: &str| {
+        let dir = lab.cwd.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    };
+    let (project, plain) = (folder("project"), folder("plain"));
+    // The policy `agit on` writes, for `project` only.
+    let policies = lab.store.join("projects");
+    fs::create_dir_all(&policies).unwrap();
+    let digest = hex::encode(Sha256::digest(project.to_string_lossy().as_bytes()));
+    fs::write(
+        policies.join(format!("{}.json", &digest[..24])),
+        serde_json::json!({
+            "root": project, "repository": "me/notes",
+            "identity": {"hub": "http://127.0.0.1:1", "agent_id": "11111111-0000-4000-8000-000000000001"},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [], "last_result": null,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let ids = [
+        (&project, "cccccccc-0000-4000-8000-000000000001"),
+        (&plain, "cccccccc-0000-4000-8000-000000000002"),
+    ];
+    for (dir, id) in ids {
+        // The conversation as Claude Code wrote it there, and the link its SessionStart left.
+        let native = lab
+            .home
+            .join(".claude/projects")
+            .join(agit::adapter::claude_code::slug_for(dir));
+        fs::create_dir_all(&native).unwrap();
+        fs::write(
+            native.join(format!("{id}.jsonl")),
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"user","uuid":"u1","sessionId":id,"cwd":dir,
+                    "timestamp":"2026-11-07T01:00:00Z","message":{"role":"user","content":"Hello"}})
+            ),
+        )
+        .unwrap();
+        let links = lab.store.join("store").join("claude-code");
+        fs::create_dir_all(&links).unwrap();
+        fs::write(
+            links.join(format!("{id}.json")),
+            serde_json::json!({"cwd": dir}).to_string(),
+        )
+        .unwrap();
+    }
+    let status = lab.run(&["status", "--json"]);
+    let pending = |id: &str| {
+        status["result"]["value"]["sessions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["session_id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {status}"))["pending_activity"]
+            .clone()
+    };
+    assert_eq!(
+        pending(ids[0].1),
+        "not saved yet: saved when its turn ends",
+        "{status}"
+    );
+    assert_eq!(pending(ids[1].1), "not saved", "{status}");
+    let text = lab.output(&["status"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&text.stdout),
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(
+        said.contains(&format!("`agit import {}` saves it.", ids[1].1))
+            && !said.contains(&format!("`agit import {}`", ids[0].1)),
+        "{said}"
+    );
+}
