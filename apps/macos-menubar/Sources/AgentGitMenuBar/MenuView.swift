@@ -208,6 +208,8 @@ private struct ProblemRow: View {
             Button("Dismiss") { model.dismiss(key) }
         case .acknowledge(let key):
             Button("OK") { model.acknowledge(key) }
+        case .copy(let command):
+            Button("Copy command") { model.copy(command, what: "the command") }
         case .none:
             EmptyView()
         }

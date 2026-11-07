@@ -65,7 +65,7 @@ it was before AgentGit first changed it beside it, with `.agit-backup` added to 
 | --- | --- |
 | `checkmark.icloud` | Every folder that uploads automatically is up to date. |
 | `arrow.clockwise.icloud` | A conversation is waiting for, or in, an upload, or the app is running an agit command. |
-| `exclamationmark.icloud` | Something needs you: sign-in expired, uploads from a folder fail, or agit is missing or too old. |
+| `exclamationmark.icloud` | Something needs you: sign-in expired, uploads from a folder fail, an automatic upload of a branch didn't go through, or agit is missing or too old. |
 | `icloud.slash` | No folder uploads automatically (nothing set up, or paused). |
 
 The menu lists each folder from `agit project list --json` with its state ("Uploads
@@ -78,6 +78,13 @@ says why and how many of its conversations are saved but not uploaded, and offer
 automatic upload on. Turning it on, from there or from the folder's switch, asks first: the
 question says the repository's automatic upload is off, how many conversations it releases, and
 who can read them, and Cancel is its default answer.
+
+Every branch whose newest automatic upload didn't go through, wherever its conversation ran,
+shows as `owner/repo@branch` with agit's words for what happened and the command that shows what
+to do (`agit push owner/repo@branch`), which it copies. These come from the `uploads_not_through`
+list of `agit project list --json`, the same one `agit status` shows, and leave when agit clears
+them: a later upload of the branch goes through, or the Hub has the branch from any push. They
+carry nothing of the conversation.
 
 Actions and the commands behind them:
 
@@ -99,14 +106,19 @@ conversation saved in that repository inherits, and the confirmation says so. Cr
 repository always makes it private.
 
 Notifications are posted only for things the user must act on (sign-in expired, an upload
-refused with its reason), at most once per problem every six hours.
+refused with its reason), at most once per problem every six hours. A branch whose automatic upload
+didn't go through is notified once when it appears, and again only if it clears and comes back; a
+folder's own refused upload is not notified as well when a branch of its repository is. An upload
+notification names no repository, branch or folder, since it can show on the lock screen; the menu
+says which.
 
 ## Data and credentials
 
 The app reads state only through `agit whoami --json` (token states and expiry times, never
-token values) and `agit project list --json`. It stores no credentials. It keeps two small
-values in its own defaults: the uploads it saw finish (agit itself records only each folder's
-last result) and which folders it paused.
+token values) and `agit project list --json`. It stores no credentials. It keeps small values in
+its own defaults: the uploads it saw finish (agit itself records only each folder's last result),
+which folders it paused, and digests of the branches whose upload didn't go through with whether
+each was notified.
 
 ## Distribution (not done yet)
 

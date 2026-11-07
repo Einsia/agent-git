@@ -8995,11 +8995,12 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
 /// An automatic upload the Hub refuses because the conversation also continued on another
 /// computer is told, and stays told: its record names the class, the next turn's end says it in
 /// the class's own words, and `agit status` lists the branch with the command that shows what to
-/// do, in text and in JSON, whatever page of sessions it shows. Another conversation's successful
-/// upload in the same folder hides none of it, and is not told the failure. The refusal repeats on
-/// every turn, so an implementation that classed it as one the next turn gets past, read one
-/// last result for the whole folder, or listed only the rows of the page would leave this
-/// conversation's turns on this computer with nothing said.
+/// do, in text and in JSON, whatever page of sessions it shows; `project list --json`, which the
+/// menu bar polls, carries the same list. Another conversation's successful upload in the same
+/// folder hides none of it, and is not told the failure. The refusal repeats on every turn, so an
+/// implementation that classed it as one the next turn gets past, read one last result for the
+/// whole folder, listed only the rows of the page, or gave the menu bar a list of its own would
+/// leave this conversation's turns on this computer with nothing said, or said differently.
 #[cfg(unix)]
 #[test]
 fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
@@ -9202,6 +9203,13 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
             "command": "agit push alice/app@work",
         }]),
         "{value}"
+    );
+    let listed = agit(&["project", "list", "--json"], None);
+    let listed =
+        &serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap()["result"]["value"];
+    assert_eq!(
+        listed["uploads_not_through"], value["uploads_not_through"],
+        "{listed}"
     );
 }
 
