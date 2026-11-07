@@ -237,6 +237,9 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
         hint.contains(&format!("publish it: `agit push {REPO}@main`")),
         "{hint}"
     );
+    // The result names the repository whose main it is, which may not be the team's.
+    let said = format!("{}{hint}", String::from_utf8_lossy(&distilled.stdout));
+    assert!(said.contains(&format!("into {REPO}'s main (")), "{said}");
     assert_eq!(
         repo.git_bytes(&["show", "refs/heads/main:memory/mine.md"])
             .unwrap(),
