@@ -770,6 +770,11 @@ pub(super) fn require_remote_ancestry(
 /// without the other, read by automatic upload as `push::OVERSIZED` is.
 pub(crate) const DIVERGED: &str = "has diverged from this checkout";
 
+/// How a push says that the Hub's copy of a session branch has moved on and nothing here is new,
+/// read by automatic upload as [`DIVERGED`] is. Unread, the upload is told as one the next turn
+/// gets past, and that turn is refused as diverged.
+pub(crate) const NOTHING_NEW: &str = "this checkout has nothing new on it";
+
 /// Where this checkout stands against a Hub branch that its head does not contain.
 #[derive(Clone, Copy)]
 enum Position {
@@ -810,17 +815,17 @@ fn remote_movement(
                 _ => "has commits this checkout does not have".into(),
             };
             format!(
-                "remote branch {branch} {state} (Hub tip {tip}), and this checkout has nothing new on it\n  → bring the Hub's turns here: `agit pull {target}`"
+                "remote branch {branch} {state} (Hub tip {tip}), and {NOTHING_NEW}\n  → bring the Hub's turns here: `agit pull {target}`"
             )
         }
         // The Hub's newer turn sits on a published copy, which is a different commit from this
         // checkout's own, so neither copy can be fast-forwarded onto the other: the way on is a
         // separate checkout of the Hub's copy, with this one kept for its originals.
         Position::BehindProjected { encrypted: false } => format!(
-            "remote branch {branch}: the Hub has a newer turn from another computer on top of what this checkout uploaded (Hub tip {tip}), and this checkout has nothing new on it\n  → continue from the Hub's copy: keep this checkout, which holds your own turns as they ran, and clone {repository} into a separate checkout"
+            "remote branch {branch}: the Hub has a newer turn from another computer on top of what this checkout uploaded (Hub tip {tip}), and {NOTHING_NEW}\n  → continue from the Hub's copy: keep this checkout, which holds your own turns as they ran, and clone {repository} into a separate checkout"
         ),
         Position::BehindProjected { encrypted: true } => format!(
-            "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and this checkout has nothing new on it; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
+            "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and {NOTHING_NEW}; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
         ),
         Position::DivergedFiles { same } => {
             let state = match counts {

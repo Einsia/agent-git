@@ -1157,6 +1157,8 @@ pub(crate) enum UploadFailure {
     Refused,
     /// The Hub's copy of the branch and this computer's have each moved on without the other.
     Diverged,
+    /// The Hub's copy of the branch has moved on, and nothing on this computer is new.
+    Behind,
     /// A folder's capture rule keeps the branch from this computer's uploads.
     Withheld,
     /// The publication rules changed while it uploaded, and again on the second try.
@@ -1213,6 +1215,10 @@ impl UploadFailure {
         if message.contains(crate::domain::privacy_git::sessions::DIVERGED) {
             return Self::Diverged;
         }
+        // Nothing here to send, and the next turn here is refused as diverged.
+        if message.contains(crate::domain::privacy_git::sessions::NOTHING_NEW) {
+            return Self::Behind;
+        }
         if message.contains(super::push::OVERSIZED) {
             return Self::TooLarge;
         }
@@ -1252,13 +1258,19 @@ impl UploadFailure {
             Self::Diverged => {
                 "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them"
             }
+            Self::Behind => {
+                "this conversation also continued on another computer, so the Hub has turns this computer doesn't, and this computer has nothing new to upload; `agit push` for this branch shows how to go on"
+            }
             Self::Withheld => {
                 "this computer keeps the conversation from uploading, so no later turn sends it either; pushing its branch yourself says why and what to do"
             }
             Self::RulesChanged => {
                 "the rules for publishing to this repository changed while it was uploading, so the upload didn't finish; the turn stays saved here, and the next turn or `agit save` uploads what's left"
             }
-            Self::Other => "it could not be completed on this computer; the next turn tries again",
+            // Nothing is known of a refusal without a name of its own, so no retry is promised.
+            Self::Other => {
+                "it could not be completed on this computer; `agit push` for this branch shows why"
+            }
         }
     }
 }

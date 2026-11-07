@@ -1540,6 +1540,30 @@ mod tests {
     use super::{Decision, SignIn, Source, decide, with_session_title};
     use clap::Parser as _;
 
+    /// A session's start catches up an upload with nothing new here while the Hub has moved on. Its
+    /// refusal is told as that, not as an unnamed failure: the next turn here is refused as
+    /// diverged, so a line promising that it tries again sends the person to wait for a turn that
+    /// never uploads. A failure without a name promises no retry either, as nothing says that one
+    /// would get through.
+    #[test]
+    fn a_refusal_the_next_turn_cannot_get_past_promises_no_retry() {
+        use super::super::project::UploadFailure;
+        use super::super::upload_outcome::Undone;
+        use crate::domain::privacy_git::sessions::NOTHING_NEW;
+
+        let refused = format!("remote branch work moved on (Hub tip abc), and {NOTHING_NEW}");
+        let class = UploadFailure::reported(Some(4), &refused);
+        assert_eq!(class, UploadFailure::Behind);
+        assert_eq!(
+            super::upload_line("alice/app", Undone::Failed(class)),
+            "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't, and this computer has nothing new to upload; `agit push` for this branch shows how to go on."
+        );
+        assert_eq!(
+            super::upload_line("alice/app", Undone::Failed(UploadFailure::Other)),
+            "agit: the last automatic upload to alice/app failed: it could not be completed on this computer; `agit push` for this branch shows why."
+        );
+    }
+
     /// A restored title rides beside a system message. Claude Code drops a hook response whose
     /// `hookSpecificOutput` lacks `hookEventName`, title and message together, so a session
     /// start that already said something (a session from before the folder was on) kept its

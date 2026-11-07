@@ -274,7 +274,7 @@ fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
         .git(&["update-ref", "refs/remotes/origin/wiki", &local])
         .unwrap();
     let error = check(&"f".repeat(40)).unwrap_err().to_string();
-    assert!(error.contains("nothing new on it"), "{error}");
+    assert!(error.contains(sessions::NOTHING_NEW), "{error}");
     assert!(error.contains("`agit pull team/wiki@wiki`"), "{error}");
     source
         .git(&["update-ref", "-d", "refs/remotes/origin/wiki"])
@@ -732,7 +732,7 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     let error = sessions::require_remote_ancestry(&source, &plan, &ledger, &advanced, "team/app")
         .unwrap_err()
         .to_string();
-    assert!(error.contains("nothing new on it"), "{error}");
+    assert!(error.contains(sessions::NOTHING_NEW), "{error}");
     assert!(!error.contains("`agit pull team/app@work`"), "{error}");
     assert!(!error.contains("diverged"), "{error}");
     save(&owned, "Private continuation by Bob");
