@@ -144,6 +144,13 @@ fn inspect(
         return row;
     }
     let Ok(path) = config::repo_dir(owner, agent) else {
+        // Left out at startup, with a note that names it and what Git said.
+        if config::repos_dir()
+            .is_ok_and(|repos| config::left_out(&repos.join(owner).join(agent)).is_some())
+        {
+            row[5] = "unavailable: its repository can't be inspected (see the note above)".into();
+            row[6] = "repository unreadable; process unverified".into();
+        }
         return row;
     };
     let Some(repo) = Repo::open(path).map(Repo::exact_root_inspection) else {

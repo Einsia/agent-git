@@ -795,6 +795,33 @@ fn observe_page(
         })
 }
 
+/// The repositories status and the overview read in the current folder: the one the folder is
+/// bound to, and those of the conversations recorded as run in it. A record of conversations that
+/// can't be read in full reads as every repository, so a repository whose state is unknown is
+/// never left out of what this folder needs.
+pub fn reads_here() -> super::migration::Reads {
+    use super::migration::Reads;
+    let Ok(cwd) = std::env::current_dir() else {
+        return Reads::Every;
+    };
+    let Ok(store) = config::store_root() else {
+        return Reads::Every;
+    };
+    let ClaimInventory { links, issues, .. } = claim_inventory(store);
+    if !issues.is_empty() {
+        return Reads::Every;
+    }
+    let folder = super::front::folder(&cwd).ok();
+    let mut read: BTreeSet<String> = links
+        .iter()
+        .filter(|link| folder.as_deref().is_some_and(|folder| ran_in(link, folder)))
+        .filter_map(|link| Some(format!("{}/{}", link.owner.as_ref()?, link.agent.as_ref()?)))
+        .collect();
+    read.extend(folder.as_deref().and_then(super::front::bound));
+    read.extend(crate::domain::workspace::read(&cwd).map(|binding| binding.repo));
+    Reads::Only(read)
+}
+
 struct ClaimInventory {
     store: Option<Store>,
     links: Vec<link::Link>,

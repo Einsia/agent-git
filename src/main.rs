@@ -199,7 +199,11 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
                 if !skip_update {
                     commands::upgrade::maybe_startup_nudge("resume");
                 }
-                if let Some(code) = prepare_startup(cli.directory.as_deref(), Startup::Migrate) {
+                if let Some(code) =
+                    prepare_startup(cli.directory.as_deref(), Startup::Migrate, || {
+                        commands::migration::Reads::Every
+                    })
+                {
                     return code;
                 }
                 return dispatch(Commands::Resume(Default::default()), false);
@@ -265,7 +269,7 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
     if json {
         let directory = cli.directory.clone();
         let code = commands::json::capture_version(command_name, json_version, || {
-            if let Some(code) = prepare_startup(directory.as_deref(), startup) {
+            if let Some(code) = prepare_startup(directory.as_deref(), startup, || reads(&command)) {
                 return code;
             }
             dispatch(command, true)
@@ -273,7 +277,7 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
         return code;
     }
 
-    if let Some(code) = prepare_startup(cli.directory.as_deref(), startup) {
+    if let Some(code) = prepare_startup(cli.directory.as_deref(), startup, || reads(&command)) {
         return code;
     }
     dispatch(command, false)
@@ -281,7 +285,11 @@ fn run(raw_args: Vec<std::ffi::OsString>) -> i32 {
 
 /// Apply the working directory before inspecting storage. Read-only inspection must refuse
 /// pending recovery without performing it; JSON callers keep failures inside their envelope.
-fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Option<i32> {
+fn prepare_startup(
+    directory: Option<&std::path::Path>,
+    startup: Startup,
+    reads: impl FnOnce() -> commands::migration::Reads,
+) -> Option<i32> {
     agit::telemetry::observe(agit::telemetry::Observation::Stage("startup"));
     if let Some(d) = directory
         && let Err(e) = std::env::set_current_dir(d)
@@ -290,7 +298,7 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
         return Some(agit::ExitCode::Usage.as_i32());
     }
     let prepared = match startup {
-        Startup::Inspect => commands::migration::check_readonly_startup(),
+        Startup::Inspect => commands::migration::check_readonly_startup(reads),
         Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
         Startup::Finish => commands::migration::finish_interrupted(),
         Startup::ScopedDoctor
@@ -309,10 +317,27 @@ fn prepare_startup(directory: Option<&std::path::Path>, startup: Startup) -> Opt
             agit::ui::hint(interrupted.step());
         } else {
             agit::ui::error(&format!("local storage preparation failed: {e:#}"));
+            if let Some(step) = commands::migration::uninspectable_step(&e) {
+                agit::ui::hint(&step);
+            }
         }
         return Some(agit::ExitCode::Precondition.as_i32());
     }
     None
+}
+
+/// What a read-only command reads, asked only once a repository can't be inspected: status and
+/// the overview read this folder's repositories, doctor names each one as a finding, and any
+/// other command reads them all.
+fn reads(command: &Commands) -> commands::migration::Reads {
+    match command {
+        // Repairing objects writes to the repository it names.
+        Commands::Doctor(args) if args.repair_objects.is_none() => {
+            commands::migration::Reads::Findings
+        }
+        Commands::Status(_) | Commands::Overview => commands::status::reads_here(),
+        _ => commands::migration::Reads::Every,
+    }
 }
 
 /// Commands that prepare local storage also judge existing project claims, once per machine. A
@@ -585,6 +610,9 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
             // A repository a command inspects that another command left part-way names its step.
             if let Some(step) = commands::migration::interrupted_step(&e) {
                 agit::ui::hint(step);
+            }
+            if let Some(step) = commands::migration::uninspectable_step(&e) {
+                agit::ui::hint(&step);
             }
             // An unwritable home or a held lock carries its own next steps, including that a
             // lock file must not be deleted while its holder runs.

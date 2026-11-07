@@ -22,6 +22,11 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod checkouts;
+mod uninspectable;
+
+pub use uninspectable::{
+    Reads, Uninspectable, left_out as uninspectable_repositories, step as uninspectable_step,
+};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
@@ -681,7 +686,11 @@ pub fn finish_interrupted() -> Result<()> {
 
 /// Inspect recovery prerequisites without creating storage, acquiring locks, or migrating refs.
 /// Legacy history can be displayed, but interrupted publication cannot be reported as settled.
-pub fn check_readonly_startup() -> Result<()> {
+///
+/// A repository Git can't inspect stops the command when `reads` says the command reads it, the
+/// first in repository order; any other is left out of the process with a note, and doctor names
+/// each as a finding instead. Recovery evidence and pending recovery stop every command.
+pub fn check_readonly_startup(reads: impl FnOnce() -> Reads) -> Result<()> {
     let home = crate::infra::config::agit_home()?;
     if !startup_recovery_evidence(&home)?.is_empty() {
         return Err(Interrupted {
@@ -689,8 +698,9 @@ pub fn check_readonly_startup() -> Result<()> {
         }
         .into());
     }
+    let mut uninspectable = Vec::new();
     // Every probe only reads, so a bounded set of repositories, aliases that share a Git directory
-    // included, is inspected at once; the first failure in repository order is reported.
+    // included, is inspected at once; failures are taken in repository order.
     for group in super::clone::list_local()?.chunks(STARTUP_CHECKOUT_WORKERS) {
         let results = std::thread::scope(|scope| {
             let workers = group
@@ -700,27 +710,82 @@ pub fn check_readonly_startup() -> Result<()> {
             workers
                 .into_iter()
                 .map(|worker| {
-                    worker
-                        .join()
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("repository inspection panicked")))
+                    worker.join().unwrap_or_else(|_| {
+                        Err(Checked::Stop(anyhow::anyhow!(
+                            "repository inspection panicked"
+                        )))
+                    })
                 })
                 .collect::<Vec<_>>()
         });
         for result in results {
-            result?;
+            match result {
+                Ok(()) => {}
+                Err(Checked::Uninspectable(found)) => uninspectable.push(found),
+                Err(Checked::Stop(error)) => return Err(error),
+            }
         }
     }
-    Ok(())
+    if uninspectable.is_empty() {
+        return Ok(());
+    }
+    let reads = reads();
+    for found in &uninspectable {
+        found.leave_out();
+    }
+    match reads {
+        Reads::Findings => Ok(()),
+        Reads::Every => Err(uninspectable.swap_remove(0).into()),
+        Reads::Only(read) => {
+            if let Some(found) = uninspectable
+                .iter()
+                .find(|found| read.contains(&found.repository))
+            {
+                return Err(found.clone().into());
+            }
+            for found in &uninspectable {
+                crate::ui::warning(&found.left_out_note());
+                crate::ui::hint(&found.step());
+            }
+            Ok(())
+        }
+    }
 }
 
-fn check_readonly_repository(path: &Path) -> Result<()> {
+/// A Git that lacks what inspection needs fails the same way on every repository, so that is told
+/// as it is, and stops, rather than leaving out each repository in turn.
+fn about_git_itself(error: &anyhow::Error) -> bool {
+    error.is::<crate::domain::repo::GitWorktreeFormatUnavailable>()
+}
+
+/// Why a repository's read-only inspection did not pass.
+enum Checked {
+    /// Git couldn't inspect it, or one of its worktrees.
+    Uninspectable(Uninspectable),
+    /// It has pending recovery, or the check itself failed.
+    Stop(anyhow::Error),
+}
+
+fn check_readonly_repository(path: &Path) -> std::result::Result<(), Checked> {
+    let uninspectable = |worktree: Option<&Path>, error: anyhow::Error| {
+        if about_git_itself(&error) {
+            Checked::Stop(error)
+        } else {
+            Checked::Uninspectable(Uninspectable::new(path, worktree, &error))
+        }
+    };
     let repo = Repo::at(path).local_objects_only();
-    let registered = repo.inspection_worktrees()?;
+    let registered = repo
+        .inspection_worktrees()
+        .map_err(|error| uninspectable(None, error))?;
     let checkouts = checkouts::Checkouts::inspect(
         &repo,
         checkouts::main_checkout_common_dir(path).as_deref(),
         &registered,
     );
+    // A worktree Git can't inspect doesn't end the scan: pending recovery in any other worktree
+    // still stops every command, whichever comes first in Git's list.
+    let mut first = None;
     for worktree in &registered {
         let checkout = Repo::at(&worktree.path).local_objects_only();
         let pending = checkouts.pending(
@@ -730,14 +795,24 @@ fn check_readonly_repository(path: &Path) -> Result<()> {
                 probe_legacy_storage_checkout_recovery(&checkout, MigrationFailureKind::Skippable)
                     .map_err(RepoMigrationFailure::into_error)
             },
-        )?;
-        anyhow::ensure!(
-            !pending,
-            "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
-            worktree.path.display()
         );
+        match pending {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(Checked::Stop(anyhow::anyhow!(
+                    "{} has pending recovery; complete recovery through the original AgentGit store before inspecting status",
+                    worktree.path.display()
+                )));
+            }
+            Err(error) => match uninspectable(Some(&worktree.path), error) {
+                Checked::Uninspectable(found) => {
+                    first.get_or_insert(found);
+                }
+                stop => return Err(stop),
+            },
+        }
     }
-    Ok(())
+    first.map_or(Ok(()), |found| Err(Checked::Uninspectable(found)))
 }
 
 /// A scoped inspection follows the selected repository's registered checkouts and aliases.
@@ -769,22 +844,41 @@ fn check_readonly_repo_startup_with_policy(
     preflight(repo)?;
     let home = crate::infra::config::agit_home()?;
     let repos = crate::infra::config::repos_dir()?;
-    let selected_common_dir = repo.common_dir_with_policy(policy)?.canonicalize()?;
+    // What Git can't inspect here is named: the repository, the worktree and what Git said.
+    let uninspectable = |worktree: Option<&Path>, error: anyhow::Error| -> anyhow::Error {
+        if about_git_itself(&error) {
+            error
+        } else {
+            Uninspectable::new(repo.root(), worktree, &error).into()
+        }
+    };
+    let selected_common_dir = repo
+        .common_dir_with_policy(policy)
+        .and_then(|common| Ok(common.canonicalize()?))
+        .map_err(|error| uninspectable(None, error))?;
     let mut roots = vec![repo.root().to_path_buf()];
     let local = repo.is_local_inspection();
     let registered = if local {
-        repo.inspection_worktrees()?
+        repo.inspection_worktrees()
     } else {
-        repo.worktrees_with_policy(policy)?
-    };
+        repo.worktrees_with_policy(policy)
+    }
+    .map_err(|error| uninspectable(None, error))?;
     roots.extend(registered.iter().map(|worktree| worktree.path.clone()));
+    // A checkout Git can't inspect doesn't end the check: pending recovery in any other one still
+    // stops the command, whichever comes first.
+    let mut first = None;
     let mut canonical_roots = Vec::new();
     for root in &roots {
-        canonical_roots.push(
-            root.canonicalize().with_context(|| {
-                format!("cannot identify registered checkout {}", root.display())
-            })?,
-        );
+        match root
+            .canonicalize()
+            .with_context(|| format!("cannot identify registered checkout {}", root.display()))
+        {
+            Ok(canonical) => canonical_roots.push(canonical),
+            Err(error) => {
+                first.get_or_insert_with(|| uninspectable(Some(root), error));
+            }
+        }
     }
     canonical_roots.sort();
     canonical_roots.dedup();
@@ -863,14 +957,20 @@ fn check_readonly_repo_startup_with_policy(
                 .collect::<Vec<_>>()
         });
         for (root, result) in group.iter().zip(results) {
-            anyhow::ensure!(
-                !result?,
-                "{} has pending recovery; complete recovery through the original AgentGit store before inspecting it",
-                root.display()
-            );
+            match result {
+                Ok(false) => {}
+                Ok(true) => anyhow::bail!(
+                    "{} has pending recovery; complete recovery through the original AgentGit store before inspecting it",
+                    root.display()
+                ),
+                Err(error) if about_git_itself(&error) => return Err(error),
+                Err(error) => {
+                    first.get_or_insert_with(|| uninspectable(Some(root), error));
+                }
+            }
         }
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 const STARTUP_CHECKOUT_WORKERS: usize = 8;
