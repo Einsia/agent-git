@@ -1094,6 +1094,13 @@ impl SettlementFixture {
         unacked_settlement_path(&self.repo, &self.branch)
     }
 
+    /// What the record of the settlement's upload says, kept where [`Session::upload_place`]
+    /// keeps it for a settlement child a test supplied.
+    fn upload_record(&self) -> Option<String> {
+        let records = self.repo.join(".git").join("agit-test-uploads");
+        crate::commands::upload_outcome::Place::at(&records, &records).state()
+    }
+
     fn tracking(&self) -> String {
         let out = std::process::Command::new("git")
             .args(crate::domain::meta::GIT_SAFE)
@@ -1800,6 +1807,9 @@ fn a_turn_uploads_only_to_the_hub_its_destination_records() {
                 session.publication_retry.next.is_some(),
                 "the turn is tried again once this computer can sign in"
             );
+            // The refusal is recorded, so the turn's end and `agit status` tell it, and the
+            // earlier turn's upload record doesn't stand in for this one.
+            assert_eq!(fixture.upload_record().as_deref(), Some("failed"));
             let refusal = crate::rc::capture::destination(&repo, &lineage)
                 .unwrap()
                 .unwrap()
@@ -1817,7 +1827,7 @@ fn a_turn_uploads_only_to_the_hub_its_destination_records() {
 
 /// End to end (the settlement success path): the temporary result file under `.git` →
 /// `SUPERVISOR_RESULT_ENV` → the subprocess writes it back → `read_to_string` → the predicate →
-/// a real push → `commit.settled`.
+/// a real push → `commit.settled`, and the upload's record says it went through.
 ///
 /// Cover the predicate alone and the before/after/reported fed to it are strings the test made
 /// up itself. Any link breaking (the result file never being handed down, say) turns `reported`
@@ -1844,6 +1854,7 @@ async fn a_real_settlement_pushes_and_reports_the_sha_its_child_wrote() {
         head,
         "the settlement never actually pushed the new commit"
     );
+    assert_eq!(fixture.upload_record().as_deref(), Some("uploaded"));
 }
 
 /// The remote commit can differ from the source; lost delivery retains a local source retry
@@ -1911,7 +1922,9 @@ async fn projected_publication_reports_the_remote_commit_across_restarts() {
     assert_eq!(fixture.head(), source);
 }
 
-/// Success exit status and even a well-formed receipt cannot acknowledge a different request.
+/// Success exit status and even a well-formed receipt cannot acknowledge a different request, and
+/// the upload's record says it failed: a record judged by the exit status alone would call an
+/// unconfirmed publication uploaded, and `agit status` would never list it.
 #[cfg(unix)]
 #[tokio::test]
 async fn unconfirmed_publication_keeps_the_source_pending_without_notification() {
@@ -1955,6 +1968,11 @@ async fn unconfirmed_publication_keeps_the_source_pending_without_notification()
         assert_eq!(
             read_unacked_settlement(&fixture.receipt()).as_deref(),
             Some(fixture.head().as_str())
+        );
+        assert_eq!(
+            fixture.upload_record().as_deref(),
+            Some("failed"),
+            "{refusal}"
         );
     }
 }

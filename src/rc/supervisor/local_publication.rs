@@ -29,6 +29,9 @@ impl Session {
             progress: Progress::LocalSaved,
             ..SessionPublicationStatus::checking()
         };
+        // A destination this computer isn't signed in to is an upload that didn't go through; the
+        // refusal is kept to be recorded once the attempt ends.
+        let mut signed_out = None;
         let prepared = (|| -> crate::Result<_> {
             let repo = Repo::at(std::path::Path::new(repository));
             let lineage = self
@@ -65,6 +68,7 @@ impl Session {
             // the next publication tries again.
             if let Err(refusal) = destination.require_sign_in() {
                 tracing_note(&format!("{refusal:#}"));
+                signed_out = Some(format!("{refusal:#}"));
                 status.readiness = Readiness::SetupRequired;
                 status.stage = Some(Stage::Consent);
                 status.reason = Some(Reason::ConsentRequired);
@@ -117,6 +121,21 @@ impl Session {
         let (repo, request, result) = match prepared {
             Ok(Some(prepared)) => prepared,
             Ok(None) => {
+                // Recorded like a refused push, so the turn's end and `agit status` say why the
+                // turn stays on this computer.
+                if let Some(refusal) = signed_out {
+                    use crate::commands::upload_outcome::{Refusal, recorded_async};
+                    let record = self
+                        .agit_session
+                        .as_ref()
+                        .context("capture binding is missing")
+                        .and_then(|lineage| self.upload_place(&lineage.slug(), branch));
+                    let refusal = Refusal::child(Some(crate::ExitCode::Auth.as_i32()), refusal);
+                    let _ = recorded_async(record, source.to_owned(), async {}, move |()| {
+                        Some(refusal)
+                    })
+                    .await;
+                }
                 // A durable receipt ends this attempt; an unconfigured source still needs
                 // idle recovery when its project destination becomes ready.
                 self.finish_publication_outcome(if retained {
@@ -145,24 +164,51 @@ impl Session {
         let mut state = self.settlement.clone();
         let out = self.out.clone();
         let logical = self.info.session_id.clone();
+        let record = self
+            .agit_session
+            .as_ref()
+            .context("capture binding is missing")
+            .and_then(|lineage| self.upload_place(&lineage.slug(), branch));
+        let source = source.to_owned();
         let publish = async move {
+            use crate::commands::upload_outcome::{Refusal, recorded_async};
             let mut status = status;
-            match guarded_output(&mut state, lease, push).await {
-                Some(output) if output.status.success() => {
-                    if let Err(error) = result_receipt(&repo, &request, result.path()) {
-                        status.progress = Progress::Failed;
-                        status.stage = Some(Stage::Publication);
-                        status.reason = Some(Reason::PublicationFailed);
-                        tracing_note(&format!("RC publication result is unavailable: {error:#}"));
-                    } else {
-                        status.readiness = Readiness::Ready;
-                        status.progress = Progress::AwaitingAck;
-                        status.stage = Some(Stage::Receiver);
-                        status.reason = None;
-                    }
+            // The publication goes through only with a result receipt the outbox accepts.
+            let recorded = recorded_async(
+                record,
+                source,
+                async {
+                    let output = guarded_output(&mut state, lease, push).await;
+                    let receipt = output
+                        .as_ref()
+                        .filter(|output| output.status.success())
+                        .map(|_| result_receipt(&repo, &request, result.path()));
+                    (output, receipt)
+                },
+                |(output, receipt)| match (output, receipt) {
+                    (Some(_), Some(Ok(()))) => None,
+                    (Some(output), _) => Some(Refusal::of(output)),
+                    (None, _) => Some(Refusal::unexplained()),
+                },
+            )
+            .await;
+            match recorded {
+                Ok((Some(_), Some(Ok(())))) => {
+                    status.readiness = Readiness::Ready;
+                    status.progress = Progress::AwaitingAck;
+                    status.stage = Some(Stage::Receiver);
+                    status.reason = None;
+                }
+                Ok((Some(_), Some(Err(error)))) => {
+                    status.progress = Progress::Failed;
+                    status.stage = Some(Stage::Publication);
+                    status.reason = Some(Reason::PublicationFailed);
+                    tracing_note(&format!("RC publication result is unavailable: {error:#}"));
                 }
                 // The Hub or the network did not answer; the next publication tries again.
-                Some(output) if output.status.code() == Some(crate::ExitCode::Network as i32) => {
+                Ok((Some(output), None))
+                    if output.status.code() == Some(crate::ExitCode::Network as i32) =>
+                {
                     status.progress = Progress::LocalSaved;
                     status.stage = Some(Stage::Publication);
                     status.reason = Some(Reason::ReceiverUnavailable);
@@ -170,14 +216,23 @@ impl Session {
                         "RC automatic publication could not reach the Hub; the source remains local and the next publication tries again",
                     );
                 }
-                Some(output) if matches!(output.status.code(), Some(code) if code == crate::ExitCode::Interactive as i32 || code == crate::ExitCode::Auth as i32) =>
+                Ok((Some(output), None)) if matches!(output.status.code(), Some(code) if code == crate::ExitCode::Interactive as i32 || code == crate::ExitCode::Auth as i32) =>
                 {
                     status.readiness = Readiness::SetupRequired;
                     status.progress = Progress::LocalSaved;
                     status.stage = Some(Stage::Consent);
                     status.reason = Some(Reason::ConsentRequired);
                 }
-                _ => {
+                // Unrecorded, it would fail unseen; the source stays and the next attempt tries.
+                Err(unrecorded) => {
+                    status.progress = Progress::LocalSaved;
+                    status.stage = Some(Stage::Publication);
+                    status.reason = Some(Reason::PublicationFailed);
+                    tracing_note(&format!(
+                        "RC automatic publication did not run; the source remains local: {unrecorded}"
+                    ));
+                }
+                Ok(_) => {
                     status.progress = Progress::Failed;
                     status.stage = Some(Stage::Publication);
                     status.reason = Some(Reason::PublicationFailed);

@@ -951,7 +951,9 @@ fn upload_announcement(
         .filter(|_| ev.source == Source::Resume)
         .and_then(|origin| super::project::held_earlier(rt, &ev.session_id, origin))
         .map(|held| held_notice(&held, &ev.session_id));
-    let failure = origin.and_then(|origin| failure_line(rt, &ev.session_id, origin));
+    // The Stop hook tells only a Claude Code conversation of an upload that didn't go through; a
+    // Codex one is told here, when it next starts.
+    let failure = failure_line(rt, &ev.session_id);
     let lines: Vec<String> = [notice.or(held), failure].into_iter().flatten().collect();
     if lines.is_empty() {
         return None;
@@ -1009,17 +1011,33 @@ fn held_notice(held: &super::project::HeldEarlier, session: &str) -> String {
     )
 }
 
-/// One line for the person when the last automatic upload of this conversation failed, said once
-/// per failure, with a reason from a fixed set and nothing of the error itself.
-fn failure_line(runtime: &str, session: &str, origin: &std::path::Path) -> Option<String> {
-    let origin = origin
-        .canonicalize()
-        .unwrap_or_else(|_| origin.to_path_buf());
-    let (repository, failure) = super::project::unreported_failure(runtime, session, &origin)?;
-    Some(format!(
-        "agit: the last automatic upload to {repository} failed: {}.",
-        failure.describe()
-    ))
+/// One line for the person when the newest automatic upload of this conversation's branch didn't
+/// go through, said once per upload, with a reason from a fixed set and nothing of the error
+/// itself. It is read from the branch's own record: a slot shared by the folder's conversations
+/// would let another conversation's upload stand in for this one's.
+fn failure_line(runtime: &str, session: &str) -> Option<String> {
+    let store = Store::at(crate::infra::config::store_root().ok()?);
+    let link = link::get(&store, runtime, session).filter(Link::is_active)?;
+    let repository = format!("{}/{}", link.owner?, link.agent?);
+    let undone = super::upload_outcome::unreported(&repository, link.branch.as_deref()?)?;
+    Some(upload_line(&repository, undone))
+}
+
+/// The line that tells the person what kept the newest automatic upload to `repository` from
+/// going through.
+fn upload_line(repository: &str, undone: super::upload_outcome::Undone) -> String {
+    match undone {
+        super::upload_outcome::Undone::Failed(_) => format!(
+            "agit: the last automatic upload to {repository} failed: {}.",
+            undone.describe()
+        ),
+        super::upload_outcome::Undone::Ended | super::upload_outcome::Undone::Unrecorded => {
+            format!(
+                "agit: the last automatic upload to {repository} didn't go through: {}.",
+                undone.describe()
+            )
+        }
+    }
 }
 
 /// How long a SessionStart waits for the Hub to confirm who can see the destination.
@@ -1210,9 +1228,8 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     // Claude Code shows a Stop hook's `systemMessage` to the person and does not continue the
     // turn for it; the detached settlement holds no pipe of the runtime and cannot say anything.
     let failure = (!await_reply && rt == "claude-code")
-        .then(|| session_origin(&ev))
-        .flatten()
-        .and_then(|origin| failure_line(rt, &ev.session_id, std::path::Path::new(&origin)));
+        .then(|| failure_line(rt, &ev.session_id))
+        .flatten();
     // A Codex turn settles here, as the turn ends: whatever keeps it from being saved is told to
     // the person now, in the turn it concerns, beside the one-time line about a branch an older
     // agit linked it to.

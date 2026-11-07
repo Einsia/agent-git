@@ -205,6 +205,7 @@ impl Drop for Publication {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_settlement(
     mut state: tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
@@ -213,9 +214,35 @@ async fn publish_settlement(
     result_file: tempfile::NamedTempFile,
     mut notification: Frame,
     out: mpsc::Sender<Frame>,
+    record: crate::Result<crate::commands::upload_outcome::Place>,
 ) -> Option<Arc<crate::protocol::ConnectionDelivery>> {
-    let push = guarded_output(&mut state, lease, command).await?;
-    let Some(published) = confirmed_strict_push(&push, &request, result_file.path()) else {
+    use crate::commands::upload_outcome::{Refusal, recorded_async};
+    // The publication goes through only with the Hub's receipt for this very request.
+    let recorded = recorded_async(
+        record,
+        request.source.clone(),
+        async {
+            let push = guarded_output(&mut state, lease, command).await?;
+            let published = confirmed_strict_push(&push, &request, result_file.path());
+            Some((push, published))
+        },
+        |pushed| match pushed {
+            Some((_, Some(_))) => None,
+            Some((push, None)) => Some(Refusal::of(push)),
+            None => Some(Refusal::unexplained()),
+        },
+    )
+    .await;
+    let (push, published) = match recorded {
+        Ok(pushed) => pushed?,
+        Err(unrecorded) => {
+            tracing_note(&format!(
+                "RC publication did not run; the pending commit remains eligible for retry: {unrecorded}"
+            ));
+            return None;
+        }
+    };
+    let Some(published) = published else {
         tracing_note(&format!(
             "RC publication has no matching successful receipt; the pending commit remains eligible for retry: {}",
             String::from_utf8_lossy(&push.stderr).trim()
@@ -1827,6 +1854,24 @@ impl Session {
             Some(child) => Some(child.repo_dir.clone()),
             None => agit_session.repo_dir().ok(),
         }
+    }
+
+    /// Where the record of an automatic upload of `slug@branch` is kept. A settlement child a test
+    /// supplied keeps it beside its repository, for the reason the child exists: the agit home is
+    /// process-wide.
+    fn upload_place(
+        &self,
+        slug: &str,
+        branch: &str,
+    ) -> crate::Result<crate::commands::upload_outcome::Place> {
+        #[cfg(test)]
+        if let Some(child) = &self.settlement_child {
+            let records = child.repo_dir.join(".git").join("agit-test-uploads");
+            return Ok(crate::commands::upload_outcome::Place::at(
+                &records, &records,
+            ));
+        }
+        crate::commands::upload_outcome::Place::of(slug, branch)
     }
 
     /// The harness-native session/thread id, once the driver knows it.
@@ -4221,6 +4266,7 @@ impl Session {
             },
         );
         notification.settlement_boundary = journal_boundary.clone();
+        let record = self.upload_place(&slug, &branch);
         let publication = (|| -> crate::Result<_> {
             use std::io::Write;
             let repo = crate::domain::repo::Repo::at(std::path::Path::new(&repo_dir_s));
@@ -4260,6 +4306,7 @@ impl Session {
             result_file,
             notification,
             self.out.clone(),
+            record,
         );
         if journal_boundary.is_some() {
             self.publication = Some(Publication(tokio::spawn(async move {

@@ -935,8 +935,9 @@ pub(super) fn run(
             )
         })?;
         show_publication(&report);
-        // A target whose branch the Hub now holds no longer waits for the privacy check. Only the
-        // Hub's acknowledgement says so: a preview, a cancelled push or a refused one sends nothing.
+        // A target whose branch the Hub now holds no longer waits for the privacy check, and an
+        // automatic upload of it that didn't go through no longer stands for it. Only the Hub's
+        // acknowledgement says so: a preview, a cancelled push or a refused one sends nothing.
         for branch in report
             .heads
             .iter()
@@ -946,6 +947,11 @@ pub(super) fn run(
             .filter_map(|published| published.reference.name().strip_prefix("refs/heads/"))
         {
             crate::domain::privacy::pending::upload::clear_uploaded(&[&repository, slug], branch);
+            // An automatic upload is recorded by the checkout it ran from, which is not the Hub
+            // repository when a device-local capture or `--to` publishes elsewhere.
+            if let Some(source) = projected.source_head(branch) {
+                crate::commands::upload_outcome::acknowledged(&repo, slug, branch, source);
+            }
         }
         let accepted: Vec<String> = [&report.heads, &report.tags]
             .into_iter()

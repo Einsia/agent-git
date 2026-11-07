@@ -147,6 +147,18 @@ impl ProjectedHistory {
         &self.session_manifest
     }
 
+    /// The local commit this publication sends as `branch`, as frozen before it was projected:
+    /// what the Hub holds of the branch once it acknowledges it, whichever public commit stands
+    /// for it there.
+    pub(crate) fn source_head(&self, branch: &str) -> Option<&str> {
+        let name = format!("refs/heads/{branch}");
+        self.source
+            .heads()
+            .iter()
+            .find(|head| head.name() == name)
+            .map(|head| head.oid())
+    }
+
     pub(crate) fn prepare_acceptance(&mut self) -> Result<()> {
         self.accepted_ledger
             .prepare(&self.candidates, &self.held_boundary)

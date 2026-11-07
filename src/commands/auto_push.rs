@@ -181,36 +181,48 @@ pub(super) fn after_settlement(
     }
     let target = format!("{slug}@{branch}");
     // A settlement detached from the runtime has no terminal to tell the outcome on, so it is
-    // recorded for the end of the session to tell.
-    let upload = super::upload_outcome::start(slug, branch, &after);
-    // A child process isolates the noninteractive publish policy and its JSON output from the
-    // settlement caller. It uses the ordinary identity, access, visibility and secret gates.
-    let outcome = std::env::current_exe().and_then(|executable| {
-        let mut command = crate::infra::background::command(executable);
-        command.arg("--json");
-        automatic_push(&mut command, &target);
-        command
-            .current_dir(directory)
-            .env("AGIT_SESSION", &target)
-            .env("AGIT_TUI", "0")
-            .stdin(Stdio::null());
-        // Statistics attribute the push to the settling invocation, which may be a hook.
-        if let Some(parent) = crate::telemetry::parent_invocation_id() {
-            command.env("AGIT_TELEMETRY_PARENT_ID", parent);
+    // recorded for the next turn's end and `agit status` to tell.
+    let recorded = super::upload_outcome::recorded(
+        super::upload_outcome::Place::of(slug, branch),
+        &after,
+        || {
+            // A child process isolates the noninteractive publish policy and its JSON output from
+            // the settlement caller. It uses the ordinary identity, access, visibility and secret
+            // gates.
+            std::env::current_exe().and_then(|executable| {
+                let mut command = crate::infra::background::command(executable);
+                command.arg("--json");
+                automatic_push(&mut command, &target);
+                command
+                    .current_dir(directory)
+                    .env("AGIT_SESSION", &target)
+                    .env("AGIT_TUI", "0")
+                    .stdin(Stdio::null());
+                // Statistics attribute the push to the settling invocation, which may be a hook.
+                if let Some(parent) = crate::telemetry::parent_invocation_id() {
+                    command.env("AGIT_TELEMETRY_PARENT_ID", parent);
+                }
+                command.output()
+            })
+        },
+        |outcome| match outcome {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some(super::upload_outcome::Refusal::of(output)),
+            Err(_) => Some(super::upload_outcome::Refusal::unexplained()),
+        },
+    );
+    let outcome = match recorded {
+        Ok(outcome) => outcome,
+        Err(unrecorded) => {
+            if !quiet {
+                ui::warning(&ui::home_shortened(&format!(
+                    "saved locally; not uploaded to {target}: {unrecorded}"
+                )));
+                ui::hint("the next turn tries again");
+            }
+            return;
         }
-        command.output()
-    });
-    if let Some(upload) = upload {
-        upload.finish(match &outcome {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) => Err(super::project::UploadFailure::reported(
-                output.status.code(),
-                &failure_reason(&output.stdout).map_or_else(String::new, |(reason, _)| reason),
-            )
-            .waiting_on(None, Some(&target))),
-            Err(_) => Err(super::project::UploadFailure::Other),
-        });
-    }
+    };
     match outcome {
         Ok(output) if output.status.success() => {
             if !quiet {
@@ -248,7 +260,7 @@ fn unexplained(target: &str) {
 /// The child's own error and hint lines, so the reason and its next commands are read where the
 /// turn was settled. A child that produced no envelope, or no error line in it, has no reason to
 /// relay.
-fn failure_reason(stdout: &[u8]) -> Option<(String, Vec<String>)> {
+pub(super) fn failure_reason(stdout: &[u8]) -> Option<(String, Vec<String>)> {
     let document: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let lines = document["diagnostics"]["stderr"].as_array()?;
     let messages = |level: &str| {
