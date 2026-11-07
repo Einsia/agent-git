@@ -1213,13 +1213,29 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         .then(|| session_origin(&ev))
         .flatten()
         .and_then(|origin| failure_line(rt, &ev.session_id, std::path::Path::new(&origin)));
-    // A Codex conversation an older agit linked to a branch held for it: told once, at the end of
-    // a turn, how to go on.
-    let failure = failure.or_else(|| {
-        (!await_reply && rt == "codex")
-            .then(|| older_line(&ev.session_id))
-            .flatten()
-    });
+    // A Codex turn settles here, as the turn ends: whatever keeps it from being saved is told to
+    // the person now, in the turn it concerns, beside the one-time line about a branch an older
+    // agit linked it to.
+    if failure.is_none() && rt == "codex" {
+        let older = (!await_reply).then(|| older_line(&ev.session_id)).flatten();
+        let settled = crate::ui::with_info_on_stderr(true, || {
+            settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
+        });
+        // An archive settlement's failure is the hook's own failure, reported as it exits.
+        let refused = settled
+            .as_ref()
+            .err()
+            .filter(|error| !super::commit::archive::is_failure(error))
+            .map(|error| format!("agit: {error:#}"));
+        let lines: Vec<String> = [older, refused].into_iter().flatten().collect();
+        if !lines.is_empty() {
+            println!(
+                "{}",
+                serde_json::json!({ "systemMessage": lines.join("\n") })
+            );
+        }
+        return settled;
+    }
     let Some(failure) = failure else {
         return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
     };
@@ -1325,7 +1341,17 @@ fn settle_event(
         }
         return Ok(());
     };
-    super::commit::settle_from_link(&store, lk)?;
+    // A save refused by its rules comes back as an exit status, after saying why. An archive
+    // settlement answers for itself, as the hook exits.
+    let archive = lk.merge_archive.is_some();
+    let (code, said) = crate::ui::recording_errors(|| super::commit::settle_from_link(&store, lk));
+    if code? != crate::ExitCode::Ok && !archive {
+        anyhow::bail!(
+            "this turn isn't saved: {}",
+            said.first()
+                .map_or("`agit status` shows why", String::as_str)
+        );
+    }
     Ok(())
 }
 

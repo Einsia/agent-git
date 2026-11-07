@@ -71,7 +71,25 @@ colorize!(transient, bright_magenta);
 
 /// Errors go to stderr — there they stay visible while `agit log > out.txt` redirects stdout.
 pub fn error(msg: &str) {
+    ERRORS.with(|errors| {
+        if let Some(errors) = errors.borrow_mut().as_mut() {
+            errors.push(msg.to_owned());
+        }
+    });
     eprintln!("{} {msg}", err_text("error"));
+}
+
+thread_local! {
+    static ERRORS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `action`'s result, with the errors it reported along the way, so a caller that answers for
+/// it elsewhere can say why.
+pub(crate) fn recording_errors<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let outer = ERRORS.with(|errors| errors.borrow_mut().replace(Vec::new()));
+    let result = action();
+    let recorded = ERRORS.with(|errors| std::mem::replace(&mut *errors.borrow_mut(), outer));
+    (result, recorded.unwrap_or_default())
 }
 
 pub fn warning(msg: &str) {

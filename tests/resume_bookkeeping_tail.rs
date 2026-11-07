@@ -737,3 +737,423 @@ impl Lab {
         .collect()
     }
 }
+
+/// A Codex session continued on a second computer, in a folder of its own, saves its turns: `agit
+/// resume` there materializes the branch for a new Codex session, a turn runs, and the turn's end
+/// commits it onto the branch, which then names that turn as its own. A turn agit can't save is
+/// told to the person as that turn ends.
+#[test]
+fn a_codex_turn_on_a_second_computer_is_saved_as_it_ends() {
+    let lab = Lab::codex();
+    // The second computer: its own folder and its own Codex, which has never seen the session.
+    let other = lab.home.join("computer-b/qa");
+    fs::create_dir_all(&other).unwrap();
+    let home_b = lab.home.join("computer-b/home");
+    fs::create_dir_all(&home_b).unwrap();
+    // Its agit holds the repository as a clone brings it, and no link of the first computer's.
+    let store_b = lab.home.join("computer-b/agit");
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(&lab.store)
+        .arg(&store_b)
+        .output()
+        .unwrap();
+    assert!(copied.status.success(), "{}", combined(&copied));
+    fs::remove_dir_all(store_b.join("store")).unwrap();
+    let repo_b = store_b.join("repos/alice/qa");
+    let resumed = lab
+        .command()
+        .args(["resume", "alice/qa@work", "--no-launch"])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{}", combined(&resumed));
+    let links = || -> Vec<(String, serde_json::Value)> {
+        fs::read_dir(store_b.join("store/codex"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| {
+                let path = entry.path();
+                (
+                    path.file_stem().unwrap().to_string_lossy().into_owned(),
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let (session, link) = links()
+        .into_iter()
+        .find(|(_, link)| link["materialized_from"].is_string())
+        .expect("the resume materializes the branch for a new Codex session");
+    let other_canonical = other.canonicalize().unwrap();
+    assert_eq!(
+        link["cwd"]
+            .as_str()
+            .map(|cwd| Path::new(cwd).canonicalize().unwrap()),
+        Some(other_canonical.clone()),
+        "{link}"
+    );
+    let transcript = walk(&home_b.join(".codex"))
+        .into_iter()
+        .find(|path| path.to_string_lossy().contains(&session))
+        .expect("the materialized Codex session");
+    append(&transcript, &lab.codex_turn(3));
+    let stop = |session: &str, transcript: &Path| {
+        let mut child = lab
+            .command()
+            .args(["hooks", "settle", "--runtime", "codex"])
+            .current_dir(&other)
+            .env("HOME", &home_b)
+            .env("AGIT_HOME", &store_b)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({"session_id":session,"cwd":other_canonical,"transcript_path":transcript,
+                    "hook_event_name":"Stop"})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", combined(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let said = stop(&session, &transcript);
+    assert!(!said.contains("isn't saved"), "{said}");
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_b)
+            .args(["rev-parse", "refs/heads/work"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let log = agit::domain::storage::materialize_at(&repo_b, &head, agit::domain::meta::LOG_FILE)
+        .unwrap();
+    assert!(
+        log.contains("synthetic prompt 3"),
+        "the second computer's turn is on the branch"
+    );
+    let link = links()
+        .into_iter()
+        .find(|(id, _)| *id == session)
+        .unwrap()
+        .1;
+    assert_eq!(link["materialized_from"], json!(head), "{link}");
+    // Settled by its id, as a person may do, and then at the end of the next turn: both land.
+    let tip = || {
+        String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo_b)
+                .args(["rev-parse", "refs/heads/work"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    let landed = |turn: usize| {
+        agit::domain::storage::materialize_at(&repo_b, &tip(), agit::domain::meta::LOG_FILE)
+            .unwrap()
+            .contains(&format!("synthetic prompt {turn}"))
+    };
+    append(&transcript, &lab.codex_turn(4));
+    let by_id = lab
+        .command()
+        .args(["commit", &session])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(by_id.status.success(), "{}", combined(&by_id));
+    assert!(landed(4));
+    append(&transcript, &lab.codex_turn(5));
+    let said = stop(&session, &transcript);
+    assert!(!said.contains("isn't saved"), "{said}");
+    assert!(landed(5));
+    // And asked for by its branch.
+    append(&transcript, &lab.codex_turn(6));
+    let by_ref = lab
+        .command()
+        .args(["commit", "alice/qa@work"])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(by_ref.status.success(), "{}", combined(&by_ref));
+    assert!(landed(6));
+    // Its hooks may run in the launch's own process, which carries the launch's variables, or in
+    // Codex's shared server, which carries none: the turn is saved either way, because the resume
+    // wrote its link for the branch before launching. The ends above ran without them.
+    append(&transcript, &lab.codex_turn(7));
+    let mut child = lab
+        .command()
+        .args(["hooks", "settle", "--runtime", "codex"])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .env("AGIT_SESSION", "alice/qa@work")
+        .env("AGIT_LAUNCH", "11111111-2222-4333-8444-000000000777")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"session_id":session,"cwd":other_canonical,"transcript_path":transcript,
+                "hook_event_name":"Stop"})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("isn't saved"),
+        "{}",
+        combined(&out)
+    );
+    assert!(landed(7));
+    let head = tip();
+
+    // A link nothing but launch variables put on the branch, in a folder that isn't the branch's,
+    // is not saved there, and the person hears so as the turn ends.
+    const ELSEWHERE: &str = "eeeeeeee-0000-4000-8000-000000000385";
+    let third = lab.home.join("computer-c/qa");
+    fs::create_dir_all(&third).unwrap();
+    let third = third.canonicalize().unwrap();
+    let stray = transcript.with_file_name(format!("rollout-2026-11-05T00-00-01-{ELSEWHERE}.jsonl"));
+    fs::write(
+        &stray,
+        format!(
+            "{}\n{}",
+            json!({"timestamp":"2026-11-05T06:34:16.000Z", "type":"session_meta",
+                "payload":{"id":ELSEWHERE, "cwd":third, "timestamp":"2026-11-05T06:34:16.000Z",
+                    "cli_version":"0.166.0"}}),
+            lab.codex_turn(1)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        store_b.join(format!("store/codex/{ELSEWHERE}.json")),
+        json!({"cwd":third,"owner":"alice","agent":"qa","branch":"work"}).to_string(),
+    )
+    .unwrap();
+    let said = stop(ELSEWHERE, &stray);
+    assert!(said.contains("isn't saved"), "{said}");
+    // Asked for by its id, it is refused the same way, and told how to go on.
+    let by_id = lab
+        .command()
+        .args(["commit", ELSEWHERE])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(!by_id.status.success(), "{}", combined(&by_id));
+    assert!(
+        combined(&by_id).contains("agit branch confirm work --repo alice/qa"),
+        "{}",
+        combined(&by_id)
+    );
+    assert_eq!(tip(), head, "nothing of it reaches the branch");
+    // Asked for by its branch, alone on it, the same.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo_b)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", combined(&out));
+    };
+    git(&["branch", "stray", &head]);
+    fs::write(
+        store_b.join(format!("store/codex/{ELSEWHERE}.json")),
+        json!({"cwd":third,"owner":"alice","agent":"qa","branch":"stray"}).to_string(),
+    )
+    .unwrap();
+    let by_ref = lab
+        .command()
+        .args(["commit", "alice/qa@stray"])
+        .current_dir(&third)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(!by_ref.status.success(), "{}", combined(&by_ref));
+    assert!(
+        combined(&by_ref).contains("agit branch confirm stray --repo alice/qa"),
+        "{}",
+        combined(&by_ref)
+    );
+    fs::write(
+        store_b.join(format!("store/codex/{ELSEWHERE}.json")),
+        json!({"cwd":third,"owner":"alice","agent":"qa","branch":"work"}).to_string(),
+    )
+    .unwrap();
+    // Nor is one whose claim names no writer that answers for the folder.
+    fs::write(
+        store_b.join(format!("store/codex/{ELSEWHERE}.json")),
+        json!({"cwd":third,"owner":"alice","agent":"qa","branch":"work",
+            "claimed_by":"unknown"})
+        .to_string(),
+    )
+    .unwrap();
+    let said = stop(ELSEWHERE, &stray);
+    assert!(said.contains("isn't saved"), "{said}");
+    fs::remove_file(store_b.join(format!("store/codex/{ELSEWHERE}.json"))).unwrap();
+    // c72's shape: a conversation under an earlier launch's variables, with no claim to take, saves
+    // nothing anywhere.
+    let mut child = lab
+        .command()
+        .args(["hooks", "settle", "--runtime", "codex"])
+        .current_dir(&other)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .env("AGIT_SESSION", "alice/qa@work")
+        .env("AGIT_LAUNCH", "11111111-2222-4333-8444-000000000385")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({"session_id":ELSEWHERE,"cwd":other_canonical,"transcript_path":stray,
+                "hook_event_name":"Stop"})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", combined(&out));
+    let after = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_b)
+            .args(["rev-parse", "refs/heads/work"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(after.trim(), head, "nothing of it reaches the branch");
+    assert!(
+        !store_b
+            .join(format!("store/codex/{ELSEWHERE}.json"))
+            .exists()
+    );
+    // A conversation an older agit linked to a fresh line made in another folder is refused by
+    // its id, with the step that says it belongs there; once the person confirms it, it settles.
+    let other_dir = lab.home.join("computer-b/elsewhere");
+    fs::create_dir_all(&other_dir).unwrap();
+    let made = lab
+        .command()
+        .args([
+            "new",
+            "alice/qa",
+            "--as",
+            "codex",
+            "-b",
+            "fresh",
+            "--no-launch",
+        ])
+        .current_dir(&other_dir)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{}", combined(&made));
+    fs::write(
+        store_b.join(format!("store/codex/{ELSEWHERE}.json")),
+        json!({"cwd":third,"owner":"alice","agent":"qa","branch":"fresh"}).to_string(),
+    )
+    .unwrap();
+    let commit = || {
+        lab.command()
+            .args(["commit", ELSEWHERE])
+            .current_dir(&third)
+            .env("HOME", &home_b)
+            .env("AGIT_HOME", &store_b)
+            .output()
+            .unwrap()
+    };
+    let refused = commit();
+    assert!(!refused.status.success(), "{}", combined(&refused));
+    assert!(
+        combined(&refused).contains("agit branch confirm fresh --repo alice/qa"),
+        "{}",
+        combined(&refused)
+    );
+    let confirmed = lab
+        .command()
+        .args(["branch", "confirm", "fresh", "--repo", "alice/qa"])
+        .current_dir(&third)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(confirmed.status.success(), "{}", combined(&confirmed));
+    let settled = commit();
+    assert!(settled.status.success(), "{}", combined(&settled));
+    let fresh = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_b)
+            .args(["rev-parse", "refs/heads/fresh"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let log =
+        agit::domain::storage::materialize_at(&repo_b, fresh.trim(), agit::domain::meta::LOG_FILE)
+            .unwrap();
+    assert!(
+        log.contains("synthetic prompt 1"),
+        "the confirmed conversation's turn: {log}"
+    );
+    // A save its rules refuse, onto a branch sealed read-only, is told as the turn ends too.
+    let sealed = lab
+        .command()
+        .args(["branch", "seal", "fresh", "--repo", "alice/qa"])
+        .current_dir(&third)
+        .env("HOME", &home_b)
+        .env("AGIT_HOME", &store_b)
+        .output()
+        .unwrap();
+    assert!(sealed.status.success(), "{}", combined(&sealed));
+    append(&stray, &lab.codex_turn(2));
+    let said = stop(ELSEWHERE, &stray);
+    assert!(
+        said.contains("isn't saved") && said.contains("sealed"),
+        "{said}"
+    );
+}
