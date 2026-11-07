@@ -27,7 +27,20 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Copy a session branch to a new branch without the history its merges recorded again
+    Merges {
+        /// The session branch: `owner/repo@branch`
+        target: String,
+        /// The new branch (default: `<branch>-repaired`)
+        #[arg(short = 'b', long = "into", value_name = "NEW-BRANCH")]
+        into: Option<String>,
+        /// List what the copy leaves out, and why, without writing it
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
+
+pub(crate) mod merges;
 
 /// The message of the commit a repair lands as.
 pub(crate) const MESSAGE: &str = "agit: restore values an earlier agit replaced";
@@ -48,7 +61,14 @@ struct Unresolved {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    let Cmd::Placeholders { target, dry_run } = args.cmd;
+    let (target, dry_run) = match args.cmd {
+        Cmd::Placeholders { target, dry_run } => (target, dry_run),
+        Cmd::Merges {
+            target,
+            into,
+            dry_run,
+        } => return merges::run(&target, into.as_deref(), dry_run),
+    };
     let parsed = super::target::parse(&target)?;
     let slug = parsed
         .repo

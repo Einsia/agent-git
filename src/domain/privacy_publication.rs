@@ -32,6 +32,9 @@ pub(crate) use snapshot::PublicationSnapshot;
 const PUBLIC_SESSION: &str = "agit-0000000000000000000000000000000000000001";
 
 /// Per-sequence source admission budget, before secret hydration and private-layer encoding.
+/// Why a projection refuses a LOG that holds one record twice, projected two ways.
+pub const REPEATED_EVENT: &str = "repeated event has ambiguous privacy provenance";
+
 pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Admission bounds the source before JSON parsing, hydration and publication copies.
@@ -678,10 +681,7 @@ pub fn project_session(
         let line = storage::envelope_line(&envelope);
         let original = storage::envelope_line(source_record);
         if let Some(previous) = mapped.insert(original, line.clone()) {
-            ensure!(
-                previous == line,
-                "repeated event has ambiguous privacy provenance"
-            );
+            ensure!(previous == line, REPEATED_EVENT);
         }
         public_log.push_str(&line);
     }

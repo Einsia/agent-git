@@ -109,7 +109,17 @@ pub fn run(mut args: Args) -> CmdResult {
         )],
     );
 
-    let prepared = protected_readable(&source, &[])?;
+    let prepared = match protected_readable(&source, &[]) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let Some(hint) = repair_hint(&source, &error) {
+                ui::error(&format!("{error:#}"));
+                ui::hint(&hint);
+                return Ok(ExitCode::Precondition);
+            }
+            return Err(error);
+        }
+    };
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
     // Passphrase: hashed locally; the plaintext is never uploaded.
@@ -296,6 +306,8 @@ struct ShareSource {
     projection_log: Option<String>,
     metadata: meta::Meta,
     branch: Option<String>,
+    /// The repository a recorded point belongs to.
+    repository: Option<String>,
 }
 
 impl ShareSource {
@@ -500,6 +512,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         projection_log: None,
         metadata,
         branch: native.branch.clone(),
+        repository: None,
     })
 }
 
@@ -635,6 +648,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         projection_log: Some(projection_log),
         metadata: snapshot,
         branch: point.branch,
+        repository: Some(point.slug),
     })
 }
 
@@ -668,6 +682,25 @@ fn legacy_synthetic(content: &serde_json::Value) -> bool {
             .is_some_and(|message| message.len() == 2)
         && content["message"]["role"] == "user"
         && content["message"]["content"].is_string()
+}
+
+/// For a session whose merges recorded some of its history again, the step that shows what a
+/// repaired copy would leave out. Only the listing: nothing it suggests uploads.
+fn repair_hint(source: &ShareSource, error: &anyhow::Error) -> Option<String> {
+    let merged = source
+        .projection_log
+        .as_deref()
+        .is_some_and(|log| log.contains("agit:__merge_start__"));
+    let repeated =
+        format!("{error:#}").contains(crate::domain::privacy_publication::REPEATED_EVENT);
+    let (Some(repository), Some(branch)) = (&source.repository, &source.branch) else {
+        return None;
+    };
+    (merged && repeated).then(|| {
+        format!(
+            "a merge recorded some of this session's history again; `agit repair merges {repository}@{branch} --dry-run` lists what a repaired copy would leave out"
+        )
+    })
 }
 
 fn failed(error: anyhow::Error) -> CmdResult {

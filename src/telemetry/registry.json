@@ -149,6 +149,7 @@
     "rc ungrant": {"aliases":[],"args":{"command":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},
     "remote": {"aliases":[],"args":{"repo":{"action":"Set","policy":"presence"},"verbose":{"action":"SetTrue","policy":"boolean"}}},
     "repair": {"aliases":[],"args":{}},
+    "repair merges": {"aliases":[],"args":{"dry_run":{"action":"SetTrue","policy":"boolean"},"into":{"action":"Set","policy":"presence"},"target":{"action":"Set","policy":"presence"}}},
     "repair placeholders": {"aliases":[],"args":{"dry_run":{"action":"SetTrue","policy":"boolean"},"target":{"action":"Set","policy":"presence"}}},
     "repo": {"aliases":[],"args":{}},
     "repo collab": {"aliases":[],"args":{}},
