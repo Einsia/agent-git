@@ -159,10 +159,17 @@ pub fn run(args: Args) -> CmdResult {
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
     ui::section("who am I");
+    let runtime_sessions = super::context::runtime_sessions();
     match super::context::from_env_with_claims(&links, inventory_complete) {
         Ok(Some(c)) => {
             println!("  {} @ {}", c.repo, c.branch);
             println!("  {}", ui::dim(&format!("via: {}", c.via)));
+            if let Some(note) = super::context::not_this_terminal(
+                &format!("{}@{}", c.repo, c.branch),
+                &runtime_sessions,
+            ) {
+                println!("  {note}");
+            }
         }
         Ok(None) => {
             println!(
@@ -172,7 +179,6 @@ pub fn run(args: Args) -> CmdResult {
         }
         Err(error) => println!("  session target unavailable: {error}"),
     }
-    let runtime_sessions = super::context::runtime_sessions();
     print_runtime_sessions(&runtime_sessions, !args.check_missing);
     if let Some(ws) = crate::domain::workspace::read(&cwd) {
         println!("  {}", ui::dim(&format!("bound repo: {}", ws.repo)));

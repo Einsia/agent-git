@@ -484,7 +484,17 @@ fn publish(mut args: Args) -> CmdResult {
         branches.retain(|branch| !unchanged.contains(branch));
         if branches.is_empty() {
             reading.finish();
-            ui::info(format_args!("{}: already up to date.", checkout.slug()));
+            if asked_explicitly {
+                report_nothing_new(
+                    &repo,
+                    &checkout.slug(),
+                    &checkout.slug(),
+                    &unchanged,
+                    &audited_push::on_the_hub(&unchanged),
+                );
+            } else {
+                ui::info(format_args!("{}: already up to date.", checkout.slug()));
+            }
             return Ok(ExitCode::Ok);
         }
     }
@@ -1374,6 +1384,130 @@ fn push_tags(
     Ok(())
 }
 
+/// What a push that found nothing new on `branches` of the checkout `slug`, published to
+/// `repository`, says: for each session branch, which session it is (its first turn's subject, cut short) and when its last turn was,
+/// and when that isn't the conversation running in this terminal, that too. A near-identical
+/// branch pushed by mistake then doesn't read as an upload. The text is local display only: it
+/// goes to the terminal, never into JSON or telemetry.
+pub(super) fn report_nothing_new(
+    repo: &Repo,
+    slug: &str,
+    repository: &str,
+    branches: &[String],
+    held: &str,
+) {
+    // A script reading the JSON gets no prompt words: they are for a person at the terminal.
+    let words = !crate::commands::json::is_capturing();
+    let mut said = false;
+    for branch in branches {
+        let Some(session) = describe_session(repo, branch) else {
+            continue;
+        };
+        said = true;
+        match session.first.filter(|_| words) {
+            Some(first) => ui::info(format_args!(
+                "Nothing new to upload: {branch} is on the Hub as the session \"{first}\" (last turn {}).",
+                session.last
+            )),
+            None => ui::info(format_args!(
+                "Nothing new to upload: {branch} is on the Hub (last turn {}).",
+                session.last
+            )),
+        }
+    }
+    if !said {
+        ui::info(format_args!(
+            "{repository}: already up to date; {held} on the Hub."
+        ));
+        return;
+    }
+    let terminal = super::context::runtime_sessions();
+    for branch in branches {
+        if let Some(note) =
+            super::context::not_this_terminal(&format!("{slug}@{branch}"), &terminal)
+        {
+            ui::hint(&note);
+        }
+    }
+}
+
+/// A session branch as a push names it.
+struct Described {
+    /// Its first turn's subject, cut short; `None` when no turn carries one.
+    first: Option<String>,
+    /// When its last turn was, as the local clock reads it.
+    last: String,
+}
+
+/// `branch` as a push names it, read from its commits' session records in either storage layout:
+/// its own session's turns only, not those of a session it was forked from, and not the commits
+/// that record no turn (a milestone, a fork, a shared file). `None` when it holds no turn of its
+/// own session.
+fn describe_session(repo: &Repo, branch: &str) -> Option<Described> {
+    let reference = format!("refs/heads/{branch}");
+    let lines = repo.git_opt(&[
+        "log",
+        "--first-parent",
+        "--format=%H%x00%ct%x00%s",
+        &reference,
+    ])?;
+    let commits: Vec<(String, i64, String)> = lines
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\0');
+            let oid = fields.next()?.to_owned();
+            let at = fields.next()?.parse().ok()?;
+            Some((oid, at, fields.next().unwrap_or_default().to_owned()))
+        })
+        .collect();
+    let oids: Vec<String> = commits.iter().map(|(oid, _, _)| oid.clone()).collect();
+    let records = meta::at_refs(repo, &oids);
+    let session = records
+        .iter()
+        .flatten()
+        .next()
+        .filter(|record| !record.is_file_line() && !record.session.is_empty())?
+        .session
+        .clone();
+    // A turn is named by the first commit that carries its ordinal, and dated by the last one that
+    // settled it: one turn can settle as several commits, when a background task's notification
+    // or a goal's continuation lands after its reply. A milestone, a fork and a file change are
+    // recorded as file commits, so they neither name nor date a turn. The subject is the person's
+    // own words and says nothing about which kind a commit is.
+    let mut openings = std::collections::BTreeMap::new();
+    let mut settled = std::collections::BTreeMap::new();
+    for ((_, at, subject), record) in commits.iter().zip(&records).rev() {
+        let Some(record) = record else { continue };
+        if record.session == session
+            && record.kind == meta::Kind::Turn
+            && let Some(turn) = record.turn
+        {
+            openings.entry(turn).or_insert((turn, subject.as_str()));
+            settled.insert(turn, *at);
+        }
+    }
+    let (_, last) = settled.iter().next_back()?;
+    let (_, (turn, opening)) = openings.iter().next()?;
+    // A turn with no words has exactly the subject `agit: turn #N`.
+    let first = (*opening != format!("agit: turn #{turn}") && !opening.trim().is_empty())
+        .then(|| crate::adapter::preview::shorten(opening, 60));
+    let at = chrono::DateTime::from_timestamp(*last, 0)?.with_timezone(&chrono::Local);
+    Some(Described {
+        first,
+        last: when(at, chrono::Local::now()),
+    })
+}
+
+/// `at` as a person reads it from `now`: today or yesterday with the time, else the date.
+fn when(at: chrono::DateTime<chrono::Local>, now: chrono::DateTime<chrono::Local>) -> String {
+    let days = (now.date_naive() - at.date_naive()).num_days();
+    match days {
+        0 => format!("today {}", at.format("%H:%M")),
+        1 => format!("yesterday {}", at.format("%H:%M")),
+        _ => at.format("%Y-%m-%d %H:%M").to_string(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn push_tags_for_test(
     repo: &Repo,
@@ -1390,6 +1524,160 @@ mod publication_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session branch is named by its own turns, in either storage layout: a fork's opening is
+    /// its own first turn, not the session it was forked from; its last turn is the commit that
+    /// settled it, not a later milestone or file commit; and a v0 session reads the same way. One
+    /// that read its parent's opening, the tip's time, or only the v1 path named the wrong
+    /// conversation, said a quiet session was active today, or fell back to "already up to date".
+    #[test]
+    fn a_session_branch_is_named_by_its_own_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repo::init(temp.path()).unwrap();
+        repo.git(&["config", "user.name", "t"]).unwrap();
+        repo.git(&["config", "user.email", "t@example.com"])
+            .unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let day = |d: i64| 1_793_000_000 + d * 86_400;
+        let commit = |session: &str,
+                      kind: meta::Kind,
+                      turn: Option<u32>,
+                      layout: meta::LayoutVersion,
+                      subject: &str,
+                      at: i64| {
+            let mut record = meta::Meta::new(session.into(), "claude-code".into(), "/w".into());
+            record.kind = kind;
+            record.turn = turn;
+            record.layout = layout;
+            meta::write(repo.root(), &record).unwrap();
+            let log = match layout {
+                meta::LayoutVersion::V0 => meta::LEGACY_LOG_FILE,
+                meta::LayoutVersion::V1 => meta::LOG_FILE,
+            };
+            std::fs::write(repo.root().join(log), format!("{subject}\n")).unwrap();
+            repo.git(&["add", "-A"]).unwrap();
+            let date = format!("@{at} +0000");
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.root())
+                .args(["commit", "-q", "--allow-empty", "-m", subject])
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .status()
+                .unwrap();
+        };
+        let parent = format!("agit-{}", "a".repeat(40));
+        let fork = format!("agit-{}", "b".repeat(40));
+        let (v0, v1) = (meta::LayoutVersion::V0, meta::LayoutVersion::V1);
+        repo.git(&["checkout", "-q", "-b", "parent"]).unwrap();
+        commit(
+            &parent,
+            meta::Kind::Turn,
+            Some(1),
+            v1,
+            "investigate the old problem",
+            day(1),
+        );
+        commit(
+            &parent,
+            meta::Kind::Turn,
+            Some(2),
+            v1,
+            "and a second look",
+            day(2),
+        );
+        repo.git(&["checkout", "-q", "-b", "fork"]).unwrap();
+        commit(&fork, meta::Kind::Turn, None, v1, "agit: fork fork", day(3));
+        commit(
+            &fork,
+            meta::Kind::Turn,
+            Some(1),
+            v1,
+            "implement the new plan",
+            day(4),
+        );
+        // The same turn settles again when a background task's notification wakes the agent.
+        commit(
+            &fork,
+            meta::Kind::Turn,
+            Some(1),
+            v1,
+            "a background task finished",
+            day(6),
+        );
+        // A milestone is recorded as a file commit, as `agit commit --milestone` writes it.
+        commit(
+            &fork,
+            meta::Kind::File,
+            Some(1),
+            v1,
+            "agit: milestone for turn #1",
+            day(9),
+        );
+        commit(
+            &fork,
+            meta::Kind::File,
+            Some(1),
+            v1,
+            "agit: shared notes",
+            day(10),
+        );
+        let named = describe_session(&repo, "fork").unwrap();
+        assert_eq!(named.first.as_deref(), Some("implement the new plan"));
+        let settled = chrono::DateTime::from_timestamp(day(6), 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(named.last, when(settled, chrono::Local::now()));
+
+        repo.git(&["checkout", "-q", "--orphan", "older"]).unwrap();
+        repo.git(&["rm", "-rqf", "."]).unwrap();
+        commit(
+            &parent,
+            meta::Kind::Turn,
+            Some(1),
+            v0,
+            "an older layout's opening",
+            day(5),
+        );
+        let named = describe_session(&repo, "older").unwrap();
+        assert_eq!(named.first.as_deref(), Some("an older layout's opening"));
+
+        // A person's words can start like agit's own: they still name and date the turn.
+        let worded = format!("agit-{}", "c".repeat(40));
+        repo.git(&["checkout", "-q", "--orphan", "worded"]).unwrap();
+        repo.git(&["rm", "-rqf", "."]).unwrap();
+        commit(
+            &worded,
+            meta::Kind::Turn,
+            Some(1),
+            v1,
+            "agit: tidy the release notes",
+            day(7),
+        );
+        let named = describe_session(&repo, "worded").unwrap();
+        assert_eq!(named.first.as_deref(), Some("agit: tidy the release notes"));
+        let settled = chrono::DateTime::from_timestamp(day(7), 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        assert_eq!(named.last, when(settled, chrono::Local::now()));
+    }
+
+    /// A last turn reads as today or yesterday with its time, and anything older by its date.
+    #[test]
+    fn a_last_turn_reads_as_today_yesterday_or_its_date() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 11, 7, 9, 30, 0)
+            .unwrap();
+        let at = |d, h, m| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 11, d, h, m, 0)
+                .unwrap()
+        };
+        assert_eq!(when(at(7, 8, 5), now), "today 08:05");
+        assert_eq!(when(at(6, 18, 40), now), "yesterday 18:40");
+        assert_eq!(when(at(4, 12, 0), now), "2026-11-04 12:00");
+    }
 
     /// Hold records that can't be read refuse the push; no records at all hold nothing.
     #[test]
