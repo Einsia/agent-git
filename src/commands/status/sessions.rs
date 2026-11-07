@@ -5,6 +5,11 @@ use crate::domain::{link, meta, repo::Repo, store::Store};
 use crate::infra::{config, local_git::Deadline};
 
 pub(super) const MAX_LINKS: usize = 4_096;
+
+/// The pending activity of a registered conversation nothing saves.
+pub(super) const NOT_SAVED: &str = "not saved";
+/// The pending activity of a registered conversation its folder's project saves at turn end.
+const NOT_SAVED_YET: &str = "not saved yet: saved when its turn ends";
 pub(super) const MAX_LINK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The claim inventory as a set: callers order a page as they choose, so a re-listing in another
@@ -111,6 +116,24 @@ fn inspect(
     }
     let (Some(owner), Some(agent), Some(branch)) = (&claim.owner, &claim.agent, &claim.branch)
     else {
+        if claim.owner.is_none() && claim.agent.is_none() && claim.branch.is_none() {
+            // A conversation its folder's hook registered with no destination: nothing claimed
+            // it. It is saved only if the folder's project captures it at the end of a turn.
+            let captured = claim.cwd.as_deref().is_some_and(|cwd| {
+                crate::commands::project::captured_by_project(
+                    &claim.source,
+                    &claim.session_id,
+                    std::path::Path::new(cwd),
+                )
+            });
+            if captured {
+                row[5] = NOT_SAVED_YET.into();
+                row[6] = "registered; this folder's project saves it".into();
+            } else {
+                row[5] = NOT_SAVED.into();
+                row[6] = "registered; nothing saves this folder's conversations".into();
+            }
+        }
         return row;
     };
     if [owner, agent]
