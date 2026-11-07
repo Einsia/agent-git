@@ -5,7 +5,8 @@
 //! reads only what push publishes: each session's LOG records as
 //! [`publication_records::published_sequence`] keeps them, the files as every branch tip holds
 //! them, the files staged for the next commit and the working-tree files that differ from the
-//! index, and commit and tag messages. Event objects are read only through the LOG that names
+//! index, and commit and tag messages. A scan of one push's branches reads those branches only,
+//! their messages the destination doesn't hold, and the checkout only when it holds one of them. Event objects are read only through the LOG that names
 //! them, so a record publication leaves out is never read, and a working-tree link is never
 //! followed, since Git stores and publishes the link itself. The high-confidence scan keeps its
 //! own, wider surface ([`scan_agent_repo`]).
@@ -39,26 +40,39 @@ impl PublishedLowConfidence {
     }
 }
 
-/// Look for low-confidence values in what a push of this repo publishes. Values the user allowed,
-/// in the privacy dictionary or the local allowlist, are skipped as the full scan skips them.
+/// Look for low-confidence values in what a push of this repo publishes, within the surface
+/// `plan` names: every branch, or the branches of one push ([`ScanPlan::of_branches`]), with their
+/// history the destination doesn't hold, and the working tree only where the plan scans it.
+/// Values the user allowed, in the privacy dictionary or the local allowlist, are skipped as the
+/// full scan skips them.
 pub fn published_low_confidence(
     repo: &Repo,
     allowed: &HashSet<String>,
+    plan: &ScanPlan,
 ) -> crate::Result<PublishedLowConfidence> {
-    published_low_confidence_within(repo, allowed, &ScanLimits::DEFAULT)
+    published_low_confidence_within(repo, allowed, plan, &ScanLimits::DEFAULT)
 }
 
 fn published_low_confidence_within(
     repo: &Repo,
     allowed: &HashSet<String>,
+    plan: &ScanPlan,
     limits: &ScanLimits,
 ) -> crate::Result<PublishedLowConfidence> {
     let home = crate::infra::config::agit_home().context(ScanPreparationFailure::LocalState)?;
     let mut allowlist = load_allowlist(&home);
     allowlist.extend(allowed.iter().cloned());
     let registered = registered_matcher_for_repo(repo)?;
+    let worktree = plan.scans_worktree(repo);
     let repo = repo.clone().local_objects_only();
-    let tips = branch_tips(&repo)?;
+    let tips: Vec<(String, String)> = branch_tips(&repo)?
+        .into_iter()
+        .filter(|(branch, _)| {
+            plan.branches
+                .as_ref()
+                .is_none_or(|branches| branches.contains(branch))
+        })
+        .collect();
     let mut pass = Pass::new(&repo, &allowlist, limits);
     for (branch, tip) in &tips {
         let session = meta::read_at_ref(&repo, tip)
@@ -72,7 +86,7 @@ fn published_low_confidence_within(
     let checkout = meta::read(repo.root())
         .filter(|metadata| !metadata.is_file_line())
         .map(|metadata| metadata.layout);
-    if inside_work_tree(&repo) {
+    if worktree && inside_work_tree(&repo) {
         pass.staged(checkout)?;
         pass.working_tree(checkout)?;
     }
@@ -82,9 +96,16 @@ fn published_low_confidence_within(
         ..
     } = pass;
     let branches: Vec<String> = tips.into_iter().map(|(branch, _)| branch).collect();
+    // One push's messages are those of its commits the destination doesn't hold; the whole
+    // repository's are every branch's.
+    let revisions = match &plan.branches {
+        Some(_) => plan.revs(),
+        None => vec!["--branches".to_owned()],
+    };
+    let revisions: Vec<&str> = revisions.iter().map(String::as_str).collect();
     scan_commit_messages(
         &repo,
-        HistorySelection::Revisions(&["--branches"]),
+        HistorySelection::Revisions(&revisions),
         limits,
         &allowlist,
         &registered,
@@ -594,7 +615,9 @@ mod tests {
         }
         repo.git(&["checkout", "-q", "main"]).unwrap();
         let scan = |limits: ScanLimits| {
-            let report = published_low_confidence_within(&repo, &HashSet::new(), &limits).unwrap();
+            let report =
+                published_low_confidence_within(&repo, &HashSet::new(), &ScanPlan::full(), &limits)
+                    .unwrap();
             let listed: Vec<String> = report
                 .listed
                 .iter()

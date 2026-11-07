@@ -659,6 +659,7 @@ pub fn publish_destination(
     let unknown = || PublishDestination {
         scan: secrets::Destination::Unknown,
         tags: Default::default(),
+        heads: Default::default(),
         identity: None,
     };
     let Some(url) = repo.remote_url() else {
@@ -683,10 +684,17 @@ pub fn publish_destination(
     let Some(refs) = crate::hub::git::ls_remote_refs(repo.root(), &url, include_tags) else {
         return unknown();
     };
+    let heads = refs
+        .refs
+        .iter()
+        .filter(|(name, _)| name.starts_with("refs/heads/"))
+        .map(|(name, oid)| (name.clone(), oid.clone()))
+        .collect();
     PublishDestination {
         scan: secrets::Destination::advertised(repo, refs.heads)
             .unwrap_or(secrets::Destination::Unknown),
         tags: refs.tags,
+        heads,
         identity: Some(identity),
     }
 }
@@ -695,6 +703,8 @@ pub struct PublishDestination {
     pub identity: Option<crate::hub::identity::RemoteIdentity>,
     pub scan: secrets::Destination,
     pub tags: std::collections::BTreeMap<String, String>,
+    /// The destination's branches by name; empty when it wasn't asked.
+    pub heads: std::collections::BTreeMap<String, String>,
 }
 
 /// Whether this push really lands on `remote_url`.

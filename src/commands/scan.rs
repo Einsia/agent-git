@@ -8,17 +8,20 @@
 //!   them buries the credentials. `--low-confidence` lists those in what push publishes, grouped
 //!   by shape ([`secrets::published_low_confidence`]).
 //!
-//!   The scan surface is [`secrets::scan_agent_repo_allowing`]: workspace + reachable blob /
-//!   commit / tag, repo-wide, run **once**. A surface that skips the workspace misses the most
-//!   common shape of all, a secret already pushed and still sitting in a workspace file. Values
-//!   the user allowed in the privacy dictionary are skipped, so an allow stops a finding the way
-//!   the scan's own hint says it does.
+//!   The scan surface is [`secrets::scan_agent_repo_allowing`], run **once**. With no ref,
+//!   `<repo>` alone, or `--all`, it is what any push of the repository may send: the workspace
+//!   plus every branch's reachable blobs, commits and tags the Hub doesn't hold. A surface that
+//!   skips the workspace misses the most common shape of all, a secret already pushed and still
+//!   sitting in a workspace file. With branches named, it is what `agit push` of those branches
+//!   would send, from the rule the push sends by
+//!   ([`crate::domain::repo::publication::sent_branches`]): a session branch's push carries
+//!   `main` when it fast-forwards the Hub's, so a scan of it covers `main` too. The workspace is
+//!   scanned there only when one of those branches is checked out in it. The first line of the
+//!   report says which of the two was scanned. Values the user allowed in the privacy dictionary
+//!   are skipped, so an allow stops a finding the way the scan's own hint says it does.
 //!
-//!   Refs on the command line do **not** narrow the scan surface; they are only parsed and
-//!   validated (a mistyped ref errors on the spot rather than quietly scanning something else).
-//!   The publish surface is not a function of any one ref: `agit push -b other` has the publish
-//!   plan bring `main` along as well, so a per-ref scan only misses. See
-//!   [`secrets::scan_agent_repo`].
+//!   Every ref is resolved first, so a mistyped ref errors on the spot rather than quietly
+//!   scanning something else.
 //!
 //! * `--sensitive`: **brings up a local review agent** to vet the transcript (content off the
 //!   session's topic, out-of-scope sensitive information, directory structure leaked through
@@ -60,6 +63,9 @@ pub struct Args {
     /// Also list entropy-only values in what push publishes, grouped by shape.
     #[arg(long)]
     pub low_confidence: bool,
+    /// Scan the whole repository even when a branch is named.
+    #[arg(long)]
+    pub all: bool,
     /// Machine-readable report.
     #[arg(long)]
     pub json: bool,
@@ -68,6 +74,10 @@ pub struct Args {
 pub fn run(args: Args) -> CmdResult {
     if args.sensitive && args.secrets {
         ui::error("`--secrets` and `--sensitive` are two different checks; run them separately.");
+        return Ok(ExitCode::Usage);
+    }
+    if args.sensitive && args.all {
+        ui::error("`--all` widens a secret scan; it does not apply to `--sensitive`.");
         return Ok(ExitCode::Usage);
     }
     if args.sensitive && args.low_confidence {
@@ -195,31 +205,47 @@ pub fn run(args: Args) -> CmdResult {
         return run_sensitive(&repo, &slug, &targets, args.json);
     }
 
-    // --secrets: scan repo-wide, **once**.
-    // Every ref is resolved first: a mistyped ref says so before a whole-repo scan is spent on
-    // it.
-    //
-    // The resolved shas take **no part** in the scan — the scan surface is the whole repo's
-    // publish surface, not the union of these refs (reasons in [`collect`]). What is wanted here
-    // is only the "a typo errors on the spot" half: swallowing a ref that does not exist and
-    // then reporting clean is far worse than erroring.
+    // --secrets, scanned **once**. Every ref is resolved first: a mistyped ref says so before a
+    // scan is spent on it, since swallowing a ref that does not exist and then reporting clean is
+    // far worse than erroring.
     for spec in &targets {
         if let Err(e) = refs::resolve(&repo, spec) {
             ui::error(&format!("{e:#}"));
             return Ok(ExitCode::Ref);
         }
     }
+    // Branches named on the command line ask what their push sends; no ref (the zero-argument
+    // form included), `<repo>` alone, a ref that names no branch, or `--all` asks about the whole
+    // repository.
+    let named: Option<Vec<String>> = if args.all || args.refs.is_empty() {
+        None
+    } else {
+        targets
+            .iter()
+            .map(|spec| match (&spec.base, &spec.tail) {
+                (refs::Base::Name(name) | refs::Base::SessionBranch(name), refs::Tail::None)
+                    if repo.has_ref(&format!("refs/heads/{name}")) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
     let allowed = privacy_records(&repo, "allowed_values", None)
         .and_then(|values| Ok(serde_json::from_value::<HashSet<String>>(values)?));
     let privacy_store = allowed.is_ok();
     let allowed = allowed.unwrap_or_default();
-    let found = collect(&repo, &n, &allowed)?;
+    let found = collect(&repo, &n, &allowed, named.as_deref())?;
     let low = args
         .low_confidence
-        .then(|| secrets::published_low_confidence(&repo, &allowed))
+        .then(|| secrets::published_low_confidence(&repo, &allowed, &found.plan))
         .transpose()?;
     super::report_binary_carriers(found.binary_carriers);
-    echo::emit("scan", &[Selection::new(slug, source).role("repo")]);
+    echo::emit("scan", &[Selection::new(slug.clone(), source).role("repo")]);
+    if !args.json {
+        println!("{}", scope_line(&slug, named.as_deref(), &found.scope));
+    }
     let records = if privacy_store && !found.hits.is_empty() {
         record_ids(&repo, &found.hits)
     } else {
@@ -246,6 +272,13 @@ pub fn run(args: Args) -> CmdResult {
         let mut report = serde_json::json!({
             "check": "secrets",
             "advisory": true,
+            "scope": match &found.scope.branches {
+                Some(_) => "branches",
+                None => "repository",
+            },
+            "branches": found.scope.branches,
+            "hub_asked": found.scope.hub_asked,
+            "working_tree": found.scope.worktree,
             "count": found.count,
             "count_exact": found.counted_all,
             "findings": findings,
@@ -318,9 +351,8 @@ pub fn run(args: Args) -> CmdResult {
         Ok(ExitCode::Policy)
     } else {
         if !args.json {
-            // Never "N refs": what is scanned is the whole repo's publish surface, not the
-            // union of the refs on the command line. Reporting it as a per-ref count makes the
-            // user believe "scan again with another ref" shows something else.
+            // Never "N refs": what was scanned is the surface the scope line names, not a count
+            // of the refs on the command line.
             ui::success_result(if found.binary_carriers == 0 {
                 "no high-confidence secret findings"
             } else {
@@ -665,7 +697,75 @@ pub(super) fn sensitive_report(
 }
 
 /// Every hit from one `--secrets` scan, each carrying **the location it really belongs to**.
+/// What a secret scan answered for.
+struct Scope {
+    /// The branches of the one push it checked; `None` for the whole repository.
+    branches: Option<Vec<String>>,
+    /// Whether the Hub said what it holds, so history it holds was left out.
+    hub_asked: bool,
+    /// Whether the checkout's working tree was scanned.
+    worktree: bool,
+}
+
+/// The first line of a secret scan's report: which question it answered, so a clean scan of one
+/// push never reads as a clean repository.
+fn scope_line(slug: &str, named: Option<&[String]>, scope: &Scope) -> String {
+    let history = if scope.hub_asked {
+        "their commits the Hub doesn't hold yet"
+    } else {
+        "their whole history, since the Hub couldn't be asked"
+    };
+    match (&scope.branches, named) {
+        (Some(sent), Some(named)) => {
+            let push = match named {
+                [branch] => format!("`agit push {slug}@{branch}`"),
+                _ => format!("pushing {} of {slug}", listed(named)),
+            };
+            let tree = if scope.worktree {
+                ", and the working tree"
+            } else {
+                ""
+            };
+            // The branches named come first, in the order written, and then what the push adds.
+            let mut sending: Vec<String> = named
+                .iter()
+                .filter(|branch| sent.contains(branch))
+                .cloned()
+                .collect();
+            sending.extend(
+                sent.iter()
+                    .filter(|branch| !named.contains(branch))
+                    .cloned(),
+            );
+            format!(
+                "Scanned what {push} would send: {}, {history}{tree}.",
+                listed(&sending)
+            )
+        }
+        _ => {
+            let history = if scope.hub_asked {
+                "every branch's commits the Hub doesn't hold yet"
+            } else {
+                "every branch's whole history, since the Hub couldn't be asked"
+            };
+            format!("Scanned all of {slug}: {history}, and the working tree.")
+        }
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 struct Found {
+    scope: Scope,
+    /// The surface scanned, which `--low-confidence` lists within too.
+    plan: secrets::ScanPlan,
     binary_carriers: u64,
     /// `(display location, hit)` of the first high-confidence hits. The location is the hit's
     /// own carrier label, never prefixed with a ref name.
@@ -703,12 +803,34 @@ struct Found {
 /// still **parses and validates** every ref (a mistyped ref must error on the spot), but those
 /// shas never reach here — off the signature, they give no one the chance to narrow the scan
 /// surface with them.
-fn collect(repo: &Repo, agent: &str, allowed: &HashSet<String>) -> crate::Result<Found> {
+/// The secret scan of `repo`: what the push of the `named` branches sends, or, with none, what
+/// any push of the repository may send.
+fn collect(
+    repo: &Repo,
+    agent: &str,
+    allowed: &HashSet<String>,
+    named: Option<&[String]>,
+) -> crate::Result<Found> {
     // `agent` is the third element of the destination identity: the name this repo resolves to,
     // which is the one `agit push` publishes to from here. Without it, when `origin` points at
     // another agent under the same account, that agent's history is subtracted wholesale from
     // the scan surface.
-    let plan = secrets::ScanPlan::to(super::publish_destination(repo, agent, false).scan);
+    let destination = super::publish_destination(repo, agent, false);
+    let hub_asked = destination.scan.narrows();
+    // The branches come from the rule the push itself sends by, main included as it decides, so
+    // the scan can't check less than the push sends.
+    let plan = match named {
+        None => secrets::ScanPlan::to(destination.scan),
+        Some(named) => secrets::ScanPlan::of_branches(
+            destination.scan,
+            crate::domain::repo::publication::sent_branches(repo, named, &destination.heads)?,
+        ),
+    };
+    let scope = Scope {
+        worktree: plan.scans_worktree(repo),
+        branches: plan.branches.clone(),
+        hub_asked,
+    };
     let wide = secrets::scan_agent_repo_allowing(repo, &plan, allowed)?;
     let labelled = |hits: Vec<secrets::Hit>| {
         hits.into_iter()
@@ -716,6 +838,8 @@ fn collect(repo: &Repo, agent: &str, allowed: &HashSet<String>) -> crate::Result
             .collect()
     };
     Ok(Found {
+        scope,
+        plan,
         binary_carriers: wide.binary_carriers,
         hits: labelled(wide.hits),
         truncated: wide.truncated,
@@ -764,6 +888,150 @@ mod tests {
         d
     }
 
+    /// A scan of named branches answers for their push. `main` named alone sends main only, so
+    /// a secret on another session branch isn't its finding. A session branch's push carries
+    /// `main` too, so its scan covers main's history as well as its own. No branch, or `--all`,
+    /// is the whole repository. Each says which it scanned.
+    #[test]
+    fn a_named_branch_is_scanned_as_its_push_sends_it() {
+        const TALK: &str = "AKIAQ3W7ZRT2M5X6VJ4H";
+        let d = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        run(&["branch", "talk"]);
+        run(&["branch", "other"]);
+        run(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("leak {AWS}"),
+        ]);
+        let on_main = run(&["rev-parse", "HEAD"]);
+        run(&["checkout", "-q", "talk"]);
+        run(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("leak {TALK}"),
+        ]);
+        let on_talk = run(&["rev-parse", "HEAD"]);
+        run(&["checkout", "-q", "main"]);
+        let repo = Repo::at(d.path());
+        let scan = |named: Option<&[&str]>| {
+            let named: Option<Vec<String>> =
+                named.map(|named| named.iter().map(|branch| branch.to_string()).collect());
+            let found = collect(&repo, "photo", &HashSet::new(), named.as_deref())
+                .expect("the repo is well-formed");
+            let line = scope_line("me/photo", named.as_deref(), &found.scope);
+            let mut commits: Vec<&str> = [&on_main, &on_talk]
+                .into_iter()
+                .filter(|commit| found.hits.iter().any(|(at, _)| at.contains(&commit[..8])))
+                .map(String::as_str)
+                .collect();
+            commits.sort_unstable();
+            (
+                commits.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                line,
+            )
+        };
+        let sorted = |commits: &[&String]| {
+            let mut commits: Vec<String> = commits.iter().map(|c| c.to_string()).collect();
+            commits.sort_unstable();
+            commits
+        };
+
+        let (found, line) = scan(Some(&["main"]));
+        assert_eq!(found, [on_main.clone()]);
+        assert_eq!(
+            line,
+            "Scanned what `agit push me/photo@main` would send: main, their whole history, since the Hub couldn't be asked, and the working tree."
+        );
+        let (found, line) = scan(Some(&["other"]));
+        assert_eq!(found, [on_main.clone()], "{line}");
+        assert!(line.contains(": other and main, "), "{line}");
+        let (found, _) = scan(Some(&["talk"]));
+        assert_eq!(found, sorted(&[&on_main, &on_talk]));
+        let (found, line) = scan(Some(&["talk", "other"]));
+        assert_eq!(found, sorted(&[&on_main, &on_talk]));
+        assert!(
+            line.starts_with("Scanned what pushing talk and other of me/photo would send: "),
+            "{line}"
+        );
+        let (found, line) = scan(None);
+        assert_eq!(found, sorted(&[&on_main, &on_talk]));
+        assert_eq!(
+            line,
+            "Scanned all of me/photo: every branch's whole history, since the Hub couldn't be asked, and the working tree."
+        );
+        // A push of a session branch from a checkout of another one sends no working tree.
+        run(&["checkout", "-q", "other"]);
+        let (_, line) = scan(Some(&["talk"]));
+        assert!(!line.contains("working tree"), "{line}");
+    }
+
+    /// `--low-confidence` lists within the same surface as the scan: a value only in another
+    /// branch's commit message, or in the working tree of a checkout of another branch, is no
+    /// value the push of `main` sends, while the whole repository's list still names both.
+    #[test]
+    fn low_confidence_values_are_listed_within_the_named_push() {
+        const IN_MESSAGE: &str = "6f1c2d3e-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+        const IN_TREE: &str = "0a9b8c7d-6e5f-4a3b-9c2d-1e0f9a8b7c6d";
+        let d = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        run(&["checkout", "-q", "-b", "other"]);
+        run(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            &format!("run {IN_MESSAGE}"),
+        ]);
+        std::fs::write(d.path().join("notes.txt"), format!("id {IN_TREE}\n")).unwrap();
+        let repo = Repo::at(d.path());
+        let listed = |named: Option<&[String]>| {
+            let found = collect(&repo, "photo", &HashSet::new(), named).unwrap();
+            let low =
+                secrets::published_low_confidence(&repo, &HashSet::new(), &found.plan).unwrap();
+            let shown: Vec<String> = low
+                .listed
+                .iter()
+                .map(|hit| format!("{} {}", hit.file.clone().unwrap_or_default(), hit.redacted))
+                .collect();
+            (low.count(), shown)
+        };
+        let (whole, shown) = listed(None);
+        assert!(whole >= 2, "{shown:?}");
+        let (main, shown) = listed(Some(&["main".to_owned()]));
+        assert_eq!(main, 0, "{shown:?}");
+    }
+
     /// This pins that one hit is reported once, and that the size of the report is not a
     /// function of how many refs the user wrote.
     ///
@@ -775,7 +1043,8 @@ mod tests {
         let d = two_branch_repo();
         let repo = Repo::at(d.path());
 
-        let found = collect(&repo, "photo", &HashSet::new()).expect("the repo is well-formed");
+        let found =
+            collect(&repo, "photo", &HashSet::new(), None).expect("the repo is well-formed");
         let leaks: Vec<&(String, secrets::Hit)> = found
             .hits
             .iter()
@@ -798,7 +1067,8 @@ mod tests {
         let d = two_branch_repo();
         let repo = Repo::at(d.path());
 
-        let found = collect(&repo, "photo", &HashSet::new()).expect("the repo is well-formed");
+        let found =
+            collect(&repo, "photo", &HashSet::new(), None).expect("the repo is well-formed");
         let (at, _) = found
             .hits
             .iter()
@@ -873,7 +1143,8 @@ mod tests {
         // two different far sides, and this test then no longer pins "the same scan surface".
         const AGENT: &str = "photo";
         // The scan path.
-        let scanned = collect(&repo, AGENT, &HashSet::new()).expect("the repo is well-formed");
+        let scanned =
+            collect(&repo, AGENT, &HashSet::new(), None).expect("the repo is well-formed");
         // The push path: the same destination, the same plan.
         let plan =
             secrets::ScanPlan::to(crate::commands::publish_destination(&repo, AGENT, true).scan);
