@@ -157,6 +157,11 @@ impl Refusal {
         }
     }
 
+    /// A refusal with no next step to name: the line says all there is.
+    pub(crate) fn plain(message: impl Into<String>, code: ExitCode) -> Self {
+        Self::new(message, "", code)
+    }
+
     pub(crate) fn report(&self) -> ExitCode {
         // A cancel or a "no" at a question is an outcome, not a failure: it reads as a plain line.
         if self.code == ExitCode::Ok {
@@ -164,13 +169,18 @@ impl Refusal {
         } else {
             ui::error(&self.message);
         }
-        ui::hint(&self.next);
+        if !self.next.is_empty() {
+            ui::hint(&self.next);
+        }
         self.code
     }
 }
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.next.is_empty() {
+            return f.write_str(&self.message);
+        }
         write!(f, "{}; {}", self.message, self.next)
     }
 }
@@ -1119,6 +1129,43 @@ fn sessions_where(
     Ok(sessions)
 }
 
+/// The conversation whose ID starts with `query` that `agit save` doesn't offer because the
+/// folder it ran in no longer exists: its runtime, ID and that folder.
+fn in_a_gone_folder(query: &str) -> Option<(&'static str, String, String)> {
+    if query.len() < 4 {
+        return None;
+    }
+    for &runtime in SAVED {
+        let Ok(adapter) = adapter::get(runtime) else {
+            continue;
+        };
+        if !adapter.available() {
+            continue;
+        }
+        for session in adapter.all_session_choices().unwrap_or_default() {
+            if !session.id.starts_with(query) {
+                continue;
+            }
+            let Some(folder) = session
+                .cwd
+                .clone()
+                .or_else(|| crate::tui::screens::selector::recorded_cwd(&session.path))
+            else {
+                continue;
+            };
+            // Only a folder that isn't there is gone: one that can't be read, say for a parent
+            // without search permission, may only need its access back.
+            if Path::new(&folder)
+                .canonicalize()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Some((runtime, session.id, folder));
+            }
+        }
+    }
+    None
+}
+
 /// One conversation `agit save` can find, wherever it ran.
 pub(crate) fn sessions_where_id(runtime: &str, id: &str) -> Result<Option<FolderSession>> {
     Ok(sessions_where(SAVED, |_, _| true)?
@@ -1143,11 +1190,23 @@ pub(crate) fn pick(here: Vec<FolderSession>, query: &str, root: &Path) -> Result
     let mut matches = if by_id.is_empty() { by_title } else { by_id };
     match matches.len() {
         1 => Ok(matches.remove(0)),
-        0 => Err(Refusal::new(
-            format!("no session in {} matches \"{query}\"", ui::tilde(root)),
-            "`agit` lists this folder's recent sessions",
-            ExitCode::Ref,
-        )
+        0 => Err(match in_a_gone_folder(query) {
+            // Named by its ID, a conversation whose folder is gone isn't "not found".
+            Some((runtime, id, folder)) => Refusal::plain(
+                format!(
+                    "{} conversation {} ran in {}, which no longer exists, so agit doesn't save it from here",
+                    crate::adapter::runtime_label(runtime),
+                    short(&id),
+                    ui::tilde(Path::new(&folder))
+                ),
+                ExitCode::Ref,
+            ),
+            None => Refusal::new(
+                format!("no session in {} matches \"{query}\"", ui::tilde(root)),
+                "`agit` lists this folder's recent sessions",
+                ExitCode::Ref,
+            ),
+        }
         .into()),
         _ => {
             let listed: Vec<String> = matches
