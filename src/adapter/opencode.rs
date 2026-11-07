@@ -115,6 +115,41 @@ fn cache_path_in(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.jsonl"))
 }
 
+/// Why a session has no transcript: its record can't be read, or its transcript couldn't be
+/// written to agit's cache. The import command reads which; a build without it only resolves.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) enum Unresolved {
+    /// The database or the session's record isn't in a form this agit reads.
+    Unreadable,
+    /// The transcript was read, but this file of agit's own couldn't be written.
+    Cache(PathBuf, std::io::Error),
+}
+
+/// The session materialized into its cache file ([`resolve`](Adapter::resolve)).
+pub(crate) fn cached_transcript(session_id: &str) -> std::result::Result<PathBuf, Unresolved> {
+    let con = db_path()
+        .and_then(|db| open(&db))
+        .filter(schema_ok)
+        .ok_or(Unresolved::Unreadable)?;
+    let m = materialize(&con, session_id).ok_or(Unresolved::Unreadable)?;
+    let dir = cache_dir().map_err(|error| {
+        Unresolved::Cache(
+            PathBuf::from("cache/opencode"),
+            std::io::Error::other(error),
+        )
+    })?;
+    std::fs::create_dir_all(&dir).map_err(|error| Unresolved::Cache(dir.clone(), error))?;
+    let path = cache_path_in(&dir, session_id);
+    let written = std::fs::write(&path, &m.text).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(ms_to_systime(m.updated_ms))
+    });
+    written.map_err(|error| Unresolved::Cache(path.clone(), error))?;
+    Ok(path)
+}
+
 /// Receipts retain the exact payload sent to the target runtime's import command.
 fn receipt_dir() -> Result<PathBuf> {
     Ok(crate::infra::config::agit_home()?
@@ -2076,23 +2111,7 @@ impl Adapter for OpenCode {
     /// keeps holding. A missing database, a missing session, and a cache that cannot be written
     /// all honestly report None (not found) instead of handing back stale bytes.
     fn resolve(&self, session_id: &str, _cwd: Option<&Path>) -> Option<PathBuf> {
-        let db = db_path()?;
-        let con = open(&db)?;
-        if !schema_ok(&con) {
-            return None;
-        }
-        let m = materialize(&con, session_id)?;
-        let dir = cache_dir().ok()?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = cache_path_in(&dir, session_id);
-        std::fs::write(&path, &m.text).ok()?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .ok()?
-            .set_modified(ms_to_systime(m.updated_ms))
-            .ok()?;
-        Some(path)
+        cached_transcript(session_id).ok()
     }
 
     fn lookup_native_readonly(

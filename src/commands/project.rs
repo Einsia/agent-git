@@ -1088,7 +1088,15 @@ fn run_child(
         .env_remove("AGIT_SESSION")
         .env_remove("AGIT_YES")
         .stdin(Stdio::null());
-    let output = command.output()?;
+    // Starting it in a folder that no longer exists fails with the system's bare "No such file
+    // or directory", which names neither the folder nor the step.
+    let output = command.output().with_context(|| {
+        format!(
+            "couldn't run `agit {}` in {}",
+            arguments.first().map_or("command", String::as_str),
+            cwd.display()
+        )
+    })?;
     let value: serde_json::Value = serde_json::from_slice(&output.stdout)
         .context("child command did not return a CLI result")?;
     if !(output.status.success() && value["ok"] == true) {
@@ -4902,6 +4910,25 @@ fn list() -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step that can't start in a conversation's folder says which folder and which step. The
+    /// system's own error for a folder that no longer exists is a bare "No such file or directory",
+    /// and `agit save` shows a failed step's error as the conversation's.
+    #[test]
+    fn a_step_that_cannot_start_names_its_folder() {
+        let gone = tempfile::tempdir().unwrap().path().join("deleted");
+        let error = run_child(
+            std::process::Command::new(std::env::current_exe().unwrap()),
+            &["import".into()],
+            &gone,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .starts_with(&format!("couldn't run `agit import` in {}", gone.display())),
+            "{error:#}"
+        );
+    }
     use crate::domain::meta::{self, Meta};
 
     fn isolated(name: &str) -> bool {
