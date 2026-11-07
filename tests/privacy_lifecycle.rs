@@ -14,7 +14,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Cloud {
@@ -220,7 +220,9 @@ impl Device {
             .env("HOME", self._root.path())
             .env("USERPROFILE", self._root.path())
             .env("CI", "1")
-            .env("NO_COLOR", "1");
+            .env("NO_COLOR", "1")
+            // A long wait for a state lock says which lock, where and in which process.
+            .env("AGIT_DIAGNOSE_LOCK_WAITS", "1");
         for name in [
             "PATH",
             "SystemRoot",
@@ -243,6 +245,7 @@ impl Device {
             .args(["__privacy-sync-v1", &self.hub])
             .output()
             .unwrap();
+        forward_lock_waits(&output.stderr);
         assert!(
             output.status.success(),
             "privacy synchronization failed: {output:?}"
@@ -251,6 +254,7 @@ impl Device {
 
     fn doctor(&self) -> String {
         let output = self.command().arg("doctor").output().unwrap();
+        forward_lock_waits(&output.stderr);
         String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr)
     }
@@ -261,14 +265,25 @@ impl Device {
                 .arg("__privacy-worker-v1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap(),
         )
     }
 }
 
+/// A child's lines about long state-lock waits, repeated in the test's own output.
+fn forward_lock_waits(stderr: &[u8]) {
+    for line in String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| line.starts_with("agit lock wait:"))
+    {
+        eprintln!("{line}");
+    }
+}
+
 struct Worker(Child);
+
 impl Worker {
     /// `text` protected. A command's worker has closed the journal by the time the command
     /// returns, so the first answer is the one to check.
@@ -501,6 +516,9 @@ fn a_rule_registered_on_this_device_protects_under_any_sign_in() {
 /// would contradict the withheld content.
 #[test]
 fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
+    // Each step says when it finishes, so a run that waits names the step it waits in.
+    let started = Instant::now();
+    let step = |name: &str| eprintln!("[{:>8.3}s] {name}", started.elapsed().as_secs_f64());
     let hub = Hub::new();
     let device = Device::signed_out(&hub.url);
     device.sign_in(Some("fixture-account"));
@@ -521,12 +539,16 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
         .write_all(value.as_bytes())
         .unwrap();
     let added = add.wait_with_output().unwrap();
+    forward_lock_waits(&added.stderr);
+    step("secrets add");
     assert!(added.status.success(), "{added:?}");
     // Synchronization encrypts the rule under the account's key and caches the key.
     device.sync();
+    step("sync");
     device.sign_in(Some("another-account"));
     let text = format!("the value is {value}");
     let readable = device.worker().protect(&text);
+    step("readable protect");
     assert_eq!(readable["status"], "complete");
     assert!(!readable["content"].as_str().unwrap().contains(value));
 
@@ -537,10 +559,13 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
             std::fs::remove_dir_all(keys).unwrap();
         }
     }
+    step("keys removed");
     let unreadable = device.worker().protect(&text);
+    step("unreadable protect");
     assert_ne!(unreadable["status"], "complete", "{unreadable}");
     assert_eq!(unreadable["reason"], "device_rules", "{unreadable}");
     let doctor = device.doctor();
+    step("doctor");
     assert!(doctor.contains("fixture-account"), "{doctor}");
     assert!(doctor.contains("agit login"), "{doctor}");
 
@@ -553,9 +578,11 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
     )
     .unwrap();
     let unlisted = device.worker().protect(&text);
+    step("unlisted protect");
     assert_ne!(unlisted["status"], "complete", "{unlisted}");
     assert_eq!(unlisted["reason"], "device_rules", "{unlisted}");
     let doctor = device.doctor();
+    step("doctor, unlisted");
     assert!(doctor.contains("cannot be read"), "{doctor}");
     assert!(
         !doctor.contains("every rule registered on this computer can be read"),
