@@ -821,10 +821,11 @@ fn remote_movement(
             )
         }
         // The Hub's newer turn sits on a published copy, which is a different commit from this
-        // checkout's own, so neither copy can be fast-forwarded onto the other: the way on is a
-        // separate checkout of the Hub's copy, with this one kept for its originals.
+        // checkout's own, so neither copy can be fast-forwarded onto the other. A pull brings the
+        // turn over as the Hub holds it; where it can't, the way on is a separate checkout of the
+        // Hub's copy, with this one kept for its originals.
         Position::BehindProjected { encrypted: false } => format!(
-            "remote branch {branch}: the Hub has a newer turn from another computer on top of what this checkout uploaded (Hub tip {tip}), and {NOTHING_NEW}\n  → continue from the Hub's copy: keep this checkout, which holds your own turns as they ran, and clone {repository} into a separate checkout"
+            "remote branch {branch}: the Hub has a newer turn from another computer on top of what this checkout uploaded (Hub tip {tip}), and {NOTHING_NEW}\n  → bring it over: `agit pull {target}`, then `agit push {target}`; if it can't be brought over, keep this checkout, which holds your own turns as they ran, and clone {repository} into a separate checkout"
         ),
         Position::BehindProjected { encrypted: true } => format!(
             "remote branch {branch} moved on from this checkout's encrypted publication (Hub tip {tip}), and {NOTHING_NEW}; `agit pull` cannot move a branch whose published copy is encrypted\n  → continue from the Hub's copy: keep this checkout, which holds the originals, and clone {repository} into a separate checkout"
@@ -2386,6 +2387,39 @@ struct Carried<'a> {
     /// Files the session changed while it was published encrypted, put back as its file line had
     /// them.
     held_back: Vec<(String, Option<super::frozen::Restored>)>,
+}
+
+/// The commit whose LOG and VIEW plain publication sends for `oid`, a turn on `parent`, when
+/// `public_parent` is the published form of `parent`: what the next push publishes for it, under
+/// this computer's rules today. `None` when `public_parent` doesn't show by its own tree that it
+/// is plain, since the push then passes every line through protection again.
+pub(super) fn plain_published(
+    source: &Repo,
+    oid: &str,
+    parent: &str,
+    public_parent: &str,
+) -> Result<Option<String>> {
+    if !shown_plain(source, source, public_parent) {
+        return Ok(None);
+    }
+    let parents = [parent.to_owned()];
+    let published = published_lines(
+        source,
+        source,
+        &std::collections::HashMap::new(),
+        oid,
+        &parents,
+        &[public_parent.to_owned()],
+    )?;
+    let conversation = conversation_commit(
+        source,
+        oid,
+        &parents,
+        &published,
+        Carried::default(),
+        &mut Rechecked::default(),
+    )?;
+    Ok(Some(conversation.commit.unwrap_or_else(|| oid.to_owned())))
 }
 
 /// Only publication metadata and mapped parents change; native evidence and file modes stay exact.

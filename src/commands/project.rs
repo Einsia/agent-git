@@ -4178,10 +4178,22 @@ fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Vi
         session_id: session.into(),
         cwd: origin.to_path_buf(),
     };
-    if withholds(&project, &candidate, false) || claimed_elsewhere(&project, runtime, session) {
+    if withholds(&project, &candidate, false)
+        || claimed_elsewhere(&project, runtime, session)
+        || superseded(runtime, session)
+    {
         return None;
     }
     Some((project, via))
+}
+
+/// Whether another session took this conversation's claim over, so nothing records its turns.
+fn superseded(runtime: &str, session: &str) -> bool {
+    Store::open()
+        .ok()
+        .flatten()
+        .and_then(|store| link::get(&store, runtime, session))
+        .is_some_and(|link| link.superseded_by.is_some() && link.merge_archive.is_none())
 }
 
 /// Whether this conversation records into a repository other than `project`'s.
@@ -5489,7 +5501,7 @@ mod tests {
 
     /// A conversation is announced as uploading only where the project would upload it: started
     /// inside an automatic project by a runtime whose hooks capture it, not excluded, not recording
-    /// into another repository. A judgement without the runtime check tells an OpenCode agent the
+    /// into another repository, its claim not taken over by another session. A judgement without the runtime check tells an OpenCode agent the
     /// project saves its conversation, and hides the import that would. The
     /// visibility comes from the Hub or its last recorded answer, never a default; this policy's
     /// Hub is not the configured one, so no request is sent.
@@ -5523,6 +5535,16 @@ mod tests {
         claim.branch = Some("work".into());
         link::write(&store, &claim).unwrap();
         assert!(announced("elsewhere", &inside).is_none());
+        // Its claim taken over by another session, as resume does when it continues the branch in
+        // a new one, a conversation records nothing, so it is not announced either.
+        let mut claim = link::Link::new("codex", "superseded", Some(&inside));
+        claim.owner = Some("alice".into());
+        claim.agent = Some("app".into());
+        claim.branch = Some("work".into());
+        claim.superseded_by = Some("codex/successor".into());
+        link::write(&store, &claim).unwrap();
+        assert!(announced("superseded", &inside).is_none());
+        assert!(automatic_capture("codex", "superseded", &inside).is_none());
         // Held back as the folder's earlier history, a conversation is not announced, and a resume
         // of it is told why; not when the person dropped it, it records into another repository,
         // or its runtime is not one the project captures.
