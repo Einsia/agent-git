@@ -404,38 +404,40 @@ impl Lab {
     }
 
     /// An OpenCode conversation of one finished turn that ran in `cwd`, in OpenCode's own
-    /// database, with no `opencode` command on PATH: an app, an editor or a PATH set only in new
-    /// shells runs it, and its database is all agit sees.
+    /// database, titled with its request, with no `opencode` command on PATH: an app, an editor
+    /// or a PATH set only in new shells runs it, and its database is all agit sees. Each call adds
+    /// one more conversation to the same database.
     fn opencode_conversation(&self, cwd: &std::path::Path, id: &str, prompt: &str) {
         let data = self.home.join(".local/share/opencode");
         std::fs::create_dir_all(&data).unwrap();
         let database = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
         database.execute_batch(
-            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
-             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
-             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
-             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
         ).unwrap();
         let cwd = cwd.to_str().unwrap();
         database
-            .execute("INSERT INTO project VALUES ('global', ?1)", [cwd])
+            .execute("INSERT OR IGNORE INTO project VALUES ('global', ?1)", [cwd])
             .unwrap();
         database
             .execute(
-                "INSERT INTO session VALUES (?1, 'global', NULL, ?2, 100, 150, '1.18.13')",
-                [id, cwd],
+                "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated, version) VALUES (?1, 'global', NULL, ?2, ?3, 100, 150, '1.18.13')",
+                [id, cwd, prompt],
             )
             .unwrap();
+        let (user, assistant) = (format!("{id}-u1"), format!("{id}-a1"));
         for (message, created, body) in [
             (
-                "u1",
+                &user,
                 110,
                 serde_json::json!({"role":"user", "time":{"created":110}}),
             ),
             (
-                "a1",
+                &assistant,
                 120,
-                serde_json::json!({"role":"assistant", "parentID":"u1", "finish":"stop", "time":{"created":120}}),
+                serde_json::json!({"role":"assistant", "parentID":user, "finish":"stop", "time":{"created":120}}),
             ),
         ] {
             database
@@ -447,14 +449,14 @@ impl Lab {
         }
         for (part, message, created, body) in [
             (
-                "u1text",
-                "u1",
+                format!("{user}text"),
+                &user,
                 111,
                 serde_json::json!({"type":"text", "text":prompt}),
             ),
             (
-                "a1text",
-                "a1",
+                format!("{assistant}text"),
+                &assistant,
                 121,
                 serde_json::json!({"type":"text", "text":"Done."}),
             ),
@@ -1202,4 +1204,89 @@ fn a_save_finds_an_opencode_conversation_and_keeps_earlier_history_out() {
             "{args:?}: {value}"
         );
     }
+}
+
+/// A folder bound before agit recorded OpenCode's earlier conversations counts every OpenCode
+/// conversation there as earlier until an explicit `agit save` or `agit on` looks at OpenCode's
+/// store once. The background capture leaves such a policy as it is. The save that looks keeps
+/// the two conversations from before out, the one in a git worktree it covers outside the folder
+/// included, and says how many; one started after it is the folder's own. Names match OpenCode's
+/// own titles. A save that never looked keeps the later conversation out too; a background path
+/// that looked would decide in the person's absence; a look that counted only the folder itself
+/// would let the worktree's earlier conversation into the next plain save.
+#[test]
+fn an_explicit_save_brings_an_old_policy_forward_so_later_opencode_conversations_are_the_folders() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    // One of the conversations from before ran in a git worktree the folder covers, outside it.
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "start"]);
+    git(&["worktree", "add", "-q", "../notes-tree"]);
+    let tree = dir
+        .parent()
+        .unwrap()
+        .join("notes-tree")
+        .canonicalize()
+        .unwrap();
+    lab.turn_on(&dir, "me/notes");
+    lab.opencode_conversation(&dir, "ses_before_one", "Plan the release");
+    lab.opencode_conversation(&tree, "ses_before_two", "Write the notes");
+    let looked = || -> bool {
+        let policies: Vec<_> = std::fs::read_dir(lab.agit_home.join("projects"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+            .collect();
+        assert_eq!(policies.len(), 1);
+        let policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(policies[0].path()).unwrap()).unwrap();
+        policy["earlier_opencode"] == true
+    };
+    let background = lab.agit(
+        &dir,
+        &["--quiet", "project", "capture", dir.to_str().unwrap()],
+    );
+    assert!(!looked(), "{background:?}");
+
+    let first = lab.agit(&dir, &["save"]);
+    let said = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        said.contains(
+            "2 OpenCode conversations here from before now count as earlier; `agit save <id>` saves one"
+        ),
+        "{said}{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(looked());
+
+    lab.opencode_conversation(&dir, "ses_after", "Ship the release");
+    let save = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"].clone()
+    };
+    let taken = |value: &serde_json::Value| -> Vec<String> {
+        value["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| Some(session["session_id"].as_str()?.to_owned()))
+            .collect()
+    };
+    let plain = save(&["--json", "save"]);
+    assert_eq!(taken(&plain), ["ses_after"], "{plain}");
+    let named = save(&["--json", "save", "Write the notes"]);
+    assert_eq!(taken(&named), ["ses_before_two"], "{named}");
 }

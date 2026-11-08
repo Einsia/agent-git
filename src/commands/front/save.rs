@@ -43,6 +43,8 @@ struct Plan {
     left_out: usize,
     /// Sessions the person stopped uploading (`agit project drop`), which only naming uploads.
     dropped: usize,
+    /// What this save's look at OpenCode's store recorded for a policy that had never looked.
+    opencode_look: Option<crate::commands::project::OpencodeLook>,
 }
 
 fn again(args: &SaveArgs) -> String {
@@ -95,6 +97,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             this_conversation: false,
             left_out: 0,
             dropped,
+            opencode_look: None,
         });
     }
     let this = crate::infra::runtime_session::this_conversation();
@@ -131,10 +134,18 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
             this_conversation: true,
             left_out: 0,
             dropped: 0,
+            opencode_look: None,
         });
     }
     let root = super::folder(&std::env::current_dir()?)?;
     let on = crate::commands::project::uploads_automatically(&root) == Some(true);
+    // An explicit save brings a policy that never looked at OpenCode's store forward, once. One
+    // that can't look keeps failing closed, so the save goes on either way.
+    let opencode_look = if on {
+        crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None)
+    } else {
+        None
+    };
     let here = super::sessions_to_save_in(&root)?;
     let mut left_out = 0;
     let mut dropped = 0;
@@ -184,6 +195,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
         this_conversation: false,
         left_out,
         dropped,
+        opencode_look,
     })
 }
 
@@ -204,7 +216,7 @@ fn save(args: SaveArgs) -> CmdResult {
         if crate::commands::json::is_capturing() {
             println!(
                 "{}",
-                serde_json::json!({"sessions": [], "folders_turned_on": [], "left_out": plan.left_out, "dropped": plan.dropped})
+                serde_json::json!({"sessions": [], "folders_turned_on": [], "left_out": plan.left_out, "dropped": plan.dropped, "opencode_earlier": opencode_earlier(plan.opencode_look.as_ref())})
             );
         } else {
             if plan.left_out == 0 && plan.dropped == 0 {
@@ -213,6 +225,7 @@ fn save(args: SaveArgs) -> CmdResult {
                 println!("Nothing new to save.");
             }
             report_left_out(plan.left_out);
+            report_opencode_look(plan.opencode_look.as_ref());
             report_dropped(plan.dropped);
         }
         return Ok(ExitCode::Ok);
@@ -335,11 +348,28 @@ fn save(args: SaveArgs) -> CmdResult {
         &skipped,
         plan.this_conversation,
         plan.dropped,
+        plan.opencode_look.as_ref(),
     )?;
     if !crate::commands::json::is_capturing() {
         report_left_out(plan.left_out);
+        report_opencode_look(plan.opencode_look.as_ref());
     }
     Ok(code)
+}
+
+/// The one-time line for a look at OpenCode's store, at the person's terminal.
+fn report_opencode_look(look: Option<&crate::commands::project::OpencodeLook>) {
+    if let Some(line) = look.and_then(crate::commands::project::OpencodeLook::line) {
+        println!("{line}");
+    }
+}
+
+/// The look's counts for `--json`, without a command to run.
+fn opencode_earlier(look: Option<&crate::commands::project::OpencodeLook>) -> serde_json::Value {
+    look.map_or(
+        serde_json::Value::Null,
+        |look| serde_json::json!({"earlier": look.earlier, "already_saved": look.saved}),
+    )
 }
 
 /// What `--all`, `--today` or a folder's save left out because the person dropped it.
@@ -393,6 +423,7 @@ fn report(
     skipped: &[(PathBuf, String)],
     this_conversation: bool,
     dropped: usize,
+    opencode_look: Option<&crate::commands::project::OpencodeLook>,
 ) -> CmdResult {
     let failed = rows
         .iter()
@@ -458,6 +489,7 @@ fn report(
                 "folders_turned_on": turned_on.iter().map(|(f, r)| serde_json::json!({"folder": f, "repository": r, "if_no": off_command(f)})).collect::<Vec<_>>(),
                 "folders_skipped": skipped.iter().map(|(f, why)| serde_json::json!({"folder": f, "why": why})).collect::<Vec<_>>(),
                 "dropped": dropped,
+                "opencode_earlier": opencode_earlier(opencode_look),
                 // A save that turned a folder on did what the person asked and more: whether new
                 // sessions there keep uploading by themselves is theirs to answer, before anything
                 // else (ledger 121, choice A).

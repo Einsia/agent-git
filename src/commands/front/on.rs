@@ -77,7 +77,17 @@ fn turn_on(args: OnArgs) -> CmdResult {
         );
         Ok(ui::prompt::confirm(&question, true)? == Some(true))
     })?;
-    report(&root, &enabled)
+    // An explicit `agit on` brings a policy that never looked at OpenCode's store forward, once.
+    let look = crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None);
+    let code = report(&root, &enabled)?;
+    if !crate::commands::json::is_capturing()
+        && let Some(line) = look
+            .as_ref()
+            .and_then(crate::commands::project::OpencodeLook::line)
+    {
+        println!("{line}");
+    }
+    Ok(code)
 }
 
 /// A folder that uploads automatically, and how it came to.
