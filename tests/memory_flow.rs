@@ -256,8 +256,19 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     let distilled = agit(&home, &claude, &["distill", "-y", "--into", &into]);
     ok(&distilled);
     let hint = String::from_utf8_lossy(&distilled.stderr);
+    // Read by a program, not a person, the push is offered for when the user asks, not as a step.
     assert!(
-        hint.contains(&format!("publish it: `agit push {REPO}@main`")),
+        hint.contains(&format!(
+            "when the user asks to publish it: `agit push {REPO}@main`"
+        )),
+        "{hint}"
+    );
+    // Distill publishes nothing; the session branch, holding the same memory and not on the Hub,
+    // is named with its own push.
+    assert!(
+        hint.contains(&format!(
+            "`s1`, which holds this memory too, isn't on the Hub yet: `agit push {REPO}@s1`"
+        )),
         "{hint}"
     );
     // The result names the repository whose main it is, which may not be the team's.
