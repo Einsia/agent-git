@@ -292,11 +292,7 @@ fn run_policy(command: PolicyAction) -> CmdResult {
             |policy| add_pattern(&mut policy.exclude, pattern),
             "exclude pattern added",
         ),
-        PolicyAction::AllowMemory { pattern, .. } => mutate(
-            &repo,
-            |policy| add_pattern(&mut policy.memory_allow, pattern),
-            "memory allowlist pattern added",
-        ),
+        PolicyAction::AllowMemory { pattern, .. } => allow_memory(&repo, &slug, pattern),
         PolicyAction::DenyMemory { pattern, .. } => mutate(
             &repo,
             |policy| {
@@ -472,6 +468,46 @@ fn emit_preview(repository: &str, report: PreviewReport) -> Result<()> {
             candidate.action, candidate.input, logical, candidate.rule, suffix
         );
     }
+    Ok(())
+}
+
+/// Adds a memory allowlist pattern and says what it covers now: the memory files agit tracks here
+/// that it admits, by name only. Each is collected as it stands, by the next `agit memory sync` or
+/// turn end, through the same secret scan as any change.
+fn allow_memory(repo: &Repo, slug: &str, pattern: String) -> Result<()> {
+    let mut policy = PrivacyPolicy::load_local(repo)?;
+    add_pattern(&mut policy.memory_allow, pattern)?;
+    policy.mandatory = crate::domain::privacy::mandatory::load()?;
+    policy.save(repo)?;
+    let covered = super::memory::release_allowed(repo, |name| {
+        policy.evaluate_memory(name, None).action
+            == crate::domain::privacy::CandidateAction::Allowed
+    })?;
+    if super::json::requested() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1,
+                "operation": "privacy_policy_update",
+                "message": "memory allowlist pattern added",
+                "policy_digest": policy.digest()?,
+                "file": PrivacyPolicy::path(repo)?,
+                "memory_files_covered": covered,
+            })
+        );
+        return Ok(());
+    }
+    ui::success("memory allowlist pattern added");
+    if covered.is_empty() {
+        println!("it matches no memory file agit tracks here yet");
+    } else {
+        println!(
+            "it covers {}; each goes into {slug}'s memory as it stands at the next `agit memory sync` or turn end",
+            covered.join(", ")
+        );
+    }
+    println!("policy file: {}", PrivacyPolicy::path(repo)?.display());
+    println!("policy digest: {}", policy.digest()?);
     Ok(())
 }
 

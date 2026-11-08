@@ -142,7 +142,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     );
     assert!(!status.contains("eligible for collection"), "{status}");
     assert!(!status.contains("everything in sync"), "{status}");
-    ok(&agit(
+    let allowed = ok(&agit(
         &home,
         &claude,
         &[
@@ -155,6 +155,9 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
             "mine.md",
         ],
     ));
+    // Allowing names what it covers now, by name only.
+    assert!(allowed.contains("it covers mine.md"), "{allowed}");
+    assert!(!allowed.contains("local fact"), "{allowed}");
     let status = ok(&agit(
         &home,
         &claude,
