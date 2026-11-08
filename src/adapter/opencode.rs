@@ -227,6 +227,9 @@ struct Listed {
     directory: Option<String>,
     time_updated: i64,
     parent_id: Option<String>,
+    /// OpenCode's own title for the conversation, which names match against as they do the
+    /// other runtimes' titles.
+    title: Option<String>,
 }
 
 fn row_to_listed(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listed> {
@@ -235,6 +238,9 @@ fn row_to_listed(r: &rusqlite::Row<'_>) -> rusqlite::Result<Listed> {
         directory: r.get(1)?,
         time_updated: r.get(3)?,
         parent_id: r.get(4)?,
+        title: r
+            .get::<_, Option<String>>(5)?
+            .filter(|title| !title.trim().is_empty()),
     })
 }
 
@@ -248,7 +254,7 @@ fn list_for_repo(con: &Connection, repo: &str) -> Result<Vec<Listed>> {
     let sessions = Layout::detect(&transaction)?.sessions();
     let rows = {
         let mut statement = transaction.prepare(&format!(
-            "WITH selected AS ({sessions}) SELECT s.id, s.directory, s.time_created, s.time_updated, s.parent_id \
+            "WITH selected AS ({sessions}) SELECT s.id, s.directory, s.time_created, s.time_updated, s.parent_id, s.title \
              FROM selected s WHERE s.directory = ?1 OR EXISTS \
              (SELECT 1 FROM project p WHERE p.id = s.project_id AND p.worktree = ?1) ORDER BY s.time_created, s.id"
         ))?;
@@ -265,7 +271,7 @@ fn list_all(con: &Connection) -> Result<Vec<Listed>> {
     let sessions = Layout::detect(&transaction)?.sessions();
     let rows = {
         let mut statement = transaction.prepare(&format!(
-            "WITH selected AS ({sessions}) SELECT id, directory, time_created, time_updated, parent_id FROM selected ORDER BY time_created, id"
+            "WITH selected AS ({sessions}) SELECT id, directory, time_created, time_updated, parent_id, title FROM selected ORDER BY time_created, id"
         ))?;
         statement
             .query_map([], row_to_listed)?
@@ -307,7 +313,7 @@ pub(crate) fn every_session_in_full() -> Result<Vec<SessionRef>> {
 
 fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
     SessionRef {
-        title: None,
+        title: l.title,
         // The content is in the database, not at this file; the path is where the materialized
         // cache belongs. It exists only after a resolve (see the comment on [`cache_dir`]).
         path: cache_path_in(cache_root, &l.id),

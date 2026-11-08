@@ -23,6 +23,9 @@ impl SessionTable {
 pub(super) struct Layout {
     legacy: bool,
     v2: bool,
+    /// Whether each session table carries the conversation's title; an older one may not.
+    legacy_title: bool,
+    v2_title: bool,
     parts: bool,
     projected: Option<SessionTable>,
     pub(super) split_parts: bool,
@@ -146,9 +149,17 @@ impl Layout {
             )
             .map_err(|_| Unavailable::Database)?;
         }
+        let titled = |table: SessionTable, present: bool| {
+            present
+                && con
+                    .prepare(&format!("SELECT title FROM {} LIMIT 0", table.name()))
+                    .is_ok()
+        };
         Ok(Self {
             legacy,
             v2,
+            legacy_title: titled(SessionTable::Legacy, legacy),
+            v2_title: titled(SessionTable::V2, v2),
             parts,
             projected,
             split_parts,
@@ -201,13 +212,19 @@ impl Layout {
 
     /// Select the authoritative identity before applying project or parent filters.
     pub(super) fn sessions(self) -> String {
-        let columns = "id, project_id, parent_id, directory, time_created, time_updated";
+        let columns = |titled: bool| {
+            format!(
+                "id, project_id, parent_id, directory, time_created, time_updated, {}",
+                if titled { "title" } else { "NULL AS title" }
+            )
+        };
+        let (legacy, v2) = (columns(self.legacy_title), columns(self.v2_title));
         match (self.legacy, self.v2) {
             (true, true) => format!(
-                "SELECT {columns} FROM session_v2 UNION ALL SELECT {columns} FROM session s WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)"
+                "SELECT {v2} FROM session_v2 UNION ALL SELECT {legacy} FROM session s WHERE NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = s.id)"
             ),
-            (false, true) => format!("SELECT {columns} FROM session_v2"),
-            _ => format!("SELECT {columns} FROM session"),
+            (false, true) => format!("SELECT {v2} FROM session_v2"),
+            _ => format!("SELECT {legacy} FROM session"),
         }
     }
 }

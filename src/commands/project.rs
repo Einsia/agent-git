@@ -1089,6 +1089,84 @@ fn opencode_earlier(project: &Project, session_id: &str) -> bool {
         && (!project.earlier_opencode || project.earlier.contains(&key("opencode", session_id)))
 }
 
+/// What one look at OpenCode's store recorded for a policy that had never looked: how many of
+/// the folder's conversations now count as earlier, and how many were already saved into the
+/// project's repository.
+pub(crate) struct OpencodeLook {
+    pub earlier: usize,
+    pub saved: usize,
+    pub repository: String,
+}
+
+/// Brings a policy bound without OpenCode's earlier record forward, once: what OpenCode holds for
+/// the folder now counts as earlier, so a conversation started after this is the folder's own,
+/// as Claude Code's and Codex's are. Only an explicit `agit save` or `agit on` calls it; a turn
+/// end or a catch-up meets an unmarked policy and keeps failing closed ([`opencode_earlier`]). A
+/// store it can't read in full marks nothing. `None` when nothing was marked.
+pub(crate) fn look_for_earlier_opencode(folder: &Path) -> Result<Option<OpencodeLook>> {
+    let root = policy_root(folder);
+    if read(&root)?
+        .is_none_or(|project| project.history != History::None || project.earlier_opencode)
+    {
+        return Ok(None);
+    }
+    let _guard = lock(&root)?;
+    let Some(mut project) = read(&root)? else {
+        return Ok(None);
+    };
+    if project.history != History::None || project.earlier_opencode {
+        return Ok(None);
+    }
+    let (found, complete) = opencode_history(&project);
+    if !complete {
+        return Ok(None);
+    }
+    let (mut earlier, mut saved) = (0, 0);
+    // The reading holds the folder and the git worktrees its policy covers, wherever those are;
+    // every conversation in it is the folder's history.
+    for candidate in &found {
+        if claimed_here(&project, "opencode", &candidate.session_id) {
+            saved += 1;
+        } else {
+            project
+                .earlier
+                .insert(key("opencode", &candidate.session_id));
+            earlier += 1;
+        }
+    }
+    project.earlier_opencode = true;
+    save(&project)?;
+    Ok(Some(OpencodeLook {
+        earlier,
+        saved,
+        repository: project.repository,
+    }))
+}
+
+impl OpencodeLook {
+    /// The one-time line, when there was anything to count.
+    pub fn line(&self) -> Option<String> {
+        if self.earlier == 0 {
+            return None;
+        }
+        let (count, verb) = match self.earlier {
+            1 => ("1 OpenCode conversation".to_owned(), "counts"),
+            n => (format!("{n} OpenCode conversations"), "count"),
+        };
+        let saved = match self.saved {
+            0 => String::new(),
+            n => format!(
+                " ({n} more {} already saved into {})",
+                if n == 1 { "is" } else { "are" },
+                self.repository
+            ),
+        };
+        Some(format!(
+            "{count} here from before now {verb} as earlier{saved}; `agit save <id>` saves one"
+        ))
+    }
+}
+
 fn checkout(project: &Project) -> Result<Repo> {
     let (owner, name) = super::parse_slug(&project.repository)?;
     Repo::open(config::repo_dir(&owner, &name)?).context("project repository is not cloned locally")
@@ -5634,6 +5712,34 @@ mod tests {
         opencode_database(&data.join("opencode.db"), &folder, &["ses_started_here"]);
         let claim = link::Link::new("opencode", "ses_started_here", Some(&folder));
         assert_eq!(start(&claim), Some(folder));
+    }
+
+    /// The look's one-time line says how many conversations it counted as earlier and, when some
+    /// were already saved into the repository, how many, so the count can be read against
+    /// OpenCode's own total. A look that counted nothing says nothing.
+    #[test]
+    fn the_looks_line_counts_earlier_and_already_saved_conversations() {
+        let look = |earlier, saved| {
+            OpencodeLook {
+                earlier,
+                saved,
+                repository: "me/notes".into(),
+            }
+            .line()
+        };
+        assert_eq!(look(0, 3), None);
+        assert_eq!(
+            look(1, 0).as_deref(),
+            Some(
+                "1 OpenCode conversation here from before now counts as earlier; `agit save <id>` saves one"
+            )
+        );
+        assert_eq!(
+            look(3, 2).as_deref(),
+            Some(
+                "3 OpenCode conversations here from before now count as earlier (2 more are already saved into me/notes); `agit save <id>` saves one"
+            )
+        );
     }
 
     /// A bind without earlier history records the folder's OpenCode conversations only from a
