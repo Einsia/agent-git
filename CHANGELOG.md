@@ -8,6 +8,106 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.45] - 2026-11-08
+
+### Added
+
+- `agit repair merges <owner/repo>@<branch>` copies a session branch whose earlier merges recorded its history again to
+  a new branch (`<branch>-repaired`, or `-b <name>`) without those repeats, keeping every turn's dates. `--dry-run` lists
+  what it would leave out. The original branch is unchanged and nothing is uploaded. A share refused because of such a
+  repeat points at the dry run.
+- `agit project list --json` now carries `uploads_not_through`, the same list of automatic uploads that didn't go through
+  that `agit status --json` shows.
+
+### Fixed
+
+- A Codex, Claude Code or WorkBuddy turn on a computer that isn't signed in to agit now says the turn isn't saved and
+  that `agit login` signs in, instead of ending silently.
+- With automatic upload off for a repository, agit no longer contacts the Hub for that repository on its own, and no
+  longer reports each turn as a failed upload: `agit status` says the turns are saved here and that `agit push`
+  publishes them. What you ask for still uploads, through the same checks as `agit push`: `agit save` (the conversation
+  you name, or this folder's unsaved sessions; `--all` and `--today` leave that repository out), `agit project sync` and
+  the menu bar's Retry. None of them answers a create-or-make-public question for you.
+- An automatic upload that didn't go through now says so at the next turn's end or start and in `agit status`,
+  including when the conversation also continued on another computer.
+- An automatic upload refused because the Hub moved on with nothing new on this computer now says so, and a failure with
+  no known cause no longer promises that the next turn tries again.
+- OpenCode conversations kept in its newer (V2) storage are now found: `agit save` saves them, with their tool results
+  and attachments, and `agit resume` restores them. Attachments other than images and PDFs are left out of what's
+  published. As before, no folder uploads OpenCode conversations by itself.
+- A Codex conversation continued on a second computer saves its turns there; a turn that can't be saved now says so at
+  the end of the turn.
+- `agit new`, `agit run` and `agit resume` with `--as codex` hold their own branch and give Codex the team memory index
+  even while Codex's shared background server is running.
+- `-y` no longer adopts personal memory (CLAUDE.md, AGENTS.md, skills, memory files) into a new repository's main. agit
+  names the files it found; you choose each one at a terminal, or add it yourself, and no hint suggests `-y` for it.
+- A runtime that `agit new`, `agit run`, `agit resume`, `agit fork` or a merge launches no longer inherits that
+  command's `-y`, `-q` or `--tui`, so the agent's own agit commands ask as usual.
+- The local daemon that runs remote-control sessions no longer keeps the `-y`, `-q` or `--tui` of the agit command that
+  started it, so its sessions' agents are asked as usual.
+- A Codex conversation that is running now appears in the remote-control session list even while Codex is busy writing
+  its own index, and `agit rc sources list` says why a list can't be read.
+- While a conversation's live view waits for the privacy check on that computer, agit now tells the Hub why the check is
+  still waiting, naming only the checker's own state (busy, restarting or not responding), and history errors shown to
+  workspace members no longer say anything about a record's contents or the owner's privacy rules.
+- Stopping agit's background service while a conversation is being archived no longer leaves that archive stuck; if a Git
+  lock is left behind anyway, `agit doctor` names the file and says how to clear it.
+- Base64 in a session record that names a text type, such as a file attached to a message or a data URI a tool prints,
+  is now decoded and checked like the rest of the record before the session is published, and left out if it can't be
+  read as text. Base64 of a binary file, or with no type beside it, is published as it is.
+- `agit merge` no longer records turns a second time when the source already holds turns that are the target's own (a
+  shared start, or the Hub's published copy, including one from another repository). The merge says how many new turns
+  from the source it recorded, or that there is nothing to merge.
+- `agit push <repo>@main` after `agit memory distill` is no longer refused for the account agit records in main's own
+  metadata; a push refused for a value in a file names the commit in your checkout and how to remove the value.
+- When `agit push` finds nothing to send, it says the branch is already on the Hub, so a push retried after one that
+  failed, such as a 502 for a push the Hub took, no longer leaves open whether it got there.
+- When `agit push <repo>@<branch>` finds nothing new to upload, it says the branch is on the Hub and names the session
+  it holds, by its opening words and when its last turn ran, so a look-alike branch pushed by mistake is easy to spot.
+  If that branch isn't the conversation running in this terminal, the push says so, and so does `agit status` for the
+  session it's set to.
+- `agit scan <repo>@<branch> --secrets` checks what `agit push` of that branch would send, main included when the push
+  carries it, instead of every branch, and says which it scanned. `--all` or no branch scans the whole repository.
+- `agit push` no longer tells a plain session that its published copy is encrypted when another computer has added a
+  turn on the Hub; it names the other computer's turn and points to a separate checkout of the Hub's copy.
+- When `agit push` finds that main has diverged from the Hub's, it points to `agit pull` (which merges the files) and
+  says when both sides hold the same files, instead of offering only a fork or a merge by hand.
+- Turning agit on in a folder for a repository that already exists on the Hub now starts from the Hub's main, instead
+  of creating a separate main that `agit status` shows as diverged.
+- A main this computer started on its own, because its first save couldn't use the Hub's, can now take the Hub's main in
+  with `agit pull <repo>@main`. The pull names the files the person added at its start and who can read the repository,
+  and leaves their upload to `agit push`.
+- The note after a push that a folder doesn't upload by itself speaks to the person when they run agit at their own
+  terminal, and lists each git worktree on its own line. It and the notes at a conversation's start and resume say who
+  can read the destination in the same words, including the people granted access to an organization's repository.
+- `agit memory distill <file>` says whether the file was never collected onto the branch, with what keeps it on this
+  computer, or is unchanged against main, instead of "already matches main, or never existed"; hints that name
+  `agit privacy policy allow-memory` say that the file is then saved to the repository and uploaded with the branch.
+- `agit distill` names the repository whose main it carries memory into, in each question and its result, and its manual
+  says it reaches only the session's own repository's main.
+- `agit save` names a conversation it can't read, and says why, instead of failing with "No such file or directory"; a
+  step that can't run in a conversation's folder says which folder.
+- In a folder turned on before agit recorded which OpenCode conversations it already had, a plain `agit save` left every
+  OpenCode conversation out. The next `agit save` or `agit on` there now looks once. The OpenCode conversations from
+  before then stay out until you name one, a plain `agit save` takes the ones started after, and `agit save` finds
+  OpenCode conversations by their titles.
+- `agit save` and the `agit` overview now find Claude Code, Codex and OpenCode conversations when the runtime's command
+  isn't on your shell's PATH, as when an app or an editor runs it.
+- `agit save <id>` for a conversation whose folder was removed says where it ran and that it isn't saved from here,
+  instead of "no session matches".
+- `agit save` says a conversation already saved in another repository or branch is saved there, instead of reporting a
+  failed upload, and offers a retry only where one can help; a conversation whose transcript no longer continues its
+  branch names the import that keeps both.
+- When Git can't inspect one of your agit repositories, `agit status` names the repository, the worktree and what Git
+  said, and goes on if the folder you're in doesn't use it. `agit doctor` reports it as a finding instead of refusing to
+  run.
+- A conversation in a folder agit isn't saving now says so once, at its start, with the command that turns the folder
+  on; `agit config notice.unsaved false` keeps it quiet. Hints about a folder's earlier sessions name `agit save <id>`
+  for one, and tell an agent to ask the person instead of running `agit save --all`.
+- `agit status` says a conversation isn't saved when nothing asked agit to save its folder's conversations, and names
+  `agit import <id>`, instead of "incomplete claim; process unverified"; in a folder whose project saves it, it says the
+  conversation is saved when its turn ends.
+
 ## [0.2.44] - 2026-11-07
 
 ### Added
