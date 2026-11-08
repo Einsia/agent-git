@@ -3950,7 +3950,8 @@ fn a_folder_never_uploads_a_conversation_with_no_finished_turn() {
 /// With the repository's `push.auto` off, a folder with automatic upload on still saves each turn,
 /// and that is all: the Hub hears nothing, statistics included, and no attempt is recorded or told.
 /// A worker that tried anyway would leave its refusal in the project's state and an upload record,
-/// and one that reached the Hub first would count here.
+/// and one that reached the Hub first would count here. The conversation's start asks the Hub
+/// nothing either, not even who can read the repository.
 #[test]
 fn with_automatic_upload_off_a_folder_saves_and_contacts_nothing() {
     use sha2::{Digest, Sha256};
@@ -4003,6 +4004,12 @@ fn with_automatic_upload_off_a_folder_saves_and_contacts_nothing() {
         .unwrap();
     fs2::FileExt::lock_exclusive(&lock).unwrap();
     let sink = sink.each();
+    let started = lab.hook("ingest", fresh, &[("source", "startup")], &sink);
+    assert!(started.status.success(), "{started:?}");
+    assert!(
+        String::from_utf8_lossy(&started.stdout).contains("`agit push einsia/qa` publishes it"),
+        "{started:?}"
+    );
     let stopped = lab.hook("settle", fresh, &[], &sink);
     assert!(stopped.status.success(), "{stopped:?}");
     drop(lock);
@@ -4015,7 +4022,8 @@ fn with_automatic_upload_off_a_folder_saves_and_contacts_nothing() {
     assert!(worker.status.success(), "{worker:?}");
 
     let told = format!(
-        "{}{}{}{}",
+        "{}{}{}{}{}",
+        String::from_utf8_lossy(&started.stderr),
         String::from_utf8_lossy(&stopped.stdout),
         String::from_utf8_lossy(&stopped.stderr),
         String::from_utf8_lossy(&worker.stdout),
@@ -4075,6 +4083,104 @@ fn with_automatic_upload_off_a_folder_saves_and_contacts_nothing() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// A conversation that starts in a folder whose repository has automatic upload off is told that
+/// its turns are saved on this computer and that `agit push` publishes them, never that they upload
+/// at the end of each turn: nothing does then. `agit status` and the agent's note say the same, read
+/// from the same setting the turn end obeys. Turned on, the start names the upload again, so a line
+/// that ignored the setting fails one way or the other.
+#[test]
+fn a_conversation_starting_with_automatic_upload_off_is_told_it_stays_on_this_computer() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        state.with_extension("json"),
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Holding the worker's lock keeps a start's catch-up queued, so nothing runs behind the test.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(state.with_extension("capture"))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+
+    let fresh = "dddddddd-0000-4000-8000-000000000007";
+    lab.append_turn(fresh, 1, "work on it", "done");
+    let started = lab.hook("ingest", fresh, &[("source", "startup")], &[]);
+    assert!(started.status.success(), "{started:?}");
+    let said = String::from_utf8_lossy(&started.stdout);
+    assert!(
+        said.contains(
+            "agit: this conversation is saved on this computer for einsia/qa at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push einsia/qa` publishes it (visibility not confirmed)."
+        ),
+        "{started:?}"
+    );
+    assert!(!said.contains("is uploaded to"), "{started:?}");
+    let status = lab
+        .agit(&["status"])
+        .env("CLAUDE_CODE_SESSION_ID", fresh)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{status:?}");
+    let told = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        told.contains(
+            "saved to: einsia/qa at the end of each turn, by this folder's project (automatic upload is off: `agit push einsia/qa` publishes it)"
+        ),
+        "{told}"
+    );
+    assert!(
+        told.contains(
+            "stays on this computer: automatic upload is off for it here, so publish it with `agit push einsia/qa` only when the user asks to; do not import it"
+        ),
+        "{told}"
+    );
+
+    checkout.set_auto_push(Some(true)).unwrap();
+    let other = "dddddddd-0000-4000-8000-000000000008";
+    lab.append_turn(other, 1, "and this", "done");
+    let started = lab.hook("ingest", other, &[("source", "startup")], &[]);
+    assert!(started.status.success(), "{started:?}");
+    let said = String::from_utf8_lossy(&started.stdout);
+    assert!(
+        said.contains("agit: this conversation is uploaded to einsia/qa ("),
+        "{started:?}"
+    );
+    assert!(!said.contains("saved on this computer"), "{started:?}");
+    drop(lock);
 }
 
 /// An explicit save is the person's own upload, even with the repository's automatic upload off,
