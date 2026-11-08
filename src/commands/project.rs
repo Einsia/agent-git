@@ -1305,7 +1305,37 @@ pub(crate) enum UploadFailure {
     Withheld,
     /// The publication rules changed while it uploaded, and again on the second try.
     RulesChanged,
+    /// The folder the conversation ran in doesn't upload it by itself, or left it out.
+    FolderOff,
     Other,
+}
+
+/// Who reads a class's line: the person, or an agent reading `agit status`, for whom a step that
+/// publishes is the user's to ask for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reader {
+    Person,
+    Agent,
+}
+
+impl Reader {
+    /// The person at a terminal, or the menu bar outside an agent session, which shows the lines
+    /// to the person and acts on none of them; an agent otherwise.
+    pub(crate) fn of_this_process() -> Self {
+        Self::of(
+            ui::prompt::can_ask(),
+            std::env::var_os(super::push::ASKED_ENV).is_some(),
+            crate::tui::Signals::from_process().agent_session.is_some(),
+        )
+    }
+
+    fn of(at_terminal: bool, menu_bar: bool, in_agent_session: bool) -> Self {
+        if at_terminal || (menu_bar && !in_agent_session) {
+            Self::Person
+        } else {
+            Self::Agent
+        }
+    }
 }
 
 impl UploadFailure {
@@ -1370,6 +1400,9 @@ impl UploadFailure {
         if message.contains(super::push::WITHHELD_HERE) {
             return Self::Withheld;
         }
+        if message.contains(super::push::FOLDER_KEEPS_IT) {
+            return Self::FolderOff;
+        }
         // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
         // name to rename is refused before the Hub is asked.
         if super::push::refused_for_good(message) {
@@ -1409,10 +1442,61 @@ impl UploadFailure {
             Self::RulesChanged => {
                 "the rules for publishing to this repository changed while it was uploading, so the upload didn't finish; the turn stays saved here, and the next turn or `agit save` uploads what's left"
             }
+            Self::FolderOff => "the folder it ran in doesn't upload it by itself",
             // Nothing is known of a refusal without a name of its own, so no retry is promised.
-            Self::Other => {
-                "it could not be completed on this computer; `agit push` for this branch shows why"
-            }
+            Self::Other => "it could not be completed on this computer",
+        }
+    }
+
+    /// The class in its own words for `target` (`<owner/repo>@<branch>`), with the command that
+    /// goes on from it named in full: once the runtime has exited, a bare `agit push` has no
+    /// session to act on. `said` is the first line the push reported, which only `agit status`
+    /// passes: every other line that tells a class goes into the conversation's transcript, which
+    /// is published.
+    pub(crate) fn describe_for(self, target: &str, reader: Reader, said: Option<&str>) -> String {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        let push = format!("agit push {}", quote_arg(target));
+        match self {
+            Self::TooLarge => format!(
+                "the session is larger than the Hub accepts, so later turns of it stay on this computer; `{push}` asks the Hub again"
+            ),
+            Self::BuildsOnWithdrawn => format!(
+                "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, `{push}` publishes it"
+            ),
+            Self::Diverged => match reader {
+                Reader::Person => format!(
+                    "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer: `{push} --keep-both` keeps both, and `{push}` shows how to merge them instead"
+                ),
+                Reader::Agent => format!(
+                    "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer; if the user wants to keep both: `{push} --keep-both`, and `{push}` shows how to merge them instead"
+                ),
+            },
+            Self::Behind => format!(
+                "this conversation also continued on another computer, so the Hub has turns this computer doesn't, and this computer has nothing new to upload; `{push}` shows how to go on"
+            ),
+            Self::Withheld => format!(
+                "this computer keeps the conversation from uploading, so no later turn sends it either; `{push}` says why and what to do"
+            ),
+            Self::FolderOff => match reader {
+                Reader::Person => format!(
+                    "the folder it ran in doesn't upload it by itself; `{push}` uploads it if you want it there"
+                ),
+                Reader::Agent => format!(
+                    "the folder it ran in doesn't upload it by itself; `{push}` uploads it only when the user asks to"
+                ),
+            },
+            Self::Other => match said {
+                Some(said) => format!(
+                    "it could not be completed on this computer: {said}; `{push} --dry-run` checks it without sending anything"
+                ),
+                None => format!(
+                    "it could not be completed on this computer; `agit status` shows why, and `{push} --dry-run` checks it without sending anything"
+                ),
+            },
+            _ => self.describe().to_owned(),
         }
     }
 }
@@ -5452,6 +5536,18 @@ mod tests {
         let record = serde_json::json!({"type": "user", "sessionId": id, "cwd": cwd,
             "timestamp": at, "message": {"role": "user", "content": "hello"}});
         fs::write(native.join(format!("{id}.jsonl")), format!("{record}\n")).unwrap();
+    }
+
+    /// The menu bar runs agit with no terminal, and shows its lines to the person, so outside an
+    /// agent session it gets the person's words; the same marker inside one is an agent's command,
+    /// which leaves a push to the user. Worded for an agent, the menu bar would ask the person
+    /// whether "the user" wants to keep both.
+    #[test]
+    fn the_menu_bar_reads_upload_lines_in_the_persons_words() {
+        assert_eq!(Reader::of(true, false, false), Reader::Person);
+        assert_eq!(Reader::of(false, true, false), Reader::Person);
+        assert_eq!(Reader::of(false, true, true), Reader::Agent);
+        assert_eq!(Reader::of(false, false, false), Reader::Agent);
     }
 
     /// A folder covers the linked worktrees that share its git common directory, and nothing else

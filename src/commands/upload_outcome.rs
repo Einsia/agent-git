@@ -5,8 +5,10 @@
 //! detached process with no terminal: without a record, a failed upload of such a session is told
 //! to nobody. Every automatic upload runs through [`recorded`] or [`recorded_async`], which record
 //! the branch tip the upload is for, whether the upload is running, went through or failed, and
-//! why in a fixed class, never an error's text. An upload whose start can't be recorded doesn't
-//! run, and a note says so instead. The record is local and never sent, and each upload overwrites
+//! why in a fixed class. Beside the class it keeps the first line the push reported, which only
+//! `agit status` shows: the turn-end and session-end lines go into the conversation's transcript,
+//! which is published, so they say the class alone. An upload whose start can't be recorded
+//! doesn't run, and a note says so instead. The record is local and never sent, and each upload overwrites
 //! it rather than adding to a history. It lives under `projects/uploads/` in agit's home, beside
 //! the projects' capture state, in files named by digests, so no repository or branch name is in a
 //! path. Dropping a branch from uploads removes its record, and unbinding a project removes every
@@ -39,12 +41,15 @@ enum Outcome {
     Uploaded {
         tip: String,
     },
-    /// `attempt` is the start this failure finished, so the turn-end line tells it once.
+    /// `attempt` is the start this failure finished, so the turn-end line tells it once. `said` is
+    /// the first line the push reported, for `agit status` alone.
     Failed {
         tip: String,
         reason: UploadFailure,
         #[serde(default)]
         attempt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        said: Option<String>,
     },
 }
 
@@ -241,6 +246,27 @@ impl Refusal {
         UploadFailure::reported(self.exit_code, &self.message)
             .waiting_on(self.session.as_deref(), Some(target))
     }
+
+    /// The first line the push reported, as `agit status` shows it beside the class. It stays in
+    /// the record on this computer: no request, statistic or publication reads it.
+    fn said(&self) -> Option<String> {
+        const LIMIT: usize = 200;
+        let line = self
+            .message
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?;
+        let line = line.strip_prefix("error ").unwrap_or(line);
+        Some(match line.char_indices().nth(LIMIT) {
+            Some((end, _)) => format!("{}…", &line[..end]),
+            None => line.to_owned(),
+        })
+    }
+
+    /// What the record keeps of this refusal.
+    fn failure(&self, target: &str) -> (UploadFailure, Option<String>) {
+        (self.class(target), self.said())
+    }
 }
 
 /// Why an upload that can't be recorded doesn't run, as the end of a launched session says it.
@@ -273,7 +299,7 @@ pub(crate) fn recorded<T>(
     let target = place.target.clone();
     let upload = place.start(tip).map_err(Unrecorded)?;
     let ran = run();
-    upload.finish(judge(&ran).map_or(Ok(()), |refusal| Err(refusal.class(&target))));
+    upload.finish(judge(&ran).map_or(Ok(()), |refusal| Err(refusal.failure(&target))));
     Ok(ran)
 }
 
@@ -292,7 +318,7 @@ pub(crate) async fn recorded_async<T>(
         .map_err(|error| Unrecorded(error.into()))?
         .map_err(Unrecorded)?;
     let ran = run.await;
-    let result = judge(&ran).map_or(Ok(()), |refusal| Err(refusal.class(&target)));
+    let result = judge(&ran).map_or(Ok(()), |refusal| Err(refusal.failure(&target)));
     let _ = tokio::task::spawn_blocking(move || upload.finish(result)).await;
     Ok(ran)
 }
@@ -501,7 +527,7 @@ impl Upload {
     /// Records how the upload went, over its own start only: a record another upload started
     /// since, of this tip or another, or one removed because the branch was dropped or its project
     /// unbound, stays as it is.
-    fn finish(self, result: Result<(), UploadFailure>) {
+    fn finish(self, result: Result<(), (UploadFailure, Option<String>)>) {
         let Self {
             paths,
             tip,
@@ -516,10 +542,11 @@ impl Upload {
             if read(&paths.record).as_ref() == Some(&started) {
                 let outcome = match result {
                     Ok(()) => Outcome::Uploaded { tip },
-                    Err(reason) => Outcome::Failed {
+                    Err((reason, said)) => Outcome::Failed {
                         tip,
                         reason,
                         attempt,
+                        said,
                     },
                 };
                 let _ = write(&paths.record, &outcome);
@@ -566,6 +593,28 @@ impl Undone {
             Self::Failed(reason) => Some(reason),
             Self::Ended | Self::Unrecorded => None,
         }
+    }
+
+    /// [`UploadFailure::describe_for`] for a class, and the state's own words otherwise.
+    pub(crate) fn describe_for(
+        self,
+        target: &str,
+        reader: super::project::Reader,
+        said: Option<&str>,
+    ) -> String {
+        match self {
+            Self::Failed(reason) => reason.describe_for(target, reader, said),
+            Self::Ended | Self::Unrecorded => self.describe().to_owned(),
+        }
+    }
+}
+
+/// What the push said when the newest automatic upload of `repository@branch` failed: its first
+/// line, which only `agit status` shows.
+pub(crate) fn said(repository: &str, branch: &str) -> Option<String> {
+    match read(&Place::of(repository, branch).ok()?.paths.record)? {
+        Outcome::Failed { said, .. } => said,
+        Outcome::Started { .. } | Outcome::Uploaded { .. } => None,
     }
 }
 
@@ -846,8 +895,8 @@ pub(crate) fn launching(repository: &str, branch: &str) -> Option<Launch> {
 enum Status {
     Uploaded,
     Uploading,
-    Failed(&'static str),
-    NotUploaded(&'static str),
+    Failed(String),
+    NotUploaded(String),
     /// Nothing on this computer says: its settlement has not decided yet, decided it elsewhere,
     /// or the process uploading it ended without saying how it went.
     Unknown,
@@ -856,8 +905,9 @@ enum Status {
 impl Launch {
     /// One line, read from local state alone, on what became of the turns this launch saved. It
     /// names the repository, which the person chose and which the session's start already named,
-    /// and never a branch, a path or anything of the conversation. `None` when the launch saved
-    /// no turn and none is being saved.
+    /// and the branch only inside the command that goes on from a class, since once the runtime
+    /// has exited a bare `agit push` has no session to act on; never a path or anything of the
+    /// conversation. `None` when the launch saved no turn and none is being saved.
     pub(crate) fn ended(&self) -> Option<String> {
         let repo = Repo::open(&self.directory)?;
         let saving = self.saving();
@@ -931,20 +981,29 @@ impl Launch {
         let place = Place::of(&self.repository, &self.branch);
         if let Ok(place) = &place {
             if place.skipped_at(tip) {
-                return Status::NotUploaded(UNRECORDED);
+                return Status::NotUploaded(UNRECORDED.to_owned());
             }
             if let Some(outcome) = read(&place.paths.record).filter(|outcome| outcome.tip() == tip)
             {
+                let target = format!("{}@{}", self.repository, self.branch);
+                let person = super::project::Reader::Person;
                 return match outcome {
                     Outcome::Uploaded { .. } => Status::Uploaded,
-                    Outcome::Failed { reason, .. } => Status::Failed(reason.describe()),
+                    // Nothing failed: the folder keeps it here, which is what the person chose.
+                    Outcome::Failed {
+                        reason: reason @ UploadFailure::FolderOff,
+                        ..
+                    } => Status::NotUploaded(reason.describe_for(&target, person, None)),
+                    Outcome::Failed { reason, .. } => {
+                        Status::Failed(reason.describe_for(&target, person, None))
+                    }
                     Outcome::Started { .. } if held(&place.paths.running) => Status::Uploading,
                     Outcome::Started { .. } => Status::Unknown,
                 };
             }
         }
         match left_out(repo, &self.repository, &self.branch) {
-            Some(reason) => Status::NotUploaded(reason),
+            Some(reason) => Status::NotUploaded(reason.to_owned()),
             None => Status::Unknown,
         }
     }
@@ -966,6 +1025,20 @@ mod tests {
 
     fn at(directory: &Path) -> Paths {
         Paths::of(directory.join("record.json"))
+    }
+
+    /// What the record keeps of a push's report is its first line, cut, so `agit status` shows
+    /// one line per upload however long the report; a report with nothing in it keeps nothing.
+    #[test]
+    fn a_refusal_keeps_the_first_line_it_reported() {
+        let long = "x".repeat(300);
+        let said = Refusal::child(Some(1), format!("\n  error {long}\nsecond line\n")).said();
+        assert_eq!(said, Some(format!("{}…", "x".repeat(200))));
+        assert_eq!(
+            Refusal::child(Some(1), "error the branch is locked\n".into()).said(),
+            Some("the branch is locked".into())
+        );
+        assert_eq!(Refusal::unexplained().said(), None);
     }
 
     /// A failure an agit that still attempted uploads with `push.auto` off recorded goes, along
@@ -996,6 +1069,7 @@ mod tests {
                 tip: "t".into(),
                 reason,
                 attempt: "a".into(),
+                said: None,
             };
             write(&place.paths.record, &failed).unwrap();
         };
@@ -1042,7 +1116,7 @@ mod tests {
 
         let failing = at(directory.path()).start("tip-1").unwrap();
         let succeeding = at(directory.path()).start("tip-1").unwrap();
-        failing.finish(Err(UploadFailure::Hub));
+        failing.finish(Err((UploadFailure::Hub, None)));
         succeeding.finish(Ok(()));
         assert_eq!(
             record(),
@@ -1053,12 +1127,12 @@ mod tests {
 
         let older = at(directory.path()).start("tip-2").unwrap();
         let newer = at(directory.path()).start("tip-3").unwrap();
-        older.finish(Err(UploadFailure::Hub));
+        older.finish(Err((UploadFailure::Hub, None)));
         assert!(
             matches!(record(), Some(Outcome::Started { tip, .. }) if tip == "tip-3"),
             "an older upload does not overwrite a newer start"
         );
-        newer.finish(Err(UploadFailure::TooLarge));
+        newer.finish(Err((UploadFailure::TooLarge, None)));
         assert!(
             matches!(
                 record(),
@@ -1244,7 +1318,7 @@ mod tests {
 
             let running = start("other", "tip-2");
             forget("alice/app", None).unwrap();
-            running.finish(Err(UploadFailure::Hub));
+            running.finish(Err((UploadFailure::Hub, None)));
             assert!(!paths("alice/app", "other").unwrap().record.exists());
 
             // A finish that read its own start holds the write lock until it has replaced the

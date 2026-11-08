@@ -15,7 +15,7 @@ pub(crate) use audited_push::{
     publication_consent_with_client,
 };
 pub(crate) use consent::{
-    AutoConsent, PublicAnswer, answer_public_switch_on, enroll_public_destination,
+    ASKED_ENV, AutoConsent, PublicAnswer, answer_public_switch_on, enroll_public_destination,
     record_unattended, unattended,
 };
 mod preview;
@@ -817,6 +817,11 @@ pub(crate) const OVERSIZED: &str = "holds more event entries than the Hub accept
 /// How a push says that a folder's capture rule keeps a branch back, read by project capture as
 /// [`OVERSIZED`] is; the next turn meets it again.
 pub(crate) const WITHHELD_HERE: &str = "will not be uploaded from this computer";
+
+/// How an automatic push says that the folder its conversation ran in doesn't upload it by
+/// itself, read by the upload's record as [`OVERSIZED`] is.
+pub(crate) const FOLDER_KEEPS_IT: &str =
+    "is not uploaded automatically: the folder it ran in left it out, or doesn't upload by itself";
 
 /// How a push says that a session branch builds on a session withdrawn on the Hub, read by
 /// project capture as [`OVERSIZED`] is.

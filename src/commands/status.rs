@@ -1201,6 +1201,14 @@ fn print_automatic_upload_off() {
     }
 }
 
+/// The first line the push reported for `target` (`<owner/repo>@<branch>`), which `agit status`
+/// shows beside the class: only here, since every other line that tells a class goes into the
+/// conversation's transcript.
+fn said_at(target: &str) -> Option<String> {
+    let (repository, branch) = target.split_once('@')?;
+    super::upload_outcome::said(repository, branch)
+}
+
 /// [`uploads_not_through`] as `agit status` shows it.
 fn print_uploads_not_through() {
     let found = uploads_not_through();
@@ -1208,8 +1216,12 @@ fn print_uploads_not_through() {
         return;
     }
     ui::section("uploads that didn't go through");
+    let reader = super::project::Reader::of_this_process();
     for (target, undone) in &found.items {
-        println!("  {target}: {}", undone.describe());
+        println!(
+            "  {target}: {}",
+            undone.describe_for(target, reader, said_at(target).as_deref())
+        );
         println!(
             "    {}",
             ui::dim(&format!("→ inspect: `{}`", inspect_command(target)))
@@ -1226,14 +1238,19 @@ fn print_uploads_not_through() {
 /// bar reads on every poll: both answer from the same records, in the same shape.
 pub(crate) fn uploads_not_through_json() -> serde_json::Value {
     let found = uploads_not_through();
+    let reader = super::project::Reader::of_this_process();
     serde_json::json!({
-        "items": found.items.iter().map(|(target, undone)| serde_json::json!({
-            "target": target,
-            "state": undone.state(),
-            "reason": undone.reason(),
-            "description": undone.describe(),
-            "command": inspect_command(target),
-        })).collect::<Vec<_>>(),
+        "items": found.items.iter().map(|(target, undone)| {
+            let said = said_at(target);
+            serde_json::json!({
+                "target": target,
+                "state": undone.state(),
+                "reason": undone.reason(),
+                "description": undone.describe_for(target, reader, said.as_deref()),
+                "said": said,
+                "command": inspect_command(target),
+            })
+        }).collect::<Vec<_>>(),
         "unreadable": found.unreadable.iter().map(|(what, error)| serde_json::json!({
             "of": what,
             "error": error,
