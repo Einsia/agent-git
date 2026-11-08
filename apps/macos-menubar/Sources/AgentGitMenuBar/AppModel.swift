@@ -251,7 +251,7 @@ final class AppModel: ObservableObject {
             problems.append(Problem(
                 id: "not-through:\(item.target)",
                 title: "\(item.target): an upload didn't go through",
-                detail: "\(item.sentence)\nIn a terminal, \(item.command) shows what to do.",
+                detail: item.detail,
                 fix: .copy(item.command)))
         }
         if !notThroughUnreadable.isEmpty {
