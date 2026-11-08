@@ -558,10 +558,6 @@ struct Live {
     /// The note is asynchronous: while it travels, the same session may be armed again, and
     /// flipping back then erases the **new** arming — which may really have taken effect.
     danger_arm: u64,
-    /// The mode the runtime confirmed when this session opened. For a Codex conversation of a
-    /// native source, whose mode a native client can change at any time, a non-owner's turns hold
-    /// only while the thread's mode is no looser than this (`danger::require_native_mode_held`).
-    admitted_mode: Option<crate::protocol::PermissionMode>,
     /// The mode already queued that takes effect only on the **next turn** (codex's `next_turn`).
     ///
     /// It is not decoration. Deciding whether something "loosens" needs a starting point, and
@@ -733,6 +729,8 @@ enum SessionRpcOperation {
         approval_id: String,
         danger: DangerAuthorization,
         session_mode: Option<crate::protocol::PermissionMode>,
+        /// A colleague asked for the whole session and it applies once; the reply says so.
+        applied_once: bool,
     },
 }
 
@@ -1360,26 +1358,6 @@ fn project_turn_start_outcome(
                 "the harness explicitly rejected the turn; no prompt or queued mode was applied",
             )),
         ),
-        TurnStartOutcome::CodexUnconfined => (
-            SessionRpcCompletion::Turn {
-                guard_attempt,
-                accepted_mode: None,
-                confirmation: None,
-                fail_closed: false,
-                retire_generation: false,
-            },
-            Err(crate::rc::harness::CodexUnconfined::rpc_error()),
-        ),
-        TurnStartOutcome::ModeOwnerOnly { mode } => (
-            SessionRpcCompletion::Turn {
-                guard_attempt,
-                accepted_mode: None,
-                confirmation: None,
-                fail_closed: false,
-                retire_generation: false,
-            },
-            Err(crate::rc::turn_mode::ModeOwnerOnly { mode }.rpc_error()),
-        ),
         TurnStartOutcome::RetryableNotAccepted { message } => (
             SessionRpcCompletion::Turn {
                 guard_attempt,
@@ -1603,36 +1581,8 @@ fn project_approval_outcome(
     }
 }
 
-/// Whether this frame may **loosen the guard to** `mode`.
-///
-/// The test is [`PermissionMode::loosens_guard`], not `is_dangerous`: the two differ by
-/// `accept_edits` and `auto`, and in those modes claude-code **stops sending `can_use_tool`
-/// altogether** — the approval classifier is never called once. Under a test of "allow anything
-/// that is not bypass", one `session.setPermissionMode(accept_edits)` frame from an operator goes
-/// around the whole fail-closed classification, and that frame is itself entirely legal.
-///
-/// Tightening is open to anyone at any time: "you need permission to become safer" makes no
-/// sense.
-fn require_owner_to_loosen(
-    caller: Option<&crate::protocol::CallerClaim>,
-    mode: crate::protocol::PermissionMode,
-    // Which mode is current. **Loosening is relative** — `plan → default` is visible only by
-    // comparison, and the whole point of `plan` is "look, do not touch". See
-    // `PermissionMode::loosens_from`.
-    //
-    // `None` = there is no "current" yet (starting a new session): only the absolute test holds
-    // then — going from nothing to something is not loosening, but asking for `bypass` from the
-    // start is still the owner's business.
-    from: Option<crate::protocol::PermissionMode>,
-) -> Result<(), RpcError> {
-    let loosening = match from {
-        Some(from) => mode.loosens_from(from),
-        None => mode.loosens_guard(),
-    };
-    require_owner_if_loosening(caller, loosening)
-}
-
-/// The same thing, but with **the conclusion already computed**.
+/// Whether this frame may loosen how much a session asks before it acts, `loosening` already
+/// judged: only the owner may; tightening is open to anyone.
 ///
 /// The mode-change path compares strictness twice: once to decide whether this frame goes through
 /// the `Drive` or the `Brake` gate, once to decide whether it takes an owner. Computed
@@ -1652,37 +1602,6 @@ fn require_owner_if_loosening(
     )
     .with_hint(
         "in these modes the agent stops asking before it edits or runs things — that stays with the workspace owner",
-    ))
-}
-
-/// Whether this frame may **drive** this session (send a message, steer, allow an approval).
-///
-/// The test is only that **monotonic** bit: whether this session was ever handed over
-/// (`bypass`). Its context may still hold what it read unsupervised at that moment, so for the
-/// rest of its life only the owner may drive it.
-///
-/// # Why the current mode is not consulted here
-///
-/// Consulting it would mean "this session runs in `accept_edits` ⇒ only the owner may talk to
-/// it" — and `accept_edits` / `auto` are **ordinary working modes**; an owner puts a session
-/// there precisely so collaborators can push it along. Conflate "switching into this mode takes
-/// an owner" with "working in this mode takes an owner" into one test, and the second sentence
-/// shuts off this feature's common use entirely.
-///
-/// The two live in two functions so they cannot be written as one sentence again.
-fn require_owner_to_drive(
-    caller: Option<&crate::protocol::CallerClaim>,
-    session_was_dangerous: bool,
-) -> Result<(), RpcError> {
-    if !session_was_dangerous || caller.is_some_and(|c| c.is_owner()) {
-        return Ok(());
-    }
-    Err(RpcError::new(
-        ErrorCode::DangerousSessionLocked,
-        "this session has run without permission checks, so only its owner may drive it",
-    )
-    .with_hint(
-        "running with no checks is handing out an unsupervised shell on a real machine — what it read then is still in its context",
     ))
 }
 
@@ -1765,6 +1684,7 @@ fn min_role(method_name: &str) -> Role {
         | method::APPROVAL_DECIDE
         | method::SESSION_SET_MODEL
         | method::SESSION_SET_PERMISSION_MODE
+        | method::SESSION_COMMAND
         | method::SESSION_PUBLICATION_DELIVER
         | method::FS_READ_FILE => Role::Operator,
         // Codex's native queue is an independently authorized persisted inbox. It does not
@@ -1999,12 +1919,6 @@ fn map_receipt<T>(
 ) -> Result<T, RpcError> {
     match got {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(ref error)) if error.is::<crate::rc::turn_mode::ModeOwnerOnly>() => Err(error
-            .downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>()
-            .map_or_else(
-                || RpcError::new(ErrorCode::Internal, error.to_string()),
-                |refused| refused.rpc_error(),
-            )),
         Ok(Err(error)) if error.is::<crate::rc::harness::TurnNotRunning>() => {
             let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
@@ -2014,12 +1928,6 @@ fn map_receipt<T>(
             let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
             Err(classified(error, false, "fence_unsupported"))
-        }
-        Ok(Err(error)) if error.is::<crate::rc::harness::CodexUnconfined>() => {
-            Err(crate::rc::harness::CodexUnconfined::rpc_error())
-        }
-        Ok(Err(error)) if error.is::<crate::rc::harness::RuntimeCommandOwnerOnly>() => {
-            Err(crate::rc::harness::RuntimeCommandOwnerOnly::rpc_error())
         }
         Ok(Err(error)) => Err(RpcError::new(ErrorCode::Internal, error.to_string())),
         Err(_) => Err(RpcError::new(ErrorCode::Internal, "session went away")),
@@ -2212,61 +2120,18 @@ pub(crate) fn watch_stream_id(workspace_id: &str, session_id: &str) -> String {
     format!("agit-watch-{workspace_id}-{session_id}")
 }
 
-/// Why a non-owner can't send to a session working in a folder the workspace binds only through a
-/// root at or above the owner's home directory.
-const HOME_SESSION: &str =
-    "This session works in the owner's home folder, so only the owner can send to it.";
-/// The same for starting a session there.
-const HOME_PROJECT: &str =
-    "This project is the owner's home folder, so only the owner can start a session in it.";
-
 impl Daemon {
-    /// The caller's workspace roots as this caller may use them: all of them for the owner; for
-    /// anyone else, none at or above the home directory, nor any under such a root.
+    /// The caller's workspace roots: every root the workspace binds, whoever the caller is.
     fn roots_for(&self, caller: &crate::protocol::CallerClaim) -> policy::CanonicalRoots {
+        self.mirror.roots(&caller.workspace_id)
+    }
+
+    /// The roots the file preview opens files under for this caller: all of them for the owner;
+    /// for anyone else, none at or above the home directory, nor any under such a root.
+    fn preview_roots_for(&self, caller: &crate::protocol::CallerClaim) -> policy::CanonicalRoots {
         self.mirror
             .roots(&caller.workspace_id)
             .for_caller(caller.is_owner())
-    }
-
-    /// Refuses a non-owner at `cwd` when the workspace reaches it only through a root at or above
-    /// the home directory, with `text`. A folder outside every bound root is left to the check
-    /// that follows, as before.
-    fn refuse_home_folder(
-        &self,
-        caller: &crate::protocol::CallerClaim,
-        cwd: &std::path::Path,
-        text: &'static str,
-    ) -> Result<(), RpcError> {
-        self.refuse_home_folder_at(caller, Some(cwd), text)
-    }
-
-    /// [`Self::refuse_home_folder`] where the folder may be unknown, which counts as the home
-    /// folder whenever the workspace binds one.
-    fn refuse_home_folder_at(
-        &self,
-        caller: &crate::protocol::CallerClaim,
-        cwd: Option<&std::path::Path>,
-        text: &'static str,
-    ) -> Result<(), RpcError> {
-        if caller.is_owner() {
-            return Ok(());
-        }
-        let roots = self.mirror.roots(&caller.workspace_id);
-        let home = match cwd {
-            Some(cwd) => policy::home_folder_only(cwd, &roots),
-            None => roots != self.roots_for(caller),
-        };
-        if !home {
-            return Ok(());
-        }
-        let mut error = RpcError::new(ErrorCode::Forbidden, text);
-        error.data = Some(serde_json::json!({
-            "outcome": "not_sent",
-            "retryable": false,
-            "reason": "home_folder"
-        }));
-        Err(error)
     }
 }
 
@@ -2300,15 +2165,6 @@ enum Need {
     Brake,
     /// Send a message, steer, allow an approval. Also passes the danger gate.
     Drive,
-}
-
-/// Which turn a non-owner's words would enter, for `Daemon::require_turn_mode`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TurnInput {
-    /// A new turn, or a message queued for one: it runs in the mode the next turn starts in.
-    Start,
-    /// The running turn: it runs in that turn's mode now.
-    Steer,
 }
 
 /// The hub's `agent` / `branch` → one **validated** lineage.

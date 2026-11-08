@@ -147,15 +147,6 @@ impl<T> Ticket<T> {
         Ok(())
     }
 
-    /// A non-owner's words enter only a turn that runs in Default or Plan (`rc::turn_mode`).
-    pub(crate) fn check_turn_mode(
-        &self,
-        mode: Option<crate::protocol::PermissionMode>,
-    ) -> crate::Result<()> {
-        super::turn_mode::require(self.owner_control, mode)?;
-        Ok(())
-    }
-
     /// Called once on dequeue. `false` = the caller has already abandoned it, **do not
     /// execute**.
     pub fn accept(&self) -> bool {

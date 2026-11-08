@@ -38,8 +38,6 @@
 //!
 //! So "add a new resume path" either asks the transcript or does not compile / does not launch.
 
-use super::{RpcError, require_owner_to_drive};
-use crate::protocol::PermissionMode;
 use crate::rc::roster::Roster;
 use std::path::Path;
 
@@ -136,78 +134,44 @@ fn transcript_records_unchecked(runtime: &str, thread_id: &str, cwd: &str) -> bo
     read(&transcript).unwrap_or(true)
 }
 
-pub(super) use crate::rc::native_settings::require_mode_held as require_native_mode_held;
-
-/// The mode a resume starts in for `caller`, from the mode the conversation would restart in.
-/// The owner gets it back as it was. Anyone else starts in Default, or in Plan when Plan was the
-/// last mode: never Auto or AcceptEdits, which would let a non-owner run tools the owner chose to
-/// stop approving, and never a looser mode than Default. The daemon decides this from the caller
-/// it authenticated and the mode it recorded, not from anything the request names.
-pub(super) fn resume_mode(
-    caller: &crate::protocol::CallerClaim,
-    last: Option<PermissionMode>,
-) -> Option<PermissionMode> {
-    if caller.is_owner() {
-        return last;
-    }
-    Some(match last {
-        Some(PermissionMode::Plan) => PermissionMode::Plan,
-        _ => PermissionMode::Default,
-    })
-}
-
-/// Ask + judge the caller: whether handing a transcript **to this caller** is allowed.
-///
-/// Resuming a session that once ran with no approvals is owner-only — its context may still
-/// hold what it read unsupervised then, and `--resume` loads all of it back into the model.
-///
-/// The two (looking history up by transcript + the owner test) are tied into one function so
-/// that one test can pin both: split apart, quietly switching the call site back to "ask only
-/// about my own row" turns no test red, and that step is the one that hands unchecked context
-/// to the operator.
+/// Ask, for a launch that hands this transcript to a session: the verdict carries the monotonic
+/// bit into the session it starts, whoever asked for it.
 pub(super) fn authorize(
     roster: &Roster,
-    caller: &crate::protocol::CallerClaim,
     runtime: &str,
     thread_id: &str,
     workspace_id: &str,
     cwd: &str,
-) -> Result<TranscriptDanger, RpcError> {
-    let danger = judge(roster, runtime, thread_id, workspace_id, cwd);
-    require_owner_to_drive(Some(caller), danger.ever_dangerous())?;
-    Ok(TranscriptDanger {
+) -> TranscriptDanger {
+    TranscriptDanger {
         authorized: true,
-        ..danger
-    })
+        ..judge(roster, runtime, thread_id, workspace_id, cwd)
+    }
 }
 
-/// Ask + judge the caller for a Codex conversation of a native source, located at `transcript`.
+/// [`authorize`] for a Codex conversation of a native source in `workspace_id`, located at
+/// `transcript`.
 /// It ran unchecked if the ledger says so, if its current mode is Bypass or unknown, or if any
 /// turn its rollout records ran outside a workspace-write or read-only sandbox, whatever mode it
 /// is in now: a conversation switched back to Default still holds what it read with full access.
 /// A rollout that cannot be read counts as unchecked.
 pub(super) fn authorize_source(
     roster: &Roster,
-    caller: &crate::protocol::CallerClaim,
+    workspace_id: &str,
     source: &str,
     thread: &str,
     cwd: &str,
     transcript: &Path,
     mode: Option<crate::protocol::PermissionMode>,
-) -> Result<TranscriptDanger, RpcError> {
-    let dangerous = roster.transcript_ever_dangerous_in(
-        "codex",
-        Some(source),
-        thread,
-        &caller.workspace_id,
-        cwd,
-    ) || mode.is_none_or(|mode| mode == crate::protocol::PermissionMode::Bypass)
-        || crate::rc::native_settings::codex_ran_unchecked(transcript).unwrap_or(true);
-    require_owner_to_drive(Some(caller), dangerous)?;
-    Ok(TranscriptDanger {
+) -> TranscriptDanger {
+    let dangerous =
+        roster.transcript_ever_dangerous_in("codex", Some(source), thread, workspace_id, cwd)
+            || mode.is_none_or(|mode| mode == crate::protocol::PermissionMode::Bypass)
+            || crate::rc::native_settings::codex_ran_unchecked(transcript).unwrap_or(true);
+    TranscriptDanger {
         judged: Some(dangerous),
         authorized: true,
-    })
+    }
 }
 
 /// Stamp the judged bit into this session.

@@ -64,8 +64,8 @@ impl Default for SteerQueue {
 }
 
 impl Session {
-    /// A steer into a running turn on a terminal whose plugin can hold it for the next tool step.
-    /// An owner's waits there; anyone else's starts the next turn.
+    /// A steer into a running turn on a terminal whose plugin can hold it for the next tool step:
+    /// it waits there, whoever sent it.
     pub(super) async fn steer_at_step(&mut self, message: String, pending: PendingSteerCommand) {
         let queued = QueuedTurn {
             message,
@@ -83,10 +83,9 @@ impl Session {
             .client_msg_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let recorded = queued.owner
-            && conversation.as_deref().is_some_and(|conversation| {
-                step_delivery::record(conversation, &record, &framed).is_ok()
-            });
+        let recorded = conversation.as_deref().is_some_and(|conversation| {
+            step_delivery::record(conversation, &record, &framed).is_ok()
+        });
         let Some(conversation) = conversation.filter(|_| recorded) else {
             if self.steer_queue.waiting.len() >= MAX_WAITING {
                 self.resolve_steer(
@@ -210,14 +209,6 @@ impl Session {
         if queued.authority.check().is_err() {
             return Some("access_ended");
         }
-        if crate::rc::turn_mode::require(queued.owner, self.driver.turn_mode(true)).is_err() {
-            return Some("mode_owner_only");
-        }
-        if !queued.owner
-            && crate::rc::policy::home_folder_only(&self.cwd, &self.confinement.borrow().roots)
-        {
-            return Some("home_folder");
-        }
         None
     }
 
@@ -233,7 +224,6 @@ impl Session {
             )) => {
                 return;
             }
-            Ok(Ok(TurnStartOutcome::ModeOwnerOnly { .. })) => "mode_owner_only",
             Ok(_) => "not_sent",
             // Never taken: the request's authority no longer admitted it.
             Err(_) => "access_ended",
@@ -359,11 +349,11 @@ mod tests {
     }
 
     /// A message that waited for the next turn is admitted by the session's gates as they stand
-    /// when it goes, not as they stood when it came: a non-owner's is dropped, and its sender
-    /// told, when the sender's access ended meanwhile, when the session works in the owner's home
-    /// folder, or when the next turn runs in a mode only the owner may use (here Auto, set after
-    /// the message was taken); the owner's goes on as a Turn command. A queue that kept the
-    /// answer a message got on arrival would carry a non-owner's words into an Auto turn.
+    /// when it goes, not as they stood when it came: one whose sender's access ended meanwhile is
+    /// dropped, and its sender told. A colleague's goes on as the owner's does, in the owner's home
+    /// folder and in whatever mode the next turn runs in (here Auto, set after the message was
+    /// taken). A queue that kept the answer a message got on arrival would carry words in after
+    /// their sender's access ended.
     #[tokio::test]
     async fn a_waiting_message_is_admitted_by_the_gates_as_they_stand_when_it_goes() {
         let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
@@ -396,14 +386,12 @@ mod tests {
             session.steer_queue.waiting.push_back(message);
         }
         access.store(false, Ordering::SeqCst);
-        assert_eq!(turn_message(session.next_queued_turn().await), "owner");
+        assert_eq!(turn_message(session.next_queued_turn().await), "home");
         assert_eq!(
             dropped(&mut out),
-            [
-                ("revoked".to_owned(), "access_ended".to_owned()),
-                ("home".to_owned(), "home_folder".to_owned()),
-            ]
+            [("revoked".to_owned(), "access_ended".to_owned())]
         );
+        assert_eq!(turn_message(session.next_queued_turn().await), "owner");
 
         // The next turn's mode changes to Auto after the message was taken.
         let project = tempfile::tempdir().unwrap();
@@ -418,11 +406,8 @@ mod tests {
             session.driver.set_permission_mode(M::Auto).await,
             Ok(crate::protocol::PermissionApply::NextTurn)
         ));
-        assert!(session.next_queued_turn().await.is_none());
-        assert_eq!(
-            dropped(&mut out),
-            [("auto".to_owned(), "mode_owner_only".to_owned())]
-        );
+        assert_eq!(turn_message(session.next_queued_turn().await), "auto");
+        assert!(dropped(&mut out).is_empty());
         session.driver.shutdown().await.unwrap();
     }
 }

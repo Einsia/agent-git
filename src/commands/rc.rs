@@ -291,21 +291,6 @@ pub(crate) fn grant(args: GrantArgs) -> CmdResult {
         "operators of {} can now answer `{}` themselves",
         args.workspace, args.command
     ));
-    // A grant covers the repository as it stands now, including what an operator changed.
-    match crate::rc::operator_changes::clear(&args.workspace) {
-        Ok(false) => {}
-        Ok(true) => ui::success(
-            "Operators can run your granted commands in this workspace again; an operator's file \
-             change had paused them.",
-        ),
-        Err(error) => {
-            ui::error(&format!(
-                "an operator's file change still pauses your granted commands in this workspace, \
-                 since it could not be cleared: {error:#}"
-            ));
-            return Ok(ExitCode::Precondition);
-        }
-    }
     ui::hint("it applies to sessions already running — the daemon re-reads this on every approval");
     Ok(ExitCode::Ok)
 }

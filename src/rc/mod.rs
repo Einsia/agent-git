@@ -104,7 +104,6 @@ pub(crate) mod native_inbox;
 pub(crate) mod native_queue;
 mod native_settings;
 pub(crate) mod navigation;
-pub(crate) mod operator_changes;
 pub mod outbound;
 pub mod peers;
 pub mod policy;
@@ -121,7 +120,6 @@ pub mod tail;
 pub mod terminal;
 pub mod ticket;
 pub mod tunnel;
-pub(crate) mod turn_mode;
 #[cfg(windows)]
 pub(crate) mod windows_job;
 pub(crate) mod writer_release;

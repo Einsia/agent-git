@@ -1270,14 +1270,14 @@ fn shared_native_settings_are_generation_fenced_and_durably_dangerous() {
     });
 }
 
-/// A project bound at the home directory confines nothing for a non-owner, wherever the bound
-/// roots are used: the file preview refuses a dot-file there, neither the local session list, the
-/// catalog nor a watch reaches it, and no session starts, resumes, is taken over or gets a message
-/// there. The owner gets each as before. A child process, so the home directory can be a folder of the test's own.
+/// A project bound at the home directory takes a colleague as it takes the owner: the local
+/// session list, the catalog and a watch reach it, and a session starts, resumes, is taken over and
+/// gets a message there with the owner's answer. Only the file preview, an action on the machine
+/// itself, still refuses a colleague a dot-file there. A child process, so the home directory can
+/// be a folder of the test's own.
 #[test]
-fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
-    const NAME: &str =
-        "rc::daemon::tests::guards::a_project_bound_at_the_home_directory_is_the_owners_alone";
+fn a_project_bound_at_the_home_directory_takes_a_colleague_as_the_owner() {
+    const NAME: &str = "rc::daemon::tests::guards::a_project_bound_at_the_home_directory_takes_a_colleague_as_the_owner";
     if std::env::var_os("AGIT_HOME_ROOT_TEST").is_none() {
         let home = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1301,50 +1301,54 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
         .build()
         .unwrap()
         .block_on(async {
-            let (tx, _rx) = mpsc::channel(1);
-            let mut live =
-                rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
-            live.info.runtime = "claude-code".into();
-            let mut roster = Roster::default();
-            roster
-                .record(
-                    "session-a",
-                    serde_json::from_value(serde_json::json!({
-                        "runtime": "claude-code",
-                        "thread_id": "native-a",
-                        "cwd": home,
-                        "workspace_id": "ws-a",
-                        "project_id": "home",
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
-            roster
-                .record(
-                    "session-b",
-                    serde_json::from_value(serde_json::json!({
-                        "runtime": "claude-code",
-                        "thread_id": "native-b",
-                        "cwd": home,
-                        "workspace_id": "ws-a",
-                        "project_id": "home",
-                        "ever_dangerous": false,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
-            let daemon = rpc_test_daemon([("session-a".into(), live)].into(), roster);
-            let mut state = daemon.lock().await;
-            state.mirror.bind("ws-a", "home", &home).unwrap();
-            let (frames, _frames_rx) = mpsc::channel(4);
-            let native = uuid::Uuid::new_v4().to_string();
-            let home_folder = |error: &RpcError| {
-                error
-                    .data
-                    .as_ref()
-                    .is_some_and(|data| data["reason"] == "home_folder")
+            let answer = |error: Option<RpcError>| {
+                error.map(|error| {
+                    (
+                        error.code,
+                        error.data.and_then(|data| data.get("reason").cloned()),
+                    )
+                })
             };
+            let mut answers = std::collections::BTreeMap::new();
             for role in ["operator", "owner"] {
+                let mut answered = Vec::new();
+                let (tx, _rx) = mpsc::channel(1);
+                let mut live =
+                    rpc_test_live("session-a", 1, tx, crate::protocol::PermissionMode::Default);
+                live.info.runtime = "claude-code".into();
+                let mut roster = Roster::default();
+                roster
+                    .record(
+                        "session-a",
+                        serde_json::from_value(serde_json::json!({
+                            "runtime": "claude-code",
+                            "thread_id": "native-a",
+                            "cwd": home,
+                            "workspace_id": "ws-a",
+                            "project_id": "home",
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                roster
+                    .record(
+                        "session-b",
+                        serde_json::from_value(serde_json::json!({
+                            "runtime": "claude-code",
+                            "thread_id": "native-b",
+                            "cwd": home,
+                            "workspace_id": "ws-a",
+                            "project_id": "home",
+                            "ever_dangerous": false,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let daemon = rpc_test_daemon([("session-a".into(), live)].into(), roster);
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "home", &home).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(4);
+                let native = uuid::Uuid::new_v4().to_string();
                 let owner = role == "owner";
                 let mut read = Frame::request(
                     method::FS_READ_FILE,
@@ -1359,7 +1363,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                     serde_json::json!({"workspace_id": "ws-a", "include_local": true}),
                 );
                 let roots = state.prepare_session_list(&list).unwrap().roots;
-                assert_eq!(roots.is_empty(), !owner, "{role}");
+                assert!(!roots.is_empty(), "{role}");
 
                 let start: SessionStart = serde_json::from_value(serde_json::json!({
                     "workspace_id": "ws-a", "project_id": "home", "runtime": "claude-code",
@@ -1373,7 +1377,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                         &Default::default(),
                     )
                     .err();
-                assert_eq!(started.as_ref().is_some_and(home_folder), !owner, "{role}");
+                answered.push(answer(started));
 
                 for params in [
                     serde_json::json!({"workspace_id": "ws-a"}),
@@ -1383,11 +1387,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                     catalog.caller = Some(claim(role, "ws-a"));
                     let catalog = state.prepare_catalog(&catalog).unwrap();
                     let (workspace, listed) = catalog.roots();
-                    assert_eq!(
-                        (workspace.is_empty(), listed.is_empty()),
-                        (!owner, !owner),
-                        "{role}"
-                    );
+                    assert!(!workspace.is_empty() && !listed.is_empty(), "{role}");
                 }
 
                 let mut watch = Frame::request(
@@ -1396,7 +1396,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                 );
                 watch.caller = Some(claim(role, "ws-a"));
                 let watch = state.prepare_watch_scan(&watch).unwrap();
-                assert_eq!(watch.roots().is_empty(), !owner, "{role}");
+                assert!(!watch.roots().is_empty(), "{role}");
 
                 let resume: SessionResume = serde_json::from_value(serde_json::json!({
                     "workspace_id": "ws-a", "session_id": "session-b", "prompt": "hello",
@@ -1410,11 +1410,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                         &Default::default(),
                     )
                     .err();
-                assert_eq!(
-                    resumed.as_ref().is_some_and(home_folder),
-                    !owner,
-                    "{role}: {resumed:?}"
-                );
+                answered.push(answer(resumed));
 
                 let resume: SessionResume = serde_json::from_value(serde_json::json!({
                     "workspace_id": "ws-a", "session_id": "native-c", "prompt": "hello",
@@ -1431,11 +1427,7 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                 let taken = state
                     .prepare_local_takeover(located, resume, &claim(role, "ws-a"), &frames)
                     .err();
-                assert_eq!(
-                    taken.as_ref().is_some_and(home_folder),
-                    !owner,
-                    "{role}: {taken:?}"
-                );
+                answered.push(answer(taken));
 
                 let mut enqueue = Frame::request(
                     method::SESSION_ENQUEUE,
@@ -1458,16 +1450,54 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                     likely_active: false,
                 };
                 let queued = state.prepare_native_inbox(&enqueue, Some(local)).err();
-                assert_eq!(
-                    queued.as_ref().is_some_and(home_folder),
-                    !owner,
-                    "{role}: {queued:?}"
-                );
+                answered.push(answer(queued));
 
                 let mut turn = rpc_turn_frame("session-a");
                 turn.caller = Some(claim(role, "ws-a"));
                 let sent = state.prepare_session_rpc(&turn).err();
-                assert_eq!(sent.as_ref().is_some_and(home_folder), !owner, "{role}");
+                answered.push(answer(sent));
+                answers.insert(role, answered);
             }
+            assert_eq!(answers["operator"], answers["owner"]);
         });
+}
+
+/// A colleague's "allow for this session" on a card whose session effect changes the permission
+/// mode is applied once: it goes ahead as an ordinary answer, where the owner's same answer waits
+/// for the sticky mode change to be made durable first. A colleague's answer was refused outright
+/// before; one that went through as sticky would hand them the owner's mode setting.
+#[tokio::test]
+async fn a_colleagues_session_wide_allow_applies_once() {
+    use crate::protocol::{ApprovalDecision, ApprovalResponse, ApprovalScope, PermissionMode};
+    for (role, sticky) in [("operator", false), ("owner", true)] {
+        let (approval_tx, _approval_rx) = mpsc::channel(1);
+        let mut approval_live = rpc_test_live("session-a", 1, approval_tx, PermissionMode::Default);
+        approval_live.info.runtime = "claude-code".into();
+        approval_live
+            .approval_requests
+            .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
+        let daemon = rpc_test_daemon(
+            [("session-a".into(), approval_live)].into_iter().collect(),
+            Roster::default(),
+        );
+        let mut approval = Frame::request(
+            method::APPROVAL_DECIDE,
+            ApprovalResponse {
+                approval_id: "approval-1".into(),
+                session_id: "session-a".into(),
+                decision: ApprovalDecision::Allow,
+                scope: ApprovalScope::Session,
+                message: None,
+                answers: None,
+                by: Some(role.into()),
+            },
+        );
+        approval.caller = Some(claim(role, "ws-a"));
+        let prepared = daemon.lock().await.prepare_session_rpc_or_wait(&approval);
+        match prepared {
+            Ok(SessionRpcPreparation::AwaitingDurableGuardRow(_)) => assert!(sticky, "{role}"),
+            Ok(SessionRpcPreparation::Ready(_)) => assert!(!sticky, "{role}"),
+            Err(error) => panic!("{role}: {error:?}"),
+        }
+    }
 }

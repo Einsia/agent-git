@@ -22,44 +22,6 @@ fn instruction(command: &Command) -> bool {
 }
 
 impl Session {
-    /// A non-owner's turn, steer or queued message into a Codex conversation is refused with
-    /// the typed `CodexUnconfined`, in every permission mode; `None` when it was. Codex can't
-    /// confine a turn (reads, environment, MCP tools run outside its sandbox).
-    pub(super) fn refuse_unconfined(&mut self, command: Command) -> Option<Command> {
-        if !matches!(self.driver, AnyDriver::Codex(_)) {
-            return Some(command);
-        }
-        match command {
-            Command::Turn { reply, .. } if !reply.owner_control() => {
-                reply.finish(Ok(TurnStartOutcome::CodexUnconfined));
-                None
-            }
-            Command::Steer { reply, .. } if !reply.owner_control() => {
-                reply.finish(Err(crate::rc::harness::CodexUnconfined.into()));
-                None
-            }
-            Command::Enqueue { reply, .. } if !reply.owner_control() => {
-                reply.finish(Err(crate::rc::harness::CodexUnconfined.into()));
-                None
-            }
-            command => Some(command),
-        }
-    }
-
-    /// A non-owner's runtime command is refused with the typed `RuntimeCommandOwnerOnly`, on
-    /// every runtime and whatever the session's mode; `None` when it was. `session.command` is
-    /// owner-only at the RPC, so this holds only what reaches the session another way: approving
-    /// a denied action, uploading the thread as feedback or changing memories acts as the owner.
-    pub(super) fn refuse_owner_only_command(&mut self, command: Command) -> Option<Command> {
-        match command {
-            Command::Runtime { reply, .. } if !reply.owner_control() => {
-                reply.finish(Err(crate::rc::harness::RuntimeCommandOwnerOnly.into()));
-                None
-            }
-            command => Some(command),
-        }
-    }
-
     pub(super) async fn prepare_fallback_instruction(
         &mut self,
         command: &Command,
@@ -114,31 +76,15 @@ impl Session {
     }
 
     fn check_control_instruction(&self, command: &Command) -> crate::Result<()> {
-        let requires_owner = self.info.dangerous || !self.driver.permission_mode_known();
-        // A non-owner's words run only in a Default or Plan turn, judged again here against the
-        // driver's mode at delivery: a mode switched after the RPC's check is caught. The order
-        // is the request's authority, then the mode rule, then the owner check: a caller whose
-        // access is gone is told that, never which mode the conversation runs in, and a non-owner
-        // refused for the mode (an unknown one included) gets that refusal, not the generic owner
-        // check.
+        // Words go in from anyone whose access holds; the model is a setting, the owner's while
+        // the session ever ran unchecked or its mode can't be read.
         match command {
-            Command::Turn { reply, .. } => {
-                reply.check_authority()?;
-                reply.check_turn_mode(self.driver.turn_mode(true))?;
-                reply.check_control(requires_owner)
-            }
-            Command::Steer { reply, .. } => {
-                reply.check_authority()?;
-                reply.check_turn_mode(self.driver.turn_mode(false))?;
-                reply.check_control(requires_owner)
-            }
-            Command::Enqueue { reply, .. } => {
-                reply.check_authority()?;
-                reply.check_turn_mode(self.driver.turn_mode(true))?;
-                reply.check_control(requires_owner)
-            }
-            Command::Model { reply, .. } | Command::Runtime { reply, .. } => {
-                reply.check_control(requires_owner)
+            Command::Turn { reply, .. } => reply.check_control(false),
+            Command::Steer { reply, .. } => reply.check_control(false),
+            Command::Enqueue { reply, .. } => reply.check_control(false),
+            Command::Runtime { reply, .. } => reply.check_control(false),
+            Command::Model { reply, .. } => {
+                reply.check_control(self.info.dangerous || !self.driver.permission_mode_known())
             }
             Command::Interrupt { reply, .. } => reply.check_control(false),
             Command::Approve { reply, .. } => reply.check_control(false),
@@ -222,10 +168,6 @@ impl Session {
         }
         match command {
             Command::Turn { reply, .. } => {
-                if let Some(refused) = error.downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>() {
-                    reply.finish(Ok(TurnStartOutcome::ModeOwnerOnly { mode: refused.mode }));
-                    return;
-                }
                 reply.finish(Ok(TurnStartOutcome::RetryableNotAccepted {
                     message: format!(
                         "Could not reconnect native control; no message was sent: {error}"
@@ -500,8 +442,18 @@ mod tests {
         };
         assert!(instruction(&turn));
         session.check_control_instruction(&turn).unwrap();
+        // A colleague's words still go into a session that once ran without checks; switching
+        // its model stays the owner's.
         session.info.dangerous = true;
-        assert!(session.check_control_instruction(&turn).is_err());
+        session.check_control_instruction(&turn).unwrap();
+        let model = Command::Model {
+            model: Some(crate::rc::harness::models::ModelPatch {
+                model: Some(Some("other".into())),
+                effort: None,
+            }),
+            reply: crate::rc::ticket::ticket().0.with_control_ceiling(false),
+        };
+        assert!(session.check_control_instruction(&model).is_err());
         let brake = Command::Interrupt {
             expected_turn_id: None,
             reply: crate::rc::ticket::ticket().0.with_control_ceiling(false),
@@ -510,132 +462,11 @@ mod tests {
         session.driver.shutdown().await.unwrap();
     }
 
-    /// Pins the delivery half of the non-owner mode rule (`rc::turn_mode`): the supervisor judges
-    /// a non-owner's turn and queued message by the mode the next turn starts in, and a steer by
-    /// the running turn's, against the driver as it delivers. The owner queues Auto for the next
-    /// turn after the operator's RPC passed: the operator's turn and queued message are refused
-    /// with a typed `ModeOwnerOnly` outcome (so the reply says `not_sent`), the steer into the
-    /// running Default turn still goes, and the owner's turn goes. A supervisor that trusted the
-    /// RPC's check sent the operator's words into an Auto turn.
+    /// A non-owner's turn and steer go through at delivery while their access holds, whatever
+    /// mode the turn runs in, here Auto; once the access is revoked between the RPC and delivery
+    /// both are refused for it.
     #[tokio::test]
-    async fn a_mode_switched_after_the_rpc_is_judged_again_at_delivery() {
-        use crate::protocol::PermissionMode as M;
-        let mut driver =
-            crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
-        assert!(matches!(
-            driver.set_permission_mode(M::Auto).await,
-            Ok(crate::protocol::PermissionApply::NextTurn)
-        ));
-        let (mut session, _output, _notes) =
-            super::super::tests::harness_test_session_with_channels(
-                AnyDriver::Codex(Box::new(driver)),
-                "codex",
-                SessionStatus::Idle,
-            );
-        let turn = |owner: bool| {
-            let (ticket, receipt) = crate::rc::ticket::ticket();
-            (
-                Command::Turn {
-                    message: "instruction".into(),
-                    attribution: Default::default(),
-                    guard_attempt: None,
-                    reply: ticket.with_control_ceiling(owner),
-                },
-                receipt,
-            )
-        };
-        let steer = Command::Steer {
-            message: "instruction".into(),
-            attribution: Default::default(),
-            reply: crate::rc::ticket::ticket().0.with_control_ceiling(false),
-        };
-        session.check_control_instruction(&steer).unwrap();
-        let (owners, _) = turn(true);
-        session.check_control_instruction(&owners).unwrap();
-
-        let (operators, mut receipt) = turn(false);
-        let error = session.check_control_instruction(&operators).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>(),
-            Some(&crate::rc::turn_mode::ModeOwnerOnly {
-                mode: Some(M::Auto)
-            })
-        );
-        session.reject_fallback_instruction(operators, error).await;
-        assert_eq!(
-            receipt
-                .wait(Duration::from_secs(1))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            TurnStartOutcome::ModeOwnerOnly {
-                mode: Some(M::Auto)
-            }
-        );
-        session.driver.shutdown().await.unwrap();
-    }
-
-    /// Pins that a non-owner refused at delivery because the mode can't be read gets the typed
-    /// mode refusal, not the generic owner check: the turn comes back as `ModeOwnerOnly` (so the
-    /// reply says Forbidden, `not_sent`, not retryable) and the steer and queued message as a
-    /// `ModeOwnerOnly` error. The owner's instructions pass the mode check and meet the owner
-    /// check as before. Asking the owner check first turned this into a retryable busy turn and
-    /// an internal error.
-    #[tokio::test]
-    async fn an_unknown_mode_at_delivery_is_refused_as_the_mode_rule() {
-        let mut driver =
-            crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
-        driver.set_test_mode_unknown();
-        let (mut session, _output, _notes) =
-            super::super::tests::harness_test_session_with_channels(
-                AnyDriver::Codex(Box::new(driver)),
-                "codex",
-                SessionStatus::Idle,
-            );
-        let unknown = crate::rc::turn_mode::ModeOwnerOnly { mode: None };
-        let steer = |owner: bool| Command::Steer {
-            message: "instruction".into(),
-            attribution: Default::default(),
-            reply: crate::rc::ticket::ticket().0.with_control_ceiling(owner),
-        };
-        let error = session
-            .check_control_instruction(&steer(false))
-            .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>(),
-            Some(&unknown)
-        );
-        assert!(session.check_control_instruction(&steer(true)).is_ok());
-
-        let (ticket, mut receipt) = crate::rc::ticket::ticket();
-        let turn = Command::Turn {
-            message: "instruction".into(),
-            attribution: Default::default(),
-            guard_attempt: None,
-            reply: ticket.with_control_ceiling(false),
-        };
-        let error = session.check_control_instruction(&turn).unwrap_err();
-        session.reject_fallback_instruction(turn, error).await;
-        assert_eq!(
-            receipt
-                .wait(Duration::from_secs(1))
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            TurnStartOutcome::ModeOwnerOnly { mode: None }
-        );
-        session.driver.shutdown().await.unwrap();
-    }
-
-    /// Pins the order at delivery: a non-owner whose access was revoked between the RPC and
-    /// delivery gets the authority refusal, not `mode_owner_only` naming the mode the
-    /// conversation runs in. With access intact the same instruction meets the mode rule. Asking
-    /// the mode rule before the authority told a caller who no longer had access which mode the
-    /// conversation ran in.
-    #[tokio::test]
-    async fn revoked_access_at_delivery_is_refused_before_the_mode_rule() {
+    async fn a_non_owners_words_are_delivered_while_their_access_holds() {
         use crate::protocol::PermissionMode as M;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -678,26 +509,12 @@ mod tests {
                 },
             ]
         };
-        // With access intact, the turn (next turn: Auto) meets the mode rule and the steer
-        // (running turn: Default) goes through.
-        let [turn, steer] = commands();
-        let error = session.check_control_instruction(&turn).unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>(),
-            Some(&crate::rc::turn_mode::ModeOwnerOnly {
-                mode: Some(M::Auto)
-            })
-        );
-        assert!(session.check_control_instruction(&steer).is_ok());
+        for command in commands() {
+            session.check_control_instruction(&command).unwrap();
+        }
         admitted.store(false, Ordering::SeqCst);
         for command in commands() {
             let error = session.check_control_instruction(&command).unwrap_err();
-            assert!(
-                error
-                    .downcast_ref::<crate::rc::turn_mode::ModeOwnerOnly>()
-                    .is_none(),
-                "revoked access must not be told the mode: {error}"
-            );
             assert!(error.to_string().contains("authority"), "{error}");
         }
         let mut session = session;

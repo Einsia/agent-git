@@ -130,17 +130,6 @@ impl Daemon {
         if live.ended || live.generation != generation {
             return Err(no_such_session(&session_id));
         }
-        if matches!(
-            f.method(),
-            method::TURN_START | method::TURN_STEER | method::SESSION_ENQUEUE
-        ) {
-            crate::rc::harness::CodexUnconfined::check(&live.info.runtime, caller_is_owner)?;
-            let cwd = self
-                .roster
-                .get(&session_id)
-                .map(|entry| PathBuf::from(&entry.cwd));
-            self.refuse_home_folder_at(&caller, cwd.as_deref(), super::HOME_SESSION)?;
-        }
         if matches!(f.method(), method::TURN_START | method::TURN_STEER)
             && let Some(error) = self.lease_refusal(&session_id)
         {
@@ -166,7 +155,6 @@ impl Daemon {
                     .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
                 require_same_workspace(&caller, &session_id, &request.workspace_id)?;
                 let d = self.session_channel(&session_id, &caller, Need::Drive)?;
-                self.require_turn_mode(&session_id, &caller, TurnInput::Start)?;
                 let source = live.info.native_source.clone().ok_or_else(|| {
                     RpcError::new(
                         ErrorCode::RuntimeUnavailable,
@@ -208,7 +196,6 @@ impl Daemon {
                     SessionRpcOperation::Value {
                         tx: d.tx,
                         command: Command::Enqueue {
-                            caller_is_owner: caller.is_owner(),
                             request: crate::rc::native_queue::Request {
                                 source,
                                 native_id,
@@ -285,7 +272,6 @@ impl Daemon {
                 let p: TurnStart = f.params_as()?;
                 // `Drive`: adding model input spends the session's capability.
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                self.require_turn_mode(&p.session_id, &caller, TurnInput::Start)?;
                 // Arm before the command can enter the supervisor queue. From
                 // this point through native write, notification inference, and
                 // a late exact response, every crash restarts as Plan until
@@ -314,7 +300,6 @@ impl Daemon {
             method::TURN_STEER => {
                 let p: TurnSteer = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
-                self.require_turn_mode(&p.session_id, &caller, TurnInput::Steer)?;
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 (
                     SessionRpcOperation::Steer {
@@ -412,7 +397,17 @@ impl Daemon {
                 )
             }
             method::APPROVAL_DECIDE => {
-                let p: crate::protocol::ApprovalResponse = f.params_as()?;
+                let mut p: crate::protocol::ApprovalResponse = f.params_as()?;
+                let mut applied_once = false;
+                // A colleague's "allow for this session" changes the session's permission mode,
+                // a setting that stays the owner's: it is applied once. Every session answer
+                // changes the mode here: a card offers one only for a single `setMode`
+                // suggestion, and one with no mode effect is refused below for anyone. A card
+                // that offered it for added rules alone would let a colleague's go through.
+                if !caller.is_owner() && p.scope == crate::protocol::ApprovalScope::Session {
+                    p.scope = crate::protocol::ApprovalScope::Once;
+                    applied_once = p.decision == crate::protocol::ApprovalDecision::Allow;
+                }
                 let need = match p.decision {
                     crate::protocol::ApprovalDecision::Allow => Need::Drive,
                     crate::protocol::ApprovalDecision::Deny => Need::Brake,
@@ -425,7 +420,6 @@ impl Daemon {
                         crate::protocol::ApprovalScope::Session
                     )
                 );
-                require_owner_if_loosening(Some(&caller), changes_session_policy)?;
                 let suggested_mode = changes_session_policy
                     .then(|| {
                         self.sessions.get(&p.session_id).and_then(|live| {
@@ -477,6 +471,7 @@ impl Daemon {
                         approval_id,
                         danger,
                         session_mode: suggested_mode,
+                        applied_once,
                     },
                     changes_session_policy,
                 )
@@ -1682,6 +1677,7 @@ impl PreparedSessionRpc {
                 approval_id,
                 danger,
                 session_mode,
+                applied_once,
             } => {
                 if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
                 {
@@ -1717,7 +1713,7 @@ impl PreparedSessionRpc {
                                     );
                                     return std::future::pending::<ExecutedSessionRpc>().await;
                                 };
-                                projected
+                                applied_once_reply(projected, applied_once)
                             }
                             Err(error) => match reply.abandon() {
                                 crate::rc::ticket::Abandon::NeverRan => (
@@ -1828,4 +1824,19 @@ impl PreparedSessionRpc {
             pending.finish(daemon).await;
         }
     }
+}
+
+/// An answer a colleague gave for the whole session, applied once: its reply says so, so the Hub
+/// can tell them.
+fn applied_once_reply(
+    (completion, response): (SessionRpcCompletion, Result<serde_json::Value, RpcError>),
+    applied_once: bool,
+) -> (SessionRpcCompletion, Result<serde_json::Value, RpcError>) {
+    let response = response.map(|mut value| {
+        if applied_once && let Some(fields) = value.as_object_mut() {
+            fields.insert("scope_applied".into(), serde_json::json!("once"));
+        }
+        value
+    });
+    (completion, response)
 }

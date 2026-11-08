@@ -290,11 +290,13 @@ pub fn prompt_of<'a>(events: &[&'a Event]) -> Option<&'a str> {
         .and_then(|e| e.text.as_deref())
 }
 
-/// The one-line summary of a prompt: its words on one line, cut after the first sixty
+/// The one-line summary of a prompt: its words on one line, past the Hub's line naming a
+/// colleague as their sender, cut after the first sixty
 /// characters, or before a placeholder the cut would split, so the summary never shows half of
 /// one. A caller that publishes the summary protects the whole prompt first and cuts the
 /// protected text, because a cut through a value leaves a fragment no rule matches any more.
 pub fn gist_of(prompt: &str) -> String {
+    let prompt = crate::adapter::preview::without_sender_line(prompt);
     let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     let Some((cut, _)) = one_line.char_indices().nth(60) else {
         return one_line;

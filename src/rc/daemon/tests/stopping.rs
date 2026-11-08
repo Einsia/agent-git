@@ -1245,21 +1245,8 @@ fn a_verb_nobody_remembered_to_register_defaults_to_owner_only() {
 /// already at bypass has to ask even to "switch back to plan" — that is, "you must ask
 /// permission to become safe".
 #[test]
-fn braking_a_dangerous_session_does_not_need_the_owner_but_driving_it_does() {
+fn braking_a_dangerous_session_does_not_need_the_owner_but_loosening_it_does() {
     let operator = claim("operator", "ws-a");
-    // Drive: feeding a message into a dangerous session / allowing an approval — owner only.
-    assert!(
-        require_owner_to_drive(Some(&operator), true).is_err(),
-        "an operator must not drive an ever-dangerous session"
-    );
-    // Driving under an **ordinary mode** needs no owner — `accept_edits` / `auto` are the
-    // working modes an owner switches to precisely so collaborators can keep moving. Conflating
-    // "switching into this mode needs the owner" with "working inside this mode needs the owner"
-    // turns the second half into a rule that shuts off the common use of the feature.
-    assert!(
-        require_owner_to_drive(Some(&operator), false).is_ok(),
-        "an operator can drive a session that has never been dangerous"
-    );
     // Loosening to `accept_edits` / `auto` is owner-only as well: under those modes claude-code
     // stops sending `can_use_tool` at all, which switches the fail-closed classifier off
     // entirely — while the frame itself is perfectly legal. The test must be `loosens_guard`,
@@ -1271,7 +1258,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_driving_it_does() {
         crate::protocol::PermissionMode::Bypass,
     ] {
         assert!(
-            require_owner_to_loosen(
+            super::super::danger_gate_tests::require_owner_to_loosen(
                 Some(&operator),
                 loosening,
                 Some(crate::protocol::PermissionMode::Default)
@@ -1280,7 +1267,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_driving_it_does() {
             "{loosening:?} loosens; only the owner can switch to it"
         );
         assert!(
-            require_owner_to_loosen(
+            super::super::danger_gate_tests::require_owner_to_loosen(
                 Some(&owner),
                 loosening,
                 Some(crate::protocol::PermissionMode::Default)
@@ -1294,7 +1281,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_driving_it_does() {
         crate::protocol::PermissionMode::Default,
     ] {
         assert!(
-            require_owner_to_loosen(
+            super::super::danger_gate_tests::require_owner_to_loosen(
                 Some(&operator),
                 tightening,
                 Some(crate::protocol::PermissionMode::Bypass)

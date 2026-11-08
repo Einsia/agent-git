@@ -46,8 +46,6 @@ use std::{
 
 /// The `native_inbox` value `session.watch` reports for a session with a live socket.
 pub const NATIVE_INBOX: &str = "claude_socket";
-/// The `native_inbox` value for a live socket that only the owner may send to.
-pub const NATIVE_INBOX_UNAVAILABLE: &str = "unavailable";
 
 /// The sender label Claude Code shows beside a delivered message.
 const FROM: &str = "agit-rc";

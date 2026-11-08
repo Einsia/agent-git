@@ -266,28 +266,6 @@ impl RuntimeContext {
             &thread.native_session_id,
         ))
     }
-
-    /// The thread's mode as the index records it now, never a mode read back from its rollout.
-    /// `None` when that cannot be read; see [`super::native_settings::current_codex_mode_in`].
-    pub(crate) fn current_mode(
-        &self,
-        thread: &LocatedThread,
-    ) -> crate::Result<Option<crate::protocol::PermissionMode>> {
-        self.validate()?;
-        ensure!(
-            thread.source_id == self.source.source_id,
-            "conversation belongs to a different runtime source"
-        );
-        ensure!(
-            thread.indexed_transcript.canonicalize()? == thread.transcript,
-            "native transcript path changed; locate the conversation again"
-        );
-        Ok(super::native_settings::current_codex_mode_in(
-            &self.source.home,
-            &thread.indexed_transcript,
-            &thread.native_session_id,
-        ))
-    }
 }
 
 fn is_guardian(source: Option<&str>) -> bool {

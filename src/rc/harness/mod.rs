@@ -63,80 +63,6 @@ impl std::fmt::Display for FenceUnsupported {
 
 impl std::error::Error for FenceUnsupported {}
 
-/// What a non-owner is told for any message into a Codex conversation. It names the rule only.
-pub(crate) const CODEX_UNCONFINED: &str = "Others can't send to Codex conversations for now.";
-
-/// A non-owner's message into a Codex conversation, refused: Codex can't confine a turn to the
-/// workspace (reads, environment, tools it runs outside its sandbox), in any permission mode.
-/// Nothing was sent.
-#[derive(Debug)]
-pub(crate) struct CodexUnconfined;
-
-impl std::fmt::Display for CodexUnconfined {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(CODEX_UNCONFINED)
-    }
-}
-
-impl std::error::Error for CodexUnconfined {}
-
-impl CodexUnconfined {
-    pub(crate) fn rpc_error() -> crate::protocol::RpcError {
-        let mut error =
-            crate::protocol::RpcError::new(crate::protocol::ErrorCode::Forbidden, CODEX_UNCONFINED);
-        error.data = Some(serde_json::json!({
-            "outcome": "not_sent",
-            "retryable": false,
-            "reason": "codex_unconfined"
-        }));
-        error
-    }
-
-    /// Refuse when `caller_is_owner` is false and the conversation is Codex.
-    pub(crate) fn check(
-        runtime: &str,
-        caller_is_owner: bool,
-    ) -> Result<(), crate::protocol::RpcError> {
-        if runtime == "codex" && !caller_is_owner {
-            return Err(Self::rpc_error());
-        }
-        Ok(())
-    }
-}
-
-/// What a non-owner is told for a runtime command. It names the rule only.
-pub(crate) const RUNTIME_COMMAND_OWNER_ONLY: &str =
-    "Only the workspace owner can run this command in this conversation.";
-
-/// A non-owner's runtime command, refused on every runtime at delivery. `session.command` is
-/// owner-only at the RPC (`daemon::min_role`); this holds whatever reaches the session anyway.
-/// Nothing was sent.
-#[derive(Debug)]
-pub(crate) struct RuntimeCommandOwnerOnly;
-
-impl std::fmt::Display for RuntimeCommandOwnerOnly {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(RUNTIME_COMMAND_OWNER_ONLY)
-    }
-}
-
-impl std::error::Error for RuntimeCommandOwnerOnly {}
-
-impl RuntimeCommandOwnerOnly {
-    pub(crate) fn rpc_error() -> crate::protocol::RpcError {
-        let mut error = crate::protocol::RpcError::new(
-            crate::protocol::ErrorCode::Forbidden,
-            RUNTIME_COMMAND_OWNER_ONLY,
-        );
-        error.data = Some(serde_json::json!({
-            "outcome": "not_sent",
-            "retryable": false,
-            "reason": "command_owner_only"
-        }));
-        error
-    }
-}
-
 /// An attach-only opening found no terminal to join when its driver was chosen (it may have
 /// exited after the opening was admitted). Nothing was launched.
 #[derive(Debug)]
@@ -527,11 +453,6 @@ pub enum TurnStartOutcome {
     FatalNotAccepted { message: String },
     /// Shared acceptance is uncertain; keep observing without resending the prompt.
     SharedUnknown { message: String },
-    /// A non-owner's turn into a Codex conversation (`CodexUnconfined`); nothing was written.
-    CodexUnconfined,
-    /// A non-owner's prompt, refused before any native bytes were written because the turn
-    /// would run in a mode only the owner may use (see `rc::turn_mode`).
-    ModeOwnerOnly { mode: Option<PermissionMode> },
     Unknown {
         message: String,
         /// The sticky mode included in the request whose acceptance is now
@@ -1015,14 +936,6 @@ impl AnyDriver {
         }
     }
 
-    /// Whose words the next turn start or steer writes; a runtime that can start work which
-    /// outlives the turn without asking holds a turn to it.
-    pub(crate) fn note_input_owner(&mut self, owner: bool) {
-        if let Self::ClaudeCode(driver) = self {
-            driver.note_input_owner(owner);
-        }
-    }
-
     pub fn shared_executor(&self) -> bool {
         match self {
             Self::Codex(driver) => driver.shared_executor(),
@@ -1050,19 +963,6 @@ impl AnyDriver {
             return false;
         }
         true
-    }
-
-    /// The mode a turn would run in now, for `rc::turn_mode`: the running turn's for a steer, the
-    /// next turn's (a queued mode, else the current one) for a start. `None` when the mode cannot
-    /// be read now.
-    pub(crate) fn turn_mode(&self, start: bool) -> Option<PermissionMode> {
-        if !self.permission_mode_known() {
-            return None;
-        }
-        match self {
-            Self::Codex(driver) => driver.turn_mode(start),
-            _ => Some(self.permission_mode()),
-        }
     }
 
     pub fn permission_mode_known(&self) -> bool {
