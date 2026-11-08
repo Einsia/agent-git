@@ -1951,7 +1951,8 @@ fn gist_from(messages: &[serde_json::Value]) -> Option<String> {
             {
                 continue;
             }
-            let t = p.get("text").and_then(|x| x.as_str())?.trim();
+            let t =
+                super::preview::without_sender_line(p.get("text").and_then(|x| x.as_str())?).trim();
             if t.is_empty() {
                 continue;
             }

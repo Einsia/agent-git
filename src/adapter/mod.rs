@@ -138,7 +138,7 @@ impl Session {
             .iter()
             .find(|e| e.kind == EventKind::UserPrompt)
             .and_then(|e| e.text.as_deref())?;
-        Some(preview::shorten(text, max))
+        Some(preview::shorten(preview::without_sender_line(text), max))
     }
 
     pub fn counts(&self) -> Counts {

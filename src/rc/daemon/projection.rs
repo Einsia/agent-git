@@ -533,11 +533,7 @@ impl Daemon {
         }
         require_same_workspace(caller, session_id, &live.info.workspace_id)?;
         if let Some(source) = &live.info.native_source {
-            let (context, thread) = self.source_thread(session_id, live, source, caller)?;
-            if need == Need::Drive && !caller.is_owner() {
-                let current = context.current_mode(&thread).ok().flatten();
-                danger::require_native_mode_held(caller, live.admitted_mode, current)?;
-            }
+            self.source_thread(session_id, live, source, caller)?;
         }
         if need == Need::Drive && !live.restart_guard_attempts.is_empty() {
             return Err(RpcError::new(
@@ -547,9 +543,6 @@ impl Daemon {
             .with_hint(
                 "nothing was queued; retry after the harness reports Ready (interrupt and deny remain available)",
             ));
-        }
-        if need == Need::Drive {
-            require_owner_to_drive(Some(caller), live.info.dangerous)?;
         }
         Ok(Driving {
             tx: live.tx.clone(),
@@ -595,39 +588,6 @@ impl Daemon {
             ));
         }
         Ok((context, thread))
-    }
-
-    /// Holds a non-owner's words to a turn that runs in Default or Plan (`rc::turn_mode`), read
-    /// at the RPC: for a steer the running turn's mode, for a start the mode the next turn starts
-    /// in (a queued mode, else the current one). A thread of a native source is read from its
-    /// Codex index now, as #288 reads it; any other session from the mode its driver last
-    /// confirmed. The supervisor asks again against the driver when it delivers. The owner is
-    /// never held.
-    pub(super) fn require_turn_mode(
-        &self,
-        session_id: &str,
-        caller: &crate::protocol::CallerClaim,
-        input: TurnInput,
-    ) -> Result<(), RpcError> {
-        if caller.is_owner() {
-            return Ok(());
-        }
-        let live = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| no_such_session(session_id))?;
-        let current = match &live.info.native_source {
-            Some(source) => {
-                let (context, thread) = self.source_thread(session_id, live, source, caller)?;
-                context.current_mode(&thread).ok().flatten()
-            }
-            None => live.info.permission_mode,
-        };
-        let mode = match input {
-            TurnInput::Start => live.pending_mode.or(current),
-            TurnInput::Steer => current,
-        };
-        crate::rc::turn_mode::require(false, mode).map_err(|refused| refused.rpc_error())
     }
 
     /// A live session **of this workspace**, found by harness thread id or by
@@ -991,7 +951,6 @@ mod bound_lineage_tests {
                         runtime_thread_id: Some("native-1".into()),
                         task: tokio::spawn(async {}),
                         danger_arm: 0,
-                        admitted_mode: None,
                         pending_mode: None,
                         approval_requests: HashMap::new(),
                         rpc_gate: Arc::new(Mutex::new(())),

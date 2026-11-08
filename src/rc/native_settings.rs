@@ -125,53 +125,6 @@ pub(super) fn read_codex_in(home: &Path, path: &Path, session: &str) -> Settings
         .unwrap_or_else(|| transcript_settings(path))
 }
 
-/// The mode the Codex index records for this thread now, or `None` when the index cannot be
-/// found, opened, locked or queried, or records no mode it maps. Unlike [`read_codex_in`] it never
-/// falls back to the rollout: an earlier turn's mode says nothing about the thread's mode now.
-pub(super) fn current_codex_mode_in(
-    home: &Path,
-    path: &Path,
-    session: &str,
-) -> Option<PermissionMode> {
-    crate::adapter::codex_index::index_path_in(home)
-        .and_then(|index| indexed_at(&index, path, session))
-        .and_then(|settings| settings.permission_mode)
-}
-
-/// [`current_codex_mode_in`] for a thread of this machine's default Codex home.
-pub(super) fn current_local_codex_mode(path: &Path, session: &str) -> Option<PermissionMode> {
-    let home = crate::adapter::codex::codex_home().ok()?;
-    current_codex_mode_in(&home, path, session)
-}
-
-/// Whether `caller` may still drive or message a Codex thread of a native source whose current
-/// mode is `current`, bounded by `admitted`. A native client can change the thread's mode at any
-/// time, so a non-owner's turn, steer or message holds only while the current mode, read from
-/// the index and nowhere else, is no looser than the bound; a looser mode, or one that cannot be
-/// read now, makes the conversation the owner's alone. The owner is never held to it.
-pub(super) fn require_mode_held(
-    caller: &crate::protocol::CallerClaim,
-    admitted: Option<PermissionMode>,
-    current: Option<PermissionMode>,
-) -> Result<(), crate::protocol::RpcError> {
-    if caller.is_owner()
-        || matches!((current, admitted), (Some(current), Some(admitted)) if !current.loosens_from(admitted))
-    {
-        return Ok(());
-    }
-    Err(mode_changed())
-}
-
-/// The refusal for a non-owner whose thread's mode is looser than its bound, or unreadable.
-pub(super) fn mode_changed() -> crate::protocol::RpcError {
-    let mut error = crate::protocol::RpcError::new(
-        crate::protocol::ErrorCode::Forbidden,
-        "this conversation's mode changed on the device; only its owner may continue it now",
-    );
-    error.data = Some(serde_json::json!({"retryable": false, "reason": "native_mode_changed"}));
-    error
-}
-
 fn transcript_settings(path: &Path) -> Settings {
     transcript_context(path).map_or_else(Settings::default, |value| settings(&value))
 }

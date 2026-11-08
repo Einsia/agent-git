@@ -350,60 +350,20 @@ pub struct ClaudeCodeDriver {
     /// message — a second turn header drawn out of nowhere inside one turn, and the transcript
     /// attributed to the wrong place. Echoes come back in the order they were written to
     /// stdin, so only the head of the queue is compared against.
-    /// Each written message awaiting its echo, with whether it is the owner's words.
-    awaiting_echoes: std::collections::VecDeque<(String, bool)>,
+    /// Each written message awaiting its echo.
+    awaiting_echoes: std::collections::VecDeque<String>,
     pub(super) next_prompt_id: Option<String>,
     goal_query_pending: bool,
-    /// The one turn known to hold only the owner's words, by its id. Only that turn may start
-    /// work that continues after it; any other (a turn Claude Code opened by itself, one a
-    /// non-owner wrote into, or none at all) can't, so a turn we can't attribute fails closed.
-    owner_turn: Option<String>,
-    /// Whose words the next `start_turn` or `steer` writes, set just before it.
-    next_input_owner: Option<bool>,
 }
 
-/// Every call passes through a PreToolUse hook (`answer_hook`), because Claude Code asks no
-/// permission for some calls that start work continuing after the turn, and any tool may take
-/// a background flag.
-const OUTLIVES_TURN_MATCHER: &str = "*";
-const OUTLIVES_TURN_HOOK: &str = "agit-outlives-turn";
-/// What the model reads when such a call is refused. It states the rule and nothing more.
-pub(crate) const OUTLIVES_TURN_REFUSAL: &str = "Only this conversation's owner can start work that continues after this turn; nothing was started.";
-
-/// The tools a turn that isn't the owner's alone may call, each still subject to Claude Code's
-/// own permission check: they act inside the turn and end with it. Every other tool, one Claude
-/// Code adds later and every MCP tool included, is refused in such a turn.
-const NON_OWNER_TOOLS: &[&str] = &[
-    "Read",
-    "Glob",
-    "Grep",
-    "Edit",
-    "Write",
-    "MultiEdit",
-    "NotebookEdit",
-    "Bash",
-    "WebFetch",
-    "WebSearch",
-    "TodoWrite",
-    "ToolSearch",
-    "ExitPlanMode",
-    "AskUserQuestion",
-];
-
-/// Whether a turn that isn't the owner's alone is refused this call: any tool not on
-/// [`NON_OWNER_TOOLS`], and any call asking to run in the background. A call it can't read is
-/// refused.
-fn outlives_turn(tool: Option<&str>, input: &Value) -> bool {
-    match tool {
-        Some(name) if NON_OWNER_TOOLS.contains(&name) => {
-            !input.is_object()
-                || !matches!(
-                    input.get("run_in_background"),
-                    None | Some(Value::Null) | Some(Value::Bool(false))
-                )
-        }
-        _ => true,
-    }
+/// The SDK handshake every session opens with. It registers no hook: a colleague's turn runs its
+/// tools as the owner's does, each under Claude Code's own permission check.
+fn initialize_request() -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": "agit-init",
+        "request": { "subtype": "initialize" }
+    })
 }
 
 /// Settings every session agit drives runs with: Claude Code never moves a running call to the
@@ -589,18 +549,9 @@ impl ClaudeCodeDriver {
         // client" mode for permissions; without it we would silently fall back
         // to whatever the local settings.json says, which is exactly the
         // failure mode where a shared workspace quietly self-approves.
-        proc.write_line(&json!({
-            "type": "control_request",
-            "request_id": "agit-init",
-            "request": { "subtype": "initialize", "hooks": {
-                "PreToolUse": [{
-                    "matcher": OUTLIVES_TURN_MATCHER,
-                    "hookCallbackIds": [OUTLIVES_TURN_HOOK],
-                }],
-            } }
-        }))
-        .await
-        .map_err(LaunchError::spawned)?;
+        proc.write_line(&initialize_request())
+            .await
+            .map_err(LaunchError::spawned)?;
 
         let model_choice = spec
             .model
@@ -627,8 +578,6 @@ impl ClaudeCodeDriver {
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
             goal_query_pending: false,
-            owner_turn: None,
-            next_input_owner: None,
         })
     }
 
@@ -653,7 +602,6 @@ impl ClaudeCodeDriver {
     }
 
     pub async fn start_turn(&mut self, message: &str) -> super::TurnStartOutcome {
-        let owner = self.next_input_owner.take() == Some(true);
         if self.goal_query_pending {
             return super::TurnStartOutcome::RetryableNotAccepted {
                 message: "Claude goal recovery is incomplete; restart the local daemon".into(),
@@ -703,8 +651,7 @@ impl ClaudeCodeDriver {
         }
         let turn = uuid::Uuid::new_v4().to_string();
         self.current_turn = Some(turn.clone());
-        self.owner_turn = owner.then(|| turn.clone());
-        self.awaiting_echoes.push_back((message.to_string(), owner));
+        self.awaiting_echoes.push_back(message.to_string());
         let prompt_id = self
             .next_prompt_id
             .take()
@@ -734,15 +681,10 @@ impl ClaudeCodeDriver {
         // turn.started and no turn.completed, viewers never see it run, and settlement does
         // not know to wait for it. The method of the same name on the codex side refuses the
         // same way; the two must mean the same thing.
-        let owner = self.next_input_owner.take() == Some(true);
         if self.current_turn.is_none() {
             return Err(super::TurnNotRunning.into());
         }
-        // Someone else's words now share this turn.
-        if !owner {
-            self.owner_turn = None;
-        }
-        self.awaiting_echoes.push_back((message.to_string(), owner));
+        self.awaiting_echoes.push_back(message.to_string());
         let prompt_id = self
             .next_prompt_id
             .take()
@@ -1123,54 +1065,10 @@ impl ClaudeCodeDriver {
                 }
                 Line::Json(v) => v,
             };
-            if v["type"] == "control_request" && v["request"]["subtype"] == "hook_callback" {
-                if let Err(error) = self.answer_hook(&v).await {
-                    // Claude Code waits on this answer before running the call; one that may not
-                    // have arrived leaves nothing safe to continue on.
-                    return Some(HarnessEvent::ProtocolInvariant {
-                        message: format!("claude hook answer was not delivered: {error}"),
-                        attempted_mode: None,
-                        confirmation_token: None,
-                    });
-                }
-                continue;
-            }
             if let Some(ev) = self.classify(v) {
                 return Some(ev);
             }
         }
-    }
-
-    /// Whose words the next `start_turn` or `steer` writes.
-    pub(crate) fn note_input_owner(&mut self, owner: bool) {
-        self.next_input_owner = Some(owner);
-    }
-
-    /// Answer a PreToolUse hook: refuse a call that would start work continuing after the turn
-    /// unless the open turn holds only the owner's words; say nothing about any other call, so
-    /// it goes on to Claude Code's own permission check.
-    async fn answer_hook(&mut self, v: &Value) -> crate::Result<()> {
-        let request_id = v["request_id"].as_str().unwrap_or_default();
-        let input = &v["request"]["input"];
-        let owners = self.current_turn.is_some() && self.current_turn == self.owner_turn;
-        let body = if v["request"]["callback_id"] == OUTLIVES_TURN_HOOK
-            && !owners
-            && outlives_turn(input["tool_name"].as_str(), &input["tool_input"])
-        {
-            json!({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": OUTLIVES_TURN_REFUSAL,
-            }})
-        } else {
-            json!({})
-        };
-        self.proc
-            .write_line(&json!({
-                "type": "control_response",
-                "response": {"subtype": "success", "request_id": request_id, "response": body},
-            }))
-            .await
     }
 
     /// Map one stream-json frame to a harness event. `None` means "internal,
@@ -1427,7 +1325,7 @@ impl ClaudeCodeDriver {
                 // submitted prompt still owns its echo even if it contains this markup.
                 if v.get("isReplay").and_then(Value::as_bool) == Some(true)
                     && text.starts_with("<local-command-stdout>")
-                    && self.awaiting_echoes.front().map(|(echo, _)| echo) != Some(&text)
+                    && self.awaiting_echoes.front().map(String::as_str) != Some(text.as_str())
                 {
                     return None;
                 }
@@ -1450,15 +1348,11 @@ impl ClaudeCodeDriver {
                 // Echoes come back in write order, so only the head is consumed; a match
                 // deeper in the queue means the order broke, and it is better to surface it
                 // as a new message.
-                let echoed = self.awaiting_echoes.front().map(|(echo, _)| echo) == Some(&text);
-                // Whose words these are travels with the message, not with the turn it was
-                // written into: a queued message can open the next turn. Words not matched to a
-                // written message are no one's.
-                let owners_words = echoed
-                    && self
-                        .awaiting_echoes
-                        .pop_front()
-                        .is_some_and(|(_, owner)| owner);
+                let echoed =
+                    self.awaiting_echoes.front().map(String::as_str) == Some(text.as_str());
+                if echoed {
+                    self.awaiting_echoes.pop_front();
+                }
                 // **Swallow an echo only while the turn is still open**: that turn's
                 // turn.started went out already, and a second one draws two turn headers for
                 // one turn.
@@ -1472,25 +1366,12 @@ impl ClaudeCodeDriver {
                 // coming. So fall through and open the turn as usual: this echo is that turn's
                 // prompt.
                 if echoed && self.current_turn.is_some() {
-                    if !owners_words {
-                        self.owner_turn = None;
-                    }
                     return None;
                 }
-                let opened = self.current_turn.is_none();
                 let turn = self
                     .current_turn
                     .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
                     .clone();
-                if opened {
-                    // Messages still queued join this turn when they echo; it is the owner's
-                    // only if all of them are too.
-                    let owners =
-                        owners_words && self.awaiting_echoes.iter().all(|(_, owner)| *owner);
-                    self.owner_turn = owners.then(|| turn.clone());
-                } else if !owners_words {
-                    self.owner_turn = None;
-                }
                 Some(HarnessEvent::TurnStarted {
                     turn_id: turn,
                     prompt: Some(text),
@@ -1628,8 +1509,6 @@ impl ClaudeCodeDriver {
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
             goal_query_pending: false,
-            owner_turn: None,
-            next_input_owner: None,
         }
     }
 
@@ -1646,52 +1525,6 @@ impl ClaudeCodeDriver {
         .expect("test process");
         driver.current_turn = None;
         driver
-    }
-
-    /// A `sh` stand-in for Claude Code that appends every line written to it to `written` and,
-    /// for each prompt (and once at start when `unprompted`), asks the PreToolUse hook about a
-    /// call to `tool` with `input`.
-    #[cfg(test)]
-    pub(crate) fn hook_stand_in(
-        directory: &std::path::Path,
-        tool: &str,
-        input: &Value,
-        unprompted: bool,
-    ) -> (String, PathBuf) {
-        let written = directory.join("written.jsonl");
-        let hook = directory.join("hook.json");
-        std::fs::write(
-            &hook,
-            json!({"type":"control_request","request_id":"hook-1","request":{
-                "subtype":"hook_callback","callback_id":OUTLIVES_TURN_HOOK,"input":{
-                    "hook_event_name":"PreToolUse","tool_name":tool,"tool_input":input}}})
-            .to_string()
-                + "\n",
-        )
-        .unwrap();
-        let script = format!(
-            "{}while IFS= read -r l; do printf '%s\\n' \"$l\" >> '{}'; case \"$l\" in *'\"type\":\"user\"'*) cat '{}';; esac; done",
-            if unprompted {
-                format!("cat '{}'; ", hook.display())
-            } else {
-                String::new()
-            },
-            written.display(),
-            hook.display(),
-        );
-        (script, written)
-    }
-
-    /// The PreToolUse hook answers a stand-in recorded, in order.
-    #[cfg(test)]
-    pub(crate) fn hook_responses(path: &std::path::Path) -> Vec<Value> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|line| line["type"] == "control_response")
-            .map(|line| line["response"]["response"].clone())
-            .collect()
     }
 
     #[cfg(test)]
@@ -1747,234 +1580,14 @@ impl ClaudeCodeDriver {
 mod tests {
     use super::*;
 
-    /// Drives a Claude Code stand-in that asks the PreToolUse hook about one `tool` call: at
-    /// start when `unprompted` (a turn nobody here opened), and for every prompt written to it.
-    /// Each write is `(steer, owner)`. Returns what the driver answered, in order.
-    async fn hook_answers(
-        tool: &str,
-        input: Value,
-        unprompted: bool,
-        writes: &[(bool, bool)],
-    ) -> Vec<Value> {
-        let directory = tempfile::tempdir().unwrap();
-        let (script, written) =
-            ClaudeCodeDriver::hook_stand_in(directory.path(), tool, &input, unprompted);
-        let mut driver = ClaudeCodeDriver::test_driver_running(&script);
-        let mut expected = usize::from(unprompted);
-        settle(&mut driver, &written, expected).await;
-        for (steer, owner) in writes {
-            driver.note_input_owner(*owner);
-            if *steer {
-                driver.steer("more").await.unwrap();
-            } else {
-                assert!(matches!(
-                    driver.start_turn("go").await,
-                    super::super::TurnStartOutcome::Accepted { .. }
-                ));
-            }
-            expected += 1;
-            settle(&mut driver, &written, expected).await;
-        }
-        let _ = driver.shutdown().await;
-        ClaudeCodeDriver::hook_responses(&written)
-    }
-
-    /// Reads the stand-in's frames until the driver has written `expected` hook answers.
-    async fn settle(driver: &mut ClaudeCodeDriver, written: &std::path::Path, expected: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while ClaudeCodeDriver::hook_responses(written).len() < expected {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the hook was never answered"
-            );
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), driver.next_event())
-                .await;
-        }
-    }
-
-    fn refused(answer: &Value) -> bool {
-        answer["hookSpecificOutput"]["permissionDecision"] == "deny"
-            && answer["hookSpecificOutput"]["permissionDecisionReason"] == OUTLIVES_TURN_REFUSAL
-    }
-
-    /// Asserts that a non-owner's turn is refused this call with the fixed text, and the owner's
-    /// turn is left to Claude Code (an empty answer, not an allow that would skip its own check).
-    async fn held_to_the_owner(tool: &str, input: Value) {
-        let non_owner = hook_answers(tool, input.clone(), false, &[(false, false)]).await;
-        assert_eq!(non_owner.len(), 1, "{tool}");
-        assert!(refused(&non_owner[0]), "{tool}: {non_owner:?}");
-        let owner = hook_answers(tool, input, false, &[(false, true)]).await;
-        assert_eq!(owner, vec![json!({})], "{tool}");
-    }
-
-    /// Pins the rule for one call that outlives the turn, kept in this session or on disk: a
-    /// non-owner's turn is refused it, the owner's is not.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_schedule_a_prompt() {
-        for durable in [false, true] {
-            held_to_the_owner(
-                "CronCreate",
-                json!({"cron":"* * * * *","prompt":"later","recurring":false,"durable":durable}),
-            )
-            .await;
-        }
-    }
-
-    /// Pins the rule for another call that outlives the turn.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_schedule_a_wakeup() {
-        held_to_the_owner(
-            "ScheduleWakeup",
-            json!({"delaySeconds":60,"reason":"later","prompt":"later"}),
-        )
-        .await;
-    }
-
-    /// Pins the rule for another call that outlives the turn.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_start_a_monitor() {
-        held_to_the_owner("Monitor", json!({"command":"sleep 4","timeout_ms":30000})).await;
-    }
-
-    /// Pins the rule for a command that outlives the turn, and that one which ends inside the turn
-    /// is left to Claude Code's own permission check.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_start_a_background_command() {
-        held_to_the_owner(
-            "Bash",
-            json!({"command":"sleep 6","run_in_background":true}),
-        )
-        .await;
-        for input in [
-            json!({"command":"ls"}),
-            json!({"command":"ls","run_in_background":false}),
-        ] {
-            let answers = hook_answers("Bash", input, false, &[(false, false)]).await;
-            assert_eq!(answers, vec![json!({})]);
-        }
-    }
-
-    /// Pins that a call of any tool asking to run in the background is refused a non-owner's
-    /// turn, not only the tools named for it.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_start_a_background_agent() {
-        held_to_the_owner(
-            "Agent",
-            json!({"description":"later","prompt":"later","run_in_background":true}),
-        )
-        .await;
-        held_to_the_owner("SomeFutureTool", json!({"run_in_background":"yes"})).await;
-        let answers =
-            hook_answers("Read", json!({"file_path":"a"}), false, &[(false, false)]).await;
-        assert_eq!(answers, vec![json!({})]);
-    }
-
-    /// Pins the rule for the calls that start other agents' work, which may go on after the turn
-    /// without asking to run in the background, and for those that cancel or stop work running
-    /// past it.
-    #[tokio::test]
-    async fn a_non_owners_turn_cannot_start_another_agent() {
-        for tool in [
-            "Agent",
-            "Task",
-            "Workflow",
-            "SendMessage",
-            "Skill",
-            "CronDelete",
-            "TaskStop",
-        ] {
-            held_to_the_owner(tool, json!({"prompt":"now"})).await;
-        }
-    }
-
-    /// The tools Claude Code 2.1.311 lists in its stream-json `system/init` for a headless
-    /// session (captured from the real binary), plus tools it offers in other configurations.
-    const CLAUDE_CODE_TOOLS: &[&str] = &[
-        "Task",
-        "AskUserQuestion",
-        "Bash",
-        "CronCreate",
-        "CronDelete",
-        "CronList",
-        "Edit",
-        "EnterPlanMode",
-        "EnterWorktree",
-        "ExitPlanMode",
-        "ExitWorktree",
-        "ListAgents",
-        "Monitor",
-        "NotebookEdit",
-        "Read",
-        "ReportFindings",
-        "ScheduleWakeup",
-        "SendMessage",
-        "Skill",
-        "TaskStop",
-        "ToolSearch",
-        "WebFetch",
-        "WebSearch",
-        "Workflow",
-        "Write",
-    ];
-    /// Tools a turn that isn't the owner's alone is refused, by name. A tool in
-    /// [`CLAUDE_CODE_TOOLS`] must be here or in `NON_OWNER_TOOLS`.
-    const REFUSED_TOOLS: &[&str] = &[
-        "Task",
-        "Agent",
-        "CronCreate",
-        "CronDelete",
-        "CronList",
-        "EnterPlanMode",
-        "EnterWorktree",
-        "ExitWorktree",
-        "ListAgents",
-        "Monitor",
-        "ReportFindings",
-        "ScheduleWakeup",
-        "SendMessage",
-        "Skill",
-        "TaskStop",
-        "Workflow",
-        "RemoteTrigger",
-        "TaskOutput",
-        "BashOutput",
-        "KillShell",
-        "PushNotification",
-        "SendUserFile",
-        "Artifact",
-        "mcp__agit__status",
-        "mcp__tracker__create_issue",
-    ];
-
-    /// Pins the allowlist against Claude Code's real tool set: every tool it offers is either
-    /// allowed or refused by name, so a release that adds a tool fails here until it is
-    /// placed; each refused one is refused through the hook and each allowed one is left to
-    /// Claude Code's own check.
-    #[tokio::test]
-    async fn every_tool_claude_code_offers_is_placed_by_name() {
-        for tool in CLAUDE_CODE_TOOLS {
-            assert!(
-                NON_OWNER_TOOLS.contains(tool) != REFUSED_TOOLS.contains(tool),
-                "{tool}: placed in neither list, or in both"
-            );
-        }
-        for tool in REFUSED_TOOLS {
-            assert!(!NON_OWNER_TOOLS.contains(tool), "{tool}");
-            assert!(outlives_turn(Some(tool), &json!({})), "{tool}");
-        }
-        for tool in NON_OWNER_TOOLS {
-            assert!(!outlives_turn(Some(tool), &json!({})), "{tool}");
-            assert!(
-                outlives_turn(Some(tool), &json!({"run_in_background":true})),
-                "{tool}"
-            );
-        }
-        held_to_the_owner("RemoteTrigger", json!({"action":"create","body":{}})).await;
-        held_to_the_owner("mcp__tracker__create_issue", json!({"title":"later"})).await;
-        held_to_the_owner("NewToolFromALaterRelease", json!({})).await;
-        let answers =
-            hook_answers("Read", json!({"file_path":"a"}), false, &[(false, false)]).await;
-        assert_eq!(answers, vec![json!({})]);
+    /// The handshake registers no hook, so nothing answers a colleague's tool call differently
+    /// from the owner's: a background command, a scheduled prompt or another agent goes to
+    /// Claude Code's own permission check whoever's words started the turn.
+    #[test]
+    fn the_handshake_registers_no_hook() {
+        let request = initialize_request();
+        assert_eq!(request["request"]["subtype"], "initialize");
+        assert!(request["request"].get("hooks").is_none(), "{request}");
     }
 
     /// Pins that every session agit drives runs with Claude Code's background tasks switched
@@ -2014,111 +1627,6 @@ mod tests {
                 "{key}"
             );
             assert_eq!(pinned[0]["env"][key], value, "{key} on the command line");
-        }
-    }
-
-    /// Pins that whose words a turn holds travels with each queued message: a message written
-    /// while one turn ran and consumed as the next turn's prompt makes that turn the owner's
-    /// only if it, and every message still queued behind it, is the owner's. An echo the driver
-    /// can't match is no one's.
-    #[tokio::test]
-    async fn a_queued_message_decides_the_turn_it_opens() {
-        let user = |text: &str| json!({"type":"user","message":{"role":"user","content":text}});
-        let result = json!({"type":"result","is_error":false});
-        let owns =
-            |d: &ClaudeCodeDriver| d.current_turn.is_some() && d.current_turn == d.owner_turn;
-        for (queued, expected) in [
-            (vec![("next", true)], true),
-            (vec![("next", false)], false),
-            (vec![("next", true), ("after", false)], false),
-            (vec![("next", true), ("after", true)], true),
-        ] {
-            let mut d = probe();
-            d.current_turn = Some("old".into());
-            d.owner_turn = Some("old".into());
-            for (text, owner) in &queued {
-                d.awaiting_echoes.push_back(((*text).into(), *owner));
-            }
-            assert!(d.classify(result.clone()).is_some(), "the old turn ends");
-            assert!(matches!(
-                d.classify(user("next")),
-                Some(HarnessEvent::TurnStarted { .. })
-            ));
-            assert_eq!(owns(&d), expected, "{queued:?}");
-            if queued.len() > 1 {
-                assert!(d.classify(user("after")).is_none());
-                assert_eq!(owns(&d), expected, "{queued:?} after the second echo");
-            }
-            d.shutdown().await.unwrap();
-        }
-        let mut d = probe();
-        assert!(matches!(
-            d.classify(user("typed in the terminal")),
-            Some(HarnessEvent::TurnStarted { .. })
-        ));
-        assert!(!owns(&d), "an echo no one wrote is no one's");
-        d.shutdown().await.unwrap();
-    }
-
-    /// Pins that a turn the device can't attribute fails closed: one Claude Code opened by
-    /// itself, a turn the owner opened once a non-owner has written into it, and a call whose
-    /// tool can't be read are each refused.
-    #[tokio::test]
-    async fn a_turn_the_device_cannot_attribute_starts_nothing_that_outlives_it() {
-        let input = json!({"cron":"* * * * *","prompt":"later"});
-        let unprompted = hook_answers("CronCreate", input.clone(), true, &[]).await;
-        assert_eq!(unprompted.len(), 1);
-        assert!(refused(&unprompted[0]), "{unprompted:?}");
-        let shared = hook_answers(
-            "CronCreate",
-            input.clone(),
-            false,
-            &[(false, true), (true, false)],
-        )
-        .await;
-        assert_eq!(shared.len(), 2);
-        assert_eq!(shared[0], json!({}), "the owner's own turn");
-        assert!(refused(&shared[1]), "after a non-owner's steer: {shared:?}");
-        let owners = hook_answers("CronCreate", input, false, &[(false, true), (true, true)]).await;
-        assert_eq!(owners, vec![json!({}), json!({})]);
-        assert!(outlives_turn(None, &json!({})));
-        assert!(outlives_turn(Some("Bash"), &json!("sleep 6 &")));
-    }
-
-    /// Pins that the hook is registered in the handshake for every call, and that the rule is
-    /// advertised.
-    #[test]
-    fn the_handshake_registers_the_outlives_turn_hook() {
-        assert_eq!(OUTLIVES_TURN_MATCHER, "*", "every call, whatever its tool");
-        let advertised = crate::rc::build_identity::DaemonIdentity::current().unwrap();
-        assert!(
-            advertised
-                .rpc_features
-                .iter()
-                .any(|feature| feature == "nonowner-selfstart-refused-v1"),
-            "{:?}",
-            advertised.rpc_features
-        );
-    }
-
-    /// Pins that the rule is advertised only by a build that also holds a non-owner's words to
-    /// Default or Plan on every path into a turn, the terminal inbox included: without that, a
-    /// non-owner's message into a terminal turn would start work this hook never sees.
-    #[test]
-    fn the_selfstart_rule_is_advertised_only_with_the_turn_mode_rule() {
-        let features = crate::rc::build_identity::DaemonIdentity::current()
-            .unwrap()
-            .rpc_features;
-        if features
-            .iter()
-            .any(|feature| feature == "nonowner-selfstart-refused-v1")
-        {
-            assert!(
-                features
-                    .iter()
-                    .any(|feature| feature == "nonowner-turn-mode-v1"),
-                "{features:?}"
-            );
         }
     }
 
@@ -2439,8 +1947,6 @@ mod tests {
             awaiting_echoes: Default::default(),
             next_prompt_id: None,
             goal_query_pending: false,
-            owner_turn: None,
-            next_input_owner: None,
         }
     }
 
@@ -2452,7 +1958,7 @@ mod tests {
             json!({"type":"user","isReplay":true,"message":{"role":"user","content":text}});
         assert!(driver.classify(record.clone()).is_none());
         assert!(driver.current_turn.is_none());
-        driver.awaiting_echoes.push_back((text.into(), false));
+        driver.awaiting_echoes.push_back(text.into());
         assert!(matches!(
             driver.classify(record),
             Some(HarnessEvent::TurnStarted { .. })
@@ -3069,7 +2575,7 @@ for line in sys.stdin:
     async fn the_replayed_echo_of_our_own_message_does_not_open_a_second_turn() {
         let mut d = probe();
         d.current_turn = Some("turn-1".into());
-        d.awaiting_echoes.push_back(("hello".into(), false));
+        d.awaiting_echoes.push_back("hello".into());
         let user_line =
             |text: &str| json!({"type":"user","message":{"role":"user","content":text}});
 
@@ -3267,7 +2773,7 @@ for line in sys.stdin:
         assert_eq!(
             d.awaiting_echoes
                 .iter()
-                .map(|(echo, _)| echo.as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>(),
             vec!["fix it"],
             "a refused start must not queue its own echo behind the steer's"

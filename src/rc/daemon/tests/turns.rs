@@ -2075,7 +2075,7 @@ async fn message_attribution_comes_from_the_caller_claim_not_request_params() {
 }
 
 #[tokio::test]
-async fn runtime_commands_require_owner_and_the_live_session_workspace() {
+async fn runtime_commands_need_an_operator_of_the_live_sessions_workspace() {
     let (tx, _rx) = mpsc::channel(1);
     let daemon = rpc_test_daemon(
         [(
@@ -2090,12 +2090,17 @@ async fn runtime_commands_require_owner_and_the_live_session_workspace() {
         method::SESSION_COMMAND,
         serde_json::json!({"session_id":"session","name":"goal.set","arguments":{"objective":"Finish"}}),
     );
-    for (role, workspace) in [("viewer", "ws-a"), ("operator", "ws-a"), ("owner", "ws-b")] {
+    for (role, workspace) in [("viewer", "ws-a"), ("owner", "ws-b")] {
         frame.caller = Some(claim(role, workspace));
         assert!(daemon.lock().await.prepare_session_rpc(&frame).is_err());
     }
-    frame.caller = Some(claim("owner", "ws-a"));
-    assert!(daemon.lock().await.prepare_session_rpc(&frame).is_ok());
+    for role in ["operator", "owner"] {
+        frame.caller = Some(claim(role, "ws-a"));
+        assert!(
+            daemon.lock().await.prepare_session_rpc(&frame).is_ok(),
+            "{role}"
+        );
+    }
 }
 
 #[test]
@@ -2315,11 +2320,11 @@ async fn pending_input_remains_stoppable_and_approvable_without_losing_its_guard
     assert!(!daemon.lock().await.sessions.contains_key("session-a"));
 }
 
-/// A non-owner's turn, steer or queued message into a Codex conversation is refused with the
-/// typed `codex_unconfined` in every permission mode, Plan included (MCP tools run unasked and
-/// unsandboxed there); the owner's turn goes on.
+/// A colleague's turn, steer and queued message into a Codex conversation meet what the owner's
+/// do, in every permission mode: a turn goes on, and a steer or queued message is answered as the
+/// owner's is.
 #[tokio::test]
-async fn a_non_owner_cannot_send_to_a_codex_conversation_in_any_mode() {
+async fn a_colleague_sends_to_a_codex_conversation_as_the_owner_does() {
     use crate::protocol::PermissionMode;
     for mode in [
         PermissionMode::Default,
@@ -2345,39 +2350,23 @@ async fn a_non_owner_cannot_send_to_a_codex_conversation_in_any_mode() {
             frame.caller = Some(claim(role, "ws-a"));
             frame
         };
-        for method in [
-            method::TURN_START,
-            method::TURN_STEER,
-            method::SESSION_ENQUEUE,
-        ] {
-            let error = state
-                .prepare_session_rpc(&frame(method, "operator"))
-                .err()
-                .unwrap_or_else(|| panic!("{method} in {mode:?} was not refused"));
-            assert!(
-                error.is(crate::protocol::ErrorCode::Forbidden),
-                "{method} {mode:?}"
-            );
-            assert_eq!(
-                error.data,
-                Some(
-                    serde_json::json!({"outcome": "not_sent", "retryable": false,
-                    "reason": "codex_unconfined"})
-                ),
-                "{method} {mode:?}"
-            );
-            assert_eq!(error.message, crate::rc::harness::CODEX_UNCONFINED);
-        }
         assert!(
             state
-                .prepare_session_rpc(&frame(method::TURN_START, "owner"))
+                .prepare_session_rpc(&frame(method::TURN_START, "operator"))
                 .is_ok(),
-            "the owner's turn in {mode:?}"
+            "a colleague's turn in {mode:?}"
         );
-        if let Err(error) = state.prepare_session_rpc(&frame(method::TURN_STEER, "owner")) {
-            assert_ne!(
-                error.data.and_then(|d| d.get("reason").cloned()),
-                Some(serde_json::json!("codex_unconfined"))
+        for method in [method::TURN_STEER, method::SESSION_ENQUEUE] {
+            let answer = |state: &mut Daemon, role: &str| {
+                state
+                    .prepare_session_rpc(&frame(method, role))
+                    .err()
+                    .map(|error| (error.code, error.data))
+            };
+            assert_eq!(
+                answer(&mut state, "operator"),
+                answer(&mut state, "owner"),
+                "{method} {mode:?}"
             );
         }
     }
@@ -2407,15 +2396,14 @@ const RUNTIME_COMMANDS: &[&str] = &[
     "some-native-command",
 ];
 
-/// A non-owner's `session.command` is refused at the RPC whatever the command, read-only ones
-/// included, on every runtime and in every mode, before anything is queued; the owner runs
-/// every one. A device that held only a dangerous session's commands to the owner would let an
-/// operator approve, upload feedback or reconfigure as the owner.
+/// A colleague's `session.command` goes on at the RPC as the owner's does, whatever the command,
+/// on every runtime: a runtime command counts as words typed into the conversation. A viewer's is
+/// refused.
 #[tokio::test]
-async fn a_non_owner_runs_no_runtime_command() {
+async fn a_colleague_runs_every_runtime_command() {
     use crate::protocol::PermissionMode;
     for runtime in ["codex", "claude-code", "opencode"] {
-        for mode in [PermissionMode::Default, PermissionMode::Plan] {
+        for mode in [PermissionMode::Default, PermissionMode::Auto] {
             let (tx, _rx) = mpsc::channel(64);
             let mut live = rpc_test_live("session", 1, tx, mode);
             live.info.runtime = runtime.into();
@@ -2434,47 +2422,29 @@ async fn a_non_owner_runs_no_runtime_command() {
                 frame
             };
             for name in RUNTIME_COMMANDS {
-                for role in ["operator", "viewer"] {
-                    let error = state
-                        .prepare_session_rpc(&frame(name, role))
-                        .err()
-                        .unwrap_or_else(|| panic!("{runtime} {mode:?}: {role}'s {name}"));
+                for role in ["operator", "owner"] {
                     assert!(
-                        error.is(crate::protocol::ErrorCode::Forbidden),
-                        "{runtime} {role} {name}"
+                        state.prepare_session_rpc(&frame(name, role)).is_ok(),
+                        "{runtime} {mode:?}: {role}'s {name}"
                     );
                 }
+                let error = state
+                    .prepare_session_rpc(&frame(name, "viewer"))
+                    .err()
+                    .unwrap_or_else(|| panic!("{runtime} {mode:?}: a viewer's {name}"));
                 assert!(
-                    state.prepare_session_rpc(&frame(name, "owner")).is_ok(),
-                    "{runtime} {mode:?}: the owner's {name}"
+                    error.is(crate::protocol::ErrorCode::Forbidden),
+                    "{runtime} {name}"
                 );
             }
         }
     }
 }
 
-/// The receipt mapping turns the delivery-time refusal into the same typed error as the RPC's.
+/// An operator's `turn.start` and `turn.steer` go on into a session in every mode, Auto, Accept
+/// edits and one the device cannot read included, as the owner's do.
 #[test]
-fn a_delivery_time_command_refusal_is_the_typed_error() {
-    let error = super::super::map_receipt::<serde_json::Value>(Ok(Err(
-        crate::rc::harness::RuntimeCommandOwnerOnly.into(),
-    )))
-    .unwrap_err();
-    assert_eq!(
-        error,
-        crate::rc::harness::RuntimeCommandOwnerOnly::rpc_error()
-    );
-}
-
-/// Pins the RPC half of the non-owner mode rule (`rc::turn_mode`), through `prepare_session_rpc`:
-/// an operator's `turn.start`, `turn.steer` and `session.enqueue` into an Auto or AcceptEdits
-/// session, or one whose mode the device cannot read, are refused `mode_owner_only`, `not_sent`,
-/// before anything is queued; into Default or Plan they go on. A start is judged by the mode the
-/// next turn starts in (a queued mode first), a steer by the running turn's. The owner goes on in
-/// every mode. A daemon that judged only Bypass let an operator drive a session the owner set to
-/// act without asking.
-#[test]
-fn a_non_owners_words_enter_only_a_default_or_plan_turn() {
+fn a_non_owners_words_enter_a_turn_in_every_mode() {
     use crate::protocol::PermissionMode as M;
     let home = tempfile::tempdir().unwrap();
     crate::rc::with_agit_home(home.path(), || {
@@ -2504,85 +2474,99 @@ fn a_non_owners_words_enter_only_a_default_or_plan_turn() {
                             client_msg_id: Some("message-steer".into()),
                         },
                     );
-                    steer.caller = Some(caller.clone());
-                    let mut enqueue = Frame::request(
-                        method::SESSION_ENQUEUE,
-                        serde_json::json!({
-                            "workspace_id": "ws-a",
-                            "session_id": "session-a",
-                            "client_msg_id": uuid::Uuid::new_v4().to_string(),
-                            "message": "inspect",
-                        }),
-                    );
-                    enqueue.caller = Some(caller);
-                    [("start", start), ("steer", steer), ("enqueue", enqueue)]
+                    steer.caller = Some(caller);
+                    [("start", start), ("steer", steer)]
                 };
-                // What each RPC gets for a session in `current` with `pending` queued for the
-                // next turn: `None` when it goes on past the mode rule.
-                let refused = |role: &str, current: Option<M>, pending: Option<M>| {
-                    let (tx, _rx) = mpsc::channel(4);
-                    let mut live = rpc_test_live("session-a", 1, tx, M::Default);
-                    // The mode rule holds for every runtime; Codex takes no non-owner input at
-                    // all (codex_unconfined), so it is pinned here on another runtime.
+                for role in ["operator", "owner"] {
+                    for mode in [
+                        Some(M::Default),
+                        Some(M::Plan),
+                        Some(M::AcceptEdits),
+                        Some(M::Auto),
+                        None,
+                    ] {
+                        let (tx, _rx) = mpsc::channel(4);
+                        let mut live = rpc_test_live("session-a", 1, tx, M::Default);
+                        live.info.runtime = "claude-code".into();
+                        live.info.permission_mode = mode;
+                        let daemon = rpc_test_daemon(
+                            HashMap::from([("session-a".to_owned(), live)]),
+                            Roster::default(),
+                        );
+                        let mut state = daemon.try_lock().unwrap();
+                        for (name, frame) in frames(role) {
+                            if let Err(error) = state.prepare_session_rpc(&frame).map(drop) {
+                                panic!("{role} {name} {mode:?}: {error:?}");
+                            }
+                        }
+                    }
+                }
+            });
+    });
+}
+
+/// A colleague's "allow for this session" goes to the session as a one-time answer, and its reply
+/// says so with `scope_applied: "once"`, so the Hub can tell them. A colleague's one-time answer
+/// carries no such field.
+#[test]
+fn a_colleagues_session_wide_allow_says_it_applied_once() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::protocol::{
+                    ApprovalDecision, ApprovalResponse, ApprovalScope, PermissionMode,
+                };
+                for (scope, said) in [
+                    (ApprovalScope::Session, Some(serde_json::json!("once"))),
+                    (ApprovalScope::Once, None),
+                ] {
+                    let (tx, mut rx) = mpsc::channel(1);
+                    let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
                     live.info.runtime = "claude-code".into();
-                    live.info.permission_mode = current;
-                    live.pending_mode = pending;
+                    live.approval_requests
+                        .insert("approval-1".into(), Some(PermissionMode::AcceptEdits));
                     let daemon = rpc_test_daemon(
-                        HashMap::from([("session-a".to_owned(), live)]),
+                        [("session-a".into(), live)].into_iter().collect(),
                         Roster::default(),
                     );
-                    let mut state = daemon.try_lock().unwrap();
-                    frames(role).map(|(name, frame)| {
-                        let result = state.prepare_session_rpc(&frame).map(drop);
-                        let refusal = result.err().filter(|error| {
-                            error.data.as_ref().and_then(|data| data.get("reason"))
-                                == Some(&serde_json::json!("mode_owner_only"))
-                        });
-                        if let Some(error) = &refusal {
-                            assert_eq!(error.code, ErrorCode::Forbidden as i32, "{name}");
-                            // The refusal names the mode the turn would run in, as the protocol
-                            // spells it, and only when it can be read.
-                            let judged = if name == "steer" {
-                                current
-                            } else {
-                                pending.or(current)
-                            };
-                            assert_eq!(
-                                error.data.as_ref().unwrap().get("mode"),
-                                judged.map(|mode| serde_json::json!(mode)).as_ref(),
-                                "{name}"
-                            );
-                            assert_eq!(
-                                error.data.as_ref().unwrap()["outcome"],
-                                "not_sent",
-                                "{name}"
-                            );
-                        }
-                        (name, refusal.is_some())
-                    })
-                };
-                let all =
-                    |refused: bool| [("start", refused), ("steer", refused), ("enqueue", refused)];
-                for mode in [M::Default, M::Plan] {
-                    assert_eq!(
-                        refused("operator", Some(mode), None),
-                        all(false),
-                        "{mode:?}"
+                    let mut frame = Frame::request(
+                        method::APPROVAL_DECIDE,
+                        ApprovalResponse {
+                            approval_id: "approval-1".into(),
+                            session_id: "session-a".into(),
+                            decision: ApprovalDecision::Allow,
+                            scope,
+                            message: None,
+                            answers: None,
+                            by: Some("colleague".into()),
+                        },
                     );
+                    frame.caller = Some(claim("operator", "ws-a"));
+                    let prepared = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
+                    let worker_daemon = daemon.clone();
+                    let worker = tokio::spawn(async move {
+                        let (_stop_tx, mut stop) = tokio::sync::watch::channel(false);
+                        prepared.execute(worker_daemon, &mut stop).await
+                    });
+                    match rx.recv().await.unwrap() {
+                        Command::Approve {
+                            response, reply, ..
+                        } => {
+                            assert_eq!(response.scope, ApprovalScope::Once, "{scope:?}");
+                            assert!(reply.accept());
+                            reply.finish(Ok(ApprovalOutcome::Applied {
+                                effective_mode: None,
+                            }));
+                        }
+                        _ => panic!("wrong command"),
+                    }
+                    let value = worker.await.unwrap().response.unwrap();
+                    assert_eq!(value.get("scope_applied").cloned(), said, "{scope:?}");
                 }
-                for mode in [Some(M::Auto), Some(M::AcceptEdits), None] {
-                    assert_eq!(refused("operator", mode, None), all(true), "{mode:?}");
-                    assert_eq!(refused("owner", mode, None), all(false), "{mode:?}");
-                }
-                // A start runs in the mode queued for the next turn, a steer in the running one.
-                assert_eq!(
-                    refused("operator", Some(M::Default), Some(M::Auto)),
-                    [("start", true), ("steer", false), ("enqueue", true)]
-                );
-                assert_eq!(
-                    refused("operator", Some(M::Auto), Some(M::Plan))[..2],
-                    [("start", false), ("steer", true)]
-                );
             });
     });
 }

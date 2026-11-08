@@ -5,6 +5,7 @@
 //! through `codex queue`; a Claude Code session that runs in another process receives them
 //! through that process's messaging socket ([`super::claude_inbox`]).
 
+use crate::adapter::preview::{DEVICE_SENDER_LINE, HUB_SENDER_LINE};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -103,13 +104,6 @@ pub struct Prepared {
     pub(crate) source: Option<super::runtime_context::RuntimeContext>,
     pub(crate) authority: super::authority::Guard,
     pub(crate) confinement: Option<tokio::sync::watch::Receiver<super::Confinement>>,
-    pub(crate) allow_dangerous: bool,
-    /// Whether the workspace owner sent the message: a Codex conversation takes only theirs.
-    pub(crate) caller_is_owner: bool,
-    /// For a non-owner's message to a source conversation, the loosest mode its thread may be in
-    /// when the message is submitted, checked against the index's current mode right before each
-    /// submission.
-    pub(crate) mode_bound: Option<crate::protocol::PermissionMode>,
     pub request: Request,
     pub transcript: PathBuf,
     pub cwd: PathBuf,
@@ -188,38 +182,16 @@ impl Prepared {
                 thread.cwd == self.cwd && thread.transcript == self.transcript,
                 "native inbox source changed before delivery"
             );
-            let current = context.current_mode(&thread).ok().flatten();
-            if !self.allow_dangerous
-                && !matches!(
-                    (current, self.mode_bound),
-                    (Some(current), Some(bound)) if !current.loosens_from(bound)
-                )
-            {
-                return Err(super::native_settings::mode_changed().into());
-            }
             super::local_goal::validate_header(
                 &thread.transcript,
                 &self.request.session_id,
                 &self.cwd,
             )?;
-        } else if !self.allow_dangerous {
-            // Read again at delivery: the mode may have changed since the message was prepared.
-            let current = match &self.native {
-                Native::Claude(_) => None,
-                Native::Codex(_) => super::native_settings::current_local_codex_mode(
-                    &self.transcript,
-                    &self.request.session_id,
-                ),
-            };
-            if let Err(refused) = super::turn_mode::require(false, current) {
-                return Err(refused.rpc_error().into());
-            }
         }
         Ok(())
     }
 
-    /// The transcript still belongs to the requested session, and its runtime still accepts
-    /// messages from this caller.
+    /// The transcript still belongs to the requested session.
     async fn validate_native(&self) -> crate::Result<()> {
         let Native::Claude(_) = &self.native else {
             return verify_transcript(&self.transcript, &self.request.session_id);
@@ -231,27 +203,10 @@ impl Prepared {
             "native transcript identity does not match the requested session"
         );
         open_regular(&self.transcript)?;
-        if !self.allow_dangerous {
-            let transcript = self.transcript.clone();
-            let unchecked = tokio::task::spawn_blocking(move || {
-                super::claude_inbox::transcript_ran_unchecked(&transcript)
-            })
-            .await??;
-            if unchecked {
-                return Err(crate::protocol::RpcError::new(
-                    crate::protocol::ErrorCode::DangerousSessionLocked,
-                    "this Claude Code session has run without permission checks, so only its owner may send it messages",
-                )
-                .into());
-            }
-        }
         Ok(())
     }
 
     pub async fn deliver(self) -> crate::Result<Value> {
-        if matches!(self.native, Native::Codex(_)) && !self.caller_is_owner {
-            return Err(super::harness::CodexUnconfined::rpc_error().into());
-        }
         self.request.validate()?;
         self.validate_source()?;
         self.validate_native().await?;
@@ -391,9 +346,8 @@ impl Prepared {
         Ok(json!({"client_msg_id":self.request.client_msg_id,"status":"queued"}))
     }
 
-    /// The owner's message passes through the session's queue, where a relay may deliver it as
-    /// the session itself; anyone else's goes straight to the socket under the peer token.
-    /// Authority is checked at the moment the message becomes visible to a relay or leaves.
+    /// The message passes through the session's queue, where a relay may deliver it as the
+    /// session itself, a colleague's as the owner's. Authority is checked at the moment the message becomes visible to a relay or leaves.
     async fn send_claude(
         &self,
         target: &ClaudeTarget,
@@ -401,13 +355,7 @@ impl Prepared {
         message: &str,
     ) -> Result<(), super::claude_inbox::SendError> {
         use super::claude_inbox::SendError::NotDelivered;
-        // Claude Code holds a peer message for approval by the session's live permission mode,
-        // which the transcript gate cannot see; a relay would deliver past that hold.
-        let queue = self
-            .allow_dangerous
-            .then(|| super::claude_inbox::Queue::open(target.queue.clone()))
-            .transpose()
-            .map_err(NotDelivered)?;
+        let queue = super::claude_inbox::Queue::open(target.queue.clone()).map_err(NotDelivered)?;
         self.validate_source().map_err(NotDelivered)?;
         let mut enqueued = None;
         let admitted = {
@@ -417,15 +365,13 @@ impl Prepared {
                     .map_err(|error| NotDelivered(error.into()))?;
             }
             self.authority.admit(|| {
-                enqueued = queue.as_ref().map(|queue| {
-                    queue.enqueue(
-                        key,
-                        &self.request.client_msg_id,
-                        message,
-                        &target.live,
-                        self.allow_dangerous,
-                    )
-                });
+                enqueued = Some(queue.enqueue(
+                    key,
+                    &self.request.client_msg_id,
+                    message,
+                    &target.live,
+                    true,
+                ));
                 true
             })
         };
@@ -434,14 +380,6 @@ impl Prepared {
                 "request authority expired before native delivery"
             )));
         }
-        let Some(queue) = queue else {
-            return super::claude_inbox::send_direct(
-                &target.live,
-                &self.request.client_msg_id,
-                message,
-            )
-            .await;
-        };
         enqueued.expect("accepted native delivery attempts the enqueue")?;
         super::claude_inbox::forward(&queue, &target.live, key).await
     }
@@ -493,17 +431,13 @@ impl Prepared {
     }
 }
 
-/// How the Hub's line naming another person's words begins. The Hub escapes it inside anyone's
-/// words, so words that begin with it carry the Hub's own line.
-const HUB_SENDER_LINE: &str = "[AgentGit: this message is from ";
-
 /// `message` from the workspace member `username` as a terminal-held conversation receives it:
 /// under one line naming the sender, the Hub's when the words already begin with it and it names
 /// that same member, else this device's, ahead of the words.
 pub(crate) fn labelled(username: Option<&str>, message: &str) -> String {
     match username {
         Some(username) if !hub_names(message, username) => {
-            format!("[AgentGit workspace message from @{username}]\n{message}")
+            format!("{DEVICE_SENDER_LINE}{username}]\n{message}")
         }
         _ => message.to_owned(),
     }
@@ -573,9 +507,6 @@ mod tests {
             source: None,
             authority: Default::default(),
             confinement: None,
-            allow_dangerous: true,
-            caller_is_owner: true,
-            mode_bound: None,
             request: Request {
                 workspace_id: "workspace".into(),
                 session_id: session.into(),
@@ -590,33 +521,6 @@ mod tests {
             username: Some("collaborator".into()),
             receipts: root.join("receipts"),
         }
-    }
-
-    /// A non-owner's message into a Codex conversation is refused at delivery with the typed
-    /// refusal, before anything is validated or written.
-    #[tokio::test]
-    async fn a_non_owners_message_to_codex_is_refused_at_delivery() {
-        let root = tempfile::tempdir().unwrap();
-        let mut value = prepared(
-            root.path(),
-            &uuid::Uuid::new_v4().to_string(),
-            &uuid::Uuid::new_v4().to_string(),
-        );
-        value.caller_is_owner = false;
-        let error = value
-            .deliver()
-            .await
-            .unwrap_err()
-            .downcast::<crate::protocol::RpcError>()
-            .unwrap();
-        assert_eq!(
-            error.data.unwrap()["reason"],
-            serde_json::json!("codex_unconfined")
-        );
-        assert!(
-            !root.path().join("receipts").exists(),
-            "nothing was written"
-        );
     }
 
     #[test]
@@ -636,16 +540,14 @@ mod tests {
 
     /// A Claude Code session running in another process receives the message through its own
     /// socket, so that process stays the only transcript writer. This pins the exact frames, one
-    /// delivery per client message id, that the owner's message goes through the relay under the
-    /// session's own token, that a held lock which no relay acts on falls back to the peer token,
-    /// and that a non-owner's message is refused `mode_owner_only` with nothing sent, whatever the
-    /// transcript records: a terminal can change its mode without recording it, so its mode
-    /// can't be read and the conversation is the owner's (`rc::turn_mode`). Resending on retry,
-    /// counting a held lock as delivery, or sending a non-owner's words into a terminal whose mode
-    /// is unknown each fails here.
+    /// delivery per client message id, that a colleague's message and the owner's go through the
+    /// relay under the session's own token, that a held lock which no relay acts on falls back to
+    /// the peer token, and that a colleague's message still goes once the transcript records a run
+    /// without permission checks. Resending on retry or counting a held lock as delivery each
+    /// fails here.
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_sessions_get_each_message_once_and_bypass_history_needs_the_owner() {
+    async fn claude_sessions_get_each_message_once_whoever_sends_it() {
         use crate::rc::claude_inbox::fixture;
         async fn next(
             connections: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<Value>>,
@@ -674,10 +576,9 @@ mod tests {
         .unwrap();
         let live = crate::rc::claude_inbox::discover_in(&registry, &session).unwrap();
         let queue = root.path().join("queue");
-        let send = |client: &str, owner: bool| {
+        let send = |client: &str| {
             let mut request = prepared(root.path(), &session, client);
             request.transcript = transcript.clone();
-            request.allow_dangerous = owner;
             request.native = Native::Claude(ClaudeTarget {
                 live: live.clone(),
                 registry: registry.clone(),
@@ -694,27 +595,19 @@ mod tests {
             ]
         };
 
-        let not_sent = |error: anyhow::Error| {
-            let error = error.downcast::<crate::protocol::RpcError>().unwrap();
-            assert_eq!(error.code, crate::protocol::ErrorCode::Forbidden as i32);
-            assert_eq!(error.data.as_ref().unwrap()["reason"], "mode_owner_only");
-            assert_eq!(error.data.as_ref().unwrap()["outcome"], "not_sent");
-        };
-        // The transcript records Default, but nothing shows the terminal still runs in it.
-        not_sent(
-            send(&uuid::Uuid::new_v4().to_string(), false)
-                .await
-                .unwrap_err(),
-        );
+        // A colleague's message goes to the terminal as the owner's does.
+        let colleague = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&colleague).await.unwrap()["status"], "queued");
+        assert_eq!(next(&mut connections).await, frames(&colleague, peer));
         let first = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&first, true).await.unwrap()["status"], "queued");
+        assert_eq!(send(&first).await.unwrap()["status"], "queued");
         assert_eq!(
             next(&mut connections).await,
             frames(&first, peer),
             "the refused message never reached the terminal"
         );
         // The retry answers from its receipt; the next connection belongs to a later message.
-        assert_eq!(send(&first, true).await.unwrap()["status"], "queued");
+        assert_eq!(send(&first).await.unwrap()["status"], "queued");
 
         let child = "0123456789abcdef0123456789abcdef";
         let relay = fixture::relay(&registry, &queue, &session, &socket, child);
@@ -726,13 +619,11 @@ mod tests {
         })
         .await
         .expect("the relay starts");
-        not_sent(
-            send(&uuid::Uuid::new_v4().to_string(), false)
-                .await
-                .unwrap_err(),
-        );
+        let colleague = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&colleague).await.unwrap()["status"], "queued");
+        assert_eq!(next(&mut connections).await, frames(&colleague, child));
         let owners = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&owners, true).await.unwrap()["status"], "queued");
+        assert_eq!(send(&owners).await.unwrap()["status"], "queued");
         assert_eq!(
             next(&mut connections).await,
             frames(&owners, child),
@@ -743,7 +634,7 @@ mod tests {
 
         let held = inbox.try_lock().unwrap().unwrap();
         let fallback = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&fallback, true).await.unwrap()["status"], "queued");
+        assert_eq!(send(&fallback).await.unwrap()["status"], "queued");
         assert_eq!(
             next(&mut connections).await,
             frames(&fallback, peer),
@@ -768,14 +659,10 @@ mod tests {
             json!({"type":"permission-mode","permissionMode":"default","sessionId":session})
         )
         .unwrap();
-        not_sent(
-            send(&uuid::Uuid::new_v4().to_string(), false)
-                .await
-                .unwrap_err(),
-        );
-        let owner = uuid::Uuid::new_v4().to_string();
-        assert_eq!(send(&owner, true).await.unwrap()["status"], "queued");
-        assert_eq!(next(&mut connections).await, frames(&owner, peer));
+        // A transcript that once ran without permission checks takes a colleague's message too.
+        let colleague = uuid::Uuid::new_v4().to_string();
+        assert_eq!(send(&colleague).await.unwrap()["status"], "queued");
+        assert_eq!(next(&mut connections).await, frames(&colleague, peer));
     }
 
     #[cfg(unix)]
@@ -846,10 +733,6 @@ mod tests {
             assert_eq!(calls.matches("--thread").count(), 1);
             assert!(calls.contains(&native));
         }
-        let mut uncertain_policy = request(&contexts[1]);
-        uncertain_policy.allow_dangerous = false;
-        uncertain_policy.request.client_msg_id = uuid::Uuid::new_v4().to_string();
-        assert!(uncertain_policy.deliver().await.is_err());
         let (binding, current) = tokio::sync::watch::channel(super::super::Confinement {
             roots: super::super::policy::CanonicalRoots::from_untrusted([project.clone()]),
             ..Default::default()

@@ -362,583 +362,6 @@ fn attach_only_joins_a_supervised_codex_session() {
     });
 }
 
-/// The one above pins only the test itself. **This one pins that the takeover path actually asks
-/// it.**
-///
-/// The takeover branch of `session.resume` **mints** a fresh logical id for a transcript the
-/// ledger does not know, and that id is forever clean to `Roster::ever_dangerous`. Hang the test
-/// back on the logical id and every operator here is let through — holding the entire context of
-/// a session that ran with no checks.
-#[test]
-fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
-    let home = tempfile::tempdir().unwrap();
-    crate::rc::with_agit_home(home.path(), || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                // The cwd in the ledger is the canonical path `policy::require_within` hands
-                // back (`spawn_session` persists exactly `spec.cwd`), and the other side of the
-                // comparison is that same path.
-                let cwd = std::fs::canonicalize(home.path()).unwrap();
-                // The row for a dangerous start that crashed before `Bound` reached disk: an
-                // empty thread id, and the ledger cannot name the transcript of that unchecked
-                // run.
-                let mut roster = Roster::default();
-                let mut orphan =
-                    rpc_test_roster_entry("agit-crashed", crate::protocol::PermissionMode::Bypass);
-                orphan.runtime = "unsupported-test-runtime".into();
-                orphan.thread_id = String::new();
-                orphan.ever_dangerous = true;
-                orphan.workspace_id = "ws-a".into();
-                orphan.cwd = cwd.to_string_lossy().into_owned();
-                roster.sessions.insert("agit-crashed".into(), orphan);
-
-                let daemon = rpc_test_daemon(HashMap::new(), roster);
-                let mut state = daemon.lock().await;
-                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
-                // A second workspace binds the same directory — scope the poisoning by
-                // workspace alone and this side is the hole.
-                state.mirror.bind("ws-b", "project-b", home.path()).unwrap();
-                let (frames, _frames_rx) = mpsc::channel(1);
-
-                let located = |workspace: &str| LocatedLocal {
-                    title: Some("Native title".into()),
-                    gist: Some("Opening prompt".into()),
-                    runtime: "unsupported-test-runtime".into(),
-                    cwd: cwd.clone(),
-                    project_id: Some(format!("project-{workspace}")),
-                    likely_active: false,
-                };
-                let takeover = |workspace: &str| SessionResume {
-                    project_id: None,
-                    workspace_id: workspace.into(),
-                    session_id: "native-nobody-knows".into(),
-                    prompt: None,
-                    by: None,
-                    agent: None,
-                    expected_agent_id: None,
-                    branch: None,
-                    attach_only: false,
-                };
-
-                for workspace in ["ws-a", "ws-b"] {
-                    let error = state
-                        .take_over_local_session(
-                            located(workspace),
-                            takeover(workspace),
-                            &claim("operator", workspace),
-                            &frames,
-                        )
-                        .await
-                        .expect_err("an unaccounted thread may be that crashed bypass session");
-                    assert_eq!(
-                        error.code,
-                        ErrorCode::DangerousSessionLocked as i32,
-                        "{workspace}: {}",
-                        error.message
-                    );
-                }
-
-                // The owner still gets through — this gate locks the role, not the path itself.
-                let error = state
-                    .take_over_local_session(
-                        located("ws-a"),
-                        takeover("ws-a"),
-                        &claim("owner", "ws-a"),
-                        &frames,
-                    )
-                    .await
-                    .expect_err("the unsupported test runtime cannot actually launch");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::RuntimeUnavailable as i32,
-                    "{}",
-                    error.message
-                );
-            });
-    });
-}
-/// Pins the takeover of a Claude Code conversation started in a terminal with
-/// `--dangerously-skip-permissions` and closed before the daemon saw it (#267, gap b, the Sim's
-/// variant 3). The ledger has no row for it, so only its transcript says it ran unchecked: an
-/// operator's takeover is refused and mints no identity, while the owner's gets past the danger
-/// gate. Where an earlier build already recorded it under a clean identity, an operator's resume
-/// of that identity is refused too, and the owner's is not. A takeover that asked only the ledger
-/// minted a clean identity any operator could then resume.
-#[test]
-fn an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation() {
-    if crate::rc::in_isolated_test(
-        "rc::daemon::tests::sessions::an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation",
-    ) {
-        return;
-    }
-    let home = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
-    }
-    crate::rc::with_agit_home(home.path(), || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                const THREAD: &str = "eeeeeeee-0000-4000-8000-0000000002b5";
-                let cwd = std::fs::canonicalize(home.path()).unwrap();
-                let native = home
-                    .path()
-                    .join("claude/projects")
-                    .join(crate::adapter::claude_code::slug_for(&cwd));
-                std::fs::create_dir_all(&native).unwrap();
-                let record = serde_json::json!({"type":"user","sessionId":THREAD,"cwd":cwd,
-                    "timestamp":"2026-11-01T00:00:00Z","permissionMode":"bypassPermissions",
-                    "message":{"role":"user","content":"hello"}});
-                std::fs::write(
-                    native.join(format!("{THREAD}.jsonl")),
-                    format!("{record}\n"),
-                )
-                .unwrap();
-
-                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
-                let mut state = daemon.lock().await;
-                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
-                let (frames, _frames_rx) = mpsc::channel(1);
-                let located = || LocatedLocal {
-                    title: None,
-                    gist: None,
-                    runtime: "claude-code".into(),
-                    cwd: cwd.clone(),
-                    project_id: Some("project-a".into()),
-                    likely_active: false,
-                };
-                let takeover = || SessionResume {
-                    project_id: None,
-                    workspace_id: "ws-a".into(),
-                    session_id: THREAD.into(),
-                    prompt: None,
-                    by: None,
-                    agent: None,
-                    expected_agent_id: None,
-                    branch: None,
-                    attach_only: false,
-                };
-                let error = state
-                    .take_over_local_session(
-                        located(),
-                        takeover(),
-                        &claim("operator", "ws-a"),
-                        &frames,
-                    )
-                    .await
-                    .expect_err("a terminal bypass transcript is owner-only");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::DangerousSessionLocked as i32,
-                    "{}",
-                    error.message
-                );
-                assert!(
-                    state
-                        .roster
-                        .logical_for_thread("claude-code", THREAD, "ws-a")
-                        .is_none(),
-                    "a refused takeover mints no identity"
-                );
-                // The owner gets past the danger gate; whatever stops the launch here is not it.
-                if let Err(error) = state
-                    .take_over_local_session(
-                        located(),
-                        takeover(),
-                        &claim("owner", "ws-a"),
-                        &frames,
-                    )
-                    .await
-                {
-                    assert_ne!(
-                        error.code,
-                        ErrorCode::DangerousSessionLocked as i32,
-                        "{}",
-                        error.message
-                    );
-                }
-
-                // A row that records the conversation under a clean identity, as a takeover that
-                // read only the ledger leaves. An operator resuming that identity is still
-                // refused, since the transcript says it ran unchecked; the owner is not.
-                let mut minted =
-                    rpc_test_roster_entry("agit-minted", crate::protocol::PermissionMode::Default);
-                minted.runtime = "claude-code".into();
-                minted.thread_id = THREAD.into();
-                minted.ever_dangerous = false;
-                minted.workspace_id = "ws-a".into();
-                minted.cwd = cwd.to_string_lossy().into_owned();
-                minted.project_id = Some("project-a".into());
-                state
-                    .roster
-                    .sessions
-                    .retain(|_, entry| entry.thread_id != THREAD);
-                state.roster.sessions.insert("agit-minted".into(), minted);
-                let resume = || SessionResume {
-                    session_id: "agit-minted".into(),
-                    ..takeover()
-                };
-                let error = state
-                    .resume_session(resume(), &claim("operator", "ws-a"), &frames)
-                    .await
-                    .expect_err("resuming the clean identity is still owner-only");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::DangerousSessionLocked as i32,
-                    "{}",
-                    error.message
-                );
-                if let Err(error) = state
-                    .resume_session(resume(), &claim("owner", "ws-a"), &frames)
-                    .await
-                {
-                    assert_ne!(
-                        error.code,
-                        ErrorCode::DangerousSessionLocked as i32,
-                        "{}",
-                        error.message
-                    );
-                }
-            });
-    });
-}
-
-/// The Codex form of the same case: a conversation run in a terminal with approvals off and full
-/// sandbox access, then closed. Its rollout records that in its turns' settings and the ledger
-/// knows nothing. The owner shares it, which records it under a logical identity marked as having
-/// run unchecked; an operator's resume of that identity is refused with `DangerousSessionLocked`,
-/// and the owner's gets past the danger gate. A share that judged Codex by the ledger alone
-/// recorded a clean identity any operator could then resume.
-#[cfg(unix)]
-#[test]
-fn an_operator_cannot_resume_a_shared_closed_bypass_codex_conversation() {
-    if crate::rc::in_isolated_test(
-        "rc::daemon::tests::sessions::an_operator_cannot_resume_a_shared_closed_bypass_codex_conversation",
-    ) {
-        return;
-    }
-    let home = tempfile::tempdir().unwrap();
-    unsafe {
-        std::env::set_var("CODEX_HOME", home.path().join("codex"));
-        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
-    }
-    crate::rc::with_agit_home(home.path(), || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                const THREAD: &str = "ffffffff-0000-4000-8000-0000000002b6";
-                let cwd = home.path().join("project");
-                std::fs::create_dir(&cwd).unwrap();
-                let cwd = cwd.canonicalize().unwrap();
-                let day = home.path().join("codex/sessions/2026/11/01");
-                std::fs::create_dir_all(&day).unwrap();
-                let records = [
-                    serde_json::json!({"timestamp":"2026-11-01T00:00:00Z","type":"session_meta",
-                        "payload":{"id":THREAD,"cwd":cwd,"timestamp":"2026-11-01T00:00:00Z",
-                            "originator":"codex_cli_rs","cli_version":"0.0.0"}}),
-                    serde_json::json!({"timestamp":"2026-11-01T00:00:01Z","type":"turn_context",
-                        "payload":{"cwd":cwd,"approval_policy":"never",
-                            "sandbox_policy":{"type":"danger-full-access"},"model":"gpt-test"}}),
-                ];
-                std::fs::write(
-                    day.join(format!("rollout-2026-11-01T00-00-00-{THREAD}.jsonl")),
-                    records
-                        .iter()
-                        .map(|record| format!("{record}\n"))
-                        .collect::<String>(),
-                )
-                .unwrap();
-
-                let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
-                let mut state = daemon.lock().await;
-                state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
-                let (frames, _frames_rx) = mpsc::channel(1);
-                let mut share = Frame::request(
-                    method::SESSION_SHARE,
-                    serde_json::json!({"workspace_id":"ws-a","project_id":"project-a",
-                        "runtime":"codex","runtime_session_id":THREAD}),
-                );
-                share.caller = Some(claim("owner", "ws-a"));
-                let shared: crate::protocol::SessionShareResult =
-                    serde_json::from_value(state.share_session(&share).unwrap()).unwrap();
-                let logical = shared.session.session_id;
-                assert!(state.roster.get(&logical).unwrap().ever_dangerous);
-                let resume = || SessionResume {
-                    project_id: None,
-                    workspace_id: "ws-a".into(),
-                    session_id: logical.clone(),
-                    prompt: None,
-                    by: None,
-                    agent: None,
-                    expected_agent_id: None,
-                    branch: None,
-                    attach_only: false,
-                };
-                let error = state
-                    .resume_session(resume(), &claim("operator", "ws-a"), &frames)
-                    .await
-                    .expect_err("a shared bypass Codex conversation is owner-only");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::DangerousSessionLocked as i32,
-                    "{}",
-                    error.message
-                );
-                if let Err(error) = state
-                    .resume_session(resume(), &claim("owner", "ws-a"), &frames)
-                    .await
-                {
-                    assert_ne!(
-                        error.code,
-                        ErrorCode::DangerousSessionLocked as i32,
-                        "{}",
-                        error.message
-                    );
-                }
-            });
-    });
-}
-
-/// The one above pins the backstop for when the ledger **cannot account for** the transcript.
-/// This one pins the case the ledger **does** account for and still misses, because that row sits
-/// under another workspace.
-///
-/// Two workspaces can each bind the same directory. The bypass session in ws-a bound a real
-/// thread id and `Bound` reached disk, so it is neither "thread_id is empty" nor in
-/// `unconfirmed_dangerous_bindings` — `dangerous_start_unaccounted` matches nothing; and a lookup
-/// by logical identity is held off by the workspace test. That transcript still lies in a
-/// directory ws-b binds too, and `local_sessions("ws-b")` lists it as takeable: scope the test by
-/// workspace alone and one takeover by ws-b's operator mints a clean `dangerous: false` identity
-/// that inherits everything that unchecked run read into its context, and then `Bound` persists
-/// that "clean" as another row.
-///
-/// When the ledger **does** know which transcript this is, there is even less reason to be looser
-/// than when it does not.
-#[test]
-fn a_bound_dangerous_transcript_stays_owner_only_from_a_second_workspace_sharing_its_folder() {
-    let home = tempfile::tempdir().unwrap();
-    crate::rc::with_agit_home(home.path(), || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cwd = std::fs::canonicalize(home.path()).unwrap();
-                // A dangerous row the ledger **fully accounts for**: a real thread id, and a
-                // confirmed binding.
-                let mut roster = Roster::default();
-                let mut bound =
-                    rpc_test_roster_entry("agit-bound", crate::protocol::PermissionMode::Bypass);
-                bound.runtime = "unsupported-test-runtime".into();
-                bound.thread_id = "native-1".into();
-                bound.ever_dangerous = true;
-                bound.workspace_id = "ws-a".into();
-                bound.cwd = cwd.to_string_lossy().into_owned();
-                roster.sessions.insert("agit-bound".into(), bound);
-                assert!(
-                    roster.unconfirmed_dangerous_bindings.is_empty(),
-                    "precondition: this row's binding is confirmed, so \
-                     `dangerous_start_unaccounted` does not match it"
-                );
-
-                let daemon = rpc_test_daemon(HashMap::new(), roster);
-                let mut state = daemon.lock().await;
-                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
-                // A second workspace binds the same directory — its listing shows the same
-                // transcript.
-                state.mirror.bind("ws-b", "project-b", home.path()).unwrap();
-                let (frames, _frames_rx) = mpsc::channel(1);
-
-                let located = |workspace: &str| LocatedLocal {
-                    title: Some("Native title".into()),
-                    gist: Some("Opening prompt".into()),
-                    runtime: "unsupported-test-runtime".into(),
-                    cwd: cwd.clone(),
-                    project_id: Some(format!("project-{workspace}")),
-                    likely_active: false,
-                };
-                let takeover = |workspace: &str| SessionResume {
-                    project_id: None,
-                    workspace_id: workspace.into(),
-                    session_id: "native-1".into(),
-                    prompt: None,
-                    by: None,
-                    agent: None,
-                    expected_agent_id: None,
-                    branch: None,
-                    attach_only: false,
-                };
-
-                for workspace in ["ws-a", "ws-b"] {
-                    let error = state
-                        .take_over_local_session(
-                            located(workspace),
-                            takeover(workspace),
-                            &claim("operator", workspace),
-                            &frames,
-                        )
-                        .await
-                        .expect_err("an unchecked transcript is owner-only in every workspace");
-                    assert_eq!(
-                        error.code,
-                        ErrorCode::DangerousSessionLocked as i32,
-                        "{workspace}'s operator took over the transcript that ran unchecked; \
-                         the monotonic danger bit did not follow it across the workspace \
-                         boundary (got: {})",
-                        error.message
-                    );
-                }
-
-                // The viewing path reads the same test: ws-b cannot call it clean either.
-                assert!(state.roster.transcript_ever_dangerous(
-                    "unsupported-test-runtime",
-                    "native-1",
-                    "ws-b",
-                    &cwd.to_string_lossy()
-                ));
-
-                // The owner still gets through — this gate locks the role, not the path itself.
-                let error = state
-                    .take_over_local_session(
-                        located("ws-b"),
-                        takeover("ws-b"),
-                        &claim("owner", "ws-b"),
-                        &frames,
-                    )
-                    .await
-                    .expect_err("the unsupported test runtime cannot actually launch");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::RuntimeUnavailable as i32,
-                    "{}",
-                    error.message
-                );
-            });
-    });
-}
-
-/// The two above pin the **takeover** half of `session.resume` (what comes in is the harness's
-/// own thread id). This one pins the **other** half of the same RPC: what comes in is an `agit-*`
-/// logical id.
-///
-/// That branch finds its own row in the ledger and then `--resume`s with **that row's thread
-/// id** — what gets loaded into context is the harness transcript, so the test can only be the
-/// transcript. Ask only its own row and a clean sibling row for the same transcript in another
-/// workspace is a master key, and two coexisting rows are **by design** the normal case: when two
-/// workspaces each bind the same directory, the workspace test in `logical_for_thread` requires
-/// each side to mint its own id (see the comment in `take_over_local_session`), while the danger
-/// bit is armed per row (`guard.rs`) — so the ws-a row is poisoned and the ws-b row is clean.
-///
-/// The reported bit is pinned with it: write `SessionInfo.dangerous` as false and every later
-/// `turn.start` / `turn.steer` / `approval.decide` goes through the `Need::Drive` gate
-/// (`session_channel` in `projection.rs` reads exactly that). It is observed here through
-/// "whether this session was recorded in `unconfirmed_dangerous_bindings` before launch": that
-/// step happens only when `spawn_session` sees `info.dangerous`.
-#[test]
-fn resuming_by_logical_id_judges_the_transcript_not_just_its_own_roster_row() {
-    let home = tempfile::tempdir().unwrap();
-    crate::rc::with_agit_home(home.path(), || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let cwd = std::fs::canonicalize(home.path()).unwrap();
-                let cwd = cwd.to_string_lossy().into_owned();
-                let mut roster = Roster::default();
-                // The ws-a row: this transcript ran unchecked and its binding is confirmed
-                // (neither an empty thread id nor in `unconfirmed_dangerous_bindings`).
-                let mut poisoned =
-                    rpc_test_roster_entry("agit-poisoned", crate::protocol::PermissionMode::Bypass);
-                poisoned.runtime = "unsupported-test-runtime".into();
-                poisoned.thread_id = "native-1".into();
-                poisoned.cwd = cwd.clone();
-                poisoned.workspace_id = "ws-a".into();
-                poisoned.ever_dangerous = true;
-                roster.sessions.insert("agit-poisoned".into(), poisoned);
-                // The ws-b row: same runtime, same thread, same directory, and clean in its own
-                // cell — this is what ws-b's operator sees in the web interface.
-                let mut clean =
-                    rpc_test_roster_entry("agit-clean", crate::protocol::PermissionMode::Default);
-                clean.runtime = "unsupported-test-runtime".into();
-                clean.thread_id = "native-1".into();
-                clean.cwd = cwd.clone();
-                clean.workspace_id = "ws-b".into();
-                clean.ever_dangerous = false;
-                roster.sessions.insert("agit-clean".into(), clean);
-
-                let daemon = rpc_test_daemon(HashMap::new(), roster);
-                let mut state = daemon.lock().await;
-                state.mirror.bind("ws-a", "project-a", home.path()).unwrap();
-                state.mirror.bind("ws-b", "project-b", home.path()).unwrap();
-                let (frames, _frames_rx) = mpsc::channel(1);
-
-                let resume = || SessionResume {
-                    project_id: None,
-                    workspace_id: "ws-b".into(),
-                    session_id: "agit-clean".into(),
-                    prompt: None,
-                    by: None,
-                    agent: None,
-                    expected_agent_id: None,
-                    branch: None,
-                    attach_only: false,
-                };
-
-                let error = state
-                    .resume_session(resume(), &claim("operator", "ws-b"), &frames)
-                    .await
-                    .expect_err("an unchecked transcript is owner-only by logical id");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::DangerousSessionLocked as i32,
-                    "ws-b's operator resumed the unchecked transcript by logical id; this \
-                     branch asked only its own row's `ever_dangerous`, while what it \
-                     `--resume`s is the same transcript the ws-a row poisoned (got: {})",
-                    error.message
-                );
-
-                // The owner still gets through — this gate locks the role, not the path itself.
-                let error = state
-                    .resume_session(resume(), &claim("owner", "ws-b"), &frames)
-                    .await
-                    .expect_err("the unsupported test runtime cannot actually launch");
-                assert_eq!(
-                    error.code,
-                    ErrorCode::RuntimeUnavailable as i32,
-                    "{}",
-                    error.message
-                );
-                assert!(
-                    state
-                        .roster
-                        .unconfirmed_dangerous_bindings
-                        .contains("agit-clean"),
-                    "the judged danger bit is not written into this session: `spawn_session` \
-                     did not prewrite it as dangerous, which means `SessionInfo.dangerous` is \
-                     false — every later turn.start / turn.steer / approval.decide then goes \
-                     through `Need::Drive`"
-                );
-                // This ledger row changes its answer too, and reaches disk **before** launch.
-                // With the two sides saying different things, `arm_danger_before_loosening`
-                // treats the next mode change as a **new** flip into dangerous, so the moment
-                // that change is withdrawn `disarm_danger` washes this unchecked transcript
-                // clean.
-                assert!(
-                    Roster::load().sessions["agit-clean"].ever_dangerous,
-                    "the judged danger bit did not reach the ledger; the disk row still says clean"
-                );
-            });
-    });
-}
-
 /// A session that **starts** in a dangerous mode must have its danger bit on disk before the
 /// harness launches.
 ///
@@ -2298,7 +1721,6 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         runtime_thread_id: None,
         task: tokio::spawn(async {}),
         danger_arm: 0,
-        admitted_mode: None,
         pending_mode: Some(crate::protocol::PermissionMode::Plan),
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),
@@ -3825,249 +3247,80 @@ async fn owner_shares_a_local_conversation_that_members_then_list_without_runnin
     std::fs::write(root.join("completed"), b"").unwrap();
 }
 
-/// A non-owner's opening that carries a prompt into Codex is refused with `codex_unconfined`
-/// before anything is reserved or launched, on all four opening paths: `session.start` with
-/// runtime codex, `session.resume` of a Codex conversation, a local takeover and a source resume. The initial turn reaches the supervisor with no
-/// owner bit, so this check is the only guard on that path.
-#[tokio::test]
-async fn a_non_owners_opening_prompt_into_codex_launches_nothing() {
+/// A colleague starts a session in the mode the start names, as the owner does, every mode the
+/// runtime can express included, and resumes one in the mode it last ran in.
+#[test]
+fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
+    use crate::protocol::PermissionMode as M;
     let home = tempfile::tempdir().unwrap();
     let cwd = home.path().canonicalize().unwrap();
-    let roster: Roster = serde_json::from_value(serde_json::json!({
-        "sessions":{"logical":{"runtime":"codex", "thread_id":"native-codex", "cwd":cwd,
-            "workspace_id":"ws-a"}}
-    }))
-    .unwrap();
-    let daemon = rpc_test_daemon(HashMap::new(), roster);
-    let mut state = daemon.lock().await;
-    state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
-    let (frames, _frames_rx) = mpsc::channel(1);
-    let reason = |error: RpcError| error.data.and_then(|data| data.get("reason").cloned());
-    let unconfined = Some(serde_json::json!("codex_unconfined"));
-
-    let start = state
-        .prepare_start_session(
-            SessionStart {
-                model: None,
-                start_id: None,
-                workspace_id: "ws-a".into(),
-                project_id: "project-a".into(),
-                runtime: "codex".into(),
-                agent: None,
-                expected_agent_id: None,
-                branch: None,
-                prompt: Some("inspect".into()),
-                by: None,
-                permission_mode: Some(crate::protocol::PermissionMode::Plan),
-                origin: None,
-            },
-            &claim("operator", "ws-a"),
-            &frames,
-            &Default::default(),
-        )
-        .err()
-        .expect("a non-owner's start with a prompt into Codex is refused");
-    assert_eq!(reason(start), unconfined);
-
-    let resume = state
-        .prepare_resume_session(
-            SessionResume {
-                project_id: None,
-                workspace_id: "ws-a".into(),
-                session_id: "logical".into(),
-                prompt: Some("inspect".into()),
-                by: None,
-                agent: None,
-                expected_agent_id: None,
-                branch: None,
-                attach_only: false,
-            },
-            &claim("operator", "ws-a"),
-            &frames,
-            &Default::default(),
-        )
-        .err()
-        .expect("a non-owner's resume with a prompt into Codex is refused");
-    assert_eq!(reason(resume), unconfined);
-
-    let resume_of = |session: &str| SessionResume {
-        project_id: None,
-        workspace_id: "ws-a".into(),
-        session_id: session.into(),
-        prompt: Some("inspect".into()),
-        by: None,
-        agent: None,
-        expected_agent_id: None,
-        branch: None,
-        attach_only: false,
-    };
-    let takeover = state
-        .prepare_local_takeover(
-            LocatedLocal {
-                title: None,
-                gist: None,
-                runtime: "codex".into(),
-                cwd: cwd.clone(),
-                project_id: Some("project-a".into()),
-                likely_active: false,
-            },
-            resume_of("native-local"),
-            &claim("operator", "ws-a"),
-            &frames,
-        )
-        .err()
-        .expect("a non-owner's takeover with a prompt into Codex is refused");
-    assert_eq!(reason(takeover), unconfined);
-
-    let source = state
-        .prepare_source_resume(
-            resume_of("local-source"),
-            &claim("operator", "ws-a"),
-            &frames,
-            ("source", "native-source"),
-            None,
-            &Default::default(),
-        )
-        .err()
-        .expect("a non-owner's source resume with a prompt into Codex is refused");
-    assert_eq!(reason(source), unconfined);
-
-    assert!(state.opening_sessions.is_empty(), "nothing reserved");
-    assert!(state.sessions.is_empty(), "nothing launched");
-}
-
-/// Pins the non-owner mode rule (`rc::turn_mode`) on a native message to a local Codex
-/// conversation (no source), read from the Codex index when the message is prepared and again
-/// when it is delivered. In Default, an operator's message is prepared; once the index says Auto,
-/// that prepared message is refused at delivery and a new one is refused when prepared, each
-/// `mode_owner_only`; the owner's is not. With the index gone the mode can't be read and the
-/// operator is refused too. A path that read the transcript's history, or checked only when
-/// preparing, put an operator's words into a turn that acts without asking.
-#[cfg(unix)]
-#[tokio::test]
-async fn a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn() {
-    if crate::rc::in_isolated_test(
-        "rc::daemon::tests::sessions::a_non_owners_native_message_enters_only_a_default_or_plan_codex_turn",
-    ) {
-        return;
-    }
-    let temporary = tempfile::tempdir().unwrap();
-    let base = temporary.path().canonicalize().unwrap();
-    let project = base.join("project");
-    let codex = base.join("codex");
-    let bin = base.join("bin");
-    let day = codex.join("sessions/2026/11/01");
-    for directory in [&project, &day, &bin] {
-        std::fs::create_dir_all(directory).unwrap();
-    }
-    // A stand-in `codex` on PATH; preparing a message only resolves it.
-    let program = bin.join("codex");
-    std::fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    // SAFETY: this case runs alone in its own process.
-    unsafe {
-        std::env::set_var("AGIT_HOME", base.join("agit"));
-        std::env::set_var("CODEX_HOME", &codex);
-        std::env::set_var(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        );
-    }
-    let native = uuid::Uuid::new_v4().to_string();
-    let transcript = day.join(format!("rollout-2026-11-01T00-00-00-{native}.jsonl"));
-    std::fs::write(
-        &transcript,
-        [
-            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":project}}),
-            serde_json::json!({"type":"turn_context","payload":{
-                "approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"}}}),
-        ]
-        .map(|line| line.to_string())
-        .join("\n")
-            + "\n",
-    )
-    .unwrap();
-    let index = codex.join("state_1.sqlite");
-    let database = rusqlite::Connection::open(&index).unwrap();
-    database.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER, model TEXT, reasoning_effort TEXT, approval_mode TEXT, sandbox_policy TEXT)").unwrap();
-    database
-        .execute(
-            "INSERT INTO threads VALUES (?1,?2,?3,'question','cli',1,0,'fixture','high','on-request','{\"type\":\"workspace-write\"}')",
-            rusqlite::params![native, transcript.to_str(), project.to_str()],
-        )
-        .unwrap();
-    drop(database);
-    let daemon = rpc_test_daemon(HashMap::new(), Roster::default());
-    let mut state = daemon.lock().await;
-    state.mirror.bind("ws-a", "project", &project).unwrap();
-    let local: crate::protocol::LocalSession = serde_json::from_value(serde_json::json!({
-        "runtime_session_id": native,
-        "runtime": "codex",
-        "cwd": project,
-        "modified_at": "2026-11-01T00:00:00Z",
-    }))
-    .unwrap();
-    let message = |state: &Daemon, role: &str| {
-        let mut frame = Frame::request(
-            method::SESSION_ENQUEUE,
-            serde_json::json!({"workspace_id":"ws-a","session_id":native,
-                "client_msg_id":uuid::Uuid::new_v4().to_string(),"message":"hello"}),
-        );
-        frame.caller = Some(claim(role, "ws-a"));
-        state.prepare_native_inbox(&frame, Some(local.clone()))
-    };
-    let reason = |error: RpcError| {
-        error
-            .data
-            .and_then(|data| data["reason"].as_str().map(str::to_owned))
-    };
-    let owner_only = Some("mode_owner_only".to_owned());
-    let unconfined = Some("codex_unconfined".to_owned());
-    // A non-owner's message into Codex is refused when prepared (codex_unconfined). The
-    // delivery-time re-read of the mode stays pinned with an owner-prepared delivery in a
-    // non-owner's shape.
-    assert_eq!(
-        message(&state, "operator").err().and_then(reason),
-        unconfined
-    );
-    let mut prepared = message(&state, "owner").unwrap_or_else(|error| panic!("{}", error.message));
-    prepared.allow_dangerous = false;
-    prepared.caller_is_owner = false;
-    assert!(prepared.validate_source().is_ok());
-
-    rusqlite::Connection::open(&index)
-        .unwrap()
-        .execute(
-            "UPDATE threads SET approval_mode='never', sandbox_policy='{\"type\":\"workspace-write\"}'",
-            [],
-        )
-        .unwrap();
-    let refused = prepared
-        .validate_source()
-        .err()
-        .and_then(|error| error.downcast::<RpcError>().ok())
-        .expect("the operator's message is refused at delivery");
-    assert_eq!(refused.data.as_ref().unwrap()["mode"], "auto");
-    assert_eq!(reason(refused), owner_only);
-    assert_eq!(
-        message(&state, "operator").err().and_then(reason),
-        unconfined
-    );
-    assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
-
-    std::fs::remove_file(&index).unwrap();
-    assert_eq!(
-        message(&state, "operator").err().and_then(reason),
-        unconfined
-    );
-    assert_ne!(message(&state, "owner").err().and_then(reason), owner_only);
+    crate::rc::with_agit_home(home.path(), || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let roster: Roster = serde_json::from_value(serde_json::json!({
+                    "sessions":{"logical":{"runtime":"claude-code", "thread_id":"native-cc",
+                        "cwd":cwd, "workspace_id":"ws-a", "permission_mode":"accept_edits"}}
+                }))
+                .unwrap();
+                let daemon = rpc_test_daemon(HashMap::new(), roster);
+                let mut state = daemon.lock().await;
+                state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+                let (frames, _frames_rx) = mpsc::channel(1);
+                let launched = |opening: Result<SessionOpening, RpcError>| match opening {
+                    Ok(SessionOpening::Launch(spawn, _)) => {
+                        assert_eq!(spawn.info.permission_mode, spawn.spec.permission_mode);
+                        spawn.spec.permission_mode
+                    }
+                    Ok(SessionOpening::Ready(_)) => panic!("nothing to replay"),
+                    Err(error) => panic!("{error:?}"),
+                };
+                let modes = crate::rc::harness::capability_of("claude-code").permission_modes;
+                assert!(modes.contains(&M::AcceptEdits) && modes.contains(&M::Auto));
+                for mode in modes.iter().copied() {
+                    let start = SessionStart {
+                        model: None,
+                        start_id: None,
+                        origin: None,
+                        workspace_id: "ws-a".into(),
+                        project_id: "project-a".into(),
+                        runtime: "claude-code".into(),
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        prompt: None,
+                        by: None,
+                        permission_mode: Some(mode),
+                    };
+                    let opening = state.prepare_start_session(
+                        start,
+                        &claim("operator", "ws-a"),
+                        &frames,
+                        &Default::default(),
+                    );
+                    assert_eq!(launched(opening), Some(mode), "{mode:?}");
+                }
+                let resumed = state.prepare_resume_session(
+                    SessionResume {
+                        project_id: None,
+                        workspace_id: "ws-a".into(),
+                        session_id: "logical".into(),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: false,
+                    },
+                    &claim("operator", "ws-a"),
+                    &frames,
+                    &Default::default(),
+                );
+                assert_eq!(launched(resumed), Some(M::AcceptEdits));
+            });
+    });
 }
 
 /// A shared project's start (`origin = "project_share"`) launches only a group member's Claude Code

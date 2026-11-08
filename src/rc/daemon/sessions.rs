@@ -539,18 +539,7 @@ impl Daemon {
                 )
                 .with_hint("that session belongs to a different workspace"));
             }
-            // Within the workspace, before any older check: a non-owner's prompt into Codex
-            // always gets this typed refusal.
-            if p.prompt.is_some() {
-                crate::rc::harness::CodexUnconfined::check(&entry.runtime, caller.is_owner())?;
-            }
-            self.refuse_home_folder(
-                caller,
-                std::path::Path::new(&entry.cwd),
-                super::HOME_SESSION,
-            )?;
-            // Resuming a session that **ever** ran without approvals is owner-only too: its
-            // context may still hold what was read at that time with nobody reviewing it.
+            // Whether this session **ever** ran without approvals, for its marker.
             //
             // **The question is about that transcript, not this row.** What `resume_from` hands
             // over below is `entry.thread_id` — one harness transcript, and one transcript can
@@ -558,20 +547,19 @@ impl Daemon {
             // two workspaces, the workspace test in `logical_for_thread` requires each side to
             // mint its own logical id (see the comment on `take_over_local_session`), and the
             // danger bit is armed per row. So ws-a's row poisoned and ws-b's row clean is the
-            // **designed** state; asking only about your own row makes ws-b's clean sibling a
-            // master key to this transcript.
+            // **designed** state; asking only about your own row shows ws-b's clean sibling as
+            // clean.
             //
             // When the ledger cannot be read (`history_lost`) **every session is treated as
             // dangerous**, and that branch of the test is still there — see
             // `Roster::transcript_ever_dangerous`.
             let danger = danger::authorize(
                 &self.roster,
-                caller,
                 &entry.runtime,
                 &entry.thread_id,
                 &p.workspace_id,
                 &entry.cwd,
-            )?;
+            );
             // The danger pre-write row from `prepare_spawn` may carry an empty thread id (the
             // harness crashed before reporting a native id). An empty string is not a resumable
             // address: feeding it to `--resume` starts a **brand new** conversation wearing the
@@ -660,7 +648,7 @@ impl Daemon {
                 // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
                 dangerous: false,
-                permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
+                permission_mode: entry.restart_permission_mode(),
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -671,9 +659,8 @@ impl Daemon {
                 // Native resume owns the current model; start receipts are immutable history.
                 model: None,
                 dangerous: false,
-                // Resume brings back the guard it ran under, never looser than Default for
-                // anyone but the owner.
-                permission_mode: danger::resume_mode(caller, entry.restart_permission_mode()),
+                // Resume brings back the guard it ran under.
+                permission_mode: entry.restart_permission_mode(),
                 attach_only: p.attach_only,
                 // A shared project resumes held to the repository, as it was started.
                 project_share: entry.project_share,
@@ -794,9 +781,6 @@ impl Daemon {
         caller: &crate::protocol::CallerClaim,
         frames: &mpsc::Sender<Frame>,
     ) -> Result<SessionOpening, RpcError> {
-        if p.prompt.is_some() {
-            crate::rc::harness::CodexUnconfined::check(&local.runtime, caller.is_owner())?;
-        }
         if let Some(error) = self.release_failed_refusal(&p.session_id) {
             return Err(error);
         }
@@ -822,7 +806,6 @@ impl Daemon {
             likely_active: _,
         } = local;
         require_active_runtime(&runtime, &p.session_id)?;
-        self.refuse_home_folder(caller, &cwd, super::HOME_SESSION)?;
         let roots = self.roots_for(caller);
         let cwd = policy::require_within(&cwd, &roots).map_err(|e| {
             RpcError::new(ErrorCode::PathNotAllowed, e.to_string()).with_hint(
@@ -886,8 +869,7 @@ impl Daemon {
         // ran under. Writing `dangerous: false` / `Default` unconditionally here means: a session
         // an owner started with bypass comes back wearing a "clean" identity as soon as it is
         // resumed once more by **harness thread id**, and `SessionNote::Bound` then writes that
-        // "clean" into the roster, washing the monotonic bit out **on disk**. From then on any
-        // operator can drive it.
+        // "clean" into the roster, washing the monotonic bit out **on disk**.
         //
         // One conversation has one identity, and one history.
         // The test lives in one place: `Roster::transcript_ever_dangerous`, taken from `danger`.
@@ -902,23 +884,18 @@ impl Daemon {
         // dangerous the unknown thread of "an ownerless session on the same
         // `(runtime, workspace)` or the same directory that started dangerous and crashed before
         // `Bound`" — the ledger does not know that session's thread id, and the unrecognized id
-        // in front of it may be exactly that one; minting a clean identity and letting it
-        // through hands the operator everything that unchecked run read.
+        // in front of it may be exactly that one.
         let danger = danger::authorize(
             &self.roster,
-            caller,
             &runtime,
             &p.session_id,
             &p.workspace_id,
             &cwd.to_string_lossy(),
-        )?;
-        let inherited_mode = danger::resume_mode(
-            caller,
-            prior
-                .as_ref()
-                .and_then(roster::Entry::restart_permission_mode),
-        )
-        .unwrap_or(crate::protocol::PermissionMode::Default);
+        );
+        let inherited_mode = prior
+            .as_ref()
+            .and_then(roster::Entry::restart_permission_mode)
+            .unwrap_or(crate::protocol::PermissionMode::Default);
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
@@ -1006,18 +983,10 @@ impl Daemon {
         let caller = caller_scope(frame)?;
         require_role(&caller, method::SESSION_ENQUEUE)?;
         let mut request: crate::rc::native_inbox::Request = frame.params_as()?;
-        let codex = enrolled.is_some()
-            || local.as_ref().is_some_and(|local| {
-                local.runtime_session_id == request.session_id && local.runtime == "codex"
-            });
-        if codex {
-            crate::rc::harness::CodexUnconfined::check("codex", caller.is_owner())?;
-        }
         request
             .validate_message()
             .map_err(|error| RpcError::new(ErrorCode::MalformedFrame, error.to_string()))?;
         frame.authority.check()?;
-        let mut mode_bound = None;
         let (cwd, transcript, native, source) = if let Some(watch) = enrolled {
             use super::source_sessions::unavailable;
             if watch.context.source.session_ref(&watch.native_id) != request.session_id {
@@ -1047,41 +1016,10 @@ impl Daemon {
             watch
                 .validate(&self.roots_for(&caller))
                 .map_err(unavailable)?;
-            let thread = watch
+            watch
                 .context
                 .locate(&watch.native_id, &self.roots_for(&caller))
                 .map_err(unavailable)?;
-            // A non-owner is judged only by the mode the index records now; one that cannot be
-            // read now, or only from the rollout's history, is refused.
-            let mode = if caller.is_owner() {
-                watch
-                    .context
-                    .settings(&thread)
-                    .map_err(unavailable)?
-                    .permission_mode
-            } else {
-                Some(
-                    watch
-                        .context
-                        .current_mode(&thread)
-                        .ok()
-                        .flatten()
-                        .ok_or_else(crate::rc::native_settings::mode_changed)?,
-                )
-            };
-            let _ = danger::authorize_source(
-                &self.roster,
-                &caller,
-                &watch.context.source.source_id,
-                &watch.native_id,
-                &watch.cwd.to_string_lossy(),
-                &thread.transcript,
-                mode,
-            )?;
-            // Nothing admitted this caller to the thread: hold its message to the mode a resume
-            // would have admitted, Default or Plan.
-            mode_bound = danger::resume_mode(&caller, mode);
-            danger::require_native_mode_held(&caller, mode_bound, mode)?;
             let native = watch.context.source.native().map_err(unavailable)?;
             request.session_id = watch.native_id;
             (
@@ -1099,7 +1037,6 @@ impl Daemon {
                 .ok_or_else(|| {
                     RpcError::new(ErrorCode::SessionNotFound, "native session is unavailable")
                 })?;
-            self.refuse_home_folder(&caller, Path::new(&local.cwd), super::HOME_SESSION)?;
             // A Claude Code session receives messages only through the process that runs it.
             let claude = match local.runtime.as_str() {
                 "codex" => None,
@@ -1127,16 +1064,7 @@ impl Daemon {
                 policy::require_within(process, &roots)
                     .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
             }
-            let _ = danger::authorize(
-                &self.roster,
-                &caller,
-                &local.runtime,
-                &request.session_id,
-                &request.workspace_id,
-                &cwd.to_string_lossy(),
-            )?;
-            // The danger gate reads the transcript the live process writes; another copy of the
-            // session can record another permission history.
+            // The transcript the live process writes; another copy of the session can differ.
             let transcript = match &claude {
                 Some(live) => {
                     crate::rc::claude_inbox::live_transcript(live, &cwd).map_err(|error| {
@@ -1153,22 +1081,6 @@ impl Daemon {
                         )
                     })?,
             };
-            // A non-owner's message runs in the mode the conversation runs in now, which must be
-            // Default or Plan: a Codex thread's is read from its index now, never its history;
-            // a Claude Code terminal's can change without being recorded, so it cannot be read
-            // and the terminal stays the owner's.
-            if !caller.is_owner() {
-                let current = match &claude {
-                    Some(_) => None,
-                    None => crate::rc::native_settings::current_local_codex_mode(
-                        &transcript,
-                        &request.session_id,
-                    ),
-                };
-                crate::rc::turn_mode::require(false, current)
-                    .map_err(|refused| refused.rpc_error())?;
-                mode_bound = current;
-            }
             let internal =
                 |error: anyhow::Error| RpcError::new(ErrorCode::Internal, error.to_string());
             let native = match claude {
@@ -1197,9 +1109,6 @@ impl Daemon {
             source,
             authority: frame.authority.clone(),
             confinement: None,
-            allow_dangerous: caller.is_owner(),
-            caller_is_owner: caller.is_owner(),
-            mode_bound,
             request,
             transcript,
             cwd,
@@ -1248,9 +1157,6 @@ impl Daemon {
                 "a shared project runs only in Claude Code; nothing was started",
                 "share_runtime_unsupported",
             ));
-        }
-        if p.prompt.is_some() {
-            crate::rc::harness::CodexUnconfined::check(&p.runtime, caller.is_owner())?;
         }
         let start_id =
             negotiated_start_id(self.start_idempotency_feature(), p.start_id.as_deref())?;
@@ -1362,7 +1268,6 @@ impl Daemon {
                     "that project is not bound in this workspace",
                 )
             })?;
-        self.refuse_home_folder(caller, &cwd, super::HOME_PROJECT)?;
         let roots = self.roots_for(caller);
         let cwd = policy::require_within(&cwd, &roots)
             .map_err(|e| RpcError::new(ErrorCode::PathNotAllowed, e.to_string()))?;
@@ -1370,13 +1275,6 @@ impl Daemon {
         authority.check_project(&p.project_id, &cwd)?;
 
         let session_id = crate::domain::meta::mint_session_id();
-        // The create path is judged too — otherwise the owner-only gate is decoration: whoever
-        // is blocked from switching permission mode just opens a **new** session carrying
-        // `bypass` and walks around it. Starting a new session in a loosened mode is the same
-        // act as switching a session into that mode.
-        // Starting a new session: there is no "current mode" to compare against, only the
-        // absolute test.
-        require_owner_to_loosen(Some(caller), mode, None)?;
         // Judge that this runtime can really express it too. Launching with a mode it cannot
         // express gives the user a session that believes it is in `plan` and writes whatever it
         // likes.

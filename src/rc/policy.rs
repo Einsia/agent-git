@@ -146,13 +146,6 @@ pub fn is_within(target: &Path, roots: &CanonicalRoots) -> bool {
     resolve_existing_ancestor(target).is_some_and(|t| within(&t, roots))
 }
 
-/// Whether the workspace reaches `cwd` only through a root at or above the home directory, so
-/// only the owner may send to a session working there. The daemon asks at the RPC; a message
-/// that waits for a later turn is asked again when it goes.
-pub(crate) fn home_folder_only(cwd: &Path, roots: &CanonicalRoots) -> bool {
-    is_within(cwd, roots) && !is_within(cwd, &roots.confining())
-}
-
 fn within(resolved: &Path, roots: &CanonicalRoots) -> bool {
     roots
         .iter()
@@ -874,9 +867,9 @@ fn resolves_under(target: &Path, at: &Path) -> bool {
     })
 }
 
-/// May the operator allow this tool call; if not, **why**.
-///
-/// `None` = the operator can answer.
+/// What an approval card says this tool call reaches, for whoever answers it: `None` when it can
+/// be proven confined to the workspace. It decides nothing; anyone who may answer approvals
+/// answers every one.
 ///
 /// # The default must be "no"
 ///
@@ -892,11 +885,6 @@ fn resolves_under(target: &Path, at: &Path) -> bool {
 /// whose command name is on the built-in short list or on the owner's granted list
 /// ([`crate::rc::grants`]), whose arguments are each validated, and which carries no shell
 /// metacharacter outside quotes. Everything else goes back to the owner.
-/// Whether approving `tool` changes files: the tools an operator can let write into the workspace.
-pub(crate) fn changes_files(tool: &str) -> bool {
-    matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
-}
-
 pub fn approval_owner_reason(
     tool: &str,
     input: &serde_json::Value,
@@ -3387,26 +3375,6 @@ mod tests {
         for cmd in ["grep -rn -e TODO src", "rg -e TODO src", "rg --files src"] {
             assert_eq!(bash(cmd), None, "`{cmd}`");
         }
-    }
-
-    /// Pins that the rule a non-owner's turn can't start work that outlives it is advertised only
-    /// by a build that also sends a write to OpenCode's project config or to Claude Code's
-    /// instruction file back to the owner: either would let one turn leave work that starts the
-    /// next time the runtime does.
-    #[test]
-    fn the_selfstart_rule_is_advertised_only_with_the_runtimes_config_held_to_the_owner() {
-        let advertised = crate::rc::build_identity::DaemonIdentity::current().unwrap();
-        if !advertised
-            .rpc_features
-            .iter()
-            .any(|feature| feature == "nonowner-selfstart-refused-v1")
-        {
-            return;
-        }
-        for name in ["opencode.json", "claude.md"] {
-            assert!(CONTROL_SURFACES.contains(&name), "{name}");
-        }
-        assert!(is_control_surface_name("CLAUDE.md"));
     }
 
     /// Pins the project config of the runtimes agit drives as control surfaces: an operator's

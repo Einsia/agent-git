@@ -48,7 +48,6 @@ pub(super) fn rpc_test_live(
         runtime_thread_id: None,
         task: tokio::spawn(async {}),
         danger_arm: 0,
-        admitted_mode: None,
         pending_mode: None,
         approval_requests: HashMap::new(),
         rpc_gate: Arc::new(Mutex::new(())),
@@ -182,7 +181,7 @@ fn rpc_mode_frame(mode: crate::protocol::PermissionMode) -> Frame {
     frame
 }
 
-fn rpc_turn_frame(session_id: &str) -> Frame {
+pub(super) fn rpc_turn_frame(session_id: &str) -> Frame {
     let mut frame = Frame::request(
         method::TURN_START,
         TurnStart {
@@ -221,17 +220,6 @@ impl Daemon {
         frames: &mpsc::Sender<Frame>,
     ) -> Result<serde_json::Value, RpcError> {
         let prepared = self.prepare_resume_session(p, caller, frames, &Default::default())?;
-        prepared.run_inline(self).await
-    }
-
-    pub(super) async fn take_over_local_session(
-        &mut self,
-        local: LocatedLocal,
-        p: SessionResume,
-        caller: &crate::protocol::CallerClaim,
-        frames: &mpsc::Sender<Frame>,
-    ) -> Result<serde_json::Value, RpcError> {
-        let prepared = self.prepare_local_takeover(local, p, caller, frames)?;
         prepared.run_inline(self).await
     }
 

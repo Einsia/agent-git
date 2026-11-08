@@ -853,7 +853,6 @@ impl Daemon {
                 generation,
                 task,
                 danger_arm: 0,
-                admitted_mode: info.permission_mode,
                 pending_mode: None,
                 approval_requests: HashMap::new(),
                 rpc_gate: Arc::new(Mutex::new(())),

@@ -766,11 +766,8 @@ const STOP_TURN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 /// declaring a turn over.
 pub const SETTLE_MAX_MS: u64 = 1500;
 
-/// The raw material for deciding a pending approval again. See `Session::pending`.
+/// What answering a pending approval needs to know. See `Session::pending`.
 struct PendingApproval {
-    tool: String,
-    /// The input as the harness raised it: what an answer is judged against.
-    input: serde_json::Value,
     /// A session-scoped Claude approval changes the global driver mode. Keep
     /// the machine-originated prediction beside the authorization evidence so
     /// the execution side can require a durable danger permit before echoing a
@@ -893,21 +890,7 @@ pub struct Session {
     redactor: redact::Redactor,
     /// Emitted upward; the daemon numbers these and ships them to the hub.
     out: mpsc::Sender<Frame>,
-    /// An approval already sent and not yet answered → **the raw material for deciding whether
-    /// it needs the owner** (the tool name plus the input).
-    ///
-    /// The material is stored rather than the verdict, because a verdict **expires**: minutes
-    /// can pass between sending an approval and someone answering it, and in between the owner
-    /// may `agit rc grant` a grant away or unbind a directory — the allowlist is re-read on
-    /// every heartbeat (`reload_grants`). Caching the conclusion "an operator may allow this"
-    /// keeps a revoked grant in force on a pending approval, and the direction it errs in is
-    /// the permissive one. Deciding again at the moment of the answer, against the list as it
-    /// stands **then**, makes a tightening take effect immediately, and a loosening need not
-    /// wait for the next approval.
-    ///
-    /// The input is the one the harness raised: the classifier compares real paths against the
-    /// allowlist, and what decides is this machine's copy, never anything a viewer sends back
-    /// with an answer.
+    /// An approval already sent and not yet answered, with what answering it needs.
     pending: std::collections::HashMap<String, PendingApproval>,
     /// The **byte** position consumed from the transcript. Used only to decide whether the file
     /// is still growing.
@@ -1225,7 +1208,6 @@ pub enum Command {
     },
     Enqueue {
         request: crate::rc::native_queue::Request,
-        caller_is_owner: bool,
         reply: Ticket<serde_json::Value>,
     },
     Steer {
@@ -1317,54 +1299,6 @@ fn command_danger_arm(command: &Command) -> Option<u64> {
     }
 }
 
-/// Trim an approval answer given by a **non-owner** down to what it may be.
-///
-/// The whole `ApprovalResponse` comes from the browser, and two of its fields reach well past
-/// answering this one request:
-///
-/// * **`scope`**: `Session` hands the request's own `permission_suggestions` back to
-///   claude-code unchanged, and `suggested_mode` maps `bypassPermissions` to
-///   `PermissionMode::Bypass`. A call an operator may answer, deliberately judged "genuinely
-///   confined" (`Write src/main.rs`), becomes a side door to a session-level mode, while the
-///   front door (`session.setPermissionMode`) is locked to the owner on both sides. "An
-///   operator may answer **this one**" must never be read as "an operator may answer every one,
-///   forever".
-///
-/// * **`message`** (the refusal reason): claude-code fills it verbatim into
-///   `{"behavior":"deny","message":...}` back to the CLI, the model reads it into context as
-///   the reason for the refusal and then acts on it — a refusal reason and an instruction are
-///   the same thing to the model. Refusal takes `Need::Brake`, which deliberately does not test
-///   `require_owner_to_drive`, on the grounds that a brake needs no permission. That holds for
-///   an interrupt and for tightening a mode, which carry no payload; it does not hold for a
-///   refusal carrying free text. An operator explicitly kept out by `turn.start` /
-///   `turn.steer` then has a path for planting arbitrary instructions into an owner-only
-///   session's context. A fixed sentence replaces it — it still tells the model this was
-///   refused, and that is all a refusal has to convey.
-///
-/// Both fields are the same kind of thing, so they are contained in the same place: the next
-/// field that comes across from the browser is added here and cannot be missed.
-fn sanitize_for_non_owner(response: &mut ApprovalResponse) {
-    response.scope = crate::protocol::ApprovalScope::Once;
-    if matches!(response.decision, crate::protocol::ApprovalDecision::Deny) {
-        response.message = Some("denied by a reviewer in the shared workspace".into());
-    }
-}
-
-fn enforce_approval_caller_fields(response: &mut ApprovalResponse, caller_is_owner: bool) {
-    if !caller_is_owner {
-        sanitize_for_non_owner(response);
-    }
-}
-
-fn approval_answer_is_blocked(
-    needs_owner: bool,
-    caller_is_owner: bool,
-    decision: crate::protocol::ApprovalDecision,
-) -> bool {
-    let refusing = matches!(decision, crate::protocol::ApprovalDecision::Deny);
-    needs_owner && !caller_is_owner && !refusing
-}
-
 /// Read a batch of new lines **and push the watermark to the file's current position** — both
 /// in one step.
 ///
@@ -1418,24 +1352,7 @@ fn danger_disarm_after_mode_result(
         .flatten()
 }
 
-/// Why a command the owner granted goes back to the owner.
-const GRANT_WITHHELD: &str = "An operator approved a file change in this workspace, so granted \
-    commands now need the owner's approval until the owner grants them again.";
-
 impl Session {
-    /// The commands the owner granted operators, as they apply here: none, once the workspace
-    /// holds a file change an operator approved. The owner answers as before.
-    fn operator_heads(
-        &self,
-        confinement: &crate::rc::Confinement,
-    ) -> std::collections::BTreeSet<String> {
-        if crate::rc::operator_changes::recorded(&self.info.workspace_id) {
-            Default::default()
-        } else {
-            confinement.operator_heads.clone()
-        }
-    }
-
     pub(crate) fn shared_executor(&self) -> bool {
         self.driver.shared_executor()
     }
@@ -2000,9 +1917,7 @@ impl Session {
             }
             TurnStartOutcome::RetryableNotAccepted { .. }
             | TurnStartOutcome::ConcurrentNotAccepted { .. }
-            | TurnStartOutcome::SharedUnknown { .. }
-            | TurnStartOutcome::CodexUnconfined => {}
-            TurnStartOutcome::ModeOwnerOnly { .. } => {}
+            | TurnStartOutcome::SharedUnknown { .. } => {}
             TurnStartOutcome::FatalNotAccepted { message } => {
                 // Request-id exhaustion is known to precede native I/O, but
                 // this generation can never allocate another unique id. Retire
@@ -2098,7 +2013,6 @@ impl Session {
             return;
         }
         pending.attribution.native_prompt_id = self.driver.reserve_prompt_identity();
-        self.driver.note_input_owner(pending.attribution.owner);
         let dispatch = self
             .driver
             .start_turn(
@@ -2554,17 +2468,6 @@ impl Session {
                         }
                         other => other,
                     };
-                    // Checked at delivery as well as at the RPC: whatever reaches the session.
-                    let cmd = match cmd {
-                        Some(command) => match self
-                            .refuse_unconfined(command)
-                            .and_then(|command| self.refuse_owner_only_command(command))
-                        {
-                            Some(command) => Some(command),
-                            None => continue,
-                        },
-                        None => None,
-                    };
                     if let Some(command) = &cmd
                         && let Err(error) = self.prepare_fallback_instruction(command).await {
                             self.reject_fallback_instruction(cmd.expect("command was checked"), error).await;
@@ -2689,7 +2592,6 @@ impl Session {
                             }
                             attribution.native_prompt_id = self.driver.reserve_prompt_identity();
                             let pending = PendingSteerCommand { message: report.text, attribution, reply };
-                            self.driver.note_input_owner(pending.attribution.owner);
                             if self.driver.steers_at_step() {
                                 self.steer_at_step(message, pending).await;
                             } else {
@@ -2717,17 +2619,9 @@ impl Session {
                             danger,
                             reply,
                         }) => {
-                            // Decide again on the machine side whether this one needs the
-                            // owner.
-                            //
-                            // This is the classifier's only execution point. Every frame that
-                            // reaches here today has passed the hub's gate, so this check stops
-                            // no **current** attack — what it stops is a hub rolled back to a
-                            // build without that gate, a second pod, a fallback query that
-                            // finds nothing: the class agitd is meant to withstand on its own
-                            // under the trust model. An unrecognized approval_id is always
-                            // refused: forwarding an approval we never sent lets whoever
-                            // guesses an id answer in someone else's place.
+                            // An unrecognized approval_id is always refused: forwarding an
+                            // approval we never sent lets whoever guesses an id answer in
+                            // someone else's place.
                             let Some(pending) = self.pending.remove(&response.approval_id)
                             else {
                                 reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
@@ -2739,74 +2633,11 @@ impl Session {
                                 }));
                                 continue;
                             };
-                            // **Decide at the moment of the answer, not with the verdict from
-                            // the moment it was sent.**
-                            //
-                            // The allowlist can change between the two (`agit rc grant`
-                            // revoking one, a directory unbound), and a cached "an operator may
-                            // allow this" keeps a revoked grant in force on a pending approval
-                            // — erring on the permissive side. The list is re-read on every
-                            // heartbeat and deciding costs a few path comparisons, which is not
-                            // worth a cache that errs outward.
-                            let conf = self.confinement.borrow().clone();
-                            let reason = |heads| {
-                                crate::rc::policy::approval_owner_reason(
-                                    &pending.tool,
-                                    &pending.input,
-                                    &conf.roots,
-                                    &self.cwd,
-                                    heads,
-                                )
-                            };
-                            let heads = self.operator_heads(&conf);
-                            let needs_owner = reason(&heads).is_some();
-                            let grant_withheld =
-                                needs_owner && reason(&conf.operator_heads).is_none();
-                            // **This gate stops only "allow".**
-                            //
-                            // A refusal is a brake, and a brake needs no permission — the
-                            // daemon decides it exactly that way (Deny takes `Need::Brake`, see
-                            // the docs on `Need`). Stopping a refusal here too makes the two
-                            // sides say different things: a high-risk approval becomes
-                            // **refusable only by the owner**, the owner may be asleep, and the
-                            // session hangs on `awaiting_approval`. Anyone being able to hit the
-                            // brake is what this screen has to be.
-                            //
-                            // The free text a refusal carries is another matter and is replaced
-                            // below (`sanitize_for_non_owner`) — that is what a refusal really
-                            // has to be guarded against, not the refusal itself.
-                            if approval_answer_is_blocked(
-                                needs_owner,
-                                caller_is_owner,
-                                response.decision,
-                            ) {
-                                // Put it back: it is still waiting for an answer.
-                                self.pending.insert(response.approval_id.clone(), pending);
-                                reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
-                                    message: if grant_withheld {
-                                        GRANT_WITHHELD.into()
-                                    } else {
-                                        "this approval reaches past what an operator may green-light, so only the owner may allow it".into()
-                                    },
-                                    retained: true,
-                                }));
-                                continue;
+                            // A colleague's "allow for this session" would change the session's
+                            // permission mode, a setting that stays the owner's: it applies once.
+                            if !caller_is_owner {
+                                response.scope = crate::protocol::ApprovalScope::Once;
                             }
-                            // **The answer's scope is decided too.**
-                            //
-                            // `scope` comes from the browser like every other field, and
-                            // neither side looks at it: `scope == Session` hands the request's
-                            // own `permission_suggestions` back to claude-code unchanged, and
-                            // `suggested_mode` maps `bypassPermissions` to
-                            // `PermissionMode::Bypass`. A call an operator may answer,
-                            // deliberately judged "genuinely confined" — `Write src/main.rs` —
-                            // is a side door to a session-level mode, while the front door
-                            // (`session.setPermissionMode`) is locked to the owner on both
-                            // sides.
-                            //
-                            // "An operator may answer **this one**" must never be read as "an
-                            // operator may answer every one, forever".
-                            enforce_approval_caller_fields(&mut response, caller_is_owner);
                             let changes_session_mode = matches!(
                                 (response.decision, response.scope),
                                 (
@@ -2844,20 +2675,6 @@ impl Session {
                             let expected_mode = changes_session_mode
                                 .then_some(pending.suggested_permission_mode)
                                 .flatten();
-                            // Recorded before the change goes ahead: a restart must not forget it.
-                            if !caller_is_owner
-                                && response.decision == crate::protocol::ApprovalDecision::Allow
-                                && crate::rc::policy::changes_files(&pending.tool)
-                                && crate::rc::operator_changes::record(&self.info.workspace_id)
-                                    .is_err()
-                            {
-                                self.pending.insert(response.approval_id.clone(), pending);
-                                reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
-                                    message: "this change could not be recorded, so it was not approved; try again".into(),
-                                    retained: true,
-                                }));
-                                continue;
-                            }
                             let mut outcome = self.driver.answer_approval(&response).await;
                             match &mut outcome {
                                 ApprovalOutcome::Applied { effective_mode }
@@ -2911,12 +2728,10 @@ impl Session {
                             let result = self.driver.runtime_command(&name, arguments).await.map(|value|self.redactor.scrub_json(&value).value);
                             reply.finish(result);
                         }
-                        Some(Command::Enqueue { request, caller_is_owner, reply }) => {
-                            let result = if self.info.dangerous && !caller_is_owner {
-                                Err(anyhow::anyhow!("native permissions changed; only the owner can queue work in this session"))
-                            } else {
-                                self.driver.enqueue(request).await
-                            };
+                        Some(Command::Enqueue { request, reply }) => {
+                            // A colleague's message queues as the owner's does, whatever the
+                            // session ran in before.
+                            let result = self.driver.enqueue(request).await;
                             reply.finish(result);
                         }
                         Some(Command::Model { model, reply }) => {
@@ -3445,13 +3260,8 @@ impl Session {
                     return None;
                 }
                 req.session_id = self.info.session_id.clone();
-                // Whether this approval goes back to the owner is decided **here** — only the
-                // machine sees the filesystem, and only it can canonicalize a path and compare
-                // it against the allowlist. The hub receives the conclusion, not the clues:
-                // inferring from `kind` turns a Bash command that `curl`s outward into an
-                // `Exec` an operator may allow.
-                //
-                // The allowlist and the grant list are read **now**, not copied at launch.
+                // What the call reaches is judged **here**: only the machine sees the filesystem,
+                // and only it can canonicalize a path and compare it against the allowlist.
                 let conf = self.confinement.borrow().clone();
                 let reason = crate::rc::policy::approval_owner_reason(
                     &req.tool,
@@ -3461,29 +3271,17 @@ impl Session {
                     // daemon, its own process cwd has nothing to do with the session, and a
                     // comparison computed from that base is wrong.
                     &self.cwd,
-                    &self.operator_heads(&conf),
+                    &conf.operator_heads,
                 )
                 .or_else(|| {
                     (!self.driver.permission_mode_known())
                         .then_some(crate::protocol::OwnerReason::Unprovable)
                 });
-                req.requires_owner = reason.is_some();
+                // Anyone who may answer approvals answers this one; the reason only says what it
+                // reaches, for whoever reads the card.
+                req.requires_owner = false;
                 req.owner_reason = reason;
-                // The verdict **stays on the machine**; sending it out is not enough.
-                //
-                // A verdict thrown away once computed leaves `pending` holding only the id,
-                // while the `approval.decide` path checks ownership alone and never compares
-                // role against verdict. The hub would then be the only executor of this whole
-                // classification — and the trust model says the hub is a relay, not an
-                // authority: every other dangerous verb (changing mode, starting a session with
-                // a mode) has a second gate on the machine side.
-                //
-                // What is stored is the **raw material** (the tool name plus the input), not the
-                // conclusion: the moment of the answer decides again against the allowlist as it
-                // stands then, see `Session::pending`.
                 let authority = PendingApproval {
-                    tool: req.tool.clone(),
-                    input: req.input.clone(),
                     suggested_permission_mode: req.suggested_permission_mode,
                 };
                 self.set_status(SessionStatus::AwaitingApproval).await;
