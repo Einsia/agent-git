@@ -43,6 +43,7 @@ mod landing;
 mod local_publication;
 pub(crate) mod native_records;
 mod settlement_io;
+mod steer_queue;
 
 use crate::domain::privacy_receipt::{PublicationReceipt, SupervisorPushRequest};
 use crate::domain::{redact, transcript};
@@ -1057,6 +1058,9 @@ pub struct Session {
     /// currently awaiting its exact response.
     pending_turn_command: Option<PendingTurnCommand>,
     pending_steer_command: Option<PendingSteerCommand>,
+    /// Messages for a running native Claude Code turn, held for its next tool step or waiting for
+    /// the next turn; see [`steer_queue`].
+    steer_queue: steer_queue::SteerQueue,
     pending_interrupt_command: Option<Ticket<()>>,
     /// The creation prompt has no original RPC receipt. Keep its authoritative
     /// result until the first viewer retry (or a different prompt) so a select
@@ -1840,6 +1844,7 @@ impl Session {
             queued_initial_turn: None,
             pending_turn_command: None,
             pending_steer_command: None,
+            steer_queue: Default::default(),
             pending_interrupt_command: None,
             resolved_initial_turn: None,
             announced_turn_ids: Default::default(),
@@ -2581,6 +2586,7 @@ impl Session {
                 self.info.status,
                 SessionStatus::Running | SessionStatus::AwaitingApproval
             );
+            self.abandon_steers().await;
         }
         self.info.status = status;
         self.info.updated_at = chrono::Utc::now().to_rfc3339();
@@ -2761,6 +2767,13 @@ impl Session {
             {
                 self.finish_landing().await;
             }
+            // A message that waited for this turn's end goes as the next command, through every
+            // check a command from the daemon passes.
+            if deferred_command.is_none()
+                && let Some(command) = self.next_queued_turn().await
+            {
+                deferred_command = Some(Some(command));
+            }
             tokio::select! {
                 biased;
                 cmd = async {
@@ -2936,9 +2949,13 @@ impl Session {
                             attribution.native_prompt_id = self.driver.reserve_prompt_identity();
                             let pending = PendingSteerCommand { message: report.text, attribution, reply };
                             self.driver.note_input_owner(pending.attribution.owner);
-                            match self.driver.steer(&message).await {
-                                SteerDispatch::Resolved(result) => self.resolve_steer(pending, result).await,
-                                SteerDispatch::Awaiting => self.pending_steer_command = Some(pending),
+                            if self.driver.steers_at_step() {
+                                self.steer_at_step(message, pending).await;
+                            } else {
+                                match self.driver.steer(&message).await {
+                                    SteerDispatch::Resolved(result) => self.resolve_steer(pending, result).await,
+                                    SteerDispatch::Awaiting => self.pending_steer_command = Some(pending),
+                                }
                             }
                             if self.info.status == SessionStatus::Ended { return; }
                         }
@@ -3292,6 +3309,10 @@ impl Session {
                     }
                 }
 
+                Some((client_msg_id, outcome)) = self.steer_queue.outcomes.1.recv() => {
+                    self.queued_turn_outcome(client_msg_id, outcome).await;
+                }
+
                 _ = ticker.tick() => {
                     if self
                         .stopping_turn
@@ -3498,6 +3519,7 @@ impl Session {
                 }
             }
             HarnessEvent::SteerResolved(result) => {
+                self.step_steer_resolved(result.is_ok());
                 if let Some(pending) = self.pending_steer_command.take() {
                     self.resolve_steer(pending, result.map_err(anyhow::Error::msg))
                         .await;
@@ -3820,6 +3842,15 @@ impl Session {
             } => {
                 self.handle_protocol_invariant(message, attempted_mode, confirmation_token)
                     .await;
+            }
+            HarnessEvent::StepSteerDelivered { operation_id } => {
+                self.step_steer_delivered(operation_id);
+            }
+            HarnessEvent::StepSteerUndelivered {
+                operation_id,
+                interrupted,
+            } => {
+                self.step_steer_undelivered(operation_id, interrupted).await;
             }
             HarnessEvent::Exited { .. } => {}
         }

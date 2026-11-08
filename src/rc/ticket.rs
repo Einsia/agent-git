@@ -125,6 +125,12 @@ impl<T> Ticket<T> {
         self.owner_control
     }
 
+    /// The request's authority, for an instruction carried on later under it: it admits that
+    /// one only while it still admits this one.
+    pub(crate) fn authority(&self) -> super::authority::Guard {
+        self.authority.clone()
+    }
+
     /// The request's authority still admits it.
     pub(crate) fn check_authority(&self) -> crate::Result<()> {
         self.authority

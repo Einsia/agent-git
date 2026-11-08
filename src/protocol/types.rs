@@ -1146,6 +1146,16 @@ pub struct TurnSteerResult {
     pub delivery: Delivery,
 }
 
+/// A message the device took and then dropped before it reached a turn: ids and a code only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TurnSteerDropped {
+    pub client_msg_id: String,
+    /// `interrupted` (the turn it waited for was stopped), `session_ended`, `access_ended`,
+    /// `mode_owner_only` or `home_folder` (the session's gates refused it when it went), or
+    /// `not_sent` (its turn didn't start).
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnInterrupt {
     pub session_id: String,

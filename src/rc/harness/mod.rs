@@ -414,6 +414,17 @@ pub enum HarnessEvent {
     /// closes the viewer RPC receipt.
     TurnStartResolved(TurnStartOutcome),
     SteerResolved(Result<Delivery, String>),
+    /// The plugin handed a message it held for the running turn to the model with a tool step's
+    /// result.
+    StepSteerDelivered {
+        operation_id: String,
+    },
+    /// A message held for a turn's next tool step that the turn ended without: `interrupted` when
+    /// the turn was stopped.
+    StepSteerUndelivered {
+        operation_id: String,
+        interrupted: bool,
+    },
     InterruptResolved(Result<InterruptOutcome, String>),
     /// An exact response arrived after a notification-only acceptance was
     /// already returned. The daemon may clear its durable Plan restart
@@ -866,6 +877,34 @@ impl AnyDriver {
             Self::OpenCode(driver) => SteerDispatch::Resolved(driver.steer(message).await),
             #[cfg(unix)]
             Self::ClaudeNative(driver) => driver.steer(message),
+        }
+    }
+
+    /// Whether a message for the running turn can wait for that turn's next tool step: only a
+    /// native Claude Code terminal whose plugin says so, while a turn runs.
+    pub fn steers_at_step(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.steers_at_step(),
+            _ => false,
+        }
+    }
+
+    /// Hands `framed` to the running turn's next tool step; see [`Self::steers_at_step`]. Its
+    /// operation id comes back with it.
+    pub fn steer_at_step(&mut self, framed: &str) -> (SteerDispatch, Option<String>) {
+        match self {
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.steer_at_step(framed),
+            _ => {
+                let _ = framed;
+                (
+                    SteerDispatch::Resolved(Err(anyhow::anyhow!(
+                        "this session can't hold a message for the next tool step"
+                    ))),
+                    None,
+                )
+            }
         }
     }
 

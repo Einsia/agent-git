@@ -24,6 +24,13 @@ const MAX_PROMPT_CHARS = 128 * 1024;
 // How long a prompt submitted during a turn is given to be refused before the receipt says
 // Claude Code holds it: a refusal comes from checking the submission, not from the turn.
 const QUEUE_REFUSAL_MS = 250;
+// An owner's message for the running turn (`steer_context`) waits here, in memory only, and goes
+// to the model with the result of that turn's next tool step. Whatever its turn ends without
+// goes back to the daemon by id, and the daemon decides whether it starts the next turn: this
+// plugin never submits it itself.
+const MAX_STEP_STEERS = 4;
+// What this plugin can do beyond the base protocol, reported with every poll.
+const CAPABILITIES = ["steer_at_step"];
 
 // Receipts contain operation metadata only. The native transcript remains the message record.
 const randomId = () => crypto.randomUUID();
@@ -50,6 +57,8 @@ const operations = new Map();
 let queue = null;
 let journal = null;
 let modelChange = null;
+// Messages held for the running turn's next tool step, by operation id: their text and the turn.
+const stepSteers = new Map();
 // Whether this terminal may write the conversation, as the daemon last said: `notice` is the
 // reason its own input waits; `unknownSince` is when the daemon stopped answering; `stale` is the
 // reason this terminal continues an older branch than the conversation's latest, once confirmed;
@@ -95,6 +104,7 @@ function rotate(session, cwd) {
   registrationRetry = 0;
   turn = null;
   modelChange = null;
+  stepSteers.clear();
   leaf = null;
   loadedAt = Date.now();
   lease = { known: false, notice: null, unknownSince: Date.now(), checkAt: 0, shown: undefined,
@@ -286,6 +296,12 @@ function validCommand(command) {
     return typeof command.text === "string" && command.text.trim().length > 0
       && command.text.length <= MAX_PROMPT_CHARS;
   }
+  if (command.method === "steer_context") {
+    return typeof command.text === "string" && command.text.trim().length > 0
+      && command.text.length <= MAX_PROMPT_CHARS
+      && typeof command.turnId === "string" && command.turnId.length > 0
+      && command.turnId.length <= 256;
+  }
   if (command.method === "model") {
     return typeof command.model === "string" && command.model.length > 0
       && command.model.length <= 256 && !/[\x00-\x1f\x7f]/.test(command.model);
@@ -368,6 +384,19 @@ async function execute($, command, target) {
       invoked = true;
       const changed = await $.config.set({ key: "model", value: command.model });
       result(record, { outcome: changed?.deny === undefined ? "applied" : "not_sent" });
+    } else if (command.method === "steer_context") {
+      // Only into the turn the daemon meant: once that turn has ended, the daemon starts the
+      // message as the next turn instead.
+      if (turn === null || turn !== command.turnId) {
+        result(record, { outcome: "not_running" });
+        return;
+      }
+      if (stepSteers.size >= MAX_STEP_STEERS) {
+        result(record, { outcome: "not_sent" });
+        return;
+      }
+      stepSteers.set(command.id, { text: command.text, turn: command.turnId });
+      result(record, { outcome: "held_for_step" });
     } else {
       // A prompt issued after a settings write must observe its native confirmation.
       while (modelChange) await modelChange.finished;
@@ -417,6 +446,33 @@ async function execute($, command, target) {
   }
 }
 
+// The held messages for the running turn go to the model with this step's result, as context
+// Claude Code records beside it; each is reported delivered by id, never by its text. A result
+// that refused the call carries nothing: the message waits for the next step.
+async function attachSteers(target, outcome) {
+  if (!stepSteers.size || !matches(target) || turn === null
+    || outcome === null || typeof outcome !== "object" || outcome.deny !== undefined) return outcome;
+  const texts = [];
+  for (const [id, steer] of [...stepSteers]) {
+    if (steer.turn !== turn) continue;
+    stepSteers.delete(id);
+    texts.push(steer.text);
+    await event("steer_delivered", { id });
+  }
+  if (!texts.length) return outcome;
+  return { ...outcome, context: [...(Array.isArray(outcome.context) ? outcome.context : []), ...texts] };
+}
+
+// What waited for a turn's next step that never came goes back to the daemon by id, with how the
+// turn ended. Its text stays here no longer.
+async function steerLeftover(turnId, reason) {
+  for (const [id, steer] of [...stepSteers]) {
+    if (steer.turn !== turnId) continue;
+    stepSteers.delete(id);
+    await event("steer_undelivered", { id, reason });
+  }
+}
+
 export async function poll($) {
   if (polling) return;
   polling = true;
@@ -440,7 +496,7 @@ export async function poll($) {
     const live = { turn, permission_mode: null, latest_seq: pending.sequence, approvals: [],
       tools: [...tools.values()], compacting: compactions.size > 0 };
     const reply = await request($, "/poll", {
-      ...target, ...live, registration, version: 1,
+      ...target, ...live, registration, version: 1, capabilities: CAPABILITIES,
       last_seq: batch.last,
       model: await $.session.model(), saturated: false,
       model_controls: await modelControls($), commands: await commandCatalog($),
@@ -540,7 +596,9 @@ export function registerControl(on) {
   });
   on("turn.start", async ($, e, next) => {
     await current($);
-    if (!ending) {
+    // Only the main loop's turns are the conversation's: a subagent's turn runs inside one, and
+    // taking it for the running turn would strand what waits for the main turn's next step or end.
+    if (!ending && e.agentId === undefined) {
       turn = e.turnId;
       await event("turn_started", { turn: e.turnId });
     }
@@ -555,6 +613,7 @@ export function registerControl(on) {
       turn = null;
       await event("turn_completed", { turn: e.turnId, reason: e.reason,
         duration_ms: Number.isFinite(e.durationMs) && e.durationMs >= 0 ? Math.round(e.durationMs) : undefined });
+      await steerLeftover(e.turnId, e.reason);
     }
     return result;
   });
@@ -565,7 +624,7 @@ export function registerControl(on) {
     tools.set(id, { id, tool: e.tool });
     await event("tool_started", { id, tool: e.tool });
     try {
-      return await next(e);
+      return await attachSteers(target, await next(e));
     } finally {
       if (matches(target) && tools.delete(id)) await event("tool_completed", { id });
     }

@@ -115,12 +115,13 @@ impl History {
     }
 }
 
-/// Projects `commits` in order with one projector, as one publication run does, and checks each
-/// against the whole-LOG projection.
-fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) {
+/// Projects `commits` in order with one projector, as one publication run does, checks each
+/// against the whole-LOG projection, and returns the last one's public commit.
+fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) -> Option<String> {
     let source = history.source();
     let mut projector = Projector::default();
     let mut rechecked = Rechecked::default();
+    let mut last = None;
     for (oid, parents) in commits {
         let projected = projector
             .project(&source, oid, parents, &Published::default(), &mut rechecked)
@@ -135,7 +136,9 @@ fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) {
         )
         .unwrap();
         assert_eq!(projected, whole, "snapshot {oid}");
+        last = projected.commit;
     }
+    last
 }
 
 /// A long session's snapshots, projected one after another as a publication introduces them, are
@@ -152,14 +155,39 @@ fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) {
 /// - two children of one commit, and a merge of them;
 /// - a rewritten LOG, and a revert that leaves a named event's object behind;
 /// - event objects the LOG never names, in a step that continues and in one that starts again,
-///   and a commit that adds one.
+///   and a commit that adds one;
+/// - a tool step's context this device's delivery records vouch for, published once as the typed
+///   message it was, and an identical context after it, which the spent record no longer vouches
+///   for.
 ///
 /// A projector that started each commit's rule afresh, continued from a sibling or across a
-/// rewritten LOG, kept a duplicate's last occurrence, or tracked the tree's event objects from
-/// the appended records alone publishes something here that the whole-LOG projection does not.
+/// rewritten LOG, kept a duplicate's last occurrence, tracked the tree's event objects from the
+/// appended records alone, or spent delivery records afresh at each commit or not at all publishes
+/// something here that the whole-LOG projection does not.
 #[test]
 fn every_snapshot_is_projected_as_its_whole_transcript_is() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(
+        home.path(),
+        every_snapshot_is_projected_as_its_whole_transcript_is_in,
+    );
+}
+
+fn every_snapshot_is_projected_as_its_whole_transcript_is_in() {
     use crate::domain::privacy::{projector::UNREADABLE_TEXT, service::OMITTED_TEXT};
+    use crate::rc::step_delivery;
+    const CONVERSATION: &str = "4e6c2b1a-0d0e-4c43-9a51-8f0e2f4a7b10";
+    const WORDS: &str = "also update the README";
+    let sent = step_delivery::framed(WORDS);
+    step_delivery::record(CONVERSATION, "client-1", &sent).unwrap();
+    let context = |uuid: &str| {
+        claude(
+            json!({"type":"attachment","uuid":uuid,"parentUuid":"a","sessionId":CONVERSATION,
+            "timestamp":"2026-11-06T08:00:00.000Z","attachment":{"type":"hook_additional_context",
+            "hookName":"tool.call","hookEvent":"PostToolUse","toolUseID":"toolu_1-context",
+            "content":[sent]}}),
+        )
+    };
     let mut history = History::new();
     let mut log = vec![
         claude(
@@ -227,6 +255,9 @@ fn every_snapshot_is_projected_as_its_whole_transcript_is() {
             _ => log.push(claude(json!({"type":"user","uuid":uuid("n"),"parentUuid":"a",
                 "message":{"role":"user","content":format!("turn {turn}")}}))),
         }
+        if turn == 30 || turn == 31 {
+            log.push(context(&uuid("x")));
+        }
         if turn == 100 {
             // A LOG rewritten in the middle.
             log.remove(5);
@@ -255,7 +286,15 @@ fn every_snapshot_is_projected_as_its_whole_transcript_is() {
         tip = history.commit(&[&parent], &log, &view, &extra, &[]);
         order.push((tip.clone(), vec![parent]));
     }
-    assert_equivalent(&history, &order);
+    let last =
+        assert_equivalent(&history, &order).expect("records are published other than as recorded");
+    // The person's words go out once, as the typed message; the second context stays back.
+    let carrying = git(
+        history.root.path(),
+        &["grep", "-l", "-F", WORDS, &last, "--", "events"],
+        None,
+    );
+    assert_eq!(carrying.lines().count(), 1, "{carrying}");
 }
 
 /// An event the LOG names whose object the tree lacks refuses the projection, in a step that

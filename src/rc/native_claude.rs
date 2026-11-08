@@ -12,7 +12,7 @@ pub use install::install_plugin;
 pub(crate) use transport::TerminalActivity;
 #[cfg(test)]
 pub(crate) use transport::fixture;
-pub use transport::{Client, Endpoint, Snapshot, Update};
+pub use transport::{Client, Endpoint, STEER_AT_STEP, Snapshot, Update};
 
 use anyhow::{Context, ensure};
 use fs2::FileExt;

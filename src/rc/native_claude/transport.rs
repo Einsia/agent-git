@@ -101,7 +101,14 @@ pub struct Snapshot {
     pub approvals: Vec<Value>,
     pub tools: Vec<Value>,
     pub compacting: bool,
+    /// What the plugin can do beyond the base protocol; an older plugin reports nothing.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
+
+/// The plugin holds an owner's message for the running turn and hands it to the model with the
+/// result of that turn's next tool step (`steer_context`).
+pub const STEER_AT_STEP: &str = "steer_at_step";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ModelControls {
@@ -126,6 +133,7 @@ impl Snapshot {
             self.events.len() <= MAX_EVENTS
                 && self.results.len() <= MAX_OPERATIONS
                 && self.commands.len() <= 128
+                && self.capabilities.len() <= 16
                 && self.latest_seq.is_none_or(|latest| latest >= self.last_seq),
             "native control metadata exceeds its bound"
         );
@@ -817,6 +825,8 @@ fn record_result(
                     | "unknown"
                     | "requested"
                     | "no_longer_active"
+                    | "held_for_step"
+                    | "not_running"
             )
         ),
         "unrecognized native result"
@@ -1092,10 +1102,20 @@ impl Client {
         );
         ensure!(
             super::super::native_inbox::valid_id(id)
-                && matches!(method, "prompt" | "abort" | "model"),
+                && matches!(method, "prompt" | "abort" | "model" | "steer_context"),
             "invalid native operation"
         );
-        if method == "prompt" {
+        if method == "steer_context" {
+            ensure!(
+                payload["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty() && text.len() <= 128 * 1024)
+                    && payload["turnId"].as_str().is_some_and(|turn| {
+                        super::super::harness::validate_native_turn_id(turn).is_ok()
+                    }),
+                "a message for the running turn needs its text and that turn's identity"
+            );
+        } else if method == "prompt" {
             ensure!(
                 payload["text"]
                     .as_str()
@@ -2055,7 +2075,19 @@ mod tests {
             "an unreadable receipt cannot authorize another native side effect"
         );
         assert!(claim(directory.path(), "new-generation", "operation", "digest").unwrap());
-        for outcome in ["accepted", "command_completed", "applied"] {
+        // Every outcome the plugin can report is one the daemon records: a result it refused would
+        // fail the plugin's whole report, and the operation would never be answered.
+        let plugin = include_str!("../harness/claude_native/plugin/hooks/control.js");
+        let outcomes: std::collections::BTreeSet<&str> = plugin
+            .match_indices("outcome: \"")
+            .filter_map(|(at, open)| {
+                let rest = &plugin[at + open.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .filter(|outcome| *outcome != "not_sent")
+            .collect();
+        assert!(outcomes.contains("held_for_step"), "{outcomes:?}");
+        for outcome in outcomes {
             let id = uuid::Uuid::new_v4().to_string();
             let result = json!({"id":id,"outcome":outcome});
             assert!(claim(directory.path(), "generation", &id, "digest").unwrap());

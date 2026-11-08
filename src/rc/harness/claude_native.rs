@@ -10,7 +10,7 @@ use crate::{
         ApprovalKind, ApprovalRequest, ApprovalResponse, ApprovalScope, Delivery, ItemKind,
         PermissionMode,
     },
-    rc::native_claude::{Client, Snapshot, Update},
+    rc::native_claude::{Client, STEER_AT_STEP, Snapshot, Update},
 };
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
@@ -22,6 +22,8 @@ use std::{
 struct PendingPrompt {
     id: String,
     steering: bool,
+    /// Held by the plugin for the running turn's next tool step (`steer_context`).
+    at_step: bool,
     /// When the prompt went to the terminal, and whether the log already noted that its
     /// receipt is overdue.
     submitted: std::time::Instant,
@@ -40,6 +42,7 @@ impl PendingPrompt {
         Self {
             id,
             steering,
+            at_step: false,
             submitted: std::time::Instant::now(),
             overdue_noted: false,
         }
@@ -182,6 +185,46 @@ impl ClaudeNativeDriver {
         match submitted {
             Ok(()) => SteerDispatch::Awaiting,
             Err(error) => SteerDispatch::Resolved(Err(error)),
+        }
+    }
+
+    /// Whether a message for the running turn can wait in the plugin for that turn's next tool
+    /// step: the plugin says it can, and a turn runs now.
+    pub fn steers_at_step(&self) -> bool {
+        self.client.is_some()
+            && self.snapshot.turn.is_some()
+            && self
+                .snapshot
+                .capabilities
+                .iter()
+                .any(|capability| capability == STEER_AT_STEP)
+    }
+
+    /// Hands `framed` to the plugin for the running turn's next tool step. Its operation id comes
+    /// back with it: the plugin reports that id delivered, or undelivered when the turn ends
+    /// first.
+    pub fn steer_at_step(&mut self, framed: &str) -> (SteerDispatch, Option<String>) {
+        let submitted = (|| {
+            ensure!(
+                self.pending_prompt.is_none(),
+                "a native submission is awaiting its receipt"
+            );
+            let turn = self
+                .snapshot
+                .turn
+                .clone()
+                .context("no turn runs to take this message")?;
+            let id = uuid::Uuid::new_v4().to_string();
+            self.client()?
+                .submit(&id, "steer_context", json!({"text":framed, "turnId":turn}))?;
+            let mut pending = PendingPrompt::new(id.clone(), true);
+            pending.at_step = true;
+            self.pending_prompt = Some(pending);
+            Ok(id)
+        })();
+        match submitted {
+            Ok(id) => (SteerDispatch::Awaiting, Some(id)),
+            Err(error) => (SteerDispatch::Resolved(Err(error)), None),
         }
     }
 
@@ -355,6 +398,18 @@ impl ClaudeNativeDriver {
                 Some("tool_completed" | "compaction_completed") => {
                     id().map(|item_id| HarnessEvent::ItemCompleted { item_id })
                 }
+                Some("steer_delivered") => {
+                    id().map(|operation_id| HarnessEvent::StepSteerDelivered { operation_id })
+                }
+                Some("steer_undelivered") => {
+                    id().map(|operation_id| HarnessEvent::StepSteerUndelivered {
+                        operation_id,
+                        interrupted: matches!(
+                            event["reason"].as_str(),
+                            Some("aborted" | "interrupted")
+                        ),
+                    })
+                }
                 _ => None,
             };
             if let Some(event) = mapped {
@@ -382,8 +437,52 @@ impl ClaudeNativeDriver {
         }
         if let Some(PendingPrompt {
             id,
+            submitted,
+            at_step: true,
+            ..
+        }) = &self.pending_prompt
+        {
+            let result = self
+                .client()
+                .ok()
+                .and_then(|client| client.result(id))
+                .and_then(|result| result["outcome"].as_str().map(str::to_owned));
+            if let Some(outcome) = result {
+                crate::rc::diagnostics::event(
+                    "native.receipt",
+                    serde_json::json!({
+                        "operation_id": crate::rc::diagnostics::id(id),
+                        "outcome": match outcome.as_str() {
+                            known @ ("held_for_step" | "not_running" | "not_sent") => known,
+                            _ => "other",
+                        },
+                        "elapsed_ms": crate::rc::diagnostics::elapsed_ms(*submitted),
+                    }),
+                );
+                let resolved = match outcome.as_str() {
+                    "held_for_step" => Ok(Delivery::AtToolBoundary),
+                    // The turn it was meant for ended before the plugin took it: it starts the
+                    // next turn, from the daemon.
+                    "not_running" => {
+                        self.events.push_back(HarnessEvent::StepSteerUndelivered {
+                            operation_id: id.clone(),
+                            interrupted: false,
+                        });
+                        Ok(Delivery::WhenIdle)
+                    }
+                    "not_sent" => Err("native submission was not delivered".into()),
+                    _ => Err("native prompt delivery is not confirmed".into()),
+                };
+                self.pending_prompt = None;
+                self.events
+                    .push_front(HarnessEvent::SteerResolved(resolved));
+            }
+        }
+        if let Some(PendingPrompt {
+            id,
             steering,
             submitted,
+            at_step: false,
             ..
         }) = &self.pending_prompt
         {
