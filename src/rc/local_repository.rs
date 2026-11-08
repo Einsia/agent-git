@@ -130,6 +130,34 @@ pub(crate) fn covering(dir: &Path) -> crate::Result<Vec<(std::path::PathBuf, Rep
     Ok(found)
 }
 
+/// Where the device-local repository named `slug` publishes to, for a line that names it the way
+/// the person knows it: `None` when no daemon on this computer registered a repository by that
+/// slug, `Some(None)` when it has no confirmed Hub destination yet. Asking never creates one.
+pub(crate) fn destination_of(slug: &str) -> Option<Option<String>> {
+    for namespace in [super::LOCAL_NAMESPACE, "rc"] {
+        let Some(repository) = super::namespace_dir(namespace)
+            .ok()
+            .and_then(|dir| registry(&dir.join("repositories.json")).ok())
+            .and_then(|repositories| {
+                repositories
+                    .into_values()
+                    .find(|repository| repository.slug == slug)
+            })
+        else {
+            continue;
+        };
+        let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main").ok()?;
+        let repo = require_by(&lineage, Authority::Saved(namespace)).ok()?;
+        return Some(
+            publication::Destination::load(&repo)
+                .ok()
+                .flatten()
+                .map(|destination| destination.repository),
+        );
+    }
+    None
+}
+
 /// The folders whose conversations `repo` holds, when it is a device-local repository a daemon on
 /// this computer registered; another repository holds none.
 pub(crate) fn folders_of(repo: &Repo) -> crate::Result<Vec<std::path::PathBuf>> {
