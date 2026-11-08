@@ -80,8 +80,9 @@ question says the repository's automatic upload is off, how many conversations i
 who can read them, and Cancel is its default answer.
 
 Every branch whose newest automatic upload didn't go through, wherever its conversation ran,
-shows as `owner/repo@branch` with agit's words for what happened and the command that shows what
-to do (`agit push owner/repo@branch`), which it copies. These come from the `uploads_not_through`
+shows as `owner/repo@branch` with agit's words for what happened, which name the command that goes
+on from it; where they don't, the row adds `agit push owner/repo@branch`, which shows what to do.
+The row's button copies that command. These come from the `uploads_not_through`
 list of `agit project list --json`, the same one `agit status` shows, and leave when agit clears
 them: a later upload of the branch goes through, or the Hub has the branch from any push. They
 carry nothing of the conversation.

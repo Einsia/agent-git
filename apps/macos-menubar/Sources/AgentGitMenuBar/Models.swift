@@ -71,6 +71,11 @@ struct UploadNotThrough: Decodable, Equatable {
     var repository: String { String(target.prefix { $0 != "@" }) }
     /// The description as a sentence: agit writes it to follow a colon.
     var sentence: String { description.prefix(1).uppercased() + description.dropFirst() + "." }
+    /// What the row says: agit's words, which name the command that goes on from most classes,
+    /// and that command where they don't. Said twice, the same command reads as two steps.
+    var detail: String {
+        description.contains(command) ? sentence : "\(sentence)\nIn a terminal, \(command) shows what to do."
+    }
 }
 
 struct UnattendedSwitchOn: Decodable, Equatable {
