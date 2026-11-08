@@ -8,6 +8,58 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.46] - 2026-11-09
+
+### Added
+
+- `agit push <repo>@<branch> --keep-both` keeps both sides of a branch that diverged from the Hub's copy in one step: it
+  publishes this checkout's line as `<branch>-local` beside the Hub's, which stays as it is. At a terminal, the refused
+  push asks the same question, and `--yes` doesn't answer it.
+- A message you type into a Claude Code turn that agit runs for remote control now reaches the model at its next tool
+  step instead of after the turn. One that can't reach the running turn is sent as the next turn or reported as not
+  delivered. On the Hub it appears as the message you typed.
+
+### Changed
+
+- Remote control shows sessions as they are, live and in their history, to you and the colleagues in your workspace:
+  nothing is held back for a privacy check any more. What `agit save`, a turn's end and `agit push` publish to a
+  repository is checked as before.
+- A colleague's message in a shared conversation now runs like your own: in any mode, in Codex, in your home folder,
+  with approvals anyone in the workspace can answer. Permission mode and model stay yours to change.
+- `agit merge` says the merge agent will take over the terminal, names `--manual`, and asks before starting it; `-y`
+  skips the question.
+
+### Fixed
+
+- When another computer added a turn to a plain session on top of what this computer uploaded, resume, run and pull
+  bring that turn over as the Hub holds it and continue from it, instead of refusing the session as continued in two
+  places.
+- A conversation another session continues, as `agit resume` does, now says so at its start and at each turn's end: its
+  turns there stay on this computer and aren't uploaded, and `agit resume <repo>@<branch>` continues the branch.
+- `agit repo rename` and `agit clone --mine` move a repository's worktrees with it. A worktree an older agit left in
+  another repository's place is named by `agit doctor`, and `agit doctor --repair-worktrees <owner/repo>` moves it home.
+- In a folder whose repository has automatic upload off, a new conversation's start line, `agit status` and the agent's
+  note say its turns are saved on this computer and that `agit push` publishes them, instead of saying they upload at
+  the end of each turn. That start also no longer asks the Hub who can read the repository.
+- When an automatic upload didn't go through, the line that says so names the exact `agit push <repo>@<branch>` that
+  goes on from it, as a bare `agit push` can't act on a conversation that has ended. A conversation whose folder doesn't
+  upload it by itself is told it's saved on this computer and not uploaded, rather than that its upload failed. For an
+  upload that failed with no named reason, `agit status` shows the first line the push reported.
+- `agit save` names a conversation that remote control keeps for a folder enrolled with the Hub by the Hub repository it
+  is for, or says it has none yet, instead of the internal desktop-…/project-… repository name.
+- Stopping or restarting remote control right after a conversation's turn was saved no longer leaves a lock file that
+  stops later turns from being saved; agit clears a lock it can tell nothing still holds, and otherwise says which file
+  it is, when it is safe to delete, and the command.
+- `agit status` keeps a row for every local repository, however many branches another has, and its "incomplete" warning
+  names how many branches of which repository were left out, with the `agit branch --repo <owner/repo> --all` that lists
+  them.
+- A memory file you allow with `agit privacy policy allow-memory` is collected as it stands by the next sync or turn
+  end, even if you edited it before allowing it; the command names the files it covers.
+- After `agit memory distill`, the hint also names the session branch's push when that branch isn't on the Hub yet, not
+  only main's.
+- `npx create-agit` no longer says your shell selects another agit when the only other one is npx's own temporary copy.
+- On Windows, reading agit's output no longer waits on a helper that outlives the command.
+
 ## [0.2.45] - 2026-11-08
 
 ### Added
