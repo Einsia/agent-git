@@ -35,6 +35,59 @@ mod shared;
 /// How many branch rows the repositories of one status page show in all.
 const BRANCH_ROWS: usize = 128;
 
+/// How many branch rows a repository may take when `used` rows are taken and `later`
+/// repositories come after it: every one of those keeps a row of its own, so one repository with
+/// many branches can't push the others out of the table. At least one.
+fn row_limit(used: usize, later: usize) -> usize {
+    BRANCH_ROWS
+        .saturating_sub(used)
+        .saturating_sub(later)
+        .max(1)
+}
+
+/// What the table left out, by repository (`omitted`, branches) and in all (`repositories`), as
+/// a warning and the command that lists the rest. `None` when nothing was.
+fn left_out_of_table(omitted: &[(String, usize)], repositories: usize) -> Option<(String, String)> {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    if omitted.is_empty() && repositories == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = omitted
+        .iter()
+        .take(3)
+        .map(|(slug, count)| {
+            format!(
+                "{count} more branch{} of {slug}",
+                if *count == 1 { "" } else { "es" }
+            )
+        })
+        .collect();
+    if omitted.len() > 3 {
+        parts.push(format!("more of {} other repositories", omitted.len() - 3));
+    }
+    if repositories > 0 {
+        parts.push(format!(
+            "{repositories} more repositor{}",
+            if repositories == 1 { "y" } else { "ies" }
+        ));
+    }
+    Some((
+        format!(
+            "status is incomplete: {} don't fit the display budget",
+            parts.join(", ")
+        ),
+        format!(
+            "`agit branch --repo {} --all` lists every branch of a repository",
+            omitted
+                .first()
+                .map_or_else(|| "<owner/repo>".to_owned(), |(slug, _)| quote_arg(slug))
+        ),
+    ))
+}
+
 /// Threads a status page keeps busy at once. Its reads are short Git queries whose time is
 /// mostly process start-up, so a few in flight hide that latency without loading the machine.
 const PAGE_WORKERS: usize = 8;
@@ -304,12 +357,14 @@ pub fn run(args: Args) -> CmdResult {
     if !agents.is_empty() {
         ui::section("agent repos");
         let mut rows = Vec::new();
-        let mut omitted = 0;
+        // Branches left out, by repository, and repositories left out entirely.
+        let mut omitted: Vec<(String, usize)> = Vec::new();
+        let mut repositories_omitted = 0;
         let mut aside_example = None;
         let mut aside_unreadable = false;
         in_order(&agents, ahead, |index, (inspected, aside)| {
             if rows.len() >= BRANCH_ROWS {
-                omitted += agents.len() - index;
+                repositories_omitted = agents.len() - index;
                 return false;
             }
             let (owner, name, path) = &agents[index];
@@ -318,7 +373,7 @@ pub fn run(args: Args) -> CmdResult {
                 aside_unreadable = true;
                 BTreeSet::new()
             });
-            let limit = BRANCH_ROWS - rows.len();
+            let limit = row_limit(rows.len(), agents.len() - index - 1);
             match branches::settle(&Repo::at(path), inspected, BRANCH_ROWS, limit) {
                 Ok(page) if page.branches.is_empty() => rows.push(vec![
                     slug,
@@ -328,7 +383,9 @@ pub fn run(args: Args) -> CmdResult {
                     "no branch refs".into(),
                 ]),
                 Ok(page) => {
-                    omitted += page.omitted;
+                    if page.omitted > 0 {
+                        omitted.push((slug.clone(), page.omitted));
+                    }
                     for branch in page.branches {
                         let state = if aside.contains(&branch.name) {
                             aside_example.get_or_insert_with(|| format!("{slug}@{}", branch.name));
@@ -366,13 +423,9 @@ pub fn run(args: Args) -> CmdResult {
                 &rows
             )
         );
-        if omitted > 0 {
-            ui::warning(
-                "status is incomplete: additional branches or repositories exceed the display budget",
-            );
-            ui::hint(
-                "inspect a repository with `agit branch --repo <owner/repo> --all` for its remaining branches",
-            );
+        if let Some((warning, hint)) = left_out_of_table(&omitted, repositories_omitted) {
+            ui::warning(&warning);
+            ui::hint(&hint);
         }
         if let Some(example) = aside_example {
             #[cfg(windows)]
@@ -683,16 +736,16 @@ fn structured(args: &Args) -> CmdResult {
             return false;
         }
         let (owner, name, path) = &agents[index];
-        let branch_sync = match branches::settle(&Repo::at(path), inspected, BRANCH_ROWS, remaining)
-        {
+        let limit = row_limit(BRANCH_ROWS - remaining, agents.len() - index - 1);
+        let branch_sync = match branches::settle(&Repo::at(path), inspected, BRANCH_ROWS, limit) {
             Ok(page) => {
-                remaining -= page.branches.len().max(1);
+                remaining = remaining.saturating_sub(page.branches.len().max(1));
                 serde_json::json!({
                     "items": page.branches, "omitted": page.omitted, "error": null,
                 })
             }
             Err(error) => {
-                remaining -= 1;
+                remaining = remaining.saturating_sub(1);
                 serde_json::json!({"items": null, "omitted": null, "error": format!("{error:#}")})
             }
         };
@@ -1275,6 +1328,29 @@ fn upload_waits_json() -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    /// A repository with more branches than the table holds leaves a row for every repository
+    /// after it, so none of them drops out of `agit status` unseen. The warning names where
+    /// branches were left out and how many, and the command that lists them; a warning that said
+    /// only "branches or repositories" left the person no repository to name.
+    #[test]
+    fn every_repository_keeps_a_row_in_the_status_table() {
+        use super::BRANCH_ROWS;
+        assert_eq!(super::row_limit(0, 0), BRANCH_ROWS);
+        assert_eq!(super::row_limit(0, 5), BRANCH_ROWS - 5);
+        assert_eq!(super::row_limit(BRANCH_ROWS - 1, 3), 1);
+        let (warning, hint) =
+            super::left_out_of_table(&[("sim-hao/parley".into(), 212)], 0).unwrap();
+        assert_eq!(
+            warning,
+            "status is incomplete: 212 more branches of sim-hao/parley don't fit the display budget"
+        );
+        assert_eq!(
+            hint,
+            "`agit branch --repo sim-hao/parley --all` lists every branch of a repository"
+        );
+        assert!(super::left_out_of_table(&[], 0).is_none());
+    }
+
     #[test]
     fn a_missing_store_only_proves_a_complete_empty_observation() {
         let empty = super::observe_page(None, &[], true, 0, 8);
