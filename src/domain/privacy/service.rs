@@ -19,10 +19,6 @@ const LIVE_LOCK_WAIT: Duration = Duration::from_millis(250);
 /// before, and apart from, any caller's budget.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 const RETRY_DELAY: Duration = Duration::from_secs(10);
-/// How long a caller can go without an answer through ordinary trouble: a worker back-off and
-/// one budget.
-pub(crate) const RETRY_WINDOW: Duration =
-    Duration::from_millis((RETRY_DELAY.as_millis() + LIVE_BUDGET.as_millis()) as u64);
 const BATCH_BYTES: usize = 128 * 1024;
 
 /// How long a caller lets the worker take, from the moment the worker is ready.
@@ -570,18 +566,6 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
     }
 }
 
-/// Whether `reason` (a [`reason_name`]) is the privacy worker's own state on this device (busy,
-/// backing off, unable to start, out of time, or garbled) and so may be told to a viewer on
-/// another computer. A reason drawn from the record or from the person's rules stays here, for
-/// `agit status`: told to every viewer of a workspace, it would say what a record holds or that
-/// another account's rules apply.
-pub fn worker_state(reason: &str) -> bool {
-    matches!(
-        reason,
-        "lock_busy" | "backoff" | "store_busy" | "spawn_failed" | "deadline" | "protocol_error"
-    )
-}
-
 /// Whether a wait reported under `reason` (a [`reason_name`]) can pass when the worker is asked
 /// again shortly: it was busy, starting, backing off, out of budget, garbled its reply, or could
 /// not load the whole policy yet. The other reasons, and one this build doesn't know, name
@@ -614,12 +598,6 @@ pub fn transform(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
 /// Protection for remote-control text a viewer is waiting for: the live budget.
 pub(crate) fn transform_live(repo: Option<&Path>, text: &str, mode: Mode) -> Outcome {
     transform_with(repo, "", text, mode, Budget::Live)
-}
-
-/// [`transform_live`] for text that continues `context`, text a stream already released: the
-/// worker's rules match across the context, and only `text` is protected and returned.
-pub fn transform_in(repo: Option<&Path>, context: &str, text: &str, mode: Mode) -> Outcome {
-    transform_with(repo, context, text, mode, Budget::Live)
 }
 
 fn transform_with(

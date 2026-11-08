@@ -1,18 +1,22 @@
 # Privacy service budgets
 
-Every byte agit commits, publishes or sends to a remote-control viewer passes through the local
-privacy worker first. This document says how long callers wait for that worker and what happens
-to input it did not protect in full.
+Every byte agit commits or publishes passes through the local privacy worker first. This document
+says how long callers wait for that worker and what happens to input it did not protect in full.
+
+Remote control is not on this path. A session is its owner's own, shown live to them or to
+colleagues in their workspace, so its records, deltas, approval cards, history pages and
+session-list labels go to its viewers as they are. What is kept where others can read it leaves
+through settlement, push or export, which check it in full.
 
 ## Budgets
 
 - **Start-up.** A new worker loads the repository's dictionary and policy, then answers a
   `Prepare` request. Start-up has its own deadline. A caller's budget starts once the worker is
   ready, so a large allowlist or journal never costs the caller its budget.
-- **Live.** Remote-control text, JSON and streams that a viewer is waiting for get a short
-  budget. A live caller that finds another caller in this process using the worker waits up to
-  `LIVE_LOCK_WAIT` for it before it reports `lock_busy`. Durable callers do not wait: each has its
-  own retry.
+- **Live.** Text and JSON values protected one at a time (`Redactor::scrub` and its fallible
+  forms) get a short budget. A live caller that finds another caller in this process using the
+  worker waits up to `LIVE_LOCK_WAIT` for it before it reports `lock_busy`. Durable callers do not
+  wait: each has its own retry.
 - **Durable.** Settlement, import, push preparation, memory collection and share or export get a
   budget of seconds that grows with the input.
   Privacy publication protects decoded fields under this budget, including `export --privacy`.
@@ -54,11 +58,6 @@ Blocked numeric and boolean data values refuse capture with an explanation; chan
 a string or review the rule before retrying. Encoded JSON strings can use the existing
 whole-carrier mapping, preserving their exact scalar types without a storage format change.
 Native control flags and counters retain their schema semantics.
-
-RC history reports unavailable repository protection and unreadable device or legacy rules as
-`privacy_rules_unavailable`, with `retryable: false` and `restart: false`. Its message asks the
-user to restore repository and rule access. A blocked scalar reports `privacy_value_unsupported`
-with the same flags. Worker contention and deadlines remain transient.
 
 ## Units larger than one request
 
@@ -104,11 +103,6 @@ are sent, so a large record never holds a session back:
 | caller | deadline | lock_busy / backoff | oversize (single unit beyond the limit) | store_busy | source_incomplete | findings_cap | spawn_failed / protocol_error | retry |
 |---|---|---|---|---|---|---|---|---|
 | start-up (worker not ready yet) | Live callers show pending (the marker), never raw. Durable callers wait for ready within the start-up deadline of seconds, then their per-call budget starts | – | – | – | – | – | start-up fails: as spawn_failed | each caller's own retry, below |
-| RC live: text (`scrub`) | marker "[privacy check pending: text withheld]"; never raw | same | same | same | same | same | same | the next event carries new text; a withheld prompt or error is not re-sent |
-| RC live: JSON and native records | `{"protection_error": …}` marker; raw dropped | same | same | same | same | same | same | live tail: lines from the first withheld record are held and projected again with the next polls, and the cursor never moves past an unprotected record. The first one's marker shows once it has waited `HELD_TAIL_NOTICE`, and before a turn boundary, while it is still retried. It is given up alone, with the given-up marker, only after its own check failed with a deadline or a protocol error `HELD_TAIL_GIVE_UP_FAILURES` times over `HELD_TAIL_GIVE_UP`; lock contention and back-offs never give a line up (`HELD_TAIL_BYTES` bounds the wait). A given-up line never shows raw text, and history serves it once its protection passes |
-| RC live: stream | held up to 1 MiB, released once processed Complete; otherwise the rest of the item is withheld behind one marker | same | withheld at once, with the rest of the item | same as deadline | same as deadline | same as deadline | same as deadline | the completed item arrives through the tail (row above) and is retried there |
-| RC history page | page refused as busy, with `reason: privacy_check_pending` and the privacy reason as `privacy_reason`; the cursor does not advance | same, but never given up | same | same | same | same | same | the viewer requests the same page again; once the page has been refused for `HELD_TAIL_NOTICE` and its own check failed with a deadline or a protocol error `HELD_TAIL_GIVE_UP_FAILURES` times, it is returned with the given-up marker for each record that did not pass, and the next request for it projects it again. Lock contention and back-offs never give a page up |
-| RC session-list labels (gist = opening prompt, native title) | each label shows the marker, never raw, and the row's `labels_withheld` names the reason (`repository_unavailable` when its repository cannot be resolved) | same | same | same | same | same | same | the next listing protects them again. A label the worker checked is kept, under a digest of its text and never as the text, with the policy stamp it was checked under, and shown again without a check while that stamp is unchanged: any rule, decision, allowlist, journal or account change changes it. A session never takes the marker as its title or gist: one opened from the list, or joined to its row, has none and carries `labels_withheld` instead, since the Hub keeps the first title and gist it is given |
 | settle (Stop hook, `agit commit`) | commits the turn-aligned processed prefix; the remainder waits for the next settle | same | only a unit that cannot be divided (above): the turn holding it is refused by the unit's size, in the output and in `agit status`, with `agit project drop` as the way out, since settling again meets the same unit | same as deadline | nothing from that increment is committed; waits, shown in `agit status` with the cause | does not occur: the field is replaced whole | same as deadline; shown in `agit status` | every Stop and every `agit commit` retries on the normal cadence, with no growing back-off |
 | settle: metadata, milestone, message | that settlement waits; nothing is committed | same | same | same | same | same | same | as settle |
 | import | as settle; import reports how many turns are pending, and the next settle drains them | same | same | same | same | same | same | as settle |

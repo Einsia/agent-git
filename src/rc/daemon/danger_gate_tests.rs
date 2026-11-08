@@ -768,7 +768,6 @@ fn attach_only_joins_a_live_terminal() {
                     LocatedLocal {
                         title: None,
                         gist: None,
-                        labels_withheld: None,
                         runtime: "claude-code".into(),
                         cwd: cwd.clone(),
                         project_id: Some("project-a".into()),
@@ -866,7 +865,6 @@ fn attach_only_launches_nothing_when_the_terminal_exits_before_the_driver_is_cho
                     LocatedLocal {
                         title: None,
                         gist: None,
-                        labels_withheld: None,
                         runtime: "claude-code".into(),
                         cwd: cwd.clone(),
                         project_id: Some("project-a".into()),

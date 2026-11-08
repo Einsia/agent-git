@@ -14,7 +14,6 @@ async fn shared_approval_resolution_preserves_other_pending_requests() {
                 tool: "shell".into(),
                 input: serde_json::json!({}),
                 suggested_permission_mode: None,
-                unseen: false,
             },
         );
     }
@@ -110,8 +109,6 @@ pub(super) fn harness_test_session_with_channels(
         redactor: redact::Redactor::this_machine(),
         out,
         pending: Default::default(),
-        unshown: Vec::new(),
-        unshown_note: None,
         consumed_bytes: 0,
         resuming: false,
         agit_session: None,
@@ -143,8 +140,6 @@ pub(super) fn harness_test_session_with_channels(
         pending_interrupt_command: None,
         resolved_initial_turn: None,
         announced_turn_ids: Default::default(),
-        delta_streams: Default::default(),
-        held: Default::default(),
         alerted_registered: Default::default(),
     };
     (session, out_rx, notes_rx)
@@ -1428,7 +1423,6 @@ async fn run_ambiguous_claude_approval(
             tool: "Bash".into(),
             input: serde_json::json!({"command": "cargo test"}),
             suggested_permission_mode: suggested_mode,
-            unseen: false,
         },
     );
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
@@ -1749,7 +1743,6 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
             tool: "shell".into(),
             input: serde_json::json!({}),
             suggested_permission_mode: None,
-            unseen: false,
         },
     );
     let (commands, mut command_rx) = mpsc::channel(1);
@@ -1806,7 +1799,6 @@ async fn a_fenced_interrupt_leaves_a_claude_turn_running() {
             tool: "Bash".into(),
             input: serde_json::json!({}),
             suggested_permission_mode: None,
-            unseen: false,
         },
     );
     let (commands, mut command_rx) = mpsc::channel(1);
@@ -2137,7 +2129,6 @@ async fn a_non_owners_denial_note_never_reaches_claude_code_in_any_mode() {
                     tool: "Bash".into(),
                     input: serde_json::json!({"command": "ls"}),
                     suggested_permission_mode: None,
-                    unseen: false,
                 },
             );
             let (ticket, mut receipt) = crate::rc::ticket::ticket();
@@ -2260,93 +2251,47 @@ fn oversized_raw_lines_are_replaced_not_streamed() {
     assert_eq!(out, small);
 }
 
-/// A transcript line is redacted on its **decoded strings**, so the JSON shape has no room to be
-/// disturbed.
-///
-/// This line is the worst case for matching wire bytes: the replaced span crosses a JSON string
-/// boundary, the scrubbed text no longer parses, and the fallback branches on that path either
-/// send the original or send a placeholder object. Rewriting string by string leaves neither
-/// outcome — what goes out is the same tree with the sensitive value swapped.
-#[test]
-fn a_transcript_line_is_scrubbed_without_ever_losing_its_json_shape() {
-    // The persona home carries a quote: the matched span `/Users/ab","x` covers the closing quote
-    // of the text string and the opening quote of the next key.
-    let redactor = redact::Redactor::new(redact::Persona {
-        username: None,
-        home: Some(r#"/Users/ab","x"#.into()),
-        hostname: None,
-    });
-    let line = crate::rc::tail::TailedLine {
-            source: None,
-            lineno: 1,
-            text: r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"/Users/ab","x":"1"}]},"sessionId":"s"}"#.into(),
-        };
-    // Precondition self-check: scrubbing this line by bytes really does leave it unparseable —
-    // otherwise this test is not pinning that shape.
-    let on_the_wire = redactor.scrub(&line.text);
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&on_the_wire.text).is_err(),
-        "the premise broke: wire-byte scrubbing no longer breaks this line's JSON"
-    );
-
-    let (items, _registered) = items_from_lines("claude-code", &redactor, &[line]);
-    assert!(
-        !items.is_empty(),
-        "the assistant line must still produce items"
-    );
-    let raw = serde_json::to_string(&items[0].raw).unwrap();
-    assert!(
-        !raw.contains("/Users/ab"),
-        "the unredacted original leaked into ItemCompleted.raw: {raw}"
-    );
-    // The shape is intact, and it really was scrubbed — not a placeholder object.
-    assert_eq!(items[0].raw["type"], "assistant");
-    assert_eq!(
-        items[0].raw["message"]["content"][0]["text"], "~user1",
-        "the home-directory path must be aliased in place: {raw}"
-    );
-}
-
-/// An approval card's `input` has the same shape as a transcript line: scrub the decoded strings,
-/// keep the structure unchanged.
-///
-/// The card carries the command line that is about to run, which is where a sensitive value is
-/// most likely to appear; for wire-byte matching it is the worst kind of input — the scrubbed
-/// text no longer parses, and the fallback branches either send the original or send a
-/// placeholder.
+/// An approval reaches viewers when the harness raises it, its command as it is, a credential
+/// included, and only the owner's answer reaches the harness: a non-owner's allow of a command
+/// only the owner may allow is refused and the request stays open for the owner. The privacy
+/// check is made to come back incomplete for the credential, so an implementation that still
+/// checked the card would hold it back or send it without its command. One that answered the
+/// harness when the card went out, or on the non-owner's allow, would have written an allow to
+/// Claude Code ahead of the owner's denial.
+#[cfg(unix)]
 #[tokio::test]
-async fn an_approval_cards_input_is_scrubbed_without_ever_losing_its_json_shape() {
-    let driver = AnyDriver::ClaudeCode(Box::new(
-        crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
-    ));
-    let (mut session, mut out, _notes) =
-        harness_test_session_with_channels(driver, "claude-code", SessionStatus::Idle);
-    // The same shape as the test above: the matched span `/Users/ab","x` covers the closing quote
-    // of one string and the opening quote of the next key.
-    session.redactor = redact::Redactor::new(redact::Persona {
-        username: None,
-        home: Some(r#"/Users/ab","x"#.into()),
-        hostname: None,
-    });
-    let input = serde_json::json!({"command": "/Users/ab", "x": "1"});
-    // Precondition self-check: scrubbing this card by bytes really does leave it unparseable —
-    // otherwise this test is not pinning that shape.
-    let serialized = serde_json::to_string(&input).unwrap();
-    assert!(
-        serde_json::from_str::<serde_json::Value>(&session.redactor.scrub(&serialized).text)
-            .is_err(),
-        "the premise broke: wire-byte scrubbing no longer breaks this card's JSON"
+async fn an_approval_reaches_viewers_as_it_is_and_only_the_owner_answers_it() {
+    use crate::protocol::{ApprovalDecision, ApprovalScope};
+    let credential = "AKIA4X7QZ2M5RT6VW3JH";
+    let command = format!("AWS_ACCESS_KEY_ID={credential} aws s3 ls s3://audit-fixture");
+    let note = "not this bucket";
+    let directory = tempfile::tempdir().unwrap();
+    let written = directory.path().join("written.jsonl");
+    let mut driver =
+        crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_recording(&written);
+    driver.add_test_approval("approval-key", None);
+    driver.set_test_mode(PermissionMode::Default);
+    let (mut session, mut out, _) = harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Running,
     );
+    redact::WITHHOLD_LIVE.with(|w| {
+        w.set(Some((
+            credential,
+            crate::domain::privacy::projector::Reason::LockBusy,
+        )))
+    });
 
     session
         .on_harness_event(HarnessEvent::Approval(crate::protocol::ApprovalRequest {
-            approval_id: "approval-leak".into(),
+            approval_id: "approval-key".into(),
             session_id: String::new(),
-            turn_id: "turn-leak".into(),
+            turn_id: "turn-key".into(),
             kind: crate::protocol::ApprovalKind::Exec,
             tool: "Bash".into(),
-            input: input.clone(),
-            summary: "/Users/ab".into(),
+            input: serde_json::json!({ "command": command }),
+            summary: command.clone(),
             paths: vec![],
             timeout_secs: 30,
             requires_owner: false,
@@ -2356,109 +2301,108 @@ async fn an_approval_cards_input_is_scrubbed_without_ever_losing_its_json_shape(
             requested_at: "now".into(),
         }))
         .await;
+    let card = std::iter::from_fn(|| out.try_recv().ok())
+        .find(|frame| frame.method() == method::APPROVAL_REQUEST)
+        .expect("the card reaches viewers when the harness raises it")
+        .params
+        .unwrap();
+    assert_eq!(card["input"]["command"], command.as_str());
+    assert_eq!(card["summary"], command.as_str());
+    assert_eq!(card["requires_owner"], true);
+    drop(out);
 
-    let mut card = None;
-    while let Ok(frame) = out.try_recv() {
-        if frame.method.as_deref() == Some(method::APPROVAL_REQUEST) {
-            card = frame.params;
-        }
+    let (commands, mut command_rx) = mpsc::channel(2);
+    let mut receipts = Vec::new();
+    for owner in [false, true] {
+        let (ticket, receipt) = crate::rc::ticket::ticket();
+        receipts.push(receipt);
+        commands
+            .send(Command::Approve {
+                response: ApprovalResponse {
+                    approval_id: "approval-key".into(),
+                    session_id: "session-turn-test".into(),
+                    decision: if owner {
+                        ApprovalDecision::Deny
+                    } else {
+                        ApprovalDecision::Allow
+                    },
+                    scope: ApprovalScope::Once,
+                    message: owner.then(|| note.into()),
+                    answers: None,
+                    by: Some(if owner { "owner" } else { "operator" }.into()),
+                },
+                caller_is_owner: owner,
+                danger: DangerAuthorization::NotRequired,
+                reply: ticket.with_control_ceiling(owner),
+            })
+            .await
+            .unwrap();
     }
-    let card = card.expect("the approval card must still reach the hub");
-    let wire = serde_json::to_string(&card).unwrap();
+    drop(commands);
+    session.run_inner(&mut command_rx).await;
+    redact::WITHHOLD_LIVE.with(|w| w.set(None));
+    let mut outcomes = Vec::new();
+    for receipt in &mut receipts {
+        outcomes.push(
+            receipt
+                .wait(std::time::Duration::from_secs(5))
+                .await
+                .expect("settled")
+                .expect("ticket stays open")
+                .expect("typed outcome"),
+        );
+    }
     assert!(
-        !wire.contains("/Users/ab"),
-        "the unredacted approval input left for the hub: {wire}"
+        matches!(
+            &outcomes[0],
+            ApprovalOutcome::ExplicitRefusal { retained: true, .. }
+        ),
+        "{outcomes:?}"
     );
-    // The shape is intact, and it really was scrubbed — not a placeholder object.
-    assert_eq!(card["input"]["command"], "~user1");
-    assert_eq!(card["input"]["x"], "1");
-
-    // The decision side must not follow: what `self.pending` keeps is still the **unredacted**
-    // copy, or answering re-judges against the scrubbed value and the allowlist never lines up.
-    assert_eq!(
-        session
-            .pending
-            .get("approval-leak")
-            .expect("the pending approval survives")
-            .input,
-        input
+    assert!(
+        matches!(outcomes[1], ApprovalOutcome::Applied { .. }),
+        "{outcomes:?}"
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let first = loop {
+        let text = std::fs::read_to_string(&written).unwrap_or_default();
+        if let Some(line) = text.lines().next() {
+            break serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing reached Claude Code"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let answer = &first["response"]["response"];
+    assert_eq!(answer["behavior"], "deny", "{first}");
+    assert_eq!(answer["message"], note, "{first}");
+    session.driver.shutdown().await.unwrap();
 }
 
-/// The live `item.completed` must carry the *same* object hash the
-/// committed envelope will carry — that identity is what lets the hub
-/// reconcile the projection against the pushed transcript.
+/// The live `item.completed` carries the *same* object hash the committed envelope will carry:
+/// that identity is what lets the hub reconcile the projection against the pushed transcript. A
+/// projection that hashed anything but the line as the harness wrote it, such as a rewritten or
+/// capped copy, would leave every live row unmatched.
 #[test]
 fn live_object_hash_equals_the_committed_envelope_hash() {
-    let raw: serde_json::Value = serde_json::from_str(
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
-        )
-        .unwrap();
-    let live = projected_object_hash(&raw, &raw, false);
+    let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
+    let items = items_from_lines(
+        "claude-code",
+        &[crate::rc::tail::TailedLine {
+            source: None,
+            lineno: 1,
+            text: line.into(),
+        }],
+    );
+    assert!(!items.is_empty());
 
-    let line = serde_json::to_string(&raw).unwrap();
-    let wrapped = transcript::wrap_lines(&line, "claude-code", "agit-abc");
+    let wrapped = transcript::wrap_lines(line, "claude-code", "agit-abc");
     let envelope: serde_json::Value = serde_json::from_str(wrapped.trim()).unwrap();
-    assert_eq!(envelope["_object_hash"].as_str().unwrap(), live);
-}
-
-#[test]
-fn persona_redaction_does_not_change_the_committed_object_identity() {
-    let raw = serde_json::json!({"cwd": "/home/alice/private"});
-    let redactor = crate::domain::redact::Redactor::new(crate::domain::redact::Persona {
-        username: Some("alice".to_string()),
-        home: Some("/home/alice".to_string()),
-        hostname: None,
-    });
-    let scrubbed = redactor.scrub_json(&raw);
-    assert_ne!(scrubbed.value, raw);
-    assert!(scrubbed.registered_ids.is_empty());
     assert_eq!(
-        projected_object_hash(&raw, &scrubbed.value, false),
-        transcript::object_hash(&raw)
-    );
-}
-
-/// `paths` in a transcript event is scrubbed exactly like `text`.
-///
-/// What the adapter puts in `paths` is the **absolute** `file_path`. With `text` scrubbed to `~`,
-/// the untouched `/Users/alice/secret/src/main.rs` in the same event still leaves the machine
-/// with `item.completed` and lands in the hub's store: everyone in the workspace who can read
-/// this transcript gets the machine owner's username and home directory. The approval-card side
-/// has the same failure shape.
-#[test]
-fn transcript_item_paths_leave_the_machine_scrubbed_like_their_text() {
-    let redactor = redact::Redactor::new(redact::Persona {
-        username: Some("alice".into()),
-        home: Some("/Users/alice".into()),
-        hostname: None,
-    });
-    let line = crate::rc::tail::TailedLine {
-        source: None,
-        lineno: 1,
-        text: r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"/Users/alice/secret/src/main.rs"}}]},"sessionId":"s1","uuid":"u1"}"#.into(),
-    };
-    let (items, _registered) = items_from_lines("claude-code", &redactor, &[line]);
-    let edit = items
-        .iter()
-        .find(|item| !item.event.paths.is_empty())
-        .expect("the tool_use line must still produce an event carrying its path");
-    // Precondition self-check: the redactor on this machine recognizes this home directory —
-    // otherwise the assertion below pins a misconfigured redactor rather than whether `paths` is
-    // scrubbed.
-    assert_eq!(
-        edit.event.paths,
-        vec!["~/secret/src/main.rs".to_string()],
-        "the event's paths must be scrubbed exactly like its text"
-    );
-    let wire = serde_json::to_string(&items).unwrap();
-    assert!(
-        !wire.contains("/Users/alice"),
-        "the operator's real home left with item.completed: {wire}"
-    );
-    assert!(
-        !wire.contains("alice"),
-        "the operator's username left with item.completed: {wire}"
+        envelope["_object_hash"].as_str().unwrap(),
+        items[0].object_hash
     );
 }
 
@@ -2965,178 +2909,6 @@ async fn accepted_claude_prompt_publishes_its_machine_generated_native_identity(
     session.driver.shutdown().await.unwrap();
 }
 
-fn assistant_line(lineno: u64, text: &str) -> crate::rc::tail::TailedLine {
-    crate::rc::tail::TailedLine {
-        source: None,
-        lineno,
-        text: serde_json::json!({
-            "type": "assistant",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
-            "sessionId": "s"
-        })
-        .to_string(),
-    }
-}
-
-/// The marker a held line shows after its notice says why it waits when that is the privacy
-/// worker's own state, and says nothing when the reason comes from the record or from the
-/// person's rules: every viewer of the workspace sees the marker. A marker that carried every
-/// reason would tell viewers what a record holds; one that carried none would leave a wait on a
-/// stuck worker unexplained.
-#[test]
-fn a_held_lines_marker_names_only_the_workers_state() {
-    use crate::domain::privacy::projector::Reason;
-    let notice = std::time::Duration::from_millis(50);
-    let redactor = redact::Redactor::new(redact::Persona::default());
-    redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
-    for (reason, shown) in [
-        (Reason::StoreBusy, Some("store_busy")),
-        (Reason::SpawnFailed, Some("spawn_failed")),
-        (Reason::LockBusy, Some("lock_busy")),
-        (Reason::FindingsCap, None),
-        (Reason::DeviceRules, None),
-        (Reason::SourceIncomplete, None),
-    ] {
-        redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(Some(reason)));
-        let mut held = HeldTail::with_timing(notice, notice * 4);
-        let mut project = |polled| {
-            held.project(
-                "claude-code",
-                &redactor,
-                polled,
-                crate::rc::codex_history::HistoryMode::Model,
-                Release::Retry,
-            )
-            .items
-        };
-        assert!(project(vec![assistant_line(1, "a reply")]).is_empty());
-        std::thread::sleep(notice);
-        let items = project(Vec::new());
-        assert_eq!(items.len(), 1, "{reason:?}");
-        assert_eq!(
-            items[0].event.text.as_deref(),
-            Some(redact::PROTECTION_ERROR_TEXT)
-        );
-        assert_eq!(items[0].privacy_pending.as_deref(), shown, "{reason:?}");
-        assert!(items[0].raw.is_null());
-    }
-    redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(None));
-    redact::WITHHOLD_NATIVE.with(|w| w.set(None));
-}
-
-/// Tailed lines whose privacy check may still pass are held for as many polls as it takes:
-/// nothing from the first such line on shows until it has waited the notice, then its marker
-/// shows once while it is still retried, and once it passes the held lines show in order. The
-/// notice belongs to the first held line, so a later line that stalls gets its own; a first line
-/// whose own check keeps failing is given up alone after its retry window, so the lines after it
-/// show; and once the held lines pass the byte bound, also while the first one is retried alone,
-/// whatever has not passed shows the given-up marker. A tail that gave up after a count of polls,
-/// kept one notice for the whole tail, let one record hold everything after it, or held without
-/// bound would lose, hide, stall or pile up records.
-#[test]
-fn held_tail_lines_wait_for_their_privacy_check_and_then_show() {
-    let notice = std::time::Duration::from_millis(100);
-    let redactor = redact::Redactor::new(redact::Persona::default());
-    let mut held = HeldTail::with_timing(notice, notice * 4);
-    let mut project = |polled: Vec<crate::rc::tail::TailedLine>, release: Release| {
-        held.project(
-            "claude-code",
-            &redactor,
-            polled,
-            crate::rc::codex_history::HistoryMode::Model,
-            release,
-        )
-        .items
-        .into_iter()
-        .map(|item| (item.line, item.event.text.unwrap_or_default()))
-        .collect::<Vec<_>>()
-    };
-    let withhold = |text: Option<&'static str>| redact::WITHHOLD_NATIVE.with(|w| w.set(text));
-    let shown = |line: u64, text: &str| vec![(line, text.to_owned())];
-
-    withhold(Some(""));
-    let first = vec![
-        assistant_line(1, "first reply"),
-        assistant_line(2, "second reply"),
-    ];
-    assert!(project(first, Release::Retry).is_empty());
-    for _ in 0..20 {
-        assert!(project(Vec::new(), Release::Retry).is_empty());
-    }
-    std::thread::sleep(notice);
-    assert_eq!(
-        project(Vec::new(), Release::Retry),
-        shown(1, redact::PROTECTION_ERROR_TEXT)
-    );
-    assert!(project(Vec::new(), Release::Retry).is_empty());
-
-    withhold(Some("second"));
-    assert_eq!(
-        project(vec![assistant_line(3, "third reply")], Release::Retry),
-        shown(1, "first reply")
-    );
-    std::thread::sleep(notice);
-    assert_eq!(
-        project(Vec::new(), Release::Retry),
-        shown(2, redact::PROTECTION_ERROR_TEXT)
-    );
-    std::thread::sleep(notice * 4);
-    // Waiting alone gives nothing up: the line's own check has to have failed often enough too.
-    assert!(project(Vec::new(), Release::Retry).is_empty());
-    let mut after = shown(2, redact::GIVEN_UP_TEXT);
-    after.extend(shown(3, "third reply"));
-    assert_eq!(project(Vec::new(), Release::Retry), after);
-
-    withhold(Some(""));
-    assert!(project(vec![assistant_line(4, "fourth reply")], Release::Retry).is_empty());
-    assert!(project(Vec::new(), Release::Retry).is_empty());
-    let large = "x".repeat(1024 * 1024);
-    let beyond: Vec<_> = (5..)
-        .take(HELD_TAIL_BYTES / large.len() + 1)
-        .map(|line| assistant_line(line, &large))
-        .collect();
-    let last = beyond.last().unwrap().lineno;
-    let given_up: Vec<_> = (4..=last)
-        .map(|line| (line, redact::GIVEN_UP_TEXT.to_owned()))
-        .collect();
-    assert_eq!(project(beyond, Release::Retry), given_up);
-    withhold(None);
-    assert!(held.is_empty());
-}
-
-/// Every way a session ends runs one exit funnel, which gives held lines a bounded wait and then
-/// shows each record that still waits as the given-up marker: a user stopping the session must
-/// not lose its last reply without a trace. An exit path that skipped the bounded release would
-/// drop those records silently.
-#[tokio::test]
-async fn held_lines_leave_a_marker_when_the_session_stops() {
-    let driver = AnyDriver::Codex(Box::new(
-        crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]),
-    ));
-    let (mut session, mut out, _notes) =
-        harness_test_session_with_channels(driver, "claude-code", SessionStatus::Idle);
-    redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
-    let held = session.held.project(
-        "claude-code",
-        &session.redactor,
-        vec![assistant_line(7, "last reply")],
-        crate::rc::codex_history::HistoryMode::Model,
-        Release::Retry,
-    );
-    assert!(held.items.is_empty());
-    session.settle_on_exit().await;
-    redact::WITHHOLD_NATIVE.with(|w| w.set(None));
-    let mut items = Vec::new();
-    while let Ok(frame) = out.try_recv() {
-        if frame.method() == method::ITEM_COMPLETED {
-            items.push(frame.params.unwrap()["event"]["text"].clone());
-        }
-    }
-    assert_eq!(items, [serde_json::json!(redact::GIVEN_UP_TEXT)]);
-    assert!(session.held.is_empty());
-    session.driver.shutdown().await.unwrap();
-}
-
 /// Pins whose words a turn holds, from the caller through the supervisor to Claude Code: a turn
 /// an operator starts is refused work that outlives it, the owner's is not. The words' owner is
 /// read from the caller the device authenticated (`MessageAttribution::from_caller`), never from
@@ -3508,7 +3280,6 @@ fn a_grant_stops_covering_operators_once_one_approves_a_file_change_in_the_works
                     tool: tool.into(),
                     input,
                     suggested_permission_mode: None,
-                    unseen: false,
                 },
             );
             let (ticket, receipt) = crate::rc::ticket::ticket();

@@ -165,7 +165,6 @@ fn attach_only_never_launches_a_conversation_nothing_runs() {
                 let located = |runtime: &str| LocatedLocal {
                     title: None,
                     gist: None,
-                    labels_withheld: None,
                     runtime: runtime.into(),
                     cwd: cwd.clone(),
                     project_id: Some("project-a".into()),
@@ -407,7 +406,6 @@ fn an_operator_cannot_take_over_an_unaccounted_dangerous_transcript() {
                 let located = |workspace: &str| LocatedLocal {
                     title: Some("Native title".into()),
                     gist: Some("Opening prompt".into()),
-                    labels_withheld: None,
                     runtime: "unsupported-test-runtime".into(),
                     cwd: cwd.clone(),
                     project_id: Some(format!("project-{workspace}")),
@@ -509,7 +507,6 @@ fn an_operator_cannot_take_over_a_closed_terminal_bypass_claude_conversation() {
                 let located = || LocatedLocal {
                     title: None,
                     gist: None,
-                    labels_withheld: None,
                     runtime: "claude-code".into(),
                     cwd: cwd.clone(),
                     project_id: Some("project-a".into()),
@@ -762,7 +759,6 @@ fn a_bound_dangerous_transcript_stays_owner_only_from_a_second_workspace_sharing
                 let located = |workspace: &str| LocatedLocal {
                     title: Some("Native title".into()),
                     gist: Some("Opening prompt".into()),
-                    labels_withheld: None,
                     runtime: "unsupported-test-runtime".into(),
                     cwd: cwd.clone(),
                     project_id: Some(format!("project-{workspace}")),
@@ -3910,7 +3906,6 @@ async fn a_non_owners_opening_prompt_into_codex_launches_nothing() {
             LocatedLocal {
                 title: None,
                 gist: None,
-                labels_withheld: None,
                 runtime: "codex".into(),
                 cwd: cwd.clone(),
                 project_id: Some("project-a".into()),
@@ -4213,7 +4208,6 @@ fn a_shared_project_stays_shared_when_resumed_or_taken_over() {
                         LocatedLocal {
                             title: None,
                             gist: None,
-                            labels_withheld: None,
                             runtime: "claude-code".into(),
                             cwd: cwd.clone(),
                             project_id: Some("project-a".into()),

@@ -54,7 +54,6 @@ struct Target {
     native: String,
     cwd: PathBuf,
     context: Option<super::runtime_context::RuntimeContext>,
-    entry: Option<super::roster::Entry>,
 }
 
 impl Target {
@@ -146,7 +145,6 @@ fn target(params: Value) -> crate::Result<Target> {
         native: native.into(),
         cwd,
         context,
-        entry: entry.cloned(),
     };
     target.validate()?;
     Ok(target)
@@ -161,14 +159,7 @@ pub async fn read(params: Value) -> crate::Result<Value> {
     };
     tokio::task::spawn_blocking(move || {
         target.validate()?;
-        let redactor = super::local_history::source_redactor(
-            "codex",
-            &target.native,
-            &target.cwd,
-            target.context,
-            target.entry.as_ref(),
-        )?;
-        Ok(redactor.try_scrub_json(&result)?.value)
+        Ok(result)
     })
     .await?
 }

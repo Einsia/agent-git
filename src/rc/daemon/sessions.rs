@@ -268,9 +268,9 @@ impl Daemon {
                 branch: lineage.as_ref().map(|lineage| lineage.branch().into()),
                 status: SessionStatus::Ended,
                 last_seq: 0,
-                title: super::named(row.title.clone()),
-                labels_withheld: row.labels_withheld.clone(),
-                gist: super::named(row.gist.clone()),
+                title: row.title.clone(),
+                labels_withheld: None,
+                gist: row.gist.clone(),
                 dangerous: self.roster.transcript_ever_dangerous(
                     &entry.runtime,
                     &entry.thread_id,
@@ -407,7 +407,7 @@ impl Daemon {
             status: SessionStatus::Ended,
             last_seq: 0,
             title: located.title,
-            labels_withheld: located.labels_withheld,
+            labels_withheld: None,
             gist: located.gist,
             dangerous: self.roster.transcript_ever_dangerous(
                 &entry.runtime,
@@ -816,7 +816,6 @@ impl Daemon {
         let LocatedLocal {
             title,
             gist,
-            labels_withheld,
             runtime,
             cwd,
             project_id,
@@ -940,7 +939,7 @@ impl Daemon {
             last_seq: 0,
             gist,
             title,
-            labels_withheld,
+            labels_withheld: None,
             // The judged bit is stamped by `prepare_spawn` — copying it here is one more place
             // that has to be right.
             dangerous: false,
@@ -1816,18 +1815,12 @@ pub(super) struct LocalSessionSnapshot {
 }
 
 /// Join a running session to its row in the local list: the session takes the row's labels as
-/// they were just checked. A label withheld in this listing leaves the session without it, and
-/// with the reason, never with the label it had before: that one was checked under the policy
-/// then in force, and a rule added since may block it.
+/// the list shows them.
 pub(super) fn take_list_labels(info: &mut SessionInfo, row: &LocalSession) {
-    info.title = super::named(row.title.clone());
+    info.title = row.title.clone();
     if row.gist.is_some() {
-        info.gist = super::named(row.gist.clone());
+        info.gist = row.gist.clone();
     }
-    info.labels_withheld = row
-        .labels_withheld
-        .clone()
-        .filter(|_| info.title.is_none() || info.gist.is_none());
 }
 
 impl LocalSessionSnapshot {

@@ -1423,7 +1423,6 @@ fn a_project_bound_at_the_home_directory_is_the_owners_alone() {
                 let located = LocatedLocal {
                     title: None,
                     gist: None,
-                    labels_withheld: None,
                     runtime: "claude-code".into(),
                     cwd: home.clone(),
                     project_id: Some("home".into()),

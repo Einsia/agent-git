@@ -145,8 +145,6 @@ async fn watch_settings_follow_index_then_live_context() {
             .as_str()
             .is_some_and(|text| text == "Preview answer")
     );
-    let wire = item.to_string();
-    assert!(!wire.contains("protection_error"));
     ready(async {
         while let Some(frame) = received.recv().await {
             assert!(!matches!(

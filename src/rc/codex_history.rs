@@ -177,23 +177,11 @@ fn canonical_user(record: &serde_json::Value, mode: HistoryMode) -> Option<&serd
     }
 }
 
-/// Only a parsed canonical UUID may enter the correlation metadata after redaction.
+/// Only a parsed canonical UUID may enter the correlation metadata.
 pub(crate) fn prompt_identity(record: &serde_json::Value, mode: HistoryMode) -> Option<String> {
     let id = canonical_user(record, mode)?.get("client_id")?.as_str()?;
     let parsed = uuid::Uuid::parse_str(id).ok()?;
     (parsed.to_string() == id).then(|| id.to_owned())
-}
-
-pub(crate) fn prompt_identity_pointer(
-    record: &serde_json::Value,
-    mode: HistoryMode,
-) -> Option<&'static str> {
-    prompt_identity(record, mode)?;
-    match mode {
-        HistoryMode::Legacy => Some("/payload/client_id"),
-        HistoryMode::Paginated => Some("/payload/item/client_id"),
-        HistoryMode::Model => None,
-    }
 }
 
 #[cfg(test)]
