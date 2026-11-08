@@ -299,7 +299,8 @@ impl Lab {
                     "  no sessions adopted yet.".to_owned(),
                     "repo\tbranch\tlast commit\ttracking ref\tstate".to_owned(),
                 ];
-                let mut incomplete = status["repositories_omitted"].as_u64().unwrap() > 0;
+                let repositories_omitted = status["repositories_omitted"].as_u64().unwrap();
+                let mut omitted_here = 0;
                 for repo in status["repositories"].as_array().unwrap() {
                     assert_eq!(repo["repo"], "local/qa");
                     let page = &repo["branches"];
@@ -308,7 +309,7 @@ impl Lab {
                         lines.push(format!("local/qa\t—\t—\t—\tunavailable: {error}"));
                         continue;
                     }
-                    incomplete |= page["omitted"].as_u64().unwrap() > 0;
+                    omitted_here += page["omitted"].as_u64().unwrap();
                     let branches = page["items"].as_array().unwrap();
                     if branches.is_empty() {
                         lines.push("local/qa\t—\t—\t—\tno branch refs".to_owned());
@@ -337,10 +338,30 @@ impl Lab {
                 }
                 let shared = &status["shared_files"];
                 assert!(shared["incomplete"].is_boolean());
-                let mut warnings = if incomplete {
-                    vec!["status is incomplete: additional branches or repositories exceed the display budget".to_owned()]
-                } else {
+                let mut parts = Vec::new();
+                if omitted_here > 0 {
+                    parts.push(format!(
+                        "{omitted_here} more branch{} of local/qa",
+                        if omitted_here == 1 { "" } else { "es" }
+                    ));
+                }
+                if repositories_omitted > 0 {
+                    parts.push(format!(
+                        "{repositories_omitted} more repositor{}",
+                        if repositories_omitted == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    ));
+                }
+                let mut warnings = if parts.is_empty() {
                     Vec::new()
+                } else {
+                    vec![format!(
+                        "status is incomplete: {} don't fit the display budget",
+                        parts.join(", ")
+                    )]
                 };
                 for change in shared["items"].as_array().unwrap() {
                     assert_eq!(change["repo"], "local/qa");
@@ -819,7 +840,7 @@ fn display_limit_reports_incomplete_without_expanding_history() {
         assert_eq!(screen.rows(), expected);
         assert_eq!(
             screen.warnings,
-            ["status is incomplete: additional branches or repositories exceed the display budget"]
+            ["status is incomplete: 2 more branches of local/qa don't fit the display budget"]
         );
         assert!(
             !screen
