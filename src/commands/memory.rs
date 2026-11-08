@@ -2353,7 +2353,24 @@ fn distill_cmd(
         &commit[..9.min(commit.len())]
     ));
     if !ui::quiet() {
-        ui::hint(&format!("publish it: `agit push {}@main`", target.slug));
+        let slug = &target.slug;
+        // Distill writes main here and publishes nothing. The session's own branch, which holds the
+        // memory it carried, needs its own push while the Hub holds neither its tip nor the public
+        // commit published for it; compared by commit id alone, a published branch would be told
+        // to push again, and pushing would not change that.
+        // An agent reads a bare "publish it" as its next step; publishing stays the user's call.
+        let lead = if ui::prompt::can_ask() {
+            "publish it"
+        } else {
+            "when the user asks to publish it"
+        };
+        if crate::domain::privacy_git::hub_holds_head(primary, branch) {
+            ui::hint(&format!("{lead}: `agit push {slug}@main`"));
+        } else {
+            ui::hint(&format!(
+                "{lead}: `agit push {slug}@main`; `{branch}`, which holds this memory too, isn't on the Hub yet: `agit push {slug}@{branch}`"
+            ));
+        }
     }
     Ok(ExitCode::Ok)
 }
