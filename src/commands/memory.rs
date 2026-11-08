@@ -539,6 +539,57 @@ fn store_baseline(checkout: &Repo, baseline: &Baseline) -> crate::Result<()> {
     write_baseline(&baseline_path(checkout)?, baseline)
 }
 
+/// Allowing a memory file is consent to it as it stands. So the top-level memory files `covered`
+/// admits, in every runtime directory a baseline of `primary`'s checkouts or start records tracks,
+/// stop counting as seen there, and their names come back. A baseline that recorded such a file
+/// while the policy kept it out would otherwise report it untouched until it changed again. The
+/// next collection takes it through the same policy check and secret scan as any change.
+pub(crate) fn release_allowed(
+    primary: &Repo,
+    covered: impl Fn(&str) -> bool,
+) -> crate::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for line in primary.git(&["worktree", "list", "--porcelain"])?.lines() {
+        if let Some(root) = line.strip_prefix("worktree ")
+            && let Ok(path) = Repo::at(Path::new(root)).git_path(BASELINE_FILE)
+        {
+            paths.push(path);
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(primary.common_dir()?.join(START_BASELINE_DIR)) {
+        paths.extend(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                }),
+        );
+    }
+    let mut names = BTreeSet::new();
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut baseline) = serde_json::from_str::<Baseline>(&text) else {
+            continue;
+        };
+        let Ok(present) = md_files(Path::new(&baseline.dir)) else {
+            continue;
+        };
+        let mut released = false;
+        for name in present.keys().filter(|name| covered(name)) {
+            names.insert(name.clone());
+            released |= baseline.files.remove(name).is_some();
+        }
+        if released {
+            write_baseline(&path, &baseline)?;
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
 fn write_baseline(path: &Path, baseline: &Baseline) -> crate::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2546,6 +2597,36 @@ mod tests {
 
     fn mirror(mem: &Path) -> PathBuf {
         mirror_dir(mem, SLUG, "s1")
+    }
+
+    /// A memory file this device recorded as seen while the policy kept it out is taken as it
+    /// stands once allowed: allowing names it, and the next collection lands its whole content.
+    /// Here the first materialization, with no baseline yet, records a file the empty allowlist
+    /// keeps out. Judged against that baseline, the file reads untouched, and without the release
+    /// it would never reach the branch until it changed again.
+    #[test]
+    fn a_file_recorded_before_it_was_allowed_is_collected_once_allowed() {
+        let (_d, primary, mem) = fixture();
+        crate::domain::privacy::PrivacyPolicy::default()
+            .save(&primary)
+            .unwrap();
+        let body = "# Decisions\n\ncredits are stored as integer milli-credits\n";
+        std::fs::write(mem.join("decisions.md"), body).unwrap();
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        let before = collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(before.collected, 0);
+        assert!(file(&primary, "refs/heads/s1", "decisions.md").is_none());
+
+        let mut policy = crate::domain::privacy::PrivacyPolicy::default();
+        policy.memory_allow.push("decisions.md".into());
+        policy.save(&primary).unwrap();
+        let covered = release_allowed(&primary, |name| name == "decisions.md").unwrap();
+        assert_eq!(covered, ["decisions.md"]);
+        collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "decisions.md").as_deref(),
+            Some(body)
+        );
     }
 
     #[test]
