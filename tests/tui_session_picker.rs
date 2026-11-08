@@ -262,7 +262,8 @@ fn bare_config_edits_and_unsets_the_persisted_value() {
     let mut terminal = Terminal::start(&home, tmp.path(), "config", 60);
     terminal.wait_for("configuration");
     terminal.type_keys("j\rcodex\r");
-    terminal.wait_for("saved");
+    // The key list itself holds "notice.unsaved", so the wait names the notice the save prints.
+    terminal.wait_for("saved runtime.default");
     let saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.join("config.json")).unwrap()).unwrap();
     assert_eq!(saved["runtime.default"], "codex");

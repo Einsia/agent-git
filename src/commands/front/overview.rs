@@ -91,13 +91,10 @@ pub fn run() -> CmdResult {
         .as_deref()
         .is_some_and(crate::commands::project::automatic_upload_declined);
     let next = next_step(account.is_some(), root.is_some(), state, total)
-        .filter(|(command, _)| !(declined && *command == "agit on"))
-        .or_else(|| {
-            (waiting > 0).then_some((
-                "agit save --all",
-                "upload the sessions that ran before this folder covered them",
-            ))
-        });
+        .filter(|(command, _)| !(declined && *command == "agit on"));
+    // With nothing else next, the sessions from before: the person's to upload, so an agent is
+    // told to ask rather than handed the command.
+    let earlier_next = (next.is_none() && waiting > 0).then_some(waiting);
 
     if crate::commands::json::is_capturing() {
         println!(
@@ -123,7 +120,11 @@ pub fn run() -> CmdResult {
                     "tracked": section.tracked,
                     "command": section.command,
                 })).collect::<Vec<_>>(),
-                "next": next.map(|(command, why)| serde_json::json!({"command": command, "why": why})),
+                "next": next
+                    .map(|(command, why)| serde_json::json!({"command": command, "why": why}))
+                    .or_else(|| earlier_next.map(|count| serde_json::json!({
+                        "ask_user": super::earlier_note(count, "here", super::Reader::Agent),
+                    }))),
             })
         );
         return Ok(ExitCode::Ok);
@@ -183,11 +184,8 @@ pub fn run() -> CmdResult {
                     format!("in {} (git worktree)", ui::tilde(worktree))
                 };
                 println!(
-                    "  {count} earlier session{} {place} {} not uploaded; to upload {} too: {}",
-                    if *count == 1 { "" } else { "s" },
-                    if *count == 1 { "is" } else { "are" },
-                    if *count == 1 { "it" } else { "them" },
-                    ui::accent("agit save --all")
+                    "  {}",
+                    super::earlier_note(*count, &place, super::Reader::of_this_process())
                 );
             }
             for session in &mut sessions {
@@ -209,9 +207,19 @@ pub fn run() -> CmdResult {
         );
     }
     println!();
-    match next {
-        Some((command, why)) => println!("Next: {} — {why}", ui::accent(command)),
-        None => println!(
+    match (next, earlier_next) {
+        (Some((command, why)), _) => println!("Next: {} — {why}", ui::accent(command)),
+        (None, Some(count)) => match super::Reader::of_this_process() {
+            super::Reader::Person => println!(
+                "Next: {} — upload the sessions that ran before this folder covered them",
+                ui::accent("agit save --all")
+            ),
+            super::Reader::Agent => println!(
+                "Next: {}",
+                super::earlier_note(count, "here", super::Reader::Agent)
+            ),
+        },
+        (None, None) => println!(
             "{}",
             FOOTER
                 .map(|(what, command)| format!("{what}: {}", ui::accent(command)))

@@ -922,7 +922,8 @@ At a terminal, bare `agit config` opens a full-screen editor for every supported
 effective and stored values separately, including an active `AGIT_HUB_URL` override. Explicit
 keys, values, `--unset`, `--list`, pipes, CI and agent sessions retain the command-line path.
 
-`hub.url` · `runtime.default` · `push.visibility` · `commit.auto` · `memory.track` (`session | off`,
+`hub.url` · `runtime.default` · `push.visibility` · `commit.auto` · `notice.unsaved` (`true | false`,
+whether a conversation starting in a folder nothing saves says so, once per folder) · `memory.track` (`session | off`,
 whether the runtime's project memory is collected into the session branch, see 3.7) ·
 `secrets.keystore` (`os | file`, where the global registration key lives: the system credential store,
 or a private file under `~/.agit/keystore/` for a machine with no desktop session such as an SSH

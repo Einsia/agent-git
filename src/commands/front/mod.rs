@@ -41,6 +41,29 @@ impl Reader {
     }
 }
 
+/// What a command says about sessions that ran `place` ("here", or in a git worktree) before the
+/// folder was on and aren't uploaded. To the person at their terminal it is a note with the
+/// commands. To an agent it says to ask the person: uploading sessions from before the folder was
+/// on is the person's choice, and an agent runs a command it is handed as the next step.
+pub(crate) fn earlier_note(count: usize, place: &str, reader: Reader) -> String {
+    match (reader, count) {
+        (Reader::Person, 1) => {
+            format!(
+                "1 earlier session {place} is not uploaded; to upload it too: `agit save --all`"
+            )
+        }
+        (Reader::Person, n) => format!(
+            "{n} earlier sessions {place} are not uploaded; to upload one, name it: `agit save <id>` (`agit` lists them); to upload all {n}: `agit save --all`"
+        ),
+        (Reader::Agent, 1) => format!(
+            "1 session that ran {place} before isn't uploaded; ask the person whether to upload it (`agit save --all`)"
+        ),
+        (Reader::Agent, n) => format!(
+            "{n} sessions that ran {place} before aren't uploaded; ask the person whether to upload one (`agit save <id>`) or all of them (`agit save --all`)"
+        ),
+    }
+}
+
 /// What a push the person made says about the folder `root` it ran in: that each new conversation
 /// there and in its subfolders, and in the git `worktrees` it would also cover, could upload to
 /// `repository` by itself, who can read it there, and how to keep it off. To an agent it adds that
