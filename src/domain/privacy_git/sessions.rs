@@ -758,14 +758,63 @@ pub(super) fn require_remote_ancestry(
                 same: tree(remote_head).is_some_and(|theirs| tree(head.oid()) == Some(theirs)),
             }
         } else {
-            Position::Diverged
+            let keep_both = keep_both_branch(&source, remote, branch);
+            return Err(Diverged {
+                message: remote_movement(
+                    repository,
+                    branch,
+                    remote_head,
+                    Position::Diverged,
+                    difference,
+                    &keep_both,
+                ),
+                repository: repository.to_owned(),
+                branch: branch.to_owned(),
+                keep_both,
+            }
+            .into());
         };
         anyhow::bail!(
             "{}",
-            remote_movement(repository, branch, remote_head, position, difference)
+            remote_movement(repository, branch, remote_head, position, difference, "")
         );
     }
     Ok(())
+}
+
+/// A push refused because this checkout's session branch and the Hub's copy each moved on without
+/// the other. It carries the branch a keep-both push publishes this checkout's line as.
+#[derive(Debug)]
+pub(crate) struct Diverged {
+    pub(crate) repository: String,
+    pub(crate) branch: String,
+    /// The first of `<branch>-local`, `<branch>-local-2`, … that names no branch here or on the
+    /// Hub.
+    pub(crate) keep_both: String,
+    message: String,
+}
+
+impl std::fmt::Display for Diverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Diverged {}
+
+/// The first of `<branch>-local`, `<branch>-local-2`, … that names no branch in `source` or among
+/// the Hub's refs, so keeping both never lands on a line either side already has.
+fn keep_both_branch(source: &Repo, remote: &RemoteRefs, branch: &str) -> String {
+    (1..)
+        .map(|n| match n {
+            1 => format!("{branch}-local"),
+            n => format!("{branch}-local-{n}"),
+        })
+        .find(|name| {
+            let reference = format!("refs/heads/{name}");
+            !remote.refs.contains_key(&reference) && !source.has_ref(&reference)
+        })
+        .expect("some suffix names no branch")
 }
 
 /// How a push says that the Hub's copy of a session branch and this checkout's have each moved on
@@ -803,6 +852,7 @@ fn remote_movement(
     remote_head: &str,
     position: Position,
     counts: Option<(usize, usize)>,
+    keep_both: &str,
 ) -> String {
     #[cfg(windows)]
     use crate::ui::quote_powershell_argument as quote_arg;
@@ -850,12 +900,16 @@ fn remote_movement(
                 Some((ahead, behind)) => format!("local +{ahead} / Hub +{behind}"),
                 None => "each side has commits the other does not".into(),
             };
-            let fork_branch = quote_arg(&format!("{branch}-local"));
-            let fork = quote_arg(&format!("{repository}@{branch}-local"));
             let merge_source = quote_arg(&format!("{repository}@{tip}"));
             let peer = quote_arg(repository);
+            // Keeping both publishes a branch, so an agent reads it as the person's to choose.
+            let keep = if crate::ui::prompt::can_ask() {
+                "keep both"
+            } else {
+                "if the user wants to keep both"
+            };
             format!(
-                "remote branch {branch} {DIVERGED} ({state}; Hub tip {tip}); local unpublished commits are kept\n  → keep both: `agit fork {target} -b {fork_branch}`, then `agit push {fork}`\n  → or merge the Hub's line in: `agit fetch {peer}`, then `agit merge {merge_source} --into {target}`, then `agit push {target}`"
+                "remote branch {branch} {DIVERGED} ({state}; Hub tip {tip}); local unpublished commits are kept\n  → {keep}: `agit push {target} --keep-both` publishes this checkout's line as {keep_both}, beside the Hub's\n  → or merge the Hub's line in: `agit fetch {peer}`, then `agit merge {merge_source} --into {target}`, then `agit push {target}`"
             )
         }
     }

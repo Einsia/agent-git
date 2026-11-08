@@ -9328,6 +9328,11 @@ fn automatic_upload_into_a_public_repository_is_switched_on_by_an_explicit_answe
 /// with the divergence and the commands that resolve it, piped and at a terminal. At a terminal
 /// the stopped stage ends its own row: a progress display that leaves its last row open puts the
 /// error on the stage's row, where a reader of that row sees only that the stage stopped.
+/// Keeping both is one step (#403):
+/// - Piped, the hint leaves it to the person.
+/// - At a terminal the push asks, default no, and `--yes` doesn't answer that question.
+/// - `--keep-both` publishes this checkout's line as `work-local` and leaves the Hub's `work` as it
+///   was; it refuses, sending nothing, on a branch that hasn't diverged.
 #[test]
 fn diverged_session_branch_names_the_divergence_and_next_commands() {
     let temp = tempfile::tempdir().unwrap();
@@ -9431,7 +9436,7 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
         for expected in [
             "error remote branch work has diverged from this checkout",
             "local unpublished commits are kept",
-            "`agit fork alice/app@work -b work-local`, then `agit push alice/app@work-local`",
+            "keep both: `agit push alice/app@work --keep-both` publishes this checkout's line as work-local, beside the Hub's",
             &format!(
                 "`agit fetch alice/app`, then `agit merge alice/app@{} --into alice/app@work`",
                 &hub_tip[..12]
@@ -9443,66 +9448,160 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     let refused = run_in(&laptop, &["push", "alice/app@work"]);
     assert!(!refused.status.success(), "{refused:?}");
     explains(&String::from_utf8_lossy(&refused.stderr));
+    // Nobody at a terminal to ask: keeping both is the person's to choose.
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("→ if the user wants to keep both:"),
+        "{refused:?}"
+    );
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-    let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-    let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
-    builder.env_clear_local();
-    for (name, value) in git_command(temp.path()).get_envs() {
-        if let Some(value) = value {
-            builder.env(name, value);
-        }
-    }
-    builder.env("AGIT_HOME", &laptop);
-    builder.env("CODEX_HOME", laptop.join("codex"));
-    builder.env("CLAUDE_CONFIG_DIR", laptop.join("claude"));
-    builder.env("AGIT_HUB_URL", &hub.base);
-    builder.env("AGIT_TUI", "0");
-    builder.env("AGIT_USE_SYSTEM_GIT", "1");
-    builder.env("AGIT_SECRETS_KEYSTORE", "file");
-    builder.env("TERM", "xterm");
-    builder.cwd(temp.path());
-    builder.args(["push", "alice/app@work"]);
-    let mut child = pair.slave.spawn_command(builder).unwrap();
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let (sender, chunks) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut buffer = [0; 4096];
-        while let Ok(count) = reader.read(&mut buffer) {
-            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
-                break;
+    const ASKED: &str = "Publish this checkout's line as alice/app@work-local (";
+    // Runs `args` at a terminal, answering the keep-both question with Enter (its default, no)
+    // when it is asked; returns whether it succeeded, the screen, and whether it asked.
+    let at_terminal = |args: &[&str]| {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        builder.env_clear_local();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                builder.env(name, value);
             }
         }
-    });
-    let mut screen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
+        builder.env("AGIT_HOME", &laptop);
+        builder.env("CODEX_HOME", laptop.join("codex"));
+        builder.env("CLAUDE_CONFIG_DIR", laptop.join("claude"));
+        builder.env("AGIT_HUB_URL", &hub.base);
+        builder.env("AGIT_TUI", "0");
+        builder.env("AGIT_USE_SYSTEM_GIT", "1");
+        builder.env("AGIT_SECRETS_KEYSTORE", "file");
+        builder.env("TERM", "xterm");
+        builder.cwd(temp.path());
+        builder.args(args);
+        let mut child = pair.slave.spawn_command(builder).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+        let (sender, chunks) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut screen = Vec::new();
+        let mut asked = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            while let Ok(chunk) = chunks.try_recv() {
+                screen.extend(chunk);
+            }
+            if !asked && String::from_utf8_lossy(&screen).contains(ASKED) {
+                asked = true;
+                writer.write_all(b"\r").unwrap();
+                writer.flush().unwrap();
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "push waited at a terminal: {}",
+                String::from_utf8_lossy(&screen)
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        thread::sleep(Duration::from_millis(200));
         while let Ok(chunk) = chunks.try_recv() {
             screen.extend(chunk);
         }
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "push waited at a terminal");
-        thread::sleep(Duration::from_millis(20));
+        let screen = String::from_utf8_lossy(&screen)
+            .replace("\u{1b}[2K", "")
+            .replace("\u{1b}[31m", "")
+            .replace("\u{1b}[39m", "");
+        (status.success(), screen, asked)
     };
-    thread::sleep(Duration::from_millis(200));
-    while let Ok(chunk) = chunks.try_recv() {
-        screen.extend(chunk);
-    }
-    assert!(!status.success());
-    let screen = String::from_utf8_lossy(&screen)
-        .replace("\u{1b}[2K", "")
-        .replace("\u{1b}[31m", "")
-        .replace("\u{1b}[39m", "");
+    let (succeeded, screen, asked) = at_terminal(&["push", "alice/app@work"]);
+    assert!(!succeeded, "{screen}");
     explains(&screen);
+    assert!(!screen.contains("if the user wants"), "{screen}");
     let stopped = screen
         .lines()
         .find(|row| row.contains("Reading remote history and session modes — stopped"))
         .unwrap_or_else(|| panic!("{screen}"));
     assert!(!stopped.contains("error"), "{screen}");
+    // Asked, and declined by default: nothing is forked or sent.
+    assert!(asked, "{screen}");
+    let local_branch = |name: &str| {
+        Command::new("git")
+            .args([
+                "-C",
+                laptop_repo.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+            ])
+            .arg(format!("refs/heads/{name}"))
+            .status()
+            .unwrap()
+            .success()
+    };
+    let hub_branch = |name: &str| {
+        Command::new("git")
+            .args([
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+            ])
+            .arg(format!("refs/heads/{name}"))
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(!local_branch("work-local") && !hub_branch("work-local"));
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
+    // `--yes` answers the push's own questions, never this one.
+    let (succeeded, screen, asked) = at_terminal(&["--yes", "push", "alice/app@work"]);
+    assert!(!succeeded && !asked, "{screen}");
+    explains(&screen);
+    assert!(!local_branch("work-local") && !hub_branch("work-local"));
+    // A preview publishes nothing, so it neither asks to keep both nor forks.
+    let (_, screen, asked) = at_terminal(&["push", "alice/app@work", "--dry-run"]);
+    assert!(!asked, "{screen}");
+    assert!(
+        !screen.contains("published this checkout's line"),
+        "{screen}"
+    );
+    assert!(!local_branch("work-local") && !hub_branch("work-local"));
+
+    // Asked for, keeping both publishes this checkout's line beside the Hub's and leaves it be.
+    let kept = run_in(&laptop, &["push", "alice/app@work", "--keep-both"]);
+    assert_success(&kept);
+    let said = String::from_utf8_lossy(&kept.stdout);
+    assert!(
+        said.contains("published this checkout's line as alice/app@work-local (")
+            && said.contains(
+                "; work stays as the Hub has it. To continue from your line: `agit resume alice/app@work-local`"
+            ),
+        "{kept:?}"
+    );
+    assert!(hub_branch("work-local"), "{kept:?}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), hub_tip);
+    // A branch the Hub's copy didn't move away from has nothing to keep beside it.
+    let tip = git(&remote, &["rev-parse", "refs/heads/work-local"]);
+    let again = run_in(&laptop, &["push", "alice/app@work-local", "--keep-both"]);
+    assert!(!again.status.success(), "{again:?}");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains(
+            "work-local hasn't diverged from the Hub, so there is nothing to keep beside it; `agit push alice/app@work-local` pushes it"
+        ),
+        "{again:?}"
+    );
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/work-local"]), tip);
+    assert!(!local_branch("work-local-2") && !hub_branch("work-local-2"));
 }
 
 /// An automatic upload the Hub refuses because the conversation also continued on another

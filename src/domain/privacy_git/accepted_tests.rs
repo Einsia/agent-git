@@ -297,7 +297,10 @@ fn remote_advances_name_pull_or_divergence_without_discarding_local_commits() {
     source.add_all().unwrap();
     source.commit("Session").unwrap();
     let error = check(&peer).unwrap_err().to_string();
-    assert!(error.contains("agit fork team/wiki@wiki"), "{error}");
+    assert!(
+        error.contains("`agit push team/wiki@wiki --keep-both`"),
+        "{error}"
+    );
     assert!(
         !error.contains(&accepted::Inconsistent.to_string()),
         "{error}"
@@ -746,7 +749,26 @@ fn session_owner_publication_retains_plain_ancestry_and_immutable_candidates() {
     assert!(
         error
             .to_string()
-            .contains("agit fork team/app@work -b work-local"),
+            .contains("`agit push team/app@work --keep-both` publishes this checkout's line as work-local, beside the Hub's"),
+        "{error:#}"
+    );
+    // Keeping both never lands on a branch the Hub already has: the next free name is offered.
+    let mut taken = advanced.clone();
+    taken
+        .refs
+        .insert("refs/heads/work-local".into(), "e".repeat(40));
+    let error =
+        sessions::require_remote_ancestry(&source, &plan, &ledger, &taken, "team/app").unwrap_err();
+    let diverged = error
+        .downcast_ref::<sessions::Diverged>()
+        .expect("{error:#}");
+    assert_eq!(
+        (diverged.repository.as_str(), diverged.branch.as_str()),
+        ("team/app", "work")
+    );
+    assert_eq!(diverged.keep_both, "work-local-2");
+    assert!(
+        error.to_string().contains("as work-local-2, beside"),
         "{error:#}"
     );
     let mut next = prepare(&branches, &selected).unwrap();

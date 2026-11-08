@@ -297,6 +297,7 @@ fn retry_push_command(args: &Args, slug: &str, branches: &[String]) -> String {
         (args.show_preview, "--show-preview"),
         (args.public, "--public"),
         (args.private, "--private"),
+        (args.keep_both, "--keep-both"),
     ] {
         if selected {
             command.push(' ');
