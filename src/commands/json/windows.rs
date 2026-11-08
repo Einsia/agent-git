@@ -383,6 +383,9 @@ impl Capture {
                         crt_handle(self.saved[index].0).unwrap_or(std::ptr::null_mut());
                     self.retained[index] = true;
                 } else if let Ok(handle) = crt_handle(index as i32 + 1) {
+                    // CRT duplication makes this copy inheritable too; what the command starts
+                    // after its capture must not hold it.
+                    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
                     restored_crt[index] = handle;
                 }
             }

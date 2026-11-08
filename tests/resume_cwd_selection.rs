@@ -325,3 +325,54 @@ fn a_changed_cwd_and_a_lossy_conversion_are_one_decision() {
     assert!(!screen.contains("proceed?"), "{screen}");
     assert!(!screen.contains("cancelled"), "{screen}");
 }
+
+/// A runtime agit launches writes to the output agit itself was given, so what agit does with its
+/// inherited handles at start-up leaves that output with the runtime. The launch goes through `sh`,
+/// so a machine without one fails here, as a launch there would.
+#[test]
+fn a_launched_runtime_writes_to_the_output_agit_inherited() {
+    const MARK: &str = "launched-runtime-output";
+    let lab = Lab::new(false);
+    let bin = lab.home.join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let runtime = bin.join("claude");
+    fs::write(&runtime, format!("#!/bin/sh\necho {MARK}\n")).unwrap();
+    // Windows finds an executable by its extension before agit hands the launch to `sh`.
+    fs::write(bin.join("claude.cmd"), format!("@echo {MARK}\r\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Only the stand-in may resolve: a directory that holds any other `claude` is left off the path,
+    // so a machine with a real one can neither launch it nor pass this test by finding it.
+    let holds_runtime = |directory: &Path| {
+        [
+            "claude",
+            "claude.exe",
+            "claude.cmd",
+            "claude.bat",
+            "claude.com",
+        ]
+        .iter()
+        .any(|name| directory.join(name).exists())
+    };
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                .filter(|directory| !holds_runtime(directory)),
+        ),
+    )
+    .unwrap();
+    let output = lab
+        .command(env!("CARGO_BIN_EXE_agit"))
+        .env("PATH", path)
+        .args(["resume", TARGET, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(MARK),
+        "{output:?}"
+    );
+}
