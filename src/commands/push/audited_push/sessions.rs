@@ -522,6 +522,7 @@ pub(super) fn run(
                 }
             })?;
         }
+        // `--keep-both` registers nothing: resolving only tells whether the branch diverged.
         let mut selected = SessionPublicationPlan::resolve(
             &repo,
             &part_branches,
@@ -529,11 +530,21 @@ pub(super) fn run(
             &repository,
             identity.clone(),
             remote.clone(),
-            !args.dry_run,
+            !args.dry_run && !args.keep_both,
             intent.explicit_hub,
             pins,
         )
         .map_err(unsent)?;
+        // A branch that hasn't diverged has nothing to keep beside it, and nothing is sent.
+        if args.keep_both {
+            return Err(crate::commands::push::NotDiverged {
+                target: format!(
+                    "{repository}@{}",
+                    part_branches.last().map_or("", String::as_str)
+                ),
+            }
+            .into());
+        }
         selected.asking_again = asked_again.iter().cloned().collect();
         resolving.finish();
         // A real push tells of a switch only once the Hub has taken it, just before the upload.

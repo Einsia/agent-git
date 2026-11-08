@@ -500,6 +500,11 @@ agit push alice/payments@ratelimit --dry-run # inspect an already registered des
 - **Visibility is decided at the first push only.** On a TTY it asks; non-interactive defaults to
   private. Change it afterwards with `agit repo visibility alice/payments public`; `agit push`
   never touches it.
+- **A branch that moved on the Hub while you settled your own turn is refused as diverged.** To keep
+  both, `agit push alice/payments@ratelimit --keep-both` publishes your line as `ratelimit-local`
+  (or the next free name) beside the Hub's, which stays as it is. At a terminal the refused push
+  asks the same question, default no; `--yes` doesn't answer it. The refusal also names the merge
+  that brings the Hub's line in instead.
 - **Publishing is selective.** By default only the current session branch is pushed, `-b` can be
   repeated, and `--all` selects all local branches. Accepted ancestors retain their commit identities;
   newly introduced encrypted snapshots publish a sanitized projection and an authenticated original.

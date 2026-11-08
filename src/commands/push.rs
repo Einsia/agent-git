@@ -31,7 +31,7 @@ use crate::{ExitCode, ui};
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Clone)]
 pub struct Args {
     /// Target: `owner/repo@branch` (or legacy bare repo / `-b branch`). Omittable when the context resolves.
     ///
@@ -101,6 +101,126 @@ pub struct Args {
     /// Expand readable snapshot content after the summary; binary payloads are summarized.
     #[arg(long)]
     pub show_preview: bool,
+
+    /// When the branch has diverged from the Hub's copy, publish this checkout's line as a new
+    /// branch beside it (`<branch>-local`, or the next free name) and leave the Hub's as it is.
+    #[arg(long, conflicts_with_all = ["all", "dry_run", "to", "to_hub", "audit"])]
+    pub keep_both: bool,
+}
+
+/// `--keep-both` on a branch the Hub's copy hasn't moved away from: there is nothing to keep
+/// beside it, and nothing was sent.
+#[derive(Debug)]
+pub(crate) struct NotDiverged {
+    pub(crate) target: String,
+}
+
+impl std::fmt::Display for NotDiverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        let branch = self.target.split_once('@').map_or("", |(_, branch)| branch);
+        write!(
+            f,
+            "{branch} hasn't diverged from the Hub, so there is nothing to keep beside it; `agit push {}` pushes it",
+            quote_arg(&self.target)
+        )
+    }
+}
+
+impl std::error::Error for NotDiverged {}
+
+/// Whether a push refused as diverged may go on to keep both: one branch of this checkout published
+/// to its own repository, by a person or with `--keep-both`. A preview publishes nothing, so it
+/// never forks, and a push to another repository or Hub would find "this checkout's line" under
+/// the destination's name, which is another checkout's.
+fn offers_keep_both(args: &Args, automatic: bool) -> bool {
+    !automatic
+        && !args.all
+        && args.branch.len() <= 1
+        && !args.dry_run
+        && !args.audit
+        && args.to.is_none()
+        && args.to_hub.is_none()
+}
+
+/// A push refused as diverged, kept both ways: with `--keep-both`, or when the person at the
+/// terminal says yes. This checkout's line is forked as the branch the refusal named and that
+/// branch is pushed; the Hub's branch stays as it is. `-y` and `AGIT_YES` never answer the
+/// question: publishing a branch nobody named takes the flag or a typed yes.
+fn keep_both(
+    args: Args,
+    refusal: &anyhow::Error,
+    diverged: &crate::domain::privacy_git::sessions::Diverged,
+) -> CmdResult {
+    let repository = &diverged.repository;
+    let kept = format!("{repository}@{}", diverged.keep_both);
+    let client = crate::hub::Client::from_env_with_timeout(std::time::Duration::from_secs(20));
+    let readers =
+        readers_of(&client, repository).unwrap_or_else(|| "visibility not confirmed".to_owned());
+    if !args.keep_both {
+        super::fix::register_terminal_error(refusal);
+        ui::error(&super::terminal_error_message(refusal));
+        let code = super::terminal_error_code(refusal, ExitCode::Failure);
+        if std::env::var_os("AGIT_YES").is_some() || !ui::prompt::may_prompt() {
+            return Ok(code);
+        }
+        let asked = ui::prompt::confirm(
+            &format!(
+                "Publish this checkout's line as {kept} ({readers}), and leave {} as the Hub has it?",
+                diverged.branch
+            ),
+            false,
+        )?;
+        if asked != Some(true) {
+            return Ok(code);
+        }
+    }
+    let base = match super::fork::resolve_base(
+        &format!("{repository}@{}", diverged.branch),
+        &std::env::current_dir()?,
+    )? {
+        Some(base) => base,
+        None => return Ok(ExitCode::Ref),
+    };
+    if super::fork::fork_branch(
+        &base,
+        &format!("{repository}@{}", diverged.branch),
+        &diverged.keep_both,
+    )?
+    .is_none()
+    {
+        return Ok(ExitCode::Precondition);
+    }
+    let pushed = publish(Args {
+        agent: Some(kept.clone()),
+        branch: Vec::new(),
+        keep_both: false,
+        ..args
+    })?;
+    if pushed == ExitCode::Ok {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
+        println!(
+            "published this checkout's line as {kept} ({readers}); {} stays as the Hub has it. To continue from your line: `agit resume {}`",
+            diverged.branch,
+            quote_arg(&kept)
+        );
+    }
+    Ok(pushed)
+}
+
+/// Who can read `repository`, as the Hub says it now; `None` when it doesn't answer.
+fn readers_of(client: &crate::hub::Client, repository: &str) -> Option<String> {
+    let (owner, name) = repository.split_once('/')?;
+    let remote = client.get_agent(owner, name).ok()?;
+    let account = client.credential_username().unwrap_or_default();
+    let (org, members_read) = super::project::owner_audience(client, owner, &account);
+    super::project::readers(repository, Some(&remote.visibility), org, members_read)
 }
 
 /// Publication rejects inherited Git routing before storage preparation or native review.
@@ -133,7 +253,32 @@ pub fn run_automatic(args: Args) -> CmdResult {
 pub fn run(args: Args) -> CmdResult {
     use crate::domain::privacy::{pending, service};
     let target = args.agent.clone().filter(|target| target.contains('@'));
+    if args.keep_both && args.branch.len() > 1 {
+        ui::error("--keep-both keeps one branch beside the Hub's; name one");
+        return Ok(ExitCode::Usage);
+    }
+    let again = args.clone();
     let result = publish(args);
+    if let Err(error) = &result
+        && let Some(diverged) = error.chain().find_map(|cause| {
+            cause.downcast_ref::<crate::domain::privacy_git::sessions::Diverged>()
+        })
+        && offers_keep_both(&again, super::auto_push::is_automatic())
+    {
+        return keep_both(again, error, diverged);
+    }
+    if let Err(error) = &result
+        && let Some(not) = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<NotDiverged>())
+    {
+        // Named as the person named it: the publication may carry the file line along with it.
+        let named = NotDiverged {
+            target: target.clone().unwrap_or_else(|| not.target.clone()),
+        };
+        ui::error(&named.to_string());
+        return Ok(ExitCode::Precondition);
+    }
     let (Some(target), Err(error)) = (target, &result) else {
         return result;
     };
@@ -598,6 +743,8 @@ fn acknowledged_unchanged(
         || args.dry_run
         || args.audit
         || args.show_preview
+        // Whether the branch diverged is the Hub's answer, never a receipt's.
+        || args.keep_both
         || args.to.is_some()
         || args.to_hub.is_some()
         || std::env::var_os(crate::domain::privacy_receipt::SUPERVISOR_RESULT_ENV).is_some()
@@ -1737,6 +1884,78 @@ mod tests {
         assert!(!first_visibility(Some(false), Some(true)));
     }
 
+    /// Keeping both forks this checkout's line and publishes it, so only a push of one branch to
+    /// its own repository offers it. A preview that offered it would fork during a dry run and
+    /// then call the preview published; a push to another repository or Hub would fork that
+    /// destination's checkout instead of this one.
+    #[test]
+    fn only_a_push_of_one_branch_to_its_own_repository_offers_to_keep_both() {
+        let push = || Args {
+            to: None,
+            to_hub: None,
+            agent: Some("alice/app@work".into()),
+            branch: vec![],
+            all: false,
+            keep_going: false,
+            verify: false,
+            private: false,
+            public: false,
+            allow_secrets: false,
+            audit: false,
+            dry_run: false,
+            show_preview: false,
+            keep_both: false,
+        };
+        assert!(super::offers_keep_both(&push(), false));
+        assert!(!super::offers_keep_both(&push(), true), "automatic");
+        for (what, args) in [
+            (
+                "dry run",
+                Args {
+                    dry_run: true,
+                    ..push()
+                },
+            ),
+            (
+                "audit",
+                Args {
+                    audit: true,
+                    ..push()
+                },
+            ),
+            (
+                "another repository",
+                Args {
+                    to: Some("alice/dest".into()),
+                    ..push()
+                },
+            ),
+            (
+                "another Hub",
+                Args {
+                    to_hub: Some("https://hub.example".into()),
+                    ..push()
+                },
+            ),
+            (
+                "every branch",
+                Args {
+                    all: true,
+                    ..push()
+                },
+            ),
+            (
+                "several branches",
+                Args {
+                    branch: vec!["a".into(), "b".into()],
+                    ..push()
+                },
+            ),
+        ] {
+            assert!(!super::offers_keep_both(&args, false), "{what}");
+        }
+    }
+
     #[test]
     fn visibility_flags_are_read_from_the_args() {
         let base = || Args {
@@ -1753,6 +1972,7 @@ mod tests {
             audit: false,
             dry_run: false,
             show_preview: false,
+            keep_both: false,
         };
         let (_d, repo) = {
             let d = tempfile::tempdir().unwrap();

@@ -55,6 +55,7 @@ agit push [owner/repo@branch] [options]
 | `-b, --branch <branch>` | Branches to publish; repeatable. Name every branch of one repository in one push rather than pushing them one at a time |
 | `--all` | Publish all settled local branches |
 | `--keep-going` | With several branches, publish each on its own when publishing them together fails |
+| `--keep-both` | When the branch has diverged from the Hub's copy, publish this checkout's line as `<branch>-local` (or the next free name) beside it; the Hub's branch stays as it is. It publishes a new branch, so run it only when the user chooses to keep both |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
 | `--to <owner/repo>` | Publish to another repository the account can write to; the checkout keeps its own repository as the default. For a device-local RC repository, selects its retained Hub destination |
 | `--allow-secrets` | Compatibility flag for servers that require secret-findings acceptance |
