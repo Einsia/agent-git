@@ -51,10 +51,24 @@ verify_archive() {
 if [[ -n "$cache_directory" && -f "$cache_directory/$checksum-$asset" ]]; then
   cp "$cache_directory/$checksum-$asset" "$temporary/$asset"
 fi
+# In CI the project's package registry holds this same pinned archive (git-runtime-archives, which
+# git-runtime:mirror fills from git-runtime-lock.json), so a job does not depend on GitHub answering.
+# The token reaches curl on stdin, never in its arguments.
+if [[ ! -f "$temporary/$asset" ]] || ! verify_archive "$temporary/$asset"; then
+  rm -f "$temporary/$asset"
+  if [[ -n "${CI_JOB_TOKEN:-}" && -n "${CI_API_V4_URL:-}" && -n "${CI_PROJECT_ID:-}" ]]; then
+    printf 'header = "JOB-TOKEN: %s"\n' "$CI_JOB_TOKEN" | curl --fail --silent --show-error --location \
+      --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 20 --max-time 180 --config - \
+      "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/git-runtime-archives/$checksum/$asset" \
+      -o "$temporary/$asset" || rm -f "$temporary/$asset"
+    [[ -f "$temporary/$asset" ]] && verify_archive "$temporary/$asset" && echo "Git LFS $version from the package registry"
+  fi
+fi
 if [[ ! -f "$temporary/$asset" ]] || ! verify_archive "$temporary/$asset"; then
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
     --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 \
     "https://github.com/git-lfs/git-lfs/releases/download/v$version/$asset" -o "$temporary/$asset"
+  echo "Git LFS $version from GitHub"
 fi
 if ! verify_archive "$temporary/$asset"; then
   echo 'Git LFS release checksum does not match its pinned value' >&2
