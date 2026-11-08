@@ -68,7 +68,9 @@ If the intents cannot be reconciled, use `agit merge --abort`; do not rebase or 
 In a non-interactive environment (CI, pipes, or an agent harness), a normal merge refuses before
 settling the target, materializing a merge session, or taking the branch lock. Use `--manual` to
 open the transaction and follow the printed `pick`/`summary`/`--continue` protocol, or run the
-command from a terminal.
+command from a terminal. At a terminal, before opening anything, it says the merge agent will take
+the terminal over, names the `--manual` command, and asks the person whether to start it; `-y`
+starts it without asking.
 
 The preview finds the common Git ancestor across the selected local repositories and counts
 settled turns after it. File and branch-identity commits do not add turns. Unrelated histories

@@ -520,12 +520,12 @@ pub(in crate::commands) fn same_place(a: &Path, b: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn quote_arg(value: &str) -> String {
+pub(in crate::commands) fn quote_arg(value: &str) -> String {
     crate::ui::quote_powershell_argument(value)
 }
 
 #[cfg(not(windows))]
-fn quote_arg(value: &str) -> String {
+pub(in crate::commands) fn quote_arg(value: &str) -> String {
     crate::ui::session::shell_arg(value)
 }
 

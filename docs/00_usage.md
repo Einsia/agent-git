@@ -655,6 +655,10 @@ The second opens a transaction, locks the target branch, and then **launches a m
 the reconciliation. Text conflicts are not the point; **intent conflicts** are (one side buckets by
 `user_id`, the other renames it to `uid`; both compile, and together they are wrong).
 
+The merge agent runs in your terminal and takes it over until the merge lands. Before anything is
+opened, `agit merge` says so, names the `--manual` command that merges without an agent, and asks
+whether to start it; answering no leaves nothing open. `-y` starts it without asking.
+
 The merge agent runs the whole process on its own side — picking material, reconciling shared
 files, writing the conclusion, landing it — and you only read the result. To learn where it got
 to, or to call it off:

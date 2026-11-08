@@ -351,6 +351,11 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     } else {
         None
     };
+    if let Some(launch) = &archive_launch
+        && let Some(code) = announce_merge_agent(&launch.runtime, src_ref, &slug, &target)?
+    {
+        return Ok(code);
+    }
 
     let store = crate::domain::store::Store::open_or_init()?;
     let branch_guard = crate::domain::link::lock_branch(&store, &slug, &target)?;
@@ -441,6 +446,41 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
         );
     }
     Ok(code)
+}
+
+/// Says that the runtime is about to take over this terminal, and how to merge without it, before
+/// anything is opened; a person who can answer may still decline. It runs with no lock held and
+/// no transaction open, so a declined or abandoned question leaves the branch as it was. `-y`
+/// takes the default and starts the agent.
+fn announce_merge_agent(
+    runtime: &str,
+    src_ref: &str,
+    slug: &str,
+    target: &str,
+) -> crate::Result<Option<ExitCode>> {
+    ui::info(format_args!(
+        "next: {} takes over this terminal as the merge agent, until the merge lands or you quit it",
+        ui::session::runtime_label(runtime)
+    ));
+    let quote = super::worktree::quote_arg;
+    ui::hint(&format!(
+        "to merge without an agent: `agit merge {} --into {} --manual`",
+        quote(src_ref),
+        quote(&format!("{slug}@{target}"))
+    ));
+    if std::env::var_os("AGIT_YES").is_some() || !ui::prompt::can_ask() {
+        return Ok(None);
+    }
+    let answer = ui::prompt::confirm("start the merge agent?", true)?;
+    if answer == Some(true) {
+        return Ok(None);
+    }
+    ui::info("nothing started; no merge is open.");
+    Ok(Some(if answer.is_none() {
+        ExitCode::Interactive
+    } else {
+        ExitCode::Ok
+    }))
 }
 
 fn print_merge_instruction(instruction: &str) {
