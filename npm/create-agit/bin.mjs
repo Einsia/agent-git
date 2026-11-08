@@ -17,7 +17,7 @@ import { randomUUID } from 'node:crypto'
 import { performance } from 'node:perf_hooks'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir, platform, arch } from 'node:os'
-import { join, delimiter } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { installBinary } from './install-binary.mjs'
 import { freshness } from './freshness.mjs'
@@ -169,7 +169,13 @@ async function main() {
   if (!process.env.PATH?.split(delimiter).includes(targetDir)) {
     dim(`note: ${targetDir} is not on your PATH — add it to your ${platform() === 'win32' ? 'user environment variables' : 'shell profile'}`)
   }
+  // npm and npx start this installer with each node_modules/.bin above its working folder, and the
+  // npx cache's own, ahead of the person's PATH, and the npx one always holds @einsia/agent-git's
+  // agit shim. The person's shell has none of them, so an agit found there is not one it selects;
+  // counting it tells every npx install to reorder a PATH that is already right.
+  const npmExecBin = directory => basename(directory) === '.bin' && basename(dirname(directory)) === 'node_modules'
   const selected = process.env.PATH?.split(delimiter)
+    .filter(directory => !npmExecBin(directory))
     .map(directory => join(directory, binaryName()))
     .find(candidate => existsSync(candidate))
   let shadowed = selected && selected !== target

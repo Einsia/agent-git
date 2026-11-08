@@ -22,10 +22,10 @@
 
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, chmodSync, copyFileSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, readdirSync, chmodSync, copyFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative } from 'node:path'
+import { delimiter, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { protectWindowsSmokeHome } from '../scripts/windows-smoke-home.mjs'
 
@@ -121,13 +121,23 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
   const acquisitionId = 'f2ec57cb-12f0-4387-bd56-7739bde158bf'
   // Setup writes for the runtimes installed here; Claude Code has run in this home.
   mkdirSync(join(home, '.claude'), { recursive: true })
+  // npx starts the installer with its cache's node_modules/.bin ahead of the person's PATH, and
+  // that folder links agit to the shim; the person's shell selects no agit there.
+  const npxBin = join(work, 'node_modules', '.bin')
+  const posix = process.platform !== 'win32'
+  if (posix) {
+    mkdirSync(npxBin, { recursive: true })
+    chmodSync(mainShim, 0o755)
+    symlinkSync(mainShim, join(npxBin, 'agit'))
+  }
   const r = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs'), '--acquisition-id', acquisitionId, '--campaign-url', 'https://example.test/?utm_source=docs&utm_campaign=launch&utm_creative_format=video&gclid=click&token=private-campaign-canary'], {
     encoding: 'utf8',
-    env: { ...env, AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic' },
+    env: { ...env, AGIT_TELEMETRY_HOST: 'http://127.0.0.1:9', AGIT_TELEMETRY_KEY: 'synthetic', ...(posix ? { PATH: `${npxBin}${delimiter}${env.PATH}` } : {}) },
     cwd: home,
   })
   const installed = join(home, '.local', 'bin', platform.binaryName())
   check(`npx wrapper installs ${platform.binaryName()} to the user bin directory`, r.status === 0 && existsSync(installed), `${r.status} ${r.stderr}`)
+  if (posix) check("the installer does not name npx's own agit as the one the shell selects", !r.stdout.includes(npxBin), r.stdout)
   if (existsSync(installed)) {
     const v = spawnSync(installed, ['--version'], { encoding: 'utf8', env })
     check('installed binary runs', v.status === 0, `${v.status} ${v.stderr}`)
@@ -151,8 +161,15 @@ const version = process.env.AGIT_NPM_SMOKE_VERSION || readFileSync(join(root, 'C
         stages.every(event => event.properties.acquisition_id === acquisitionId && event.properties.elapsed_ms >= 0) &&
         !JSON.stringify(stages).includes('private-campaign-canary'))
       writeFileSync(preferences, JSON.stringify({ preference: 'disabled', generation: saved.generation + 1 }))
-      const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env, encoding: 'utf8', cwd: home })
+      // An agit ahead of the installed one on the person's own PATH is still named.
+      const shadow = join(work, 'shadow-bin')
+      if (posix) {
+        mkdirSync(shadow, { recursive: true })
+        symlinkSync(bin, join(shadow, 'agit'))
+      }
+      const again = spawnSync('node', [join(work, 'node_modules', 'create-agit', 'bin.mjs')], { env: { ...env, ...(posix ? { PATH: `${shadow}${delimiter}${env.PATH}` } : {}) }, encoding: 'utf8', cwd: home })
       check('reinstallation with npm yes preserves an opt-out', again.status === 0 && JSON.parse(readFileSync(preferences, 'utf8')).preference === 'disabled', again.stderr)
+      if (posix) check('an agit ahead of the installed one on PATH is named', again.stdout.includes(`selects another agit at ${join(shadow, 'agit')}`), again.stdout)
     }
   }
 }
