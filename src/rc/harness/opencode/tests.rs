@@ -366,12 +366,8 @@ async fn exit_snapshots_include_rows_written_after_the_last_completed_turn() {
         let snapshot = shared.lock().unwrap().snapshot.take().unwrap();
         assert!(snapshot.finalized);
         let bytes = snapshot.bytes.unwrap();
-        let (items, _) = crate::rc::supervisor::native_records::NativeRecords::default()
-            .project_final(
-                &bytes,
-                false,
-                &crate::domain::redact::Redactor::this_machine(),
-            )
+        let items = crate::rc::supervisor::native_records::NativeRecords::default()
+            .project_final(&bytes, false)
             .unwrap();
         assert!(
             items
@@ -491,12 +487,8 @@ async fn native_exit_captures_durable_incomplete_turns() {
     driver.shutdown().await.unwrap();
     let snapshot = driver.take_snapshot().expect("final native snapshot");
     assert!(snapshot.finalized);
-    let (items, _) = crate::rc::supervisor::native_records::NativeRecords::default()
-        .project_final(
-            &snapshot.bytes.unwrap(),
-            false,
-            &crate::domain::redact::Redactor::this_machine(),
-        )
+    let items = crate::rc::supervisor::native_records::NativeRecords::default()
+        .project_final(&snapshot.bytes.unwrap(), false)
         .unwrap();
     assert!(
         items

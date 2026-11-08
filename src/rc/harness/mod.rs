@@ -1015,17 +1015,6 @@ impl AnyDriver {
         }
     }
 
-    /// Whether the runtime shows this session's approvals in its own terminal on this computer.
-    /// Only a native Claude Code session runs in one; a shared executor may serve a session that
-    /// was started remotely and has no terminal at all.
-    pub(crate) fn asks_on_this_computer(&self) -> bool {
-        #[cfg(unix)]
-        let native = matches!(self, Self::ClaudeNative(_));
-        #[cfg(not(unix))]
-        let native = false;
-        native
-    }
-
     /// Whose words the next turn start or steer writes; a runtime that can start work which
     /// outlives the turn without asking holds a turn to it.
     pub(crate) fn note_input_owner(&mut self, owner: bool) {

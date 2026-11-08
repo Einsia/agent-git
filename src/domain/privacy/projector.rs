@@ -130,8 +130,7 @@ pub(crate) struct NativeBatch {
 /// Where a stream may cut a line too long to wait for its newline: at whitespace with no
 /// assignment separator within a window on either side, so a name leaves together with the
 /// separator after it. Zero when no such point exists. A rule that needs more context than the
-/// window still sees it in the released text every stream request carries (see
-/// `StreamRedactor`).
+/// window still sees it in the released text every stream request carries as its context.
 fn long_line_cut(text: &str, boundary: usize) -> usize {
     const WINDOW: usize = 96;
     let mut end = boundary;

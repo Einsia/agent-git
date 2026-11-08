@@ -1,16 +1,16 @@
 //! Snapshot projections retain native coordinates while rows change in place.
 
-use super::{ItemCompleted, cap_raw, projected_object_hash};
+use super::{ItemCompleted, cap_raw};
 use crate::adapter::{Adapter, opencode::OpenCode};
-use crate::domain::redact::Redactor;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+/// Native rows become `item.completed` as they are: each row's `raw` is the row itself, capped
+/// for the wire, and its event text and paths are the ones the adapter read from it.
 #[derive(Default)]
 pub(crate) struct NativeRecords {
     initialized: bool,
     fingerprints: HashMap<String, String>,
-    protection_failures: HashSet<String>,
 }
 
 impl NativeRecords {
@@ -18,38 +18,34 @@ impl NativeRecords {
         &mut self,
         bytes: &[u8],
         resuming: bool,
-        redactor: &Redactor,
-    ) -> crate::Result<(Vec<ItemCompleted>, Vec<String>)> {
-        self.project_window(bytes, resuming, redactor, 0)
+    ) -> crate::Result<Vec<ItemCompleted>> {
+        self.project_window(bytes, resuming, 0)
     }
 
     pub(crate) fn project_window(
         &mut self,
         bytes: &[u8],
         resuming: bool,
-        redactor: &Redactor,
         from_line: u64,
-    ) -> crate::Result<(Vec<ItemCompleted>, Vec<String>)> {
-        self.project_snapshot(bytes, resuming, redactor, from_line, false)
+    ) -> crate::Result<Vec<ItemCompleted>> {
+        self.project_snapshot(bytes, resuming, from_line, false)
     }
 
     pub(crate) fn project_final(
         &mut self,
         bytes: &[u8],
         resuming: bool,
-        redactor: &Redactor,
-    ) -> crate::Result<(Vec<ItemCompleted>, Vec<String>)> {
-        self.project_snapshot(bytes, resuming, redactor, 0, true)
+    ) -> crate::Result<Vec<ItemCompleted>> {
+        self.project_snapshot(bytes, resuming, 0, true)
     }
 
     fn project_snapshot(
         &mut self,
         bytes: &[u8],
         resuming: bool,
-        redactor: &Redactor,
         from_line: u64,
         finalized: bool,
-    ) -> crate::Result<(Vec<ItemCompleted>, Vec<String>)> {
+    ) -> crate::Result<Vec<ItemCompleted>> {
         let text = std::str::from_utf8(bytes)?;
         let parsed = OpenCode.parse(text)?;
         let lines = text
@@ -76,9 +72,7 @@ impl NativeRecords {
         let mut current = HashMap::new();
         let mut indices = HashMap::<usize, usize>::new();
         let mut items = Vec::new();
-        let mut registered = HashSet::new();
-        let mut protection_error_emitted = false;
-        for mut event in parsed.events {
+        for event in parsed.events {
             let Some(line) = event.line else {
                 continue;
             };
@@ -114,52 +108,13 @@ impl NativeRecords {
             content.line = None;
             let fingerprint =
                 crate::domain::transcript::object_hash(&serde_json::json!([raw, content]));
-            let unchanged = self.fingerprints.get(&item_id) == Some(&fingerprint)
-                && !self.protection_failures.contains(&item_id);
+            let unchanged = self.fingerprints.get(&item_id) == Some(&fingerprint);
             current.insert(item_id.clone(), fingerprint);
             if unchanged || (!self.initialized && resuming) || (line as u64) < from_line {
                 continue;
             }
-            let scrubbed = redactor.scrub_json(raw);
-            let protection_error = scrubbed.value.get("protection_error").is_some();
-            if protection_error {
-                self.protection_failures.insert(item_id.clone());
-                if protection_error_emitted {
-                    continue;
-                }
-                protection_error_emitted = true;
-            } else {
-                self.protection_failures.remove(&item_id);
-            }
-            let hash = projected_object_hash(
-                raw,
-                &scrubbed.value,
-                scrubbed.secrets > 0 || protection_error,
-            );
-            registered.extend(scrubbed.registered_ids);
-            let (raw, raw_truncated) = if protection_error {
-                // The internal failure marker is a control-plane detail; never put it in the
-                // transcript payload that viewers can inspect.
-                (Value::Null, false)
-            } else {
-                cap_raw(scrubbed.value)
-            };
-            if protection_error {
-                event.text = Some(crate::domain::redact::PROTECTION_ERROR_TEXT.into());
-            } else if let Some(text) = event.text.take() {
-                let scrubbed = redactor.scrub(&text);
-                registered.extend(scrubbed.registered_ids);
-                event.text = Some(scrubbed.text);
-            }
-            event.paths = event
-                .paths
-                .iter()
-                .map(|path| {
-                    let scrubbed = redactor.scrub(path);
-                    registered.extend(scrubbed.registered_ids);
-                    scrubbed.text
-                })
-                .collect();
+            let hash = crate::domain::transcript::object_hash(raw);
+            let (raw, raw_truncated) = cap_raw(raw.clone());
             items.push(ItemCompleted {
                 source_id: Some(source_id),
                 item_id,
@@ -170,14 +125,11 @@ impl NativeRecords {
                 object_hash: hash,
                 raw,
                 raw_truncated,
-                privacy_pending: None,
             });
         }
         self.initialized = true;
         self.fingerprints = current;
-        self.protection_failures
-            .retain(|item_id| self.fingerprints.contains_key(item_id));
-        Ok((items, registered.into_iter().collect()))
+        Ok(items)
     }
 }
 
@@ -235,21 +187,11 @@ mod tests {
     #[test]
     fn snapshots_keep_host_roles_native_hashes_and_replaced_row_identities() {
         let mut records = NativeRecords::default();
-        let redactor = Redactor::new(crate::domain::redact::Persona {
-            username: None,
-            home: Some("/private-person".into()),
-            hostname: None,
-        });
-        let bytes = transcript("/private-person/answer");
-        let (items, _) = records.project(&bytes, false, &redactor).unwrap();
+        let bytes = transcript("answer");
+        let items = records.project(&bytes, false).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].event.kind, EventKind::UserPrompt);
         assert_eq!(items[1].event.kind, EventKind::AssistantReply);
-        assert!(
-            !serde_json::to_string(&items)
-                .unwrap()
-                .contains("/private-person")
-        );
         let raw: Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().nth(3).unwrap())
                 .unwrap();
@@ -257,17 +199,10 @@ mod tests {
             items[1].object_hash,
             crate::domain::transcript::object_hash(&raw)
         );
-        assert!(
-            records
-                .project(&bytes, false, &redactor)
-                .unwrap()
-                .0
-                .is_empty()
-        );
+        assert!(records.project(&bytes, false).unwrap().is_empty());
         let changed = records
-            .project(&transcript("replaced answer"), false, &redactor)
-            .unwrap()
-            .0;
+            .project(&transcript("replaced answer"), false)
+            .unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].item_id, items[1].item_id);
         assert_eq!(changed[0].event.text.as_deref(), Some("replaced answer"));
@@ -276,25 +211,19 @@ mod tests {
     #[test]
     fn resumed_snapshots_seed_history_without_hiding_new_content() {
         let mut records = NativeRecords::default();
-        let redactor = Redactor::this_machine();
         assert!(
             records
-                .project(&transcript("old answer"), true, &redactor)
+                .project(&transcript("old answer"), true)
                 .unwrap()
-                .0
                 .is_empty()
         );
-        let items = records
-            .project(&transcript("new answer"), true, &redactor)
-            .unwrap()
-            .0;
+        let items = records.project(&transcript("new answer"), true).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].event.text.as_deref(), Some("new answer"));
     }
 
     #[test]
     fn watch_windows_retain_host_context_and_wait_for_terminal_assistant_rows() {
-        let redactor = Redactor::this_machine();
         let mut records = NativeRecords::default();
         let bytes = transcript("answer");
         let mut rows = std::str::from_utf8(&bytes)
@@ -309,15 +238,11 @@ mod tests {
             .collect::<String>();
         assert!(
             records
-                .project_window(partial.as_bytes(), false, &redactor, 3)
+                .project_window(partial.as_bytes(), false, 3)
                 .unwrap()
-                .0
                 .is_empty()
         );
-        let items = records
-            .project_window(&bytes, false, &redactor, 3)
-            .unwrap()
-            .0;
+        let items = records.project_window(&bytes, false, 3).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].event.kind, EventKind::AssistantReply);
         assert_eq!(items[0].line, 3);

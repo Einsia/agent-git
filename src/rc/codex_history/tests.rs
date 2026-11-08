@@ -1,6 +1,5 @@
 use super::*;
 use crate::adapter::EventKind;
-use crate::domain::redact::{Persona, Redactor};
 use crate::rc::tail::{TailedLine, Tailer};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -206,12 +205,8 @@ fn replacement_before_first_poll_cannot_use_the_prepared_sources_mode() {
     .unwrap();
     let batch = tailer.poll_codex().unwrap();
     assert_eq!(batch.mode, HistoryMode::Paginated);
-    let (items, _) = crate::rc::supervisor::items_from_lines_with_mode(
-        "codex",
-        &Redactor::new(Persona::default()),
-        &batch.lines,
-        batch.mode,
-    );
+    let items =
+        crate::rc::supervisor::items_from_lines_with_mode("codex", &batch.lines, batch.mode);
     assert_eq!(items.len(), 1);
     assert_eq!(
         items[0].native_prompt_id.as_deref(),
@@ -271,9 +266,8 @@ fn correlation_survives_raw_capping() {
             lineno: 41,
             text: raw.to_string(),
         };
-        let (items, _) = crate::rc::supervisor::items_from_lines_with_mode(
+        let items = crate::rc::supervisor::items_from_lines_with_mode(
             "codex",
-            &Redactor::new(Persona::default()),
             std::slice::from_ref(&line),
             mode,
         );

@@ -153,23 +153,6 @@ fn read_with_roster(
     Ok(result)
 }
 
-pub(super) fn source_redactor(
-    runtime: &str,
-    native: &str,
-    cwd: &std::path::Path,
-    context: Option<super::runtime_context::RuntimeContext>,
-    entry: Option<&super::roster::Entry>,
-) -> crate::Result<crate::domain::redact::Redactor> {
-    Target {
-        runtime,
-        native,
-        cwd: cwd.to_str().context("Native directory is not UTF-8")?,
-        context,
-        entry,
-    }
-    .redactor()
-}
-
 struct Target<'a> {
     runtime: &'a str,
     native: &'a str,
@@ -204,12 +187,6 @@ impl Target<'_> {
             crate::adapter::native_snapshot::Limits::default(),
         )
     }
-
-    /// History pages are the owner's own conversation, shown to them or to colleagues in their
-    /// workspace, so they go as they are: the device-control redactor runs no privacy check.
-    fn redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
-        Ok(crate::domain::redact::Redactor::try_this_machine()?.for_device_control())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,9 +199,6 @@ pub(crate) enum Failure {
     Unsupported,
     #[error("History reader is busy; retry shortly")]
     Busy,
-    /// A record on the page has not passed its privacy check yet, for this reason.
-    #[error("History page is waiting for its privacy check ({0}); retry shortly")]
-    Withheld(&'static str),
     #[error("History snapshot expired; reload history")]
     Expired,
     #[error("Invalid history cursor; reload history")]
@@ -248,24 +222,11 @@ pub(crate) enum Failure {
 pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     use crate::protocol::{ErrorCode, RpcError};
     let mut reason = None;
-    let mut privacy = None;
     let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
         Some(Failure::Missing) => ("source_missing", false, true),
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
         Some(Failure::Unsupported) => ("unsupported", false, false),
         Some(Failure::Busy) => ("busy", true, false),
-        Some(Failure::Withheld("unsupported_scalar")) => {
-            ("privacy_value_unsupported", false, false)
-        }
-        Some(Failure::Withheld("device_rules" | "legacy_rules")) => {
-            ("privacy_rules_unavailable", false, false)
-        }
-        Some(Failure::Withheld(withheld)) => {
-            reason = Some("privacy_check_pending");
-            privacy = Some(*withheld)
-                .filter(|withheld| crate::domain::privacy::service::worker_state(withheld));
-            ("busy", true, false)
-        }
         Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
         Some(Failure::Limit) => ("resource_limit", false, false),
         // The snapshot no longer holds the history it pinned; only a fresh read helps.
@@ -309,9 +270,7 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
             _ => ("read_failed", true, false),
         },
     };
-    // Native paths and parser excerpts are not part of the remote error contract, and neither is
-    // why the privacy check refused: that is about the record or the person's rules, and every
-    // viewer of the workspace reads this. Only the worker's own state goes as `privacy_reason`.
+    // Native paths and parser excerpts are not part of the remote error contract.
     let mut result = RpcError::new(
         ErrorCode::RuntimeUnavailable,
         format!("History read failed ({kind})"),
@@ -319,9 +278,6 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
     if let Some(reason) = reason {
         data["reason"] = json!(reason);
-    }
-    if let Some(privacy) = privacy {
-        data["privacy_reason"] = json!(privacy);
     }
     result.data = Some(data);
     result
@@ -958,10 +914,7 @@ mod tests {
     /// Clients act on `retryable` and `restart` alone: a transient condition must be retried
     /// silently and a permanent one shown. A policy refusal reported as retryable keeps a client
     /// retrying forever, and a refreshing catalog reported as missing shows a conversation as
-    /// gone. Every viewer of the workspace reads these errors, so a privacy refusal names its kind
-    /// and, while the check is pending, only the worker's own state: an error that named a
-    /// refusal drawn from the record or the person's rules would tell viewers what a record holds
-    /// or whose rules apply.
+    /// gone.
     #[test]
     fn history_errors_tell_transient_from_permanent_conditions() {
         let flags = |error: anyhow::Error| {
@@ -990,21 +943,6 @@ mod tests {
             flags(Failure::Missing.into()),
             ("source_missing".to_owned(), false, true, None)
         );
-        for (withheld, kind, reason) in [
-            ("unsupported_scalar", "privacy_value_unsupported", None),
-            ("device_rules", "privacy_rules_unavailable", None),
-            ("legacy_rules", "privacy_rules_unavailable", None),
-            ("findings_cap", "busy", None),
-            ("source_incomplete", "busy", None),
-            ("store_busy", "busy", Some("store_busy")),
-            ("spawn_failed", "busy", Some("spawn_failed")),
-        ] {
-            let response = rpc_error(Failure::Withheld(withheld).into());
-            let data = response.data.unwrap();
-            assert_eq!(data["kind"], kind, "{withheld}");
-            assert_eq!(data["privacy_reason"].as_str(), reason, "{withheld}");
-            assert_eq!(response.message, format!("History read failed ({kind})"));
-        }
     }
 
     #[test]
@@ -1052,11 +990,7 @@ mod tests {
         assert_eq!(earlier.len(), original.len());
         select_view(&mut earlier, "claude-code", &json!({"view":"conversation"}));
         assert_eq!(earlier.len(), original.len());
-        let redactor =
-            crate::domain::redact::Redactor::new(crate::domain::redact::Persona::default());
-        let (full, _) = super::super::supervisor::items_from_lines_with_mode(
-            "codex", &redactor, &earlier, mode,
-        );
+        let full = super::super::supervisor::items_from_lines_with_mode("codex", &earlier, mode);
         let context = select_view(&mut earlier, "codex", &json!({"view":"conversation"}));
         assert_eq!(
             earlier
@@ -1065,9 +999,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             visible
         );
-        let (projected, _) = super::super::supervisor::items_from_lines_with_mode(
-            "codex", &redactor, &earlier, mode,
-        );
+        let projected =
+            super::super::supervisor::items_from_lines_with_mode("codex", &earlier, mode);
         assert!(!projected.is_empty());
         for mut item in projected {
             let expected = full
@@ -1178,7 +1111,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.starts_with("Existing native history "))
         }));
-        assert!(!history.to_string().contains("protection_error"));
         roster.save().unwrap();
         drop(roster);
         let restarted = super::super::roster::Roster::try_load().unwrap();
@@ -1371,16 +1303,13 @@ mod tests {
                     .collect::<String>(),
             )
             .unwrap();
-            let redactor =
-                crate::domain::redact::Redactor::new(crate::domain::redact::Persona::default());
             let mut cursor = None;
             let mut prompts = vec![];
             loop {
                 let (lines, before, mode) = page(&path, cursor).unwrap();
                 assert_eq!(mode, expected_mode);
-                let (items, _) = super::super::supervisor::items_from_lines_with_mode(
-                    "codex", &redactor, &lines, mode,
-                );
+                let items =
+                    super::super::supervisor::items_from_lines_with_mode("codex", &lines, mode);
                 let mut earlier = items
                     .into_iter()
                     .filter(|item| item.event.kind == EventKind::UserPrompt)

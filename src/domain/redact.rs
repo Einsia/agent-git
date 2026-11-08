@@ -50,11 +50,6 @@ use zeroize::Zeroizing;
 /// What a reader sees in place of text whose privacy check did not complete.
 pub const WITHHELD: &str = "[privacy check pending: text withheld]";
 
-/// How much undelivered stream text waits for the privacy worker to return before it is
-/// dropped; a live item that outlasts the worker's absence shows [`WITHHELD`] once instead.
-#[cfg(feature = "cli")]
-const STREAM_HOLD_BYTES: usize = 1024 * 1024;
-
 /// What one redaction pass produced.
 #[derive(Debug, Clone)]
 pub struct Report {
@@ -86,9 +81,7 @@ pub struct JsonReport {
 #[cfg(feature = "cli")]
 impl JsonReport {
     /// A value whose privacy check did not complete: `{"protection_error": …}` in place of the
-    /// value, never the value itself. Remote-control consumers that recognize the key show
-    /// [`PROTECTION_ERROR_TEXT`] and drop the raw record; any other consumer receives only the
-    /// marker.
+    /// value, never the value itself.
     fn withheld() -> Self {
         Self {
             value: serde_json::json!({ "protection_error": PROTECTION_ERROR_TEXT }),
@@ -100,71 +93,15 @@ impl JsonReport {
     }
 }
 
-#[cfg(feature = "rc")]
-pub(crate) struct NativeJson {
-    pub value: serde_json::Value,
-    pub secret_projection: bool,
-    pub registered_ids: Vec<String>,
-    /// Whether a withheld record can never pass, so retrying it is pointless.
-    pub permanent: bool,
-    /// Whether the privacy check ran on this withheld record and failed, with a deadline or a
-    /// protocol error, rather than not running for contention or a back-off. Only such failures
-    /// count toward giving a record up.
-    pub failed: bool,
-    /// Why this withheld record's check did not complete, when the worker said.
-    pub reason: Option<crate::domain::privacy::projector::Reason>,
-}
-
-#[cfg(feature = "rc")]
-impl NativeJson {
-    /// A record whose privacy check did not complete: the failure marker, never the record.
-    fn withheld() -> Self {
-        Self {
-            value: serde_json::json!({ "protection_error": PROTECTION_ERROR_TEXT }),
-            secret_projection: true,
-            registered_ids: Vec::new(),
-            permanent: false,
-            failed: false,
-            reason: None,
-        }
-    }
-
-    /// A record too large for one protection unit: withheld, and never worth retrying.
-    fn withheld_permanently() -> Self {
-        Self {
-            value: serde_json::json!({ "protection_error": TOO_LARGE_TEXT }),
-            permanent: true,
-            ..Self::withheld()
-        }
-    }
-}
-
-#[cfg(feature = "rc")]
-pub(crate) const PROTECTION_ERROR_TEXT: &str = "[privacy check pending: content withheld]";
-
-/// What a reader sees in place of a record too large for the privacy check ever to pass.
-#[cfg(feature = "rc")]
-pub(crate) const TOO_LARGE_TEXT: &str = "[content withheld: too large for the privacy check]";
-
-/// What a reader sees in place of a record whose privacy check was given up on: it is not
-/// retried, unlike [`PROTECTION_ERROR_TEXT`].
-#[cfg(feature = "rc")]
-pub(crate) const GIVEN_UP_TEXT: &str = "[content withheld: its privacy check did not finish]";
+/// What `{"protection_error": …}` says in place of a value whose privacy check did not complete.
+#[cfg(feature = "cli")]
+const PROTECTION_ERROR_TEXT: &str = "[privacy check pending: content withheld]";
 
 #[cfg(all(test, feature = "rc"))]
 thread_local! {
-    /// Makes the native records on this thread whose JSON contains this text transiently
-    /// withheld (every record for `""`), so tests can exercise the paths that hold and retry such
-    /// records; unit tests cannot host the privacy worker.
-    pub(crate) static WITHHOLD_NATIVE: std::cell::Cell<Option<&'static str>> =
-        const { std::cell::Cell::new(None) };
-    /// The reason the records [`WITHHOLD_NATIVE`] withholds report: a protocol error unless this
-    /// names another, such as the lock contention that only delays a record.
-    pub(crate) static WITHHOLD_NATIVE_REASON: std::cell::Cell<
-        Option<crate::domain::privacy::projector::Reason>,
-    > = const { std::cell::Cell::new(None) };
     /// Makes the text and JSON checks on this thread whose input contains this text come back
-    /// incomplete for this reason, as they do while the privacy worker is busy or backing off.
+    /// incomplete for this reason, as they do while the privacy worker is busy or backing off;
+    /// unit tests cannot host the privacy worker.
     pub(crate) static WITHHOLD_LIVE: std::cell::Cell<
         Option<(&'static str, crate::domain::privacy::projector::Reason)>,
     > = const { std::cell::Cell::new(None) };
@@ -277,8 +214,6 @@ pub struct Redactor {
     persona: Persona,
     repo: Option<std::path::PathBuf>,
     preserve_device_identity: bool,
-    #[cfg(feature = "rc")]
-    native: std::sync::Arc<std::sync::Mutex<(String, String)>>,
 }
 
 /// The name appearing in `/home/<name>` / `/Users/<name>`. The reserved macOS shared
@@ -387,8 +322,6 @@ impl Redactor {
             persona,
             repo: None,
             preserve_device_identity: false,
-            #[cfg(feature = "rc")]
-            native: Default::default(),
         }
     }
 
@@ -437,12 +370,6 @@ impl Redactor {
         self
     }
 
-    #[cfg(feature = "rc")]
-    pub(crate) fn bind_native_session(&self, session: &str) {
-        if let Ok(mut native) = self.native.try_lock() {
-            native.1 = session.into();
-        }
-    }
     #[cfg(feature = "secret-vault")]
     pub(crate) fn publication_values_in(
         &self,
@@ -476,191 +403,12 @@ impl Redactor {
         }
     }
 
-    #[cfg(feature = "rc")]
-    pub(crate) fn scrub_native_batch_profiled(
-        &self,
-        records: &[(&serde_json::Value, &[&str])],
-        timing: &mut dyn FnMut(&'static str, f64),
-    ) -> Vec<NativeJson> {
-        if self.preserve_device_identity {
-            return records
-                .iter()
-                .map(|(value, _)| NativeJson {
-                    value: (*value).clone(),
-                    secret_projection: false,
-                    registered_ids: Vec::new(),
-                    permanent: false,
-                    failed: false,
-                    reason: None,
-                })
-                .collect();
-        }
-        let started = std::time::Instant::now();
-        let native = self
-            .native
-            .try_lock()
-            .map(|native| native.clone())
-            .unwrap_or_default();
-        // A request is the batch serialized whole and stays within one protection unit: the
-        // batch without records, each record with its pointers, and two separators for every
-        // entry after the first. A record that does not fit alone can never pass, so it is
-        // withheld for good, while the others are protected in groups that fit.
-        let base = serde_json::to_string(&crate::domain::privacy::projector::NativeBatch {
-            runtime: native.0.clone(),
-            session: native.1.clone(),
-            records: Vec::new(),
-            pointers: Vec::new(),
-        })
-        .map_or(usize::MAX, |text| text.len());
-        let limit = crate::domain::privacy::projector::MAX_UNIT_BYTES;
-        let mut out: Vec<Option<NativeJson>> = records.iter().map(|_| None).collect();
-        let mut group = Vec::new();
-        let mut group_bytes = base;
-        for (index, (value, pointers)) in records.iter().enumerate() {
-            let bytes = [
-                serde_json::to_string(value).map(|text| text.len()),
-                serde_json::to_string(pointers).map(|text| text.len()),
-            ]
-            .into_iter()
-            .try_fold(0usize, |sum, part| {
-                part.map(|part| sum.saturating_add(part))
-            })
-            .unwrap_or(usize::MAX);
-            if base.saturating_add(bytes) > limit {
-                out[index] = Some(NativeJson::withheld_permanently());
-                continue;
-            }
-            if !group.is_empty() && group_bytes.saturating_add(bytes + 2) > limit {
-                self.protect_native_group(&native, records, &std::mem::take(&mut group), &mut out);
-                group_bytes = base;
-            }
-            group_bytes += if group.is_empty() { bytes } else { bytes + 2 };
-            group.push(index);
-        }
-        self.protect_native_group(&native, records, &group, &mut out);
-        timing(
-            "dictionary_protect_ms",
-            started.elapsed().as_secs_f64() * 1000.0,
-        );
-        out.into_iter()
-            .map(|record| record.unwrap_or_else(NativeJson::withheld))
-            .collect()
-    }
-
-    /// Protect `records[group]` in one request and store each result at its index in `out`.
-    #[cfg(feature = "rc")]
-    fn protect_native_group(
-        &self,
-        native: &(String, String),
-        records: &[(&serde_json::Value, &[&str])],
-        group: &[usize],
-        out: &mut [Option<NativeJson>],
-    ) {
-        if group.is_empty() {
-            return;
-        }
-        let batch = crate::domain::privacy::projector::NativeBatch {
-            runtime: native.0.clone(),
-            session: native.1.clone(),
-            records: group.iter().map(|&i| records[i].0.clone()).collect(),
-            pointers: group
-                .iter()
-                .map(|&i| records[i].1.iter().map(|p| (*p).to_owned()).collect())
-                .collect(),
-        };
-        let projected = serde_json::to_string(&batch).ok().map(|input| {
-            crate::domain::privacy::service::transform_live(
-                self.repo.as_deref(),
-                &input,
-                crate::domain::privacy::projector::Mode::ProtectNative,
-            )
-        });
-        #[cfg(test)]
-        let projected = projected.filter(|_| {
-            !WITHHOLD_NATIVE
-                .with(std::cell::Cell::get)
-                .is_some_and(|text| {
-                    batch
-                        .records
-                        .iter()
-                        .any(|record| record.to_string().contains(text))
-                })
-        });
-        // A batch that cannot be put into a request is as malformed as a reply that cannot be read.
-        let reason = projected.as_ref().map_or(
-            Some(crate::domain::privacy::projector::Reason::ProtocolError),
-            |outcome| outcome.reason,
-        );
-        #[cfg(test)]
-        let reason = match WITHHOLD_NATIVE_REASON.with(std::cell::Cell::get) {
-            Some(withheld) if projected.is_none() => Some(withheld),
-            _ => reason,
-        };
-        // Only a check that ran and ended with a deadline or a protocol error is this group's
-        // failure; contention, a back-off or a busy dictionary only delays it.
-        let failed = matches!(
-            reason,
-            Some(
-                crate::domain::privacy::projector::Reason::Deadline
-                    | crate::domain::privacy::projector::Reason::ProtocolError
-            )
-        );
-        let values = projected
-            .filter(crate::domain::privacy::service::passed)
-            .and_then(|outcome| {
-                if outcome.status == crate::domain::privacy::projector::Status::Skipped {
-                    // Only a unit-test binary passes an unprocessed outcome: its worker cannot
-                    // run, and the content is the batch itself.
-                    return Some(batch.records.clone());
-                }
-                serde_json::from_str::<Vec<serde_json::Value>>(&outcome.content).ok()
-            })
-            .filter(|values| values.len() == group.len());
-        let Some(values) = values else {
-            // One record must not keep the others from passing: each is tried on its own.
-            if group.len() > 1 {
-                for &index in group {
-                    self.protect_native_group(native, records, &[index], out);
-                }
-            } else {
-                out[group[0]] = Some(NativeJson {
-                    failed,
-                    reason,
-                    ..NativeJson::withheld()
-                });
-            }
-            return;
-        };
-        for (mut value, &index) in values.into_iter().zip(group) {
-            let secret_projection = value != *records[index].0;
-            self.scrub_json_inner(&mut value, &mut JsonTotals::default());
-            out[index] = Some(NativeJson {
-                value,
-                secret_projection,
-                registered_ids: Vec::new(),
-                permanent: false,
-                failed: false,
-                reason: None,
-            });
-        }
-    }
-
     pub fn this_machine() -> Self {
         Self::new(Persona::this_machine())
     }
 
     pub fn try_this_machine() -> crate::Result<Self> {
         Ok(Self::this_machine())
-    }
-
-    pub fn stream(&self) -> StreamRedactor {
-        StreamRedactor {
-            redactor: self.clone(),
-            pending: String::new(),
-            withheld: false,
-            #[cfg(feature = "cli")]
-            released: String::new(),
-        }
     }
 
     /// Redact one text. Deterministic: same input, same persona ⇒ same output. Text whose
@@ -674,12 +422,6 @@ impl Redactor {
     /// records: a credential such as a PEM private key spans lines, and only a pass that sees the
     /// whole text replaces it from BEGIN through END.
     pub(crate) fn protect_text(&self, text: &str) -> Result<Report, Withheld> {
-        self.protect_text_in("", text)
-    }
-
-    /// [`Self::protect_text`] for text that continues `context`, text a stream already
-    /// released: rules match across the context, and only `text` is protected.
-    fn protect_text_in(&self, context: &str, text: &str) -> Result<Report, Withheld> {
         if self.preserve_device_identity {
             return Ok(Report {
                 text: text.to_owned(),
@@ -691,22 +433,11 @@ impl Redactor {
             return Err(withheld);
         }
         #[cfg(feature = "cli")]
-        let protected = if context.is_empty() {
-            crate::domain::privacy::service::transform_live(
-                self.repo.as_deref(),
-                text,
-                crate::domain::privacy::projector::Mode::ProtectText,
-            )
-        } else {
-            crate::domain::privacy::service::transform_in(
-                self.repo.as_deref(),
-                context,
-                text,
-                crate::domain::privacy::projector::Mode::ProtectText,
-            )
-        };
-        #[cfg(not(feature = "cli"))]
-        let _ = context;
+        let protected = crate::domain::privacy::service::transform_live(
+            self.repo.as_deref(),
+            text,
+            crate::domain::privacy::projector::Mode::ProtectText,
+        );
         #[cfg(feature = "cli")]
         if !crate::domain::privacy::service::passed(&protected) {
             return Err(Withheld::of(&protected));
@@ -1065,124 +796,9 @@ impl JsonTotals {
     }
 }
 
-/// A bounded held tail gives the worker lookahead across transport chunks, and every request
-/// carries the text released before it as context, so a value is recognized even when its
-/// name, keyword or command line left in an earlier release; text leaves in whole lines. Text
-/// leaves only once the worker has processed it: while the worker is unavailable the text waits,
-/// and text that waits too long, or is still unprocessed when the item ends, is withheld rather
-/// than released. Once a stream withholds text it withholds the rest of the item too: the
-/// dropped text may have opened a secret, such as the BEGIN line of a key, that what follows
-/// cannot be recognized without. Released text never ends inside a private key: the worker holds
-/// a key back from its BEGIN line until its footer is complete, and if released text opens a key
-/// anyway, or the item ends inside one, the rest of the item is withheld.
-pub struct StreamRedactor {
-    redactor: Redactor,
-    pending: String,
-    /// Whether this stream withheld text, after which it delivers nothing but one marker.
-    withheld: bool,
-    /// The last text this stream released, as it was before protection: the context every
-    /// request carries.
-    #[cfg(feature = "cli")]
-    released: String,
-}
-
-impl StreamRedactor {
-    pub fn push(&mut self, chunk: &str) -> Report {
-        if self.withheld {
-            return empty_report();
-        }
-        self.pending.push_str(chunk);
-        if self.redactor.preserve_device_identity {
-            return self.flush();
-        }
-        #[cfg(feature = "cli")]
-        {
-            // Text that waits beyond the hold, processed or not, is withheld with the rest of
-            // the item; this also keeps every request below one protection unit.
-            if self.pending.len() > STREAM_HOLD_BYTES {
-                return self.withhold();
-            }
-            let outcome = crate::domain::privacy::service::transform_in(
-                self.redactor.repo.as_deref(),
-                &self.released,
-                &self.pending,
-                crate::domain::privacy::projector::Mode::ProtectStream,
-            );
-            // Only text the worker protected with the whole policy leaves; anything else waits.
-            let processed = crate::domain::privacy::service::passed(&outcome)
-                .then(|| outcome.consumed.unwrap_or(self.pending.len()));
-            let Some(consumed) = processed else {
-                return empty_report();
-            };
-            if consumed > self.pending.len() || !self.pending.is_char_boundary(consumed) {
-                return self.withhold();
-            }
-            let released = format!("{}{}", self.released, &self.pending[..consumed]);
-            if opens_key(&released) {
-                return self.withhold();
-            }
-            let Some(keep) = context_start(&released) else {
-                return self.withhold();
-            };
-            self.released = released[keep..].to_owned();
-            self.pending.drain(..consumed);
-            let mut report = self.redactor.persona_only(&outcome.content);
-            report.secrets = outcome.replacements;
-            if outcome.replacements > 0 {
-                report.registered_ids = crate::domain::privacy::projector::tokens(&outcome.content)
-                    .map(|(_, _, token)| token.to_owned())
-                    .collect();
-            }
-            report
-        }
-        #[cfg(not(feature = "cli"))]
-        self.flush()
-    }
-
-    pub fn flush(&mut self) -> Report {
-        if self.withheld || self.pending.is_empty() {
-            self.pending.clear();
-            return empty_report();
-        }
-        let ready = std::mem::take(&mut self.pending);
-        if self.redactor.preserve_device_identity {
-            return Report {
-                text: ready,
-                ..empty_report()
-            };
-        }
-        #[cfg(feature = "cli")]
-        {
-            // The item ends here, so a key it opened and never closed is withheld whole,
-            // whatever the detector made of it.
-            let released = std::mem::take(&mut self.released);
-            if opens_key(&format!("{released}{ready}")) {
-                return self.withhold();
-            }
-            self.redactor
-                .protect_text_in(&released, &ready)
-                .unwrap_or_else(|_| self.withhold())
-        }
-        #[cfg(not(feature = "cli"))]
-        self.redactor
-            .protect_text(&ready)
-            .unwrap_or_else(|_| self.withhold())
-    }
-
-    /// [`WITHHELD`], once: the stream delivers nothing more for this item.
-    fn withhold(&mut self) -> Report {
-        self.pending.clear();
-        if std::mem::replace(&mut self.withheld, true) {
-            empty_report()
-        } else {
-            withheld_report()
-        }
-    }
-}
-
-/// How much released text the stream keeps at least and sends with each request as context, so
-/// a rule whose name or keyword left in an earlier release still recognizes the value that
-/// follows, and a key header split across two releases is still seen whole.
+/// How much of the text before a window each request carries at least as context, so a rule
+/// whose name or keyword lies before the window still recognizes the value in it, and a key
+/// header split across two windows is still seen whole.
 #[cfg(feature = "cli")]
 const STREAM_CONTEXT_BYTES: usize = 16 * 1024;
 
@@ -1193,10 +809,15 @@ const STREAM_CONTEXT_BYTES: usize = 16 * 1024;
 #[cfg(feature = "cli")]
 const CONTEXT_LINE_BREAKS: usize = 11;
 
-/// The most context one request carries, so the context and the held text still fit one unit.
+/// The room one request keeps for the text it protects, beyond its context.
+#[cfg(feature = "cli")]
+const STREAM_TEXT_ROOM: usize = 2 * 1024 * 1024;
+
+/// The most context one request carries, so the context and the text after it still fit one
+/// unit.
 #[cfg(feature = "cli")]
 const STREAM_CONTEXT_CAP: usize =
-    crate::domain::privacy::projector::MAX_UNIT_BYTES - 2 * STREAM_HOLD_BYTES;
+    crate::domain::privacy::projector::MAX_UNIT_BYTES - STREAM_TEXT_ROOM;
 
 /// Where the context the next request carries starts in `released`: [`STREAM_CONTEXT_BYTES`]
 /// back, and further back only to the last command within [`CONTEXT_LINE_BREAKS`] line breaks of
@@ -1337,12 +958,6 @@ impl PrivateKeys {
             }
         }
     }
-}
-
-/// Whether `text` opens a private key and does not close it.
-#[cfg(feature = "cli")]
-fn opens_key(text: &str) -> bool {
-    PrivateKeys::new(text).end_after(text.len()).is_some()
 }
 
 fn withheld_report() -> Report {
@@ -1778,50 +1393,12 @@ mod tests {
         );
     }
 
-    /// A native record whose request cannot fit one protection unit is withheld for good, alone:
-    /// the records beside it are still protected, only the oversized one is marked permanent so
-    /// its page can move on, and a record whose request fits exactly passes. A batch that
-    /// withheld every record beside a large one, marked it retryable, or judged size with a
-    /// fixed reserve instead of the real request would hide ordinary history or retry a record
-    /// that can never pass.
-    #[test]
-    fn an_oversized_native_record_is_withheld_alone_and_for_good() {
-        let redactor = Redactor::new(persona());
-        let large = serde_json::json!({
-            "type": "user",
-            "message": {"content": "x".repeat(crate::domain::privacy::projector::MAX_UNIT_BYTES)}
-        });
-        let small = serde_json::json!({"type": "user", "message": {"content": "hello"}});
-        // A record whose whole single-record request fits exactly is not too large.
-        let room = crate::domain::privacy::projector::MAX_UNIT_BYTES
-            - serde_json::to_string(&crate::domain::privacy::projector::NativeBatch {
-                runtime: String::new(),
-                session: String::new(),
-                records: vec![serde_json::json!({"type": "user", "message": {"content": ""}})],
-                pointers: vec![Vec::new()],
-            })
-            .unwrap()
-            .len();
-        let fits = serde_json::json!({"type": "user", "message": {"content": "x".repeat(room)}});
-        let records = [(&large, &[][..]), (&small, &[][..]), (&fits, &[][..])];
-        let protected = redactor.scrub_native_batch_profiled(&records, &mut |_, _| {});
-        assert_eq!(protected.len(), 3);
-        assert!(protected[0].value.get("protection_error").is_some());
-        assert!(protected[0].permanent);
-        assert!(!protected[1].permanent);
-        assert_eq!(protected[1].value, small);
-        assert!(!protected[2].permanent);
-        assert_eq!(protected[2].value, fits);
-    }
-
-    /// The device-control redactor, the one remote control uses, passes text, JSON values, native
-    /// records and streamed text as they are, a credential and a public IP included, while the
-    /// privacy check would hold them back: remote control shows the owner their own session. A
-    /// redactor of any other kind still holds back what the check holds back. A device-control
-    /// redactor that asked the privacy worker would put the withheld marker or a placeholder into
-    /// the owner's view; one that still numbered IPs would show `[ip1]` in live text and the
-    /// stream but the address in history. The stream splits after the address, not inside it,
-    /// because a chunk holding half an address is not numbered either way.
+    /// The device-control redactor, the one remote control uses, passes text and JSON values as
+    /// they are, a credential and a public IP included, while the privacy check would hold them
+    /// back: remote control shows the owner their own session. A redactor of any other kind still
+    /// holds back what the check holds back. A device-control redactor that asked the privacy
+    /// worker would put the withheld marker or a placeholder into the owner's view; one that
+    /// still numbered IPs would show `[ip1]` in live text but the address in history.
     #[cfg(feature = "rc")]
     #[test]
     fn the_device_control_redactor_passes_everything_as_it_is() {
@@ -1829,31 +1406,17 @@ mod tests {
         let credential = "AKIA4X7QZ2M5RT6VW3JH";
         let text = format!("ssh 47.91.17.103 && export AWS_ACCESS_KEY_ID={credential}\n");
         WITHHOLD_LIVE.with(|w| w.set(Some((credential, Reason::LockBusy))));
-        WITHHOLD_NATIVE.with(|w| w.set(Some(credential)));
         let value = serde_json::json!({"command": text});
-        let record = serde_json::json!({"type": "user", "message": {"content": text}});
-        let records = [(&record, &[][..])];
 
         let live = Redactor::new(persona()).for_device_control();
         assert_eq!(live.protect_text(&text).unwrap().text, text);
         assert_eq!(live.scrub(&text).text, text);
         assert_eq!(live.protect_json(&value).unwrap().value, value);
-        let native = live.scrub_native_batch_profiled(&records, &mut |_, _| {});
-        assert_eq!(native[0].value, record);
-        let mut stream = live.stream();
-        let (first, second) = text.split_at(text.find("&&").unwrap());
-        let streamed = [stream.push(first), stream.push(second), stream.flush()]
-            .map(|report| report.text)
-            .concat();
-        assert_eq!(streamed, text);
 
         let checked = Redactor::new(persona());
         assert!(checked.protect_text(&text).is_err());
         assert!(checked.protect_json(&value).is_err());
-        let native = checked.scrub_native_batch_profiled(&records, &mut |_, _| {});
-        assert!(native[0].value.get("protection_error").is_some());
         WITHHOLD_LIVE.with(|w| w.set(None));
-        WITHHOLD_NATIVE.with(|w| w.set(None));
     }
 
     #[test]
@@ -1903,10 +1466,11 @@ mod tests {
         assert_eq!(keys.end_after(last), None);
     }
 
-    /// A key with no footer is open at the end of its text, so a stream that ends inside one is
-    /// withheld; a key whose footer is the text's last line is closed there. An index that
-    /// recorded "no footer" as a close at the end of the text answers both the same way, and the
-    /// unclosed key at the end of a stream goes out as ordinary text.
+    /// A key with no footer is open at the end of its text, so no cut after its header is safe and
+    /// an omission that covers it reaches the end; a key whose footer is the text's last line is
+    /// closed there. An index that recorded "no footer" as a close at the end of the text answers
+    /// both the same way, and the rest of an unclosed key would reach a later window as ordinary
+    /// text.
     #[cfg(feature = "cli")]
     #[test]
     fn a_key_without_a_footer_stays_open_at_the_end_of_its_text() {
@@ -1916,13 +1480,21 @@ mod tests {
             "-----BEGIN PGP PRIVATE KEY BLOCK-----",
         ] {
             let open = format!("intro\n{header}\nSYNTHETIC\n");
-            assert!(opens_key(&open), "{open:?}");
+            assert_eq!(
+                PrivateKeys::new(&open).end_after(open.len()),
+                Some(open.len()),
+                "{open:?}"
+            );
             assert_eq!(PrivateKeys::new(&open).end_after(2), None);
             let footer = header
                 .replacen("BEGIN", "END", 1)
                 .replacen("begin", "end", 1);
             let closed = format!("{open}{footer}");
-            assert!(!opens_key(&closed), "{closed:?}");
+            assert_eq!(
+                PrivateKeys::new(&closed).end_after(closed.len()),
+                None,
+                "{closed:?}"
+            );
         }
     }
 }

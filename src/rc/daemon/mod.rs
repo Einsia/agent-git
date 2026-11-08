@@ -106,8 +106,6 @@ enum LocalSessionScan {
 struct LocatedLocal {
     title: Option<String>,
     gist: Option<String>,
-    /// Why a label the list showed is not carried over: see [`LocalSession::labels_withheld`].
-    labels_withheld: Option<String>,
     runtime: String,
     cwd: PathBuf,
     project_id: Option<String>,
@@ -2769,12 +2767,6 @@ fn finish_local_sessions_timed(
     sessions
 }
 
-/// `label`, unless it is the privacy marker the session list shows in place of a label whose check
-/// did not pass: that is never a session's name.
-pub(super) fn named(label: Option<String>) -> Option<String> {
-    label.filter(|label| label != crate::domain::redact::PROTECTION_ERROR_TEXT)
-}
-
 /// Resolve one already-enumerated local session.
 ///
 /// `scan` is `FnOnce` on purpose: resume needs both `likely_active` and launch coordinates, and
@@ -2804,13 +2796,9 @@ fn locate_local_with(
             .find(|(_, path)| cwd.starts_with(std::path::Path::new(path)))
             .map(|(id, _)| id.clone())
     });
-    // A label whose privacy check did not pass is a marker for the list, not the session's name:
-    // the session opened from it reports its title and gist to the Hub, which keeps the first
-    // ones it is given. It opens with no name and says why.
     Ok(LocatedLocal {
-        title: named(cand.title),
-        gist: named(cand.gist),
-        labels_withheld: cand.labels_withheld,
+        title: cand.title,
+        gist: cand.gist,
         runtime: cand.runtime,
         cwd,
         project_id,

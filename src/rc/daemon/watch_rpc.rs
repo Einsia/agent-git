@@ -503,10 +503,7 @@ impl Daemon {
                 "the prior runtime source watch is detaching; retry the updated source",
             ));
         }
-        let redactor = crate::domain::redact::Redactor::this_machine().for_device_control();
-        let model_settings = settings
-            .as_ref()
-            .map(|settings| redactor.scrub_json(&settings.model()).value);
+        let model_settings = settings.as_ref().map(|settings| settings.model());
         match self.watches.get_mut(&watch_id) {
             // Someone is already watching (and that tail really is alive): add a
             // subscriber rather than start a second one.
@@ -571,7 +568,6 @@ impl Daemon {
                     let mut native_records =
                         crate::rc::supervisor::native_records::NativeRecords::default();
                     let mut initial = true;
-                    let mut held = crate::rc::supervisor::HeldTail::default();
                     let mut enrolled = enrolled;
                     let mut rollover_check = tokio::time::Instant::now() + WATCH_ROLLOVER_CHECK;
                     loop {
@@ -639,8 +635,7 @@ impl Daemon {
                                 };
                                 bytes
                             };
-                            let Ok((items, _)) =
-                                native_records.project_window(&bytes, false, &redactor, from_line)
+                            let Ok(items) = native_records.project_window(&bytes, false, from_line)
                             else {
                                 history_status(&frames, &stream, "failed", Some("invalid_record"))
                                     .await;
@@ -692,8 +687,6 @@ impl Daemon {
                             history_status(&frames, &stream, "reset", None).await;
                             initial = true;
                             settings_boundary = None;
-                            // Held lines belong to the content the reset replaced.
-                            held = Default::default();
                         }
                         if lines.iter().any(|line| {
                             !line.text.trim().is_empty()
@@ -705,27 +698,13 @@ impl Daemon {
                         }
                         // Quiet decides nothing here: reaping is judged by the daemon
                         // (`reap_idle_watches`) because it has to sit under the same lock as
-                        // "add a viewer". This only reports whether there was activity, and
-                        // retrying held lines is none, or a watch nobody views would never be
-                        // reaped while one record keeps failing.
+                        // "add a viewer". This only reports whether there was activity.
                         if !lines.is_empty() {
                             active.store(
                                 crate::rc::daemon::now_secs(),
                                 std::sync::atomic::Ordering::Release,
                             );
-                        }
-                        if !lines.is_empty() || !held.is_empty() {
-                            // A read-only follow has no session identity, and
-                            // `secret.detected` is a session-level alert: this only
-                            // guarantees the content is redacted.
-                            for mut frame in held_watch_frames(
-                                &mut held,
-                                &rt,
-                                &redactor,
-                                lines,
-                                mode,
-                                settings_boundary,
-                            ) {
+                            for mut frame in watch_frames(&rt, &lines, mode, settings_boundary) {
                                 frame.stream = Some(stream.clone());
                                 if matches!(
                                     frame.method(),
@@ -1052,44 +1031,16 @@ impl WatchRpcTicket {
 #[path = "tests/watch_rpc.rs"]
 mod tests;
 
-/// Lifecycle markers stay interleaved with their protected source records.
-#[cfg(test)]
+/// Frames for the polled lines: lifecycle markers stay interleaved with their source records.
 fn watch_frames(
     runtime: &str,
-    redactor: &crate::domain::redact::Redactor,
     lines: &[crate::rc::tail::TailedLine],
     mode: crate::rc::codex_history::HistoryMode,
     settings_boundary: Option<u64>,
 ) -> Vec<Frame> {
-    held_watch_frames(
-        &mut crate::rc::supervisor::HeldTail::default(),
-        runtime,
-        redactor,
-        lines.to_vec(),
-        mode,
-        settings_boundary,
-    )
-}
-
-/// Frames for the polled lines that may be shown now; lines whose privacy check may still pass
-/// wait in `held`, with their lifecycle markers, for the next poll.
-fn held_watch_frames(
-    held: &mut crate::rc::supervisor::HeldTail,
-    runtime: &str,
-    redactor: &crate::domain::redact::Redactor,
-    polled: Vec<crate::rc::tail::TailedLine>,
-    mode: crate::rc::codex_history::HistoryMode,
-    settings_boundary: Option<u64>,
-) -> Vec<Frame> {
-    let shown = held.project(
-        runtime,
-        redactor,
-        polled,
-        mode,
-        crate::rc::supervisor::Release::Retry,
-    );
-    let lines = &shown.lines;
-    let mut items = shown.items.into_iter().peekable();
+    let mut items = crate::rc::supervisor::items_from_lines_with_mode(runtime, lines, mode)
+        .into_iter()
+        .peekable();
     let mut frames = Vec::new();
     for line in lines {
         if let Some(frame) = watch_turn_event(runtime, &line.text) {
@@ -1108,9 +1059,7 @@ fn held_watch_frames(
         {
             frames.push(Frame::notification(
                 "session.model",
-                serde_json::json!({
-                    "settings":redactor.scrub_json(&settings.model()).value
-                }),
+                serde_json::json!({ "settings": settings.model() }),
             ));
             frames.push(Frame::notification(
                 "session.permissionMode",
@@ -1194,10 +1143,8 @@ mod watch_activity_tests {
                 text: record.to_string(),
             })
             .collect();
-        let redactor = crate::domain::redact::Redactor::new(Default::default());
         let frames = watch_frames(
             "codex",
-            &redactor,
             &lines,
             crate::rc::codex_history::HistoryMode::Model,
             None,

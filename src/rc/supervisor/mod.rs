@@ -23,19 +23,14 @@
 //!   pushed history line by line, and why "we talked about it on the web but
 //!   `agit log` doesn't have it" is structurally impossible.
 //!
-//! # Redaction happens here, before anything leaves the machine
+//! # Nothing on this path is held back
 //!
-//! Every event is scrubbed with a `domain::redact::Redactor` carrying this
-//! machine's persona plus the daemon's device-local secret filter — the same
-//! path `agit export` uses for publishing a copy. That masks secrets (the whole
-//! gitleaks rule set plus the registered low-entropy literals), the home
-//! directory, the hostname and public IPs.
-//! Doing it at the edge rather than at the hub means a leaked key never reaches
-//! the network at all.
-//!
-//! A registered literal is the one thing whose removal also changes the line's
-//! advertised identity: keeping the original hash would hand the hub an offline
-//! oracle for guessing a low-entropy value. See [`projected_object_hash`].
+//! A supervised session is its owner's own, shown live to them or to colleagues
+//! in their workspace, so its transcript records, streamed deltas and approval
+//! cards go out as the harness produced them (see
+//! `Redactor::for_device_control`). What is kept where others can read it
+//! leaves through `agit save`, turn-end settlement or push, each of which runs
+//! the full privacy check of its own.
 
 pub(crate) mod archive_recovery;
 mod background;
@@ -774,56 +769,14 @@ pub const SETTLE_MAX_MS: u64 = 1500;
 /// The raw material for deciding a pending approval again. See `Session::pending`.
 struct PendingApproval {
     tool: String,
-    /// Unredacted. It stays in this machine's memory and never reaches the wire.
+    /// The input as the harness raised it: what an answer is judged against.
     input: serde_json::Value,
     /// A session-scoped Claude approval changes the global driver mode. Keep
     /// the machine-originated prediction beside the authorization evidence so
     /// the execution side can require a durable danger permit before echoing a
     /// bypass suggestion.
     suggested_permission_mode: Option<PermissionMode>,
-    /// Its card went out without its content, which never passed the privacy check, so it can be
-    /// denied but not allowed.
-    unseen: bool,
 }
-
-/// An approval whose card has not passed its privacy check. The card stays on this machine: a
-/// card sent with its command withheld asks someone to approve what they cannot see. The harness
-/// keeps waiting meanwhile, so nothing runs unanswered.
-struct UnshownApproval {
-    /// The card as the harness raised it, with this machine's verdict and before redaction.
-    request: crate::protocol::ApprovalRequest,
-    authority: PendingApproval,
-    /// How long it waited before its latest check; zero before the first.
-    waited: std::time::Duration,
-    next: tokio::time::Instant,
-    /// Consecutive checks that came back with only part of this device's policy applied.
-    incomplete: u32,
-    /// False once its check cannot pass: it then waits for an answer on the computer.
-    retrying: bool,
-}
-
-/// What a viewer reads while an approval card waits for its privacy check. It names no part of
-/// the request.
-const UNSHOWN_APPROVAL_NOTE: &str =
-    "An approval request is waiting for its privacy check before it can be shown";
-
-/// What a viewer reads when a card cannot pass its check in a session whose runtime asks on this
-/// computer. It names no part of the request.
-const UNSHOWABLE_APPROVAL_NOTE: &str =
-    "An approval request can't be shown here; answer it on the computer";
-
-/// The first retry of a card's privacy check. A check misses while another caller holds the
-/// worker, which passes quickly, so the first retry comes soon; the delay then doubles up to the
-/// worker's own retry window and stays there.
-const UNSHOWN_APPROVAL_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// How many retries in a row may still apply only part of this device's policy before a card is
-/// taken to be one that cannot pass: content still being written can clear it in between.
-const PARTIAL_POLICY_RETRIES: u32 = 3;
-
-/// The summary of a card that cannot pass its check, sent with none of its content.
-const UNCHECKED_APPROVAL_SUMMARY: &str =
-    "This request can't be shown here, so it can be denied but not allowed";
 
 #[derive(Debug, Clone, Default)]
 pub struct MessageAttribution {
@@ -941,7 +894,7 @@ pub struct Session {
     /// Emitted upward; the daemon numbers these and ships them to the hub.
     out: mpsc::Sender<Frame>,
     /// An approval already sent and not yet answered → **the raw material for deciding whether
-    /// it needs the owner** (the tool name plus the unredacted input).
+    /// it needs the owner** (the tool name plus the input).
     ///
     /// The material is stored rather than the verdict, because a verdict **expires**: minutes
     /// can pass between sending an approval and someone answering it, and in between the owner
@@ -952,16 +905,10 @@ pub struct Session {
     /// stands **then**, makes a tightening take effect immediately, and a loosening need not
     /// wait for the next approval.
     ///
-    /// The input is stored unredacted: the classifier compares real paths against the allowlist
-    /// (redaction replaces the home directory with a pseudonym, so the comparison is bound to
-    /// miss). It stays in this machine's memory and never reaches the wire — the copy sent to
-    /// viewers is scrubbed before emit.
+    /// The input is the one the harness raised: the classifier compares real paths against the
+    /// allowlist, and what decides is this machine's copy, never anything a viewer sends back
+    /// with an answer.
     pending: std::collections::HashMap<String, PendingApproval>,
-    /// Approvals the harness raised whose card has not passed its privacy check. They are not in
-    /// `pending`, so an answer naming one is refused like any approval never sent.
-    unshown: Vec<UnshownApproval>,
-    /// The note viewers were last told about cards waiting on this machine.
-    unshown_note: Option<&'static str>,
     /// The **byte** position consumed from the transcript. Used only to decide whether the file
     /// is still growing.
     ///
@@ -1072,11 +1019,6 @@ pub struct Session {
     /// delivery has no bounded lateness, so silently evicting an old id would
     /// let a delayed duplicate create a second head and resurrect UI state.
     announced_turn_ids: BoundedTurnIds,
-    /// A delta is a transport chunk, not a semantic boundary; every item keeps its own safety
-    /// tail.
-    delta_streams: std::collections::HashMap<String, redact::StreamRedactor>,
-    /// Tailed lines that wait for their privacy check (see [`HeldTail`]).
-    held: HeldTail,
     /// One device-local rule alerts once per session; every occurrence is still redacted.
     alerted_registered: std::collections::HashSet<String>,
 }
@@ -1501,148 +1443,6 @@ impl Session {
         self.driver.started_process()
     }
 
-    /// Send the card once its summary, paths and input all pass the privacy check, and only then
-    /// accept an answer to it; until then it waits in `unshown`. Callers settle the note after.
-    async fn offer_approval(&mut self, mut unshown: UnshownApproval) {
-        let (card, registered) = match self.protect_card(&unshown.request) {
-            Ok(protected) => protected,
-            Err(withheld) => {
-                use crate::domain::privacy::projector::Reason;
-                unshown.incomplete = match withheld.reason {
-                    Some(Reason::SourceIncomplete) => unshown.incomplete.saturating_add(1),
-                    _ => 0,
-                };
-                // These name the content or this device's rules, which waiting does not change;
-                // every other reason is the worker's state, so the check is retried for good.
-                if matches!(
-                    withheld.reason,
-                    Some(
-                        Reason::Oversize
-                            | Reason::FindingsCap
-                            | Reason::DeviceRules
-                            | Reason::LegacyRules
-                            | Reason::UnsupportedScalar
-                    )
-                ) || unshown.incomplete > PARTIAL_POLICY_RETRIES
-                {
-                    return self.cannot_show(unshown).await;
-                }
-                unshown.waited = if unshown.waited.is_zero() {
-                    UNSHOWN_APPROVAL_RETRY
-                } else {
-                    unshown
-                        .waited
-                        .saturating_mul(2)
-                        .min(crate::domain::privacy::service::RETRY_WINDOW)
-                };
-                unshown.next = tokio::time::Instant::now() + unshown.waited;
-                self.unshown.push(unshown);
-                return;
-            }
-        };
-        self.alert_registered(registered, "approval").await;
-        self.pending
-            .insert(card.approval_id.clone(), unshown.authority);
-        self.emit(method::APPROVAL_REQUEST, card).await;
-    }
-
-    /// A card that cannot pass its check. A runtime that shows approvals in a terminal on this
-    /// computer asks there too, so the approval waits for that answer behind a note; any other
-    /// session gets a card with none of the request's content, which can be denied while allowing
-    /// what nobody could read is refused.
-    async fn cannot_show(&mut self, mut unshown: UnshownApproval) {
-        if self.driver.asks_on_this_computer() {
-            unshown.retrying = false;
-            self.unshown.push(unshown);
-            return;
-        }
-        let mut card = unshown.request;
-        card.summary = UNCHECKED_APPROVAL_SUMMARY.into();
-        card.tool = String::new();
-        card.paths = Vec::new();
-        card.input = serde_json::json!({});
-        card.can_allow_for_session = false;
-        card.suggested_permission_mode = None;
-        self.pending.insert(
-            card.approval_id.clone(),
-            PendingApproval {
-                unseen: true,
-                ..unshown.authority
-            },
-        );
-        self.emit(method::APPROVAL_REQUEST, card).await;
-    }
-
-    async fn retry_unshown_approvals(&mut self) {
-        let now = tokio::time::Instant::now();
-        let due = |unshown: &UnshownApproval| unshown.retrying && unshown.next <= now;
-        if !self.unshown.iter().any(due) {
-            return;
-        }
-        let (due, waiting) = std::mem::take(&mut self.unshown)
-            .into_iter()
-            .partition(|unshown| due(unshown));
-        self.unshown = waiting;
-        for unshown in due {
-            self.offer_approval(unshown).await;
-        }
-        self.settle_unshown_note().await;
-    }
-
-    /// A note stands exactly while some card waits on this machine; one left standing tells
-    /// viewers an approval is coming after it was answered or dropped.
-    async fn settle_unshown_note(&mut self) {
-        let note = if self.unshown.iter().any(|unshown| unshown.retrying) {
-            Some(UNSHOWN_APPROVAL_NOTE)
-        } else if !self.unshown.is_empty() {
-            Some(UNSHOWABLE_APPROVAL_NOTE)
-        } else {
-            None
-        };
-        if note == self.unshown_note {
-            return;
-        }
-        self.unshown_note = note;
-        self.emit(
-            "session.progress",
-            serde_json::json!({ "text": note.unwrap_or_default() }),
-        )
-        .await;
-    }
-
-    /// The card a viewer may see, or why some part of it is withheld. A command line is exactly
-    /// where a token ends up, so every string on the card is protected.
-    fn protect_card(
-        &self,
-        request: &crate::protocol::ApprovalRequest,
-    ) -> Result<(crate::protocol::ApprovalRequest, Vec<String>), redact::Withheld> {
-        let mut card = request.clone();
-        let summary = self.redactor.protect_text(&request.summary)?;
-        let mut registered = summary.registered_ids;
-        card.summary = summary.text;
-        // **`paths` is raw material on the same card, not metadata.** What
-        // `harness::paths_of` puts here is the **absolute** `file_path`, so an unprotected path
-        // gives everyone who sees the card the machine owner's username and home directory. The
-        // verdict never reads it (see `policy::approval_owner_reason`).
-        card.paths = request
-            .paths
-            .iter()
-            .map(|path| {
-                let report = self.redactor.protect_text(path)?;
-                registered.extend(report.registered_ids);
-                Ok(report.text)
-            })
-            .collect::<Result<_, _>>()?;
-        // `input` is structured, so what gets protected is its **decoded strings**: matching
-        // wire bytes misses every registered literal containing `"`, `\` or a newline, and its
-        // re-parse can fail into sending the unprotected input. The verdict is unaffected; it
-        // reads the unredacted input kept in the authority.
-        let input = self.redactor.protect_json(&request.input)?;
-        registered.extend(input.registered_ids);
-        card.input = input.value;
-        Ok((card, registered))
-    }
-
     /// Drop both halves of every approval the harness can no longer answer.
     ///
     /// The supervisor copy is the machine-side authorization evidence; the
@@ -1651,10 +1451,8 @@ impl Session {
     /// turn boundary must clear both in the same production function.
     async fn abandon_pending_approvals(&mut self) -> bool {
         let pending = std::mem::take(&mut self.pending);
-        let unshown = std::mem::take(&mut self.unshown);
         let driver = self.driver.abandon_pending_approvals();
-        let abandoned = !pending.is_empty() || !unshown.is_empty() || driver != 0;
-        self.settle_unshown_note().await;
+        let abandoned = !pending.is_empty() || driver != 0;
         // Every viewer must retire the same cards when native requests become unanswerable.
         for approval_id in pending.into_keys() {
             self.emit(
@@ -1806,8 +1604,6 @@ impl Session {
             redactor,
             out,
             pending: Default::default(),
-            unshown: Vec::new(),
-            unshown_note: None,
             consumed_bytes: 0,
             landed_thread: None,
             landing: None,
@@ -1834,8 +1630,6 @@ impl Session {
             pending_interrupt_command: None,
             resolved_initial_turn: None,
             announced_turn_ids: Default::default(),
-            delta_streams: Default::default(),
-            held: HeldTail::default(),
             alerted_registered: Default::default(),
             generation,
             publication_incarnation: None,
@@ -2406,12 +2200,6 @@ impl Session {
         let _ = self.out.send(f).await;
     }
 
-    /// Take one redaction result: `registered_ids` becomes an alert, the text goes out as is.
-    async fn finish_scrub(&mut self, report: redact::Report, source: &str) -> String {
-        self.alert_registered(report.registered_ids, source).await;
-        report.text
-    }
-
     /// One device-local rule alerts once per session. `secret.detected` carries only a count
     /// and a source; the rule id and the matched text stay on this machine.
     async fn alert_registered(&mut self, ids: Vec<String>, source: &str) {
@@ -2430,39 +2218,6 @@ impl Session {
                 },
             )
             .await;
-        }
-    }
-
-    /// End one item's streaming redaction: emit the safety tail it holds back and drop the
-    /// stream.
-    async fn flush_delta(&mut self, item_id: &str) {
-        let Some(mut stream) = self.delta_streams.remove(item_id) else {
-            return;
-        };
-        self.emit_delta_report(item_id, stream.flush()).await;
-    }
-
-    async fn emit_delta_report(&mut self, item_id: &str, report: redact::Report) {
-        if report.text.is_empty() {
-            return;
-        }
-        let text = self.finish_scrub(report, "item_delta").await;
-        self.emit(
-            method::ITEM_DELTA,
-            ItemDelta {
-                item_id: item_id.to_string(),
-                text,
-            },
-        )
-        .await;
-    }
-
-    /// A held-back tail leaves only through here, so every turn boundary and every exit path
-    /// passes through it: missing one means that stretch of text **never** appears on the web.
-    async fn flush_all_deltas(&mut self) {
-        let ids: Vec<String> = self.delta_streams.keys().cloned().collect();
-        for id in ids {
-            self.flush_delta(&id).await;
         }
     }
 
@@ -2533,7 +2288,7 @@ impl Session {
     async fn publish_turn_started(&mut self, prepared: PreparedTurnStarted) {
         self.alert_registered(prepared.registered_ids, "turn_prompt")
             .await;
-        if prepared.mark_running && self.pending.is_empty() && self.unshown.is_empty() {
+        if prepared.mark_running && self.pending.is_empty() {
             self.set_status(SessionStatus::Running).await;
         }
         self.emit(method::TURN_STARTED, prepared.frame).await;
@@ -3020,17 +2775,6 @@ impl Session {
                             // The free text a refusal carries is another matter and is replaced
                             // below (`sanitize_for_non_owner`) — that is what a refusal really
                             // has to be guarded against, not the refusal itself.
-                            if pending.unseen
-                                && response.decision == crate::protocol::ApprovalDecision::Allow
-                            {
-                                // Put it back: a denial can still answer it.
-                                self.pending.insert(response.approval_id.clone(), pending);
-                                reply.finish(Ok(ApprovalOutcome::ExplicitRefusal {
-                                    message: "this request's command never passed its privacy check, so nobody could see it; it can be denied, not allowed".into(),
-                                    retained: true,
-                                }));
-                                continue;
-                            }
                             if approval_answer_is_blocked(
                                 needs_owner,
                                 caller_is_owner,
@@ -3138,7 +2882,7 @@ impl Session {
                                         session_id: self.info.session_id.clone(),
                                         approval_id: response.approval_id.clone(),
                                     }).await;
-                                    if self.pending.is_empty() && self.unshown.is_empty() {
+                                    if self.pending.is_empty() {
                                         self.set_status(SessionStatus::Running).await;
                                     }
                                     // Answering "allow, and stop asking" moves
@@ -3271,9 +3015,6 @@ impl Session {
                             );
                             self.abandon_pending_approvals().await;
                             // Drain whatever the harness wrote on its way out.
-                            // The held-back delta tails go first, ahead of the
-                            // transcript's authoritative items for the same text.
-                            self.flush_all_deltas().await;
                             self.drain_transcript().await;
                             self.emit(method::SESSION_STATUS, serde_json::json!({
                                 "session_id": self.info.session_id,
@@ -3307,7 +3048,6 @@ impl Session {
                         self.stop().await;
                         return;
                     }
-                    self.retry_unshown_approvals().await;
                     self.finish_local_settlement(false).await;
                     self.finish_publication(false).await;
                     if self.idle_settlement_ready() {
@@ -3457,7 +3197,6 @@ impl Session {
                 runtime_thread_id,
                 transcript_path,
             } => {
-                self.redactor.bind_native_session(&runtime_thread_id);
                 // The native id stays here. Viewers address the session by its
                 // logical agit id, which is what makes "continue on another
                 // machine" and "continue in another harness" invisible to them.
@@ -3544,8 +3283,6 @@ impl Session {
                 kind,
                 tool,
             } => {
-                self.delta_streams
-                    .insert(item_id.clone(), self.redactor.stream());
                 self.emit(
                     method::ITEM_STARTED,
                     ItemStarted {
@@ -3558,20 +3295,13 @@ impl Session {
                 .await;
             }
             HarnessEvent::Delta { item_id, text } => {
-                // Each fragment releases inspected bytes; completion flushes the bounded tail.
-                if !self.delta_streams.contains_key(&item_id) {
-                    let stream = self.redactor.stream();
-                    self.delta_streams.insert(item_id.clone(), stream);
+                // A delta goes out as the harness sent it, the moment it arrives.
+                if !text.is_empty() {
+                    self.emit(method::ITEM_DELTA, ItemDelta { item_id, text })
+                        .await;
                 }
-                let report = self
-                    .delta_streams
-                    .get_mut(&item_id)
-                    .expect("delta stream was inserted above")
-                    .push(&text);
-                self.emit_delta_report(&item_id, report).await;
             }
             HarnessEvent::ItemCompleted { item_id } => {
-                self.flush_delta(&item_id).await;
                 // Stream completion is separate from the authoritative transcript record.
                 self.emit("item.finished", serde_json::json!({"item_id":item_id}))
                     .await;
@@ -3606,10 +3336,6 @@ impl Session {
                 // do this). A turn boundary is authoritative: no approval from
                 // that turn can still be answered.
                 self.abandon_pending_approvals().await;
-                // Release the held-back delta tails before the turn boundary: `item.completed`
-                // is about to come out of the transcript, and the streaming form of the same
-                // text has to go ahead of it.
-                self.flush_all_deltas().await;
                 // **One drain is not enough.** At the moment the harness writes `result` on
                 // stdout, its last transcript line need not be persisted yet: the model's final
                 // reply (`assistant_reply`) can come **after** `turn.completed`, so any client
@@ -3646,7 +3372,9 @@ impl Session {
                 let error = match error {
                     Some(message) => {
                         let report = self.redactor.scrub(&message);
-                        Some(self.finish_scrub(report, "turn_error").await)
+                        self.alert_registered(report.registered_ids, "turn_error")
+                            .await;
+                        Some(report.text)
                     }
                     None => None,
                 };
@@ -3691,11 +3419,6 @@ impl Session {
             }
             HarnessEvent::ApprovalResolved { approval_id } => {
                 let shown = self.pending.remove(&approval_id).is_some();
-                let held = self.unshown.len();
-                // No viewer saw a card that never left this machine, so none has one to retire.
-                self.unshown
-                    .retain(|unshown| unshown.request.approval_id != approval_id);
-                self.settle_unshown_note().await;
                 if shown {
                     self.emit(
                         method::APPROVAL_RESOLVED,
@@ -3706,9 +3429,8 @@ impl Session {
                     )
                     .await;
                 }
-                if (shown || self.unshown.len() < held)
+                if shown
                     && self.pending.is_empty()
-                    && self.unshown.is_empty()
                     && self.info.status == SessionStatus::AwaitingApproval
                 {
                     self.set_status(SessionStatus::Running).await;
@@ -3729,9 +3451,6 @@ impl Session {
                 // inferring from `kind` turns a Bash command that `curl`s outward into an
                 // `Exec` an operator may allow.
                 //
-                // Decide with the **unredacted** input, and decide before redaction: redaction
-                // replaces the home directory with a pseudonym, and comparing against the
-                // allowlist after that is bound to miss.
                 // The allowlist and the grant list are read **now**, not copied at launch.
                 let conf = self.confinement.borrow().clone();
                 let reason = crate::rc::policy::approval_owner_reason(
@@ -3759,53 +3478,20 @@ impl Session {
                 // authority: every other dangerous verb (changing mode, starting a session with
                 // a mode) has a second gate on the machine side.
                 //
-                // What is stored is the **raw material** (the tool name plus the unredacted
-                // input), not the conclusion: the moment of the answer decides again against
-                // the allowlist as it stands then, see `Session::pending`. So this input is
-                // taken before redaction — the scrubbed copy does not compare against the
-                // allowlist.
+                // What is stored is the **raw material** (the tool name plus the input), not the
+                // conclusion: the moment of the answer decides again against the allowlist as it
+                // stands then, see `Session::pending`.
                 let authority = PendingApproval {
                     tool: req.tool.clone(),
                     input: req.input.clone(),
                     suggested_permission_mode: req.suggested_permission_mode,
-                    unseen: false,
                 };
                 self.set_status(SessionStatus::AwaitingApproval).await;
-                // A harness can deliver the same request again; its newer copy replaces the held
-                // one. One already sent stays answerable whatever this copy's check says, and it is
-                // shown again only once that check passes.
-                self.unshown
-                    .retain(|held| held.request.approval_id != req.approval_id);
-                if self.pending.contains_key(&req.approval_id) {
-                    let protected = self.protect_card(&req).ok();
-                    let unseen = protected.is_none()
-                        && self
-                            .pending
-                            .get(&req.approval_id)
-                            .is_some_and(|shown| shown.unseen);
-                    self.pending.insert(
-                        req.approval_id.clone(),
-                        PendingApproval {
-                            unseen,
-                            ..authority
-                        },
-                    );
-                    if let Some((card, registered)) = protected {
-                        self.alert_registered(registered, "approval").await;
-                        self.emit(method::APPROVAL_REQUEST, card).await;
-                    }
-                } else {
-                    self.offer_approval(UnshownApproval {
-                        request: req,
-                        authority,
-                        waited: std::time::Duration::ZERO,
-                        next: tokio::time::Instant::now(),
-                        incomplete: 0,
-                        retrying: true,
-                    })
-                    .await;
-                }
-                self.settle_unshown_note().await;
+                // The card is the request as the harness raised it, and it is answerable from the
+                // moment it goes out. A harness can deliver the same request again; its newer
+                // copy replaces the pending one and is shown again.
+                self.pending.insert(req.approval_id.clone(), authority);
+                self.emit(method::APPROVAL_REQUEST, req).await;
             }
             HarnessEvent::Notice { text } => {
                 tracing_note(&format!("[{}] {text}", self.info.session_id));
@@ -3944,14 +3630,7 @@ impl Session {
     async fn settle_on_exit(&mut self) {
         self.finish_local_settlement(true).await;
         self.finish_publication(true).await;
-        // Funnelled here for the same reason as the drain: the tail a streaming redactor holds
-        // back leaves only on a flush, and held lines only through their bounded release, while
-        // Shutdown, driver EOF and harness Exited each return on their own — adding the line to
-        // every exit path always misses one, and the symptom is that stretch of text **never**
-        // appearing on the web.
-        self.flush_all_deltas().await;
         self.drain_transcript().await;
-        self.release_held().await;
         // A turn the reaped harness was still running when it ended on its own ends here, as a
         // turn of its own; otherwise the exit commit finds no completion and the turn waits for one
         // that may never come. A turn cut off by a person's stop is held like their interrupt; one
@@ -4423,18 +4102,12 @@ impl Session {
         while std::time::Instant::now() < deadline && quiet_rounds < 2 {
             let before = self.consumed_bytes;
             self.drain_transcript().await;
-            // Lines that wait for their privacy check are not settled output yet.
-            if self.consumed_bytes == before && self.held.is_empty() {
+            if self.consumed_bytes == before {
                 quiet_rounds += 1;
             } else {
                 quiet_rounds = 0;
             }
             tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
-        }
-        // The turn boundary does not wait for held lines: the first one shows its marker before
-        // it, and they are still retried and shown after it.
-        if !self.held.is_empty() {
-            self.project_held(Release::Notice).await;
         }
     }
 
@@ -4480,17 +4153,14 @@ impl Session {
                 .map_err(anyhow::Error::msg)
                 .and_then(|bytes| {
                     if snapshot.finalized {
-                        self.native_records
-                            .project_final(&bytes, self.resuming, &self.redactor)
+                        self.native_records.project_final(&bytes, self.resuming)
                     } else {
-                        self.native_records
-                            .project(&bytes, self.resuming, &self.redactor)
+                        self.native_records.project(&bytes, self.resuming)
                     }
                 });
             match projection {
-                Ok((items, registered)) => {
+                Ok(items) => {
                     self.consumed_bytes = self.consumed_bytes.saturating_add(1);
-                    self.alert_registered(registered, "item_completed").await;
                     for item in items {
                         self.emit(method::ITEM_COMPLETED, item).await;
                     }
@@ -4530,7 +4200,7 @@ impl Session {
                 poll_and_mark(tailer, &mut self.consumed_bytes),
             )
         };
-        if polled.is_empty() && self.held.is_empty() {
+        if polled.is_empty() {
             return;
         }
 
@@ -4538,344 +4208,37 @@ impl Session {
         // so it must not be alive across an `.await` — keeping the parse in its
         // own scope (inside `items_from_lines`) is what lets this whole session
         // run as a spawned task.
-        let shown = self.held.project(
-            &self.info.runtime,
-            &self.redactor,
-            polled,
-            mode,
-            Release::Retry,
-        );
-        self.alert_registered(shown.registered, "item_completed")
-            .await;
-        for item in shown.items {
-            self.emit(method::ITEM_COMPLETED, item).await;
-        }
-    }
-
-    /// Before the session ends, held lines get a bounded wait for their privacy check; whatever
-    /// still waits is given up and shown as the marker, so no record a viewer would have seen is
-    /// lost without a trace.
-    async fn release_held(&mut self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(SETTLE_MAX_MS);
-        while !self.held.is_empty() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(TAIL_POLL_MS)).await;
-            self.drain_transcript().await;
-        }
-        if !self.held.is_empty() {
-            self.project_held(Release::Finish).await;
-        }
-    }
-
-    /// Show what the held lines may show now under `release`.
-    async fn project_held(&mut self, release: Release) {
-        let mode = self.held.mode();
-        let shown = self.held.project(
-            &self.info.runtime,
-            &self.redactor,
-            Vec::new(),
-            mode,
-            release,
-        );
-        self.alert_registered(shown.registered, "item_completed")
-            .await;
-        for item in shown.items {
+        let items = items_from_lines_with_mode(&self.info.runtime, &polled, mode);
+        for item in items {
             self.emit(method::ITEM_COMPLETED, item).await;
         }
     }
 }
 
-/// How long tailed lines wait for their privacy check before a viewer is shown the marker in
-/// their place while they are still retried: longer than a worker back-off and one budget, so
-/// ordinary contention never shows it outside a turn boundary, which shows it at once (see
-/// [`Release::Notice`]).
-pub(crate) const HELD_TAIL_NOTICE: std::time::Duration = std::time::Duration::from_secs(12);
-const _: () = assert!(
-    HELD_TAIL_NOTICE.as_millis() > crate::domain::privacy::service::RETRY_WINDOW.as_millis()
-);
-/// How long the first held line is retried before it may be given up and shown as the marker,
-/// so a record that never passes holds nothing after it: several worker back-offs.
-pub(crate) const HELD_TAIL_GIVE_UP: std::time::Duration =
-    std::time::Duration::from_secs(3 * HELD_TAIL_NOTICE.as_secs());
-/// How many times the first held line's own check must have failed, with a deadline or a
-/// protocol error, before it may be given up. Lock contention and back-offs never give a line up:
-/// it waits, bounded by [`HELD_TAIL_BYTES`].
-pub(crate) const HELD_TAIL_GIVE_UP_FAILURES: u32 = 3;
-/// How much tailed text may wait for its privacy check before it is given up and shown as the
-/// marker.
-pub(crate) const HELD_TAIL_BYTES: usize = 16 * 1024 * 1024;
-
-/// What a projection of held lines does with the ones whose privacy check has not passed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Release {
-    /// Hold them and retry; the first one's marker shows once it has waited the notice.
-    Retry,
-    /// As `Retry`, but the first one's marker shows now: a turn boundary does not pass in
-    /// silence.
-    Notice,
-    /// Hold nothing: whatever has not passed is given up and shown as its marker.
-    Finish,
-}
-
-/// Tailed lines whose privacy check has not passed yet. The cursor that read them has moved on,
-/// so this is their only copy: they are held from the first line whose check may pass on a later
-/// try and projected again with the next poll, so a busy or slow privacy worker delays them
-/// instead of losing them. A record that can never pass is shown as its marker and not held, and
-/// so is a first line whose own check kept failing through [`HELD_TAIL_GIVE_UP`].
-#[derive(Default)]
-pub(crate) struct HeldTail {
-    lines: Vec<crate::rc::tail::TailedLine>,
-    mode: Option<super::codex_history::HistoryMode>,
-    head: Option<HeldHead>,
-    #[cfg(test)]
-    timing: Option<(std::time::Duration, std::time::Duration)>,
-}
-
-/// The first held line, since when it waits, how often its own check failed, and whether its
-/// marker was shown.
-struct HeldHead {
-    line: (Option<String>, u64),
-    since: std::time::Instant,
-    failures: u32,
-    noticed: bool,
-}
-
-fn held_key(line: &crate::rc::tail::TailedLine) -> (Option<String>, u64) {
-    (line.source.clone(), line.lineno)
-}
-
-/// What a tail may show now.
-pub(crate) struct ShownLines {
-    pub lines: Vec<crate::rc::tail::TailedLine>,
-    pub items: Vec<ItemCompleted>,
-    pub registered: Vec<String>,
-}
-
-impl HeldTail {
-    /// A tail whose notice and give-up periods are `notice` and `give_up`.
-    #[cfg(test)]
-    pub(crate) fn with_timing(notice: std::time::Duration, give_up: std::time::Duration) -> Self {
-        Self {
-            timing: Some((notice, give_up)),
-            ..Self::default()
-        }
-    }
-
-    fn timing(&self) -> (std::time::Duration, std::time::Duration) {
-        #[cfg(test)]
-        if let Some(timing) = self.timing {
-            return timing;
-        }
-        (HELD_TAIL_NOTICE, HELD_TAIL_GIVE_UP)
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// The history mode the held lines were read in.
-    pub(crate) fn mode(&self) -> super::codex_history::HistoryMode {
-        self.mode
-            .unwrap_or(super::codex_history::HistoryMode::Model)
-    }
-
-    /// Project the held lines followed by `polled` and return the lines, with their items, that
-    /// may be shown now; [`Release`] says what happens to the ones that have not passed. A first
-    /// line that was held before is tried on its own first, so a record after it in the same
-    /// request cannot keep it from passing.
-    pub(crate) fn project(
-        &mut self,
-        runtime: &str,
-        redactor: &redact::Redactor,
-        polled: Vec<crate::rc::tail::TailedLine>,
-        mode: super::codex_history::HistoryMode,
-        release: Release,
-    ) -> ShownLines {
-        let held_before = !self.lines.is_empty();
-        let mut lines = std::mem::take(&mut self.lines);
-        lines.extend(polled);
-        self.mode = Some(mode);
-        // Beyond the byte bound nothing more is held: whatever has not passed is given up. It
-        // applies once lines already wait, so one large poll is still held once.
-        let release = if held_before
-            && lines.iter().map(|line| line.text.len()).sum::<usize>() > HELD_TAIL_BYTES
-        {
-            Release::Finish
-        } else {
-            release
-        };
-        let mut shown = ShownLines {
-            lines: Vec::new(),
-            items: Vec::new(),
-            registered: Vec::new(),
-        };
-        let mut start = 0;
-        if lines.len() > 1
-            && self
-                .head
-                .as_ref()
-                .is_some_and(|head| head.line == held_key(&lines[0]))
-        {
-            if self.step(runtime, redactor, &lines[..1], mode, release, &mut shown) == 0 {
-                self.lines = lines;
-                return shown;
-            }
-            start = 1;
-        }
-        let done = self.step(
-            runtime,
-            redactor,
-            &lines[start..],
-            mode,
-            release,
-            &mut shown,
-        );
-        self.lines = lines.split_off(start + done);
-        shown
-    }
-
-    /// Projects `lines` into `shown` and returns how many leading lines are done; the lines
-    /// after them stay held.
-    fn step(
-        &mut self,
-        runtime: &str,
-        redactor: &redact::Redactor,
-        lines: &[crate::rc::tail::TailedLine],
-        mode: super::codex_history::HistoryMode,
-        release: Release,
-        shown: &mut ShownLines,
-    ) -> usize {
-        let (notice, give_up) = self.timing();
-        let expired = self.head.as_ref().is_some_and(|head| {
-            lines
-                .first()
-                .is_some_and(|first| head.line == held_key(first))
-                && head.failures >= HELD_TAIL_GIVE_UP_FAILURES
-                && head.since.elapsed() >= give_up
-        });
-        let given_up = if release == Release::Finish {
-            lines.len()
-        } else {
-            usize::from(expired)
-        };
-        let projected =
-            items_from_lines_tracked(runtime, redactor, lines, mode, given_up, &mut |_, _| {});
-        let (show, done) = match projected.first_withheld {
-            None => {
-                self.head = None;
-                (lines.len(), lines.len())
-            }
-            Some(first) => {
-                let line = held_key(&lines[first]);
-                if !self.head.as_ref().is_some_and(|head| head.line == line) {
-                    self.head = Some(HeldHead {
-                        line,
-                        since: std::time::Instant::now(),
-                        failures: 0,
-                        noticed: false,
-                    });
-                }
-                let head = self.head.as_mut().expect("the first held line is tracked");
-                head.failures += u32::from(projected.first_withheld_failed);
-                // Its marker shows once, while the line is still retried.
-                if !head.noticed && (release == Release::Notice || head.since.elapsed() >= notice) {
-                    head.noticed = true;
-                    (first + 1, first)
-                } else {
-                    (first, first)
-                }
-            }
-        };
-        shown.items.extend(
-            projected
-                .items
-                .into_iter()
-                .zip(projected.item_lines)
-                .filter(|(_, line)| *line < show)
-                .map(|(item, _)| item),
-        );
-        shown.registered.extend(projected.registered);
-        shown.lines.extend_from_slice(&lines[..show]);
-        done
-    }
-}
-
-/// Transcript lines → `item.completed` payloads, plus the device-local rule ids
-/// these lines matched. Shared by the supervised session and the read-only watch
-/// path — both must produce the exact same items for the same lines, or the two
-/// views of one session drift.
+/// Transcript lines → `item.completed` payloads. Shared by the supervised session, the read-only
+/// watch path and history pages: each must produce the exact same items for the same lines, or
+/// the views of one session drift.
 pub fn items_from_lines(
     runtime: &str,
-    redactor: &redact::Redactor,
     lines: &[crate::rc::tail::TailedLine],
-) -> (Vec<ItemCompleted>, Vec<String>) {
-    items_from_lines_with_mode(
-        runtime,
-        redactor,
-        lines,
-        super::codex_history::HistoryMode::Model,
-    )
+) -> Vec<ItemCompleted> {
+    items_from_lines_with_mode(runtime, lines, super::codex_history::HistoryMode::Model)
 }
 
+/// [`items_from_lines`] for lines read in `mode`. A record goes as the harness wrote it: its
+/// `raw` is the line's own JSON, capped for the wire, and its `object_hash` is the hash the
+/// committed envelope carries, which is what lets the hub reconcile the live projection against
+/// the pushed transcript.
 pub(crate) fn items_from_lines_with_mode(
     runtime: &str,
-    redactor: &redact::Redactor,
     lines: &[crate::rc::tail::TailedLine],
     mode: super::codex_history::HistoryMode,
-) -> (Vec<ItemCompleted>, Vec<String>) {
-    items_from_lines_profiled(runtime, redactor, lines, mode, &mut |_, _| {})
-}
-
-pub(crate) fn items_from_lines_profiled(
-    runtime: &str,
-    redactor: &redact::Redactor,
-    lines: &[crate::rc::tail::TailedLine],
-    mode: super::codex_history::HistoryMode,
-    record_timing: &mut dyn FnMut(&'static str, f64),
-) -> (Vec<ItemCompleted>, Vec<String>) {
-    let projected = items_from_lines_tracked(runtime, redactor, lines, mode, 0, record_timing);
-    (projected.items, projected.registered)
-}
-
-/// `item.completed` payloads for `lines`, with where each came from and where privacy stopped.
-pub(crate) struct ProjectedLines {
-    pub items: Vec<ItemCompleted>,
-    pub registered: Vec<String>,
-    /// For each item, the index in `lines` of the line it came from.
-    pub item_lines: Vec<usize>,
-    /// The index in `lines` of the first line whose privacy check did not complete and may on
-    /// a later try. A record that can never pass, or one given up, shows its marker and does not
-    /// count here.
-    pub first_withheld: Option<usize>,
-    /// Whether that line's check ran and failed, rather than not running for contention.
-    pub first_withheld_failed: bool,
-    /// Why that line's check did not complete, when the worker said.
-    pub first_withheld_reason: Option<crate::domain::privacy::projector::Reason>,
-}
-
-/// Records from lines before `given_up` whose privacy check did not complete are given up: each
-/// shows [`redact::GIVEN_UP_TEXT`]. Of the later ones, which may still pass, only the first
-/// shows a marker, since everything after it waits with it.
-pub(crate) fn items_from_lines_tracked(
-    runtime: &str,
-    redactor: &redact::Redactor,
-    lines: &[crate::rc::tail::TailedLine],
-    mode: super::codex_history::HistoryMode,
-    given_up: usize,
-    record_timing: &mut dyn FnMut(&'static str, f64),
-) -> ProjectedLines {
-    let mut projected = ProjectedLines {
-        items: vec![],
-        registered: vec![],
-        item_lines: vec![],
-        first_withheld: None,
-        first_withheld_failed: false,
-        first_withheld_reason: None,
-    };
+) -> Vec<ItemCompleted> {
     let Ok(adapter) = crate::adapter::get(runtime) else {
-        return projected;
+        return Vec::new();
     };
-    let mut records = vec![];
-    for (index, line) in lines.iter().enumerate() {
+    let mut out = vec![];
+    for line in lines {
         if line.text.trim().is_empty() {
             continue;
         }
@@ -4889,9 +4252,6 @@ pub(crate) fn items_from_lines_tracked(
             let Ok(parsed) = adapter.parse(&line.text) else {
                 continue;
             };
-            if parsed.events.is_empty() {
-                continue;
-            }
             let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
                 continue;
             };
@@ -4900,84 +4260,13 @@ pub(crate) fn items_from_lines_tracked(
         if events.is_empty() {
             continue;
         }
-
-        let verified = (runtime == "codex")
-            .then(|| super::codex_history::prompt_identity_pointer(&raw, mode))
-            .flatten();
-        records.push((index, line, raw, verified.into_iter().collect::<Vec<_>>()));
-    }
-    let inputs: Vec<_> = records
-        .iter()
-        .map(|(_, _, raw, pointers)| (raw, pointers.as_slice()))
-        .collect();
-    let protected = redactor.scrub_native_batch_profiled(&inputs, record_timing);
-    let mut out = vec![];
-    let mut registered = std::collections::HashSet::new();
-    let mut pending_marker_emitted = false;
-    for ((index, line, raw, _), scrubbed) in records.into_iter().zip(protected) {
-        let secret_projection = scrubbed.secret_projection;
-        registered.extend(scrubbed.registered_ids);
-        let scrubbed_raw = scrubbed.value;
         let native_prompt_id = (runtime == "codex")
-            .then(|| super::codex_history::prompt_identity(&scrubbed_raw, mode))
+            .then(|| super::codex_history::prompt_identity(&raw, mode))
             .flatten();
-        // Once a secret value is removed, sending the hash of the original JSON
-        // can give the hub an offline dictionary oracle. Path/persona redaction must
-        // retain the committed envelope's original hash so live reconciliation
-        // still works.
-        let object_hash = projected_object_hash(&raw, &scrubbed_raw, secret_projection);
-        let mut privacy_pending = None;
-        let events = if scrubbed_raw.get("protection_error").is_some() {
-            let marker = if scrubbed.permanent {
-                scrubbed_raw["protection_error"]
-                    .as_str()
-                    .unwrap_or(redact::TOO_LARGE_TEXT)
-                    .to_owned()
-            } else if index < given_up {
-                redact::GIVEN_UP_TEXT.to_owned()
-            } else {
-                if projected.first_withheld.is_none() {
-                    projected.first_withheld = Some(index);
-                    projected.first_withheld_failed = scrubbed.failed;
-                    projected.first_withheld_reason = scrubbed.reason;
-                }
-                if pending_marker_emitted {
-                    continue;
-                }
-                pending_marker_emitted = true;
-                privacy_pending = Some(crate::domain::privacy::service::reason_name(
-                    scrubbed.reason,
-                ))
-                .filter(|reason| crate::domain::privacy::service::worker_state(reason))
-                .map(str::to_owned);
-                redact::PROTECTION_ERROR_TEXT.to_owned()
-            };
-            vec![crate::adapter::Event::text(
-                crate::adapter::EventKind::AssistantReply,
-                marker,
-                None,
-            )]
-        } else if runtime == "codex" {
-            super::codex_history::events(&scrubbed_raw, mode)
-        } else {
-            serde_json::to_string(&scrubbed_raw)
-                .ok()
-                .and_then(|text| adapter.parse(&text).ok())
-                .map(|session| session.events)
-                .unwrap_or_default()
-        };
-        let (raw_out, truncated) = if scrubbed_raw.get("protection_error").is_some() {
-            // The internal failure marker is a control-plane detail; never put it in the
-            // transcript payload that viewers can inspect.
-            (serde_json::Value::Null, false)
-        } else {
-            cap_raw(scrubbed_raw)
-        };
-
-        // IR text and paths are derived from the protected native bytes before display truncation.
+        let object_hash = transcript::object_hash(&raw);
+        let (raw, truncated) = cap_raw(raw);
         for (i, mut event) in events.into_iter().enumerate() {
             event.line = Some(line.lineno as usize);
-            projected.item_lines.push(index);
             out.push(ItemCompleted {
                 source_id: line
                     .source
@@ -4993,32 +4282,15 @@ pub(crate) fn items_from_lines_tracked(
                 // one line can produce several events and shipping the
                 // same bytes N times is pure waste.
                 raw: if i == 0 {
-                    raw_out.clone()
+                    raw.clone()
                 } else {
                     serde_json::Value::Null
                 },
                 raw_truncated: truncated,
-                privacy_pending: privacy_pending.clone(),
             });
         }
     }
-    projected.items = out;
-    projected.registered = registered.into_iter().collect();
-    projected
-}
-
-/// The identity the hub is told this line has.
-///
-/// Ordinary persona/path redaction keeps the **original** hash: that identity is
-/// what lets the hub reconcile the live projection against the pushed
-/// transcript. A registered low-entropy value is the one exception — see
-/// [`items_from_lines`].
-fn projected_object_hash(
-    raw: &serde_json::Value,
-    scrubbed: &serde_json::Value,
-    registered_projection: bool,
-) -> String {
-    transcript::object_hash(if registered_projection { scrubbed } else { raw })
+    out
 }
 
 /// Cap an oversized raw line. Returns the value to send and whether it was cut.
@@ -5073,71 +4345,3 @@ mod tests;
 
 #[cfg(test)]
 mod settle_tests;
-
-#[cfg(test)]
-mod approval_card_tests {
-    use super::tests::harness_test_session_with_channels;
-    use super::*;
-
-    /// This pins that **every** string field on an approval card is scrubbed, `paths` included.
-    ///
-    /// `harness::paths_of` puts the absolute `file_path` into `paths`. With summary and input
-    /// each scrubbed, the untouched `/Users/alice/secret/src/main.rs` in the same struct still
-    /// leaves the machine with `approval.request` — everyone in the workspace who sees this
-    /// card gets the machine owner's username and home directory.
-    #[tokio::test]
-    async fn an_approval_cards_paths_leave_the_machine_scrubbed_like_its_input() {
-        let driver = AnyDriver::ClaudeCode(Box::new(
-            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver(),
-        ));
-        let (mut session, mut out, _notes) =
-            harness_test_session_with_channels(driver, "claude-code", SessionStatus::Idle);
-        session.redactor = redact::Redactor::new(redact::Persona {
-            username: Some("alice".into()),
-            home: Some("/Users/alice".into()),
-            hostname: None,
-        });
-
-        session
-            .on_harness_event(HarnessEvent::Approval(crate::protocol::ApprovalRequest {
-                approval_id: "approval-paths".into(),
-                session_id: String::new(),
-                turn_id: "turn-paths".into(),
-                kind: crate::protocol::ApprovalKind::FileChange,
-                tool: "Edit".into(),
-                input: serde_json::json!({ "file_path": "/Users/alice/secret/src/main.rs" }),
-                summary: "edit /Users/alice/secret/src/main.rs".into(),
-                paths: vec!["/Users/alice/secret/src/main.rs".into()],
-                timeout_secs: 30,
-                requires_owner: false,
-                owner_reason: None,
-                can_allow_for_session: false,
-                suggested_permission_mode: None,
-                requested_at: "now".into(),
-            }))
-            .await;
-
-        let mut card = None;
-        while let Ok(frame) = out.try_recv() {
-            if frame.method.as_deref() == Some(method::APPROVAL_REQUEST) {
-                card = frame.params;
-            }
-        }
-        let card = card.expect("the approval card must still reach the hub");
-        let wire = serde_json::to_string(&card).unwrap();
-        // precondition: input and summary really scrub to `~`, which is to say the redactor on
-        // this machine knows this home directory — otherwise the assertion below only proves
-        // the redactor was misconfigured.
-        assert_eq!(card["input"]["file_path"], "~/secret/src/main.rs");
-        assert_eq!(card["summary"], "edit ~/secret/src/main.rs");
-        assert_eq!(card["paths"][0], "~/secret/src/main.rs");
-        assert!(
-            !wire.contains("/Users/alice"),
-            "the operator's real home left with the approval card: {wire}"
-        );
-        assert!(
-            !wire.contains("alice"),
-            "the operator's username left with the approval card: {wire}"
-        );
-    }
-}
