@@ -182,6 +182,22 @@ class RuntimeArchiveTests(unittest.TestCase):
                 self.assertEqual(puts, [body] if uploaded else [])
                 self.assertEqual(bool(failures), failed, failures)
 
+    def test_lfs_fixture_installer_asks_the_mirror_for_pins_it_holds(self):
+        """install-test-lfs.sh fetches git-runtime-archives/<sha256>/<asset> first in CI.
+
+        That copy exists only for pins git-runtime:mirror uploads from git-runtime-lock.json, so a pin
+        in the installer that the lock lacks would send every CI job back to GitHub.
+        """
+        lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
+        mirrored = {(pin["sha256"], pin["url"].rsplit("/", 1)[-1]) for pin in mirror.upstream_pins(lock)}
+        installer = Path(__file__).with_name("install-test-lfs.sh").read_text()
+        version = re.search(r"^version=(\S+)$", installer, re.M).group(1)
+        pins = re.findall(r"platform=(\S+)\n\s+archive=(\S+)\n\s+checksum=([0-9a-f]{64})", installer)
+        self.assertTrue(pins)
+        for platform, archive, checksum in pins:
+            asset = f"git-lfs-{platform}-v{version}.{archive}"
+            self.assertTrue((checksum, asset) in mirrored, f"{platform}: {asset} at {checksum} is not a mirrored pin")
+
 
 class RuntimeSourceTests(unittest.TestCase):
     def test_every_copyleft_runtime_pin_has_a_published_source(self):
