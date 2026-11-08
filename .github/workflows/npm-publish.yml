@@ -193,11 +193,17 @@ jobs:
           TARBALL="$(npm pack --silent)"
           echo "packed: $TARBALL"
           visible() {
+            local missing=()
             for k in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-              npm view "@einsia/agent-git-$k@$VERSION" version >/dev/null 2>&1 || return 1
+              npm view "@einsia/agent-git-$k@$VERSION" version >/dev/null 2>&1 \
+                || missing+=("@einsia/agent-git-$k@$VERSION")
             done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "Waiting for platform packages: ${missing[*]}"
+              return 1
+            fi
           }
-          for _ in $(seq 20); do
+          for _ in $(seq 80); do
             visible && break
             sleep 15
           done
