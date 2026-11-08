@@ -1007,8 +1007,10 @@ fn failure_line(runtime: &str, session: &str) -> Option<String> {
     let store = Store::at(crate::infra::config::store_root().ok()?);
     let link = link::get(&store, runtime, session).filter(Link::is_active)?;
     let repository = format!("{}/{}", link.owner?, link.agent?);
-    let undone = super::upload_outcome::unreported(&repository, link.branch.as_deref()?)?;
-    Some(upload_line(&repository, undone))
+    let branch = link.branch?;
+    let undone = super::upload_outcome::unreported(&repository, &branch)?;
+    let folder = link.cwd.as_deref().map(std::path::Path::new);
+    Some(upload_line(&repository, &branch, folder, undone))
 }
 
 /// The line for a conversation whose claim another session took over, as resume does when it
@@ -1031,19 +1033,35 @@ fn superseded_line(runtime: &str, session: &str) -> Option<String> {
     ))
 }
 
-/// The line that tells the person what kept the newest automatic upload to `repository` from
-/// going through.
-fn upload_line(repository: &str, undone: super::upload_outcome::Undone) -> String {
+/// The line that tells the person what kept the newest automatic upload of `repository@branch`
+/// from going through, naming the command that goes on from it in full. A folder that keeps the
+/// conversation here failed at nothing, so its line says what happened instead.
+fn upload_line(
+    repository: &str,
+    branch: &str,
+    folder: Option<&std::path::Path>,
+    undone: super::upload_outcome::Undone,
+) -> String {
+    use super::project::{Reader, UploadFailure};
+    use super::upload_outcome::Undone;
+    let target = format!("{repository}@{branch}");
+    let said = undone.describe_for(&target, Reader::Person, None);
     match undone {
-        super::upload_outcome::Undone::Failed(_) => format!(
-            "agit: the last automatic upload to {repository} failed: {}.",
-            undone.describe()
-        ),
-        super::upload_outcome::Undone::Ended | super::upload_outcome::Undone::Unrecorded => {
+        Undone::Failed(UploadFailure::FolderOff) => {
+            let folder = folder.map_or_else(
+                || "the folder it ran in".to_owned(),
+                |folder| format!("the folder it ran in, {},", crate::ui::tilde(folder)),
+            );
             format!(
-                "agit: the last automatic upload to {repository} didn't go through: {}.",
-                undone.describe()
+                "agit: the turns of this conversation are saved on this computer and not uploaded: {}.",
+                said.replacen("the folder it ran in", &folder, 1)
             )
+        }
+        Undone::Failed(_) => {
+            format!("agit: the last automatic upload to {repository} failed: {said}.")
+        }
+        Undone::Ended | Undone::Unrecorded => {
+            format!("agit: the last automatic upload to {repository} didn't go through: {said}.")
         }
     }
 }
@@ -1618,14 +1636,62 @@ mod tests {
         let refused = format!("remote branch work moved on (Hub tip abc), and {NOTHING_NEW}");
         let class = UploadFailure::reported(Some(4), &refused);
         assert_eq!(class, UploadFailure::Behind);
+        let line = |undone| super::upload_line("alice/app", "work", None, undone);
         assert_eq!(
-            super::upload_line("alice/app", Undone::Failed(class)),
-            "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't, and this computer has nothing new to upload; `agit push` for this branch shows how to go on."
+            line(Undone::Failed(class)),
+            "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't, and this computer has nothing new to upload; `agit push alice/app@work` shows how to go on."
         );
         assert_eq!(
-            super::upload_line("alice/app", Undone::Failed(UploadFailure::Other)),
-            "agit: the last automatic upload to alice/app failed: it could not be completed on this computer; `agit push` for this branch shows why."
+            line(Undone::Failed(UploadFailure::Other)),
+            "agit: the last automatic upload to alice/app failed: it could not be completed on this computer; `agit status` shows why, and `agit push alice/app@work --dry-run` checks it without sending anything."
         );
+    }
+
+    /// Once the runtime has exited, a bare `agit push` has no session to act on, so every turn-end
+    /// line that sends the person to a push names its target in full. A folder that doesn't upload
+    /// the conversation by itself failed at nothing: its line leads with what happened and names
+    /// the folder and the push that uploads it. Whatever the push said is never in these lines:
+    /// they go into the transcript, which is published.
+    #[test]
+    fn a_turn_end_line_names_the_push_that_goes_on_from_it() {
+        use super::super::project::UploadFailure;
+        use super::super::upload_outcome::Undone;
+        use crate::commands::push::FOLDER_KEEPS_IT;
+
+        let refused = format!(
+            "`alice/app@work` {FOLDER_KEEPS_IT}; `agit push alice/app@work` uploads it if you want it there"
+        );
+        assert_eq!(
+            UploadFailure::reported(Some(1), &refused),
+            UploadFailure::FolderOff
+        );
+        assert_eq!(
+            super::upload_line(
+                "alice/app",
+                "work",
+                Some(std::path::Path::new("/w/parley")),
+                Undone::Failed(UploadFailure::FolderOff)
+            ),
+            "agit: the turns of this conversation are saved on this computer and not uploaded: the folder it ran in, /w/parley, doesn't upload it by itself; `agit push alice/app@work` uploads it if you want it there."
+        );
+        let diverged = super::upload_line(
+            "alice/app",
+            "work",
+            None,
+            Undone::Failed(UploadFailure::Diverged),
+        );
+        assert!(
+            diverged.contains("`agit push alice/app@work --keep-both` keeps both, and `agit push alice/app@work` shows how to merge them instead"),
+            "{diverged}"
+        );
+        for class in [
+            UploadFailure::TooLarge,
+            UploadFailure::BuildsOnWithdrawn,
+            UploadFailure::Withheld,
+        ] {
+            let said = super::upload_line("alice/app", "work", None, Undone::Failed(class));
+            assert!(said.contains("`agit push alice/app@work`"), "{said}");
+        }
     }
 
     /// A restored title rides beside a system message. Claude Code drops a hook response whose

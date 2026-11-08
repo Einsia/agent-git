@@ -8339,7 +8339,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     assert_eq!(
         launch(turn(4)).as_deref(),
         Some(
-            "agit: saved 1 turn of this conversation on this computer; the upload to alice/app failed: the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again."
+            "agit: saved 1 turn of this conversation on this computer; the upload to alice/app failed: the session is larger than the Hub accepts, so later turns of it stay on this computer; `agit push alice/app@work` asks the Hub again."
         )
     );
     let previews = hub.previews.lock().unwrap().len();
@@ -9781,7 +9781,7 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
         serde_json::from_str(said.lines().next().unwrap_or_default()).unwrap_or_default();
     assert_eq!(
         message["systemMessage"],
-        "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them.",
+        "agit: the last automatic upload to alice/app failed: this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer: `agit push alice/app@work --keep-both` keeps both, and `agit push alice/app@work` shows how to merge them instead.",
         "{said}"
     );
 
@@ -9805,15 +9805,28 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
     let value =
         &serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["result"]["value"];
     assert_eq!(value["sessions"]["items"], json!([]), "{value}");
+    // Read by a program, the push that keeps both is the user's to ask for. What the push said is
+    // there too, for `agit status` alone.
+    let items = value["uploads_not_through"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{value}");
+    let mut item = items[0].clone();
+    let said = item["said"].take();
+    assert!(
+        said.as_str().is_some_and(
+            |said| said.starts_with("remote branch work has diverged from this checkout")
+        ),
+        "{value}"
+    );
+    item.as_object_mut().unwrap().remove("said");
     assert_eq!(
-        value["uploads_not_through"]["items"],
-        json!([{
+        item,
+        json!({
             "target": "alice/app@work",
             "state": "failed",
             "reason": "diverged",
-            "description": "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer, and `agit push` for this branch shows how to keep both or merge them",
+            "description": "this conversation also continued on another computer, so the Hub has turns this computer doesn't; turns here stay on this computer; if the user wants to keep both: `agit push alice/app@work --keep-both`, and `agit push alice/app@work` shows how to merge them instead",
             "command": "agit push alice/app@work",
-        }]),
+        }),
         "{value}"
     );
     let listed = agit(&["project", "list", "--json"], None);

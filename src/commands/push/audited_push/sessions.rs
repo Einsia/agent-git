@@ -1434,6 +1434,7 @@ mod answer_tests {
 /// Why an automatic upload of `slug@branch` was refused by the folder its conversation ran in.
 fn folder_refusal(slug: &str, branch: &str) -> String {
     format!(
-        "`{slug}@{branch}` is not uploaded automatically: the folder it ran in left it out, or doesn't upload by itself; `agit push {slug}@{branch}` uploads it if you want it there"
+        "`{slug}@{branch}` {}; `agit push {slug}@{branch}` uploads it if you want it there",
+        crate::commands::push::FOLDER_KEEPS_IT
     )
 }
