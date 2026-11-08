@@ -25,6 +25,8 @@
     "domain::secret_filter::repository_keys::tests",
     "rc::transport::tests",
     "rc::policy::tests::directory_requests_never_truncate_verbatim_path_components",
+    "infra::background::tests::a_helper_that_outlives_its_parent_does_not_hold_the_parent_output",
+    "infra::background::tests::a_child_that_inherits_output_still_writes_to_it_after_the_sweep",
     "infra::background::tests::helper_has_no_console_window_and_keeps_output",
     "rc::harness::proc::tests::windows_shutdown_reaps_the_harness_job_before_returning",
     "rc::local::windows::tests",

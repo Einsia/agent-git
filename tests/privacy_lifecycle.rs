@@ -246,8 +246,12 @@ impl Device {
         );
     }
 
+    /// Doctor's report, read to the end of its output. Doctor starts the privacy worker, and the
+    /// output ends when doctor exits, not whenever a helper it started lets go of it.
     fn doctor(&self) -> String {
-        let output = self.command().arg("doctor").output().unwrap();
+        let mut doctor = self.command();
+        doctor.arg("doctor");
+        let output = output_within(doctor, OUTPUT_LIMIT);
         forward_lock_waits(&output.stderr);
         let report = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
@@ -276,6 +280,79 @@ impl Device {
 }
 
 /// A child's lines about long state-lock waits, repeated in the test's own output.
+const OUTPUT_LIMIT: Duration = Duration::from_secs(90);
+
+/// `command`'s output, or a failure when `limit` passes first: the failure comes at the limit,
+/// however long the output would have stayed open, and says whether the command itself had exited
+/// or something it started was still holding its output.
+fn output_within(mut command: Command, limit: Duration) -> std::process::Output {
+    let deadline = Instant::now() + limit;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (done, finished) = std::sync::mpsc::channel();
+    let read = |stream: Box<dyn Read + Send>, index: usize| {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut bytes = Vec::new();
+            let _ = stream.read_to_end(&mut bytes);
+            let _ = done.send((index, bytes));
+        });
+    };
+    read(Box::new(child.stdout.take().unwrap()), 0);
+    read(Box::new(child.stderr.take().unwrap()), 1);
+    let mut streams = [Vec::new(), Vec::new()];
+    for _ in 0..2 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match finished.recv_timeout(remaining) {
+            Ok((index, bytes)) => streams[index] = bytes,
+            Err(_) => {
+                let state = match child.try_wait() {
+                    Ok(Some(status)) => format!("the command had exited ({status})"),
+                    _ => "the command was still running".to_string(),
+                };
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("output still open after {limit:?}; {state}");
+            }
+        }
+    }
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the command was still running {limit:?} after it started; its output had closed"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let [stdout, stderr] = streams;
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+/// A helper that holds a finished command's output fails at the limit, well before the helper
+/// would have let go.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "output still open after 2s; the command had exited")]
+fn output_held_after_the_command_exits_fails_at_the_limit() {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "sleep 10 &"]);
+    output_within(command, Duration::from_secs(2));
+}
+
 fn forward_lock_waits(stderr: &[u8]) {
     for line in String::from_utf8_lossy(stderr)
         .lines()
@@ -606,6 +683,36 @@ fn read_only_inspection_creates_no_privacy_journal() {
         journals(&device.home).is_empty(),
         "{:?}",
         journals(&device.home)
+    );
+}
+
+/// A worker that cannot run is reported in the command's own output, read to its end, and the
+/// report does not depend on anything the worker writes. A missing worker is the failure here.
+#[test]
+fn a_worker_that_cannot_start_is_reported_in_the_output_that_was_captured() {
+    let hub = Hub::new();
+    let device = Device::new(&hub.url);
+    let mut doctor = device.command();
+    doctor
+        .env(
+            "AGIT_TEST_PRIVACY_WORKER",
+            device.home.join("no-such-privacy-worker"),
+        )
+        .arg("doctor");
+    let output = output_within(doctor, OUTPUT_LIMIT);
+    let report = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(
+        report.contains("privacy is temporarily unavailable"),
+        "{report}"
+    );
+    assert!(
+        report.contains("the privacy rules registered on this computer could not be checked"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("every rule registered on this computer can be read"),
+        "{report}"
     );
 }
 

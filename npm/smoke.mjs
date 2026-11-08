@@ -67,6 +67,16 @@ if (process.platform === 'win32') {
   delete env.HOME
   delete env.AGIT_HOME
 }
+// A stand-in `codex` comes first on every step's PATH. agit asks an installed Codex about its
+// features and hooks, and a real one can leave work of its own running in this run's homes after
+// agit returns, which the cleanup below would then meet. The stand-in answers and exits, so agit's
+// own Codex path still runs.
+const fixtureBin = join(work, 'fixture-bin')
+mkdirSync(fixtureBin, { recursive: true })
+writeFileSync(join(fixtureBin, 'codex'), '#!/bin/sh\n[ "$1 $2" = "features list" ] && echo "hooks stable true"\nexit 0\n', { mode: 0o755 })
+writeFileSync(join(fixtureBin, 'codex.cmd'), '@if "%1 %2"=="features list" echo hooks stable true\r\n@exit /b 0\r\n')
+const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH'
+env[pathKey] = `${fixtureBin}${delimiter}${env[pathKey] ?? ''}`
 let failed = 0
 const check = (label, ok, detail = '') => {
   console.log(`${ok ? '✓' : '✗ FAIL'} ${label}${ok ? '' : ` :: ${detail}`}`)
@@ -300,7 +310,7 @@ if (process.platform !== 'win32') {
   const pathOnlyEnv = { ...env, HOME: pathOnly, AGIT_HOME: join(pathOnly, '.agit'),
     CODEX_HOME: join(pathOnly, '.codex'), CLAUDE_CONFIG_DIR: join(pathOnly, '.claude'),
     XDG_DATA_HOME: join(pathOnly, '.local', 'share'), XDG_CONFIG_HOME: join(pathOnly, '.config'),
-    PATH: `${join(pathOnly, 'bin')}:${env.PATH}` }
+    [pathKey]: `${join(pathOnly, 'bin')}${delimiter}${env[pathKey]}` }
   const agit = (args, extra = {}) => spawnSync(bin, args, {
     encoding: 'utf8', env: { ...pathOnlyEnv, ...extra }, cwd: project, stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -374,6 +384,21 @@ if (process.platform !== 'win32') {
   check('postinstall in a source checkout stays silent', r.status === 0, `${r.status} ${r.stderr}`)
 }
 
-rmSync(work, { recursive: true, force: true })
+// Once agit has returned, nothing of it may hold the folder it worked in: a person deleting that
+// folder would meet the same refusal. Record what is alive and fail at once, without retrying.
+function processesThatMayHoldIt() {
+  if (process.platform !== 'win32') return '(not listed on this platform)'
+  const script = `$work = $env:AGIT_SMOKE_WORK
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -in 'agit.exe', 'git.exe', 'node.exe' -or ($_.CommandLine -and $_.CommandLine.Contains($work)) -or ($_.ExecutablePath -and $_.ExecutablePath.Contains($work)) } |
+  ForEach-Object { "pid $($_.ProcessId) parent $($_.ParentProcessId) $($_.Name): $($_.CommandLine)" }`
+  const listed = spawnSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8', env: { ...process.env, AGIT_SMOKE_WORK: work } })
+  return listed.status === 0 ? listed.stdout.trim() || '(none)' : `(could not list: ${listed.error ?? listed.stderr})`
+}
+try {
+  rmSync(work, { recursive: true, force: true })
+} catch (error) {
+  check('the work folder can be removed once agit has returned', false, `${error.code} ${error.path}; processes that may hold it:\n${processesThatMayHoldIt()}`)
+}
 console.log(failed === 0 ? 'smoke ok' : `smoke FAILED (${failed})`)
 process.exit(failed === 0 ? 0 : 1)
