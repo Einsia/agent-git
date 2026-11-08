@@ -1187,7 +1187,7 @@ fn promote_with_progress(
     ))?;
     let copy_identity = validate_copy_response(client.base(), &resp, &source_identity)?;
 
-    relocate_promoted_checkout(
+    let moved = relocate_promoted_checkout(
         &repo,
         source,
         &source_identity,
@@ -1203,6 +1203,9 @@ fn promote_with_progress(
         ui::bold(&source.slug()),
         ui::bold(&format!("{}/{}", resp.owner, resp.name))
     ));
+    if let Some(moved) = moved {
+        progress.line(format_args!("  {moved}"));
+    }
     progress.line(format_args!("  {}", ui::accent(&resp.web_url)));
     progress.line(format_args!(
         "{}",
@@ -1233,7 +1236,7 @@ pub(crate) fn relocate_promoted_checkout(
     owner: &str,
     name: &str,
     push_url: &str,
-) -> crate::Result<()> {
+) -> crate::Result<Option<String>> {
     anyhow::ensure!(
         identity::require_current(repo, &source_identity.hub)? == *source_identity
             && source_identity.agent_id == source.agent_id
@@ -1273,6 +1276,19 @@ pub(crate) fn relocate_promoted_checkout(
             "{destination_slug} already has an active runtime claim; inspect it before promoting this checkout"
         );
     }
+    // The worktrees move with the checkout; one that can't stops the promotion before anything
+    // local changes.
+    let relocation = if dest != checkout {
+        Some(super::worktree::Relocation::plan(
+            repo,
+            &source_slug,
+            owner,
+            name,
+            "nothing was moved",
+        )?)
+    } else {
+        None
+    };
 
     preserve_source_tracking(
         repo,
@@ -1283,16 +1299,30 @@ pub(crate) fn relocate_promoted_checkout(
     repo.set_remote(push_url)?;
     repo.set_upstream(&source.clone_url)?;
 
-    if dest != checkout {
+    let mut moved = None;
+    if let Some(relocation) = &relocation {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::rename(checkout, &dest)
-            .with_context(|| format!("can’t move {} to {}", checkout.display(), dest.display()))?;
+        relocation.apply(repo)?;
+        if let Err(error) = std::fs::rename(checkout, &dest) {
+            relocation.undo(repo);
+            return Err(error).with_context(|| {
+                format!("can’t move {} to {}", checkout.display(), dest.display())
+            });
+        }
+        super::worktree::Relocation::relink(&Repo::at(&dest), checkout);
+        moved = relocation.describe().map(|worktrees| {
+            format!(
+                "the checkout moved: {} → {}, {worktrees}",
+                ui::tilde(checkout),
+                ui::tilde(&dest)
+            )
+        });
     }
     rename_links(&source.owner, &source.name, owner, name)?;
 
-    Ok(())
+    Ok(moved)
 }
 
 /// A copy retains only the source's exchanged refs as publication evidence. Local branch

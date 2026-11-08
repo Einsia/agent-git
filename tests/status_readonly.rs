@@ -1,3 +1,6 @@
+#[path = "support/worktrees.rs"]
+mod worktrees;
+
 use agit::domain::meta::{self, LayoutVersion, Meta};
 use agit::domain::repo::Repo;
 use std::collections::BTreeMap;
@@ -485,10 +488,145 @@ fn a_repository_left_out_at_startup_is_not_read_later_in_the_command() {
     assert!(!table.contains("owner/moved"), "{table}");
 }
 
-/// `agit doctor` is never stopped by a repository Git can't inspect: it names it as a finding,
-/// with the worktree and the command that shows Git's answer, and runs its other checks.
+/// The worktree repair refuses, before it touches any link, a stale registration whose place the
+/// repository of that name took back for a worktree of its own, and a locked worktree. Either way
+/// every worktree's link stays as it was and nothing moves. A repair that relinked first and moved
+/// second would take another repository's worktree, or leave one linked to this repository from
+/// another repository's place when the move failed.
 #[test]
-fn doctor_names_a_repository_git_cannot_inspect_and_runs_its_other_checks() {
+fn the_worktree_repair_refuses_a_reused_place_and_a_locked_worktree_untouched() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    let place = home.join("worktrees/owner/old/main");
+    fs::remove_dir_all(&place).unwrap();
+    Repo::at(home.join("repos/owner/old"))
+        .git(&[
+            "worktree",
+            "add",
+            "--detach",
+            place.to_str().unwrap(),
+            "HEAD",
+        ])
+        .unwrap();
+    let link = fs::read(place.join(".git")).unwrap();
+    let output = status(
+        &home,
+        "http://127.0.0.1:1",
+        &["doctor", "--repair-worktrees", "owner/moved"],
+    );
+    let reused = said(&output);
+    assert_eq!(output.status.code(), Some(4), "{reused}");
+    assert!(
+        reused.contains(
+            "it is owner/old's worktree now, and owner/moved's record of it is out of date; nothing was moved"
+        ),
+        "{reused}"
+    );
+    assert_eq!(fs::read(place.join(".git")).unwrap(), link, "{reused}");
+    assert!(!home.join("worktrees/owner/moved").exists(), "{reused}");
+
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    let place = home.join("worktrees/owner/old/main");
+    Repo::at(home.join("repos/owner/moved"))
+        .git(&["worktree", "lock", place.to_str().unwrap()])
+        .unwrap();
+    let link = fs::read(place.join(".git")).unwrap();
+    let output = status(
+        &home,
+        "http://127.0.0.1:1",
+        &["doctor", "--repair-worktrees", "owner/moved"],
+    );
+    let locked = said(&output);
+    assert_eq!(output.status.code(), Some(4), "{locked}");
+    assert!(
+        locked.contains("it is locked; `git worktree unlock ")
+            && locked.contains("if nothing uses it; nothing was moved"),
+        "{locked}"
+    );
+    assert_eq!(fs::read(place.join(".git")).unwrap(), link, "{locked}");
+    assert!(!home.join("worktrees/owner/moved").exists(), "{locked}");
+}
+
+/// The worktree repair writes only the link of the worktree it moves. A second registration of
+/// the same repository, outside agit's worktrees, whose path the original-name repository has
+/// since used for a worktree of its own, keeps that repository's link; and a file standing where a
+/// folder on the way to the target belongs stops the repair before any link changes. Git's own
+/// repair rewrites every registration's link, so the second worktree would open the copy.
+#[test]
+fn the_worktree_repair_touches_only_the_worktree_it_moves() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    moved_from_its_worktree(&home);
+    let side = fixture.path().join("elsewhere/side");
+    fs::create_dir_all(side.parent().unwrap()).unwrap();
+    Repo::at(home.join("repos/owner/moved"))
+        .git(&[
+            "worktree",
+            "add",
+            "--detach",
+            side.to_str().unwrap(),
+            "HEAD",
+        ])
+        .unwrap();
+    fs::remove_dir_all(&side).unwrap();
+    Repo::at(home.join("repos/owner/old"))
+        .git(&[
+            "worktree",
+            "add",
+            "--detach",
+            side.to_str().unwrap(),
+            "HEAD",
+        ])
+        .unwrap();
+    let side_link = fs::read(side.join(".git")).unwrap();
+
+    let blocked = home.join("worktrees/owner/moved");
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::write(&blocked, b"a file where a folder belongs").unwrap();
+    let place = home.join("worktrees/owner/old/main");
+    let link = fs::read(place.join(".git")).unwrap();
+    let output = status(
+        &home,
+        "http://127.0.0.1:1",
+        &["doctor", "--repair-worktrees", "owner/moved"],
+    );
+    let refused = said(&output);
+    assert_eq!(output.status.code(), Some(4), "{refused}");
+    assert!(
+        refused.contains("worktrees/owner/moved; nothing was moved"),
+        "{refused}"
+    );
+    assert_eq!(fs::read(place.join(".git")).unwrap(), link, "{refused}");
+
+    fs::remove_file(&blocked).unwrap();
+    let output = status(
+        &home,
+        "http://127.0.0.1:1",
+        &["doctor", "--repair-worktrees", "owner/moved"],
+    );
+    let repaired = said(&output);
+    assert_success(&output);
+    assert!(
+        home.join("worktrees/owner/moved/main/.git").exists(),
+        "{repaired}"
+    );
+    assert_eq!(
+        fs::read(side.join(".git")).unwrap(),
+        side_link,
+        "{repaired}"
+    );
+}
+
+/// `agit doctor` is never stopped by a repository Git can't inspect, and runs its other checks.
+/// A worktree sitting in another repository's place is named with that place and the one command
+/// that moves it into its own repository's place; after that command, the worktree opens there,
+/// every worktree names its repository, and status no longer leaves the repository out. A repair
+/// that rewrote the worktree's link where it stands would leave it naming the wrong repository.
+#[test]
+fn doctor_names_a_misplaced_worktree_and_its_repair_moves_it_home() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path().join("home");
     moved_from_its_worktree(&home);
@@ -498,8 +636,8 @@ fn doctor_names_a_repository_git_cannot_inspect_and_runs_its_other_checks() {
         assert_eq!(output.status.code(), Some(4), "{args:?}: {said}");
         assert!(
             said.contains("owner/moved")
-                && said.contains("Git couldn't tell where its storage is, in its worktree ")
-                && said.contains("; see Git's answer in full: `git -C "),
+                && said.contains("its worktree ")
+                && said.contains("worktrees/owner/old/main sits in owner/old's place, and Git can't reach its storage there; `agit doctor --repair-worktrees owner/moved` moves it to owner/moved's place"),
             "{args:?}: {said}"
         );
         assert!(
@@ -508,4 +646,27 @@ fn doctor_names_a_repository_git_cannot_inspect_and_runs_its_other_checks() {
         );
         assert!(!said.contains("local storage"), "{args:?}: {said}");
     }
+    let repair = status(
+        &home,
+        "http://127.0.0.1:1",
+        &["doctor", "--repair-worktrees", "owner/moved"],
+    );
+    let repaired = said(&repair);
+    assert_success(&repair);
+    assert!(
+        repaired.contains("moved ") && repaired.contains("worktrees/owner/moved/main"),
+        "{repaired}"
+    );
+    let moved = home.join("worktrees/owner/moved/main");
+    assert!(Repo::at(&moved).git(&["status", "--porcelain"]).is_ok());
+    assert!(!home.join("worktrees/owner/old").exists(), "{repaired}");
+    worktrees::assert_each_names_its_repository(&home);
+    let output = status(&home, "http://127.0.0.1:1", &["status"]);
+    assert_success(&output);
+    let after = said(&output);
+    assert!(!after.contains("leaves it out"), "{after}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("owner/moved"),
+        "{after}"
+    );
 }

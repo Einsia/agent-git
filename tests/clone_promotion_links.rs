@@ -2,6 +2,8 @@
 
 #[path = "support/lab_env.rs"]
 mod lab_env;
+#[path = "support/worktrees.rs"]
+mod worktrees;
 
 use agit::domain::{link, repo::Repo, store::Store};
 use agit::hub::identity::{self, RemoteIdentity};
@@ -226,6 +228,14 @@ fn promotion(name: &str) {
     source.commit("local history").unwrap();
     source.git(&["branch", "-m", "work"]).unwrap();
     let original_head = source.git(&["rev-parse", "refs/heads/work"]).unwrap();
+    // A session branch's worktree, in its repository's place, with an edit staged in it.
+    let topic = home.join("worktrees/alice/qa/topic");
+    std::fs::create_dir_all(topic.parent().unwrap()).unwrap();
+    source
+        .git(&["worktree", "add", "-b", "topic", topic.to_str().unwrap()])
+        .unwrap();
+    std::fs::write(topic.join("staged.txt"), "staged before the promotion").unwrap();
+    Repo::at(&topic).git(&["add", "staged.txt"]).unwrap();
     identity::pin(&source, &RemoteIdentity::new(&hub, SOURCE).unwrap()).unwrap();
     let store = Store::at(home.join("store"));
     for (id, owner) in [
@@ -271,6 +281,56 @@ fn promotion(name: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!home.join("repos/alice/qa").exists());
+    // The worktree moved into the promoted repository's place and kept its staged edit; nothing
+    // of the promoted repository is left under the old owner's path.
+    let moved_topic = home.join("worktrees/me").join(name).join("topic");
+    assert_eq!(
+        Repo::at(&moved_topic)
+            .git(&["status", "--porcelain"])
+            .unwrap(),
+        "A  staged.txt"
+    );
+    assert!(!home.join("worktrees/alice/qa").exists());
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains("the checkout moved: ") && said.contains(", and its worktrees: "),
+        "{said}"
+    );
+    worktrees::assert_each_names_its_repository(&home);
+    // A later checkout of the old owner's repository gets a worktree of its own there, and the
+    // promoted one's is untouched.
+    let fresh = Repo::init(&home.join("repos/alice/qa")).unwrap();
+    fresh.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    std::fs::write(fresh.root().join("README.md"), "the old owner's own").unwrap();
+    fresh.add_all().unwrap();
+    fresh.commit("old owner").unwrap();
+    fresh.git(&["branch", "topic"]).unwrap();
+    let path = Command::new(env!("CARGO_BIN_EXE_agit"))
+        .args(["repo", "path", "alice/qa@topic"])
+        .env_clear_local()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", temporary.path())
+        .env("AGIT_HOME", &home)
+        .env("CI", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert!(path.status.success(), "{path:?}");
+    let old_owners = std::path::PathBuf::from(String::from_utf8_lossy(&path.stdout).trim());
+    assert!(old_owners.ends_with("worktrees/alice/qa/topic"), "{path:?}");
+    assert_eq!(
+        Repo::at(&moved_topic)
+            .git(&["status", "--porcelain"])
+            .unwrap(),
+        "A  staged.txt"
+    );
+    worktrees::assert_each_names_its_repository(&home);
     let promoted = Repo::open(home.join("repos/me").join(name)).unwrap();
     assert_eq!(
         promoted.git(&["rev-parse", "refs/heads/work"]).unwrap(),

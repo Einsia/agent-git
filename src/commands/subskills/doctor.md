@@ -9,6 +9,7 @@ description: Diagnose AgentGit local storage, runtime integrations, and optional
 
 ```bash
 agit doctor [--repo <owner/repo>] [--check-backend] [--deep]
+agit doctor --repair-worktrees <owner/repo>
 ```
 
 ## Options
@@ -18,6 +19,7 @@ agit doctor [--repo <owner/repo>] [--check-backend] [--deep]
 | `--repo <owner/repo>` | Inspect only this local repository and its fully matching adopted-session claims |
 | `--check-backend` | Also check Hub/backend reachability and configuration |
 | `--deep` | Inspect committed session integrity throughout locally reachable history |
+| `--repair-worktrees <owner/repo>` | Move this repository's worktrees that sit in another repository's place into its own, relinked |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Examples
@@ -42,6 +44,8 @@ deletes the remote repository.
 `--repo` requires an explicit complete owner and repository name, without a branch or selector. The repository must already exist locally; a missing repository is a reference error. The option does not infer an owner from authentication, workspace context, or an incomplete claim. Repository integrity checks include its registered worktrees. Other repositories are excluded from the integrity report, and their native transcripts are not opened. Runtime, skill, authentication, Git, and keystore diagnostics remain global.
 
 Doctor does not run startup migration or the automatic upgrade network check. It refuses pending recovery without consuming that evidence or repairing storage, and says which case it is: another agit command still running (run doctor again when it has finished), or one that stopped before it finished (`agit config --list` finishes it and uploads nothing). Doctor creates no file to tell the two apart. With `--repo`, this includes the selected repository's checkout aliases and legacy recovery evidence. Global recovery records are inspected for repository identity; records belonging to other repositories are then skipped. Recovery evidence whose repository cannot be identified also blocks scoped inspection. `--check-backend` remains an explicit request for a network connectivity check.
+
+A repository Git can't inspect (a worktree whose storage Git can't find, say) doesn't stop doctor. It is a finding that names the repository, the worktree and what Git said, and the other checks run. `agit status` and the bare `agit` overview leave such a repository out, with a note, when the current folder's conversations don't go to it, and stop when they do. When the worktree sits in another repository's place, as one a checkout left behind when an older agit moved it, the finding gives `agit doctor --repair-worktrees <owner/repo>`. That command moves each such worktree into the repository's own place and relinks it there. It only moves, sends nothing to the Hub, and moves nothing when a place is already taken.
 
 Live transcript comparison uses each active claim's recorded owner, repository, and local branch. A repository with the same name under another owner, a matching tag, and uncommitted worktree changes do not replace that evidence. Missing identity, missing files, unreadable storage, and incomplete native records are reported as unavailable.
 

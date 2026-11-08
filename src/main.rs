@@ -448,7 +448,13 @@ fn startup_for(command: &Commands) -> Startup {
             Startup::ToolDispatcher
         }
         Commands::Diff(args) if args.range.is_none() => Startup::ScopedDiff,
-        Commands::Doctor(args) if args.repo.is_some() || args.repair_permissions.is_some() => {
+        // Moving a worktree back is how a repository the read-only check can't inspect is
+        // repaired, so that check never stands in front of it.
+        Commands::Doctor(args)
+            if args.repo.is_some()
+                || args.repair_permissions.is_some()
+                || args.repair_worktrees.is_some() =>
+        {
             Startup::ScopedDoctor
         }
         Commands::Doctor(_) => Startup::Inspect,

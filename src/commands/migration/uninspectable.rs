@@ -99,6 +99,11 @@ impl Uninspectable {
         )
     }
 
+    /// The linked worktree it failed in, if it wasn't the repository's own checkout.
+    pub fn worktree(&self) -> Option<&Path> {
+        self.worktree.as_deref()
+    }
+
     /// The next step under the line.
     pub fn step(&self) -> String {
         format!("{}; `agit doctor` checks the repository", self.look())

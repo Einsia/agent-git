@@ -674,6 +674,19 @@ fn operation_running(home: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Refuses while recovery evidence is held: a command that moves checkouts must not run while
+/// another is still writing, or one stopped part-way, since what it would move may be half-written.
+pub fn refuse_interrupted() -> Result<()> {
+    let home = crate::infra::config::agit_home()?;
+    if startup_recovery_evidence(&home)?.is_empty() {
+        return Ok(());
+    }
+    Err(Interrupted {
+        running: operation_running(&home)?,
+    }
+    .into())
+}
+
 /// Finishes what a command that stopped part-way left behind, for the front door's commands that
 /// otherwise skip startup migration. Evidence a running command still holds is left to it.
 pub fn finish_interrupted() -> Result<()> {
