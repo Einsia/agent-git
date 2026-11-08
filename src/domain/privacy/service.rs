@@ -326,14 +326,6 @@ fn lock_within(wait: Duration) -> Option<std::sync::MutexGuard<'static, State>> 
     }
 }
 
-/// What the policy the worker checks `repo`'s content under is loaded from, as of now, or `None`
-/// when that cannot be read. Two equal stamps mean the same policy, so a result checked under one
-/// may be used again while the stamp is unchanged; a new rule, decision, account or allowlist
-/// changes it.
-pub(crate) fn policy_stamp(repo: Option<&Path>) -> Option<u64> {
-    worker::policy_stamp(repo).ok()
-}
-
 /// Wait until a worker that failed may be started again, at most one back-off.
 pub(crate) fn wait_for_retry() {
     let until = shared().lock().ok().and_then(|state| state.failed_until);

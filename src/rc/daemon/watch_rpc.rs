@@ -31,7 +31,6 @@ pub(super) struct PreparedWatch {
     roots: policy::CanonicalRoots,
     runtime: String,
     cwd: PathBuf,
-    protection_repo: Option<PathBuf>,
     source: WatchSource,
     enrolled: Option<super::source_watch::SourceWatch>,
     seed: Option<Frame>,
@@ -153,10 +152,6 @@ impl WatchScan {
         let runtime = local.runtime;
         let cwd = policy::require_within(Path::new(&local.cwd), &roots)
             .map_err(|error| RpcError::new(ErrorCode::PathNotAllowed, error.to_string()))?;
-        let protection_repo =
-            crate::rc::protection::native_repository(&runtime, &request.session_id, &cwd)
-                .ok()
-                .flatten();
         let (source, from_line, total_lines, absolute_lines) = if runtime == "opencode" {
             use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
             let source = OpenCode
@@ -257,7 +252,6 @@ impl WatchScan {
             roots,
             runtime,
             cwd,
-            protection_repo,
             source,
             enrolled,
             seed,
@@ -341,7 +335,6 @@ impl Daemon {
             roots,
             runtime,
             cwd,
-            protection_repo,
             source,
             enrolled,
             seed,
@@ -510,17 +503,7 @@ impl Daemon {
                 "the prior runtime source watch is detaching; retry the updated source",
             ));
         }
-        let native_id = enrolled
-            .as_ref()
-            .map(|watch| watch.native_id.as_str())
-            .unwrap_or(&request.session_id);
-        let mut redactor = crate::domain::redact::Redactor::this_machine()
-            .for_device_control()
-            .with_unbound_native_context(&runtime, native_id);
-        if let Some(root) = &protection_repo {
-            redactor = redactor.for_repository(Some(root));
-            redactor = redactor.with_native_context(&runtime, native_id, &cwd, root);
-        }
+        let redactor = crate::domain::redact::Redactor::this_machine().for_device_control();
         let model_settings = settings
             .as_ref()
             .map(|settings| redactor.scrub_json(&settings.model()).value);

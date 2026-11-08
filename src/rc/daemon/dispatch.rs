@@ -1033,7 +1033,6 @@ mod tests {
                 "finish_ms",
                 "gist_ms",
                 "include_local",
-                "labels_ms",
                 "local_rows",
                 "lock_finish_ms",
                 "lock_prepare_ms",

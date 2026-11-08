@@ -62,7 +62,6 @@ fn prepared(scan: WatchScan, cwd: PathBuf) -> PreparedWatch {
             handle: None,
         },
         cwd,
-        protection_repo: None,
         enrolled: None,
         from_line: 0,
         total_lines: 0,

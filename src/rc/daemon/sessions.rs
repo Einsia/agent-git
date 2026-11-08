@@ -175,7 +175,6 @@ impl Daemon {
                 "scan_ms": timing.scan,
                 "enumerate_ms": timing.scan_times.enumerate,
                 "gist_ms": timing.scan_times.gist,
-                "labels_ms": timing.scan_times.labels,
                 "lock_finish_ms": timing.lock_finish,
                 "finish_ms": crate::rc::diagnostics::elapsed_ms(finishing),
                 "total_ms": crate::rc::diagnostics::elapsed_ms(timing.started),

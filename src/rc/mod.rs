@@ -109,7 +109,6 @@ pub mod outbound;
 pub mod peers;
 pub mod policy;
 pub(crate) mod project_share;
-pub(crate) mod protection;
 pub mod roster;
 pub(crate) mod runtime_catalog;
 pub mod runtime_context;
