@@ -1695,23 +1695,9 @@ impl Session {
     ) -> Result<Session, crate::rc::harness::proc::LaunchError> {
         let agit_session = spec.agit_session.clone();
         let cwd = spec.cwd.clone();
-        let mut redactor = redact::Redactor::this_machine()
-            .for_device_control()
-            .with_unbound_native_context(&info.runtime, spec.resume_from.as_deref().unwrap_or(""));
-        if let Some(session) = &agit_session {
-            let repo = session
-                .repo_dir()
-                .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
-            redactor = redactor
-                .with_repository(&repo)
-                .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
-            redactor = redactor.with_native_context(
-                &info.runtime,
-                spec.resume_from.as_deref().unwrap_or(""),
-                &cwd,
-                &repo,
-            );
-        }
+        // The session is the owner's own, shown live to them or to colleagues in their
+        // workspace: nothing it shows is checked (see `Redactor::for_device_control`).
+        let redactor = redact::Redactor::this_machine().for_device_control();
         // **Whether this is a new run or a continuation is known at this moment.**
         //
         // The two sites below cannot ask "does the transcript file exist right now": that

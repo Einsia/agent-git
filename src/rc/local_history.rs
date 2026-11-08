@@ -205,72 +205,10 @@ impl Target<'_> {
         )
     }
 
+    /// History pages are the owner's own conversation, shown to them or to colleagues in their
+    /// workspace, so they go as they are: the device-control redactor runs no privacy check.
     fn redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
-        self.resolve_redactor()
-            .context(super::protection::Unavailable)
-    }
-
-    fn resolve_redactor(&self) -> crate::Result<crate::domain::redact::Redactor> {
-        if self.context.is_none() {
-            return super::protection::for_native(
-                self.runtime,
-                self.native,
-                std::path::Path::new(self.cwd),
-            );
-        }
-        // A source-qualified transcript cannot inherit a bare native ID's repository mappings.
-        let redactor = crate::domain::redact::Redactor::try_this_machine()?
-            .for_device_control()
-            .with_unbound_native_context(self.runtime, self.native);
-        match self.entry.and_then(|entry| {
-            entry
-                .agit_session
-                .as_deref()
-                .zip(entry.expected_agent_id.as_deref())
-        }) {
-            Some((lineage, expected)) => {
-                let lineage = super::lineage::AgitSession::parse(lineage, expected)?;
-                let root = lineage.repo_dir()?;
-                let repo = crate::domain::repo::Repo::open(&root)
-                    .context("History repository is unavailable")?;
-                if self
-                    .entry
-                    .is_some_and(|entry| entry.workspace_id == super::endpoint::WORKSPACE)
-                {
-                    super::local_repository::require(&lineage)?;
-                } else {
-                    let identity = crate::hub::identity::read(&repo)?
-                        .context("History repository identity is unavailable")?;
-                    ensure!(
-                        identity.agent_id == lineage.agent_id(),
-                        "History repository identity changed"
-                    );
-                }
-                Ok(redactor.with_repository(&root)?.with_native_context(
-                    self.runtime,
-                    self.native,
-                    std::path::Path::new(self.cwd),
-                    &root,
-                ))
-            }
-            None => {
-                let context = self.context.as_ref().context(Failure::Missing)?;
-                let key = context.source.session_ref(self.native);
-                match super::protection::native_repository(
-                    self.runtime,
-                    &key,
-                    std::path::Path::new(self.cwd),
-                )? {
-                    Some(root) => Ok(redactor.with_repository(&root)?.with_native_context(
-                        self.runtime,
-                        self.native,
-                        std::path::Path::new(self.cwd),
-                        &root,
-                    )),
-                    None => Ok(redactor),
-                }
-            }
-        }
+        Ok(crate::domain::redact::Redactor::try_this_machine()?.for_device_control())
     }
 }
 
@@ -311,11 +249,7 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     use crate::protocol::{ErrorCode, RpcError};
     let mut reason = None;
     let mut privacy = None;
-    let protection = error
-        .downcast_ref::<super::protection::Unavailable>()
-        .is_some();
     let (kind, retryable, restart) = match error.downcast_ref::<Failure>() {
-        _ if protection => ("privacy_rules_unavailable", false, false),
         Some(Failure::Missing) => ("source_missing", false, true),
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
         Some(Failure::Unsupported) => ("unsupported", false, false),
@@ -977,64 +911,6 @@ mod tests {
             )
             .unwrap();
             assert!(beta.to_string().contains("beta-child"));
-            // A page whose records may still pass is refused as busy, with the privacy check's
-            // reason, however often it is asked for. While the worker is only contended it is
-            // never given up, however long that lasts: the check did not run, so nothing says the
-            // page cannot pass.
-            crate::domain::redact::WITHHOLD_NATIVE.with(|w| w.set(Some("")));
-            crate::domain::redact::WITHHOLD_NATIVE_REASON
-                .with(|r| r.set(Some(crate::domain::privacy::projector::Reason::LockBusy)));
-            snapshot::WITHHELD_PAGE_NOTICE
-                .with(|n| n.set(Some(std::time::Duration::from_millis(200))));
-            let read_refused = || {
-                read_with_roster(
-                    json!({"session_id":"beta"}),
-                    &roster,
-                    &mut Timings::default(),
-                )
-                .unwrap_err()
-            };
-            for _ in 0..5 {
-                let refused = read_refused();
-                assert!(matches!(
-                    refused.downcast_ref(),
-                    Some(Failure::Withheld("lock_busy"))
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let contended = rpc_error(read_refused()).data.unwrap();
-            assert_eq!(contended["kind"], "busy");
-            assert_eq!(contended["retryable"], true);
-            assert_eq!(contended["reason"], "privacy_check_pending");
-            assert_eq!(contended["privacy_reason"], "lock_busy");
-            // A check that runs and fails is counted, and once the page has been refused for the
-            // notice with as many failures as a held tail line needs, it is returned with the
-            // given-up marker for each record. Time alone would give a page up within one burst
-            // of a client's retries, long before a worker back-off ends.
-            crate::domain::redact::WITHHOLD_NATIVE_REASON.with(|r| r.set(None));
-            for _ in 0..crate::rc::supervisor::HELD_TAIL_GIVE_UP_FAILURES {
-                let refused = read_refused();
-                assert!(matches!(
-                    refused.downcast_ref(),
-                    Some(Failure::Withheld("protocol_error"))
-                ));
-            }
-            let given_up = read_with_roster(
-                json!({"session_id":"beta"}),
-                &roster,
-                &mut Timings::default(),
-            )
-            .unwrap();
-            crate::domain::redact::WITHHOLD_NATIVE.with(|w| w.set(None));
-            snapshot::WITHHELD_PAGE_NOTICE.with(|n| n.set(None));
-            let items = given_up["items"].as_array().unwrap();
-            assert!(!items.is_empty());
-            assert!(
-                items
-                    .iter()
-                    .all(|item| item["event"]["text"] == crate::domain::redact::GIVEN_UP_TEXT),
-                "{given_up}"
-            );
             // A removed project directory leaves its existing history readable.
             let moved = directory.path().join("moved");
             std::fs::rename(&project, &moved).unwrap();
@@ -1109,21 +985,6 @@ mod tests {
         assert_eq!(
             flags(super::super::policy::PolicyError::OutsideAllowlist("/outside".into()).into()),
             ("path_not_allowed".to_owned(), false, false, None)
-        );
-        let unavailable = anyhow::anyhow!("private path or parser excerpt")
-            .context(super::super::protection::Unavailable);
-        let response = rpc_error(unavailable);
-        assert_eq!(
-            response.message,
-            "History read failed (privacy_rules_unavailable)"
-        );
-        assert_eq!(response.data.as_ref().unwrap()["retryable"], false);
-        assert_eq!(response.data.as_ref().unwrap()["restart"], false);
-        assert_eq!(
-            flags(
-                anyhow::anyhow!("private details").context(super::super::protection::Unavailable)
-            ),
-            ("privacy_rules_unavailable".to_owned(), false, false, None)
         );
         assert_eq!(
             flags(Failure::Missing.into()),

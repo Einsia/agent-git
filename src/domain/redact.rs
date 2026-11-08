@@ -425,30 +425,18 @@ impl Redactor {
             .map_err(anyhow::Error::new)
     }
 
+    /// The redactor for what remote control shows: a person's own sessions, seen live by them
+    /// or by the colleagues in their workspace. It keeps this device's paths and names as they
+    /// are, and it runs no privacy check, so nothing it passes is held back or replaced by a
+    /// placeholder. What leaves this device to be kept where others can read it goes through
+    /// `agit save`, turn-end settlement or push, which check it in full with a redactor of their
+    /// own.
     #[cfg(feature = "rc")]
     pub(crate) fn for_device_control(mut self) -> Self {
         self.preserve_device_identity = true;
         self
     }
 
-    #[cfg(feature = "rc")]
-    pub(crate) fn with_native_context(
-        self,
-        runtime: &str,
-        session: &str,
-        _cwd: &std::path::Path,
-        root: &std::path::Path,
-    ) -> Self {
-        self.for_repository(Some(root))
-            .with_unbound_native_context(runtime, session)
-    }
-    #[cfg(feature = "rc")]
-    pub(crate) fn with_unbound_native_context(self, runtime: &str, session: &str) -> Self {
-        if let Ok(mut native) = self.native.try_lock() {
-            *native = (runtime.into(), session.into());
-        }
-        self
-    }
     #[cfg(feature = "rc")]
     pub(crate) fn bind_native_session(&self, session: &str) {
         if let Ok(mut native) = self.native.try_lock() {
@@ -494,6 +482,19 @@ impl Redactor {
         records: &[(&serde_json::Value, &[&str])],
         timing: &mut dyn FnMut(&'static str, f64),
     ) -> Vec<NativeJson> {
+        if self.preserve_device_identity {
+            return records
+                .iter()
+                .map(|(value, _)| NativeJson {
+                    value: (*value).clone(),
+                    secret_projection: false,
+                    registered_ids: Vec::new(),
+                    permanent: false,
+                    failed: false,
+                    reason: None,
+                })
+                .collect();
+        }
         let started = std::time::Instant::now();
         let native = self
             .native
@@ -644,13 +645,6 @@ impl Redactor {
         }
     }
 
-    /// What this redactor replaces on its own, after the privacy worker: text the worker checked
-    /// under one policy comes out of two redactors the same when this is the same for both.
-    #[cfg(feature = "rc")]
-    pub(crate) fn persona_key(&self) -> String {
-        format!("{:?}/{}", self.persona, self.preserve_device_identity)
-    }
-
     pub fn this_machine() -> Self {
         Self::new(Persona::this_machine())
     }
@@ -686,6 +680,12 @@ impl Redactor {
     /// [`Self::protect_text`] for text that continues `context`, text a stream already
     /// released: rules match across the context, and only `text` is protected.
     fn protect_text_in(&self, context: &str, text: &str) -> Result<Report, Withheld> {
+        if self.preserve_device_identity {
+            return Ok(Report {
+                text: text.to_owned(),
+                ..empty_report()
+            });
+        }
         #[cfg(all(test, feature = "rc"))]
         if let Some(withheld) = withheld_live(text) {
             return Err(withheld);
@@ -841,75 +841,73 @@ impl Redactor {
         let secrets = 0;
         let registered_ids = Vec::new();
 
-        if !self.preserve_device_identity {
-            // ── 2. The full home prefix ──
-            if let Some(home) = &self.persona.home
-                && home.len() > 1
-            {
-                paths += out.matches(home.as_str()).count();
-                out = out.replace(home.as_str(), "~");
-            }
+        // ── 2. The full home prefix ──
+        if let Some(home) = &self.persona.home
+            && home.len() > 1
+        {
+            paths += out.matches(home.as_str()).count();
+            out = out.replace(home.as_str(), "~");
+        }
 
-            // ── 3. /home/<name>, /Users/<name>, C:\Users\<name> ──
-            let persona_user = self.persona.username.as_deref();
-            let mut aliases: HashMap<String, usize> = HashMap::new();
-            {
-                let view = crate::domain::secrets::view_of(&out);
-                for m in HOME_USER_RE.captures_iter(&view) {
-                    let name = m[1].to_string();
-                    if Some(name.as_str()) == persona_user
-                        || matches!(name.as_str(), "Shared" | "Guest")
-                    {
-                        continue;
-                    }
+        // ── 3. /home/<name>, /Users/<name>, C:\Users\<name> ──
+        let persona_user = self.persona.username.as_deref();
+        let mut aliases: HashMap<String, usize> = HashMap::new();
+        {
+            let view = crate::domain::secrets::view_of(&out);
+            for m in HOME_USER_RE.captures_iter(&view) {
+                let name = m[1].to_string();
+                if Some(name.as_str()) == persona_user
+                    || matches!(name.as_str(), "Shared" | "Guest")
+                {
+                    continue;
+                }
+                let next = aliases.len() + 1;
+                aliases.entry(name).or_insert(next);
+            }
+            let mut spans: Vec<(usize, usize, String)> = vec![];
+            for c in HOME_USER_RE.captures_iter(&view) {
+                let m = c.get(0).unwrap();
+                let name = &c[1];
+                let repl = if Some(name) == persona_user {
+                    Some("~".to_string())
+                } else {
+                    aliases.get(name).map(|n| format!("~user{n}"))
+                };
+                if let Some(r) = repl {
+                    spans.push((m.start(), m.end(), r));
+                }
+            }
+            apply_spans(&mut out, &spans, &mut paths);
+
+            let view = crate::domain::secrets::view_of(&out);
+            let mut spans: Vec<(usize, usize, String)> = vec![];
+            for c in WIN_USER_RE.captures_iter(&view) {
+                let m = c.get(0).unwrap();
+                let name = c[2].to_string();
+                let repl = if Some(name.as_str()) == persona_user {
+                    "~".to_string()
+                } else if matches!(name.as_str(), "Shared" | "Guest") {
+                    continue;
+                } else {
                     let next = aliases.len() + 1;
-                    aliases.entry(name).or_insert(next);
-                }
-                let mut spans: Vec<(usize, usize, String)> = vec![];
-                for c in HOME_USER_RE.captures_iter(&view) {
-                    let m = c.get(0).unwrap();
-                    let name = &c[1];
-                    let repl = if Some(name) == persona_user {
-                        Some("~".to_string())
-                    } else {
-                        aliases.get(name).map(|n| format!("~user{n}"))
-                    };
-                    if let Some(r) = repl {
-                        spans.push((m.start(), m.end(), r));
-                    }
-                }
-                apply_spans(&mut out, &spans, &mut paths);
+                    let n = *aliases.entry(name).or_insert(next);
+                    format!(r"C:\Users\user{n}")
+                };
+                spans.push((m.start(), m.end(), repl));
+            }
+            apply_spans(&mut out, &spans, &mut paths);
+        }
 
-                let view = crate::domain::secrets::view_of(&out);
-                let mut spans: Vec<(usize, usize, String)> = vec![];
-                for c in WIN_USER_RE.captures_iter(&view) {
-                    let m = c.get(0).unwrap();
-                    let name = c[2].to_string();
-                    let repl = if Some(name.as_str()) == persona_user {
-                        "~".to_string()
-                    } else if matches!(name.as_str(), "Shared" | "Guest") {
-                        continue;
-                    } else {
-                        let next = aliases.len() + 1;
-                        let n = *aliases.entry(name).or_insert(next);
-                        format!(r"C:\Users\user{n}")
-                    };
-                    spans.push((m.start(), m.end(), repl));
-                }
-                apply_spans(&mut out, &spans, &mut paths);
-            }
-
-            // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
-            if let Some(user) = persona_user
-                && user.len() >= 3
-            {
-                out = replace_token(&out, user, "user", &mut paths);
-            }
-            if let Some(host) = &self.persona.hostname
-                && host.len() >= 3
-            {
-                out = replace_token(&out, host, "host", &mut paths);
-            }
+        // ── 4. Bare username and hostname — outside /home too: chown user:group, ssh user@host ──
+        if let Some(user) = persona_user
+            && user.len() >= 3
+        {
+            out = replace_token(&out, user, "user", &mut paths);
+        }
+        if let Some(host) = &self.persona.hostname
+            && host.len() >= 3
+        {
+            out = replace_token(&out, host, "host", &mut paths);
         }
 
         // ── 5. Public IPs ──
@@ -967,6 +965,15 @@ impl Redactor {
         value: &serde_json::Value,
         durable: bool,
     ) -> Result<JsonReport, Withheld> {
+        if self.preserve_device_identity {
+            return Ok(JsonReport {
+                value: value.clone(),
+                secrets: 0,
+                paths: 0,
+                ips: 0,
+                registered_ids: vec![],
+            });
+        }
         #[cfg(all(test, feature = "rc"))]
         if let Some(withheld) = withheld_live(&value.to_string()) {
             return Err(withheld);
@@ -1085,6 +1092,9 @@ impl StreamRedactor {
             return empty_report();
         }
         self.pending.push_str(chunk);
+        if self.redactor.preserve_device_identity {
+            return self.flush();
+        }
         #[cfg(feature = "cli")]
         {
             // Text that waits beyond the hold, processed or not, is withheld with the rest of
@@ -1135,6 +1145,12 @@ impl StreamRedactor {
             return empty_report();
         }
         let ready = std::mem::take(&mut self.pending);
+        if self.redactor.preserve_device_identity {
+            return Report {
+                text: ready,
+                ..empty_report()
+            };
+        }
         #[cfg(feature = "cli")]
         {
             // The item ends here, so a key it opened and never closed is withheld whole,
@@ -1796,6 +1812,48 @@ mod tests {
         assert_eq!(protected[1].value, small);
         assert!(!protected[2].permanent);
         assert_eq!(protected[2].value, fits);
+    }
+
+    /// The device-control redactor, the one remote control uses, passes text, JSON values, native
+    /// records and streamed text as they are, a credential and a public IP included, while the
+    /// privacy check would hold them back: remote control shows the owner their own session. A
+    /// redactor of any other kind still holds back what the check holds back. A device-control
+    /// redactor that asked the privacy worker would put the withheld marker or a placeholder into
+    /// the owner's view; one that still numbered IPs would show `[ip1]` in live text and the
+    /// stream but the address in history. The stream splits after the address, not inside it,
+    /// because a chunk holding half an address is not numbered either way.
+    #[cfg(feature = "rc")]
+    #[test]
+    fn the_device_control_redactor_passes_everything_as_it_is() {
+        use crate::domain::privacy::projector::Reason;
+        let credential = "AKIA4X7QZ2M5RT6VW3JH";
+        let text = format!("ssh 47.91.17.103 && export AWS_ACCESS_KEY_ID={credential}\n");
+        WITHHOLD_LIVE.with(|w| w.set(Some((credential, Reason::LockBusy))));
+        WITHHOLD_NATIVE.with(|w| w.set(Some(credential)));
+        let value = serde_json::json!({"command": text});
+        let record = serde_json::json!({"type": "user", "message": {"content": text}});
+        let records = [(&record, &[][..])];
+
+        let live = Redactor::new(persona()).for_device_control();
+        assert_eq!(live.protect_text(&text).unwrap().text, text);
+        assert_eq!(live.scrub(&text).text, text);
+        assert_eq!(live.protect_json(&value).unwrap().value, value);
+        let native = live.scrub_native_batch_profiled(&records, &mut |_, _| {});
+        assert_eq!(native[0].value, record);
+        let mut stream = live.stream();
+        let (first, second) = text.split_at(text.find("&&").unwrap());
+        let streamed = [stream.push(first), stream.push(second), stream.flush()]
+            .map(|report| report.text)
+            .concat();
+        assert_eq!(streamed, text);
+
+        let checked = Redactor::new(persona());
+        assert!(checked.protect_text(&text).is_err());
+        assert!(checked.protect_json(&value).is_err());
+        let native = checked.scrub_native_batch_profiled(&records, &mut |_, _| {});
+        assert!(native[0].value.get("protection_error").is_some());
+        WITHHOLD_LIVE.with(|w| w.set(None));
+        WITHHOLD_NATIVE.with(|w| w.set(None));
     }
 
     #[test]

@@ -69,8 +69,8 @@ fn main() {
             a_value_is_protected_when_its_context_left_earlier,
         ),
         (
-            "a session's history and labels in its repository",
-            a_sessions_history_and_labels_require_its_repository_rules,
+            "a session's history as it is",
+            a_sessions_history_goes_as_it_is,
         ),
         (
             "encoded credentials across the record size boundary",
@@ -519,10 +519,12 @@ fn a_value_is_protected_when_its_context_left_earlier(_home: &Path) {
     assert_eq!(shape(&delivered), shape(&whole));
 }
 
-/// A session's history and labels use the rules of the repository its link names. Unclaimed
-/// sessions use device rules, but an unreadable link or missing linked repository cannot mean
-/// unclaimed: that would release repository-blocked text through the device-only policy.
-fn a_sessions_history_and_labels_require_its_repository_rules(home: &Path) {
+/// Remote control shows a session's history as it is, whoever's rules would block a value in it:
+/// the history is the owner's own, seen by them or by colleagues in their workspace. A linked
+/// session whose repository blocks a phrase still shows it, and a link that can't be read or a
+/// repository that has moved doesn't refuse the history. A history read that went through the
+/// privacy check again would hide the phrase, or refuse while the rules can't load.
+fn a_sessions_history_goes_as_it_is(home: &Path) {
     let phrase = "cedar lantern";
     let repo = agit::domain::repo::Repo::init(&home.join("repos/alice/notes")).unwrap();
     agit::domain::secret_filter::RepositoryDictionary::open(repo.root())
@@ -541,127 +543,31 @@ fn a_sessions_history_and_labels_require_its_repository_rules(home: &Path) {
     link.owner = Some("alice".into());
     link.agent = Some("notes".into());
     let link_path = agit::domain::link::write(&store, &link).unwrap();
-    let unclaimed = "6b3f2c1e-0000-4000-8000-000000000002";
-    let row = |id: &str| agit::protocol::LocalSession {
-        runtime_session_id: id.into(),
-        runtime: "claude-code".into(),
-        cwd: work.display().to_string(),
-        modified_at: "2026-10-26T00:00:00Z".into(),
-        gist: Some(format!("ask about the {phrase}")),
-        title: Some(format!("{phrase} plan")),
-        labels_withheld: None,
-        adopted: true,
-        agent: None,
-        likely_active: false,
-    };
-    let mut sessions = vec![row(native), row(unclaimed)];
-    agit::rc::daemon::protect_session_labels(&mut sessions);
-    for label in [&sessions[0].gist, &sessions[0].title] {
-        let label = label.as_deref().unwrap();
-        assert!(!label.contains(phrase), "{label}");
-        assert_eq!(
-            agit::domain::privacy::projector::tokens(label).count(),
-            1,
-            "{label}"
-        );
-    }
-    assert_eq!(
-        sessions[1].gist.as_deref(),
-        Some(format!("ask about the {phrase}").as_str())
-    );
     let project = home
         .join("claude/projects")
         .join(agit::adapter::claude_code::slug_for(&work));
     std::fs::create_dir_all(&project).unwrap();
-    for id in [native, unclaimed] {
-        std::fs::write(
-            project.join(format!("{id}.jsonl")),
-            format!(
-                "{}\n",
-                serde_json::json!({"type":"user","cwd":work,"message":{"role":"user","content":format!("ask about the {phrase}")}})
-            ),
-        )
-        .unwrap();
-    }
-    let history = |id: &str| {
-        agit::rc::local_history::read(
-            serde_json::json!({"session_id":id,"runtime":"claude-code","cwd":work}),
-        )
-    };
-    assert!(!history(native).unwrap().to_string().contains(phrase));
-    assert!(history(unclaimed).unwrap().to_string().contains(phrase));
-    let source_home = home.join("native-source");
-    std::fs::create_dir_all(source_home.join("sessions")).unwrap();
     std::fs::write(
-        source_home.join(format!("sessions/rollout-{native}.jsonl")),
+        project.join(format!("{native}.jsonl")),
         format!(
-            "{}\n{}\n",
-            serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":work}}),
-            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("ask about the {phrase}")}]}})
+            "{}\n",
+            serde_json::json!({"type":"user","cwd":work,"message":{"role":"user","content":format!("ask about the {phrase}")}})
         ),
     )
     .unwrap();
-    let source = agit::rc::runtime_sources::Registry::open()
-        .unwrap()
-        .register(&source_home, None, None, None)
-        .unwrap();
-    let mut roster = agit::rc::roster::Roster::default();
-    roster
-        .record(
-            "qualified-history",
-            serde_json::from_value(serde_json::json!({
-                "native_source":{"source_id":source.source_id,"generation":source.generation},
-                "runtime":"codex","thread_id":native,"cwd":work,"workspace_id":"local-owner"
-            }))
-            .unwrap(),
+    let history = || {
+        agit::rc::local_history::read(
+            serde_json::json!({"session_id":native,"runtime":"claude-code","cwd":work}),
         )
-        .unwrap();
-    roster.save().unwrap();
-    let source_params = serde_json::json!({"session_id":"qualified-history"});
-    assert!(
-        agit::rc::local_history::read(source_params.clone())
-            .unwrap()
-            .to_string()
-            .contains(phrase)
-    );
-    let mut source_link =
-        agit::domain::link::Link::new("codex", &source.session_ref(native), Some(&work));
-    source_link.owner = link.owner.clone();
-    source_link.agent = link.agent.clone();
-    source_link.native_binding = Some(agit::domain::link::NativeBinding {
-        source: agit::protocol::NativeSourceRef {
-            source_id: source.source_id,
-            generation: source.generation,
-        },
-        thread_id: native.into(),
-    });
-    let source_link_path = agit::domain::link::write(&store, &source_link).unwrap();
-    let native_params = serde_json::json!({"session_id":native,"runtime":"claude-code","cwd":work});
-    for (link, path, params) in [
-        (link, link_path, native_params),
-        (source_link, source_link_path, source_params),
-    ] {
-        let history = || agit::rc::local_history::read(params.clone());
-        assert!(!history().unwrap().to_string().contains(phrase));
-        std::fs::write(&path, "{invalid link").unwrap();
-        let refusal = history().unwrap_err().to_string();
-        assert!(
-            refusal.contains("privacy rules are unavailable"),
-            "{refusal}"
-        );
-        assert!(refusal.contains("restore access"), "{refusal}");
-        agit::domain::link::write(&store, &link).unwrap();
-        let moved = home.join("unavailable-notes");
-        std::fs::rename(repo.root(), &moved).unwrap();
-        let refusal = history().unwrap_err().to_string();
-        assert!(
-            refusal.contains("privacy rules are unavailable"),
-            "{refusal}"
-        );
-        assert!(refusal.contains("restore access"), "{refusal}");
-        std::fs::rename(moved, repo.root()).unwrap();
-        assert!(!history().unwrap().to_string().contains(phrase));
-    }
+    };
+    assert!(history().unwrap().to_string().contains(phrase));
+    std::fs::write(&link_path, "{invalid link").unwrap();
+    assert!(history().unwrap().to_string().contains(phrase));
+    agit::domain::link::write(&store, &link).unwrap();
+    let moved = home.join("unavailable-notes");
+    std::fs::rename(repo.root(), &moved).unwrap();
+    assert!(history().unwrap().to_string().contains(phrase));
+    std::fs::rename(moved, repo.root()).unwrap();
 }
 
 /// Text, stream output and JSON values the worker cannot process are withheld: the marker
