@@ -403,6 +403,31 @@ fn report_left_out(left_out: usize) {
     }
 }
 
+/// Remote control keeps the conversations of a folder enrolled with the Hub in a device-local
+/// repository, whose slug and branch are internal identities nobody can find on the Hub. A row
+/// names such a conversation by the Hub repository it is for, `Some(None)` when it has none yet;
+/// `None` for any other repository, which the row names as it is.
+fn remote_control_destination(saved_in: &str) -> Option<Option<String>> {
+    let (slug, _) = saved_in.split_once('@')?;
+    crate::rc::local_repository::destination_of(slug)
+}
+
+/// The row of a conversation saved in another repository (`saved_in`, `<owner/repo>@<branch>`).
+/// One remote control keeps is named by where it is for, never as though it went there: remote
+/// control publishes on its own schedule, and its upload can be off.
+fn saved_in_line(title: &str, saved_in: &str) -> String {
+    let title = ui::truncate(title, 60);
+    match remote_control_destination(saved_in) {
+        Some(Some(destination)) => format!(
+            "\"{title}\" is saved by remote control on this computer, for {destination} on the Hub, so it isn't uploaded here"
+        ),
+        Some(None) => format!(
+            "\"{title}\" is saved by remote control on this computer, which hasn't been given a Hub repository to publish it to, so it isn't uploaded here"
+        ),
+        None => format!("\"{title}\" is already saved in {saved_in}, so it isn't uploaded here"),
+    }
+}
+
 fn link(repository: &str, branch: &str) -> String {
     super::session_link(repository, branch).unwrap_or_else(|| super::repository_link(repository))
 }
@@ -446,6 +471,13 @@ fn report(
                         ("failed", None, Some(not_continued(&r.repository, branch)))
                     }
                 };
+                let remote_control = match &r.outcome {
+                    Saved::Elsewhere {
+                        saved_in: Some(saved_in),
+                        ..
+                    } => remote_control_destination(saved_in),
+                    _ => None,
+                };
                 serde_json::json!({
                     "title": r.title,
                     "runtime": r.runtime,
@@ -467,6 +499,8 @@ fn report(
                         Saved::Elsewhere { saved_in, .. } => saved_in.as_deref(),
                         _ => None,
                     },
+                    "saved_by": remote_control.as_ref().map(|_| "remote_control"),
+                    "publishes_to": remote_control.clone().flatten(),
                     "why": match &r.outcome {
                         Saved::Elsewhere { why, .. } => why.as_deref(),
                         _ => None,
@@ -553,10 +587,7 @@ fn report(
                 Saved::Elsewhere {
                     saved_in: Some(saved_in),
                     ..
-                } => println!(
-                    "\"{}\" is already saved in {saved_in}, so it isn't uploaded here",
-                    ui::truncate(&row.title, 60)
-                ),
+                } => println!("{}", saved_in_line(&row.title, saved_in)),
                 Saved::Elsewhere { why: Some(why), .. } => println!(
                     "\"{}\" isn't uploaded here: {why}",
                     ui::truncate(&row.title, 60)
@@ -596,4 +627,64 @@ fn report(
     } else {
         ExitCode::Ok
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// A conversation remote control keeps for a folder enrolled with the Hub is named by the Hub
+    /// repository it is for, or as having none yet, never by the device-local slug and branch,
+    /// which nobody can find on the Hub; any other repository is named as it is. A row that kept
+    /// the slug would send the person looking for a repository that doesn't exist.
+    #[cfg(unix)]
+    #[test]
+    fn a_conversation_remote_control_keeps_is_named_by_its_hub_repository() {
+        if crate::rc::in_isolated_test(
+            "commands::front::save::tests::a_conversation_remote_control_keeps_is_named_by_its_hub_repository",
+        ) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        }
+        crate::rc::select_local_authority();
+        let folder = root.path().join("parley");
+        std::fs::create_dir(&folder).unwrap();
+        let repository =
+            crate::rc::local_repository::ensure_repository("project", &folder).unwrap();
+        let saved_in = format!("{}@desktop-branch", repository.slug);
+        assert_eq!(
+            super::saved_in_line("Run the checks", &saved_in),
+            "\"Run the checks\" is saved by remote control on this computer, which hasn't been given a Hub repository to publish it to, so it isn't uploaded here"
+        );
+        let repo = crate::rc::local_repository::require(
+            &crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .unwrap(),
+        )
+        .unwrap();
+        let target = crate::hub::identity::RemoteIdentity::new(
+            "https://hub.example",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        crate::rc::local_repository::publication::Selection::prepare(
+            &repo,
+            Some("sim-hao/parley"),
+            &target.hub,
+        )
+        .unwrap()
+        .unwrap()
+        .bind(&repo, &target)
+        .unwrap();
+        let line = super::saved_in_line("Run the checks", &saved_in);
+        assert_eq!(
+            line,
+            "\"Run the checks\" is saved by remote control on this computer, for sim-hao/parley on the Hub, so it isn't uploaded here"
+        );
+        assert!(!line.contains(&repository.slug), "{line}");
+        assert_eq!(
+            super::saved_in_line("Plan the move", "other/place@work"),
+            "\"Plan the move\" is already saved in other/place@work, so it isn't uploaded here"
+        );
+    }
 }
