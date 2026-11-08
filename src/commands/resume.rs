@@ -1157,6 +1157,7 @@ fn resume_branch_for(
             "fast-forwarded `{branch}` +{commits} to the published tip {}",
             &to[..9.min(to.len())]
         )),
+        super::pull::Alignment::BroughtOver { turns } => ui::info(super::pull::brought_over(turns)),
         super::pull::Alignment::Diverged => return Ok(None),
     }
     if super::branch::is_sealed(repo, branch) {
@@ -2087,7 +2088,7 @@ pub(crate) fn require_merge_claim_with_bytes(
             link::MaterializationActivity::Unverifiable => ClaimActivity::Unverifiable,
         }
     } else {
-        native_claim_activity(repo, settled.log, text)?
+        native_claim_activity(repo, settled.log, text, &claim.source)?
     };
     if activity == ClaimActivity::Untouched {
         return Ok(());
@@ -2134,7 +2135,12 @@ pub(crate) fn require_merge_claim_with_bytes(
 /// prefix changes the projection of that prefix, so an untouched transcript reads as rewritten
 /// and the branch becomes unresumable. A token the dictionary cannot resolve leaves the
 /// comparison unverifiable, which fails closed.
-fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Result<ClaimActivity> {
+fn native_claim_activity(
+    repo: &Repo,
+    committed: &str,
+    live: &str,
+    runtime: &str,
+) -> crate::Result<ClaimActivity> {
     if transcript::continuity(committed, live) == transcript::Continuity::Noop {
         return Ok(ClaimActivity::Untouched);
     }
@@ -2146,12 +2152,13 @@ fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Res
             // replacing that transcript loses nothing.
             transcript::Continuity::Diverged => {
                 let settled = committed_prefix(committed, transcript::live_hashes(live).len());
-                if settled.len() < committed.len()
+                if (settled.len() < committed.len()
                     && crate::domain::privacy::service::native_continuity(
                         repo.root(),
                         settled,
                         live,
-                    )? == transcript::Continuity::Noop
+                    )? == transcript::Continuity::Noop)
+                    || moved_past_its_tail(repo, committed, live, runtime)?
                 {
                     ClaimActivity::Untouched
                 } else {
@@ -2160,6 +2167,60 @@ fn native_claim_activity(repo: &Repo, committed: &str, live: &str) -> crate::Res
             }
         },
     )
+}
+
+/// Whether the branch moved past the live transcript once the runtime's bookkeeping tail is set
+/// aside: the transcript is the branch's first events, then only records its adapter judges
+/// settled, as the ordinary path judges a tail ([`adapter::judge_tail`]), and the branch holds more
+/// past those events. A runtime writes such a tail after a turn, Claude Code its prompt snapshot
+/// among others, and a turn another computer added to the branch comes after it in the LOG, so
+/// counted line for line the two never meet. No size or count of the tail decides: a
+/// conversational record, a type this build doesn't know or a partial line keeps the transcript
+/// rewritten.
+fn moved_past_its_tail(
+    repo: &Repo,
+    committed: &str,
+    live: &str,
+    runtime: &str,
+) -> crate::Result<bool> {
+    let Ok(adapter) = adapter::get(runtime) else {
+        return Ok(false);
+    };
+    // Where each whole record of the transcript ends.
+    let mut ends = Vec::new();
+    let mut at = 0;
+    for line in live.split_inclusive('\n') {
+        at += line.len();
+        if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+            ends.push(at);
+        }
+    }
+    let committed_events = transcript::live_hashes(committed).len();
+    // The tail grows one record at a time from the end, and stops at the first record that isn't
+    // bookkeeping.
+    for kept in (0..ends.len()).rev() {
+        let split = if kept == 0 { 0 } else { ends[kept - 1] };
+        let (settled, tail) = live.split_at(split);
+        if adapter::judge_tail(
+            adapter.as_ref(),
+            |window| Ok(adapter::settled_end(settled, window).into()),
+            tail,
+            tail,
+        )? != adapter::Tail::Settled
+        {
+            return Ok(false);
+        }
+        if kept < committed_events
+            && crate::domain::privacy::service::native_continuity(
+                repo.root(),
+                committed_prefix(committed, kept),
+                settled,
+            )? == transcript::Continuity::Noop
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The committed LOG cut after its first `events` envelopes.
@@ -2194,7 +2255,7 @@ fn claim_activity(repo: &Repo, committed_log: &str, link: &Link) -> crate::Resul
     let Ok(live) = link.read() else {
         return Ok(ClaimActivity::Unverifiable);
     };
-    native_claim_activity(repo, committed_log, &live)
+    native_claim_activity(repo, committed_log, &live, &link.source)
 }
 
 fn report_multiple_active(slug: &str, branch: &str, links: &[Link]) {
@@ -3304,6 +3365,84 @@ mod tests {
             "concurrent settlement",
         );
         assert!(super::require_resume_head(&repo, branch, &head).is_err());
+    }
+
+    /// Claude Code writes a bookkeeping tail after a turn, its prompt snapshot among it. When a
+    /// turn another computer added moved the branch past the transcript, the transcript is the
+    /// branch's first events and then that tail, so continuing from the branch loses nothing of
+    /// it. Counted line for line, the tail meets the other computer's turn and reads as rewritten.
+    /// A turn in the tail, or a record of a type this build doesn't know, keeps it rewritten.
+    #[test]
+    fn a_bookkeeping_tail_leaves_a_branch_that_moved_past_the_transcript_untouched() {
+        const NAME: &str = "commands::resume::tests::a_bookkeeping_tail_leaves_a_branch_that_moved_past_the_transcript_untouched";
+        if crate::rc::in_isolated_test(NAME) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", root.path().join("agit"));
+            std::env::set_var("CLAUDE_CONFIG_DIR", root.path().join("claude"));
+        }
+        let repo = Repo::init(&root.path().join("repo")).unwrap();
+        let record = |value: serde_json::Value| format!("{value}\n");
+        let user = |uuid: &str, text: &str| {
+            record(
+                serde_json::json!({"type":"user","sessionId":"native","uuid":uuid,
+                "message":{"role":"user","content":text}}),
+            )
+        };
+        let assistant = |uuid: &str, text: &str| {
+            record(
+                serde_json::json!({"type":"assistant","sessionId":"native","uuid":uuid,
+                "message":{"role":"assistant","content":[{"type":"text","text":text}]}}),
+            )
+        };
+        let here = format!(
+            "{}{}",
+            user("u1", "Rename the flag."),
+            assistant("u2", "Renamed.")
+        );
+        let there = format!("{}{}", user("u3", "Ship it."), assistant("u4", "Shipped."));
+        let session = format!("agit-{}", "a".repeat(40));
+        let committed = transcript::wrap_lines(&format!("{here}{there}"), "claude-code", &session);
+        // Claude Code 2.1.311's own end-of-turn records, repeating the prompt settled here.
+        let tail = include_str!("../../tests/fixtures/cc-2.1.311-trailing-records.jsonl").replace(
+            "\"lastPrompt\": \"<text>\"",
+            &format!("\"lastPrompt\": {}", serde_json::json!("Rename the flag.")),
+        );
+        let activity = |live: &str| {
+            super::native_claim_activity(&repo, &committed, live, "claude-code").unwrap()
+        };
+        assert_eq!(
+            activity(&format!("{here}{tail}")),
+            super::ClaimActivity::Untouched
+        );
+        assert_eq!(activity(&here), super::ClaimActivity::Untouched);
+        for kept in [
+            user("u5", "Another turn here."),
+            record(serde_json::json!({"type":"mystery-record","sessionId":"native"})),
+        ] {
+            assert_eq!(
+                activity(&format!("{here}{tail}{kept}")),
+                super::ClaimActivity::Rewritten,
+                "{kept}"
+            );
+            assert_eq!(
+                activity(&format!("{here}{kept}{tail}")),
+                super::ClaimActivity::Rewritten,
+                "{kept}"
+            );
+        }
+        // A tail on a transcript that isn't the branch's first events is still rewritten.
+        let other = format!(
+            "{}{}",
+            user("u1", "Something else."),
+            assistant("u2", "Done.")
+        );
+        assert_eq!(
+            activity(&format!("{other}{tail}")),
+            super::ClaimActivity::Rewritten
+        );
     }
 
     /// A per-link lock must validate the routing state read after acquisition. Otherwise a

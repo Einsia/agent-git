@@ -947,6 +947,10 @@ fn upload_announcement(
     if !announces_upload(rt, ev.source) {
         return None;
     }
+    // A conversation another session continues uploads nothing, whatever its folder does.
+    if let Some(line) = superseded_line(rt, &ev.session_id) {
+        return Some(serde_json::json!({ "systemMessage": line }));
+    }
     let notice = origin
         .and_then(|origin| {
             super::project::automatic_upload(rt, &ev.session_id, origin, UPLOAD_VISIBILITY_WAIT)
@@ -1005,6 +1009,26 @@ fn failure_line(runtime: &str, session: &str) -> Option<String> {
     let repository = format!("{}/{}", link.owner?, link.agent?);
     let undone = super::upload_outcome::unreported(&repository, link.branch.as_deref()?)?;
     Some(upload_line(&repository, undone))
+}
+
+/// The line for a conversation whose claim another session took over, as resume does when it
+/// continues a branch in a new session: its turns here stay on this computer, and nothing
+/// records them for the branch. `None` for any other conversation.
+fn superseded_line(runtime: &str, session: &str) -> Option<String> {
+    let store = Store::at(crate::infra::config::store_root().ok()?);
+    // A conversation a merge archive retains is another matter, and says nothing here.
+    let link = link::get(&store, runtime, session).filter(|link| link.merge_archive.is_none())?;
+    let successor = link.superseded_by.as_deref()?;
+    let successor = successor
+        .split_once('/')
+        .map_or(successor, |(_, id)| id)
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let target = format!("{}/{}@{}", link.owner?, link.agent?, link.branch?);
+    Some(format!(
+        "agit: this conversation continues as another session ({successor}), so its turns here stay on this computer and aren't uploaded. To continue {target}: `agit resume {target}`."
+    ))
 }
 
 /// The line that tells the person what kept the newest automatic upload to `repository` from
@@ -1230,6 +1254,11 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         (Some(failure), Some(line)) => Some(format!("{failure}\n{line}")),
         (failure, line) => failure.or(line),
     };
+    // A turn in a conversation another session continues is no turn of the branch: it is said
+    // at each turn's end, as nothing records it.
+    let superseded = (!await_reply)
+        .then(|| superseded_line(rt, &ev.session_id))
+        .flatten();
     // A folder nothing saves says so once, at the first turn end that gets there before a start
     // did (a Codex whose start hook isn't trusted yet, say), to the person only.
     let unclaimed = super::context::from_session_env().is_none()
@@ -1260,7 +1289,10 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
             .err()
             .filter(|error| !super::commit::archive::is_failure(error))
             .map(|error| format!("agit: {error:#}"));
-        let lines: Vec<String> = [older, refused, unsaved].into_iter().flatten().collect();
+        let lines: Vec<String> = [superseded, older, refused, unsaved]
+            .into_iter()
+            .flatten()
+            .collect();
         if !lines.is_empty() {
             println!(
                 "{}",
@@ -1269,10 +1301,11 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         }
         return settled;
     }
-    let failure = match (failure, unsaved) {
-        (Some(failure), Some(line)) => Some(format!("{failure}\n{line}")),
-        (failure, line) => failure.or(line),
-    };
+    let lines: Vec<String> = [failure, superseded, unsaved]
+        .into_iter()
+        .flatten()
+        .collect();
+    let failure = (!lines.is_empty()).then(|| lines.join("\n"));
     let Some(failure) = failure else {
         return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
     };

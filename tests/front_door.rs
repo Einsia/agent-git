@@ -335,6 +335,37 @@ impl Lab {
         self.session_start(cwd, id, "resume")
     }
 
+    /// What the Stop hook tells the person when `runtime`'s conversation `id` in `cwd` ends a turn:
+    /// its `systemMessage`, or nothing.
+    fn stop(
+        &self,
+        cwd: &std::path::Path,
+        id: &str,
+        runtime: &str,
+        transcript: &std::path::Path,
+    ) -> String {
+        let event = serde_json::json!({"session_id": id, "cwd": cwd, "transcript_path": transcript,
+            "hook_event_name": "Stop"});
+        let mut child = self
+            .command(cwd, &["hooks", "settle", "--runtime", runtime])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|response| response["systemMessage"].as_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
     /// What the SessionStart hook answers when Claude Code starts conversation `id` in `cwd`,
     /// for `source` (`startup`, `resume`, …).
     fn session_start(&self, cwd: &std::path::Path, id: &str, source: &str) -> serde_json::Value {
@@ -953,6 +984,78 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
 /// judged by the folder's path alone says nothing in the worktree and saves nothing there; one
 /// that took the worktree's earlier sessions along uploads them unasked; one whose `agit off`
 /// reached the folder turns the folder off too.
+/// A conversation another session continues says so at its turn's end, and never also that
+/// nothing saves its folder, though no agit setting covers that folder: its claim still holds a
+/// branch, and only a conversation nothing claims is told about the folder. A conversation nothing
+/// claims, in another such folder, is told, so the first folder's silence isn't silence for any
+/// folder. Telling a superseded conversation both would turn its one true line into two.
+#[test]
+fn a_superseded_conversation_names_where_it_continues_never_its_unsaved_folder() {
+    const UNSAVED: &str = "agit isn't saving this folder's conversations";
+    let lab = Lab::new();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let old = lab.folder("old-window", false);
+    let id = "21212121-2121-4212-8212-212121212121";
+    lab.conversation(&old, id, "Plan the move");
+    let mut claim = agit::domain::link::Link::new("claude-code", id, Some(&old));
+    claim.owner = Some("me".into());
+    claim.agent = Some("notes".into());
+    claim.branch = Some("work".into());
+    claim.superseded_by = Some("claude-code/31313131-3131-4313-8313-313131313131".into());
+    agit::domain::link::write(&store, &claim).unwrap();
+    let transcript = lab
+        .home
+        .join(".claude/projects")
+        .join(agit::adapter::claude_code::slug_for(&old))
+        .join(format!("{id}.jsonl"));
+    let said = lab.stop(&old, id, "claude-code", &transcript);
+    assert!(
+        said.contains("agit: this conversation continues as another session (31313131)"),
+        "{said}"
+    );
+    assert!(!said.contains(UNSAVED), "{said}");
+
+    let plain = lab.folder("plain-window", false);
+    let fresh = "41414141-4141-4141-8141-414141414141";
+    lab.conversation(&plain, fresh, "Sketch it");
+    let transcript = lab
+        .home
+        .join(".claude/projects")
+        .join(agit::adapter::claude_code::slug_for(&plain))
+        .join(format!("{fresh}.jsonl"));
+    let said = lab.stop(&plain, fresh, "claude-code", &transcript);
+    assert!(said.contains(UNSAVED), "{said}");
+}
+
+/// A Codex conversation another session continues is told so at its turn's end together with
+/// whatever its settlement refused, in one message. A refusal held back because another line was
+/// already there would leave the person not knowing the turn went nowhere.
+#[test]
+fn a_superseded_codex_turn_end_says_where_it_continues_and_what_was_refused() {
+    let lab = Lab::new();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let dir = lab.folder("codex-window", false);
+    let id = "51515151-5151-4515-8515-515151515151";
+    let mut claim = agit::domain::link::Link::new("codex", id, Some(&dir));
+    claim.owner = Some("me".into());
+    claim.agent = Some("notes".into());
+    claim.branch = Some("work".into());
+    claim.superseded_by = Some("codex/61616161-6161-4616-8616-616161616161".into());
+    agit::domain::link::write(&store, &claim).unwrap();
+    let said = lab.stop(&dir, id, "codex", &dir.join("rollout.jsonl"));
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(
+        lines.contains(&"agit: this conversation continues as another session (61616161), so its turns here stay on this computer and aren't uploaded. To continue me/notes@work: `agit resume me/notes@work`."),
+        "{said}"
+    );
+    assert!(
+        lines.iter().any(
+            |line| line.starts_with("agit: ") && !line.contains("continues as another session")
+        ),
+        "the refused settlement is told too: {said}"
+    );
+}
+
 /// A conversation starting in a folder nothing saves tells the person once that agit isn't
 /// saving it, and the command that turns it on; the agent's context never carries it. The next
 /// start there says nothing, nor does one inside agit's own home, nor any once `notice.unsaved` is
