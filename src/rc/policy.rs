@@ -146,6 +146,13 @@ pub fn is_within(target: &Path, roots: &CanonicalRoots) -> bool {
     resolve_existing_ancestor(target).is_some_and(|t| within(&t, roots))
 }
 
+/// Whether the workspace reaches `cwd` only through a root at or above the home directory, so
+/// only the owner may send to a session working there. The daemon asks at the RPC; a message
+/// that waits for a later turn is asked again when it goes.
+pub(crate) fn home_folder_only(cwd: &Path, roots: &CanonicalRoots) -> bool {
+    is_within(cwd, roots) && !is_within(cwd, &roots.confining())
+}
+
 fn within(resolved: &Path, roots: &CanonicalRoots) -> bool {
     roots
         .iter()

@@ -139,6 +139,7 @@ pub(super) fn harness_test_session_with_channels(
         queued_initial_turn: None,
         pending_turn_command: None,
         pending_steer_command: None,
+        steer_queue: Default::default(),
         pending_interrupt_command: None,
         resolved_initial_turn: None,
         announced_turn_ids: Default::default(),

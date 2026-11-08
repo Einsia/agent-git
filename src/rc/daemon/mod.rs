@@ -2255,10 +2255,9 @@ impl Daemon {
             return Ok(());
         }
         let roots = self.mirror.roots(&caller.workspace_id);
-        let confining = self.roots_for(caller);
         let home = match cwd {
-            Some(cwd) => policy::is_within(cwd, &roots) && !policy::is_within(cwd, &confining),
-            None => roots != confining,
+            Some(cwd) => policy::home_folder_only(cwd, &roots),
+            None => roots != self.roots_for(caller),
         };
         if !home {
             return Ok(());

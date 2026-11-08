@@ -2414,11 +2414,21 @@ fn conversation_commit(
         .iter()
         .map(|line| storage::parse_legacy_envelope_line(line))
         .collect::<Result<Vec<_>>>()?;
-    let kept = publication_records::published_sequence(
+    // A tool step's context agit's plugin handed over goes out as the typed message it was,
+    // where this device's records vouch for it; any other stays context and is left out.
+    let typed = crate::rc::step_delivery::typed_records(
         envelopes
             .iter()
             .map(|envelope| (envelope.source.as_str(), &envelope.content)),
     );
+    let kept = publication_records::published_sequence(envelopes.iter().zip(&typed).map(
+        |(envelope, typed)| {
+            (
+                envelope.source.as_str(),
+                typed.as_ref().unwrap_or(&envelope.content),
+            )
+        },
+    ));
     // Records an encrypted snapshot already published keep the projection their readers saw,
     // narrowed by today's rules.
     let spliced = super::frozen::splice(&envelopes, kept, projected, others)?;

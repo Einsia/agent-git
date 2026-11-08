@@ -755,6 +755,10 @@ impl Adapter for ClaudeCode {
         let mut id = String::new();
         let mut cwd = None;
         let mut events = vec![];
+        // A tool step's context counts as the owner's words only where this device's records
+        // vouch for it; see `rc::step_delivery`. Without them, as on the Hub, it stays context.
+        #[cfg(feature = "rc")]
+        let mut delivered = crate::rc::step_delivery::Conversations::default();
 
         // Line numbers start at 0 and go into every event ([`Event::line`]): the web transcript
         // uses them to go back to the source for tool arguments and thinking bodies. Blank and
@@ -955,7 +959,20 @@ impl Adapter for ClaudeCode {
                 // UserPrompt: taken as prompts, one sentence is counted 6 times (1 real + 4
                 // last-prompt + 1 enqueue), and gist and turn splitting break together.
                 "attachment" | "last-prompt" => {
-                    events.push(other_event(ts).at_line(lineno));
+                    #[cfg(feature = "rc")]
+                    let words = delivered.words(&v);
+                    #[cfg(not(feature = "rc"))]
+                    let words: Vec<String> = Vec::new();
+                    if words.is_empty() {
+                        events.push(other_event(ts).at_line(lineno));
+                    } else {
+                        for words in words {
+                            events.push(
+                                Event::text(EventKind::UserInterjection, words, ts.clone())
+                                    .at_line(lineno),
+                            );
+                        }
+                    }
                 }
                 // A queue record has two fates, by `operation`:
                 //

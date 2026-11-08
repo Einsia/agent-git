@@ -373,6 +373,64 @@ test("a prompt for a running turn is acknowledged as queued at once, and an idle
   assert.deepEqual(f.latest().results, [{ id: "idle", outcome: "not_sent" }]);
 });
 
+// An owner's message for the running turn waits in plugin memory and goes to the model with the
+// result of that turn's next main-loop tool step, as that step's context, once; the daemon hears
+// only its id. A subagent's turn and step and a refused call don't take it: a plugin that took a
+// subagent's turn for the running one would never deliver the message nor give it back. What the turn ends without goes
+// back to the daemon by id with how the turn ended, and the plugin never submits it itself: a
+// plugin that did would start a turn the session's gates never saw again. A message for a turn
+// that has already ended is answered not_running, so the daemon starts it as the next turn.
+test("a message for the running turn goes with its next tool step, or back to the daemon by id", async () => {
+  const f = await fixture();
+  await f.fire("session.start");
+  await f.fire("turn.start", { turnId: "turn-1" });
+  await f.poll();
+  assert.deepEqual(f.latest().capabilities, ["steer_at_step"]);
+  const target = f.latest();
+  const steer = (id, text, turnId = "turn-1") =>
+    ({ ...target, id, method: "steer_context", text, turnId });
+  const settle = async () => { await f.poll(); await flush(); await flush(); await f.poll(); };
+  f.replies.push(body => ({ generation: body.generation, commands: [steer("held-1", "MSG one")] }));
+  await settle();
+  assert.deepEqual(f.latest().results, [{ id: "held-1", outcome: "held_for_step" }]);
+
+  // A subagent's own turn runs inside the main one and leaves the main turn's message waiting.
+  await f.fire("turn.start", { turnId: "sub-turn", agentId: "a" });
+  const subagent = await f.fire("tool.call", { tool: "Read", tool_use_id: "sub-1", agentId: "a" },
+    async () => ({ result: "sub" }));
+  assert.deepEqual(subagent, { result: "sub" });
+  await f.fire("turn.complete", { turnId: "sub-turn", agentId: "a", reason: "completed", durationMs: 1 });
+  const refused = await f.fire("tool.call", { tool: "Bash", tool_use_id: "denied-1" },
+    async () => ({ deny: "not allowed" }));
+  assert.deepEqual(refused, { deny: "not allowed" });
+  const delivered = await f.fire("tool.call", { tool: "Bash", tool_use_id: "bash-1" },
+    async () => ({ result: "ok", context: ["earlier"] }));
+  assert.deepEqual(delivered, { result: "ok", context: ["earlier", "MSG one"] });
+  const after = await f.fire("tool.call", { tool: "Bash", tool_use_id: "bash-2" },
+    async () => ({ result: "ok" }));
+  assert.deepEqual(after, { result: "ok" }, "a message goes once");
+
+  f.replies.push(body => ({ generation: body.generation, ack_results: ["held-1"],
+    commands: [steer("held-2", "MSG two"), steer("late", "MSG late", "ended-turn")] }));
+  await settle();
+  assert.deepEqual(f.latest().results, [
+    { id: "held-2", outcome: "held_for_step" },
+    { id: "late", outcome: "not_running" },
+  ]);
+  await f.fire("turn.complete", { turnId: "turn-1", reason: "completed", durationMs: 1 });
+  await f.poll();
+  // An event is sent again until a poll's reply acknowledges it: one per sequence number.
+  const sent = [...new Map(f.requests.filter(r => r.path === "/poll")
+    .flatMap(r => r.body.events).map(e => [e.seq, e])).values()];
+  assert.deepEqual(sent.filter(e => e.kind.startsWith("steer_")).map(({ seq, ...e }) => e), [
+    { kind: "steer_delivered", id: "held-1" },
+    { kind: "steer_undelivered", id: "held-2", reason: "completed" },
+  ]);
+  assert.equal(JSON.stringify(f.requests.map(r => r.body)).includes("MSG"), false,
+    "the daemon hears ids, never the text it sent");
+  assert.deepEqual(f.calls.filter(call => call[0] === "prompt"), []);
+});
+
 test("native slash commands keep their receipt and activity without creating a model prompt", async () => {
   const f = await fixture();
   const completed = deferred();

@@ -53,6 +53,10 @@ pub(super) struct Projector {
     unique_bytes: usize,
     /// The record rule after every LOG occurrence, duplicates included.
     sequence: PublishedSequence,
+    /// This device's delivery records spent on the tool-step contexts read so far, as
+    /// [`conversation_commit`] spends them over the whole LOG: each vouches once along the chain,
+    /// and a fresh start spends them anew.
+    deliveries: crate::rc::step_delivery::Conversations,
     /// Each recorded event's first occurrence.
     entries: HashMap<String, Entry>,
     /// Each LOG occurrence as it is published, in LOG order.
@@ -171,6 +175,7 @@ impl Projector {
         let prefix = published.prefix.as_ref().filter(|_| start == 0);
         let writer = BlobWriter::open(source)?;
         let mut sequence = std::mem::take(&mut self.sequence);
+        let mut deliveries = std::mem::take(&mut self.deliveries);
         let mut entries = std::mem::take(&mut self.entries);
         let mut occurrences = std::mem::take(&mut self.occurrences);
         let mut rewritten = self.rewritten;
@@ -220,7 +225,13 @@ impl Projector {
                 );
             }
             let position = occurrences.len();
-            let Some(content) = sequence.next(&envelope.source, &envelope.content) else {
+            // A tool step's context this device's records vouch for goes out as the typed message
+            // it was, as in `conversation_commit`.
+            let typed = (envelope.source == "claude-code")
+                .then(|| deliveries.as_typed(&envelope.content))
+                .flatten();
+            let recorded = typed.as_ref().unwrap_or(&envelope.content);
+            let Some(content) = sequence.next(&envelope.source, recorded) else {
                 rewritten += 1;
                 occurrences.push(None);
                 return Ok(());
@@ -305,6 +316,7 @@ impl Projector {
             );
         }
         self.sequence = sequence;
+        self.deliveries = deliveries;
         self.entries = entries;
         self.occurrences = occurrences;
         self.rewritten = rewritten;

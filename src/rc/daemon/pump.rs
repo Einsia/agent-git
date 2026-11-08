@@ -42,6 +42,11 @@ impl Daemon {
         // durably remove the fallback, preventing a stale snapshot from
         // rolling later roster updates back on another restart.
         let roster = Roster::try_load()?;
+        // A conversation whose transcript is gone from this device keeps no delivery records.
+        #[cfg(unix)]
+        crate::rc::step_delivery::sweep(|session| {
+            crate::adapter::claude_code::locate_transcript(session, None).is_some()
+        });
         // Privacy dependencies are opened only by the isolated worker after daemon startup.
         let d = Arc::new(Mutex::new(Daemon {
             identity: identity.clone(),
