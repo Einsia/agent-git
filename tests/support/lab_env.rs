@@ -42,6 +42,72 @@ impl LabEnv for Command {
     }
 }
 
+/// The agent runtimes a command can find on PATH and ask about themselves, as `agit doctor` does.
+const RUNTIMES: [&str; 3] = ["claude", "codex", "opencode"];
+
+/// The parent's PATH without the agent runtimes installed on the computer running the tests.
+/// `agit doctor` asks each runtime it finds on PATH about itself, so a test that passed PATH on
+/// reached whichever runtimes that computer had, and waited as long as they took to answer
+/// (#417). Each folder holding a runtime is left out.
+pub fn path_without_runtimes() -> std::ffi::OsString {
+    without_runtimes(&std::env::var_os("PATH").unwrap_or_default())
+}
+
+/// `path` without the folders that hold an agent runtime. When git is in one of them, a scratch
+/// folder with a `git` that runs it takes that folder's place, so git stays and the runtime goes.
+/// Git for Windows finds its installation from where its launcher sits, so there a git that shares
+/// a folder with a runtime stops the test instead.
+pub fn without_runtimes(path: &std::ffi::OsStr) -> std::ffi::OsString {
+    let holds = |folder: &std::path::Path, program: &str| {
+        ["", ".exe", ".cmd", ".bat", ".com", ".ps1"]
+            .iter()
+            .any(|suffix| folder.join(format!("{program}{suffix}")).is_file())
+    };
+    let mut kept = Vec::new();
+    for folder in std::env::split_paths(path) {
+        if !RUNTIMES.iter().any(|runtime| holds(&folder, runtime)) {
+            kept.push(folder);
+        } else if holds(&folder, "git") {
+            kept.push(git_alone(&folder));
+        }
+    }
+    std::env::join_paths(kept).expect("a PATH made of PATH's own folders joins")
+}
+
+#[cfg(unix)]
+fn git_alone(folder: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    // One scratch folder per git for the whole test binary, however many commands it starts.
+    static ALONE: std::sync::Mutex<
+        std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let mut alone = ALONE.lock().unwrap();
+    if let Some(scratch) = alone.get(folder) {
+        return scratch.clone();
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("agit-test-git-")
+        .tempdir()
+        .unwrap()
+        .keep();
+    let git = scratch.join("git");
+    let target = folder.join("git").to_string_lossy().replace('\'', "'\\''");
+    std::fs::write(&git, format!("#!/bin/sh\nexec '{target}' \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    alone.insert(folder.to_path_buf(), scratch.clone());
+    scratch
+}
+
+#[cfg(windows)]
+fn git_alone(folder: &std::path::Path) -> std::path::PathBuf {
+    panic!(
+        "test setup, not agit: git and an agent runtime share {} on this computer's PATH, so the \
+         tests can't leave the runtime out without losing git; put git on PATH from a folder that \
+         holds no codex, claude or opencode",
+        folder.display()
+    )
+}
+
 /// The same environment for a command run on a pseudo-terminal.
 #[cfg(feature = "rc")]
 impl LabEnv for portable_pty::CommandBuilder {

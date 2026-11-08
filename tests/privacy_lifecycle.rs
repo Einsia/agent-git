@@ -222,16 +222,10 @@ impl Device {
             .env("CI", "1")
             .env("NO_COLOR", "1")
             // A long wait for a state lock says which lock, where and in which process.
-            .env("AGIT_DIAGNOSE_LOCK_WAITS", "1");
-        for name in [
-            "PATH",
-            "SystemRoot",
-            "WINDIR",
-            "ComSpec",
-            "PATHEXT",
-            "TEMP",
-            "TMP",
-        ] {
+            .env("AGIT_DIAGNOSE_LOCK_WAITS", "1")
+            // Doctor asks every runtime it finds about itself; these tests aren't about them.
+            .env("PATH", lab_env::path_without_runtimes());
+        for name in ["SystemRoot", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
@@ -255,8 +249,17 @@ impl Device {
     fn doctor(&self) -> String {
         let output = self.command().arg("doctor").output().unwrap();
         forward_lock_waits(&output.stderr);
-        String::from_utf8_lossy(&output.stdout).into_owned()
-            + &String::from_utf8_lossy(&output.stderr)
+        let report = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        // On any computer, whatever it has installed: a runtime doctor finds here is one it waits
+        // on, as long as that runtime takes to answer.
+        for runtime in ["codex", "claude"] {
+            assert!(
+                report.contains(&format!("`{runtime}` is not on PATH")),
+                "{report}"
+            );
+        }
+        report
     }
 
     fn worker(&self) -> Worker {
@@ -752,19 +755,81 @@ fn independent_devices_recover_durable_aliases_after_cloud_failure() {
     assert_eq!(output["content"], secret);
 }
 
+/// The two branches of the test PATH that the doctor assertions above can't reach on runners with
+/// no agent runtime installed, built here from fake folders: a folder holding a runtime is left
+/// out while other tools stay, and a git that shares a folder with a runtime is reached through a
+/// folder of its own and still runs. A PATH that kept either folder would let doctor ask the
+/// computer's own runtime about itself and wait on it (#417).
+#[test]
+fn the_test_path_holds_git_and_no_agent_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let folder = |name: &str, programs: &[(&str, &str)]| {
+        let folder = root.path().join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        for (program, body) in programs {
+            let file = folder.join(program);
+            std::fs::write(&file, body).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        folder
+    };
+    let kept = |folders: &[&PathBuf]| {
+        std::env::split_paths(&lab_env::without_runtimes(
+            &std::env::join_paths(folders).unwrap(),
+        ))
+        .collect::<Vec<_>>()
+    };
+    let tools = folder("tools", &[("make", "")]);
+    let claude = folder("claude", &[("claude", "")]);
+    let codex = folder("codex", &[("codex.cmd", "")]);
+    assert_eq!(kept(&[&tools, &claude, &codex]), vec![tools.clone()]);
+    #[cfg(unix)]
+    {
+        let shared = folder(
+            "shared",
+            &[
+                ("git", "#!/bin/sh\necho shared-git \"$@\"\n"),
+                ("codex", ""),
+            ],
+        );
+        let path = kept(&[&tools, &shared]);
+        assert_eq!(path.len(), 2, "{path:?}");
+        assert_eq!(path[0], tools);
+        assert_ne!(path[1], shared);
+        assert!(!path[1].join("codex").exists(), "{path:?}");
+        let ran = Command::new(path[1].join("git"))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            "shared-git --version\n"
+        );
+    }
+}
+
 /// A refusal that an immediate retry would meet again is paced and reported by cause. A sync
 /// that treats it like a transient failure re-sends the outbox on every run; one that reports
 /// every 403 as an account problem sends the user to `agit login` for a block that no sign-in
 /// can lift.
 #[test]
 fn refused_dictionary_uploads_back_off_and_name_their_cause() {
+    // Each step says when it finishes, so a run that waits names the step it waits in.
+    let started = Instant::now();
+    let step = |name: &str| eprintln!("[{:>8.3}s] {name}", started.elapsed().as_secs_f64());
     let hub = Hub::new();
     let input =
         json!({"type":"assistant","data":{"api_key":"AKIA2E7YQXK4NMZ5VJ3T"}}).to_string() + "\n";
     let edge = Device::new(&hub.url);
     let account = Device::new(&hub.url);
-    for device in [&edge, &account] {
+    step("devices");
+    for (name, device) in [("edge", &edge), ("account", &account)] {
         let protected = device.worker().call("protect_jsonl", &input);
+        step(&format!("{name} protect"));
         assert!(protected["replacements"].as_u64().unwrap() > 0);
     }
 
@@ -774,11 +839,14 @@ fn refused_dictionary_uploads_back_off_and_name_their_cause() {
         "<html><body><h1>403 Forbidden</h1></body></html>",
     ));
     edge.sync();
+    step("edge sync, refused");
     let attempts = hub.state.lock().unwrap().upload_attempts;
     assert!(attempts > 0);
     edge.sync();
+    step("edge sync, backing off");
     assert_eq!(hub.state.lock().unwrap().upload_attempts, attempts);
     let report = edge.doctor();
+    step("edge doctor");
     assert!(
         report.contains("blocked before it reached the Hub"),
         "{report}"
@@ -791,7 +859,9 @@ fn refused_dictionary_uploads_back_off_and_name_their_cause() {
         r#"{"error":"privacy storage is disabled for this account","kind":"forbidden"}"#,
     ));
     account.sync();
+    step("account sync, refused");
     let report = account.doctor();
+    step("account doctor");
     assert!(
         report.contains("privacy storage is disabled for this account"),
         "{report}"
