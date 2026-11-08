@@ -2446,6 +2446,36 @@ pub(crate) fn claim_automatic_upload_offer(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// The one line, said once, that agit isn't saving the conversations of the folder `cwd` is in:
+/// a folder never bound and never offered. It takes the same one chance as a push's suggestion
+/// ([`claim_automatic_upload_offer`]), so a folder turned off, or one the person declined, stays
+/// quiet. Quiet too inside agit's own home, under a folder whose policy covers it, and everywhere
+/// once `notice.unsaved` is false. The line is the person's; it never reaches the agent, which
+/// would turn uploads on by running the command it names.
+pub(crate) fn unsaved_folder_line(cwd: &Path) -> Option<String> {
+    if super::config::get("notice.unsaved").as_deref() == Some("false") {
+        return None;
+    }
+    let cwd = cwd.canonicalize().ok()?;
+    let home = config::agit_home().ok()?;
+    if cwd.starts_with(home.canonicalize().unwrap_or(home)) {
+        return None;
+    }
+    let root = super::front::folder(&cwd).ok()?;
+    // Read before anything is written: a turn end in a folder already told leaves no file behind.
+    if governing(&cwd).ok()?.is_some()
+        || !never_bound(&root)
+        || automatic_upload_offered(&root)
+        || !claim_automatic_upload_offer(&root).ok()?
+    {
+        return None;
+    }
+    Some(
+        "agit isn't saving this folder's conversations; `agit on` here saves them from now on. Said once per folder; `agit config notice.unsaved false` stops it everywhere."
+            .to_owned(),
+    )
+}
+
 /// Records that the person declined turning `root` on. It changes nothing else: a binding, a
 /// paused folder and its local saving stay as they were.
 pub(crate) fn record_automatic_upload_declined(root: &Path) -> Result<()> {

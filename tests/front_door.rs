@@ -332,6 +332,12 @@ impl Lab {
 
     /// What the SessionStart hook answers when Claude Code resumes conversation `id` in `cwd`.
     fn resume(&self, cwd: &std::path::Path, id: &str) -> serde_json::Value {
+        self.session_start(cwd, id, "resume")
+    }
+
+    /// What the SessionStart hook answers when Claude Code starts conversation `id` in `cwd`,
+    /// for `source` (`startup`, `resume`, …).
+    fn session_start(&self, cwd: &std::path::Path, id: &str, source: &str) -> serde_json::Value {
         let transcript = self
             .home
             .join(".claude")
@@ -339,7 +345,7 @@ impl Lab {
             .join(agit::adapter::claude_code::slug_for(cwd))
             .join(format!("{id}.jsonl"));
         let event = serde_json::json!({"session_id": id, "cwd": cwd, "transcript_path": transcript,
-            "hook_event_name": "SessionStart", "source": "resume"});
+            "hook_event_name": "SessionStart", "source": source});
         let mut child = self
             .command(cwd, &["hooks", "ingest", "--runtime", "claude-code"])
             .stdin(std::process::Stdio::piped())
@@ -947,6 +953,124 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
 /// judged by the folder's path alone says nothing in the worktree and saves nothing there; one
 /// that took the worktree's earlier sessions along uploads them unasked; one whose `agit off`
 /// reached the folder turns the folder off too.
+/// A conversation starting in a folder nothing saves tells the person once that agit isn't
+/// saving it, and the command that turns it on; the agent's context never carries it. The next
+/// start there says nothing, nor does one inside agit's own home, nor any once `notice.unsaved` is
+/// false. A line that repeated every session would be noise; one in the agent's context would get
+/// uploads turned on by the agent.
+#[test]
+fn a_conversation_in_a_folder_nothing_saves_tells_the_person_once() {
+    const LINE: &str = "agit isn't saving this folder's conversations; `agit on` here saves them from now on. Said once per folder; `agit config notice.unsaved false` stops it everywhere.";
+    let lab = Lab::new();
+    let plain = lab.folder("plain", false);
+    let first = lab.session_start(&plain, "17171717-1717-4171-8171-171717171717", "startup");
+    assert!(
+        first["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains(LINE)),
+        "{first}"
+    );
+    assert!(
+        !first["hookSpecificOutput"]
+            .to_string()
+            .contains("isn't saving"),
+        "{first}"
+    );
+    let again = lab.session_start(&plain, "18181818-1818-4181-8181-181818181818", "startup");
+    assert!(!again.to_string().contains("isn't saving"), "{again}");
+
+    let own = lab.agit_home.join("repos/me/notes");
+    std::fs::create_dir_all(&own).unwrap();
+    let own = lab.session_start(&own, "19191919-1919-4191-8191-191919191919", "startup");
+    assert!(!own.to_string().contains("isn't saving"), "{own}");
+
+    let other = lab.folder("other", false);
+    let set = lab.agit(&other, &["config", "notice.unsaved", "false"]);
+    assert!(set.status.success(), "{set:?}");
+    let quiet = lab.session_start(&other, "20202020-2020-4202-8202-202020202020", "startup");
+    assert!(!quiet.to_string().contains("isn't saving"), "{quiet}");
+}
+
+/// Sessions from before a folder covered them are the person's to upload. Without a terminal,
+/// where an agent reads the output, no line and no JSON field offers `agit save --all` as a step
+/// to take: each says to ask the person, in `agit on`, `agit save`, the overview and status. A
+/// hint that handed an agent the command would publish sessions nobody chose.
+#[test]
+fn without_a_terminal_no_output_hands_an_agent_save_all_for_earlier_sessions() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    let git = |at: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(at)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "start"]);
+    git(&dir, &["worktree", "add", "-q", "../notes-tree"]);
+    let tree = dir
+        .parent()
+        .unwrap()
+        .join("notes-tree")
+        .canonicalize()
+        .unwrap();
+    lab.turn_on(&dir, "me/notes");
+    lab.conversation(
+        &tree,
+        "15151515-1515-4151-8151-151515151515",
+        "Try the adapter idea",
+    );
+    lab.conversation(
+        &tree,
+        "16161616-1616-4161-8161-161616161616",
+        "Sketch the parser",
+    );
+    fn strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+        match value {
+            serde_json::Value::String(text) => out.push(text),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| strings(item, out)),
+            serde_json::Value::Object(fields) => {
+                fields.values().for_each(|item| strings(item, out))
+            }
+            _ => {}
+        }
+    }
+    let mut asked = 0;
+    for (at, args) in [
+        (&tree, &["on"][..]),
+        (&tree, &["--json", "on"]),
+        (&tree, &["save"]),
+        (&tree, &[]),
+        (&tree, &["--json"]),
+        (&tree, &["status"]),
+        (&tree, &["status", "--json"]),
+        (&dir, &[]),
+    ] {
+        let out = lab.agit(at, args);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut texts: Vec<&str> = said.lines().collect();
+        let document = serde_json::from_slice::<serde_json::Value>(&out.stdout).ok();
+        if let Some(document) = &document {
+            strings(document, &mut texts);
+        }
+        for text in texts.iter().filter(|text| text.contains("agit save --all")) {
+            assert!(text.contains("ask the person"), "{args:?}: {text}");
+            asked += 1;
+        }
+    }
+    assert!(asked > 0, "no output mentioned the sessions from before");
+}
+
 #[test]
 fn a_folder_covers_its_git_worktrees_from_now_on() {
     let lab = Lab::new();
@@ -997,7 +1121,13 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
     assert_eq!(here["through"], serde_json::json!(dir), "{here}");
     assert_eq!(here["repository"], "me/notes", "{here}");
     assert_eq!(here["earlier_sessions_not_uploaded"], 1, "{here}");
-    assert_eq!(here["next"]["command"], "agit save --all", "{here}");
+    assert!(
+        here["next"]["command"].is_null()
+            && here["next"]["ask_user"]
+                .as_str()
+                .is_some_and(|ask| ask.contains("ask the person")),
+        "{here}"
+    );
     // `agit remote` lists the remotes of the repository the folder saves to, from the worktree
     // too; this lab has no checkout of it, so it names the repository and how to get it. One that
     // fell back to AGIT_SESSION alone could not tell which repository a folder means.
@@ -1017,7 +1147,7 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
     );
     assert_eq!(
         status["earlier_sessions_not_uploaded"],
-        serde_json::json!({"count": 1, "command": "agit save --all"}),
+        serde_json::json!({"count": 1, "ask_user": "1 session that ran here before isn't uploaded; ask the person whether to upload it (`agit save --all`)"}),
         "{status}"
     );
     // Resumed, that conversation tells the person, and only the person, that it is not uploaded

@@ -8,7 +8,7 @@ use clap::Args as ClapArgs;
 
 /// The full set of valid keys. Adding a key means editing here; an unknown key is always rejected
 /// and this table printed.
-pub const KEYS: [(&str, &str); 8] = [
+pub const KEYS: [(&str, &str); 9] = [
     (
         "hub.url",
         "default hub address (AGIT_HUB_URL takes priority)",
@@ -26,6 +26,10 @@ pub const KEYS: [(&str, &str); 8] = [
         "automatically publish settled turns: true | false (default false)",
     ),
     ("commit.auto", "hooks auto-settlement switch: true | false"),
+    (
+        "notice.unsaved",
+        "say once per folder that agit isn't saving its conversations: true | false (default true)",
+    ),
     (
         "memory.track",
         "collect the runtime’s project memory onto session branches: session | off",
@@ -567,6 +571,7 @@ fn default_value(key: &str) -> Option<&'static str> {
         "hub.url" => Some(config::DEFAULT_HUB_URL),
         "push.visibility" => Some("ask"),
         "commit.auto" => Some("true"),
+        "notice.unsaved" => Some("true"),
         "push.auto" => Some("false"),
         "memory.track" => Some("session"),
         config::SecretKeystore::KEY => Some(config::SecretKeystore::Os.as_str()),
@@ -583,7 +588,7 @@ fn wants_tui(args: &Args) -> bool {
 pub(crate) fn validate(key: &str, v: &str) -> crate::Result<()> {
     let ok = match key {
         "push.visibility" => matches!(v, "ask" | "private" | "public"),
-        "commit.auto" | "push.auto" => matches!(v, "true" | "false"),
+        "commit.auto" | "push.auto" | "notice.unsaved" => matches!(v, "true" | "false"),
         "memory.track" => matches!(v, "session" | "off"),
         "runtime.default" => crate::adapter::normalize(v).is_ok(),
         "hub.url" => v.starts_with("http://") || v.starts_with("https://"),

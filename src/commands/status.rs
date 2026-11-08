@@ -194,10 +194,8 @@ pub fn run(args: Args) -> CmdResult {
     }
     if let Some(count) = worktree_left_out(&cwd).filter(|count| *count > 0) {
         println!(
-            "  {count} earlier session{} here {} not uploaded; to upload {} too: `agit save --all`",
-            if count == 1 { "" } else { "s" },
-            if count == 1 { "is" } else { "are" },
-            if count == 1 { "it" } else { "them" },
+            "  {}",
+            super::front::earlier_note(count, "here", super::front::Reader::of_this_process())
         );
     }
     print_upload_waits();
@@ -731,9 +729,10 @@ fn structured(args: &Args) -> CmdResult {
         "runtime_session": runtime_session_json(&runtime_sessions),
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "worktree": super::project::worktree_notice(&cwd),
+        // Uploading the sessions from before is the person's choice: the agent asks.
         "earlier_sessions_not_uploaded": earlier.map(|count| serde_json::json!({
             "count": count,
-            "command": "agit save --all",
+            "ask_user": super::front::earlier_note(count, "here", super::front::Reader::Agent),
         })),
         "upload_waits": upload_waits_json(),
         "uploads_not_through": uploads_not_through_json(),

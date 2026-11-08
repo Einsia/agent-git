@@ -179,7 +179,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
         };
         return Err(Refusal::new(
             format!("this would upload {count} in {}", ui::tilde(&root)),
-            "name one: `agit save SESSION-ID` (`agit` shows them), or upload them all: `agit save --all`",
+            "ask the person whether to upload one (`agit save SESSION-ID`, `agit` shows them) or all of them (`agit save --all`)",
             ExitCode::Interactive,
         )
         .into());
@@ -397,11 +397,8 @@ fn off_command(folder: &Path) -> String {
 fn report_left_out(left_out: usize) {
     if left_out > 0 {
         println!(
-            "{left_out} session{} from before this folder was on {} left out; to upload {} too: {}",
-            if left_out == 1 { "" } else { "s" },
-            if left_out == 1 { "is" } else { "are" },
-            if left_out == 1 { "it" } else { "them" },
-            ui::accent("agit save --all")
+            "{}",
+            super::earlier_note(left_out, "here", super::Reader::of_this_process())
         );
     }
 }

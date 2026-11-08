@@ -18,8 +18,15 @@ repository linked to the folder's Git origin that the account can write to; othe
 account's own private repository named after the origin or the folder (created if missing).
 A public destination is used only when named with `--repo` and `--public`.
 
-Earlier sessions are not uploaded; the result says how many there are, and
-`agit save --all` uploads them.
+Earlier sessions are not uploaded, and the result says how many there are. Uploading them is
+the user's choice: ask whether to upload one (`agit save <id>`) or all of them
+(`agit save --all`), and don't run either unasked. `result.value.next.ask_user` has the question.
+
+A second project folder is turned on the same way: `agit on` in that folder, with `--repo` to
+choose its repository when it shouldn't be the one chosen for it. A conversation already run
+there before it was on is saved by naming it: `agit save <id>`. In a folder nothing saves, a
+conversation's start tells the person once that agit isn't saving it;
+`agit config notice.unsaved false` stops that everywhere.
 
 A folder that is a Git main checkout also covers its linked worktrees (`git worktree add`) that
 have no setting of their own, and the result names each one (`also covers … (git worktree)`).

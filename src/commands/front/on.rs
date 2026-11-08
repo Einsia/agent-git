@@ -448,9 +448,9 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
                 "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).collect::<Vec<_>>(),
+                // Uploading the sessions from before is the person's choice: the agent asks.
                 "next": (waiting > 0).then(|| serde_json::json!({
-                    "command": "agit save --all",
-                    "why": "upload the sessions that ran here before",
+                    "ask_user": super::earlier_note(waiting, "here", super::Reader::Agent),
                 })),
             })
         );
@@ -505,14 +505,9 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
         std::iter::once(("here".to_owned(), earlier)).chain(worktrees.iter().map(
             |(worktree, count)| (format!("in {} (git worktree)", ui::tilde(worktree)), *count),
         ));
+    let reader = super::Reader::of_this_process();
     for (place, count) in here.filter(|(_, count)| *count > 0) {
-        println!(
-            "  {count} earlier session{} {place} {} not uploaded; to upload {} too: {}",
-            if count == 1 { "" } else { "s" },
-            if count == 1 { "is" } else { "are" },
-            if count == 1 { "it" } else { "them" },
-            ui::accent("agit save --all")
-        );
+        println!("  {}", super::earlier_note(count, &place, reader));
     }
     println!("  to stop: {}", ui::accent("agit off"));
     Ok(ExitCode::Ok)
@@ -557,7 +552,7 @@ impl RuntimeState {
                 "nothing is saved yet: Codex lists none of AgentGit's hooks; to add them: `agit setup --runtime codex --hooks`".into()
             }
             Self::CatchUp => {
-                "this Codex has no hooks, so nothing from it is saved by itself; to upload its sessions here: `agit save SESSION-ID`, or all of them: `agit save --all`".into()
+                "this Codex has no hooks, so nothing from it is saved by itself; to upload one of its sessions here, name it: `agit save SESSION-ID`".into()
             }
         }
     }

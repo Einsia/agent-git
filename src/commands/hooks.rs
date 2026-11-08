@@ -756,7 +756,12 @@ fn session_start(rt: &'static str, ev: &Event) -> Option<serde_json::Value> {
         .map(|l| l.agent.is_some() && l.branch.is_some())
         .unwrap_or(false);
     if !has_binding && !concerns_us(bound, env_session.is_some()) {
-        return None;
+        // Nothing saves this conversation, and a folder nothing saves says so once, to the
+        // person only.
+        return announces_upload(rt, ev.source)
+            .then(|| origin.and_then(super::project::unsaved_folder_line))
+            .flatten()
+            .map(|line| serde_json::json!({ "systemMessage": line }));
     }
 
     let store = Store::open_or_init().ok()?;
@@ -1225,6 +1230,22 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         (Some(failure), Some(line)) => Some(format!("{failure}\n{line}")),
         (failure, line) => failure.or(line),
     };
+    // A folder nothing saves says so once, at the first turn end that gets there before a start
+    // did (a Codex whose start hook isn't trusted yet, say), to the person only.
+    let unclaimed = super::context::from_session_env().is_none()
+        && !Store::open()
+            .ok()
+            .flatten()
+            .and_then(|store| link::get(&store, rt, &ev.session_id))
+            .is_some_and(|lk| lk.branch.is_some());
+    let unsaved = (!await_reply && matches!(rt, "claude-code" | "codex") && unclaimed)
+        .then(|| {
+            ev.cwd
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(super::project::unsaved_folder_line)
+        })
+        .flatten();
     // A Codex turn settles here, as the turn ends: whatever keeps it from being saved is told to
     // the person now, in the turn it concerns, beside the one-time line about a branch an older
     // agit linked it to.
@@ -1239,7 +1260,7 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
             .err()
             .filter(|error| !super::commit::archive::is_failure(error))
             .map(|error| format!("agit: {error:#}"));
-        let lines: Vec<String> = [older, refused].into_iter().flatten().collect();
+        let lines: Vec<String> = [older, refused, unsaved].into_iter().flatten().collect();
         if !lines.is_empty() {
             println!(
                 "{}",
@@ -1248,6 +1269,10 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         }
         return settled;
     }
+    let failure = match (failure, unsaved) {
+        (Some(failure), Some(line)) => Some(format!("{failure}\n{line}")),
+        (failure, line) => failure.or(line),
+    };
     let Some(failure) = failure else {
         return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
     };
