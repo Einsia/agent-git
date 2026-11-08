@@ -24,6 +24,7 @@ mod objects;
 #[cfg(unix)]
 mod permissions;
 mod transaction;
+mod worktrees;
 
 use super::CmdResult;
 use super::skill_bundle;
@@ -54,6 +55,16 @@ pub struct Args {
         conflicts_with_all = ["repair_permissions", "repo", "check_backend", "deep"]
     )]
     pub repair_objects: Option<String>,
+
+    /// Move a local repository's worktrees that sit in another repository's place into its own,
+    /// relinking each to it
+    #[arg(
+        long,
+        value_name = "OWNER/REPO",
+        value_parser = parse_repo,
+        conflicts_with_all = ["repair_permissions", "repair_objects", "repo", "check_backend", "deep"]
+    )]
+    pub repair_worktrees: Option<String>,
 
     /// Restrict repository and adopted-session checks to this local owner/repo
     #[arg(long, value_name = "OWNER/REPO", value_parser = parse_repo)]
@@ -93,6 +104,9 @@ enum Check {
 pub fn run(args: Args) -> CmdResult {
     if let Some(slug) = args.repair_objects.as_deref() {
         return objects::repair(slug);
+    }
+    if let Some(slug) = args.repair_worktrees.as_deref() {
+        return worktrees::repair(slug);
     }
     if let Some(path) = args.repair_permissions.as_deref() {
         #[cfg(unix)]
@@ -302,7 +316,19 @@ pub fn run(args: Args) -> CmdResult {
     // One Git can't inspect is named with what Git said; nothing else here reads it.
     for found in super::migration::uninspectable_repositories() {
         fatal = true;
-        checks.push((found.repository.clone(), Check::Err(found.finding())));
+        let finding = match found.worktree().and_then(|worktree| {
+            super::worktree::sits_in_place_of(&found.repository, worktree)
+                .map(|(place, _)| (worktree, place))
+        }) {
+            Some((worktree, place)) => format!(
+                "its worktree {} sits in {place}'s place, and Git can't reach its storage there; \
+                 `agit doctor --repair-worktrees {repository}` moves it to {repository}'s place",
+                ui::tilde(worktree),
+                repository = found.repository
+            ),
+            None => found.finding(),
+        };
+        checks.push((found.repository.clone(), Check::Err(finding)));
     }
     let agents = match &selected {
         Some((_, _, path)) if config::left_out(path).is_some() => Vec::new(),

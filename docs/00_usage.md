@@ -818,6 +818,18 @@ confirmation (or `--yes`) moves a branch that stays unreadable to
 repair that stops early (no network, no confirmation) is picked up again by the next `agit doctor`
 and by running the repair again.
 
+A checkout that an older agit moved without its worktrees can leave a worktree in another
+repository's place, where Git can't reach its storage. `agit status` names the repository and
+leaves it out when your folder doesn't use it, and doctor names the worktree and the repair:
+
+```sh
+agit doctor --repair-worktrees alice/wiki-work
+```
+
+It moves each such worktree into the repository's own place and relinks it, and moves nothing if a
+place is already taken. `agit repo rename` and `agit clone --mine` move a repository's worktrees
+with it.
+
 ```sh
 agit upgrade --check      # report whether a new release exists, nothing else
 agit upgrade              # atomically replaces the current binary; on failure the installed one is untouched

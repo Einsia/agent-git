@@ -27,7 +27,7 @@ agit repo <subcommand>
 | `collab rm <repo> <user>` | Remove a collaborator | — |
 | `collab list <repo>` | List collaborators | — |
 | `invite <repo>[@<branch>] [-b <branch>] [--role read|write|owner]` | Print an invite link; with `@<branch>` (or `-b <branch>`) the invitee lands on that branch's session after accepting | Default role `read`; owners only; `@` selects the session in `AGIT_SESSION` |
-| `rename <repo> <new-name>` | Rename a remote repo | — |
+| `rename <repo> <new-name>` | Rename a remote repo, and move the local checkout and its worktrees to the new name | A worktree that can't move stops it before the Hub is asked |
 | `delete <repo>` | Delete a remote repo | `--local` deletes only the local copy |
 | `path [repo]` | Print the main checkout for a bare repo, or `<owner/repo>@<branch>` for that session branch's worktree (created on demand); `@` selects the branch supplied through `AGIT_SESSION` | An omitted repo requires `AGIT_SESSION` and returns its main checkout |
 

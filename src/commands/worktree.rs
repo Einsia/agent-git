@@ -279,8 +279,258 @@ pub fn rename(primary: &Repo, old: &str, new: &str) -> crate::Result<()> {
     Ok(())
 }
 
+/// The linked worktrees that follow a repository when it takes another owner or name: each moves
+/// from its place under the old home to the same place under the new one, so a worktree's path
+/// always names the repository its `.git` points to. One registered outside the old home stays
+/// where it is and is only relinked.
+pub struct Relocation {
+    slug: String,
+    from_home: PathBuf,
+    to_home: PathBuf,
+    moves: Vec<(PathBuf, PathBuf)>,
+    /// What a refusal says has not happened: "nothing was renamed" or "nothing was moved".
+    unchanged: &'static str,
+}
+
+impl Relocation {
+    /// The moves for `primary` (`slug`) to become `owner/name`, planned before anything changes.
+    /// A target that is taken, a locked worktree or one whose folder is gone stops it, with
+    /// nothing changed.
+    pub fn plan(
+        primary: &Repo,
+        slug: &str,
+        owner: &str,
+        name: &str,
+        unchanged: &'static str,
+    ) -> crate::Result<Self> {
+        let from_home = home_for(primary)?;
+        let to_home = canonical(&config::agit_home()?)
+            .join("worktrees")
+            .join(owner)
+            .join(name);
+        let mut relocation = Self {
+            slug: slug.to_owned(),
+            from_home,
+            to_home,
+            moves: Vec::new(),
+            unchanged,
+        };
+        let locked = locked_worktrees(primary);
+        for holder in primary.worktrees()? {
+            if holder.primary {
+                continue;
+            }
+            let Ok(rest) = holder.path.strip_prefix(&relocation.from_home) else {
+                continue;
+            };
+            let to = relocation.to_home.join(rest);
+            if !holder.path.exists() {
+                return Err(relocation.refusal(
+                    &holder.path,
+                    &to,
+                    &format!(
+                        "its folder is missing; `git -C {} worktree prune` forgets it",
+                        quote_arg(&primary.root().to_string_lossy())
+                    ),
+                ));
+            }
+            if locked.iter().any(|path| same_place(path, &holder.path)) {
+                return Err(relocation.refusal(
+                    &holder.path,
+                    &to,
+                    &format!(
+                        "it is locked; `git worktree unlock {}` if nothing uses it",
+                        quote_arg(&holder.path.to_string_lossy())
+                    ),
+                ));
+            }
+            // A disk that ignores case already has a case-only rename's target: the same folder.
+            if same_place(&holder.path, &to) {
+                continue;
+            }
+            if to.exists() {
+                return Err(relocation.refusal(&holder.path, &to, "something is already there"));
+            }
+            relocation.moves.push((holder.path, to));
+        }
+        Ok(relocation)
+    }
+
+    fn refusal(&self, from: &Path, to: &Path, why: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "can't move {}'s worktree {} to {}: {why}; {}",
+            self.slug,
+            crate::ui::tilde(from),
+            crate::ui::tilde(to),
+            self.unchanged
+        )
+    }
+
+    /// Move every planned worktree, from `primary` where it is now. A failure moves back what
+    /// moved, so the repository is as it was.
+    pub fn apply(&self, primary: &Repo) -> crate::Result<()> {
+        for (done, (from, to)) in self.moves.iter().enumerate() {
+            if let Err(error) = primary.move_worktree(from, to) {
+                for (from, to) in self.moves[..done].iter().rev() {
+                    let _ = primary.move_worktree(to, from);
+                }
+                let said = format!("{error:#}");
+                return Err(self.refusal(from, to, said.lines().next().unwrap_or("Git refused")));
+            }
+        }
+        if let Ok(all) = config::worktrees_dir() {
+            let all = canonical(&all);
+            for (from, _) in &self.moves {
+                remove_empty_parents(from, &all);
+            }
+        }
+        Ok(())
+    }
+
+    /// Move every worktree back, from `primary` where it is now; for a step that failed after
+    /// [`Self::apply`].
+    pub fn undo(&self, primary: &Repo) {
+        for (from, to) in self.moves.iter().rev() {
+            let _ = primary.move_worktree(to, from);
+        }
+    }
+
+    /// Once the repository itself sits at `moved`, having been at `old`, the worktrees whose `.git`
+    /// still names a registration under `old` are pointed at that registration in its new place.
+    /// No other worktree is touched: one whose link names another repository is that repository's,
+    /// even where a stale registration here still names its path.
+    pub fn relink(moved: &Repo, old: &Path) {
+        let Ok(common) = moved.common_dir() else {
+            return;
+        };
+        let old_common = [
+            old.join(".git"),
+            old.parent()
+                .map(|parent| canonical(parent).join(old.file_name().unwrap_or_default()))
+                .unwrap_or_else(|| old.to_path_buf())
+                .join(".git"),
+        ];
+        for (admin, checkout) in registrations(&common) {
+            let Some(named) = link_of(&checkout) else {
+                continue;
+            };
+            if old_common.iter().any(|old| named.starts_with(old)) {
+                let _ = link_to(&checkout, &admin);
+            }
+        }
+    }
+
+    /// The line that says the worktrees moved too, when any did.
+    pub fn describe(&self) -> Option<String> {
+        (!self.moves.is_empty()).then(|| {
+            format!(
+                "and its worktrees: {} → {}",
+                crate::ui::tilde(&self.from_home),
+                crate::ui::tilde(&self.to_home)
+            )
+        })
+    }
+}
+
+/// The repository whose place under agit's worktrees `path` sits in, with that place, when it
+/// isn't `slug`'s own: a worktree there names one repository while its `.git` points to another.
+pub fn sits_in_place_of(slug: &str, path: &Path) -> Option<(String, PathBuf)> {
+    let all = canonical(&config::agit_home().ok()?).join("worktrees");
+    let path = canonical(path);
+    let mut parts = path.strip_prefix(&all).ok()?.components();
+    let owner = parts.next()?.as_os_str().to_str()?.to_owned();
+    let name = parts.next()?.as_os_str().to_str()?.to_owned();
+    parts.next()?;
+    let place = format!("{owner}/{name}");
+    (place != slug).then(|| (place, all.join(owner).join(name)))
+}
+
+/// The linked worktrees Git holds locked, from the registrations themselves: a lock is a
+/// `locked` file beside the registration's `gitdir`.
+fn locked_worktrees(primary: &Repo) -> Vec<PathBuf> {
+    let Ok(common) = primary.common_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().join("locked").exists())
+        .filter_map(|entry| {
+            let gitdir = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            let gitdir = PathBuf::from(gitdir.trim());
+            let gitdir = if gitdir.is_absolute() {
+                gitdir
+            } else {
+                entry.path().join(gitdir)
+            };
+            gitdir.parent().map(Path::to_path_buf)
+        })
+        .collect()
+}
+
+/// Each worktree registration in the common Git directory `common`: its directory there, and the
+/// checkout its `gitdir` names.
+pub(in crate::commands) fn registrations(common: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let gitdir = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
+            let gitdir = resolve(&entry.path(), gitdir.trim());
+            Some((entry.path(), gitdir.parent()?.to_path_buf()))
+        })
+        .collect()
+}
+
+/// The registration a linked worktree's own `.git` names.
+pub(in crate::commands) fn link_of(checkout: &Path) -> Option<PathBuf> {
+    let link = std::fs::read_to_string(checkout.join(".git")).ok()?;
+    Some(resolve(
+        checkout,
+        link.trim().strip_prefix("gitdir:")?.trim(),
+    ))
+}
+
+/// Points the linked worktree at `checkout` at the registration `admin`, the one write
+/// `git worktree repair` makes for it, and nothing else. Git's repair also rewrites every other
+/// registration's worktree, including one another repository has since made at a stale
+/// registration's path, which would then open this repository instead.
+pub(in crate::commands) fn link_to(checkout: &Path, admin: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        checkout.join(".git"),
+        format!("gitdir: {}\n", admin.display()),
+    )
+}
+
+pub(in crate::commands) fn resolve(base: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+pub(in crate::commands) fn same_place(a: &Path, b: &Path) -> bool {
+    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+}
+
+#[cfg(windows)]
+fn quote_arg(value: &str) -> String {
+    crate::ui::quote_powershell_argument(value)
+}
+
+#[cfg(not(windows))]
+fn quote_arg(value: &str) -> String {
+    crate::ui::session::shell_arg(value)
+}
+
 /// Once a branch like `a/b` is gone, collect the `a/` it emptied as well, up to the worktree home.
-fn remove_empty_parents(path: &Path, stop: &Path) {
+pub(in crate::commands) fn remove_empty_parents(path: &Path, stop: &Path) {
     let mut current = path.parent();
     while let Some(dir) = current {
         if dir == stop || !dir.starts_with(stop) {

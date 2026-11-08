@@ -1159,6 +1159,25 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
         ));
         return Ok(ExitCode::Precondition);
     }
+    // The worktrees move with the checkout; one that can't stops the rename before the Hub hears
+    // of it.
+    let primary = Repo::open(&old_dir);
+    let relocation = match primary.as_ref().map(|primary| {
+        super::worktree::Relocation::plan(
+            primary,
+            &format!("{owner}/{name}"),
+            &owner,
+            new_name,
+            "nothing was renamed",
+        )
+    }) {
+        Some(Ok(relocation)) => Some(relocation),
+        Some(Err(error)) => {
+            ui::error(&format!("{error:#}"));
+            return Ok(ExitCode::Precondition);
+        }
+        None => None,
+    };
     let client = super::require_login()?;
     let identity = match mutation_identity(&client, &owner, &name) {
         Ok(identity) => identity,
@@ -1167,9 +1186,18 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
+    if let (Some(primary), Some(relocation)) = (&primary, &relocation)
+        && let Err(error) = relocation.apply(primary)
+    {
+        ui::error(&format!("{error:#}"));
+        return Ok(ExitCode::Precondition);
+    }
     match client.rename_agent(&owner, &name, new_name, &identity.agent_id) {
         Ok(()) => ui::success(&format!("remote renamed: {repo} → {owner}/{new_name}")),
         Err(e) => {
+            if let (Some(primary), Some(relocation)) = (&primary, &relocation) {
+                relocation.undo(primary);
+            }
             super::fix::register_terminal_api_error(&e);
             ui::error(&format!("remote rename failed: {e:#}"));
             return Ok(super::terminal_error_code(&e, ExitCode::Network));
@@ -1177,13 +1205,16 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
     }
     // The local directory follows. A disk that ignores case may not move a directory onto its
     // own name in another case, so a case-only rename goes through another name.
-    if Repo::open(&old_dir).is_some() {
+    if primary.is_some() {
         if case_only {
             let step = old_dir.with_file_name(format!(".{new_name}.renaming"));
             std::fs::rename(&old_dir, &step)?;
             std::fs::rename(&step, &new_dir)?;
         } else {
             std::fs::rename(&old_dir, &new_dir)?;
+        }
+        if relocation.is_some() {
+            super::worktree::Relocation::relink(&Repo::at(&new_dir), &old_dir);
         }
         if let Some(r) = Repo::open(&new_dir)
             && let Some(url) = r.remote_url()
@@ -1198,6 +1229,12 @@ fn rename(repo: &str, new_name: &str) -> CmdResult {
             ui::tilde(&old_dir),
             ui::tilde(&new_dir)
         ));
+        if let Some(line) = relocation
+            .as_ref()
+            .and_then(super::worktree::Relocation::describe)
+        {
+            println!("  {line}");
+        }
     }
     Ok(ExitCode::Ok)
 }
