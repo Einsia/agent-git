@@ -808,8 +808,9 @@ fn merge_agent_generation_cannot_modify_a_replacement_transaction() {
 struct ArchiveTerminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
-    _writer: Box<dyn std::io::Write + Send>,
+    writer: Box<dyn std::io::Write + Send>,
     output: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    seen: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -830,6 +831,27 @@ impl ArchiveTerminal {
         runtime: &str,
         file_mode: Option<&str>,
         extra: &[&str],
+    ) -> Self {
+        Self::spawn(
+            lab, exit, available, target, runtime, file_mode, extra, true,
+        )
+    }
+
+    /// A merge started by a person who passed no `-y`, so a question waits for them.
+    fn start_unconfirmed(lab: &Lab) -> Self {
+        Self::spawn(lab, 0, true, "work", "codex", None, &[], false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        lab: &Lab,
+        exit: u8,
+        available: bool,
+        target: &str,
+        runtime: &str,
+        file_mode: Option<&str>,
+        extra: &[&str],
+        yes: bool,
     ) -> Self {
         use std::io::Read;
         use std::os::unix::fs::PermissionsExt;
@@ -866,6 +888,7 @@ impl ArchiveTerminal {
         command.env_clear_local();
         for (key, value) in template.get_envs() {
             if key != "CI"
+                && (yes || key != "AGIT_YES")
                 && let Some(value) = value
             {
                 command.env(key, value);
@@ -920,14 +943,42 @@ impl ArchiveTerminal {
         Self {
             child,
             _master: pty.master,
-            _writer: writer,
+            writer,
             output,
+            seen: Vec::new(),
         }
+    }
+
+    /// Types `keys` once `question` is on the terminal.
+    fn answer(&mut self, question: &str, keys: &[u8]) {
+        use std::io::Write;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !String::from_utf8_lossy(&self.seen).contains(question) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no question {question:?}; output={}",
+                String::from_utf8_lossy(&self.seen)
+            );
+            match self
+                .output
+                .recv_timeout(std::time::Duration::from_millis(10))
+            {
+                Ok(Ok(bytes)) => self.seen.extend_from_slice(&bytes),
+                Ok(Err(error)) => panic!("terminal read failed: {error}"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "terminal closed before {question:?}; output={}",
+                    String::from_utf8_lossy(&self.seen)
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        self.writer.write_all(keys).unwrap();
+        self.writer.flush().unwrap();
     }
 
     fn finish(mut self) -> (portable_pty::ExitStatus, String) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut output = Vec::new();
+        let mut output = std::mem::take(&mut self.seen);
         let mut status = None;
         let mut output_closed = false;
         loop {
@@ -1024,6 +1075,10 @@ fn session_agent_start_settles_old_content_then_activates_archive_before_spawn()
             ),
             "{output}"
         );
+        // With `-y` nothing is asked, but the takeover is still said before anything opens.
+        let notice = output.find("takes over this terminal as the merge agent");
+        let opened = output.find("merge transaction open");
+        assert!(notice.is_some() && notice < opened, "{output}");
         let repo = Repo::open(lab.repo()).unwrap();
         let tx = mergetx::read(repo.root()).unwrap().unwrap();
         assert_eq!(tx.mode, Some(mergetx::Mode::SessionAgent));
@@ -1186,12 +1241,14 @@ fn failed_archive_runtime_keeps_installed_authority_for_explicit_abort() {
     assert_eq!(lab.git(&["rev-parse", "refs/heads/work"]), head);
 }
 
-/// Runtime absence and unverifiable old records cannot consume the old claim or create a Tx.
+/// Runtime absence and unverifiable old records cannot consume the old claim or create a Tx, and
+/// neither can a person who says no when told the agent is about to take over their terminal. If
+/// the question came after the transaction opened, declining would leave the branch locked.
 #[test]
 #[cfg(unix)]
 fn archive_start_preflight_refusals_preserve_old_pending_authority() {
     use agit::domain::{mergetx, repo::Repo};
-    for change in ["unavailable", "in-flight", "malformed"] {
+    for change in ["unavailable", "in-flight", "malformed", "declined"] {
         let lab = Lab::new();
         let original = fs::read(&lab.native).unwrap();
         let suffix = match change {
@@ -1201,25 +1258,42 @@ fn archive_start_preflight_refusals_preserve_old_pending_authority() {
                 message("assistant", "SYNTHETIC-DONE")
             ),
             "in-flight" => message("user", "SYNTHETIC-PENDING"),
+            "declined" => String::new(),
             _ => "{\"incomplete\":".into(),
         };
         fs::write(&lab.native, [original, suffix.into_bytes()].concat()).unwrap();
         let native = fs::read(&lab.native).unwrap();
         let link = fs::read(lab.link()).unwrap();
         let head = lab.git(&["rev-parse", "refs/heads/work"]);
-        let (status, output) =
-            ArchiveTerminal::start_with_runtime(&lab, 0, change != "unavailable").finish();
-        assert_ne!(status.exit_code(), 0, "{change}: {status:?}: {output}");
-        assert!(
-            output.contains(if change == "unavailable" {
-                "not on PATH"
-            } else if change == "malformed" {
-                "malformed"
-            } else {
-                "unsettled"
-            }),
-            "{change}: {output}"
-        );
+        let (status, output) = if change == "declined" {
+            let mut terminal = ArchiveTerminal::start_unconfirmed(&lab);
+            terminal.answer("start the merge agent?", b"n\r");
+            terminal.finish()
+        } else {
+            ArchiveTerminal::start_with_runtime(&lab, 0, change != "unavailable").finish()
+        };
+        if change == "declined" {
+            assert_eq!(status.exit_code(), 0, "{status:?}: {output}");
+            for said in [
+                "next: Codex takes over this terminal as the merge agent",
+                "to merge without an agent: `agit merge me/qa@source --into me/qa@work --manual`",
+                "nothing started; no merge is open.",
+            ] {
+                assert!(output.contains(said), "{said}: {output}");
+            }
+        } else {
+            assert_ne!(status.exit_code(), 0, "{change}: {status:?}: {output}");
+            assert!(
+                output.contains(if change == "unavailable" {
+                    "not on PATH"
+                } else if change == "malformed" {
+                    "malformed"
+                } else {
+                    "unsettled"
+                }),
+                "{change}: {output}"
+            );
+        }
         assert!(
             mergetx::read(Repo::open(lab.repo()).unwrap().root())
                 .unwrap()
