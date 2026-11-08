@@ -285,7 +285,8 @@ async fn attempt(
 /// Runs one stage on its own task: a panic fails the attempt instead of ending recovery. After a
 /// stop no stage starts, and the one in flight gets [`STOP_GRACE`] to finish before it is aborted
 /// together with its subprocesses. `None` means the daemon is stopping and the stage didn't end.
-async fn run<T: Send + 'static>(
+/// Observation runs its captures through it too, since a capture can settle a conversation.
+pub(super) async fn run<T: Send + 'static>(
     stop: &mut tokio::sync::watch::Receiver<bool>,
     stage: impl std::future::Future<Output = crate::Result<T>> + Send + 'static,
 ) -> Option<crate::Result<T>> {

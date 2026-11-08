@@ -41,6 +41,43 @@ pub(crate) fn event(event: &str, metadata: Value) {
     }
 }
 
+/// Records that checkout recovery removed an index lock nothing could still be writing, for the
+/// conversation `session` names when its checkout records one. A daemon writes this to its own
+/// log. Any other process hands it to the daemons running on this machine, since such a lock is
+/// mostly removed by a command a daemon started; with none running it is not kept.
+pub(crate) fn checkout_lock_cleared(session: Option<&str>) {
+    let in_daemon = DAEMON_LOG.get().is_some();
+    if in_daemon {
+        record_checkout_lock_cleared(session);
+    }
+    // A test process reports to no daemon: one on the machine running the tests is not its own.
+    #[cfg(all(unix, not(test)))]
+    if !in_daemon {
+        const BOUND: Duration = Duration::from_secs(1);
+        let request = super::control::Request::CheckoutLockCleared {
+            session_id: session.map(str::to_owned),
+        };
+        let Ok(home) = crate::infra::config::agit_home() else {
+            return;
+        };
+        for namespace in [super::LOCAL_NAMESPACE, "rc"] {
+            let socket = super::control::socket_path_for(&home.join(namespace));
+            if socket.exists() {
+                let _ = super::control::ask_at(&socket, &request, BOUND);
+            }
+        }
+    }
+}
+
+/// The log line [`checkout_lock_cleared`] stands for: the conversation's id, capped as [`id`],
+/// and no path.
+pub(crate) fn record_checkout_lock_cleared(session: Option<&str>) {
+    event(
+        "archive.checkout_lock_cleared",
+        json!({"session_id": session.map(id)}),
+    );
+}
+
 /// Waits, up to `timeout`, until every event recorded so far is written. The log outlives the
 /// daemon's last task, so lines still queued when the process exits are lost: a planned exit then
 /// reads like a crash.

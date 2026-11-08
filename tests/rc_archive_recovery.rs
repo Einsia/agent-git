@@ -514,9 +514,49 @@ fn daemon_output(rc: &Path) -> String {
         .join("\n")
 }
 
+/// The index locks and checkout transaction journals left in `repo`'s Git directory and in
+/// those of its linked worktrees.
+fn checkout_leftovers(repo: &Path) -> Vec<std::path::PathBuf> {
+    let git = repo.join(".git");
+    let linked = std::fs::read_dir(git.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path());
+    std::iter::once(git.clone())
+        .chain(linked)
+        .flat_map(|dir| ["index.lock", "agit-checkout-transaction.json"].map(|name| dir.join(name)))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+/// Opens the FIFO at `path` on a thread of its own, since an open waits for the other end; the
+/// receiver gets the open file.
+fn open_fifo(
+    path: std::path::PathBuf,
+    write: bool,
+) -> tokio::sync::oneshot::Receiver<std::fs::File> {
+    let (opened, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let file = std::fs::OpenOptions::new()
+            .read(!write)
+            .write(write)
+            .open(path)
+            .unwrap();
+        let _ = opened.send(file);
+    });
+    receiver
+}
+
 /// Watching retains per-turn collection after viewers disconnect and the daemon restarts.
 /// Native input stays outside the daemon, failed publication retains archive jobs, and an
 /// archive commit that waited for a privacy worker missing its start-up is tried again.
+///
+/// A stop that lands while the first archived turn's checkout is held after its branch moved and
+/// before its refresh lets that refresh finish within the daemon's grace, so it leaves neither an
+/// index lock nor a checkout journal. A daemon that ended the archive commit at the stop, or
+/// revoked the commit's settlement authority before its archive work finished, would leave the
+/// journal, and the lock too when Git was writing the index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     use serde_json::{Value, json};
@@ -555,8 +595,21 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     };
     let first = turn(1);
     std::fs::write(&transcript, &first).unwrap();
+    // The first checkout refresh after a branch move waits until the test closes `hold`, and a
+    // stopping daemon opens `stopping` as it starts waiting for its archive work.
+    let hold = root.join("refresh-hold");
+    std::fs::create_dir(&hold).unwrap();
+    std::fs::write(hold.join("armed"), "").unwrap();
+    let stopping = root.join("daemon-stopping");
+    for fifo in [hold.join("hold"), stopping.clone()] {
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
     let _stop = Stop(&root);
     let started = daemon(&["rc", "local", "start", "--detach"])
+        .env("AGIT_TEST_CHECKOUT_REFRESH_HOLD", &hold)
+        .env("AGIT_TEST_DAEMON_ARCHIVE_WAIT", &stopping)
         .output()
         .unwrap();
     assert!(
@@ -628,12 +681,38 @@ async fn observed_native_turns_archive_without_a_viewer_or_model_takeover() {
     let mut initial_head = None;
     for number in 1..=2 {
         if number == 2 {
+            let held =
+                tokio::time::timeout(Duration::from_secs(120), open_fifo(hold.join("hold"), true))
+                    .await
+                    .expect("the first archived turn's checkout refresh never reached its hold")
+                    .unwrap();
+            let mut stop = tokio::process::Command::from(command(&root, &["rc", "local", "stop"]));
+            let stopped = tokio::spawn(async move { stop.output().await });
+            tokio::time::timeout(Duration::from_secs(60), open_fifo(stopping.clone(), false))
+                .await
+                .expect("the stopping daemon never waited for its archive work")
+                .unwrap();
+            drop(held);
+            let stopped = stopped.await.unwrap().unwrap();
             assert!(
-                command(&root, &["rc", "local", "stop"])
-                    .output()
-                    .unwrap()
-                    .status
-                    .success()
+                stopped.status.success(),
+                "{}",
+                String::from_utf8_lossy(&stopped.stderr)
+            );
+            let saved: Value = serde_json::from_slice(
+                &std::fs::read(home.join("desktop-rc/sessions.json")).unwrap(),
+            )
+            .unwrap();
+            let (slug, _) = saved["sessions"][&logical]["agit_session"]
+                .as_str()
+                .unwrap()
+                .split_once('@')
+                .unwrap();
+            let left = checkout_leftovers(&home.join("repos").join(slug));
+            assert!(
+                left.is_empty(),
+                "the stop inside the checkout refresh left {left:?}\n{}",
+                daemon_output(&home.join("desktop-rc"))
             );
             std::fs::write(&transcript, format!("{first}{}", turn(2))).unwrap();
             assert!(

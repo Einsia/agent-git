@@ -79,7 +79,7 @@ pub mod control;
 mod control_protocol;
 pub mod daemon;
 mod daemon_guard;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod endpoint;
 /// The conversations a folder held when `agit rc start --here` bound it.
 pub(crate) mod folder_cutoff;

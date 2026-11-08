@@ -214,6 +214,12 @@ impl Daemon {
                                 std::thread::sleep(std::time::Duration::from_millis(20));
                             }
                         }
+                        control::Request::CheckoutLockCleared { session_id } => {
+                            crate::rc::diagnostics::record_checkout_lock_cleared(
+                                session_id.as_deref(),
+                            );
+                            control::Reply::Recorded
+                        }
                         control::Request::ReloadSecrets => {
                             crate::domain::privacy::service::invalidate();
                             control::Reply::SecretsReloaded {
@@ -954,8 +960,11 @@ impl Daemon {
         };
         // Archive recovery heard the stop with everything else and lets the stage it has in
         // flight finish; returning without waiting for it would abort that stage at once. The
-        // daemon's lock is released first, since the stage's last step takes it.
+        // daemon's lock is released first, since the stage's last step takes it, and settlement
+        // authority stays until the wait is over, since revoking it ends that stage's settlement.
+        announce_archive_wait();
         archive_recovery.finish().await;
+        d.lock().await.revoke_settlement();
         crate::rc::diagnostics::event("daemon.stopped", stopped);
         // The log's writer is not joined when the process exits; what is still queued is lost.
         crate::rc::diagnostics::settle(std::time::Duration::from_secs(2));
@@ -1165,16 +1174,36 @@ impl Daemon {
             }
         })
         .await;
-        // **Settlement authority is revoked only after the whole fleet has exited cleanly.**
-        //
-        // Revoking it before the sessions receive `Shutdown` (by putting it in
-        // `begin_daemon_stop`, say) makes the first line of `settle_on_exit` →
-        // `settle_and_push` fail to take the lease and return: every `agit rc stop` exit
-        // settlement does nothing. Placed here, "no longer authorized to settle" really
-        // does coincide in time with "no session is settling any more".
+        self.journal.flush();
+    }
+
+    /// Revokes settlement authority, which ends every settlement still in flight: a lease that
+    /// changes ends the process group of each one running under it.
+    ///
+    /// **A stopping daemon revokes it only after its fleet has exited and its archive work has
+    /// finished or run out of its grace.** Revoked before the sessions receive `Shutdown` (in
+    /// `begin_daemon_stop`, say), the first line of `settle_on_exit` → `settle_and_push` fails to
+    /// take the lease and returns: every `agit rc stop` exit settlement does nothing. Revoked
+    /// before the archive work finishes, it ends the archive commit in flight, which can stop that
+    /// commit's checkout after its branch moved and before the checkout caught up. Placed after
+    /// both, "no longer authorized to settle" coincides in time with "nothing is settling any
+    /// more".
+    pub(super) fn revoke_settlement(&self) {
         let revoked_epoch = self.settlement.borrow().epoch.wrapping_add(1);
         set_connection_features(&self.settlement, revoked_epoch, false, false);
-        self.journal.flush();
+    }
+}
+
+/// In a debug build whose `AGIT_TEST_DAEMON_ARCHIVE_WAIT` names a FIFO, a stopping daemon opens it
+/// for writing as it starts waiting for its archive work, from a thread of its own, so a test that
+/// holds that work learns the stop has reached it while the daemon never waits on the test. A
+/// release build ignores the variable.
+fn announce_archive_wait() {
+    #[cfg(all(unix, debug_assertions))]
+    if let Some(fifo) = std::env::var_os("AGIT_TEST_DAEMON_ARCHIVE_WAIT") {
+        std::thread::spawn(move || {
+            let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+        });
     }
 }
 

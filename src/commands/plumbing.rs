@@ -14,6 +14,8 @@ use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 use std::io::{BufRead as _, Read, Write as _};
 
+mod index_lock;
+
 const CHECKOUT_JOURNAL_VERSION: u32 = 4;
 const CHECKOUT_JOURNAL_INLINE_VERSION: u32 = 3;
 const CHECKOUT_JOURNAL_OID_VERSION: u32 = 2;
@@ -21,6 +23,10 @@ const CHECKOUT_JOURNAL_LEGACY_VERSION: u32 = 1;
 const CHECKOUT_JOURNAL_NAME: &str = "agit-checkout-transaction.json";
 const CHECKOUT_ATTRIBUTES_SIDECAR_NAME: &str = "agit-checkout-attributes.snapshot";
 const CHECKOUT_LOCK_NAME: &str = "agit-checkout-transaction.lock";
+/// Who runs the transaction whose journal sits next to it ([`index_lock::Runner`]), bound to that
+/// journal's bytes. Its presence alone is no pending recovery.
+const CHECKOUT_RUNNER_SIDECAR_NAME: &str = "agit-checkout-runner.json";
+const MAX_CHECKOUT_RUNNER_BYTES: u64 = 4 * 1024;
 /// The files whose presence in a checkout's private Git directory is pending checkout recovery.
 const CHECKOUT_RECOVERY_METADATA: [&str; 2] =
     [CHECKOUT_JOURNAL_NAME, CHECKOUT_ATTRIBUTES_SIDECAR_NAME];
@@ -724,6 +730,16 @@ struct CheckoutJournal {
     attributes_upgrade: Option<CheckoutAttributesUpgrade>,
 }
 
+/// The runner sidecar's record: who runs the transaction, and the SHA-256 of the exact journal
+/// bytes it was written for. The journal stays as every agit reads it, and a record vouches only
+/// for the journal it names.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutRunnerRecord {
+    journal_sha256: String,
+    runner: index_lock::Runner,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckoutJournalPublication {
     /// The journal name never entered the directory, or its removal was followed by a successful
@@ -1145,7 +1161,7 @@ fn persist_checkout_transaction(
         maybe_crash_checkout_at("after_attributes_sidecar");
     }
     let mut journal_publication = CheckoutJournalPublication::DurablyAbsent;
-    let durable_metadata = (|| -> Result<(CheckoutJournal, std::path::PathBuf)> {
+    let durable_metadata = (|| -> Result<(CheckoutJournal, std::path::PathBuf, String)> {
         let attributes_upgrade = attributes_layers
             .as_ref()
             .map(attributes_sidecar_descriptor)
@@ -1164,13 +1180,16 @@ fn persist_checkout_transaction(
         }
         journal.attributes_upgrade = attributes_upgrade;
         let path = checkout_git_path(repo, CHECKOUT_JOURNAL_NAME)?;
-        if let Err(failure) = write_checkout_journal(&path, &journal) {
-            journal_publication = failure.publication;
-            return Err(failure.error);
-        }
-        Ok((journal, path))
+        let journal_sha256 = match write_checkout_journal(&path, &journal) {
+            Ok(journal_sha256) => journal_sha256,
+            Err(failure) => {
+                journal_publication = failure.publication;
+                return Err(failure.error);
+            }
+        };
+        Ok((journal, path, journal_sha256))
     })();
-    let (journal, path) = match durable_metadata {
+    let (journal, path, journal_sha256) = match durable_metadata {
         Ok(durable) => durable,
         Err(journal_error) => {
             if journal_publication == CheckoutJournalPublication::DurablyAbsent
@@ -1184,6 +1203,15 @@ fn persist_checkout_transaction(
             return Err(journal_error);
         }
     };
+    // The record only lets recovery clear an index lock by itself, and without one a person does,
+    // so the transaction goes on without it. One that could not be written is removed, so that no
+    // record an earlier transaction left vouches for this journal.
+    let recorded = index_lock::Runner::current()
+        .context("this process's start time can't be read")
+        .and_then(|runner| write_checkout_runner(&path, &journal_sha256, runner));
+    if recorded.is_err() {
+        let _ = remove_checkout_runner(&path);
+    }
     Ok(CheckoutTransaction {
         journal,
         attributes_layers,
@@ -1199,6 +1227,7 @@ pub(super) fn finish_checkout_transaction(mut transaction: CheckoutTransaction) 
     if let Some(path) = transaction.sidecar_path.as_deref() {
         remove_checkout_sidecar(path)?;
     }
+    remove_checkout_runner(&transaction.path)?;
     if let Some(recovery_evidence) = transaction.recovery_evidence.take() {
         recovery_evidence.clear()?;
     }
@@ -1209,6 +1238,7 @@ pub(super) fn refresh_prepared_checkout(
     repo: &Repo,
     transaction: &CheckoutTransaction,
 ) -> std::result::Result<(), CheckoutRefreshFailure> {
+    hold_checkout_refresh();
     let checked_out = checked_out_branch(repo).map_err(|error| CheckoutRefreshFailure {
         error,
         restored: true,
@@ -1276,6 +1306,23 @@ pub(super) fn refresh_prepared_checkout(
     )
 }
 
+/// In a debug build whose `AGIT_TEST_CHECKOUT_REFRESH_HOLD` names a directory holding the file
+/// `armed`, the first refresh to start after its branch moved takes `armed` away and waits: it
+/// opens the FIFO `hold` there, which returns once a test opens it for writing, and reads it to
+/// its end, which comes when the test closes it. A test stops agit at that point to find what a
+/// stop between the branch move and the finished checkout leaves. A release build ignores it.
+fn hold_checkout_refresh() {
+    #[cfg(all(unix, debug_assertions))]
+    if let Some(directory) = std::env::var_os("AGIT_TEST_CHECKOUT_REFRESH_HOLD") {
+        let directory = std::path::PathBuf::from(directory);
+        if std::fs::remove_file(directory.join("armed")).is_ok()
+            && let Ok(mut hold) = std::fs::File::open(directory.join("hold"))
+        {
+            let _ = std::io::copy(&mut hold, &mut std::io::sink());
+        }
+    }
+}
+
 fn lock_checkout_transactions(repo: &Repo) -> Result<std::fs::File> {
     let path = checkout_git_path(repo, CHECKOUT_LOCK_NAME)?;
     let lock = std::fs::OpenOptions::new()
@@ -1292,11 +1339,13 @@ fn lock_checkout_transactions(repo: &Repo) -> Result<std::fs::File> {
 
 fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Result<bool> {
     let path = checkout_git_path(repo, CHECKOUT_JOURNAL_NAME)?;
-    let Some(journal) = read_checkout_journal(&path)? else {
+    let Some((journal, journal_sha256)) = read_checkout_journal_digested(&path)? else {
         remove_orphaned_checkout_sidecar(repo)?;
+        remove_checkout_runner(&path)?;
         return Ok(false);
     };
     let attributes_upgrade = validate_checkout_journal(repo, &journal)?;
+    let runner = checkout_runner(&path, &journal_sha256);
 
     let checked_out = checked_out_branch(repo)?;
     anyhow::ensure!(
@@ -1305,6 +1354,9 @@ fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Re
         journal.branch,
         checked_out.as_deref().unwrap_or("detached HEAD")
     );
+    let git_dir = path
+        .parent()
+        .context("checkout transaction journal has no parent directory")?;
     let refname = format!("refs/heads/{}", journal.branch);
     let current = optional_ref_commit(repo, &refname)?;
     if journal.scope == CheckoutScope::Root {
@@ -1317,6 +1369,7 @@ fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Re
                 let original_attributes = attributes_upgrade
                     .as_ref()
                     .context("root checkout journal has no durable attributes snapshot")?;
+                settle_index_lock(repo, git_dir, runner.as_ref(), &journal)?;
                 refresh_root_checkout(repo, &journal.new, original_attributes).with_context(
                     || format!("cannot recover root checkout transaction for {refname}"),
                 )?;
@@ -1349,6 +1402,7 @@ fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Re
         );
     };
 
+    settle_index_lock(repo, git_dir, runner.as_ref(), &journal)?;
     refresh_checkout_transactionally(
         repo,
         source,
@@ -1362,28 +1416,133 @@ fn recover_interrupted_checkout_locked(repo: &Repo, _lock: &std::fs::File) -> Re
     .map_err(|failure| failure.error)
     .with_context(|| format!("cannot recover checkout transaction for {refname} at {current}"))
     .map_err(|error| match checkout_git_path(repo, "index.lock") {
-        Ok(lock) if lock.exists() => error.context(stale_index_lock(&lock)),
+        Ok(lock) if lock.exists() => error.context(index_lock_refusal(
+            index_lock::holder(&lock, runner.as_ref(), repo.root(), git_dir),
+            &lock,
+            repo.root(),
+        )),
         _ => error,
     })?;
     remove_recovered_checkout_metadata(repo, &path, &journal)?;
     Ok(true)
 }
 
-/// What a person reads when `lock`, Git's index lock, keeps an interrupted checkout transaction
-/// from finishing: which file, why it is there, and the one step that clears it. Nothing removes
-/// the file by itself, since nothing proves that no other Git is writing that index.
-pub(crate) fn stale_index_lock(lock: &std::path::Path) -> String {
+/// Settles Git's index lock in the checkout of an interrupted transaction before recovery writes
+/// that checkout's index. A recovery that only discards the journal writes no index and leaves
+/// any lock alone. The lock goes when nothing can still be writing that index
+/// ([`index_lock::Holder::Nobody`]), and the daemons' log records that it went; otherwise recovery
+/// stops here with [`index_lock_refusal`]. Removing a lock that a live Git holds would let two
+/// writers replace the same index, and leaving a lock nothing holds refuses every later attempt.
+fn settle_index_lock(
+    repo: &Repo,
+    git_dir: &std::path::Path,
+    runner: Option<&index_lock::Runner>,
+    journal: &CheckoutJournal,
+) -> Result<()> {
+    let lock = checkout_git_path(repo, "index.lock")?;
+    match index_lock::holder(&lock, runner, repo.root(), git_dir) {
+        index_lock::Holder::Absent => Ok(()),
+        index_lock::Holder::Nobody => {
+            match std::fs::remove_file(&lock) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("cannot remove the stale index lock {}", lock.display())
+                    });
+                }
+            }
+            crate::rc::diagnostics::checkout_lock_cleared(
+                checkout_session(repo, &journal.new).as_deref(),
+            );
+            Ok(())
+        }
+        holder => anyhow::bail!("{}", index_lock_refusal(holder, &lock, repo.root())),
+    }
+}
+
+/// The conversation `commit` records, as its session metadata names it: the id a log line may
+/// carry where a path may not.
+fn checkout_session(repo: &Repo, commit: &str) -> Option<String> {
+    let text = repo.show_raw_result(commit, meta::FILE).ok()??;
+    let snapshot: meta::Meta = serde_json::from_str(&text).ok()?;
+    meta::validate(&snapshot).ok()?;
+    (!snapshot.session.is_empty()).then_some(snapshot.session)
+}
+
+/// What the reader is told about `lock`, the index lock in the checkout at `worktree`, when it
+/// stays: [`stale_index_lock`] when who may hold it can't be shown, else [`index_lock_in_use`].
+fn index_lock_refusal(
+    holder: index_lock::Holder,
+    lock: &std::path::Path,
+    worktree: &std::path::Path,
+) -> String {
+    match holder {
+        index_lock::Holder::Unknown => stale_index_lock(lock, worktree),
+        _ => index_lock_in_use(lock),
+    }
+}
+
+/// What the reader is told while something that may write the index whose lock is `lock` still
+/// runs: nothing to do, since agit tries again by itself.
+fn index_lock_in_use(lock: &std::path::Path) -> String {
     format!(
-        "{} is left from a Git process that was stopped while it wrote a conversation's checkout \
-         in agit's store; when no agit or git command is running, delete that file, and agit \
-         finishes that conversation's archive by itself",
+        "{} is in use by a process still running in agit's store; agit tries this \
+         conversation's archive again once it ends",
         lock.display()
     )
 }
 
-/// The index locks that keep interrupted checkout transactions in `repo` or its linked worktrees
-/// from finishing, as [`stale_index_lock`] describes them.
-pub(crate) fn stuck_checkout_locks(repo: &Repo) -> Vec<std::path::PathBuf> {
+/// What the reader is told when only a person can clear `lock`, Git's index lock in the checkout
+/// at `worktree`: why the file is there, when deleting it is safe, the command that deletes it,
+/// and that agit finishes the archive afterwards. An agent reading it is told to ask the user
+/// before deleting it rather than given the step: whether a Git still runs there is the person's
+/// to judge.
+fn stale_index_lock(lock: &std::path::Path, worktree: &std::path::Path) -> String {
+    stale_index_lock_for(
+        lock,
+        worktree,
+        crate::tui::Signals::from_process().agent_session.is_some(),
+    )
+}
+
+fn stale_index_lock_for(lock: &std::path::Path, worktree: &std::path::Path, agent: bool) -> String {
+    let command = remove_file_command(lock);
+    let step = if agent {
+        format!("ask the user before deleting it with {command}")
+    } else {
+        command
+    };
+    format!(
+        "{} was left when agit was stopped while it updated a conversation's checkout in its \
+         store. It is safe to delete once no git command is running in {}: {step}, and agit \
+         finishes that conversation's archive by itself",
+        lock.display(),
+        worktree.display()
+    )
+}
+
+/// The command that deletes `path` in this platform's shell, with `path` quoted as one argument.
+fn remove_file_command(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        format!(
+            "Remove-Item -LiteralPath {}",
+            crate::ui::quote_powershell_argument(&path)
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        format!("rm {}", crate::ui::quote_posix_argument(&path))
+    }
+}
+
+/// What `agit doctor` reports about each index lock that keeps an interrupted checkout transaction
+/// in `repo` or one of its linked worktrees from finishing, judged as recovery judges it
+/// ([`index_lock_refusal`]). A lock recovery removes by itself is not reported, and nothing is
+/// removed here.
+pub(crate) fn stuck_checkout_locks(repo: &Repo) -> Vec<String> {
     let Ok(common) = repo.common_dir() else {
         return Vec::new();
     };
@@ -1394,10 +1553,41 @@ pub(crate) fn stuck_checkout_locks(repo: &Repo) -> Vec<std::path::PathBuf> {
         .map(|entry| entry.path());
     std::iter::once(common.clone())
         .chain(linked)
-        .filter(|dir| dir.join(CHECKOUT_JOURNAL_NAME).is_file())
-        .map(|dir| dir.join("index.lock"))
-        .filter(|lock| lock.exists())
+        .filter_map(|git_dir| {
+            let journal = git_dir.join(CHECKOUT_JOURNAL_NAME);
+            if !journal.is_file() {
+                return None;
+            }
+            let lock = git_dir.join("index.lock");
+            let runner = read_checkout_journal_digested(&journal)
+                .ok()
+                .flatten()
+                .and_then(|(_, journal_sha256)| checkout_runner(&journal, &journal_sha256));
+            // A checkout whose worktree can't be found can't be shown free of Git processes.
+            let (worktree, runner) = match checkout_worktree(&common, &git_dir) {
+                Some(worktree) => (worktree, runner),
+                None => (git_dir.clone(), None),
+            };
+            match index_lock::holder(&lock, runner.as_ref(), &worktree, &git_dir) {
+                index_lock::Holder::Absent | index_lock::Holder::Nobody => None,
+                holder => Some(index_lock_refusal(holder, &lock, &worktree)),
+            }
+        })
         .collect()
+}
+
+/// The worktree whose private Git directory is `git_dir`: the one `common` sits in, else the one
+/// a linked worktree's `gitdir` file names.
+fn checkout_worktree(
+    common: &std::path::Path,
+    git_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if git_dir == common {
+        return common.parent().map(std::path::Path::to_owned);
+    }
+    let named = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let dot_git = git_dir.join(named.trim_end_matches(['\n', '\r']));
+    dot_git.parent().map(std::path::Path::to_owned)
 }
 
 fn remove_recovered_checkout_metadata(
@@ -1412,7 +1602,7 @@ fn remove_recovered_checkout_metadata(
     if let Some(path) = sidecar_path.as_deref() {
         remove_checkout_sidecar(path)?;
     }
-    Ok(())
+    remove_checkout_runner(journal_path)
 }
 
 fn validate_checkout_journal(
@@ -2127,7 +2317,10 @@ fn native_checkout_metadata_path(repo: &Repo, name: &str) -> Option<std::path::P
     // store. Other Git paths can be redirected by configuration or environment variables.
     if !matches!(
         name,
-        CHECKOUT_LOCK_NAME | CHECKOUT_JOURNAL_NAME | CHECKOUT_ATTRIBUTES_SIDECAR_NAME
+        CHECKOUT_LOCK_NAME
+            | CHECKOUT_JOURNAL_NAME
+            | CHECKOUT_ATTRIBUTES_SIDECAR_NAME
+            | CHECKOUT_RUNNER_SIDECAR_NAME
     ) || !repo.root().is_absolute()
         || [
             "GIT_DIR",
@@ -2146,7 +2339,15 @@ fn native_checkout_metadata_path(repo: &Repo, name: &str) -> Option<std::path::P
     Some(native.git_dir().join(name))
 }
 
+#[cfg(test)]
 fn read_checkout_journal(path: &std::path::Path) -> Result<Option<CheckoutJournal>> {
+    Ok(read_checkout_journal_digested(path)?.map(|(journal, _)| journal))
+}
+
+/// The journal at `path` and the SHA-256 of the exact bytes it was read from.
+fn read_checkout_journal_digested(
+    path: &std::path::Path,
+) -> Result<Option<(CheckoutJournal, String)>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2178,15 +2379,16 @@ fn read_checkout_journal(path: &std::path::Path) -> Result<Option<CheckoutJourna
         path.display(),
         MAX_CHECKOUT_JOURNAL_BYTES
     );
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid checkout journal {}", path.display()))
-        .map(Some)
+    let journal = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid checkout journal {}", path.display()))?;
+    Ok(Some((journal, hex::encode(Sha256::digest(&bytes)))))
 }
 
+/// Publishes `journal` at `path`, returning the SHA-256 of the exact bytes written.
 fn write_checkout_journal(
     path: &std::path::Path,
     journal: &CheckoutJournal,
-) -> std::result::Result<(), CheckoutJournalWriteFailure> {
+) -> std::result::Result<String, CheckoutJournalWriteFailure> {
     let before_publication = |error| CheckoutJournalWriteFailure {
         error,
         publication: CheckoutJournalPublication::DurablyAbsent,
@@ -2243,7 +2445,110 @@ fn write_checkout_journal(
             ))),
         };
     }
-    Ok(())
+    Ok(hex::encode(Sha256::digest(&bytes)))
+}
+
+/// Where the runner sidecar of the journal at `journal_path` is: next to it, in the same private
+/// Git directory.
+fn checkout_runner_path(journal_path: &std::path::Path) -> Result<std::path::PathBuf> {
+    Ok(journal_path
+        .parent()
+        .context("checkout transaction journal has no parent directory")?
+        .join(CHECKOUT_RUNNER_SIDECAR_NAME))
+}
+
+/// Records `runner` next to the journal at `journal_path` for the journal bytes whose SHA-256 is
+/// `journal_sha256`, written the way the journal is: a private temporary file, synced, renamed
+/// into place, its directory synced. A record left there for another journal is replaced.
+fn write_checkout_runner(
+    journal_path: &std::path::Path,
+    journal_sha256: &str,
+    runner: index_lock::Runner,
+) -> Result<()> {
+    let path = checkout_runner_path(journal_path)?;
+    let parent = path
+        .parent()
+        .context("checkout runner sidecar has no parent directory")?;
+    let mut bytes = serde_json::to_vec(&CheckoutRunnerRecord {
+        journal_sha256: journal_sha256.to_owned(),
+        runner,
+    })?;
+    bytes.push(b'\n');
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "cannot create temporary checkout runner sidecar in {}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary
+        .write_all(&bytes)
+        .with_context(|| format!("cannot write checkout runner sidecar {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("cannot sync checkout runner sidecar {}", path.display()))?;
+    temporary
+        .persist(&path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("cannot publish checkout runner sidecar {}", path.display()))?;
+    sync_directory(parent)
+}
+
+/// The runner recorded next to the journal at `journal_path`, when its record was written for
+/// exactly the journal bytes whose SHA-256 is `journal_sha256`. A record that is missing,
+/// unreadable, readable by others or written for other bytes names no runner: an older agit
+/// writes none, and one an earlier transaction left behind must not vouch for a later journal.
+fn checkout_runner(
+    journal_path: &std::path::Path,
+    journal_sha256: &str,
+) -> Option<index_lock::Runner> {
+    let path = checkout_runner_path(journal_path).ok()?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CHECKOUT_RUNNER_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(MAX_CHECKOUT_RUNNER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let record: CheckoutRunnerRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.journal_sha256 == journal_sha256).then_some(record.runner)
+}
+
+/// Removes the runner sidecar of the journal at `journal_path`, if there is one.
+fn remove_checkout_runner(journal_path: &std::path::Path) -> Result<()> {
+    let path = checkout_runner_path(journal_path)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("cannot inspect checkout runner sidecar {}", path.display())
+            });
+        }
+    }
+    std::fs::remove_file(&path)
+        .with_context(|| format!("cannot remove checkout runner sidecar {}", path.display()))?;
+    sync_directory(
+        path.parent()
+            .context("checkout runner sidecar has no parent directory")?,
+    )
 }
 
 fn sync_checkout_journal_directory(path: &std::path::Path) -> Result<()> {
@@ -4645,6 +4950,7 @@ mod tests {
             CHECKOUT_LOCK_NAME,
             CHECKOUT_JOURNAL_NAME,
             CHECKOUT_ATTRIBUTES_SIDECAR_NAME,
+            CHECKOUT_RUNNER_SIDECAR_NAME,
         ] {
             let primary_path = native_checkout_metadata_path(&repo, name).unwrap();
             let linked_path = native_checkout_metadata_path(&linked, name).unwrap();
@@ -5457,6 +5763,9 @@ mod tests {
         (staged, worktree)
     }
 
+    /// Runs a transaction in a child that stops dead at `point`. The child runs in a process
+    /// group of its own, as a settlement subprocess does, so once it is reaped the runner its
+    /// journal names is gone together with that group.
     fn crash_checkout_subprocess(
         repo: &Repo,
         old: &str,
@@ -5464,7 +5773,8 @@ mod tests {
         point: &str,
         refresh_full_index: bool,
     ) {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
             .args([
                 "--exact",
                 "commands::plumbing::tests::checkout_transaction_crash_child",
@@ -5477,9 +5787,10 @@ mod tests {
             .env(
                 "AGIT_TEST_CHECKOUT_FULL_INDEX",
                 if refresh_full_index { "1" } else { "0" },
-            )
-            .output()
-            .unwrap();
+            );
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut child, 0);
+        let output = child.output().unwrap();
         assert_eq!(
             output.status.code(),
             Some(86),
@@ -5683,30 +5994,355 @@ mod tests {
         }
     }
 
-    /// An interrupted transaction that a leftover index lock keeps from finishing says which
-    /// file, why, and the one step, in its error and in what `agit doctor` lists; once the file
-    /// is gone the transaction finishes. Recovery removes nothing by itself, so a lock that a live
-    /// Git still holds is never taken from it.
+    /// Records `runner` for the interrupted transaction's journal in `repo`, bound to its bytes,
+    /// or removes the record.
+    fn set_journal_runner(repo: &Repo, runner: Option<index_lock::Runner>) {
+        let path = checkout_git_path(repo, CHECKOUT_JOURNAL_NAME).unwrap();
+        match runner {
+            Some(runner) => {
+                let (_, journal_sha256) = read_checkout_journal_digested(&path).unwrap().unwrap();
+                write_checkout_runner(&path, &journal_sha256, runner).unwrap();
+            }
+            None => remove_checkout_runner(&path).unwrap(),
+        }
+    }
+
+    /// The runner recovery reads for the interrupted transaction's journal in `repo`.
+    #[cfg(unix)]
+    fn recorded_runner(repo: &Repo) -> Option<index_lock::Runner> {
+        let path = checkout_git_path(repo, CHECKOUT_JOURNAL_NAME).unwrap();
+        let (_, journal_sha256) = read_checkout_journal_digested(&path).unwrap().unwrap();
+        checkout_runner(&path, &journal_sha256)
+    }
+
+    /// Dates `lock` `offset` from now: a lock dated before a check is one that check is about,
+    /// and one dated after it was written since.
+    fn date_lock(lock: &std::path::Path, offset: std::time::Duration, later: bool) {
+        let now = std::time::SystemTime::now();
+        let at = if later { now + offset } else { now - offset };
+        std::fs::File::options()
+            .write(true)
+            .open(lock)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// A journal with no runner recorded for it, as an older agit leaves, shows nothing about who
+    /// may hold a leftover index lock, and neither does a runner record written for another
+    /// journal's bytes: recovery and `agit doctor` both name the file, when deleting it is safe
+    /// and the command that deletes it, and nothing removes it. The command works on a path
+    /// holding a single quote, and once the file is gone the transaction finishes. A recovery that
+    /// removed the lock without a runner to judge could take it from a Git still writing; one that
+    /// trusted any runner record present would take a lock for a journal its runner never wrote;
+    /// an unquoted path would split the printed command at the quote.
     #[test]
-    fn a_leftover_index_lock_is_named_with_its_one_step_and_never_removed() {
+    fn a_lock_whose_runner_is_unknown_is_named_with_its_one_step_and_never_removed() {
         let directory = tempfile::tempdir().unwrap();
-        let (repo, old, new) = checkout_crash_fixture(directory.path());
+        let (repo, old, new) = checkout_crash_fixture(&directory.path().join("it's"));
+        crash_checkout_subprocess(&repo, &old, &new, "after_ref_cas", true);
+        let lock = checkout_git_path(&repo, "index.lock").unwrap();
+        std::fs::write(&lock, "").unwrap();
+        let explained = stale_index_lock(&lock, repo.root());
+        let refused = |case: &str| {
+            let error = format!("{:#}", recover_interrupted_checkout(&repo).unwrap_err());
+            assert!(
+                error.starts_with(&explained),
+                "{case}: the plain explanation leads: {error}"
+            );
+            assert!(lock.exists(), "{case}");
+            assert_eq!(
+                stuck_checkout_locks(&repo),
+                vec![explained.clone()],
+                "{case}"
+            );
+        };
+
+        // The transaction's own runner, gone with its group, recorded for other journal bytes.
+        #[cfg(unix)]
+        {
+            let runner = recorded_runner(&repo).expect("the transaction recorded its runner");
+            let journal = checkout_git_path(&repo, CHECKOUT_JOURNAL_NAME).unwrap();
+            let elsewhere = hex::encode(Sha256::digest(b"another journal\n"));
+            write_checkout_runner(&journal, &elsewhere, runner).unwrap();
+            refused("a runner recorded for another journal");
+        }
+        set_journal_runner(&repo, None);
+        refused("no runner recorded");
+
+        let command = remove_file_command(&lock);
+        assert!(
+            stale_index_lock_for(&lock, repo.root(), false)
+                .contains(&format!(": {command}, and agit finishes")),
+            "a person is given the step"
+        );
+        assert!(
+            stale_index_lock_for(&lock, repo.root(), true).contains(&format!(
+                ": ask the user before deleting it with {command}, "
+            )),
+            "an agent is told to ask first"
+        );
+        #[cfg(unix)]
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .unwrap()
+                .success()
+        );
+        #[cfg(not(unix))]
+        std::fs::remove_file(&lock).unwrap();
+        assert!(
+            !lock.exists(),
+            "{command} did not delete {}",
+            lock.display()
+        );
+        assert!(recover_interrupted_checkout(&repo).unwrap());
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
+        assert!(stuck_checkout_locks(&repo).is_empty());
+    }
+
+    /// A transaction stopped dead leaves its journal and an index lock. Once its runner and every
+    /// process of its group are gone, nothing of this user works in the checkout, and the lock
+    /// predates that check, recovery removes the lock, records that in the daemons' log by the
+    /// conversation's id, and finishes the refresh; `agit doctor` lists nothing beforehand, since
+    /// agit clears it by itself. A lock dated after the check is kept. Without this a person has
+    /// to delete a file after an ordinary stop; a recovery that skipped the date would take a lock
+    /// written after it looked.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_lock_nothing_can_still_hold_is_removed_and_the_checkout_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        let session = format!("agit-{}{:08x}", uuid::Uuid::new_v4().simple(), 0);
+        let mut claimed = meta::Meta::new(session.clone(), "codex".into(), ".".into());
+        claimed.layout = meta::LayoutVersion::V0;
+        std::fs::create_dir_all(repo.root().join("session")).unwrap();
+        std::fs::write(
+            repo.root().join(meta::FILE),
+            meta::to_text(&claimed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(repo.root().join("a.txt"), "old a\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("old").unwrap();
+        let old = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let tree = tree_apply_owned(
+            &repo,
+            &old,
+            vec![("a.txt".into(), Some(b"new a\n".to_vec()))],
+        )
+        .unwrap();
+        let new = commit_tree(&repo, &tree, &[&old], "new").unwrap();
         crash_checkout_subprocess(&repo, &old, &new, "after_ref_cas", true);
         let lock = checkout_git_path(&repo, "index.lock").unwrap();
         std::fs::write(&lock, "").unwrap();
 
+        date_lock(&lock, std::time::Duration::from_secs(60), true);
+        index_lock::take_refusals();
         let error = format!("{:#}", recover_interrupted_checkout(&repo).unwrap_err());
         assert!(
-            error.starts_with(&stale_index_lock(&lock)),
-            "the plain explanation leads: {error}"
+            error.starts_with(&index_lock_in_use(&lock)),
+            "{error}\nunread: {}",
+            index_lock::take_refusals()
         );
         assert!(lock.exists());
-        assert_eq!(stuck_checkout_locks(&repo), vec![lock.clone()]);
+        assert_eq!(
+            stuck_checkout_locks(&repo),
+            vec![index_lock_in_use(&lock)],
+            "unread: {}",
+            index_lock::take_refusals()
+        );
 
-        std::fs::remove_file(&lock).unwrap();
-        assert!(recover_interrupted_checkout(&repo).unwrap());
+        date_lock(&lock, std::time::Duration::from_secs(60), false);
+        let reported = stuck_checkout_locks(&repo);
+        assert!(
+            reported.is_empty(),
+            "{reported:?}\nunread: {}",
+            index_lock::take_refusals()
+        );
+        crate::rc::diagnostics::test_events(&session, 0);
+        let recovered = recover_interrupted_checkout(&repo);
+        assert!(
+            matches!(recovered, Ok(true)),
+            "{recovered:?}\nunread: {}",
+            index_lock::take_refusals()
+        );
+        assert!(!lock.exists());
         assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
-        assert!(stuck_checkout_locks(&repo).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+            "new a\n"
+        );
+        assert!(repo.git(&["status", "--porcelain"]).unwrap().is_empty());
+        let journal = checkout_git_path(&repo, CHECKOUT_JOURNAL_NAME).unwrap();
+        assert!(!journal.exists());
+        assert!(
+            !checkout_runner_path(&journal).unwrap().exists(),
+            "the runner record outlived its journal"
+        );
+        assert!(
+            crate::rc::diagnostics::test_events(&session, 1)
+                .iter()
+                .any(|line| line["event"] == "archive.checkout_lock_cleared"),
+            "the removal is not in the log"
+        );
+    }
+
+    /// An index lock stays, and recovery says a process is still working there, while anything may
+    /// still write that index: a process of this user with its working directory in the checkout,
+    /// a Git started elsewhere with `--git-dir` naming it that holds the lock itself, a process
+    /// with a file open in the Git directory, one whose argument names the Git directory, one
+    /// whose `GIT_DIR` does, the transaction's runner itself, or a process left in the runner's
+    /// group after the runner ended. `agit doctor` says the same. Once none is left the lock goes.
+    /// A recovery that judged by working directory alone would take the lock from that Git while
+    /// it writes the index; one that skipped any other of these would take it from the process
+    /// only that one names.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_lock_is_kept_while_anything_may_still_write_the_index() {
+        use std::os::unix::process::CommandExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let (repo, old, new) = checkout_crash_fixture(directory.path());
+        crash_checkout_subprocess(&repo, &old, &new, "after_ref_cas", true);
+        let gone = recorded_runner(&repo).expect("the transaction recorded its runner");
+        let lock = checkout_git_path(&repo, "index.lock").unwrap();
+        std::fs::write(&lock, "").unwrap();
+        date_lock(&lock, std::time::Duration::from_secs(60), false);
+        // A process that runs until its input is closed.
+        let waiting = |cwd: &std::path::Path, group: i32| {
+            std::process::Command::new("cat")
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .process_group(group)
+                .spawn()
+                .unwrap()
+        };
+        let end = |mut child: std::process::Child| {
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        };
+        let kept = |case: &str| {
+            let error = format!(
+                "{:#}",
+                recover_interrupted_checkout(&repo)
+                    .err()
+                    .unwrap_or_else(|| panic!("{case}: recovery removed the lock"))
+            );
+            assert!(
+                error.starts_with(&index_lock_in_use(&lock)),
+                "{case}: {error}"
+            );
+            assert!(lock.exists(), "{case}");
+            assert_eq!(
+                stuck_checkout_locks(&repo),
+                vec![index_lock_in_use(&lock)],
+                "{case}"
+            );
+        };
+
+        let inside = waiting(repo.root(), 0);
+        kept("a process works in the checkout");
+        end(inside);
+
+        let git_dir = checkout_git_path(&repo, CHECKOUT_JOURNAL_NAME)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        // `command` in its own group from `/`, running until its input is closed.
+        let started = |command: &mut std::process::Command| {
+            command
+                .current_dir("/")
+                .stdin(std::process::Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        std::fs::remove_file(&lock).unwrap();
+        let mut git = started(
+            crate::infra::git_runtime::command()
+                .arg(format!("--git-dir={}", git_dir.display()))
+                .args(["update-index", "--index-info"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !lock.try_exists().unwrap() {
+            assert!(
+                git.try_wait().unwrap().is_none(),
+                "Git ended before it took the index lock"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Git never took the index lock"
+            );
+            std::thread::yield_now();
+        }
+        kept("Git writes the index from outside the checkout");
+        end(git);
+        std::fs::write(&lock, "").unwrap();
+        date_lock(&lock, std::time::Duration::from_secs(60), false);
+
+        let held = git_dir.join("held-by-a-test");
+        let open = started(
+            std::process::Command::new("cat").stdout(std::fs::File::create(&held).unwrap()),
+        );
+        kept("a process has a file open in the Git directory");
+        end(open);
+        std::fs::remove_file(&held).unwrap();
+
+        let named = started(
+            std::process::Command::new("sh")
+                .args(["-c", "read line"])
+                .arg(&git_dir),
+        );
+        kept("an argument names the Git directory");
+        end(named);
+
+        // Git itself: macOS leaves the environment of its protected system binaries, such as
+        // `sh`, out of what it shows another process, and shows Git's.
+        let located = started(
+            crate::infra::git_runtime::command()
+                .args(["hash-object", "--stdin"])
+                .env("GIT_DIR", &git_dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        );
+        kept("GIT_DIR names the Git directory");
+        end(located);
+
+        let runner = waiting(std::path::Path::new("/"), 0);
+        set_journal_runner(
+            &repo,
+            Some(index_lock::Runner {
+                pid: runner.id(),
+                started_ms: crate::rc::native_claude::started_ms(runner.id()).unwrap(),
+                process_group: gone.process_group,
+            }),
+        );
+        kept("the runner still runs");
+        end(runner);
+
+        let leader = waiting(std::path::Path::new("/"), 0);
+        let member = waiting(std::path::Path::new("/"), leader.id() as i32);
+        set_journal_runner(
+            &repo,
+            Some(index_lock::Runner {
+                pid: leader.id(),
+                started_ms: crate::rc::native_claude::started_ms(leader.id()).unwrap(),
+                process_group: leader.id() as i32,
+            }),
+        );
+        end(leader);
+        kept("a process of the runner's group is left");
+        end(member);
+
+        assert!(recover_interrupted_checkout(&repo).unwrap());
+        assert!(!lock.exists());
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), new);
     }
 
     #[test]

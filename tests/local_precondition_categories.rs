@@ -1073,6 +1073,7 @@ fn serve_rc_status(action: &str) {
             Request::ReloadSecrets => panic!("a status fixture must not reload secrets"),
             Request::StopIfIdle { .. } => panic!("a status fixture must not restart"),
             Request::TerminalOpened { .. } | Request::WriterLeaf { .. } => panic!("a status fixture runs no conversation"),
+            Request::CheckoutLockCleared { .. } => Reply::Recorded,
         }).unwrap();
         if stop {
             break;
