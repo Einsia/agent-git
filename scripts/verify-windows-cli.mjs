@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { readFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs'
+import { readFileSync, mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, join, resolve } from 'node:path'
 import { protectWindowsSmokeHome } from './windows-smoke-home.mjs'
 
 const binary = resolve(process.argv[2])
@@ -24,6 +24,15 @@ try {
   for (const key of Object.keys(env)) {
     if (['HOME', 'AGIT_HOME', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME'].includes(key.toUpperCase())) delete env[key]
   }
+  // A stand-in `codex` comes first on PATH. Setup asks an installed Codex about its features and
+  // hooks, and a real one can leave its shared background runtime working in this home after agit
+  // returns, which the cleanup below then can't remove. The stand-in answers and exits, so agit's
+  // own Codex path still runs.
+  const fixtureBin = join(home, 'fixture-bin')
+  mkdirSync(fixtureBin, { recursive: true })
+  writeFileSync(join(fixtureBin, 'codex.cmd'), '@echo %*>> "%~dp0codex-calls.txt"\r\n@if "%1 %2"=="features list" echo hooks stable true\r\n@exit /b 0\r\n')
+  const pathKey = Object.keys(env).find(key => key.toUpperCase() === 'PATH') ?? 'PATH'
+  env[pathKey] = `${fixtureBin}${delimiter}${env[pathKey] ?? ''}`
   for (const args of [['--version'], ['--help'], ['config', 'hub.url'], ['setup'], ['-y', 'init', 'windows-smoke', '--no-bind']]) {
     const result = spawnSync(binary, args, {
       encoding: 'utf8',
@@ -34,6 +43,8 @@ try {
     assert.ok(result.stdout.trim(), `${args.join(' ')} produced no output`)
     console.log(`${args.join(' ')}: ok`)
   }
+  // The stand-in only keeps the host's runtime out if setup reaches it rather than another codex.
+  assert.match(readFileSync(join(fixtureBin, 'codex-calls.txt'), 'utf8'), /^features list\r?$/m, 'setup must query the stand-in Codex')
   assert.ok(existsSync(join(home, '.agit')), 'startup must create the store under USERPROFILE')
   assert.ok(existsSync(join(home, '.claude', 'skills', 'agit', 'SKILL.md')), 'setup must install the skill under USERPROFILE')
   const initialized = spawnSync('git', ['-C', join(home, '.agit', 'repos', 'local', 'windows-smoke'), 'show-ref', '--verify', 'refs/heads/main'], { encoding: 'utf8', env })
