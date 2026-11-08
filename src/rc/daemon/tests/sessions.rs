@@ -1342,6 +1342,10 @@ fn ending_a_socket_epoch_revokes_the_ack_even_after_a_quick_reconnect() {
 /// The grace period is pinned with it: waiting for the hub to accept `commit.settled` is already
 /// `supervisor::SETTLEMENT_DELIVERY_WAIT`, and land/commit/push come after it. A cap that cannot
 /// hold one settlement cuts this path off halfway the moment it actually starts running.
+///
+/// The drain itself leaves the authorization in place, since the archive work a stopping daemon
+/// waits for next settles under it too; a drain that revoked it would end that work's commit in
+/// flight. Revoking it afterwards really revokes it.
 #[test]
 fn the_stop_drain_keeps_the_settlement_lease_until_the_fleet_has_settled() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1409,13 +1413,18 @@ fn the_stop_drain_keeps_the_settlement_lease_until_the_fleet_has_settled() {
                     settled.load(Ordering::SeqCst),
                     "the grace period cannot hold one exit settlement and cuts it off halfway"
                 );
-                let after_drain = *state.settlement.borrow();
-                assert!(
-                    !after_drain.agent_identity_v1 && !after_drain.session_start_idempotency_v1,
-                    "the authorization is revoked only after the fleet drains — and at that \
-                     moment it must really be revoked"
+                assert_eq!(
+                    *state.settlement.borrow(),
+                    after_stop,
+                    "the drain revoked the authorization the archive work still settles under"
                 );
-                assert_ne!(after_drain.epoch, after_stop.epoch);
+                state.revoke_settlement();
+                let revoked = *state.settlement.borrow();
+                assert!(
+                    !revoked.agent_identity_v1 && !revoked.session_start_idempotency_v1,
+                    "a revoked authorization must really be revoked"
+                );
+                assert_ne!(revoked.epoch, after_stop.epoch);
             });
     });
 }

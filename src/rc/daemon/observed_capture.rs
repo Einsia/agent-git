@@ -186,14 +186,30 @@ impl Collector {
                     .map(|source| source.session_ref(&entry.thread_id))
                     .unwrap_or_else(|| entry.thread_id.clone())
             });
-            let result = tokio::select! {
-                biased;
-                _ = stop.wait_for(|stopped| *stopped) => None,
-                result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                    collect(daemon, request, self.recorded.get(&logical).and_then(|recorded| recorded.digest.clone()))) => Some(result),
+            // A stop lets the capture in flight finish within the grace archive recovery gives its
+            // stages. A capture dropped at once ends the settlement subprocess it started wherever
+            // that subprocess is, and a repository write it is in the middle of stays half done.
+            let digest = self
+                .recorded
+                .get(&logical)
+                .and_then(|recorded| recorded.digest.clone());
+            let capture = {
+                let daemon = daemon.clone();
+                async move {
+                    Ok::<_, anyhow::Error>(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            collect(&daemon, request, digest),
+                        )
+                        .await,
+                    )
+                }
             };
+            let result = super::archive_recovery::run(stop, capture).await;
             daemon.lock().await.opening_sessions.remove(&logical);
             let Some(result) = result else { return };
+            // A capture that panicked fails like one that returned an error.
+            let result = result.unwrap_or_else(|error| Ok(Err(error)));
             // Slow: the capture ran out of its time, or its landing recorded a wait the worker
             // may get past when asked again.
             let slow = match &result {

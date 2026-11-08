@@ -30,6 +30,12 @@ pub enum Request {
         thread_id: String,
         leaf: String,
     },
+    /// Checkout recovery removed an index lock nothing could still be writing, in the checkout of
+    /// the conversation `session_id` names when its checkout records one.
+    CheckoutLockCleared {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -360,11 +360,8 @@ pub fn run(args: Args) -> CmdResult {
         if let Some(status) = transaction::inspect(root, &slug) {
             checks.push((slug.clone(), Check::Warn(status)));
         }
-        for lock in super::plumbing::stuck_checkout_locks(&repo) {
-            checks.push((
-                slug.clone(),
-                Check::Warn(super::plumbing::stale_index_lock(&lock)),
-            ));
+        for finding in super::plumbing::stuck_checkout_locks(&repo) {
+            checks.push((slug.clone(), Check::Warn(finding)));
         }
         let common = crate::domain::repo::Repo::at(root)
             .local_objects_only()

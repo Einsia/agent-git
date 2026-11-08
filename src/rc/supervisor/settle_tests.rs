@@ -77,7 +77,7 @@ fn a_stale_lock_is_reported_without_its_path() {
     let path = "/home/person/.agit/repos/acme/secret-project/.git/worktrees/fix-payroll/index.lock";
     let detail = settlement_failure_detail(
         "strict commit failed",
-        &format!("error {path} is left from a Git process that was stopped"),
+        &format!("error {path} was left when agit was stopped while it updated a checkout"),
     );
     assert!(detail.contains("stale checkout lock"), "{detail}");
     assert!(
