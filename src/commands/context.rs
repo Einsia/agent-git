@@ -191,8 +191,8 @@ pub struct RuntimeSession {
     /// `<owner>/<repo>@<branch>` of an active complete claim; `agit commit` accepts it verbatim.
     pub target: Option<String>,
     /// The repository the folder's project saves this unclaimed conversation into by itself at
-    /// the end of each turn, and what the sign-in lets it do.
-    pub(crate) project: Option<(String, super::project::SignIn)>,
+    /// the end of each turn, what the sign-in lets it do, and whether the turns then upload.
+    pub(crate) project: Option<super::project::AutomaticSave>,
 }
 
 impl RuntimeSession {
@@ -200,8 +200,9 @@ impl RuntimeSession {
         serde_json::json!({
             "runtime": self.runtime, "session_id": self.session_id, "variable": self.variable,
             "managed": self.managed, "target": self.target,
-            "project": self.project.as_ref().map(|(repository, sign_in)| serde_json::json!({
-                "repository": repository, "sign_in": sign_in.name(),
+            "project": self.project.as_ref().map(|save| serde_json::json!({
+                "repository": save.repository, "sign_in": save.sign_in.name(),
+                "automatic_upload": !save.upload_off,
             })),
         })
     }
@@ -291,8 +292,18 @@ pub fn runtime_session_note(sessions: &[RuntimeSession]) -> Option<String> {
             // The project saves it when a turn ends, so during its first turn it has no claim yet.
             // An import now would claim it elsewhere, and the project leaves a conversation
             // claimed elsewhere to that claim.
-            (None, Some((repository, sign_in))) => {
-                let saved = match sign_in {
+            (None, Some(save)) => {
+                let repository = &save.repository;
+                let saved = match save.sign_in {
+                    // Off, nothing goes up at a turn's end; the push is the user's to ask for, as
+                    // for a conversation already saved.
+                    super::project::SignIn::Current | super::project::SignIn::Expired
+                        if save.upload_off =>
+                    {
+                        format!(
+                            "is saved automatically for {repository} at the end of each turn by this folder's project and stays on this computer: automatic upload is off for it here, so publish it with `agit push {repository}` only when the user asks to"
+                        )
+                    }
                     super::project::SignIn::Current => format!(
                         "is saved automatically into {repository} at the end of each turn by this folder's project"
                     ),
@@ -543,7 +554,8 @@ mod tests {
     /// A conversation the folder's project saves has no claim until its first turn ends, and an
     /// agent asked about it then must be told the project saves it, never to import it: an import
     /// claims it elsewhere, and the project stops uploading it. Signed out, the note still says
-    /// what `agit login` does. A conversation no project saves keeps the import advice.
+    /// what `agit login` does. With automatic upload off, it says the turns stay on this computer
+    /// and leaves their push to the user. A conversation no project saves keeps the import advice.
     #[test]
     fn a_conversation_the_project_saves_is_never_sent_to_import() {
         use crate::commands::project::SignIn;
@@ -555,9 +567,16 @@ mod tests {
             target: None,
             project,
         };
+        let saves = |sign_in, upload_off| {
+            runtime_session_note(&[session(Some(crate::commands::project::AutomaticSave {
+                repository: "acme/widget".into(),
+                sign_in,
+                upload_off,
+            }))])
+            .unwrap()
+        };
         for sign_in in [SignIn::Current, SignIn::Expired, SignIn::Absent] {
-            let note =
-                runtime_session_note(&[session(Some(("acme/widget".into(), sign_in)))]).unwrap();
+            let note = saves(sign_in, false);
             assert!(
                 note.contains("acme/widget") && note.ends_with("do not import it"),
                 "{note}"
@@ -569,6 +588,16 @@ mod tests {
                 "{note}"
             );
         }
+        // With automatic upload off, the turns stay on this computer, so the note says what
+        // publishes them and leaves that to the user, signed in or out. Not signed in, nothing is
+        // saved yet, and the note is the same as with it on.
+        for sign_in in [SignIn::Current, SignIn::Expired] {
+            assert_eq!(
+                saves(sign_in, true),
+                "this conversation (claude-code S1, from CLAUDE_CODE_SESSION_ID) is saved automatically for acme/widget at the end of each turn by this folder's project and stays on this computer: automatic upload is off for it here, so publish it with `agit push acme/widget` only when the user asks to; do not import it"
+            );
+        }
+        assert_eq!(saves(SignIn::Absent, true), saves(SignIn::Absent, false));
         assert!(
             runtime_session_note(&[session(None)])
                 .unwrap()

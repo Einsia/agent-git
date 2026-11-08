@@ -4120,9 +4120,21 @@ pub(crate) struct AutomaticUpload {
     /// Whether every member of that organization reads it, when known.
     pub(crate) members_read: Option<bool>,
     pub(crate) sign_in: SignIn,
+    /// Automatic upload is off for the repository on this computer: the turns are saved here, and
+    /// only `agit push` publishes them.
+    pub(crate) upload_off: bool,
     /// The git worktree the conversation started in and the main checkout whose setting uploads
     /// it, when it started in one.
     pub(crate) worktree: Option<(PathBuf, PathBuf)>,
+}
+
+/// The repository a project saves a conversation into by itself, read from local state alone.
+#[derive(Clone, Debug)]
+pub(crate) struct AutomaticSave {
+    pub(crate) repository: String,
+    pub(crate) sign_in: SignIn,
+    /// As [`AutomaticUpload::upload_off`].
+    pub(crate) upload_off: bool,
 }
 
 /// What the saved sign-in lets a project do on this device, judged without asking the Hub.
@@ -4304,25 +4316,36 @@ pub(crate) fn record_memory_start(runtime: &str, session: &str, origin: &Path) -
     Ok(())
 }
 
-/// The repository a project saves this conversation into by itself, and what the sign-in lets it
-/// do, read from local state alone.
+/// The repository a project saves this conversation into by itself, what the sign-in lets it do,
+/// and whether its turns then upload, read from local state alone.
 pub(crate) fn automatic_capture(
     runtime: &str,
     session: &str,
     origin: &Path,
-) -> Option<(String, SignIn)> {
+) -> Option<AutomaticSave> {
     let origin = origin
         .canonicalize()
         .unwrap_or_else(|_| origin.to_path_buf());
     let (project, _) = capturing(runtime, session, &origin)?;
-    let sign_in = sign_in(&project);
-    Some((project.repository, sign_in))
+    Some(AutomaticSave {
+        sign_in: sign_in(&project),
+        upload_off: upload_off(&project),
+        repository: project.repository,
+    })
+}
+
+/// Whether the turns a project saves stay on this computer, as the turn end decides: a setting
+/// that can't be read uploads nothing there either, so it counts as off.
+fn upload_off(project: &Project) -> bool {
+    automatic_upload_off(project).unwrap_or(true)
 }
 
 /// The repository a project uploads this conversation to by itself, judged by the folder the
 /// conversation started in, as [`capturing`] judges it. Who can see it is the Hub's answer within
 /// `wait`, recorded for later, or else the last recorded answer; the requests never renew
-/// credentials, so a caller may run them inside a hook.
+/// credentials, so a caller may run them inside a hook. With automatic upload off, nothing
+/// automatic contacts the Hub, so only a recorded answer that names no fewer readers than there
+/// are stands: "public".
 pub(crate) fn automatic_upload(
     runtime: &str,
     session: &str,
@@ -4331,7 +4354,10 @@ pub(crate) fn automatic_upload(
 ) -> Option<AutomaticUpload> {
     let (project, via) = capturing(runtime, session, origin)?;
     let recorded = recorded_audience(&project.root);
-    let answered = crate::hub::Client::from_env_with_live_access(wait)
+    let upload_off = upload_off(&project);
+    let answered = (!upload_off)
+        .then(|| crate::hub::Client::from_env_with_live_access(wait))
+        .flatten()
         .filter(|client| {
             identity::normalize_hub(client.base()).ok().as_deref()
                 == Some(project.identity.hub.as_str())
@@ -4363,6 +4389,12 @@ pub(crate) fn automatic_upload(
             let _ = record_audience(&project.root, &audience);
             audience
         }
+        // A private repository may have turned public since, so its recorded answer, unasked,
+        // could name fewer readers than there are.
+        None if upload_off => Audience {
+            visibility: recorded.visibility.filter(|v| v == "public"),
+            ..recorded
+        },
         None => recorded,
     };
     let sign_in = sign_in(&project);
@@ -4371,6 +4403,7 @@ pub(crate) fn automatic_upload(
         org: audience.org,
         members_read: audience.members_read,
         sign_in,
+        upload_off,
         worktree: match via {
             Via::Worktree(worktree) => Some((worktree, project.root)),
             Via::Folder => None,
@@ -5578,6 +5611,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(audience(), Some((Some("private".into()), Some(true))));
+        // With automatic upload off, the start asks the Hub nothing, and a recorded "private" may
+        // be out of date in the direction that names fewer readers, so only "public" stands.
+        crate::domain::repo::automatic_upload_off::set("alice", "app", true).unwrap();
+        let off = || {
+            automatic_upload("codex", "fresh", &inside, wait).map(|u| (u.upload_off, u.visibility))
+        };
+        assert_eq!(off(), Some((true, None)));
+        assert!(automatic_capture("codex", "fresh", &inside).is_some_and(|save| save.upload_off));
+        record_audience(
+            &policy.root,
+            &Audience {
+                visibility: Some("public".into()),
+                org: Some(true),
+                members_read: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(off(), Some((true, Some("public".into()))));
+        crate::domain::repo::automatic_upload_off::set("alice", "app", false).unwrap();
+        assert_eq!(off(), Some((false, Some("public".into()))));
+        assert!(automatic_capture("codex", "fresh", &inside).is_some_and(|save| !save.upload_off));
 
         // In a git worktree the folder covers, a conversation from before the folder covered it
         // is the folder's earlier history: not announced and not captured; one that began after,

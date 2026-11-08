@@ -549,15 +549,21 @@ fn print_runtime_sessions(sessions: &[super::context::RuntimeSession], with_note
                     println!("  {}", ui::dim("saved to: no active complete claim"))
                 }
                 None => match &one.project {
-                    Some((repository, sign_in)) => println!(
+                    Some(save) => println!(
                         "  {}",
                         ui::dim(&format!(
-                            "saved to: {repository} at the end of each turn, by this folder's project{}",
-                            match sign_in {
-                                super::project::SignIn::Current => "",
-                                super::project::SignIn::Expired =>
-                                    " (uploads wait for `agit login`)",
-                                super::project::SignIn::Absent => " (once agit is signed in)",
+                            "saved to: {} at the end of each turn, by this folder's project{}",
+                            save.repository,
+                            match (save.sign_in, save.upload_off) {
+                                (super::project::SignIn::Absent, _) =>
+                                    " (once agit is signed in)".to_owned(),
+                                (_, true) => format!(
+                                    " (automatic upload is off: `agit push {}` publishes it)",
+                                    save.repository
+                                ),
+                                (super::project::SignIn::Current, false) => String::new(),
+                                (super::project::SignIn::Expired, false) =>
+                                    " (uploads wait for `agit login`)".to_owned(),
                             }
                         ))
                     ),
