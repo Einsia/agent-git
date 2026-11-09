@@ -8,6 +8,23 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.48] - 2026-11-10
+
+### Changed
+
+- Files in an agit repository other than conversation records, such as files added with `agit file`, memory and
+  skills, are now pushed as they are, the way git pushes files, with no privacy check. So are session branch names. A
+  push no longer stops because one of them holds a value the check would replace, or is too large to check.
+  Conversation records are still checked when they're saved, as before.
+
+### Fixed
+
+- A conversation in which the privacy check had left part of a record out could stop saving at its next turn. It now
+  goes on saving, and the part stays left out.
+- agit now reads the requests in a Codex conversation that Codex imported from another agent, which it missed when
+  Codex kept them only as event records, and dates the imported turns by when they started instead of when they were
+  imported.
+
 ## [0.2.47] - 2026-11-09
 
 ### Changed
