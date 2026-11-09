@@ -911,6 +911,26 @@ pub(crate) fn json_string_regions(text: &str) -> Vec<(usize, usize)> {
     strings
 }
 
+/// A JSON member name made only of letters, underscores and hyphens is a schema word, however
+/// unusual its letters: `cacheCreationInputTokens` measures like a token. Bare entropy is a
+/// backstop for unlabelled opaque values and leaves such a name alone.
+pub(crate) fn schema_word(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_alphabetic() || byte == b'_' || byte == b'-')
+}
+
+/// Where `text`, when all of it is JSON, uses a schema word as a member name. In valid JSON only
+/// a member name has a colon after its closing quote.
+#[cfg(feature = "secret-vault")]
+pub(crate) fn json_schema_word_regions(text: &str) -> std::collections::HashSet<(usize, usize)> {
+    json_string_regions(text)
+        .into_iter()
+        .filter(|&(start, end)| {
+            schema_word(&text[start..end]) && text[end + 1..].trim_start().starts_with(':')
+        })
+        .collect()
+}
+
 pub(crate) fn semantic_match_value<'a>(
     text: &'a str,
     strings: &[(usize, usize)],
