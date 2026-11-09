@@ -2087,12 +2087,13 @@ fn imported_and_live_metadata_remain_publishable() {
 /// value the user blocked may be left in place. A record larger than one request still lands,
 /// with its media payload kept byte for byte and the credential beside it replaced. One whose
 /// short strings sit in a large structured tool result lands with that result left out, says so,
-/// and still has its credential replaced. One that holds only short strings the person typed
-/// cannot be divided: it is refused by its size, with the step that ends the wait, and stays off
-/// the branch. An implementation that committed what the worker returned unchanged, settled under
+/// and still has its credential replaced, and the conversation's next turn settles after it. One
+/// that holds only short strings the person typed cannot be divided: it is refused by its size,
+/// with the step that ends the wait, and stays off the branch. An implementation that committed what the worker returned unchanged, settled under
 /// a partial policy, or could not divide a large record would put the transcript on the branch
 /// without the protection the user configured, or never put it there; one that only said
-/// "pending" would leave such a conversation waiting with no way out.
+/// "pending" would leave such a conversation waiting with no way out; one that compared the place
+/// left out with the live record would refuse every later save as a changed transcript.
 #[test]
 fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     let lab = Lab::new(5);
@@ -2305,6 +2306,25 @@ fn imported_turns_reach_a_branch_only_once_protected_with_the_whole_policy() {
     assert!(
         on_patched(token).is_empty(),
         "the credential in the rest was not replaced"
+    );
+    let mut transcript = fs::read_to_string(path).unwrap();
+    transcript.push_str(&format!(
+        "{}\n{}\n",
+        serde_json::json!({"type":"user", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-after-ask"), "message":{"role":"user", "content":"SYNTHETIC-AFTER-ASK"}}),
+        serde_json::json!({"type":"assistant", "sessionId":id, "cwd":first["cwd"],
+        "uuid":format!("{id}-after-answer"), "message":{"role":"assistant", "content":"SYNTHETIC-AFTER-ANSWER"}})
+    ));
+    fs::write(path, transcript).unwrap();
+    let next = lab
+        .command()
+        .args(["commit", "me/qa@patched"])
+        .output()
+        .unwrap();
+    assert!(next.status.success(), "{next:?}");
+    assert!(
+        !on_patched("SYNTHETIC-AFTER-ANSWER").is_empty(),
+        "the turn after a left-out part did not settle"
     );
 
     let vault = lab.store.join("secret-filter/vault.json");

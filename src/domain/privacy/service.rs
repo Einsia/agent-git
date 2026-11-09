@@ -1039,11 +1039,7 @@ const WINDOW_CONTEXT_BYTES: usize = 16 * 1024;
 /// The smallest window a part with too many findings is divided into.
 const SMALLEST_WINDOW: usize = 64 * 1024;
 
-/// What a record keeps in place of a string no request can carry and no window can divide.
-pub(crate) const OMITTED_TEXT: &str = "[content omitted: too large for the privacy check]";
-/// What a long text keeps in place of a part with too many findings for the privacy check to
-/// finish or divide.
-pub(crate) const CROWDED_TEXT: &str = "[content omitted: too many findings for the privacy check]";
+pub(crate) use super::projector::{CROWDED_TEXT, OMITTED_TEXT};
 
 /// The envelope is storage framing; only its native content crosses the privacy boundary.
 /// Recomputing its address after protection keeps the stored event valid on older readers.

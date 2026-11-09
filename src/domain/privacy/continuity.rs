@@ -1,7 +1,15 @@
 //! Settled content remains immutable when a local recovery dictionary is unavailable.
 
-use super::projector::tokens;
+use super::projector::{CROWDED_TEXT, OMITTED_TEXT, UNREADABLE_TEXT, tokens};
 use serde_json::Value;
+
+/// What the privacy check settles in place of a value it left out. The live transcript still
+/// holds the original there, so a settled value or span that is one of these continues whatever
+/// the live record has at that place, as a placeholder does. Unlike a placeholder, a whole value
+/// left out may have been an array or an object, so it matches a live value of any type. Compared
+/// literally, a record settled with a part left out would never match its own live line again,
+/// and the conversation would stop settling at its next turn.
+const LEFT_OUT: [&str; 3] = [OMITTED_TEXT, CROWDED_TEXT, UNREADABLE_TEXT];
 
 /// A legacy opaque span has no locally comparable original. All surrounding content and
 /// structure must still agree; this never authorizes rewriting the settled representation.
@@ -9,6 +17,11 @@ use serde_json::Value;
 /// restored, in full or in part, it has none, and a missing value must never read as `null`.
 fn compatible(original: Option<&Value>, stored: &Value, live: &Value) -> bool {
     if original == Some(live) {
+        return true;
+    }
+    if let Value::String(stored) = stored
+        && LEFT_OUT.contains(&stored.as_str())
+    {
         return true;
     }
     match (stored, live) {
@@ -90,20 +103,29 @@ fn assign(
     false
 }
 
-/// Unknown opaque strings compare only their surrounding literals, never a guessed original.
+/// Unknown opaque strings, and text left out in place ([`LEFT_OUT`]), compare only their
+/// surrounding literals, never a guessed original.
 pub(crate) fn compatible_string(stored: &str, live: &str) -> bool {
     if stored == live {
         return true;
     }
-    let spans: Vec<_> = tokens(stored).collect();
-    let Some((first, _, _)) = spans.first() else {
+    let mut spans: Vec<(usize, usize)> = tokens(stored)
+        .map(|(start, end, _)| (start, end))
+        .chain(LEFT_OUT.iter().flat_map(|marker| {
+            stored
+                .match_indices(marker)
+                .map(|(start, found)| (start, start + found.len()))
+        }))
+        .collect();
+    spans.sort_unstable();
+    let Some((first, _)) = spans.first() else {
         return false;
     };
     if !live.starts_with(&stored[..*first]) {
         return false;
     }
     let mut cursor = *first;
-    for (index, (_, end, _)) in spans.iter().enumerate() {
+    for (index, (_, end)) in spans.iter().enumerate() {
         let Some(character) = live[cursor..].chars().next() else {
             return false;
         };
@@ -185,6 +207,56 @@ pub fn retain_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A value the privacy check left out, whole or as a span inside a longer text, continues
+    /// whatever the live record holds at that place, and only there: every other value, and the
+    /// words around a span, must still agree, and the settled record is what settlement keeps. A
+    /// comparison that took the marker literally would stop the conversation settling; one that
+    /// let a marker excuse its whole line, or a whole text, would accept a live record rewritten
+    /// beside it.
+    #[test]
+    fn a_part_left_out_continues_only_at_its_own_place() {
+        let session = "agit-0123456789abcdef0123456789abcdef01234567";
+        let record = |patch: Value, note: &str, path: &str| serde_json::json!({"type":"user","toolUseResult":{"filePath":path,"structuredPatch":patch,"note":note}});
+        let settled = record(
+            Value::from(OMITTED_TEXT),
+            &format!("before {CROWDED_TEXT} after"),
+            "big.txt",
+        );
+        let committed =
+            crate::domain::transcript::wrap_lines(&format!("{settled}\n"), "claude-code", session);
+        let next = serde_json::json!({"type":"user","message":{"role":"user","content":"next"}});
+        let live = |record: Value| format!("{record}\n{next}\n");
+        let original = record(
+            serde_json::json!([{"oldStart":1,"lines":["+key=secret-1"]}]),
+            "before key=secret-1 key=secret-2 after",
+            "big.txt",
+        );
+        let (end, projected) = retain_prefix(&committed, &committed, &live(original.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, format!("{original}\n").len());
+        assert!(projected.contains(OMITTED_TEXT) && !projected.contains("secret-1"));
+        for changed in [
+            record(
+                original["toolUseResult"]["structuredPatch"].clone(),
+                "before key=secret-1 after",
+                "other.txt",
+            ),
+            record(
+                original["toolUseResult"]["structuredPatch"].clone(),
+                "rewritten key=secret-1 after",
+                "big.txt",
+            ),
+        ] {
+            assert!(
+                retain_prefix(&committed, &committed, &live(changed.clone()))
+                    .unwrap()
+                    .is_none(),
+                "{changed}"
+            );
+        }
+    }
 
     /// Only the first line may differ, and only as another header of the same thread; the
     /// committed header is what settlement keeps. A comparison that accepts any differing header
