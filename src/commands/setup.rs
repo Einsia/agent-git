@@ -1015,6 +1015,26 @@ fn codex_hooks_capability() -> Option<CodexHooksCapability> {
     parse_codex_hooks_capability(&String::from_utf8_lossy(&listed))
 }
 
+/// What the installed Codex says about its hooks feature in `folder`, asked within `limit`:
+/// `Some(true)` when it is on, `Some(false)` when it is off or this Codex has none, and `None` when
+/// Codex couldn't be asked in time. It is asked from `folder` itself, since Codex applies a trusted
+/// project's own configuration there, and a listing that asked from one place would give that
+/// place's answer for every folder. A listing runs often, so a Codex that hangs costs it no more
+/// than `limit`.
+pub(super) fn codex_hooks_enabled_within(
+    folder: &std::path::Path,
+    limit: std::time::Duration,
+) -> Option<bool> {
+    let exe = crate::adapter::which("codex")?;
+    let mut command = std::process::Command::new(exe);
+    command.args(["features", "list"]).current_dir(folder);
+    let listed = crate::adapter::probe::output(command, limit, 1 << 20)?;
+    Some(
+        parse_codex_hooks_capability(&String::from_utf8_lossy(&listed))
+            .is_some_and(|capability| capability.enabled),
+    )
+}
+
 /// The runtimes whose hooks can capture project sessions automatically. Codex counts only when
 /// it reports an enabled hooks feature; a Codex that cannot does not take Claude Code capture
 /// down with it, and its sessions remain available to manual project sync.

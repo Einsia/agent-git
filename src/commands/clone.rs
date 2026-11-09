@@ -598,6 +598,16 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     }
 
     super::migration::finish_external_history_update(&store, history_update)?;
+    if let Some(writable) = plan.write_known
+        && let Some(account) = crate::infra::credentials::account_key(&plan.identity.hub)
+    {
+        let _ = store.record_write_access(
+            &plan.identity.hub,
+            &account,
+            &plan.identity.agent_id,
+            writable,
+        );
+    }
 
     let heads = local_branches(&store);
     progress.line(format_args!(
@@ -877,6 +887,9 @@ pub struct Plan {
     pub upstream_identity: Option<RemoteIdentity>,
     /// Whether this one can be pushed. A read-only checkout cannot.
     pub writable: bool,
+    /// What the Hub answered about pushing to it, when it was asked; `None` when it wasn't, such
+    /// as a read-only clone without a sign-in. `project list` reads the recorded answer.
+    pub write_known: Option<bool>,
     /// This run only promotes an existing read-only checkout to yours; no new content is fetched.
     pub promoted_in_place: bool,
 }
@@ -1024,6 +1037,7 @@ fn plan(
             upstream: None,
             upstream_identity: None,
             writable: true,
+            write_known: Some(true),
             promoted_in_place: false,
         }));
     }
@@ -1034,11 +1048,18 @@ fn plan(
     let source_identity = RemoteIdentity::new(client.base(), &source.agent_id)?;
 
     if mode == Mode::ReadOnly {
-        let writable = client.has_token()
-            && matches!(
-                client.push_access(src_owner, src_name, &source.agent_id),
-                Ok(crate::hub::PushAccess::Writable)
-            );
+        // A failed check is no answer: recorded as read-only, it would hide a repository the
+        // account may push to.
+        let write_known = client
+            .has_token()
+            .then(|| {
+                client
+                    .push_access(src_owner, src_name, &source.agent_id)
+                    .ok()
+            })
+            .flatten()
+            .map(|access| matches!(access, crate::hub::PushAccess::Writable));
+        let writable = write_known == Some(true);
         return Ok(Some(Plan {
             owner: source.owner,
             name: source.name,
@@ -1047,6 +1068,7 @@ fn plan(
             upstream: None,
             upstream_identity: None,
             writable,
+            write_known,
             promoted_in_place: false,
         }));
     }
@@ -1090,6 +1112,7 @@ fn plan(
         upstream: Some(source.clone_url),
         upstream_identity: Some(source_identity),
         writable: true,
+        write_known: Some(true),
         promoted_in_place: false,
     }))
 }
@@ -1223,6 +1246,7 @@ fn promote_with_progress(
         upstream: Some(source.clone_url.clone()),
         upstream_identity: Some(source_identity),
         writable: true,
+        write_known: Some(true),
         promoted_in_place: true,
     })
 }
@@ -1807,6 +1831,7 @@ mod tests {
                     upstream: Some(source.clone_url.clone()),
                     upstream_identity: Some(RemoteIdentity::new(hub, &source.agent_id).unwrap()),
                     writable: true,
+                    write_known: Some(true),
                     promoted_in_place: false,
                 }
                 .apply_remotes(&repo, false, None)
@@ -1895,6 +1920,7 @@ mod tests {
                     upstream: Some(source.clone_url.clone()),
                     upstream_identity: Some(RemoteIdentity::new(hub, &source.agent_id).unwrap()),
                     writable: true,
+                    write_known: Some(true),
                     promoted_in_place: false,
                 }
                 .apply_remotes(&repo, true, None)
@@ -2122,6 +2148,7 @@ mod tests {
             upstream: None,
             upstream_identity: None,
             writable: true,
+            write_known: Some(true),
             promoted_in_place: false,
         };
 
@@ -2178,6 +2205,7 @@ mod tests {
             upstream: None,
             upstream_identity: None,
             writable: true,
+            write_known: Some(true),
             promoted_in_place: false,
         };
         let refs = repo.git(&["for-each-ref"]).unwrap();

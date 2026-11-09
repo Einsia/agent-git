@@ -315,6 +315,14 @@ fn recorded_audience(root: &Path) -> Audience {
         .unwrap_or_default()
 }
 
+/// Records that the repository `root` uploads to was seen public: a push refused because it is
+/// public is the latest word on its audience, whatever holds the folder later.
+fn observed_public(root: &Path) {
+    let mut audience = recorded_audience(root);
+    audience.visibility = Some("public".into());
+    let _ = record_audience(root, &audience);
+}
+
 fn record_audience(root: &Path, audience: &Audience) -> Result<()> {
     config::create_state_dir(&home()?)?;
     let mut file = tempfile::NamedTempFile::new_in(home()?)?;
@@ -1296,6 +1304,8 @@ pub(crate) enum UploadFailure {
     PrivacyIncomplete,
     TooLarge,
     BuildsOnWithdrawn,
+    /// The repository is public, and the person never switched on automatic upload into it.
+    PublicNeedsConsent,
     Refused,
     /// The Hub's copy of the branch and this computer's have each moved on without the other.
     Diverged,
@@ -1397,6 +1407,9 @@ impl UploadFailure {
         if message.contains(super::push::BUILDS_ON_WITHDRAWN) {
             return Self::BuildsOnWithdrawn;
         }
+        if message.contains(super::push::PUBLIC_NOT_SWITCHED_ON) {
+            return Self::PublicNeedsConsent;
+        }
         if message.contains(super::push::WITHHELD_HERE) {
             return Self::Withheld;
         }
@@ -1428,6 +1441,9 @@ impl UploadFailure {
             }
             Self::BuildsOnWithdrawn => {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
+            }
+            Self::PublicNeedsConsent => {
+                "its repository is public, and automatic upload into a public repository waits until you switch it on"
             }
             Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
             Self::Diverged => {
@@ -1850,42 +1866,98 @@ impl std::fmt::Display for LeftOut {
 
 impl std::error::Error for LeftOut {}
 
+/// Why `project sync` leaves a candidate session out, in the words of its row.
+fn sync_skip(project: &Project, candidate: &Candidate) -> Option<&'static str> {
+    if project
+        .excluded
+        .contains(&key(&candidate.runtime, &candidate.session_id))
+    {
+        Some("dropped")
+    } else if project
+        .earlier
+        .contains(&key(&candidate.runtime, &candidate.session_id))
+        || before_covered(project, candidate, true).unwrap_or(true)
+    {
+        Some("before_on")
+    } else if codex_unhooked(project, candidate) {
+        Some("codex_hooks_not_seen")
+    } else if delegation_withheld(&project.repository, candidate, Some(project), true)
+        .unwrap_or(true)
+    {
+        Some("delegated")
+    } else {
+        None
+    }
+}
+
+/// Uploads what the folder owes the Hub. Every candidate session gets a row: `pushed`, `failed`
+/// with its reason, `pending` when no turn of it has finished yet, or `skipped` with why. Only a
+/// failure fails the command, and a person sees the first one and how many there were: an exit
+/// code alone tells them nothing.
 fn sync(project: &mut Project) -> CmdResult {
     let mut rows = Vec::new();
-    let mut failed = false;
+    let mut counts = BTreeMap::<&str, usize>::new();
+    let mut first_failure = None;
     for candidate in candidates(project)? {
-        if project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
-            || before_covered(project, &candidate, true).unwrap_or(true)
-            || codex_unhooked(project, &candidate)
-            || delegation_withheld(&project.repository, &candidate, Some(project), true)
-                .unwrap_or(true)
-        {
-            continue;
-        }
-        let outcome = match sync_one(project, &candidate, false) {
-            Ok((branch, head)) => {
-                serde_json::json!({"branch": branch, "status": "pushed", "head": head})
-            }
-            Err(error) => {
-                failed = true;
-                serde_json::json!({"status": "failed", "error": format!("{error:#}")})
+        let outcome = if let Some(reason) = sync_skip(project, &candidate) {
+            serde_json::json!({"status": "skipped", "reason": reason})
+        } else {
+            match sync_one(project, &candidate, false) {
+                Ok((branch, head)) => {
+                    serde_json::json!({"branch": branch, "status": "pushed", "head": head})
+                }
+                Err(error) if error.is::<NothingSettled>() => {
+                    serde_json::json!({"status": "pending"})
+                }
+                Err(error) => {
+                    let reason = UploadFailure::of(&error, project, &candidate);
+                    if reason == UploadFailure::PublicNeedsConsent {
+                        observed_public(&project.root);
+                    }
+                    first_failure.get_or_insert(reason);
+                    serde_json::json!({
+                        "status": "failed", "error": format!("{error:#}"), "reason": reason,
+                    })
+                }
             }
         };
+        let status: &'static str = match outcome["status"].as_str() {
+            Some("pushed") => "pushed",
+            Some("pending") => "pending",
+            Some("skipped") => "skipped",
+            _ => "failed",
+        };
+        *counts.entry(status).or_default() += 1;
         rows.push(serde_json::json!({
             "runtime": candidate.runtime, "session_id": candidate.session_id,
             "outcome": outcome,
         }));
     }
-    project.last_result = Some(serde_json::json!({"at":chrono::Utc::now(),"sessions":rows}));
+    let count = |status: &str| counts.get(status).copied().unwrap_or_default();
+    project.last_result = Some(serde_json::json!({
+        "at": chrono::Utc::now(),
+        "sessions": rows,
+        "uploaded": count("pushed"),
+        "failed": count("failed"),
+        "skipped": count("skipped"),
+        "pending": count("pending"),
+    }));
     save(project)?;
     println!(
         "{}",
         serde_json::json!({"project":project.root,"repository":project.repository,"result":project.last_result})
     );
-    Ok(if failed {
-        ExitCode::Failure
-    } else {
-        ExitCode::Ok
+    Ok(match first_failure {
+        Some(reason) => {
+            let failed = count("failed");
+            ui::error(&format!(
+                "{failed} session{} didn't upload; the first because {}",
+                if failed == 1 { "" } else { "s" },
+                reason.describe()
+            ));
+            ExitCode::Failure
+        }
+        None => ExitCode::Ok,
     })
 }
 
@@ -2144,13 +2216,24 @@ fn bind(
     let repository = repository.as_str();
     project.repository = repository.into();
     project.identity = RemoteIdentity::new(client.base(), &remote.agent_id)?;
-    ensure!(
-        matches!(
-            super::remote_request(client.push_access(&owner, &name, &remote.agent_id))?,
-            crate::hub::PushAccess::Writable
-        ),
-        "project repository does not grant write access"
+    let writable = matches!(
+        super::remote_request(client.push_access(&owner, &name, &remote.agent_id))?,
+        crate::hub::PushAccess::Writable
     );
+    // `project list` reads the answer back, so a folder the account can't push from says so
+    // before the person tries again.
+    if let Ok(dir) = config::repo_dir(&owner, &name)
+        && let Some(checkout) = Repo::open(dir)
+        && let Some(account) = credentials::account_key(&project.identity.hub)
+    {
+        let _ = checkout.record_write_access(
+            &project.identity.hub,
+            &account,
+            &project.identity.agent_id,
+            writable,
+        );
+    }
+    ensure!(writable, "project repository does not grant write access");
     let me = super::remote_request(client.me())?;
     project.account = me.username;
     project.account_id = me.account_id;
@@ -3253,6 +3336,9 @@ fn capture_candidate(
         .as_ref()
         .err()
         .map(|error| UploadFailure::of(error, &project, &candidate));
+    if reason == Some(UploadFailure::PublicNeedsConsent) {
+        observed_public(&project.root);
+    }
     project.last_result = Some(serde_json::json!({
         "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),
@@ -4808,12 +4894,18 @@ struct Listed {
     sessions: Vec<adapter::SessionRef>,
 }
 
+/// A record a listing could not read, so a short list is told apart from a partial one and the
+/// person learns which file to look at.
+struct Unreadable {
+    what: &'static str,
+    path: Option<PathBuf>,
+}
+
 /// Every existing folder with a policy or a binding; a policy wins over the binding it writes.
-/// The flag is false when a policy or binding could not be read, so a short list is told apart
-/// from a partial one.
-fn listed() -> Result<(Vec<Listed>, bool)> {
+/// Policies and bindings that could not be read are returned beside them.
+fn listed() -> Result<(Vec<Listed>, Vec<Unreadable>)> {
     let mut folders = BTreeMap::new();
-    let mut complete = true;
+    let mut unreadable = Vec::new();
     let entries = match fs::read_dir(home()?) {
         Ok(entries) => Some(entries),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -4843,10 +4935,17 @@ fn listed() -> Result<(Vec<Listed>, bool)> {
                     );
                 }
             }
-            _ => complete = false,
+            _ => unreadable.push(Unreadable {
+                what: "folder upload policy",
+                path: Some(path),
+            }),
         }
     }
-    let (bindings, bindings_complete) = workspace::all()?;
+    let (bindings, unreadable_bindings) = workspace::all_readable()?;
+    unreadable.extend(unreadable_bindings.into_iter().map(|path| Unreadable {
+        what: "folder binding",
+        path: Some(path),
+    }));
     let hub = identity::normalize_hub(&config::hub_url()).unwrap_or_else(|_| config::hub_url());
     for binding in bindings {
         let Ok(root) = Path::new(&binding.dir).canonicalize() else {
@@ -4862,20 +4961,24 @@ fn listed() -> Result<(Vec<Listed>, bool)> {
             });
         }
     }
-    Ok((
-        folders.into_values().collect(),
-        complete && bindings_complete,
-    ))
+    Ok((folders.into_values().collect(), unreadable))
 }
 
 /// A conversation belongs to the deepest listed folder that holds its directory, as a nested
-/// binding takes its directory out of the folder around it. Returns false when a runtime's
-/// sessions could not be listed.
-fn assign_sessions(folders: &mut [Listed]) -> Result<bool> {
-    let mut complete = true;
+/// binding takes its directory out of the folder around it. Returns the runtimes whose sessions
+/// could not be listed.
+fn assign_sessions(folders: &mut [Listed]) -> Result<Vec<Unreadable>> {
+    let mut unreadable = Vec::new();
     for runtime in ["claude-code", "codex"] {
         let Ok(sessions) = adapter::get(runtime)?.all_session_choices() else {
-            complete = false;
+            unreadable.push(Unreadable {
+                what: if runtime == "codex" {
+                    "Codex conversations"
+                } else {
+                    "Claude Code conversations"
+                },
+                path: None,
+            });
             continue;
         };
         for session in sessions {
@@ -4900,7 +5003,7 @@ fn assign_sessions(folders: &mut [Listed]) -> Result<bool> {
             .sessions
             .sort_by_key(|session| std::cmp::Reverse(session.mtime));
     }
-    Ok(complete)
+    Ok(unreadable)
 }
 
 /// Whole records from the start or the end of a transcript, at most [`TITLE_SCAN_BYTES`] of it.
@@ -5002,8 +5105,13 @@ struct LastUpload {
     at: Option<chrono::DateTime<chrono::FixedOffset>>,
     ok: bool,
     error: Option<String>,
+    /// The failure's [`UploadFailure`] code, when the attempt recorded one.
+    reason: Option<serde_json::Value>,
     session_id: Option<String>,
     uploaded: BTreeMap<String, String>,
+    /// How many sessions a sync uploaded, failed, skipped and left pending; `None` for one
+    /// automatic upload.
+    counts: Option<serde_json::Value>,
 }
 
 fn last_upload(result: &serde_json::Value) -> LastUpload {
@@ -5013,11 +5121,32 @@ fn last_upload(result: &serde_json::Value) -> LastUpload {
     let reason = |error: &serde_json::Value| readable(error.as_str().unwrap_or("upload failed"));
     if let Some(rows) = result["sessions"].as_array() {
         let pushed = |row: &&serde_json::Value| row["outcome"]["status"] == "pushed";
-        let failed = rows.iter().find(|row| !pushed(row));
+        // A sync recorded before its rows said `pending` or `skipped` had only pushed and failed
+        // rows, so any other status is a failure there too.
+        let failed = rows.iter().find(|row| {
+            !matches!(
+                row["outcome"]["status"].as_str(),
+                Some("pushed" | "pending" | "skipped")
+            )
+        });
+        let count = |status: &str| {
+            rows.iter()
+                .filter(|row| row["outcome"]["status"] == status)
+                .count()
+        };
         return LastUpload {
             at,
             ok: failed.is_none(),
             error: failed.map(|row| reason(&row["outcome"]["error"])),
+            reason: failed
+                .map(|row| row["outcome"]["reason"].clone())
+                .filter(|reason| !reason.is_null()),
+            counts: Some(serde_json::json!({
+                "uploaded": count("pushed"),
+                "failed": rows.len() - count("pushed") - count("pending") - count("skipped"),
+                "skipped": count("skipped"),
+                "pending": count("pending"),
+            })),
             session_id: failed.and_then(|row| row["session_id"].as_str().map(str::to_owned)),
             uploaded: rows
                 .iter()
@@ -5035,6 +5164,10 @@ fn last_upload(result: &serde_json::Value) -> LastUpload {
         at,
         ok,
         error: (!ok).then(|| reason(&result["error"])),
+        reason: (!ok)
+            .then(|| result["reason"].clone())
+            .filter(|reason| !reason.is_null()),
+        counts: None,
         uploaded: session_id
             .iter()
             .filter(|_| ok)
@@ -5181,15 +5314,415 @@ fn session_json(
     })
 }
 
+/// Why a folder set to upload by itself isn't uploading: a `code` from an open set, which a
+/// reader that doesn't know one shows by its `text` and counts as needing attention, so a code
+/// added later never reads as nothing to do.
+struct Held {
+    code: &'static str,
+    text: String,
+    /// The Hub and account the folder was set up under, for `other_account`.
+    under: Option<(String, String)>,
+}
+
+impl Held {
+    fn json(&self) -> serde_json::Value {
+        let mut held = serde_json::json!({"code": self.code, "text": self.text});
+        if let Some((hub, account)) = &self.under {
+            held["hub"] = hub.as_str().into();
+            held["account"] = account.as_str().into();
+        }
+        held
+    }
+}
+
+/// What the Hub last said about the signed-in account pushing to the repository `checkout` is
+/// pinned to; `None` when it said nothing about this account and repository.
+fn writable(checkout: &Repo) -> Option<bool> {
+    let pinned = identity::read(checkout).ok().flatten()?;
+    let account = credentials::account_key(&pinned.hub)?;
+    checkout.write_access(&pinned.hub, &account, &pinned.agent_id)
+}
+
+/// What keeps a folder that is on from uploading, judged from local state: the repository's own
+/// switch, the person's sign-in, the account the folder was set up under, what the Hub last said
+/// about writing to it, and a last upload refused because a public repository was never switched
+/// on. A refusal the person has answered since (a newer sign-in, a recorded switch-on) holds
+/// nothing.
+fn held(
+    project: &Project,
+    state: &str,
+    checkout: Option<&Repo>,
+    last: Option<&LastUpload>,
+    current_hub: &str,
+    reader: Reader,
+) -> Option<Held> {
+    let repository = &project.repository;
+    if state == "blocked" {
+        return Some(Held {
+            code: "push_auto_off",
+            text: format!("automatic upload (push.auto) is off for {repository} on this computer"),
+            under: None,
+        });
+    }
+    if state != "on" {
+        return None;
+    }
+    let other_hub =
+        identity::normalize_hub(current_hub).is_ok_and(|hub| hub != project.identity.hub);
+    let signed_in_as = credentials::load_checked(&project.identity.hub)
+        .ok()
+        .flatten()
+        .map(|credential| credential.username);
+    if other_hub
+        || signed_in_as
+            .as_deref()
+            .is_some_and(|account| account != project.account)
+    {
+        return Some(Held {
+            code: "other_account",
+            text: format!(
+                "this folder uploads as {} on {}, and agit is signed in {}",
+                project.account,
+                project.identity.hub,
+                if other_hub {
+                    "to another Hub"
+                } else {
+                    "as another account"
+                }
+            ),
+            under: Some((project.identity.hub.clone(), project.account.clone())),
+        });
+    }
+    let failed = last.filter(|last| !last.ok);
+    let failed_for = |code: &str| {
+        failed.is_some_and(|last| last.reason.as_ref().and_then(|r| r.as_str()) == Some(code))
+    };
+    // A failed upload for sign-in is answered by any sign-in written after it.
+    let signed_in_since = failed
+        .and_then(|last| last.at)
+        .zip(credentials::saved_at(&project.identity.hub))
+        .is_some_and(|(at, saved)| chrono::DateTime::<chrono::Utc>::from(saved) > at);
+    if sign_in(project) != SignIn::Current || (failed_for("signed_out") && !signed_in_since) {
+        return Some(Held {
+            code: "signed_out",
+            text: format!(
+                "agit isn't signed in as {} on {}",
+                project.account, project.identity.hub
+            ),
+            under: None,
+        });
+    }
+    if checkout.and_then(writable) == Some(false) {
+        return Some(Held {
+            code: "no_write_access",
+            text: format!(
+                "{} doesn't let {} upload to it",
+                repository, project.account
+            ),
+            under: None,
+        });
+    }
+    if failed_for("public_needs_consent")
+        && !checkout.is_some_and(|repo| {
+            super::push::confirms_public(repo, &project.identity).unwrap_or(false)
+        })
+    {
+        return Some(Held {
+            code: "public_needs_consent",
+            text: match reader {
+                Reader::Person => format!(
+                    "{repository} is public, and automatic upload into it waits until you switch it on"
+                ),
+                Reader::Agent => format!(
+                    "{repository} is public, and automatic upload into it waits until the user switches it on"
+                ),
+            },
+            under: None,
+        });
+    }
+    None
+}
+
+/// What Codex last said about its hooks feature in one folder, and what that answer rests on
+/// ([`codex_answer_key`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexAnswer {
+    key: String,
+    enabled: bool,
+    /// When Codex gave it, in seconds since the epoch; an answer without one is never reused.
+    #[serde(default)]
+    asked_at: u64,
+}
+
+/// Codex's system-wide configuration, which sits below the person's own and can turn its hooks
+/// feature on or off for everyone on the computer.
+#[cfg(unix)]
+const CODEX_SYSTEM_CONFIG: &str = "/etc/codex/config.toml";
+
+/// How long an answer from Codex is reused at most, whatever its key says. Codex can be configured
+/// in ways a key can't follow, such as a value its environment overrides, and a listing would
+/// otherwise go on reporting such a change for as long as the files stay as they are.
+const CODEX_ANSWER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// What an answer from Codex about its hooks feature in `folder` rests on: the installed Codex, the
+/// system configuration at `system`, the person's own configuration, which also says which projects
+/// are trusted, and each project configuration from `folder` up. A listing that reused an answer
+/// past a change in any of them would keep reporting a feature since turned on or off; `None` when
+/// Codex can't be found.
+fn codex_answer_key(folder: &Path, system: Option<&Path>) -> Option<String> {
+    let mut hash = Sha256::new();
+    let mut add = |path: &Path| {
+        let stamp = fs::metadata(path)
+            .ok()
+            .map(|file| (file.len(), file.modified().ok()));
+        hash.update(format!("{}\0{stamp:?}\0", path.display()));
+    };
+    add(&adapter::which("codex")?);
+    if let Some(system) = system {
+        add(system);
+    }
+    add(&adapter::codex::codex_home().ok()?.join("config.toml"));
+    for directory in folder.ancestors() {
+        add(&directory.join(".codex").join("config.toml"));
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
+fn codex_system_config() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(CODEX_SYSTEM_CONFIG))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn codex_answers_path() -> Result<PathBuf> {
+    Ok(config::agit_home()?.join("codex-hooks-answers.json"))
+}
+
+/// The answers kept from earlier listings. One that can't be read is as good as none: Codex is
+/// asked again.
+fn codex_answers() -> BTreeMap<PathBuf, CodexAnswer> {
+    codex_answers_path()
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|text| serde_json::from_slice(&text).ok())
+        .unwrap_or_default()
+}
+
+/// What a listing asks the runtimes installed here, and who reads its answers: Claude Code's
+/// settings once, and Codex from each folder, since a trusted project's own configuration can turn
+/// its hooks feature on or off there.
+///
+/// The menu bar repeats its listing all day, so Codex is started for a folder only when no kept
+/// answer matches what the answer rests on, and only for a listing that asks at all
+/// (`ask_codex`): a person's plain listing uses kept answers and starts nothing. Every folder of a
+/// listing shares [`CODEX_CHECK_LIMIT`], so a Codex that hangs costs the listing no more than
+/// that, and a folder with no kept answer that the limit doesn't reach reads as unknown.
+struct Asking {
+    claude_code: Option<Option<bool>>,
+    codex: bool,
+    ask_codex: bool,
+    /// Codex's system configuration ([`CODEX_SYSTEM_CONFIG`]), on a platform that has one.
+    codex_system: Option<PathBuf>,
+    until: std::time::Instant,
+    reader: Reader,
+    answers: std::cell::RefCell<BTreeMap<PathBuf, CodexAnswer>>,
+    learned: std::cell::Cell<bool>,
+}
+
+impl Asking {
+    fn here(ask_codex: bool) -> Self {
+        let installed =
+            |runtime: &str| adapter::get(runtime).is_ok_and(|adapter| adapter.available());
+        Self::of(
+            installed("claude-code")
+                .then(|| super::setup::claude_hooks_missing().map(|missing| missing.is_empty())),
+            installed("codex"),
+            ask_codex,
+            std::time::Instant::now() + CODEX_CHECK_LIMIT,
+            Reader::of_this_process(),
+        )
+        .with_codex_system(codex_system_config())
+    }
+
+    fn with_codex_system(mut self, system: Option<PathBuf>) -> Self {
+        self.codex_system = system;
+        self
+    }
+
+    fn of(
+        claude_code: Option<Option<bool>>,
+        codex: bool,
+        ask_codex: bool,
+        until: std::time::Instant,
+        reader: Reader,
+    ) -> Self {
+        Asking {
+            claude_code,
+            codex,
+            ask_codex,
+            codex_system: None,
+            until,
+            reader,
+            answers: std::cell::RefCell::new(if codex {
+                codex_answers()
+            } else {
+                BTreeMap::new()
+            }),
+            learned: std::cell::Cell::new(false),
+        }
+    }
+
+    fn in_folder(&self, folder: &Path) -> Runtimes {
+        Runtimes {
+            claude_code: self.claude_code,
+            codex: self.codex.then(|| self.codex_in(folder)),
+        }
+    }
+
+    fn codex_in(&self, folder: &Path) -> Option<bool> {
+        let key = codex_answer_key(folder, self.codex_system.as_deref())?;
+        let now = now_seconds();
+        if let Some(kept) = self.answers.borrow().get(folder)
+            && kept.key == key
+            && now.saturating_sub(kept.asked_at) < CODEX_ANSWER_MAX_AGE.as_secs()
+        {
+            return Some(kept.enabled);
+        }
+        if !self.ask_codex {
+            return None;
+        }
+        let left = self
+            .until
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        let enabled = super::setup::codex_hooks_enabled_within(folder, left)?;
+        self.answers.borrow_mut().insert(
+            folder.to_path_buf(),
+            CodexAnswer {
+                key,
+                enabled,
+                asked_at: now,
+            },
+        );
+        self.learned.set(true);
+        Some(enabled)
+    }
+
+    /// Keep what this listing learned for the next one. A listing that can't is still a listing;
+    /// the next one asks again.
+    fn remember(&self) {
+        if !self.learned.get() {
+            return;
+        }
+        let write = || -> Result<()> {
+            let path = codex_answers_path()?;
+            let directory = path.parent().context("agit's home has no parent")?;
+            config::create_state_dir(directory)?;
+            let mut file = tempfile::NamedTempFile::new_in(directory)?;
+            serde_json::to_writer(&mut file, &*self.answers.borrow())?;
+            file.persist(&path)?;
+            Ok(())
+        };
+        let _ = write();
+    }
+}
+
+/// What the runtimes installed here say about one folder.
+struct Runtimes {
+    /// `None` when Claude Code isn't installed; otherwise whether its settings carry AgentGit's
+    /// capture hooks, `None` inside when they can't be read.
+    claude_code: Option<Option<bool>>,
+    /// `None` when Codex isn't installed; otherwise whether its hooks feature is on, `None` inside
+    /// when Codex couldn't be asked in time.
+    codex: Option<Option<bool>>,
+}
+
+/// Whether each runtime installed here saves this folder's conversations by itself. Codex does
+/// once its hooks feature is on and the person trusted AgentGit's hooks, which shows as a hook
+/// seen for the folder's newest Codex conversation. A Codex that can't be asked in time reads
+/// as unknown, never as a failed listing. A `fix` tells a person the step; an agent is told whose
+/// step it is, since installing hooks or trusting them in Codex is the person's to decide.
+fn capture_json(folder: &Listed, runtimes: &Runtimes, reader: Reader) -> Vec<serde_json::Value> {
+    let mut rows = Vec::new();
+    if let Some(hooks) = runtimes.claude_code {
+        let fix = (hooks == Some(false)).then_some(match reader {
+            Reader::Person => {
+                "Install AgentGit's Claude Code hooks: `agit setup --runtime claude-code --hooks`"
+            }
+            Reader::Agent => {
+                "When the user asks, install AgentGit's Claude Code hooks: `agit setup --runtime claude-code --hooks`"
+            }
+        });
+        rows.push(serde_json::json!({"runtime": "claude-code", "ready": hooks, "fix": fix}));
+    }
+    if let Some(hooks) = runtimes.codex {
+        let newest = folder
+            .sessions
+            .iter()
+            .find(|session| session.runtime == "codex");
+        let (ready, fix) = match hooks {
+            None => (None, None),
+            Some(false) => (
+                Some(false),
+                Some(match reader {
+                    Reader::Person => {
+                        "Turn on Codex's hooks feature, then open /hooks in Codex and trust AgentGit's hooks"
+                    }
+                    Reader::Agent => {
+                        "The user turns on Codex's hooks feature, then opens /hooks in Codex and trusts AgentGit's hooks"
+                    }
+                }),
+            ),
+            Some(true)
+                if newest
+                    .is_some_and(|session| !codex_capture_allowed(&folder.root, &session.id)) =>
+            {
+                (
+                    Some(false),
+                    Some(match reader {
+                        Reader::Person => "Open /hooks in Codex and trust AgentGit's hooks",
+                        Reader::Agent => {
+                            "The user opens /hooks in Codex and trusts AgentGit's hooks"
+                        }
+                    }),
+                )
+            }
+            Some(true) => (Some(true), None),
+        };
+        rows.push(serde_json::json!({"runtime": "codex", "ready": ready, "fix": fix}));
+    }
+    rows
+}
+
+/// How long a listing waits, over all its folders, for Codex to say whether its hooks feature is
+/// on.
+const CODEX_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn folder_json(
     folder: &Listed,
     store: Option<&Store>,
     checkouts: &mut Checkouts,
+    asking: &Asking,
 ) -> serde_json::Value {
     let slug = super::parse_slug(&folder.repository).ok();
-    let auto_push = slug
+    let checkout = slug
         .as_ref()
-        .and_then(|(owner, name)| Repo::open(config::repo_dir(owner, name).ok()?))
+        .and_then(|(owner, name)| Repo::open(config::repo_dir(owner, name).ok()?));
+    let auto_push = checkout
+        .as_ref()
         .and_then(|repo| repo.auto_push_enabled().ok());
     // A policy that uploads automatically publishes nothing while its repository's own automatic
     // publication preference on this machine is off. The folder is then blocked, not uploading:
@@ -5224,18 +5757,44 @@ fn folder_json(
             )
         })
         .count();
+    let held = folder.project.as_ref().and_then(|project| {
+        held(
+            project,
+            state,
+            checkout.as_ref(),
+            last.as_ref(),
+            &config::hub_url(),
+            asking.reader,
+        )
+    });
+    // The audience last seen for this folder: the Hub's answer, or a refusal because the
+    // repository is public.
+    let visibility = recorded_audience(&folder.root).visibility;
     serde_json::json!({
         "folder": folder.root,
         "state": state,
+        "held": held.as_ref().map(Held::json),
         "repository": folder.repository,
         "repository_url": repository_url,
+        "visibility": visibility,
+        "writable": checkout.as_ref().and_then(writable),
         "auto_push": auto_push,
         "queued": queued,
-        "last_upload": last.as_ref().map(|last| serde_json::json!({
-            "at": last.at, "ok": last.ok, "error": last.error, "session_id": last.session_id,
-        })),
+        "last_upload": last.as_ref().map(|last| {
+            let mut json = serde_json::json!({
+                "at": last.at, "ok": last.ok, "error": last.error, "reason": last.reason,
+                "session_id": last.session_id,
+            });
+            if let Some(counts) = &last.counts {
+                for field in ["uploaded", "failed", "skipped", "pending"] {
+                    json[field] = counts[field].clone();
+                }
+            }
+            json
+        }),
         "sessions_here": folder.sessions.len(),
         "awaiting_upload": awaiting_upload,
+        "capture": capture_json(folder, &asking.in_folder(&folder.root), asking.reader),
         "recent": recent,
     })
 }
@@ -5243,20 +5802,26 @@ fn folder_json(
 /// Reads local state only and changes none of it. It takes no lock a capture worker waits on; the
 /// upload records are read as `agit status` reads them, which looks at a running upload's lock for
 /// an instant, so an upload starting meanwhile waits that instant and is never turned away.
-fn listing() -> Result<serde_json::Value> {
-    let (mut folders, policies_complete) = listed()?;
-    let sessions_complete = assign_sessions(&mut folders)?;
+fn listing(ask_codex: bool) -> Result<serde_json::Value> {
+    let (mut folders, mut unreadable) = listed()?;
+    unreadable.extend(assign_sessions(&mut folders)?);
     let store = Store::open().ok().flatten();
     let mut checkouts = Checkouts::new();
+    let asking = Asking::here(ask_codex);
     let folders: Vec<_> = folders
         .iter()
-        .map(|folder| folder_json(folder, store.as_ref(), &mut checkouts))
+        .map(|folder| folder_json(folder, store.as_ref(), &mut checkouts, &asking))
         .collect();
+    asking.remember();
     Ok(serde_json::json!({
         "schema_version": 1,
         "hub": config::hub_url(),
         "folders": folders,
-        "incomplete": !(policies_complete && sessions_complete),
+        "incomplete": !unreadable.is_empty(),
+        "unreadable": unreadable
+            .iter()
+            .map(|record| serde_json::json!({"what": record.what, "path": record.path}))
+            .collect::<Vec<_>>(),
         // Public automatic uploads switched on with no person answering, for the menu bar to
         // tell the person once each.
         "public_switched_on_unattended": super::push::unattended(),
@@ -5267,7 +5832,7 @@ fn listing() -> Result<serde_json::Value> {
 }
 
 fn list() -> CmdResult {
-    let value = listing()?;
+    let value = listing(super::json::requested())?;
     if super::json::requested() {
         println!("{value}");
         return Ok(ExitCode::Ok);
@@ -5301,12 +5866,46 @@ fn list() -> CmdResult {
                 if waiting == 1 { "" } else { "s" },
                 if waiting == 1 { "is" } else { "are" },
             );
+        } else if let Some(text) = folder["held"]["text"].as_str() {
+            println!("  {} {text}", ui::warn_text("not uploading:"));
         } else if folder["last_upload"]["ok"] == false {
             println!(
                 "  {} {}",
                 ui::warn_text("the last upload failed:"),
                 folder["last_upload"]["error"].as_str().unwrap_or_default()
             );
+        }
+        for capture in folder["capture"].as_array().map_or(&[][..], Vec::as_slice) {
+            if let Some(fix) = capture["fix"].as_str() {
+                println!(
+                    "  {} {fix}",
+                    ui::warn_text(&format!(
+                        "{} isn't saved yet:",
+                        if capture["runtime"] == "codex" {
+                            "Codex"
+                        } else {
+                            "Claude Code"
+                        }
+                    ))
+                );
+            }
+        }
+    }
+    for record in value["unreadable"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+    {
+        let what = record["what"].as_str().unwrap_or("a record");
+        match record["path"].as_str() {
+            Some(path) => println!(
+                "{} {what} {}; this list may be missing a folder",
+                ui::warn_text("unreadable:"),
+                ui::tilde(Path::new(path))
+            ),
+            None => println!(
+                "{} {what}; this list may be missing conversations",
+                ui::warn_text("unreadable:")
+            ),
         }
     }
     Ok(ExitCode::Ok)
@@ -6594,6 +7193,16 @@ mod tests {
         save(&on).unwrap();
         let mut off = project(&paused);
         off.enabled = false;
+        // A sync whose sessions uploaded, waited for their first turn or were left out failed
+        // nothing.
+        off.last_result = Some(serde_json::json!({
+            "at": "2026-01-01T00:00:00Z",
+            "sessions": [
+                {"session_id": "p", "outcome": {"status": "pushed", "branch": "b", "head": "h"}},
+                {"session_id": "w", "outcome": {"status": "pending"}},
+                {"session_id": "d", "outcome": {"status": "skipped", "reason": "dropped"}},
+            ],
+        }));
         save(&off).unwrap();
         let muted = work.path().join("muted");
         fs::create_dir_all(&muted).unwrap();
@@ -6686,7 +7295,7 @@ mod tests {
 
         save(&quiet).unwrap();
 
-        let value = listing().unwrap();
+        let value = listing(true).unwrap();
         assert_eq!(value["incomplete"], false, "{value:#}");
         let folders = value["folders"].as_array().unwrap();
         let folder = |dir: &Path| {
@@ -6699,6 +7308,19 @@ mod tests {
         assert_eq!(folders.len(), 5, "{value:#}");
         assert_eq!(folder(&outer)["state"], "on");
         assert_eq!(folder(&paused)["state"], "off");
+        let synced = &folder(&paused)["last_upload"];
+        assert_eq!(synced["ok"], true, "{value:#}");
+        assert_eq!(
+            [
+                &synced["uploaded"],
+                &synced["pending"],
+                &synced["skipped"],
+                &synced["failed"]
+            ],
+            [1, 1, 1, 0]
+        );
+        assert_eq!(folder(&muted)["held"]["code"], "push_auto_off");
+        assert!(folder(&outer)["visibility"].is_null(), "{value:#}");
         assert_eq!(folder(&nested)["state"], "local_only");
         assert_eq!(folder(&muted)["state"], "blocked");
         assert_eq!(folder(&muted)["auto_push"], false);
@@ -6719,7 +7341,18 @@ mod tests {
 
         quiet.last_result = Some(uploaded(&second));
         save(&quiet).unwrap();
-        let value = listing().unwrap();
+        // A refusal because the repository is public stays the folder's known audience, whatever
+        // holds the folder afterwards.
+        observed_public(&outer.canonicalize().unwrap());
+        // A policy that can't be read is named, so the person knows which file to look at.
+        let broken = state_path(&work.path().join("broken")).unwrap();
+        fs::write(&broken, b"not a policy").unwrap();
+        let value = listing(true).unwrap();
+        assert_eq!(value["incomplete"], true);
+        assert_eq!(
+            value["unreadable"],
+            serde_json::json!([{"what": "folder upload policy", "path": broken}])
+        );
         let muted = value["folders"]
             .as_array()
             .unwrap()
@@ -6727,7 +7360,476 @@ mod tests {
             .find(|folder| folder["folder"] == serde_json::json!(muted.canonicalize().unwrap()))
             .unwrap();
         assert_eq!(muted["recent"][0]["status"], "uploaded", "{value:#}");
+        let outer_now = value["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|folder| folder["folder"] == serde_json::json!(outer.canonicalize().unwrap()))
+            .unwrap();
+        assert_eq!(outer_now["visibility"], "public", "{value:#}");
         assert_eq!(muted["awaiting_upload"], 0);
+    }
+
+    /// A folder that is on says what keeps it from uploading, judged from local state, and only
+    /// while it still holds: the repository's switch, the account and Hub it was set up under,
+    /// the sign-in, what the Hub last said about writing, and a public repository nobody switched
+    /// on. A listing that took any failed upload as current would keep asking someone to sign in
+    /// who already did; one that read the switch-on from the policy alone would keep a public
+    /// folder held after the person switched it on.
+    #[test]
+    fn a_folder_that_is_on_says_what_holds_it_until_it_is_answered() {
+        if !isolated("a_folder_that_is_on_says_what_holds_it_until_it_is_answered") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let project = project(work.path());
+        let hub = project.identity.hub.clone();
+        let code = |held: Option<Held>| held.map(|held| held.code);
+        let failed = |reason: &str, at: &str| LastUpload {
+            at: chrono::DateTime::parse_from_rfc3339(at).ok(),
+            ok: false,
+            error: Some("upload failed".into()),
+            reason: Some(reason.into()),
+            session_id: None,
+            uploaded: BTreeMap::new(),
+            counts: None,
+        };
+        let sign_in = |username: &str| {
+            credentials::save(
+                &hub,
+                &credentials::HubCredential {
+                    account_id: None,
+                    username: username.into(),
+                    email: None,
+                    hub: Some(hub.clone()),
+                    access_token: "test-token".into(),
+                    access_expires_at: "2099-01-01T00:00:00Z".into(),
+                    refresh_token: "test-refresh".into(),
+                    refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+                },
+            )
+            .unwrap();
+        };
+        assert_eq!(
+            code(held(&project, "blocked", None, None, &hub, Reader::Person)),
+            Some("push_auto_off")
+        );
+        assert_eq!(
+            code(held(&project, "off", None, None, &hub, Reader::Person)),
+            None
+        );
+        let elsewhere = held(
+            &project,
+            "on",
+            None,
+            None,
+            "https://other.test",
+            Reader::Person,
+        )
+        .unwrap();
+        assert_eq!(elsewhere.code, "other_account");
+        assert_eq!(elsewhere.json()["account"], "alice", "{}", elsewhere.json());
+        assert_eq!(elsewhere.json()["hub"], serde_json::json!(hub));
+        assert_eq!(
+            code(held(&project, "on", None, None, &hub, Reader::Person)),
+            Some("signed_out")
+        );
+        sign_in("bob");
+        assert_eq!(
+            code(held(&project, "on", None, None, &hub, Reader::Person)),
+            Some("other_account")
+        );
+        sign_in("alice");
+        assert_eq!(
+            code(held(&project, "on", None, None, &hub, Reader::Person)),
+            None
+        );
+        // A refusal for sign-in holds until a sign-in is written after it.
+        let refused = failed("signed_out", "2999-01-01T00:00:00Z");
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                None,
+                Some(&refused),
+                &hub,
+                Reader::Person
+            )),
+            Some("signed_out")
+        );
+        let answered = failed("signed_out", "2000-01-01T00:00:00Z");
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                None,
+                Some(&answered),
+                &hub,
+                Reader::Person
+            )),
+            None
+        );
+
+        let checkout = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        identity::pin(&checkout, &project.identity).unwrap();
+        let agent = project.identity.agent_id.clone();
+        // Another account's answer says nothing about this one.
+        checkout
+            .record_write_access(&hub, "bob", &agent, false)
+            .unwrap();
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                Some(&checkout),
+                None,
+                &hub,
+                Reader::Person
+            )),
+            None
+        );
+        checkout
+            .record_write_access(&hub, "alice", &agent, false)
+            .unwrap();
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                Some(&checkout),
+                None,
+                &hub,
+                Reader::Person
+            )),
+            Some("no_write_access")
+        );
+        checkout
+            .record_write_access(&hub, "alice", &agent, true)
+            .unwrap();
+        let public = failed("public_needs_consent", "2026-01-01T00:00:00Z");
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                Some(&checkout),
+                Some(&public),
+                &hub,
+                Reader::Person
+            )),
+            Some("public_needs_consent")
+        );
+        let told = held(
+            &project,
+            "on",
+            Some(&checkout),
+            Some(&public),
+            &hub,
+            Reader::Agent,
+        )
+        .unwrap();
+        assert!(
+            told.text.contains("the user switches it on"),
+            "{}",
+            told.text
+        );
+        super::super::push::AutoConsent {
+            version: 3,
+            hub: hub.clone(),
+            account: "alice".into(),
+            account_id: "account-1".into(),
+            agent_id: project.identity.agent_id.clone(),
+            url: format!("{hub}/alice/app.git"),
+            visibility: "public".into(),
+        }
+        .save(&checkout)
+        .unwrap();
+        assert_eq!(
+            code(held(
+                &project,
+                "on",
+                Some(&checkout),
+                Some(&public),
+                &hub,
+                Reader::Person
+            )),
+            None
+        );
+    }
+
+    /// A sync gives every candidate session a row, and one it leaves out says why, without a
+    /// failure: a reader that saw only the uploaded rows would read "nothing to upload" as "all
+    /// uploaded", and one that counted a left-out session as failed would show a failure nobody
+    /// can fix by retrying.
+    #[test]
+    fn a_sync_names_why_it_leaves_a_session_out() {
+        if !isolated("a_sync_names_why_it_leaves_a_session_out") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let mut policy = project(work.path());
+        let cwd = policy.root.clone();
+        let native = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+            .join("projects")
+            .join(adapter::claude_code::slug_for(&cwd));
+        fs::create_dir_all(&native).unwrap();
+        for id in [
+            "aaaaaaaa-0000-4000-8000-000000000051",
+            "bbbbbbbb-0000-4000-8000-000000000052",
+        ] {
+            let record = serde_json::json!({"type": "user", "isSidechain": false,
+                "sessionId": id, "cwd": cwd, "message": {"role": "user", "content": "hi"}});
+            fs::write(native.join(format!("{id}.jsonl")), format!("{record}\n")).unwrap();
+        }
+        policy
+            .excluded
+            .insert(key("claude-code", "aaaaaaaa-0000-4000-8000-000000000051"));
+        policy
+            .earlier
+            .insert(key("claude-code", "bbbbbbbb-0000-4000-8000-000000000052"));
+        save(&policy).unwrap();
+        assert_eq!(sync(&mut policy).unwrap(), ExitCode::Ok);
+        let result = read(&policy.root).unwrap().unwrap().last_result.unwrap();
+        let reasons: BTreeMap<String, serde_json::Value> = result["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                assert_eq!(row["outcome"]["status"], "skipped", "{result:#}");
+                (
+                    row["session_id"].as_str().unwrap().to_owned(),
+                    row["outcome"]["reason"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            BTreeMap::from([
+                (
+                    "aaaaaaaa-0000-4000-8000-000000000051".to_owned(),
+                    "dropped".into()
+                ),
+                (
+                    "bbbbbbbb-0000-4000-8000-000000000052".to_owned(),
+                    "before_on".into()
+                ),
+            ])
+        );
+        assert_eq!(
+            [&result["uploaded"], &result["failed"], &result["skipped"]],
+            [0, 0, 2]
+        );
+    }
+
+    /// A Codex conversation is saved by itself only once Codex's hooks are on and the person
+    /// trusted AgentGit's, which the folder's newest Codex conversation shows. A Codex that can't
+    /// be asked is unknown rather than ready or broken, so a listing never claims either.
+    #[test]
+    fn capture_says_what_each_runtime_still_needs_here() {
+        if !isolated("capture_says_what_each_runtime_still_needs_here") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let session = |id: &str| adapter::SessionRef {
+            id: id.into(),
+            path: work.path().join(id),
+            runtime: "codex",
+            cwd: None,
+            mtime: std::time::SystemTime::now(),
+            gist: None,
+            title: None,
+        };
+        let folder = Listed {
+            root: work.path().to_path_buf(),
+            repository: "alice/app".into(),
+            hub: "https://example.test".into(),
+            project: None,
+            sessions: vec![session("codex-newest"), session("codex-older")],
+        };
+        let codex = |hooks: Option<bool>| {
+            let rows = capture_json(
+                &folder,
+                &Runtimes {
+                    claude_code: Some(Some(true)),
+                    codex: Some(hooks),
+                },
+                Reader::Person,
+            );
+            assert_eq!(rows[0]["runtime"], "claude-code");
+            (rows[1]["ready"].clone(), rows[1]["fix"].clone())
+        };
+        codex_hooks_seen("codex-older");
+        let (ready, fix) = codex(Some(true));
+        assert_eq!(ready, false);
+        assert!(fix.as_str().unwrap().contains("/hooks"), "{fix}");
+        codex_hooks_seen("codex-newest");
+        assert_eq!(codex(Some(true)), (true.into(), serde_json::Value::Null));
+        let (ready, fix) = codex(Some(false));
+        assert_eq!(ready, false);
+        assert!(fix.as_str().unwrap().contains("hooks feature"), "{fix}");
+        assert_eq!(
+            codex(None),
+            (serde_json::Value::Null, serde_json::Value::Null)
+        );
+        let none = capture_json(
+            &folder,
+            &Runtimes {
+                claude_code: None,
+                codex: None,
+            },
+            Reader::Person,
+        );
+        assert!(none.is_empty());
+        // Claude Code is ready only when its settings carry AgentGit's capture hooks.
+        let claude = |hooks: Option<bool>| {
+            capture_json(
+                &folder,
+                &Runtimes {
+                    claude_code: Some(hooks),
+                    codex: None,
+                },
+                Reader::Person,
+            )[0]
+            .clone()
+        };
+        let unhooked = claude(Some(false));
+        assert_eq!(unhooked["ready"], false);
+        assert!(
+            unhooked["fix"]
+                .as_str()
+                .unwrap()
+                .contains("agit setup --runtime claude-code --hooks"),
+            "{unhooked}"
+        );
+        assert_eq!(claude(Some(true))["fix"], serde_json::Value::Null);
+        let unread = claude(None);
+        assert!(
+            unread["ready"].is_null() && unread["fix"].is_null(),
+            "{unread}"
+        );
+        // An agent reads whose step it is, not a step to take.
+        let agent = capture_json(
+            &folder,
+            &Runtimes {
+                claude_code: Some(Some(false)),
+                codex: Some(Some(false)),
+            },
+            Reader::Agent,
+        );
+        assert!(
+            agent[0]["fix"]
+                .as_str()
+                .unwrap()
+                .starts_with("When the user asks"),
+            "{agent:?}"
+        );
+        assert!(
+            agent[1]["fix"]
+                .as_str()
+                .unwrap()
+                .starts_with("The user turns on"),
+            "{agent:?}"
+        );
+    }
+
+    /// Codex is asked about its hooks feature from each folder, because a trusted project's own
+    /// configuration can change the answer there, and only when no kept answer matches what the
+    /// answer rests on and is young enough, because the menu bar repeats its listing all day. A
+    /// listing that asked from one place would give that place's answer for every folder; one
+    /// that skipped the kept answer would start a Codex per folder on every repeat; one that kept
+    /// an answer past a change to any configuration layer, the system's included, or past its age
+    /// would go on reporting a feature since turned off. A person's plain listing, and a folder the
+    /// shared limit doesn't reach, start nothing and read as unknown.
+    #[cfg(unix)]
+    #[test]
+    fn codex_is_asked_about_its_hooks_from_each_folder_only_when_something_changed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !isolated("codex_is_asked_about_its_hooks_from_each_folder_only_when_something_changed")
+        {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let started = work.path().join("started");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\necho started >> '{}'\nif [ -f hooks-on ]; then echo 'hooks stable true'; else echo 'hooks stable false'; fi\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        // SAFETY: `isolated` runs this test alone in a process of its own.
+        unsafe { std::env::set_var("PATH", path) };
+        let (on, off) = (work.path().join("on"), work.path().join("off"));
+        fs::create_dir(&on).unwrap();
+        fs::create_dir(&off).unwrap();
+        fs::write(on.join("hooks-on"), "").unwrap();
+        let runs = || {
+            fs::read_to_string(&started)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let later = || std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // One listing, as `list` runs it: the folders' answers, then kept for the next.
+        let system = work.path().join("system-config.toml");
+        let listed = |ask: bool, until: std::time::Instant| {
+            let asking = Asking::of(None, true, ask, until, Reader::Person)
+                .with_codex_system(Some(system.clone()));
+            let answers = (asking.in_folder(&on).codex, asking.in_folder(&off).codex);
+            asking.remember();
+            answers
+        };
+
+        assert_eq!(listed(true, later()), (Some(Some(true)), Some(Some(false))));
+        assert_eq!(runs(), 2);
+        assert_eq!(listed(true, later()), (Some(Some(true)), Some(Some(false))));
+        assert_eq!(runs(), 2, "a repeat with nothing changed started Codex");
+        assert_eq!(
+            listed(false, later()),
+            (Some(Some(true)), Some(Some(false)))
+        );
+        assert_eq!(runs(), 2, "a plain listing started Codex");
+
+        let config = adapter::codex::codex_home().unwrap().join("config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "changed = true\n").unwrap();
+        assert_eq!(listed(false, later()), (Some(None), Some(None)));
+        assert_eq!(runs(), 2, "a plain listing started Codex");
+        assert_eq!(
+            listed(true, std::time::Instant::now()),
+            (Some(None), Some(None))
+        );
+        assert_eq!(runs(), 2, "the spent limit started Codex");
+        assert_eq!(listed(true, later()), (Some(Some(true)), Some(Some(false))));
+        assert_eq!(runs(), 4, "a changed configuration wasn't asked about");
+
+        // The system configuration alone changing asks again too.
+        fs::write(&system, "changed = true\n").unwrap();
+        assert_eq!(listed(false, later()), (Some(None), Some(None)));
+        assert_eq!(listed(true, later()), (Some(Some(true)), Some(Some(false))));
+        assert_eq!(
+            runs(),
+            6,
+            "a changed system configuration wasn't asked about"
+        );
+
+        // An answer past its age is asked again, whatever its key says.
+        let path = codex_answers_path().unwrap();
+        let mut kept: BTreeMap<PathBuf, CodexAnswer> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for answer in kept.values_mut() {
+            answer.asked_at -= CODEX_ANSWER_MAX_AGE.as_secs();
+        }
+        fs::write(&path, serde_json::to_vec(&kept).unwrap()).unwrap();
+        assert_eq!(listed(true, later()), (Some(Some(true)), Some(Some(false))));
+        assert_eq!(runs(), 8, "an answer past its age was reused");
     }
 
     /// A paused, upload-off or excluding project swallows only passive capture: the Stop hook

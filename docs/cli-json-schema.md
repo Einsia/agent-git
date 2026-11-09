@@ -232,7 +232,9 @@ automatic upload. `result.kind` is `project` and `result.value` holds:
 
 - `schema_version` (`1`), `hub` (the selected Hub), and `incomplete`: true when a project policy,
   a directory binding or a runtime's session index could not be read, so a short list is told
-  apart from a partial one.
+  apart from a partial one. `unreadable` lists each of those as `what` (`folder upload policy`,
+  `folder binding`, `Claude Code conversations` or `Codex conversations`) and `path` (the file,
+  or null for a runtime's conversations).
 - `folders`: one item per existing folder that has a project policy (`agit project bind`) or a
   directory binding (`agit init`, `agit clone`); a folder with both is listed once, by its policy.
 
@@ -244,25 +246,59 @@ Each folder has:
   not uploaded until `agit config --repo OWNER/NAME push.auto true`), `off` (a policy that is
   paused or uploads only on `agit project sync`) or `local_only` (saved on this machine only, by
   a binding without a policy).
+- `held`: null, or why a folder that should upload isn't, as `code` and `text` (the reason in plain
+  words). Codes are an open set: a reader shows `text` for a code it doesn't know and counts the
+  folder as needing attention. Today's codes are `push_auto_off` (the `blocked` state),
+  `public_needs_consent` (the repository is public and automatic upload into it was never
+  switched on), `signed_out` (agit isn't signed in as the folder's account, or an upload failed
+  for sign-in and no sign-in was written since), `other_account` (agit is signed in as another
+  account or to another Hub; it also carries the `hub` and `account` the folder uploads as) and
+  `no_write_access` (the Hub last said the account can't push to the repository). A held reason
+  is judged from local state, so it clears once its cause is answered here.
 - `repository` (`owner/name`) and `repository_url`, its page on the folder's Hub.
+- `visibility`: `public` or `private` as last seen for this folder (the Hub's answer, or an upload
+  refused because the repository is public), or null when agit never learned it. The listing
+  doesn't ask the Hub, so it can be out of date.
+- `writable`: whether the Hub last said the signed-in account may push to the repository the
+  checkout is pinned to (recorded by `agit clone` and `agit project bind`), or null when it said
+  nothing about that account and repository.
 - `auto_push`: the repository's automatic publication preference on this machine
   (`agit config --repo OWNER/NAME push.auto`), or null when it has no local checkout. While it is
   false, the uploads a policy attempts are refused by that choice, not failing.
 - `queued`: conversations waiting for the folder's background upload.
 - `last_upload`: null, or the last automatic or `project sync` attempt as `at`, `ok`, `error` (the
-  failure's own words, without the diagnostic envelope) and `session_id` (the conversation it
-  failed on, or the one it uploaded). A refusal recorded while `push.auto` was off is left out once
+  failure's own words, without the diagnostic envelope), `reason` (the failure's code:
+  `signed_out`, `hub`, `privacy_incomplete`, `too_large`, `builds_on_withdrawn`,
+  `public_needs_consent`, `refused` or `other`; null when it succeeded or predates codes) and
+  `session_id` (the conversation it failed on, or the one it uploaded). A `project sync` result
+  also has `uploaded`, `failed`, `skipped` and `pending` counts; a session left out or still in
+  its first turn is not a failure. A refusal recorded while `push.auto` was off is left out once
   the folder is `on` again, since it no longer describes the folder.
 - `sessions_here`: Claude Code and Codex conversations whose directory is this folder or below
   it. A conversation belongs to the deepest listed folder holding its directory, the way a nested
   binding owns its directory.
 - `awaiting_upload`: how many of those are saved and not on the Hub at their saved head (status
   `not_uploaded` or `waiting`), counted over all of them, not only `recent`.
+- `capture`: one item per runtime installed here, as `runtime`, `ready` and `fix`. `ready` is
+  whether that runtime's new conversations here are saved by themselves: for Claude Code, its
+  settings carry AgentGit's capture hooks; for Codex, its hooks feature is on and AgentGit's hooks
+  are trusted, which shows as a hook seen for the folder's newest Codex conversation. `fix` is what to do when it isn't, else null. Both are null when the
+  runtime couldn't be asked in time. Codex is asked from the folder, and its answer is kept for at
+  most an hour, and only until Codex, its system or personal configuration, or a project
+  configuration above the folder changes. `agit project list` without `--json` uses a kept answer
+  and doesn't start Codex.
 - `recent`: the newest of those conversations, newest first. Each has `title` (the runtime's own
   name for it, else its opening request; null when neither is known), `runtime`, `session_id`,
   `last_active` (when its transcript last changed), `status`, `repository` (where it is saved,
   or null), `saved_at` (its saved branch head's commit time, or null) and `url` (its Hub page,
   only when this checkout has seen it published).
+
+`agit project sync` prints `{project, repository, result}`. `result` has `at`, the counts above,
+and `sessions`: one row per candidate session, as `runtime`, `session_id` and `outcome`.
+`outcome.status` is `pushed` (with `branch` and `head`), `failed` (with `error` and `reason`),
+`pending` (claimed, but no turn of it has finished yet) or `skipped` (with `reason`: `dropped`,
+`before_on`, `codex_hooks_not_seen` or `delegated`). Only a failed row fails the command, and the
+first failure and the count are also said in plain words.
 
 `status` is `not_saved` (no repository holds the conversation), `not_uploaded` (saved here, and
 this checkout knows of no upload), `waiting` (the Hub has an older head than the saved one) or

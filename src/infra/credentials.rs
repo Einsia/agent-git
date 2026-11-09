@@ -119,6 +119,26 @@ pub fn load(hub: &str) -> Option<HubCredential> {
     load_checked(hub).ok().flatten()
 }
 
+/// The account `hub`'s sign-in is for, by the identity that never changes: its account id when the
+/// Hub gave one, else its user name. `None` when not signed in there.
+pub fn account_key(hub: &str) -> Option<String> {
+    load_checked(hub)
+        .ok()
+        .flatten()
+        .map(|credential| credential.account_id.unwrap_or(credential.username))
+}
+
+/// When the sign-in for `hub` was last written: by `agit login`, or by a renewal. `None` when
+/// there is no canonical record for it.
+pub fn saved_at(hub: &str) -> Option<std::time::SystemTime> {
+    let authority = HubAuthority::parse(hub).ok()?;
+    let dir = crate::infra::config::credentials_dir().ok()?;
+    std::fs::symlink_metadata(dir.join(format!("{}.json", authority.storage_key())))
+        .ok()?
+        .modified()
+        .ok()
+}
+
 /// A present canonical slot is authoritative even when it cannot supply credentials.
 pub fn load_checked(hub: &str) -> Result<Option<HubCredential>> {
     let authority = HubAuthority::parse(hub)?;

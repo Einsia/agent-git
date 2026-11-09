@@ -20,6 +20,7 @@ impl Recorded {
 }
 
 const AUTO_PUSH_KEY: &str = "agit.autoPush";
+const WRITE_ACCESS_KEY: &str = "agit.writeAccess";
 /// Set on a device-local repository when the person turned its folder off with `agit off`.
 const UPLOADS_OFF_KEY: &str = "agit.uploadsOff";
 
@@ -64,6 +65,52 @@ impl Repo {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// What the Hub last said about `account` pushing to the repository `agent_id` on `hub`, or
+    /// `None` when it wasn't asked for exactly that account and repository here. A listing reads
+    /// it without asking the Hub, so it can be out of date; the push itself is the authority. An
+    /// answer for another account or repository is no answer: read as this one's, a read-only
+    /// account's clone would report the owner's folder as unwritable.
+    pub fn write_access(&self, hub: &str, account: &str, agent_id: &str) -> Option<bool> {
+        let (status, output, _) = self
+            .git_status(&[
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                WRITE_ACCESS_KEY,
+            ])
+            .ok()?;
+        if status != Some(0) {
+            return None;
+        }
+        let record: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+        (record["hub"] == hub && record["account"] == account && record["agent_id"] == agent_id)
+            .then(|| record["writable"].as_bool())
+            .flatten()
+    }
+
+    /// Records what the Hub answered about `account` pushing to `agent_id` on `hub` (see
+    /// [`Self::write_access`]).
+    pub fn record_write_access(
+        &self,
+        hub: &str,
+        account: &str,
+        agent_id: &str,
+        writable: bool,
+    ) -> Result<()> {
+        let record = serde_json::json!({
+            "hub": hub, "account": account, "agent_id": agent_id, "writable": writable,
+        });
+        self.git(&[
+            "config",
+            "--local",
+            "--replace-all",
+            WRITE_ACCESS_KEY,
+            &record.to_string(),
+        ])?;
         Ok(())
     }
 
