@@ -1383,6 +1383,7 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
     let mut saw_message = false;
     let mut agent_path = None;
     let mut saw_header = false;
+    let mut turn = NativeTurn::default();
 
     // The line number goes into every event ([`Event::line`]); the web transcript uses it to
     // go back to the source for tool arguments and reasoning. Blank and malformed lines take
@@ -1460,6 +1461,9 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
                 match p.get("type").and_then(|x| x.as_str()).unwrap_or("") {
                     "message" | "agent_message" => {
                         saw_message = true;
+                        if p["role"] == "user" {
+                            turn.has_user_item = true;
+                        }
                         if let Some((kind, text)) =
                             classify_response_message_for(p, agent_path.as_deref())
                         {
@@ -1515,11 +1519,24 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
             }
             "event_msg" => {
                 let Some(p) = payload else { continue };
+                match p.get("type").and_then(|x| x.as_str()) {
+                    Some("task_started") => {
+                        turn.close(&mut events, &mut saw_message, true);
+                        turn.note_start(p);
+                        continue;
+                    }
+                    Some("user_message") => {
+                        turn.note_request(p, lineno, ts, events.len());
+                        continue;
+                    }
+                    _ => {}
+                }
                 // Completion and cancellation both close the native turn without adding content.
                 if matches!(
                     p.get("type").and_then(|x| x.as_str()),
                     Some("task_complete" | "turn_aborted")
                 ) {
+                    turn.note_start(p);
                     events.push(Event {
                         kind: EventKind::TurnEnd,
                         text: None,
@@ -1528,6 +1545,7 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
                         tool: None,
                         line: Some(lineno),
                     });
+                    turn.close(&mut events, &mut saw_message, true);
                     continue;
                 }
                 if p.get("type").and_then(|x| x.as_str()) == Some("patch_apply_end") {
@@ -1553,12 +1571,88 @@ pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
             _ => events.push(other_event(ts).at_line(lineno)),
         }
     }
+    turn.close(&mut events, &mut saw_message, false);
 
     Session {
         id,
         runtime: "codex".into(),
         cwd,
         events,
+    }
+}
+
+/// What one native turn says about itself, gathered until the turn closes.
+///
+/// A request normally arrives as a `response_item` user message. Some Codex writers, the
+/// external-session import among them, keep a turn's requests only as `event_msg`
+/// `user_message` records; a turn with no user `response_item` takes its requests from those,
+/// at their own lines, and a turn that has one ignores them, so a native turn carrying both
+/// never yields a request twice. That is decided only for a turn that has closed
+/// (`task_complete`, `turn_aborted`, or the next `task_started`): until then a user
+/// `response_item` may still arrive, and records read without their turn (remote control
+/// projects one record at a time and owns `user_message` itself) must keep ignoring them.
+///
+/// A turn Codex imported from another agent (`turn_id` `external-import-turn-N`) stamps every
+/// line with the instant of the import; its `started_at` keeps when the turn really began, so
+/// the turn's events are dated by that instead.
+#[derive(Default)]
+struct NativeTurn {
+    /// Index into the events where this turn's events begin.
+    first_event: usize,
+    has_user_item: bool,
+    /// Requests from `user_message` records, each with the event index it belongs before.
+    requests: Vec<(usize, Event)>,
+    imported_start: Option<String>,
+}
+
+const IMPORTED_TURN_PREFIX: &str = "external-import-turn-";
+
+impl NativeTurn {
+    fn note_start(&mut self, payload: &serde_json::Value) {
+        let imported = payload["turn_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with(IMPORTED_TURN_PREFIX));
+        if imported
+            && let Some(seconds) = payload["started_at"].as_i64()
+            && let Some(start) = chrono::DateTime::from_timestamp(seconds, 0)
+        {
+            self.imported_start = Some(start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        }
+    }
+
+    fn note_request(
+        &mut self,
+        payload: &serde_json::Value,
+        lineno: usize,
+        ts: Option<String>,
+        at: usize,
+    ) {
+        let Some(text) = payload["message"].as_str().filter(|t| !t.trim().is_empty()) else {
+            return;
+        };
+        let (kind, text) = classify_message("user", text.to_owned());
+        if kind == EventKind::UserPrompt {
+            self.requests
+                .push((at, Event::text(kind, text, ts).at_line(lineno)));
+        }
+    }
+
+    /// Settles the turn into `events` and starts the next one after them. `closed` says the
+    /// record that ended it was the turn's own end, not the end of the records read.
+    fn close(&mut self, events: &mut Vec<Event>, saw_message: &mut bool, closed: bool) {
+        let turn = std::mem::take(self);
+        if closed && !turn.has_user_item && !turn.requests.is_empty() {
+            *saw_message = true;
+            for (at, request) in turn.requests.into_iter().rev() {
+                events.insert(at, request);
+            }
+        }
+        if let Some(start) = turn.imported_start {
+            for event in &mut events[turn.first_event..] {
+                event.timestamp = Some(start.clone());
+            }
+        }
+        self.first_event = events.len();
     }
 }
 
@@ -2708,6 +2802,101 @@ mod tests {
         assert_eq!(c.prompts, 1);
         assert_eq!(c.edits, 1);
         assert_eq!(c.dropped, 1, "encrypted reasoning counts toward dropped");
+    }
+
+    /// Pins how a Codex thread imported from another agent reads: one request per turn, from
+    /// the `response_item` user line where the writer has one and from the `user_message` record
+    /// where it doesn't (the older import writer), and every event of an imported turn dated by
+    /// the turn's `started_at` rather than the import instant on each line. A native turn that
+    /// carries both records keeps one request and its own times. A parser reading requests only
+    /// from `response_item` drops every request of the older shape; one reading both records
+    /// counts native requests twice.
+    #[test]
+    fn imported_turns_keep_their_requests_and_original_times() {
+        let at = "2026-11-09T17:06:11.658Z";
+        let line = |record: serde_json::Value| {
+            let mut record = record;
+            record["timestamp"] = at.into();
+            record.to_string()
+        };
+        let started = |turn: u32, seconds: i64| {
+            line(
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_started",
+                "turn_id":format!("external-import-turn-{turn}"),"started_at":seconds}}),
+            )
+        };
+        let complete = |turn: u32, seconds: i64| {
+            line(
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete",
+                "turn_id":format!("external-import-turn-{turn}"),"started_at":seconds}}),
+            )
+        };
+        let event = |text: &str| {
+            line(
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}}),
+            )
+        };
+        let item = |role: &str, text: &str| {
+            line(
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":role,
+                "content":[{"type":if role == "user" {"input_text"} else {"output_text"},"text":text}]}}),
+            )
+        };
+        let header =
+            line(serde_json::json!({"type":"session_meta","payload":{"id":"s1","cwd":"/repo"}}));
+        let turn = |n: u32, seconds: i64, request: &str, with_item: bool| {
+            let mut lines = vec![started(n, seconds), event(request)];
+            if with_item {
+                lines.push(item("user", request));
+            }
+            lines.extend([item("assistant", "done"), complete(n, seconds)]);
+            lines
+        };
+        // The current import writer: `task_started`, then both request records.
+        let current: Vec<String> = std::iter::once(header.clone())
+            .chain(turn(1, 1_793_844_000, "why does deploy fail?", true))
+            .chain(turn(2, 1_793_847_600, "fix it", true))
+            .collect();
+        // The older one: no `task_started` and no `response_item` user line.
+        let older: Vec<String> = std::iter::once(header.clone())
+            .chain(
+                turn(1, 1_793_844_000, "why does deploy fail?", false)
+                    .into_iter()
+                    .skip(1),
+            )
+            .chain(turn(2, 1_793_847_600, "fix it", false).into_iter().skip(1))
+            .collect();
+        for lines in [current, older] {
+            let s = Codex.parse(&lines.join("\n")).unwrap();
+            let requests: Vec<_> = s
+                .events
+                .iter()
+                .filter(|e| e.kind == EventKind::UserPrompt)
+                .map(|e| (e.text.as_deref().unwrap(), e.timestamp.as_deref().unwrap()))
+                .collect();
+            assert_eq!(
+                requests,
+                [
+                    ("why does deploy fail?", "2026-11-05T02:00:00.000Z"),
+                    ("fix it", "2026-11-05T03:00:00.000Z"),
+                ]
+            );
+            assert!(s.events.iter().all(|e| e.timestamp.as_deref() != Some(at)));
+        }
+
+        let native = [
+            header,
+            item("user", "rename it"),
+            event("rename it"),
+            item("assistant", "renamed"),
+            line(
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete",
+                "turn_id":"0199a1b2-c3d4","started_at":1_793_844_000}}),
+            ),
+        ];
+        let s = Codex.parse(&native.join("\n")).unwrap();
+        assert_eq!(s.counts().prompts, 1);
+        assert!(s.events.iter().all(|e| e.timestamp.as_deref() == Some(at)));
     }
 
     #[test]
