@@ -8,6 +8,33 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.47] - 2026-11-09
+
+### Changed
+
+- `agit project list --json` says why a folder that should upload isn't, which runtimes still need setting up there, and
+  which records it couldn't read; `agit project sync` reports every session, and a session still in its first turn or
+  left out is no longer a failure.
+
+### Fixed
+
+- `agit on`, setup and doctor no longer wait without limit on a busy Codex, leave nothing running from it, and no longer
+  end silently when Codex exits without answering; doctor says when Codex didn't answer in time.
+- A value under a field whose name ends in `password`, `passwd`, `passphrase` or `pwd` is now replaced before anything is
+  shared even when it reads like ordinary words, and so is the credential in an HTTP Basic `Authorization` or
+  `Proxy-Authorization` header. Documentation placeholders such as `YOUR_PASSWORD`, and a password field set without
+  quotes to a Python class defined in the same file, stay as they are.
+- With `privacy.entropy = replace`, a full-length hash written after `sha1:`, `sha256:`, `sha384:` or `sha512:` is no
+  longer replaced for looking random. A Terraform `password = "…"` now has only the value inside the quotes replaced,
+  not the quotes. Values under credential fields, and your own blocks, are still replaced as before.
+- A conversation saved with `privacy.entropy = replace` could stop saving with "the native transcript does not continue
+  this branch's settled content". It happened when a name in one of its records, such as Claude Code's
+  `cacheCreationInputTokens`, had been replaced and this computer couldn't restore it. Such a conversation now
+  continues, and what was already saved stays as it is.
+- With `privacy.entropy = replace`, a JSON member name made only of letters, underscores or hyphens, such as
+  `cacheCreationInputTokens`, is no longer replaced as if it were a credential. What it holds is still checked, and your
+  own blocks still apply to the name.
+
 ## [0.2.46] - 2026-11-09
 
 ### Added
