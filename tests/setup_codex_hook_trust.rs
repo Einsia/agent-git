@@ -12,11 +12,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// A Codex with the hooks feature whose app server answers `hooks/list` with the result in
-/// `hooks-list.json` beside it, in the shape Codex's app-server protocol defines.
+/// A Codex whose app server answers `hooks/list` with the result in `hooks-list.json` beside it,
+/// in the shape Codex's app-server protocol defines. Its hooks feature is on only where the folder
+/// it runs in turns it on in its own `.codex/config.toml`, as a trusted project's configuration does.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 case "$1" in
-features) echo "hooks stable true" ;;
+features)
+  if grep -qx 'hooks = true' .codex/config.toml 2>/dev/null; then echo "hooks stable true"
+  else echo "hooks stable false"; fi ;;
 app-server)
   while IFS= read -r line; do
     case "$line" in
@@ -72,7 +75,9 @@ fn agit(home: &Path, path: &str, args: &[&str]) -> Output {
 /// copy running setup changes the command Codex approved, and one that takes npx's cached copy
 /// ahead of it on PATH for the person's `agit` does the same during an `npx` install. Codex's verdict on the AgentGit hooks
 /// (one changed since approval, one disabled) reaches the person through setup and doctor, while
-/// another tool's hook that Codex also lists is not reported as AgentGit's.
+/// another tool's hook that Codex also lists is not reported as AgentGit's. The hooks feature is
+/// on only in the folder setup runs in, by that folder's own configuration; asked from anywhere
+/// else, Codex would call it off and setup would report nothing of the hooks.
 #[test]
 fn approved_codex_hooks_survive_setup_and_unapproved_ones_are_reported() {
     // Outside the system temporary directory: an `agit` there is one a cleanup removes, and setup
@@ -106,6 +111,12 @@ fn approved_codex_hooks_survive_setup_and_unapproved_ones_are_reported() {
     .unwrap();
     std::fs::create_dir_all(hooks_file.parent().unwrap()).unwrap();
     std::fs::write(&hooks_file, &approved).unwrap();
+    // Setup runs in `home`, whose own configuration turns the hooks feature on.
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "[features]\nhooks = true\n",
+    )
+    .unwrap();
     std::fs::write(
         tools.join("hooks-list.json"),
         serde_json::to_string(&serde_json::json!({"data": [{

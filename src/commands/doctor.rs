@@ -912,10 +912,35 @@ fn claude_hooks_check() -> Option<(String, Check)> {
 }
 
 /// Whether Codex runs AgentGit's hooks, as Codex itself reports them for this directory. No row
-/// when Codex cannot say or lists none of them: an unknown state is not reported as a problem.
+/// when there is no Codex, or it lists none of them or can't say: an unknown state is not
+/// reported as a problem. A Codex that is still busy when the time runs out gets a row that says
+/// so; without it, doctor would sit silent for the whole wait and then report nothing.
 fn codex_hooks_row() -> Option<Check> {
+    use super::setup::CodexHooksAnswer;
+    use std::io::{IsTerminal as _, Write as _};
     let cwd = std::env::current_dir().ok()?;
-    let hooks = super::setup::codex_hooks(&cwd)?;
+    // The wait is shown only to a person watching, on stderr, and erased once it's over.
+    let shown = crate::adapter::which("codex").is_some()
+        && std::io::stderr().is_terminal()
+        && !ui::quiet()
+        && !super::json::requested();
+    if shown {
+        eprint!("  asking Codex about its hooks…");
+        let _ = std::io::stderr().flush();
+    }
+    let answer = super::setup::codex_hooks(&cwd);
+    if shown {
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+    let hooks = match answer? {
+        CodexHooksAnswer::Listed(hooks) => hooks,
+        CodexHooksAnswer::Late => {
+            return Some(Check::Warn(
+                "Codex didn't answer in time, so agit couldn't check whether it runs AgentGit's hooks here; open Codex and run /hooks".into(),
+            ));
+        }
+    };
     if let Some(problem) = hooks.problem() {
         return Some(Check::Warn(problem));
     }

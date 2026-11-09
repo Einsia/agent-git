@@ -85,6 +85,27 @@ impl Job {
         Ok(())
     }
 
+    /// Lets a process in the job start a child outside it by asking to (`CREATE_BREAKAWAY_FROM_JOB`),
+    /// as a runtime's shared background server does; every other descendant stays owned. Without
+    /// it, ending the job would end a server the person's other conversations may be using.
+    pub fn allow_breakaway(&self) -> io::Result<()> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        if unsafe {
+            SetInformationJobObject(
+                self.handle.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn new() -> io::Result<Self> {
         let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if raw.is_null() {

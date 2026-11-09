@@ -1928,8 +1928,9 @@ pub fn run(args: Args) -> CmdResult {
             println!("{}", serde_json::to_string(&project)?);
             // Codex captures this directory only through hooks it has approved.
             if project.enabled
-                && let Some(problem) =
-                    super::setup::codex_hooks(&root).and_then(|hooks| hooks.problem())
+                && let Some(problem) = super::setup::codex_hooks(&root)
+                    .and_then(super::setup::CodexHooksAnswer::listed)
+                    .and_then(|hooks| hooks.problem())
             {
                 ui::warning(&problem);
             }

@@ -568,7 +568,10 @@ fn runtimes(root: &Path) -> Vec<(&'static str, RuntimeState)> {
     }
     if crate::adapter::get("codex").is_ok_and(|a| a.available()) {
         let state = if crate::commands::setup::codex_hooks_enabled() {
-            codex_state(crate::commands::setup::codex_hooks(root))
+            codex_state(
+                crate::commands::setup::codex_hooks(root)
+                    .and_then(crate::commands::setup::CodexHooksAnswer::listed),
+            )
         } else {
             RuntimeState::CatchUp
         };
