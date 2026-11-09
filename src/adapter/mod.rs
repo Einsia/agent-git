@@ -44,6 +44,7 @@ pub mod native_title;
 pub mod openclaw;
 pub mod opencode;
 pub(crate) mod preview;
+pub(crate) mod probe;
 pub(crate) mod protocol_ids;
 mod session_visibility;
 mod sqlite_native;

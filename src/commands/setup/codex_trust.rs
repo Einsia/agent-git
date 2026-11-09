@@ -5,14 +5,32 @@
 //! whenever Codex changes the form, so the installed Codex is asked instead, through its app
 //! server's `hooks/list`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// How long Codex may take to answer before agit stops asking and says nothing about the hooks.
-const ANSWER_LIMIT: Duration = Duration::from_secs(10);
+/// How long Codex may take to answer one of agit's questions before agit stops asking.
+pub(super) const ANSWER_LIMIT: Duration = Duration::from_secs(10);
+
+/// What Codex said when asked about AgentGit's hooks.
+#[derive(Debug)]
+pub(crate) enum CodexHooksAnswer {
+    Listed(CodexHooks),
+    /// Codex was still starting or busy when [`ANSWER_LIMIT`] ran out.
+    Late,
+}
+
+impl CodexHooksAnswer {
+    /// The hooks Codex listed; `None` when it answered too late to list them.
+    pub(crate) fn listed(self) -> Option<CodexHooks> {
+        match self {
+            Self::Listed(hooks) => Some(hooks),
+            Self::Late => None,
+        }
+    }
+}
 
 /// AgentGit's hooks as Codex lists them for one working directory.
 #[derive(Debug, Default)]
@@ -60,20 +78,20 @@ impl CodexHooks {
 }
 
 /// Ask the installed Codex about AgentGit's hooks in `cwd`. `None` when there is no Codex, or it
-/// does not answer `hooks/list` in time or in a form agit reads; nothing is claimed then.
-pub(crate) fn codex_hooks(cwd: &Path) -> Option<CodexHooks> {
+/// ends without answering, or answers in a form agit doesn't read; nothing is claimed then.
+pub(crate) fn codex_hooks(cwd: &Path) -> Option<CodexHooksAnswer> {
     let codex = crate::adapter::which("codex")?;
-    let child = Command::new(codex)
+    let mut command = Command::new(codex);
+    command
         .arg("app-server")
-        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut server = Server(child);
-    let mut input = server.0.stdin.take()?;
-    let output = server.0.stdout.take()?;
+        .stderr(Stdio::null());
+    // The folder is named in the request; the server itself runs from elsewhere, as every
+    // question to the person's runtime does.
+    let mut server = crate::adapter::probe::Asked::start(command).ok()?;
+    let mut input = server.child().stdin.take()?;
+    let output = server.child().stdout.take()?;
     let (lines, answers) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(output).lines() {
@@ -84,47 +102,57 @@ pub(crate) fn codex_hooks(cwd: &Path) -> Option<CodexHooks> {
         }
     });
     let deadline = Instant::now() + ANSWER_LIMIT;
-    let mut send = |message: serde_json::Value| writeln!(input, "{message}").ok();
+    let mut send = |message: serde_json::Value| {
+        crate::adapter::probe::write_line(&mut input, &message.to_string()).ok()
+    };
     send(serde_json::json!({
         "id": 1,
         "method": "initialize",
         "params": {"clientInfo": {"name": "agit", "version": env!("CARGO_PKG_VERSION")}},
     }))?;
-    answer(&answers, 1, deadline)?;
+    if let Waited::Ended = answer(&answers, 1, deadline).ok()? {
+        return Some(CodexHooksAnswer::Late);
+    }
     send(serde_json::json!({"method": "initialized"}))?;
     send(serde_json::json!({
         "id": 2,
         "method": "hooks/list",
         "params": {"cwds": [cwd]},
     }))?;
-    let listed = answer(&answers, 2, deadline)?;
-    read_hooks(&listed)
-}
-
-/// The app server lives only as long as one question; dropping it ends the process on every path.
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+    match answer(&answers, 2, deadline).ok()? {
+        Waited::Answered(listed) => read_hooks(&listed).map(CodexHooksAnswer::Listed),
+        Waited::Ended => Some(CodexHooksAnswer::Late),
     }
 }
 
-/// The result of the response with this `id`, skipping notifications and other responses.
-fn answer(
-    answers: &mpsc::Receiver<String>,
-    id: u64,
-    deadline: Instant,
-) -> Option<serde_json::Value> {
+/// How waiting for one answer ended, when it didn't end with the server gone.
+enum Waited {
+    Answered(serde_json::Value),
+    /// The time ran out first.
+    Ended,
+}
+
+/// The `result` of the answer to request `id`. `Err` when the server closed its output first, or
+/// answered without a result.
+fn answer(answers: &mpsc::Receiver<String>, id: u64, deadline: Instant) -> Result<Waited, ()> {
     loop {
-        let left = deadline.checked_duration_since(Instant::now())?;
-        let line = answers.recv_timeout(left).ok()?;
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(Waited::Ended);
+        };
+        let line = match answers.recv_timeout(left) {
+            Ok(line) => line,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Waited::Ended),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(()),
+        };
         let Ok(mut message) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if message.get("id").and_then(|value| value.as_u64()) == Some(id) {
-            return message.get_mut("result").map(serde_json::Value::take);
+            return message
+                .get_mut("result")
+                .map(serde_json::Value::take)
+                .map(Waited::Answered)
+                .ok_or(());
         }
     }
 }

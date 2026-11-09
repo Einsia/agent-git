@@ -49,7 +49,7 @@ mod native;
 pub mod presence;
 pub(crate) mod skill_off;
 
-pub(crate) use codex_trust::{CodexHooks, codex_hooks};
+pub(crate) use codex_trust::{CodexHooks, CodexHooksAnswer, codex_hooks};
 
 use clap::Args as ClapArgs;
 use std::borrow::Cow;
@@ -619,7 +619,11 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
 /// until then. Codex's own answer is preferred; a changed command always needs a new approval.
 fn report_codex_review(changed: bool) {
     let cwd = std::env::current_dir().ok().or_else(home);
-    match cwd.as_deref().and_then(codex_hooks) {
+    match cwd
+        .as_deref()
+        .and_then(codex_hooks)
+        .and_then(CodexHooksAnswer::listed)
+    {
         Some(hooks) => {
             if let Some(problem) = hooks.problem() {
                 ui::warning(&problem);
@@ -996,16 +1000,19 @@ pub(crate) fn codex_hooks_enabled() -> bool {
 /// Ask the installed Codex whether it knows the hooks feature. Presence is the compatibility
 /// boundary; the version string is not, because downstream builds may add or remove capabilities
 /// without sharing the release numbering of the public binary.
+///
+/// A Codex that doesn't answer within [`codex_trust::ANSWER_LIMIT`] is taken not to have it, as
+/// one that can't be run is. It is asked from the folder agit runs in: Codex applies a trusted
+/// project's own configuration there, which can turn the feature on or off for that project.
 fn codex_hooks_capability() -> Option<CodexHooksCapability> {
     let exe = crate::adapter::which("codex")?;
-    let output = std::process::Command::new(exe)
-        .args(["features", "list"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    let mut command = std::process::Command::new(exe);
+    command.args(["features", "list"]);
+    if let Ok(folder) = std::env::current_dir() {
+        command.current_dir(folder);
     }
-    parse_codex_hooks_capability(&String::from_utf8_lossy(&output.stdout))
+    let listed = crate::adapter::probe::output(command, codex_trust::ANSWER_LIMIT, 1 << 20)?;
+    parse_codex_hooks_capability(&String::from_utf8_lossy(&listed))
 }
 
 /// The runtimes whose hooks can capture project sessions automatically. Codex counts only when

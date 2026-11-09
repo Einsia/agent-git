@@ -77,35 +77,14 @@ fn outside_shared_server() -> &'static str {
 /// Whether the `codex` on PATH lists [`NO_DAEMON`] in its help. A Codex that can't be run or
 /// doesn't answer in time is taken not to have it, and is launched as an older Codex is.
 fn offers_no_daemon() -> bool {
-    use std::io::Read as _;
     let Some(codex) = super::which("codex") else {
         return false;
     };
-    let Ok(mut child) = std::process::Command::new(codex)
-        .arg("--help")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let output = child.stdout.take();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut text = Vec::new();
-        if let Some(output) = output {
-            let _ = output.take(HELP_BYTES).read_to_end(&mut text);
-        }
-        let _ = sender.send(text);
-    });
-    let answer = receiver.recv_timeout(HELP_ANSWER_LIMIT);
-    // Ended either way: one that hasn't answered is not waited for again.
-    let _ = child.kill();
-    let _ = child.wait();
+    let mut command = std::process::Command::new(codex);
+    command.arg("--help");
     // The flag as a word of its own, not the start of a longer option.
-    answer.is_ok_and(|text| {
-        String::from_utf8_lossy(&text)
+    super::probe::output(command, HELP_ANSWER_LIMIT, HELP_BYTES).is_some_and(|help| {
+        String::from_utf8_lossy(&help)
             .split(|c: char| c.is_whitespace() || c == ',')
             .any(|word| word == NO_DAEMON)
     })
