@@ -11,6 +11,12 @@ use serde_json::{Value, value::RawValue};
 use std::ops::Range;
 
 pub const MAX_UNIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// What a record keeps in place of a string no request can carry and no window can divide.
+pub(crate) const OMITTED_TEXT: &str = "[content omitted: too large for the privacy check]";
+/// What a long text keeps in place of a part with too many findings for the privacy check to
+/// finish or divide.
+pub(crate) const CROWDED_TEXT: &str = "[content omitted: too many findings for the privacy check]";
 const MAX_FINDINGS: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
