@@ -1712,21 +1712,6 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     repo.add_all().unwrap();
     repo.commit("Protected repeated events").unwrap();
     assert_success(&run(&["--yes", "push", "alice/app@hydrated"], false));
-    // A branch new to the Hub whose name holds that request's protected value, spelled as a branch
-    // name, is refused: the stored request shows only a placeholder, so the name is compared with
-    // the request as publication restores it.
-    let spelled = format!("ship-{}", secret.to_ascii_lowercase());
-    repo.git(&["branch", &spelled, "hydrated"]).unwrap();
-    let before = hub.posts.load(Ordering::Acquire);
-    let refused = run(&["--yes", "push", &format!("alice/app@{spelled}")], false);
-    assert!(!refused.status.success(), "{refused:?}");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("rename the branch with `agit branch rename"),
-        "{refused:?}"
-    );
-    assert_eq!(hub.posts.load(Ordering::Acquire), before);
-    repo.git(&["branch", "-D", &spelled]).unwrap();
     let restored = envelope(&git(&remote, &["rev-parse", "refs/heads/hydrated"]))
         .open_layer(&rotated)
         .unwrap();
@@ -1783,51 +1768,6 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("publication hydration is incomplete"),
-        "{refused:?}"
-    );
-    assert_eq!(hub.posts.load(Ordering::Acquire), received);
-
-    // A value the user registered is refused in a publication branch name. Only the privacy
-    // worker's dictionary holds it, so a check that ran the detector alone would publish it.
-    let registered = "zephyr-orchid-7741";
-    let environment = git_command(temp.path());
-    let mut add = Command::new(env!("CARGO_BIN_EXE_agit"));
-    add.env_clear_local();
-    for (name, value) in environment.get_envs() {
-        if let Some(value) = value {
-            add.env(name, value);
-        }
-    }
-    let mut add = add
-        .current_dir(temp.path())
-        .env("AGIT_HOME", &home)
-        .env("AGIT_HUB_URL", &hub.base)
-        .env("CI", "1")
-        .env("AGIT_TUI", "0")
-        .env("AGIT_USE_SYSTEM_GIT", "1")
-        .env(
-            "AGIT_SECRETS_KEYSTORE",
-            if cfg!(unix) { "file" } else { "os" },
-        )
-        .args(["secrets", "add", "branch-word", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    add.stdin
-        .take()
-        .unwrap()
-        .write_all(registered.as_bytes())
-        .unwrap();
-    assert_success(&add.wait_with_output().unwrap());
-    let named = format!("ship-{registered}");
-    repo.git(&["branch", &named, "work"]).unwrap();
-    let refused = run(&["--yes", "push", &format!("alice/app@{named}")], false);
-    assert!(!refused.status.success(), "{refused:?}");
-    assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("rename the branch with `agit branch rename"),
         "{refused:?}"
     );
     assert_eq!(hub.posts.load(Ordering::Acquire), received);
@@ -3788,11 +3728,8 @@ fn continued_plain_session_declares_only_what_it_adds() {
 /// rewrite them, and one that rechecked none would send the new value. A record protection changed when it was published
 /// keeps its published line the same way, in a merge as in a turn; a push that matched lines only
 /// by their unprotected form would protect it again under the newer value and drop the published
-/// line. A file holding such a value refuses its publication by name, with nothing sent; a check
-/// of generic rules alone would miss it, and one that skipped what it cannot read would send a
-/// large text file unchecked. So does a value that spans what a file held and what is appended to
-/// it, which a check of the appended bytes alone misses, and a file whose bytes are also a session
-/// record's, which a check that took the record's pass for the file's would send.
+/// line. A file a person's history added goes out as Git sends it, whatever it holds and however
+/// large, while a record beside it still has the value replaced.
 #[test]
 fn plain_publication_carries_only_conversation_records() {
     const CLAUDE_MD: &str = "CANARY-PROJECT-CLAUDE-MD-7f3a";
@@ -4244,95 +4181,76 @@ fn plain_publication_carries_only_conversation_records() {
         );
     }
 
-    // A file a person's history added, holding a value only the privacy rules know, refuses its
-    // publication by name, with nothing sent: a file is never rewritten for them. So does a text
-    // file too large to check, which would otherwise go out unread. A binary file of that size
-    // goes out, as capture does not read one.
-    let file_branch = |branch: &str, name: &str, content: &[u8]| {
-        repo.git(&["checkout", "-q", "-b", branch, "main"]).unwrap();
+    // A file a person's history added is published as Git publishes it, a value the privacy rules
+    // know and a text file too large to check included, while a conversation record committed
+    // beside it still goes out with that value replaced.
+    let oversized = agit::domain::privacy_publication::MAX_INPUT_BYTES + 1;
+    let files: [(&str, &str, Vec<u8>); 3] = [
+        (
+            "notes",
+            "notes.txt",
+            format!("ask {REGISTERED} first\n").into_bytes(),
+        ),
+        (
+            "big",
+            "big.txt",
+            "line\n".repeat(oversized / 5 + 1).into_bytes(),
+        ),
+        ("image", "image.bin", vec![0; oversized]),
+    ];
+    for (branch, name, content) in &files {
+        repo.git(&["checkout", "-q", "main"]).unwrap();
+        if *branch == "notes" {
+            snapshot(
+                branch,
+                "claude-code",
+                'f',
+                &[
+                    json!({"type":"user","uuid":"n1","parentUuid":null,"sessionId":"f","message":{"role":"user","content":format!("note {REGISTERED} down")}}),
+                ],
+            );
+        } else {
+            repo.git(&["checkout", "-q", "-b", branch]).unwrap();
+        }
         fs::write(repo.root().join(name), content).unwrap();
         repo.add_all().unwrap();
         repo.commit(branch).unwrap();
-        repo.git(&["checkout", "-q", "main"]).unwrap();
-    };
-    let oversized = agit::domain::privacy_publication::MAX_INPUT_BYTES + 1;
-    file_branch(
-        "notes",
-        "notes.txt",
-        format!("ask {REGISTERED} first\n").as_bytes(),
-    );
-    file_branch(
-        "big",
-        "big.txt",
-        "line\n".repeat(oversized / 5 + 1).as_bytes(),
-    );
-    file_branch("image", "image.bin", &vec![0; oversized]);
-    // A value that begins in what a file held and ends in what a later commit appends.
-    file_branch("split", "split.txt", b"ask heron-led");
-    repo.git(&["checkout", "-q", "split"]).unwrap();
-    fs::write(
-        repo.root().join("split.txt"),
-        "ask heron-ledger-7731 first\n",
-    )
-    .unwrap();
-    repo.add_all().unwrap();
-    repo.commit("split more").unwrap();
-    // A person's file whose bytes are a session record's, which is judged as records are and
-    // not as text, holding a value registered since.
-    repo.git(&["checkout", "-q", "main"]).unwrap();
-    snapshot(
-        "copy",
-        "claude-code",
-        'f',
-        &[
-            json!({"type":"user","uuid":"c1","parentUuid":null,"sessionId":"f","message":{"role":"user","content":"start the copy"}}),
-        ],
-    );
-    let copied = fs::read_to_string(repo.root().join(meta::LOG_FILE)).unwrap();
-    register("copied", copied.lines().next().unwrap());
-    fs::write(repo.root().join("copy.txt"), &copied).unwrap();
-    repo.add_all().unwrap();
-    repo.commit("copy the record list").unwrap();
-    repo.git(&["checkout", "-q", "main"]).unwrap();
-    for (branch, name, said) in [
-        ("notes", "`notes.txt`", "holds a value"),
-        ("big", "`big.txt`", "too large"),
-        ("split", "`split.txt`", "holds a value"),
-        ("copy", "`copy.txt`", "holds a value"),
-    ] {
-        let before = hub.posts.load(Ordering::Acquire);
-        let refused = run(&["--yes", "push", &format!("alice/app@{branch}")]);
-        assert!(!refused.status.success(), "{refused:?}");
-        let told = String::from_utf8_lossy(&refused.stderr);
-        assert!(
-            told.contains(name) && told.contains(said) && told.contains("nothing was published"),
-            "{told}"
-        );
-        assert_eq!(hub.posts.load(Ordering::Acquire), before);
-        assert!(
-            Command::new("git")
-                .current_dir(&remote)
-                .args([
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}")
-                ])
-                .output()
-                .unwrap()
-                .stdout
-                .is_empty()
+        assert_success(&run(&["--yes", "push", &format!("alice/app@{branch}")]));
+        let path = format!("refs/heads/{branch}:{name}");
+        assert_eq!(
+            git(&remote, &["rev-parse", &path]),
+            git(repo.root(), &["rev-parse", &format!("HEAD:{name}")]),
+            "{name} went out changed"
         );
     }
-    assert_success(&run(&["--yes", "push", "alice/app@image"]));
+    repo.git(&["checkout", "-q", "main"]).unwrap();
+    let published = git(&remote, &["rev-parse", "refs/heads/notes"]);
+    let (log, _) = storage::materialize_pair_at(&remote, &published).unwrap();
+    assert!(log.contains("note ") && !log.contains(REGISTERED), "{log}");
+
+    // A session branch is published under its name as it is, though the name holds a value the
+    // privacy rules know and the session's first message holds the same value.
+    let named = format!("ship-{REGISTERED}");
+    snapshot(
+        &named,
+        "claude-code",
+        'a',
+        &[
+            json!({"type":"user","uuid":"g1","parentUuid":null,"sessionId":"g","message":{"role":"user","content":format!("ship {REGISTERED} now")}}),
+        ],
+    );
+    repo.git(&["checkout", "-q", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", &format!("alice/app@{named}")]));
+    git(
+        &remote,
+        &["rev-parse", "--verify", &format!("refs/heads/{named}")],
+    );
 }
 
-/// A conversation whose first message quotes a placeholder this computer never made publishes
-/// under the branch name made from that message: the placeholder is text the person saw, and the
-/// name was made from the same text. One quoted in a later record, a tool result here, never
-/// stops it either, since only the first message names the branch. A push that restored the
-/// whole session before reading its first message, or that refused every placeholder it could not
-/// restore, would keep such a conversation on this computer for good.
+/// A conversation whose first message quotes a placeholder this computer never made publishes,
+/// and so does one quoting it in a later record, a tool result here: the placeholder is text the
+/// person saw. A push that refused every placeholder it could not restore would keep such a
+/// conversation on this computer for good.
 #[test]
 fn a_first_message_quoting_a_placeholder_made_elsewhere_publishes() {
     let temp = tempfile::tempdir().unwrap();
@@ -5596,10 +5514,9 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
 }
 
 /// A session larger than one privacy envelope may hold, but within what capture records, makes its
-/// first publication to a new branch. The new branch is named from the session's opening request,
-/// which publication reads from the whole saved LOG; a read capped below what capture admits
-/// refuses the first publication of every session that grew past that cap while it was recorded,
-/// which is how an old long conversation fails to catch up.
+/// first publication to a new branch: a read capped below what capture admits would refuse the
+/// first publication of every session that grew past that cap while it was recorded, which is how
+/// an old long conversation fails to catch up.
 #[test]
 fn a_session_larger_than_an_envelope_makes_its_first_publication() {
     let temp = tempfile::tempdir().unwrap();
@@ -12009,13 +11926,11 @@ fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
     assert_success(&pushed);
 }
 
-/// A file line's own `session/meta.json` is judged as agit's record: the committer agit writes
-/// there, this computer's signed-in account, doesn't refuse main even when today's check would
-/// replace its value (a distill writes it), while a flagged value in a free-text field of the
-/// record, or in a key the record doesn't define, still refuses. The refusal names the person's
-/// own commit and how to remove the value.
+/// Main goes up after a distill writes this computer's account into its `session/meta.json`, even
+/// when today's check would replace that value. A file committed on main is published as it is, so
+/// a flagged value written into that file by hand, or into a copy of it, goes up too.
 #[test]
-fn a_file_lines_record_is_judged_as_agits_record() {
+fn a_file_lines_record_is_published_as_it_is() {
     const ACCOUNT: &str = "acct-7f3a9c2e5b1d4a6f80c2";
     const FLAGGED: &str = "password=Sup3rS3cretValue42";
     let temp = tempfile::tempdir().unwrap();
@@ -12150,59 +12065,8 @@ fn a_file_lines_record_is_judged_as_agits_record() {
     let published = git(repo.root(), &["rev-parse", "refs/heads/main"]);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
 
-    // A flagged value in a free-text field of the record still refuses, naming this computer's
-    // own commit and how to remove it.
     let mut record = meta::Meta::new_file_line();
     record.milestone = Some(FLAGGED.into());
-    meta::write(repo.root(), &record).unwrap();
-    repo.add_all().unwrap();
-    repo.commit("Milestone").unwrap();
-    let mine = git(repo.root(), &["rev-parse", "--short=12", "HEAD"]);
-    let refused = run(&["--yes", "push", "alice/app@main"]);
-    assert!(!refused.status.success(), "{refused:?}");
-    let text = said(&refused);
-    for expected in [
-        format!(
-            "`session/meta.json` (from commit {mine}) holds a value today's privacy check replaces"
-        ),
-        format!(
-            "Remove the value from `session/meta.json` in commit {mine} and the commits after it on main, which nothing has published yet, or keep main local."
-        ),
-    ] {
-        assert!(text.contains(&expected), "{expected}: {text}");
-    }
-    assert!(!text.contains("agit scan"), "{text}");
-    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
-
-    // So does one in a key the record doesn't define: that file isn't agit's record.
-    repo.git(&["reset", "--hard", "-q", &published]).unwrap();
-    let mut fields: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(repo.root().join("session/meta.json")).unwrap())
-            .unwrap();
-    fields["notes"] = json!(FLAGGED);
-    fs::write(
-        repo.root().join("session/meta.json"),
-        serde_json::to_string_pretty(&fields).unwrap(),
-    )
-    .unwrap();
-    repo.add_all().unwrap();
-    repo.commit("Notes").unwrap();
-    let refused = run(&["--yes", "push", "alice/app@main"]);
-    assert!(!refused.status.success(), "{refused:?}");
-    assert!(
-        said(&refused).contains("holds a value today's privacy check replaces"),
-        "{refused:?}"
-    );
-    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
-
-    // The record's bytes at any other path are a person's file: a copy of main's record that
-    // carries the account, added beside a changed record in the same commit, still refuses, and
-    // the refusal names the copy.
-    repo.git(&["reset", "--hard", "-q", &published]).unwrap();
-    let mut record = meta::Meta::new_file_line();
-    record.committer_account =
-        Some(agit::domain::session_privacy::AccountIdentity::new(&hub.base, ACCOUNT).unwrap());
-    record.title = Some("Team memory".into());
     meta::write(repo.root(), &record).unwrap();
     fs::copy(
         repo.root().join("session/meta.json"),
@@ -12210,12 +12074,14 @@ fn a_file_lines_record_is_judged_as_agits_record() {
     )
     .unwrap();
     repo.add_all().unwrap();
-    repo.commit("Record and its copy").unwrap();
-    let refused = run(&["--yes", "push", "alice/app@main"]);
-    assert!(!refused.status.success(), "{refused:?}");
-    assert!(
-        said(&refused).contains("`z-copy.json` (from commit"),
-        "{refused:?}"
-    );
-    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
+    repo.commit("Milestone and its copy").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    let head = git(repo.root(), &["rev-parse", "HEAD"]);
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), head);
+    for path in ["session/meta.json", "z-copy.json"] {
+        assert!(
+            git(&remote, &["show", &format!("refs/heads/main:{path}")]).contains(FLAGGED),
+            "{path}"
+        );
+    }
 }

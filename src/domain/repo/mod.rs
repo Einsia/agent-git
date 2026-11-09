@@ -1588,31 +1588,6 @@ impl Repo {
         )
     }
 
-    /// The first `limit` bytes of `blob`, for an object too large to read whole.
-    #[cfg(feature = "cli")]
-    pub(crate) fn blob_prefix(&self, blob: &str, limit: usize) -> Result<Vec<u8>> {
-        use std::io::Read;
-        let mut command = self.cmd();
-        ReadPolicy::LocalOnly.apply(&mut command);
-        let mut child = command
-            .args(["cat-file", "blob", blob])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        let mut bytes = Vec::new();
-        let read = child
-            .stdout
-            .take()
-            .context("git produced no output pipe")?
-            .take(limit as u64)
-            .read_to_end(&mut bytes);
-        let _ = child.kill();
-        let _ = child.wait();
-        read?;
-        anyhow::ensure!(!bytes.is_empty(), "object {blob} could not be read");
-        Ok(bytes)
-    }
-
     /// A long-lived `cat-file` in `mode` with the same isolation as this repository's other
     /// local object reads.
     #[cfg(feature = "cli")]

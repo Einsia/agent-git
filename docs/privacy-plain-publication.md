@@ -20,9 +20,9 @@ were already published encrypted.
 4. **Replacement happens at capture and commit**, incrementally, before Git objects exist.
    A push passes every record and commit message it adds through the same protection again,
    so a rule added since capture applies, and it sends nothing while that protection cannot
-   complete. A text file it adds goes through the same check and is never rewritten: if it
-   holds a value the rules recognize, or is too large to check, the push refuses and names
-   the file. A line the Hub already holds stays as it was published.
+   complete. Every other file it adds, and every branch name, is published as it is, the
+   way Git publishes it, with no privacy check. A line the Hub already holds stays as it was
+   published.
 5. **Protection is the client's**, at capture and again at push for what each push adds. The
    Hub does not re-check published records.
 6. **Reversible restore stays account-scoped.** The account dictionary keeps its role; the
