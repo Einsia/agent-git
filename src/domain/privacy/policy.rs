@@ -151,6 +151,21 @@ impl Snapshot {
     }
 
     pub fn scan(&self, text: &str, limit: usize) -> Batch {
+        self.scan_with(text, limit, self.entropy)
+    }
+
+    /// Findings in a JSON member name. A schema word skips bare entropy; named rules and the
+    /// user's blocks still apply to it, and any other name is scanned like a value.
+    pub fn scan_member_name(&self, name: &str, limit: usize) -> Batch {
+        let entropy = if detector::schema_word(name) {
+            detector::Entropy::Exclude
+        } else {
+            self.entropy
+        };
+        self.scan_with(name, limit, entropy)
+    }
+
+    fn scan_with(&self, text: &str, limit: usize, entropy: detector::Entropy) -> Batch {
         let Batch {
             mut findings,
             mut complete,
@@ -160,7 +175,7 @@ impl Snapshot {
         let heuristics = detector::scan_filtered(
             text,
             limit.saturating_sub(findings.len()),
-            self.entropy,
+            entropy,
             |value, start| {
                 !self
                     .allows
@@ -512,5 +527,48 @@ mod tests {
             secret
         );
         assert_eq!(batch.findings[0].source, Source::RepositoryUser);
+    }
+
+    /// The entropy opt-in sees a schema word as a value but not as a member name, and only bare
+    /// entropy gives way: named rules, user blocks and other opaque names are still found.
+    #[test]
+    fn bare_entropy_leaves_member_names_that_are_schema_words() {
+        let opted_in = Snapshot::compile(&[], &[], false)
+            .unwrap()
+            .with_entropy(detector::Entropy::Include);
+        for word in [
+            "cacheCreationInputTokens",
+            "ZqXvLmTrQwNyBkShDfGjCpVuHaEiOsPtRn_Mb",
+            "ZqXvLmTrQwNyBkShDfGjCpVuHaEiOsPtRn-Mb",
+        ] {
+            assert!(
+                !opted_in.scan(word, 32).findings.is_empty(),
+                "{word} is found as a value"
+            );
+            assert!(
+                opted_in.scan_member_name(word, 32).findings.is_empty(),
+                "{word} is not found as a member name"
+            );
+        }
+        for opaque in ["c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0", "AKIAZXQWERTPLKJHGFDS"] {
+            assert!(
+                !opted_in.scan_member_name(opaque, 32).findings.is_empty(),
+                "{opaque} is still found as a member name"
+            );
+        }
+        let word = "cacheCreationInputTokens";
+        let blocked = Snapshot::compile(
+            &[Literal {
+                value: word,
+                source: Source::RepositoryUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap()
+        .with_entropy(detector::Entropy::Include)
+        .scan_member_name(word, 32);
+        assert_eq!(blocked.findings.len(), 1);
+        assert_eq!(blocked.findings[0].source, Source::RepositoryUser);
     }
 }

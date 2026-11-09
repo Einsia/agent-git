@@ -18,6 +18,10 @@ bare entropy discovery:
 - `secrets::paths` recognizes resource locations in links, rooted paths and named
   path fields. This applies to text carriers generally, not just `README.md`.
 - Media and repository identity handling retain their existing evidence checks.
+- A JSON member name made only of letters, underscores and hyphens is a schema word.
+  Replacement under the opt-in doesn't apply bare entropy to it, including in JSON carried
+  as text. Named rules and the user's blocks still apply to it, its value is checked as
+  usual, and explicit diagnostics still report it.
 
 The source classifier examines original text before escape normalization. Literal
 contents and comments cannot supply executable syntax. Valid JSON carriers are

@@ -1056,7 +1056,7 @@ impl Projector {
                 Value::Object(values) => {
                     let carried = carrier(values);
                     for (key, value) in values {
-                        let batch = projector.policy.scan(key, MAX_FINDINGS);
+                        let batch = projector.policy.scan_member_name(key, MAX_FINDINGS);
                         if !batch.complete || !batch.findings.is_empty() {
                             return Some(batch);
                         }
@@ -1216,7 +1216,8 @@ impl Projector {
                     let next = if hydrate {
                         self.hydrate(name)
                     } else {
-                        self.protect(name)
+                        let batch = self.policy.scan_member_name(name, MAX_FINDINGS);
+                        self.protect_findings(name, batch)
                     };
                     if !names.insert(next.content.clone()) {
                         outcome.status = Status::Partial;
@@ -1578,13 +1579,23 @@ impl Projector {
             std::borrow::Cow::Owned(format!("{prefix}{text}"))
         };
         let mut batch = self.policy.scan(&input, MAX_FINDINGS);
+        // A string holding JSON holds member names too.
+        let entropy_hit = batch
+            .findings
+            .iter()
+            .any(|hit| hit.rule == "high-entropy-value");
+        let schema_words = if entropy_hit {
+            super::detector::json_schema_word_regions(text)
+        } else {
+            Default::default()
+        };
         batch.findings.retain_mut(|hit| {
             if hit.start < prefix.len() {
                 return false;
             }
             hit.start -= prefix.len();
             hit.end -= prefix.len();
-            true
+            hit.rule != "high-entropy-value" || !schema_words.contains(&(hit.start, hit.end))
         });
         // A credential-named field delimits its value exactly, so the whole decoded value is one
         // finding whatever punctuation, quotes included, it carries.
@@ -2371,6 +2382,105 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&restored.content).unwrap(),
             record
+        );
+    }
+
+    /// With the entropy opt-in, a schema word stays a member name wherever a record holds one:
+    /// a usage record, a tool's input, and JSON carried as text, with or without escapes. What
+    /// such a name holds is still checked, a blocked name is still replaced, and so is an opaque
+    /// name. The same word as a value or in prose is not a member name, and is still replaced.
+    #[test]
+    fn entropy_leaves_schema_word_member_names_and_checks_what_they_hold() {
+        let root = tempfile::tempdir().unwrap();
+        let word = "cacheCreationInputTokens";
+        let opaque = "c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0";
+        let carrier = |arguments: &Value| json!({"type":"response_item","payload":{"type":"function_call","call_id":"call","name":"Inspect","arguments":arguments.to_string()}});
+        let mut projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(&[], &[], false)
+                .unwrap()
+                .with_entropy(crate::domain::privacy::detector::Entropy::Include),
+            key: None,
+            complete: true,
+            missing: None,
+            hydration_growth: Default::default(),
+        };
+        let unchanged = [
+            json!({"type":"cost-state","costUSD":0.1,"modelUsage":{"claude-opus-5-5":{"inputTokens":1,"cacheReadInputTokens":3,word:4}}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"call","name":"Inspect","input":{word:4}}]}}),
+            carrier(&json!({word:4})),
+            carrier(&json!({"note":"quoted \" text",word:4})),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"text","text":json!({word:4}).to_string()}]}]}}),
+        ];
+        for record in &unchanged {
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert!(protected.status == Status::Complete);
+            assert_eq!(protected.replacements, 0, "{record}");
+            let projected: Value = serde_json::from_str(&protected.content).unwrap();
+            assert_eq!(&projected, record);
+        }
+        let held = json!({"type":"cost-state","modelUsage":{"claude-opus-5-5":{word:opaque}}});
+        let protected = projector.transform(&held.to_string(), Mode::ProtectJsonl);
+        let projected: Value = serde_json::from_str(&protected.content).unwrap();
+        let entry = &projected["modelUsage"]["claude-opus-5-5"];
+        assert!(entry[word].as_str().is_some_and(|value| value != opaque));
+        assert!(!protected.content.contains(opaque));
+        for record in [
+            json!({"type":"cost-state","modelUsage":{"claude-opus-5-5":{opaque:4}}}),
+            carrier(&json!({opaque:4})),
+            carrier(&json!({word:opaque})),
+        ] {
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert_eq!(protected.replacements, 1, "{record}");
+            assert!(!protected.content.contains(opaque));
+        }
+        for record in [
+            carrier(&json!({"note":word})),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":format!("the {word} field")}]}}),
+        ] {
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert_eq!(protected.replacements, 1, "{record}");
+            assert!(!protected.content.contains(word));
+        }
+        projector.policy = Snapshot::compile(
+            &[super::super::policy::Literal {
+                value: word,
+                source: Source::RepositoryUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap()
+        .with_entropy(crate::domain::privacy::detector::Entropy::Include);
+        for record in &unchanged {
+            let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
+            assert!(protected.replacements >= 1, "{record}");
+            assert!(!protected.content.contains(word), "{record}");
+        }
+        // Beside bare entropy elsewhere in the same text, the blocked name is still a finding of
+        // its own: only bare entropy gives way to a schema word.
+        let text = json!({word:4,"note":opaque}).to_string();
+        let beside = json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":[{"type":"text","text":text}]}]}});
+        let protected = projector.transform(&beside.to_string(), Mode::ProtectJsonl);
+        assert!(!protected.content.contains(word));
+        assert!(!protected.content.contains(opaque));
+        let batch = projector.field_findings(&text, None);
+        for value in [word, opaque] {
+            let at = text.find(value).unwrap();
+            assert!(
+                batch
+                    .findings
+                    .iter()
+                    .any(|hit| hit.start <= at && at + value.len() <= hit.end),
+                "{value}"
+            );
+        }
+        assert!(
+            batch
+                .findings
+                .iter()
+                .any(|hit| hit.rule == "high-entropy-value")
         );
     }
 
