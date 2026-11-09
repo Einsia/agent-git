@@ -2200,8 +2200,8 @@ mod tests {
     }
 
     /// A credential-named field's whole decoded value is one finding, punctuation included,
-    /// unless the user allowed that value. A field context fed to the detector as an unquoted
-    /// assignment would end the value at `;` and publish the rest; a whole-value rule that
+    /// unless a preset or the user allowed that value. A field context fed to the detector as an
+    /// unquoted assignment would end the value at `;` and publish the rest; a whole-value rule that
     /// ignored allows would override the user's decision. Lists retain their field's context,
     /// but object members establish their own context instead of inheriting a list's name.
     #[test]
@@ -2217,9 +2217,13 @@ mod tests {
             hydration_growth: Default::default(),
         };
         let password = "c7Zq4xR2mNv8LpT3;mNv8L\"pT3!wYb6Ks1Hd9Fg5Jt0";
+        let passphrase = "maple-river-7";
         let opaque = "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe";
         let record = json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Write","input":{
             "passwd":password,"passwords":[password],"file_path":"/tmp/c7Zq4xR2.cfg",
+            "password":passphrase,"pwd":"aaaaaaaaaaaa",
+            "passphrase":"cedar_river","admin_password":"MAPLE_RIVER7",
+            "examples":{"password":"YOUR_PASSWORD","passwd":"${DB_PASSWORD}"},
             "api_keys":[opaque,[opaque],{"label":opaque},42,true],"references":[opaque]
         }}]}});
         let protected = projector.transform(&record.to_string(), Mode::ProtectJsonl);
@@ -2229,6 +2233,14 @@ mod tests {
         assert!(protected.content.contains("/tmp/c7Zq4xR2.cfg"));
         let value: Value = serde_json::from_str(&protected.content).unwrap();
         let input = &value["message"]["content"][0]["input"];
+        assert!(whole_token(input["password"].as_str().unwrap()));
+        assert_eq!(input["pwd"], "aaaaaaaaaaaa");
+        assert!(whole_token(input["passphrase"].as_str().unwrap()));
+        assert!(whole_token(input["admin_password"].as_str().unwrap()));
+        assert_eq!(
+            input["examples"],
+            record["message"]["content"][0]["input"]["examples"]
+        );
         assert!(whole_token(input["passwords"][0].as_str().unwrap()));
         assert!(whole_token(input["api_keys"][0].as_str().unwrap()));
         assert!(whole_token(input["api_keys"][1][0].as_str().unwrap()));
@@ -2241,7 +2253,12 @@ mod tests {
             serde_json::from_str::<Value>(&restored.content).unwrap(),
             record
         );
-        projector.policy = Snapshot::compile(&[], &[password, opaque], false).unwrap();
+        projector.policy = Snapshot::compile(
+            &[],
+            &[password, passphrase, opaque, "cedar_river", "MAPLE_RIVER7"],
+            false,
+        )
+        .unwrap();
         let allowed = projector.transform(&record.to_string(), Mode::ProtectJsonl);
         assert_eq!(
             serde_json::from_str::<Value>(&allowed.content).unwrap(),

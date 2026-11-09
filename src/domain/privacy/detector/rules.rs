@@ -201,6 +201,20 @@ impl Rule {
     ///
     /// `line` is the source line the hit sits on; an allow with `regexTarget = "line"` reads it.
     pub fn accepts(&self, secret: &str, whole: &str, line: &str) -> bool {
+        if self.id == "hashicorp-tf-password"
+            && !super::assigned_credential(secret, super::Shape::Quoted, true)
+        {
+            return false;
+        }
+        if self.id == "agit-basic-authorization" {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(secret)
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(secret));
+            if !decoded.is_ok_and(|value| value.contains(&b':')) {
+                return false;
+            }
+        }
         if let Some(min) = self.entropy
             && shannon(secret) <= min
         {
@@ -229,6 +243,16 @@ impl Rule {
             .and_then(|g| caps.get(g))
             .or_else(|| (1..caps.len()).find_map(|i| caps.get(i)))
             .unwrap_or(whole);
+        // The Terraform rule captures string delimiters; only its value participates in
+        // protection and allowance checks, or quoting changes both output syntax and policy.
+        if self.id == "hashicorp-tf-password"
+            && let Some(value) = pick
+                .as_str()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+        {
+            return (pick.start() + 1, pick.end() - 1, value);
+        }
         (pick.start(), pick.end(), pick.as_str())
     }
 
