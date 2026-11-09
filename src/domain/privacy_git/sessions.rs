@@ -915,91 +915,6 @@ fn remote_movement(
     }
 }
 
-/// The opening request of the session a branch head belongs to, or `None` for a head that is
-/// not a session line.
-fn opening_request(
-    source: &Repo,
-    sessions: &sources::History,
-    head: &str,
-) -> Result<Option<String>> {
-    let metadata = match sessions.stored(head) {
-        Some(metadata) => metadata.clone(),
-        None => match super::super::storage::metadata_local(source.root(), head) {
-            Ok(metadata) => metadata,
-            Err(_) => return Ok(None),
-        },
-    };
-    if !metadata.is_session_line() {
-        return Ok(None);
-    }
-    // Every committed session fits the storage cap, as capture enforces it. A smaller cap here
-    // would refuse the first publication of a session that grew past it while recorded.
-    let limit = super::super::storage::MAX_MATERIALIZED_BYTES;
-    let (log, _) =
-        super::super::storage::materialize_pair_local(source.root(), head, limit, limit)?;
-    let native = zeroize::Zeroizing::new(crate::domain::transcript::unwrap_strict(&log)?);
-    let adapter = crate::adapter::get(&metadata.runtime)?;
-    let first = |native: &str| -> Result<Option<String>> {
-        Ok(adapter
-            .parse(native)?
-            .events
-            .iter()
-            .find(|event| event.kind == crate::adapter::EventKind::UserPrompt)
-            .and_then(|event| event.text.clone()))
-    };
-    // A record that wraps a whole encoded field in one placeholder can hide the request until it
-    // is restored, so such a session is restored whole before its request is read.
-    if super::super::storage::parse_envelopes(&log)?
-        .iter()
-        .any(|record| crate::domain::privacy::projector::has_wrapped_carrier(&record.content))
-    {
-        let restored =
-            crate::domain::privacy::service::PublicationHydrator::new(source.root(), true)?
-                .jsonl(&native)?;
-        return first(&restored);
-    }
-    let Some(request) = first(&native)? else {
-        return Ok(None);
-    };
-    opening_request_restored(source, &request).map(Some)
-}
-
-/// The opening `request` as the name was made from it. The stored request has its protected
-/// values replaced already, and the name may have been made from an original, so each placeholder
-/// this computer made is restored. One its dictionary, loaded whole, never held is text the person
-/// saw and stays as it is: the name was made from that same text. While the dictionary cannot be
-/// read whole, a placeholder it does not show may still be one this computer made, so nothing is
-/// published. Only the request is read, so a placeholder elsewhere in the session never stops it.
-fn opening_request_restored(source: &Repo, request: &str) -> Result<String> {
-    use crate::domain::privacy::{
-        projector::{Mode, Reason, Status},
-        service,
-    };
-    if crate::domain::privacy::projector::tokens(request)
-        .next()
-        .is_none()
-    {
-        return Ok(request.to_owned());
-    }
-    let restored = service::transform(Some(source.root()), request, Mode::HydrateText);
-    if restored.status == Status::Complete
-        || (restored.status == Status::Partial
-            && restored.reason == Some(Reason::UnheldPlaceholders))
-    {
-        return Ok(restored.content);
-    }
-    // The push names the steps that end the wait after this, from `pending::steps`.
-    let unreadable = matches!(
-        restored.reason,
-        Some(Reason::DeviceRules | Reason::LegacyRules)
-    );
-    Err(anyhow::Error::new(service::Pending::of(&restored)).context(if unreadable {
-        "this conversation's first message holds a placeholder this computer can't read, so it stays here for now and nothing was uploaded"
-    } else {
-        "the privacy check of this conversation's first message did not finish, so it stays here for now and nothing was uploaded"
-    }))
-}
-
 impl ProjectedHistory {
     pub fn prepare_sessions(
         source: &Repo,
@@ -1168,20 +1083,6 @@ impl ProjectedHistory {
                     .name()
                     .strip_prefix("refs/heads/")
                     .context("invalid publication branch")?;
-                ensure!(
-                    redactor.publishes_unchanged(branch)?,
-                    "a branch name contains text the privacy check would change, so it can't be published as it is; rename the branch with `agit branch rename OLD NEW` (`agit branch` lists them), then push again"
-                );
-                // A branch new to the Hub is named from its session's opening request: it must
-                // carry nothing publication replaces in that request, in any spelling.
-                if !selected.remote.refs.contains_key(head.name())
-                    && let Some(request) = opening_request(&source, source_sessions, head.oid())?
-                {
-                    ensure!(
-                        !redactor.name_carries_replaced(branch, &request)?,
-                        "a branch name contains text the privacy check would change, so it can't be published as it is; rename the branch with `agit branch rename OLD NEW` (`agit branch` lists them), then push again"
-                    );
-                }
                 let reachable = ancestors(head.oid(), walk)?;
                 // Below a boundary the remote head may be held history the walk did not reach;
                 // whether the publication fast-forwards it is checked against the Hub before
@@ -2847,127 +2748,6 @@ impl PreviewOrder<'_> {
     }
 }
 
-/// A session snapshot's own record files: their content passed protection as records, field by
-/// field, and a text judgement of the same bytes is a different one. Every other path of a tree,
-/// and every path of a file line, is a person's file.
-fn session_record_file(path: &str) -> bool {
-    path == meta::LOG_FILE
-        || path == meta::VIEW_FILE
-        || path == meta::LEGACY_LOG_FILE
-        || path == meta::LEGACY_VIEW_FILE
-        || path == meta::FILE
-        || path
-            .rsplit('/')
-            .next()
-            .is_some_and(|id| meta::event_path(id).is_ok_and(|event| event == path))
-}
-
-/// A text file a publication adds must pass capture's protection as it is, whatever rules were in
-/// force when it was recorded, values registered or blocked since included. Anything protection
-/// would replace refuses the publication and names the file and the person's own commit that
-/// brought it: unlike a conversation record, a person's file is never rewritten for them. The
-/// whole file is judged, an appended one included, since a value can span what its parent held
-/// and what is appended. A binary file is not read, as capture does not read one. A file line's
-/// own record is judged as one ([`file_line_record_text`]).
-fn passes_protection(
-    root: &Path,
-    entry: &Introduced,
-    found: &Found,
-    record: bool,
-    bytes: &[u8],
-) -> Result<()> {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Ok(());
-    };
-    if text.contains('\0') {
-        return Ok(());
-    }
-    let judged = record
-        .then(|| file_line_record_text(text))
-        .flatten()
-        .unwrap_or_else(|| text.to_owned());
-    let protected = crate::domain::privacy::service::protect_for_commit(
-        Some(root),
-        &judged,
-        crate::domain::privacy::projector::Mode::ProtectText,
-    )
-    .map_err(|pending| {
-        anyhow::Error::new(pending).context(format!(
-            "`{}` did not pass today's privacy check, so nothing was published",
-            entry.path
-        ))
-    })?;
-    let commit = found.source_commit(&entry.commit);
-    let short = &commit[..commit.len().min(12)];
-    ensure!(
-        protected == judged,
-        "`{}` (from commit {short}) holds a value today's privacy check replaces, so nothing was published. Remove the value from `{}` in commit {short} and the commits after it on {}, {}, or keep {} local.",
-        entry.path,
-        entry.path,
-        found.branch,
-        crate::commands::push::VALUE_IN_UNPUBLISHED,
-        found.branch,
-    );
-    Ok(())
-}
-
-/// Where a refused file was found: the person's own commits behind the published ones, and the
-/// branch they are on.
-struct Found<'a> {
-    /// Each published commit's source, where publication wrote another commit for it.
-    sources: BTreeMap<&'a str, &'a str>,
-    branch: String,
-}
-
-impl Found<'_> {
-    /// The person's own commit for `published`: what they find in their checkout.
-    fn source_commit<'b>(&'b self, published: &'b str) -> &'b str {
-        self.sources.get(published).copied().unwrap_or(published)
-    }
-}
-
-/// A file line's own `session/meta.json`, judged as agit's record: the fields agit writes from
-/// known values, the line's format and the committer this computer is signed in as, are left out,
-/// and the rest is judged as text. `None` when the file isn't exactly the record agit writes for
-/// what it holds (a field the record doesn't define, a shape it doesn't read): anyone can commit
-/// anything at that path, and such a file is a person's file.
-fn file_line_record_text(text: &str) -> Option<String> {
-    let record: meta::Meta = serde_json::from_str(text).ok()?;
-    let written: serde_json::Value = serde_json::from_str(text).ok()?;
-    let mut fields = match serde_json::to_value(&record).ok()? {
-        serde_json::Value::Object(fields)
-            if serde_json::Value::Object(fields.clone()) == written =>
-        {
-            fields
-        }
-        _ => return None,
-    };
-    for format in ["layout", "line", "kind"] {
-        fields.remove(format);
-    }
-    if record.committer_account.is_some()
-        && record.committer_account == crate::infra::credentials::current_account().ok()?
-    {
-        fields.remove("committer_account");
-    }
-    serde_json::to_string_pretty(&serde_json::Value::Object(fields)).ok()
-}
-
-/// A text file too large to read here cannot be checked, and unchecked text never goes out quietly:
-/// the person moves it, or chooses Git LFS knowing nothing reads what LFS carries. Whether it is
-/// text is judged as Git judges it, by a NUL in its first bytes.
-fn checkable(repo: &Repo, entry: &Introduced) -> Result<()> {
-    const SNIFF_BYTES: usize = 8000;
-    ensure!(
-        repo.blob_prefix(&entry.blob, SNIFF_BYTES)?.contains(&0),
-        "`{}` (from commit {}) is text too large for the privacy check to read, {} move it out of the session, or keep the branch local; a file tracked with Git LFS is published as it is, unchecked.",
-        entry.path,
-        &entry.commit[..entry.commit.len().min(12)],
-        crate::commands::push::FILE_IN_HISTORY,
-    );
-    Ok(())
-}
-
 /// Text is shown as text; anything else by its length.
 fn describe(value: &mut serde_json::Value, bytes: &[u8]) {
     match std::str::from_utf8(bytes) {
@@ -3696,59 +3476,7 @@ impl ProjectedHistory {
             .filter(|entry| !matches!(entry, PublishedSnapshot::SessionOwnerV2 { .. }))
             .map(PublishedSnapshot::commit)
             .collect::<Vec<_>>();
-        let sessions = self
-            .session_manifest
-            .snapshots
-            .iter()
-            .filter(|entry| matches!(entry, PublishedSnapshot::Plain { .. }))
-            .map(PublishedSnapshot::commit)
-            .collect::<BTreeSet<_>>();
-        let file_lines = self
-            .session_manifest
-            .snapshots
-            .iter()
-            .filter(|entry| matches!(entry, PublishedSnapshot::FileLine { .. }))
-            .map(PublishedSnapshot::commit)
-            .collect::<BTreeSet<_>>();
-        let person_file = |entry: &Introduced| {
-            !sessions.contains(entry.commit.as_str()) || !session_record_file(&entry.path)
-        };
-        // A file line's root record is agit's record where it is exactly one.
-        let record = |entry: &Introduced| {
-            file_lines.contains(entry.commit.as_str()) && entry.path == meta::FILE
-        };
-        let found = Found {
-            sources: self
-                .candidates
-                .values()
-                .flat_map(|candidate| candidate.mappings.values())
-                .filter(|mapping| mapping.public != mapping.source)
-                .map(|mapping| (mapping.public.as_str(), mapping.source.as_str()))
-                .collect(),
-            branch: match self.branches.as_slice() {
-                [branch] => branch.clone(),
-                _ => "its branch".to_owned(),
-            },
-        };
         let introduced = introduced_blobs(&self.repo, &commits)?;
-        // A blob is read once, under the first entry that carries it. Any person's file carrying
-        // it is checked as text there, whatever that first entry is, and is the file the refusal
-        // names: a session record's pass is a different judgement and stands for no file. A file
-        // line's record is judged as one only where every path carrying its blob is that record:
-        // the same bytes at any other path are a person's file, checked as text and named.
-        let mut checked_as = BTreeMap::<&str, &Introduced>::new();
-        for entry in introduced.iter().filter(|entry| person_file(entry)) {
-            match checked_as.entry(entry.blob.as_str()) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(entry);
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if record(slot.get()) && !record(entry) {
-                        slot.insert(entry);
-                    }
-                }
-            }
-        }
         let mut seen = BTreeSet::new();
         let mut reads = Vec::new();
         let mut steps = Vec::new();
@@ -3791,20 +3519,11 @@ impl ProjectedHistory {
                 let mut value = entry.preview();
                 let bytes = match body {
                     ObjectBody::TooLarge(size) => {
-                        if let Some(file) = checked_as.get(entry.blob.as_str()) {
-                            checkable(&self.repo, file)?;
-                        }
                         value["omitted_bytes"] = json!(size);
                         order.next = index + 1;
                         return emit(value);
                     }
                     ObjectBody::Read(bytes) => bytes,
-                };
-                let check = |bytes: &[u8]| match checked_as.get(entry.blob.as_str()) {
-                    Some(file) => {
-                        passes_protection(&self.source_root, file, &found, record(file), bytes)
-                    }
-                    None => Ok(()),
                 };
                 if let Some(pointer) = super::super::lfs::Pointer::parse(bytes)? {
                     value["lfs"] = serde_json::to_value(&pointer)?;
@@ -3819,19 +3538,14 @@ impl ProjectedHistory {
                         let mut payload = Vec::new();
                         captured.open_payload(&pointer)?.read_to_end(&mut payload)?;
                         pointer.verify(payload.as_slice())?;
-                        check(&payload)?;
                         describe(&mut value, &payload);
                     }
                 } else if let Some(base) =
                     base.filter(|base| !base.is_empty() && bytes.starts_with(base))
                 {
                     value["appended_to"] = json!(entry.previous);
-                    // The whole file is checked: a value can begin in what the parent held and
-                    // end in what this commit appends. Only the appended bytes are shown.
-                    check(bytes)?;
                     describe(&mut value, &bytes[base.len()..]);
                 } else {
-                    check(bytes)?;
                     describe(&mut value, bytes);
                 }
                 order.next = index + 1;

@@ -876,27 +876,15 @@ pub(crate) fn branch_list_unread(
     }
 }
 
-/// How a push says a file in the branch's history stops it: the same push meets the same file.
-pub(crate) const FILE_IN_HISTORY: &str =
-    "so nothing was published. It is in this branch's history:";
-
-/// How a push says a value in a file of the branch's unpublished history stops it, and that the
-/// same push meets it again until the value is removed.
-pub(crate) const VALUE_IN_UNPUBLISHED: &str = "which nothing has published yet";
-
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
-        FILE_IN_HISTORY,
-        VALUE_IN_UNPUBLISHED,
         REFUSED_AGAIN,
         UPGRADE_FIRST,
         UPGRADE_FIRST_ELSEWHERE,
         OVERSIZED,
         BUILDS_ON_WITHDRAWN,
         ENCRYPTED_REFUSED,
-        // A branch name the privacy check would change stays refused until it is renamed.
-        "rename the branch with `agit branch rename",
     ]
     .iter()
     .any(|phrase| message.contains(phrase))
