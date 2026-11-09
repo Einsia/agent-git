@@ -43,13 +43,19 @@ fn read_in(root: &Path, dir: &Path) -> Option<Workspace> {
 /// Every recorded binding, and whether all of them could be read. A binding file that cannot be
 /// read is left out and makes the listing incomplete rather than failing it.
 pub fn all() -> Result<(Vec<Workspace>, bool)> {
+    let (bindings, unreadable) = all_readable()?;
+    Ok((bindings, unreadable.is_empty()))
+}
+
+/// Every binding that can be read, and the binding files that can't.
+pub fn all_readable() -> Result<(Vec<Workspace>, Vec<PathBuf>)> {
     let entries = match std::fs::read_dir(self::dir()?) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), true)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(e.into()),
     };
     let mut bindings = Vec::new();
-    let mut complete = true;
+    let mut unreadable = Vec::new();
     for entry in entries {
         let path = entry?.path();
         if path.extension().is_none_or(|extension| extension != "json") {
@@ -60,10 +66,10 @@ pub fn all() -> Result<(Vec<Workspace>, bool)> {
             .and_then(|text| serde_json::from_str(&text).ok())
         {
             Some(binding) => bindings.push(binding),
-            None => complete = false,
+            None => unreadable.push(path),
         }
     }
-    Ok((bindings, complete))
+    Ok((bindings, unreadable))
 }
 
 pub fn write(dir: &Path, ws: &Workspace) -> Result<()> {

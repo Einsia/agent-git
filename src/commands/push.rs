@@ -15,8 +15,8 @@ pub(crate) use audited_push::{
     publication_consent_with_client,
 };
 pub(crate) use consent::{
-    ASKED_ENV, AutoConsent, PublicAnswer, answer_public_switch_on, enroll_public_destination,
-    record_unattended, unattended,
+    ASKED_ENV, AutoConsent, PublicAnswer, answer_public_switch_on, confirms_public,
+    enroll_public_destination, record_unattended, unattended,
 };
 mod preview;
 
@@ -826,6 +826,10 @@ pub(crate) const FOLDER_KEEPS_IT: &str =
 /// How a push says that a session branch builds on a session withdrawn on the Hub, read by
 /// project capture as [`OVERSIZED`] is.
 pub(crate) const BUILDS_ON_WITHDRAWN: &str = "builds on a session withdrawn on the Hub";
+
+/// How an automatic push says that automatic upload into a public repository was never switched
+/// on, read by project capture as [`OVERSIZED`] is.
+pub(crate) const PUBLIC_NOT_SWITCHED_ON: &str = "is not switched on";
 
 /// How a push says that the Hub refused it for what it carries, so the same push meets the same
 /// refusal. Project capture reads it as [`OVERSIZED`] is, and offers no retry for it.
