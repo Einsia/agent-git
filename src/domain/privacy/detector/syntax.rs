@@ -71,6 +71,7 @@ pub(super) fn credential_reference_regions(text: &str) -> Vec<(usize, usize)> {
     let mut regions = Vec::new();
     let mut statement = 0;
     let mut function_body = false;
+    let mut python_classes = std::collections::HashSet::new();
     for (i, token) in tokens.iter().enumerate() {
         match token.kind {
             Kind::Boundary | Kind::Symbol(b';' | b'}') => statement = i + 1,
@@ -78,6 +79,27 @@ pub(super) fn credential_reference_regions(text: &str) -> Vec<(usize, usize)> {
         }
         if matches!(token.kind, Kind::Symbol(b';' | b'}')) {
             function_body = false;
+        }
+        if i == statement
+            && word(i) == "class"
+            && !word(i + 1).is_empty()
+            && tokens
+                .get(i + 2)
+                .is_some_and(|token| token.kind == Kind::Symbol(b':'))
+            && tokens
+                .get(i + 3)
+                .is_some_and(|token| token.kind == Kind::Boundary)
+            && tokens.get(i + 4).is_some_and(|body| {
+                let prefix = text[..token.start].rsplit('\n').next().unwrap_or_default();
+                let indent = &text[tokens[i + 3].end..body.start];
+                body.kind == Kind::Word
+                    && prefix.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+                    && indent.starts_with(prefix)
+                    && indent.len() > prefix.len()
+                    && indent.bytes().all(|byte| matches!(byte, b' ' | b'\t'))
+            })
+        {
+            python_classes.insert(word(i + 1));
         }
         match token.kind {
             Kind::Symbol(open @ (b'(' | b'{' | b'[')) => {
@@ -191,13 +213,24 @@ pub(super) fn credential_reference_regions(text: &str) -> Vec<(usize, usize)> {
             && next == i + 1
             && binding
             && (end > next || reference_name(word(next)));
+        // Python bindings omit a declaration keyword. A preceding class declaration supplies
+        // the name's role; spelling alone cannot exempt an unquoted configuration password.
+        let python_reference = token.kind == Kind::Symbol(b'=')
+            && i == statement + 1
+            && tokens[statement].kind == Kind::Word
+            && next == end
+            && python_classes.contains(word(next))
+            && tokens.get(end + 1).is_none_or(|token| {
+                matches!(token.kind, Kind::Boundary | Kind::Symbol(b';'))
+                    || (token.kind == Kind::Symbol(b'(') && closed[end + 1])
+            });
         let qualified_call = end > next
             && scopes.last().is_some_and(|(_, _, executable)| *executable)
             && tokens.get(end + 1).is_some_and(|token| {
                 token.kind == Kind::Symbol(b'{')
                     || (token.kind == Kind::Symbol(b'(') && tokens[end].end == token.start)
             });
-        if annotation || initializer || qualified_call {
+        if annotation || initializer || qualified_call || python_reference {
             regions.push((value.start, tokens[end].end));
         }
     }

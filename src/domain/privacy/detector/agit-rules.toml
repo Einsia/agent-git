@@ -44,6 +44,14 @@ regexes = [
     '''^[A-Za-z]+(?:[._-][A-Za-z]+)+$''',
 ]
 
+# Basic authentication carries a username and password in base64. The scanner validates the
+# decoded separator, so an unrelated base64 value or prose after "Basic" is not enough.
+[[rules]]
+id = "agit-basic-authorization"
+description = "HTTP Basic credential in an authorization header"
+regex = '''(?i)\b(?:proxy-)?authorization["']?[ \t]*:[ \t]*["']?basic[ \t]+([A-Za-z0-9+/]{4,}={0,2})(?:[^A-Za-z0-9+/=]|$)'''
+keywords = ["authorization"]
+
 # A PostHog personal API key reads and writes a project's data. gitleaks has no PostHog rule;
 # the project key (`phc_`) is public by design and stays out.
 [[rules]]

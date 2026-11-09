@@ -433,6 +433,65 @@ mod tests {
         assert!(span(&opted_in, opaque));
     }
 
+    /// A Basic header is evidence only when its payload decodes to a user/password pair.
+    /// Treating the scheme word or arbitrary base64 as enough would hide ordinary text.
+    #[test]
+    fn basic_authorization_requires_a_header_and_decoded_credentials() {
+        let policy = Snapshot::compile(&[], &[], false).unwrap();
+        let value = "dXNlcjpwYXNz";
+        for text in [
+            format!("Authorization: Basic {value}\r\nAccept: application/json"),
+            format!("{{\"Proxy-Authorization\":\"basic {value}\"}}"),
+        ] {
+            let batch = policy.scan(&text, 32);
+            assert!(batch.complete);
+            assert_eq!(batch.findings.len(), 1);
+            assert_eq!(&text[batch.findings[0].start..batch.findings[0].end], value);
+        }
+        for text in [
+            format!("Basic {value}"),
+            "Authorization: Basic bm90LWNyZWRlbnRpYWxz".to_string(),
+            format!("Authorization: Basic {value}="),
+        ] {
+            assert!(policy.scan(&text, 32).findings.is_empty(), "{text}");
+        }
+    }
+
+    /// Digest syntax exempts only bare entropy; a secret field or explicit block still wins.
+    /// Exempting every hexadecimal run would silently publish unlabelled opaque credentials.
+    #[test]
+    fn typed_digests_preserve_stronger_credential_evidence() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let policy = Snapshot::compile(&[], &[], false)
+            .unwrap()
+            .with_entropy(detector::Entropy::Include);
+        let typed = format!("sha256:{digest}");
+        assert!(policy.scan(&typed, 32).findings.is_empty());
+        for text in [
+            digest.to_string(),
+            format!("sha256:{digest}0"),
+            format!("password = \"{typed}\""),
+        ] {
+            assert!(!policy.scan(&text, 32).findings.is_empty(), "{text}");
+        }
+        let blocked = Snapshot::compile(
+            &[Literal {
+                value: digest,
+                source: Source::GlobalUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap();
+        let batch = blocked.scan(&typed, 32);
+        assert_eq!(batch.findings.len(), 1);
+        assert_eq!(batch.findings[0].source, Source::GlobalUser);
+        assert_eq!(
+            &typed[batch.findings[0].start..batch.findings[0].end],
+            digest
+        );
+    }
+
     #[test]
     fn overlapping_blocks_and_heuristics_form_one_reversible_range() {
         let secret = "AKIA2E7YQXK4NMZ5VJ3T";

@@ -550,19 +550,19 @@ pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
                             in_code: code_context(text, name, value),
                         }
                     };
-                    (value, shape)
+                    (value, shape, password_name(name.as_str()))
                 })
             })
         })
-        .filter(|(value, shape)| assigned_credential(value.as_str(), *shape))
-        .filter(|(value, shape)| {
+        .filter(|(value, shape, password)| assigned_credential(value.as_str(), *shape, *password))
+        .filter(|(value, shape, _)| {
             matches!(shape, Shape::Quoted)
                 || !references
                     .get_or_init(|| syntax::credential_reference_regions(text))
                     .iter()
                     .any(|&(start, end)| start <= value.start() && value.end() <= end)
         })
-        .map(|(value, _)| (value.start(), value.end()))
+        .map(|(value, _, _)| (value.start(), value.end()))
         .collect()
 }
 
@@ -579,7 +579,15 @@ pub(crate) fn credential_field_value(field: &str, value: &str) -> bool {
     named
         && (8..=256).contains(&value.len())
         && !value.contains(['\n', '\r'])
-        && assigned_credential(value, Shape::Quoted)
+        && assigned_credential(value, Shape::Quoted, password_name(field))
+        && !rules::preset_allows(value)
+}
+
+fn password_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["password", "passwd", "passphrase", "pwd"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 fn credential_name(name: &str) -> bool {
@@ -647,7 +655,7 @@ fn code_context(text: &str, name: regex::Match<'_>, value: regex::Match<'_>) -> 
 /// (`secret_filter::Session`, `token: &State`) is code; so is a digit-free camel-case identifier
 /// in a program declaration. Elsewhere a camel-shaped value is still a credential, since random
 /// and passphrase passwords take that shape too.
-fn assigned_credential(value: &str, shape: Shape) -> bool {
+fn assigned_credential(value: &str, shape: Shape, password: bool) -> bool {
     let code = match shape {
         Shape::Quoted => false,
         Shape::Unquoted { in_code } => {
@@ -683,10 +691,30 @@ fn assigned_credential(value: &str, shape: Shape) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"/._-~".contains(&byte));
     let location = value.contains("://") || path;
+    // Documentation markers name a credential kind; an arbitrary uppercase or snake-case
+    // string is still a literal password when quoted.
+    let placeholder = value.strip_prefix("YOUR_").is_some_and(|kind| {
+        matches!(
+            kind.strip_suffix("_HERE").unwrap_or(kind),
+            "PASSWORD"
+                | "PASSWD"
+                | "PASSPHRASE"
+                | "PWD"
+                | "SECRET"
+                | "TOKEN"
+                | "API_KEY"
+                | "ACCESS_KEY"
+                | "PRIVATE_KEY"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+        )
+    });
     let reference = environment
         || location
+        || placeholder
         || (value.contains('.') && value.split('.').all(identifier))
-        || (value.contains('_')
+        || (matches!(shape, Shape::Unquoted { .. })
+            && value.contains('_')
             && value.split('_').all(|word| {
                 !word.is_empty()
                     && (word
@@ -697,7 +725,11 @@ fn assigned_credential(value: &str, shape: Shape) -> bool {
     let mixed_alpha = value.bytes().any(|byte| byte.is_ascii_uppercase())
         && value.bytes().any(|byte| byte.is_ascii_lowercase());
     let has_digit = value.bytes().any(|byte| byte.is_ascii_digit());
-    !code && !reference && (mixed_alpha || has_digit) && rules::shannon(value) >= 3.5
+    // A password field supplies evidence even when a human-chosen value has little entropy.
+    // Other credential-like names still need entropy to distinguish opaque data from prose.
+    !code
+        && !reference
+        && (password || ((mixed_alpha || has_digit) && rules::shannon(value) >= 3.5))
 }
 
 /// Words that each start with one capital and continue in lowercase letters or digits, after an
@@ -811,6 +843,7 @@ pub(crate) fn entropy_candidate_spans(
                 && rules::shannon(candidate) >= floor
                 && (mixed_alpha || has_digit || is_hex)
                 && !base64_media_payload(text, start)
+                && (credential_field || !typed_digest(text, start, end))
             {
                 let span = (start, end);
                 start = end;
@@ -819,6 +852,30 @@ pub(crate) fn entropy_candidate_spans(
             start = end;
         }
         None
+    })
+}
+
+/// A digest's algorithm marker and exact hexadecimal width exempt only bare entropy.
+/// Credential assignments and explicit blocks retain their independent authority.
+fn typed_digest(text: &str, start: usize, end: usize) -> bool {
+    let before = &text[..start];
+    [
+        ("sha1:", 40),
+        ("sha256:", 64),
+        ("sha384:", 96),
+        ("sha512:", 128),
+    ]
+    .iter()
+    .any(|(marker, width)| {
+        end - start == *width
+            && before.ends_with(marker)
+            && before[..before.len() - marker.len()]
+                .bytes()
+                .next_back()
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric() && byte != b'_')
+            && text[start..end]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
     })
 }
 
@@ -1029,6 +1086,7 @@ mod tests {
             "let mut token=OAuth2AuthenticationToken;",
             "match key { \"secrets.keystore\" => config::SecretKeystore::parse(v).is_some(), }",
             "let relay = super::Relay { credentials: super::Credentials {} };",
+            "class OAuthProviderV2:\n    pass\ntoken = OAuthProviderV2()\npassword = OAuthProviderV2\n",
         ] {
             assert!(scan_high_confidence(text, 32).findings.is_empty(), "{text}");
         }
@@ -1080,6 +1138,11 @@ mod tests {
             "interface Auth { password: c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0; }",
             "fn new(credential: c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0)",
             "struct Auth { credential: secret_store::c7Zq4xR2mNv8LpT3wYb6Ks1Hd9Fg5Jt0, }",
+            "password = OAuthProviderV2",
+            "# class OAuthProviderV2:\npassword = OAuthProviderV2",
+            "class OAuthProviderV2:\npassword = OAuthProviderV2",
+            "\"class OAuthProviderV2:\"\npassword = OAuthProviderV2",
+            "class OAuthProviderV2:\n    pass\npassword = 'OAuthProviderV2'",
         ] {
             assert!(
                 scan_high_confidence(text, 32)
@@ -1089,6 +1152,32 @@ mod tests {
                 "{text}"
             );
         }
+        let literals = concat!(
+            "password = \"cedar_river\"\n",
+            "administrator_login_password = \"MAPLE_RIVER7\"\n",
+            "passphrase = 'spruce_meadow'\n",
+            "password = \"YOUR_PASSWORD7\"\n",
+            "password = \"$DB_PASSWORD\"\n",
+            "password = \"${DB_PASSWORD}\"\n",
+            "password = \"%DB_PASSWORD%\"\n",
+            "password = \"YOUR_PASSWORD\"\n",
+            "password = \"YOUR_PASSWORD_HERE\"\n",
+        );
+        let batch = scan_high_confidence(literals, 32);
+        assert!(batch.complete);
+        assert_eq!(
+            batch
+                .findings
+                .iter()
+                .map(|hit| &literals[hit.start..hit.end])
+                .collect::<Vec<_>>(),
+            [
+                "cedar_river",
+                "MAPLE_RIVER7",
+                "spruce_meadow",
+                "YOUR_PASSWORD7"
+            ]
+        );
         let provider = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
         let source = format!("const token={provider};");
         assert!(
