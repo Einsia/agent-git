@@ -3132,6 +3132,133 @@ async fn idle_settlement_retries_a_failed_archive_before_publishing() {
     assert!(!session.idle_settlement_ready());
 }
 
+/// A turn whose settlement stopped at the privacy check lands while the session is idle, with no
+/// later turn and no stop. Twice over:
+/// - The settlement records a deadline wait and settles nothing, the idle retry it keeps comes
+///   due, and the next settlement, the worker no longer slow, commits the turn, uploads it and
+///   clears the wait.
+/// - The same while an earlier turn waits for its upload: delivering that turn doesn't end the
+///   retry the waiting one still needs.
+///
+/// A supervisor that reset its retry after a settlement that settled nothing, or after a
+/// delivery, or retried without reading the wait the commit recorded, would leave the turn
+/// unsettled until another turn or the session's stop.
+#[cfg(unix)]
+#[test]
+fn a_turn_whose_settlement_waited_for_the_privacy_check_lands_while_idle() {
+    const CHILD: &str = "AGIT_RC_PRIVACY_WAIT_SETTLE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rc::supervisor::settle_tests::a_turn_whose_settlement_waited_for_the_privacy_check_lands_while_idle",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("AGIT_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(home.path().join("completed").exists(), "{output:?}");
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use crate::domain::privacy::pending;
+            let fixture = SettlementFixture::new(true);
+            let script = std::fs::read_to_string(&fixture.exe).unwrap();
+            let home = crate::infra::config::agit_home().unwrap();
+            let waits = home.join("privacy-pending.json");
+            let commits = fixture.repo.join(".git/commit-count");
+            let pushes = fixture.repo.join(".git/push-count");
+            // The second and fourth commits are the ones whose privacy check missed its deadline:
+            // each records the wait under the conversation's claim and settles nothing, as the
+            // real `agit commit --from-supervisor` does. The first push fails, so the first turn
+            // still waits for its upload when the second settlement runs.
+            let commit_step = format!(
+                "commit)\n    n=$(cat '{commits}' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '{commits}'\n    \
+                 if [ $n = 2 ] || [ $n = 4 ]; then\n        \
+                 printf '%s' '{{\"test-session\":{{\"reason\":\"deadline\",\"turns\":1,\"since\":0}}}}' > '{waits}'\n        \
+                 exit 0\n    fi\n    rm -f '{waits}'\n",
+                commits = commits.display(),
+                waits = waits.display(),
+            );
+            let push_step = format!(
+                "push)\n    p=$(cat '{pushes}' 2>/dev/null || echo 0); p=$((p + 1)); echo $p > '{pushes}'\n    \
+                 if [ $p = 1 ]; then exit 7; fi\n",
+                pushes = pushes.display(),
+            );
+            std::fs::write(
+                &fixture.exe,
+                script
+                    .replace("commit)\n", &commit_step)
+                    .replace("push)\n", &push_step),
+            )
+            .unwrap();
+            let (mut session, mut out, _notes, _authority, _lease) = fixture.session();
+            let settled = |frames: Vec<Frame>| {
+                frames
+                    .iter()
+                    .filter(|frame| frame.method() == method::COMMIT_SETTLED)
+                    .count()
+            };
+
+            // An earlier turn is saved, and its upload fails.
+            let before = fixture.head();
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(settled(frames), 0);
+            let first = fixture.head();
+            assert_ne!(first, before);
+            idle_retry_comes_due(&mut session).await;
+            // This turn's check misses its deadline while the earlier turn's upload goes through.
+            let delivered = only_settled_frame(
+                settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await,
+            );
+            assert_eq!(delivered.commit_sha, first);
+            assert_eq!(fixture.head(), first);
+            assert_eq!(pending::load()["test-session"].reason, "deadline");
+            idle_retry_comes_due(&mut session).await;
+            let landed = only_settled_frame(
+                settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await,
+            );
+            assert_ne!(landed.commit_sha, first);
+            assert_eq!(fixture.tracking(), landed.commit_sha);
+            assert!(!pending::load().contains_key("test-session"));
+
+            // With nothing else waiting for its upload.
+            let frames = settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await;
+            assert_eq!(settled(frames), 0);
+            assert_eq!(fixture.head(), landed.commit_sha);
+            assert_eq!(pending::load()["test-session"].reason, "deadline");
+            idle_retry_comes_due(&mut session).await;
+            let next = only_settled_frame(
+                settle_draining(&mut session, &mut out, SettlementBoundary::Turn).await,
+            );
+            assert_ne!(next.commit_sha, landed.commit_sha);
+            assert_eq!(fixture.tracking(), next.commit_sha);
+            assert!(!pending::load().contains_key("test-session"));
+            assert!(!session.idle_settlement_ready());
+            session.driver.shutdown().await.unwrap();
+            std::fs::write(home.join("completed"), "").unwrap();
+        });
+}
+
+/// Waits for the session's idle retry, which a turn still waiting to settle or upload keeps, and
+/// finds the session ready to settle again when it comes due.
+#[cfg(unix)]
+async fn idle_retry_comes_due(session: &mut Session) {
+    let retry = session
+        .publication_retry
+        .next
+        .expect("a turn that waits keeps an idle retry");
+    tokio::time::sleep_until(retry).await;
+    assert!(session.idle_settlement_ready());
+}
+
 /// A stop nobody chose (a service manager's SIGTERM, an upgrade restart) archives the turn it
 /// interrupts, through the interrupt Claude writes for it, while a person's stop (`agit rc stop`)
 /// holds the same turn like their own interrupt and queues nothing. A stop that holds both keeps

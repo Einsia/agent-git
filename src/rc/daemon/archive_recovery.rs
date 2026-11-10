@@ -9,9 +9,15 @@ use tokio::time::Instant;
 
 const CYCLE: Duration = Duration::from_secs(5);
 const BATCH: usize = 16;
-/// A privacy wait can end by itself (a deadline, a worker back-off) without anything recording
-/// that it did, so a job waiting on one is attempted again after this long.
+/// A privacy wait whose cause the person ends (their rules unreadable) is attempted again after
+/// this long, in case it ended without anything recording that it did.
 const PRIVACY_RECHECK: Duration = Duration::from_secs(30 * 60);
+/// A wait that ends by itself (a deadline, a busy or backing-off worker) whose quick tries are
+/// spent is attempted again after this long, doubling on each further wait up to
+/// [`TRANSIENT_RECHECK_MAX`]: a machine loaded for a while holds a finished turn for minutes,
+/// not for the half hour a person's own cause is given.
+const TRANSIENT_RECHECK: Duration = Duration::from_secs(60);
+const TRANSIENT_RECHECK_MAX: Duration = Duration::from_secs(10 * 60);
 /// A wait whose reason is only that the worker did not answer in time (see
 /// [`crate::domain::privacy::service::transient`]) is asked again this many times, this far
 /// apart, before its job parks: a finished turn is not held for the recheck because the worker
@@ -469,11 +475,23 @@ enum Until {
 }
 
 impl Park {
-    fn privacy(claim: Option<String>, wait: Option<pending::Waiting>, now: Instant) -> Self {
-        let recheck = wait
-            .as_ref()
-            .is_none_or(|wait| wait.refused_bytes.is_none())
-            .then(|| now + retry_delay(PRIVACY_RECHECK));
+    /// `waits` counts the parks this capture's transient waits have had since its last success.
+    fn privacy(
+        claim: Option<String>,
+        wait: Option<pending::Waiting>,
+        now: Instant,
+        waits: u32,
+    ) -> Self {
+        let recheck = match wait.as_ref() {
+            Some(wait) if wait.refused_bytes.is_some() => None,
+            Some(wait) if crate::domain::privacy::service::transient(&wait.reason) => Some(
+                TRANSIENT_RECHECK
+                    .saturating_mul(2_u32.saturating_pow(waits.min(16)))
+                    .min(TRANSIENT_RECHECK_MAX),
+            ),
+            _ => Some(PRIVACY_RECHECK),
+        }
+        .map(|after| now + retry_delay(after));
         Self {
             claim,
             until: Until::Privacy { wait, recheck },
@@ -508,6 +526,8 @@ struct Schedule {
     retry: HashMap<String, Retry>,
     /// The quick tries each capture has used since its last success.
     quick: HashMap<String, u32>,
+    /// The parks each capture's transient privacy waits have had since its last success.
+    transient_parks: HashMap<String, u32>,
     /// Jobs that wait for their claim or for state outside the job.
     parked: HashMap<String, Park>,
     /// Jobs this daemon has considered; the schedule starts empty after a restart.
@@ -524,6 +544,8 @@ impl Schedule {
         self.seen.retain(|id| ids.contains(id));
         self.retry.retain(|capture, _| captures.contains(capture));
         self.quick.retain(|capture, _| captures.contains(capture));
+        self.transient_parks
+            .retain(|capture, _| captures.contains(capture));
     }
 
     /// Whether the next attempt of `job` is one of its quick tries.
@@ -567,7 +589,7 @@ impl Schedule {
             // at once would meet the same wait.
             self.parked.insert(
                 id,
-                Park::privacy(evidence.claim.clone(), evidence.privacy.clone(), now),
+                Park::privacy(evidence.claim.clone(), evidence.privacy.clone(), now, 0),
             );
             return false;
         }
@@ -581,6 +603,7 @@ impl Schedule {
             Outcome::Published => {
                 self.retry.remove(&job.capture_key());
                 self.quick.remove(&job.capture_key());
+                self.transient_parks.remove(&job.capture_key());
                 self.parked.remove(&job.filename());
                 return;
             }
@@ -627,7 +650,10 @@ impl Schedule {
                     "agitd: completed turn archive waits for the privacy check ({}, turn {}); `agit status` names the reason",
                     job.logical, job.turn_id
                 );
-                Some(Park::privacy(evidence.claim, evidence.privacy, now))
+                let waits = self.transient_parks.entry(job.capture_key()).or_default();
+                let park = Park::privacy(evidence.claim, evidence.privacy, now, *waits);
+                *waits = waits.saturating_add(1);
+                Some(park)
             }
             Class::Waits(Waiting::PushDisabled) => {
                 eprintln!(
@@ -1098,10 +1124,12 @@ mod tests {
     }
 
     /// A wait whose reason is only that the worker did not answer in time is asked again a few
-    /// times, a short delay apart, and only then parks; one whose reason a retry meets again parks
-    /// at once, as does a refused record. A restart that finds a transient wait recorded tries
-    /// at once. A schedule that parked every wait would hold a finished turn for the recheck
-    /// because the worker was slow to start once.
+    /// times, a short delay apart, and only then parks, for minutes that double up to a cap; one
+    /// whose reason a retry meets again parks at once for the long recheck, as a refused record
+    /// parks for good. A restart that finds a transient wait recorded tries at once. A schedule
+    /// that parked every wait would hold a finished turn for the recheck because the worker was
+    /// slow to start once, and one that gave a transient wait the long recheck would hold it for
+    /// half an hour on a machine loaded for a few minutes.
     #[test]
     fn a_worker_that_did_not_answer_in_time_is_asked_again_shortly_before_the_job_parks() {
         let root = tempfile::tempdir().unwrap();
@@ -1129,10 +1157,18 @@ mod tests {
             now += QUICK_DELAY;
             assert!(schedule.due(&job, &slow, now));
         }
-        schedule.record(&job, error(), slow.clone(), now);
-        assert!(!schedule.due(&job, &slow, now + QUICK_DELAY));
-        assert!(!schedule.due(&job, &slow, now + PRIVACY_RECHECK / 2));
-        assert!(schedule.due(&job, &slow, now + PRIVACY_RECHECK));
+        // Its quick tries spent, it parks for a minute, then for twice as long each time, up to
+        // ten minutes, never for the half hour a cause the person must end is given.
+        let mut recheck = TRANSIENT_RECHECK;
+        for _ in 0..5 {
+            schedule.record(&job, error(), slow.clone(), now);
+            assert!(!schedule.due(&job, &slow, now + recheck - QUICK_DELAY));
+            now += recheck;
+            assert!(schedule.due(&job, &slow, now));
+            recheck = (recheck * 2).min(TRANSIENT_RECHECK_MAX);
+        }
+        assert_eq!(recheck, TRANSIENT_RECHECK_MAX);
+        assert!(TRANSIENT_RECHECK_MAX < PRIVACY_RECHECK);
         schedule.record(&job, Outcome::Published, claimed(Some("claim")), now);
         schedule.record(&job, error(), slow.clone(), now);
         assert!(schedule.due(&job, &slow, now + QUICK_DELAY));

@@ -121,6 +121,7 @@ pub(super) fn harness_test_session_with_channels(
         pending_settlement: None,
         publication: None,
         publication_retry: PublicationRetry::default(),
+        privacy_claim: None,
         reported_settlement_failure: None,
         local_settlement: None,
         settlement_due: false,
@@ -3041,4 +3042,38 @@ async fn a_colleague_queues_into_a_session_that_ran_without_checks() {
             .contains("does not offer a shared native queue"),
         "{error:#}"
     );
+}
+
+/// A settlement that stopped at the privacy check settled no new turn, and nothing else settles
+/// that turn before the next one ends, so the idle retry keeps running while a wait that can end
+/// is recorded: a worker that was only slow, or rules the person makes readable again. A
+/// settlement that reset the timer, as one with nothing left does, would leave the turn unsaved
+/// until another turn or the session's stop. A record refused for its size meets the same
+/// refusal on every try, so it waits for nothing.
+#[tokio::test(start_paused = true)]
+async fn a_settlement_stopped_at_the_privacy_check_is_tried_again_while_idle() {
+    use crate::domain::privacy::pending::Waiting;
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let mut session = harness_test_session(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Idle,
+    );
+    let wait = |reason: &str, refused_bytes: Option<u64>| Waiting {
+        reason: reason.into(),
+        turns: 1,
+        since: 0,
+        refused_bytes,
+    };
+    for (wait, retried) in [
+        (Some(wait("deadline", None)), true),
+        (Some(wait("device_rules", None)), true),
+        (Some(wait("oversize", Some(9 << 20))), false),
+        (None, false),
+    ] {
+        session.publication_retry = PublicationRetry::default();
+        session.after_settling_nothing(wait.as_ref());
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        assert_eq!(session.publication_retry.due(), retried, "{wait:?}");
+    }
 }

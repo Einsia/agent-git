@@ -172,6 +172,38 @@ struct PublicationRetry {
     next: Option<tokio::time::Instant>,
 }
 
+impl Session {
+    /// After a settlement that settled no new turn. One that stopped at a privacy wait leaves its
+    /// turn unsettled, so the idle retry keeps running until the turn lands: the wait ends by
+    /// itself when the worker was only slow or busy, and when the person ends its cause (their
+    /// rules readable again), and nothing else settles the turn before the next one ends. A
+    /// record refused for its size meets the same refusal on every try, so it doesn't retry. A
+    /// settlement that reset the timer here would leave such a turn unsaved until another turn or
+    /// the session's stop, however long that is.
+    fn after_settling_nothing(&mut self, wait: Option<&crate::domain::privacy::pending::Waiting>) {
+        match wait.filter(|wait| wait.refused_bytes.is_none()) {
+            Some(wait) if crate::domain::privacy::service::transient(&wait.reason) => {
+                self.publication_retry.failed();
+            }
+            Some(_) => self.publication_retry.refused(),
+            None => self.publication_retry = PublicationRetry::default(),
+        }
+    }
+
+    /// Where a settlement or a publication would leave nothing more to do: the retry stops only
+    /// if no privacy wait is recorded for this conversation. A publication that delivered an
+    /// earlier turn says nothing about a later one whose settlement stopped at the check, so
+    /// clearing the timer there would strand that turn as surely as a settlement that settled
+    /// nothing.
+    fn retry_while_a_turn_waits(&mut self) {
+        let wait = self
+            .privacy_claim
+            .as_ref()
+            .and_then(|claim| crate::domain::privacy::pending::load().remove(claim));
+        self.after_settling_nothing(wait.as_ref());
+    }
+}
+
 impl PublicationRetry {
     fn failed(&mut self) {
         self.schedule(300);
@@ -962,6 +994,8 @@ pub struct Session {
     /// Publication owns the repository writer until its process tree has finished.
     publication: Option<Publication>,
     publication_retry: PublicationRetry,
+    /// The claim this conversation's settlements record a privacy wait under, once one has run.
+    privacy_claim: Option<String>,
     /// The settlement failure the client was last told about. The same failure recurs until
     /// the transcript or the branch changes, and one notice is enough.
     reported_settlement_failure: Option<String>,
@@ -1531,6 +1565,7 @@ impl Session {
             pending_settlement: None,
             publication: None,
             publication_retry: PublicationRetry::default(),
+            privacy_claim: None,
             reported_settlement_failure: None,
             local_settlement: None,
             settlement_due: false,
@@ -3395,7 +3430,7 @@ impl Session {
                     self.apply_publication_delivery(delivery);
                 }
                 if acknowledged {
-                    self.publication_retry = PublicationRetry::default();
+                    self.retry_while_a_turn_waits();
                 } else {
                     self.publication_retry.failed();
                 }
@@ -3644,6 +3679,12 @@ impl Session {
         let Ok(prepared_file) = tempfile::NamedTempFile::new_in(repo_dir.join(".git")) else {
             return deferred_command;
         };
+        let claim = self
+            .info
+            .native_source
+            .as_ref()
+            .map(|source| source.session_ref(&thread_id))
+            .unwrap_or_else(|| thread_id.clone());
         let mut strict_commit = command(&["commit", "--from-supervisor"]);
         strict_commit
             .env(crate::commands::commit::SUPERVISOR_RESULT_ENV, result_file.path())
@@ -3652,7 +3693,7 @@ impl Session {
                 crate::commands::commit::archive::NATIVE_ENV,
                 serde_json::json!({
                     "runtime": crate::adapter::normalize(&self.info.runtime).map(str::to_owned).unwrap_or_else(|_| self.info.runtime.clone()),
-                    "session_id": self.info.native_source.as_ref().map(|source| source.session_ref(&thread_id)).unwrap_or_else(|| thread_id.clone()),
+                    "session_id": claim,
                 })
                 .to_string(),
             );
@@ -3686,6 +3727,7 @@ impl Session {
             expected_agent_id,
             journal_boundary,
             push,
+            claim,
         };
         self.local_commit_with_reads(request, context, commands, &mut deferred_command)
             .await;
@@ -3706,10 +3748,12 @@ impl Session {
             expected_agent_id,
             journal_boundary,
             mut push,
+            claim,
         } = context;
         if !settlement_lease_is_current(&self.settlement, lease) {
             return;
         }
+        self.privacy_claim = Some(claim);
         let settlement_io::LocalCommit {
             before,
             output: commit,
@@ -3781,8 +3825,10 @@ impl Session {
         };
         self.reported_settlement_failure = None;
         let Some(sha) = candidate else {
-            self.publication_retry = PublicationRetry::default();
-            return; // strict commit succeeded but produced no new turn
+            // The commit succeeded and settled no new turn: either nothing was left, or it
+            // stopped at the privacy check, which it recorded.
+            self.retry_while_a_turn_waits();
+            return;
         };
         if lease.local_owner {
             let mut notification = Frame::notification(
