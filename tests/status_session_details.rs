@@ -550,7 +550,7 @@ impl Lab {
             if let Some(text) = text {
                 assert!(
                 text.contains(
-                    "session\truntime\trepo\tbranch\tlast commit\tpending activity\tlocal instance\tproject"
+                    "session\truntime\trepo\tbranch\tlast commit\tpending activity\tlocal instance\tproject\tupload"
                 ),
                 "{text}"
             );
@@ -559,7 +559,7 @@ impl Lab {
                     .find(|line| line.starts_with(&format!("{SID}\tcodex\t")))
                     .expect("selected session row missing");
                 let fields = selected.split('\t').collect::<Vec<_>>();
-                assert_eq!(fields.len(), 8, "{text}");
+                assert_eq!(fields.len(), 9, "{text}");
                 assert_eq!(fields[2], "alice/notes");
                 assert_eq!(fields[3], "topic");
                 if badge.starts_with("current")
@@ -629,7 +629,7 @@ impl Lab {
                     .find(|line| line.starts_with(&format!("{SID}\tcodex\t")))
                     .unwrap();
                 let fields = row.split('\t').collect::<Vec<_>>();
-                assert_eq!(fields.len(), 8, "{text}");
+                assert_eq!(fields.len(), 9, "{text}");
                 assert_eq!(fields[7], expected, "{text}");
                 assert!(text.contains("no session target supplied through AGIT_SESSION"));
             }
@@ -1566,6 +1566,125 @@ fn pagination_preserves_identity_rows_and_bounds_native_detail_inspection() {
             );
         }
     }
+}
+
+/// Whether the Hub has a conversation comes from refs alone, so a row past the eighth, whose
+/// transcript the page doesn't inspect, still says it is uploaded, waiting or not uploaded. A
+/// claim whose branch this computer doesn't have says nothing.
+#[test]
+fn every_status_row_says_whether_the_hub_has_it_without_inspecting_the_transcript() {
+    let lab = Lab::new();
+    for index in 0..8 {
+        let mut claim = lab.claim.clone();
+        claim.session_id = format!("00000000-0000-4000-8000-{index:012}");
+        claim.branch = Some(format!("unavailable-{index}"));
+        link::write(&lab.store, &claim).unwrap();
+    }
+    let tree = lab.git(&["rev-parse", "HEAD^{tree}"]);
+    let older = lab.git(&["commit-tree", &tree, "-m", "an older upload"]);
+    for (remote, expected, token) in [
+        (Some(lab.head.as_str()), "uploaded", Some("uploaded")),
+        (Some(older.as_str()), "waiting", Some("waiting")),
+        (None, "not uploaded", Some("not_uploaded")),
+    ] {
+        match remote {
+            Some(commit) => lab.git(&["update-ref", "refs/remotes/origin/topic", commit]),
+            None => lab.git(&["update-ref", "-d", "refs/remotes/origin/topic"]),
+        };
+        let refs = lab.git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+        for json in [false, true] {
+            let mut command = lab.command(env!("CARGO_BIN_EXE_agit"));
+            if json {
+                command.args(["--json", "--json-version", "2"]);
+            }
+            let output = command
+                .args(["status", "--offset", "0", "--limit", "9"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            if json {
+                let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                let rows = document["result"]["value"]["sessions"]["items"]
+                    .as_array()
+                    .unwrap();
+                let row = rows.iter().find(|row| row["session_id"] == SID).unwrap();
+                assert_eq!(
+                    row["pending_activity"],
+                    "unavailable: per-page inspection limit"
+                );
+                assert_eq!(row["upload"].as_str(), token, "{row:#}");
+                let others = rows.iter().filter(|row| row["session_id"] != SID);
+                assert!(
+                    others.clone().count() == 8
+                        && others.into_iter().all(|row| row["upload"].is_null())
+                );
+            } else {
+                let text = std::str::from_utf8(&output.stdout).unwrap();
+                let fields = text
+                    .lines()
+                    .find(|line| line.starts_with(&format!("{SID}\tcodex\t")))
+                    .unwrap()
+                    .split('\t')
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    fields[5], "unavailable: per-page inspection limit",
+                    "{text}"
+                );
+                assert_eq!(fields[8], expected, "{text}");
+            }
+        }
+        assert_eq!(
+            lab.git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+            refs
+        );
+    }
+}
+
+/// The upload column names its refs' objects and reads no commit, so an unreadable commit on
+/// another branch, here one Git would wait on forever, can't hold the page past its deadline.
+#[cfg(unix)]
+#[test]
+fn the_upload_column_reads_no_commit() {
+    let lab = Lab::new();
+    for index in 0..8 {
+        let mut claim = lab.claim.clone();
+        claim.session_id = format!("00000000-0000-4000-8000-{index:012}");
+        claim.branch = Some(format!("unavailable-{index}"));
+        link::write(&lab.store, &claim).unwrap();
+    }
+    lab.git(&["update-ref", "refs/remotes/origin/topic", &lab.head]);
+    let tree = lab.git(&["rev-parse", "HEAD^{tree}"]);
+    let elsewhere = lab.git(&["commit-tree", &tree, "-m", "a commit Git can't read"]);
+    lab.git(&["update-ref", "refs/heads/elsewhere", &elsewhere]);
+    let object = lab
+        .repo
+        .root()
+        .join(".git/objects")
+        .join(&elsewhere[..2])
+        .join(&elsewhere[2..]);
+    fs::remove_file(&object).unwrap();
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(object.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let output = status_output(lab.command(env!("CARGO_BIN_EXE_agit")).args([
+        "--json",
+        "--json-version",
+        "2",
+        "status",
+        "--offset",
+        "0",
+        "--limit",
+        "9",
+    ]));
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = document["result"]["value"]["sessions"]["items"]
+        .as_array()
+        .unwrap();
+    let row = rows.iter().find(|row| row["session_id"] == SID).unwrap();
+    assert_eq!(row["upload"], "uploaded", "{row:#}");
 }
 
 #[test]

@@ -142,6 +142,33 @@ pub fn read(repo: &Repo) -> crate::Result<Option<RemoteIdentity>> {
     let Some(raw) = repo.git_opt(&["config", "--local", "--get", CONFIG_KEY]) else {
         return Ok(None);
     };
+    parse(repo, &raw).map(Some)
+}
+
+/// [`read`], with its Git read within `deadline` and its output bounded, for an inspection that
+/// must not wait on Git.
+#[cfg(feature = "cli")]
+pub(crate) fn read_within(
+    repo: &Repo,
+    deadline: crate::infra::local_git::Deadline,
+) -> crate::Result<Option<RemoteIdentity>> {
+    let output = repo.inspection_output_with_deadline(
+        &["config", "--local", "--get", CONFIG_KEY],
+        64 * 1024,
+        deadline,
+    )?;
+    // `git config --get` exits 1, saying nothing, when the key is unset.
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "the remote identity can't be read"
+    );
+    parse(repo, std::str::from_utf8(&output.stdout)?).map(Some)
+}
+
+fn parse(repo: &Repo, raw: &str) -> crate::Result<RemoteIdentity> {
     let parsed: RemoteIdentity = serde_json::from_str(raw.trim()).with_context(|| {
         format!(
             "the remote identity in {} is malformed; refusing to guess which remote this checkout belongs to",
@@ -150,7 +177,7 @@ pub fn read(repo: &Repo) -> crate::Result<Option<RemoteIdentity>> {
     })?;
     // A non-canonical stored form is normalized on read; no value is silently accepted under a
     // second comparison rule.
-    RemoteIdentity::new(&parsed.hub, &parsed.agent_id).map(Some)
+    RemoteIdentity::new(&parsed.hub, &parsed.agent_id)
 }
 
 /// Write the pin for the first time; re-running with the same value is a no-op, and a different
@@ -367,6 +394,24 @@ mod tests {
         let other = RemoteIdentity::new("https://hub.test", &id(2)).unwrap();
         assert!(pin(&repo, &other).is_err());
         assert_eq!(read(&repo).unwrap(), Some(first));
+    }
+
+    /// The bounded read gives what `read` gives while its deadline holds, and nothing once it has
+    /// passed: `agit status` reads the pin this way and must not wait on Git.
+    #[test]
+    fn the_bounded_pin_read_answers_only_within_its_deadline() {
+        use crate::infra::local_git::Deadline;
+        let d = tempfile::tempdir().unwrap();
+        let repo = Repo::init(d.path()).unwrap();
+        let inspection = repo.clone().exact_root_inspection();
+        assert_eq!(read_within(&inspection, Deadline::new()).unwrap(), None);
+        let first = RemoteIdentity::new("https://hub.test", &id(1)).unwrap();
+        pin(&repo, &first).unwrap();
+        assert_eq!(
+            read_within(&inspection, Deadline::new()).unwrap(),
+            Some(first)
+        );
+        assert!(read_within(&inspection, Deadline::at(std::time::Instant::now())).is_err());
     }
 
     #[test]

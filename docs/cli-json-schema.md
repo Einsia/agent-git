@@ -188,6 +188,14 @@ origin is ordinary absence. These labels do not select a session or prove a live
 process. Project inspection shares the page deadline, reads at most eight branch
 metadata blobs capped at 1 MiB each, and caps origin output at 16 KiB. Final claim
 inventory changes invalidate project labels alongside the other observed details.
+
+The appended `upload` field is `uploaded`, `waiting`, `not_uploaded` or null, with the meanings
+`agit project list --json` gives them. It is read from the recorded repository's local and
+remote-tracking refs, and from its accepted publication record, for every displayed row,
+including rows past the eighth, whose transcripts the page doesn't inspect. The ref read names
+objects without reading a commit and shares the page deadline. It is null when the claim names
+no repository or branch, when this computer has no such branch, or when the refs can't be read
+in time. Final claim inventory changes reset it to null with the other details.
 Superseded and merge-exploration rows may report their recorded cwd match, but
 their code-origin relationship remains unavailable.
 

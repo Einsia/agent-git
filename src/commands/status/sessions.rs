@@ -92,7 +92,115 @@ fn initial_row(claim: &link::Link) -> Vec<String> {
         "unavailable: incomplete claim".into(),
         "incomplete claim; process unverified".into(),
         super::project::UNAVAILABLE.into(),
+        "—".into(),
     ]
+}
+
+/// A repository a page reads for its upload column, opened once, with its accepted publication
+/// record read when a row needs it.
+struct Uploads {
+    repo: Repo,
+    projections: Option<crate::domain::privacy_git::Projections>,
+}
+
+/// Whether the Hub has the claim's branch, for every row of a page: the eight-row bound is on
+/// transcript inspection, and a saved conversation past it is still uploaded or not. It answers
+/// as `agit project list` does, from the branch's two refs and the accepted publication record,
+/// and reads no commit.
+fn upload(
+    repos: &mut std::collections::BTreeMap<String, Option<Uploads>>,
+    claim: &link::Link,
+    deadline: Deadline,
+) -> String {
+    let (Some(owner), Some(name), Some(branch)) = (&claim.owner, &claim.agent, &claim.branch)
+    else {
+        return "—".into();
+    };
+    let Some(uploads) = repos
+        .entry(format!("{owner}/{name}"))
+        .or_insert_with(|| {
+            let repo = Repo::open(config::repo_dir(owner, name).ok()?)?;
+            Some(Uploads {
+                repo: repo.exact_root_inspection(),
+                projections: None,
+            })
+        })
+        .as_mut()
+    else {
+        return "—".into();
+    };
+    let Some((Some(head), remote)) = upload_heads(&uploads.repo, branch, deadline) else {
+        return "—".into();
+    };
+    let standing = crate::commands::project::hub_standing(
+        Some(head.as_str()),
+        remote.as_deref(),
+        false,
+        || {
+            let public = remote.as_deref().unwrap_or_default();
+            uploads
+                .projections
+                .get_or_insert_with(|| {
+                    crate::domain::privacy_git::Projections::open_within(&uploads.repo, deadline)
+                })
+                .source(branch, public)
+                .is_some_and(|source| source == head)
+        },
+    );
+    if standing == "not_uploaded" {
+        "not uploaded"
+    } else {
+        standing
+    }
+    .into()
+}
+
+/// The local and Hub heads of `branch` as its refs name them, within the page's deadline and
+/// with its output bounded. Naming an object reads no commit, so an unreadable one elsewhere in
+/// the repository can't hold the page. `None` when the refs can't be read.
+fn upload_heads(
+    repo: &Repo,
+    branch: &str,
+    deadline: Deadline,
+) -> Option<(Option<String>, Option<String>)> {
+    let local = format!("refs/heads/{branch}");
+    let remote = format!("refs/remotes/origin/{branch}");
+    let output = repo
+        .inspection_output_with_deadline(
+            &[
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "--",
+                &local,
+                &remote,
+            ],
+            64 * 1024,
+            deadline,
+        )
+        .ok()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return None;
+    }
+    let mut heads = (None, None);
+    for line in std::str::from_utf8(&output.stdout).ok()?.lines() {
+        let (name, object) = line.split_once('\0')?;
+        if name == local {
+            heads.0 = Some(object.to_owned());
+        } else if name == remote {
+            heads.1 = Some(object.to_owned());
+        }
+    }
+    Some(heads)
+}
+
+/// The upload column's text as JSON: the tokens `agit project list --json` uses, or null.
+pub(super) fn upload_json(cell: &str) -> Option<&'static str> {
+    match cell {
+        "uploaded" => Some("uploaded"),
+        "waiting" => Some("waiting"),
+        "not uploaded" => Some("not_uploaded"),
+        _ => None,
+    }
 }
 
 fn inspect(
@@ -253,6 +361,7 @@ pub(super) fn rows(
     let mut budget = Budget::new(256 * 1024 * 1024);
     let deadline = Deadline::new();
     let mut project = super::project::Observation::new();
+    let mut uploads = std::collections::BTreeMap::new();
     let mut rows = links
         .iter()
         .skip(offset)
@@ -268,6 +377,7 @@ pub(super) fn rows(
                 row
             };
             row[7] = project.relation(claim, index < 8, deadline).into();
+            row[8] = upload(&mut uploads, claim, deadline);
             row
         })
         .collect::<Vec<_>>();
@@ -290,6 +400,7 @@ fn finish_rows(
             row[5] = "unavailable: claim inventory changed or incomplete".into();
             row[6] = "claim unverified; process unverified".into();
             row[7] = super::project::UNAVAILABLE.into();
+            row[8] = "—".into();
         }
     }
     Page {
