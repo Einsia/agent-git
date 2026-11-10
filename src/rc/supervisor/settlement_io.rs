@@ -196,6 +196,8 @@ pub(super) struct LocalSettlementContext {
     pub expected_agent_id: String,
     pub journal_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
     pub push: tokio::process::Command,
+    /// The conversation's claim key, which a privacy wait the commit records is kept under.
+    pub claim: String,
 }
 
 pub(super) struct LocalSettlement {
