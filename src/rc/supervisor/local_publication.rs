@@ -44,6 +44,7 @@ impl Session {
                 status.reason = Some(Reason::DestinationMissing);
                 return Ok(None);
             };
+            status.target = Some(destination.target());
             ensure!(
                 lineage.agent_id() == local_agent_id,
                 "RC source repository identity changed"

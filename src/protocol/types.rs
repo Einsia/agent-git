@@ -910,6 +910,17 @@ pub struct SessionPublicationStatus {
     pub stage: Option<PublicationStage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<PublicationReason>,
+    /// Where this device uploads the session's turns, as it knows it; absent when it has no
+    /// destination or can't read one. The Hub compares it with the project's binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PublicationTarget>,
+}
+
+/// The repository a session's turns upload to, and its Hub identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationTarget {
+    pub repository: String,
+    pub agent_id: String,
 }
 
 impl SessionPublicationStatus {
@@ -919,6 +930,7 @@ impl SessionPublicationStatus {
             progress: PublicationProgress::Idle,
             stage: Some(PublicationStage::Capture),
             reason: Some(PublicationReason::Unbound),
+            target: None,
         }
     }
     pub fn checking() -> Self {
@@ -927,6 +939,7 @@ impl SessionPublicationStatus {
             progress: PublicationProgress::Idle,
             stage: Some(PublicationStage::Consent),
             reason: Some(PublicationReason::EligibilityUnchecked),
+            target: None,
         }
     }
 }

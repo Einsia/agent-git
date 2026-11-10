@@ -1560,6 +1560,20 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 hints[1].params.as_ref().unwrap()["publication"]["progress"],
                 "awaiting_ack"
             );
+            // Each status names where the turns upload, and the device reads the same from the
+            // repository before any upload.
+            let target = serde_json::json!({"repository":"alice/photo","agent_id":remote_id});
+            for hint in &hints {
+                assert_eq!(
+                    hint.params.as_ref().unwrap()["publication"]["target"],
+                    target
+                );
+            }
+            assert_eq!(
+                crate::rc::capture::upload_target(session.agit_session.as_ref().unwrap())
+                    .map(|target| serde_json::to_value(target).unwrap()),
+                Some(target)
+            );
             assert!(
                 frames
                     .iter()
@@ -1699,6 +1713,11 @@ fn local_settlement_publishes_confirmed_target_and_retains_each_source() {
                 .unwrap();
             repo.git(&["config", "--unset", "agit.desktopPublication"])
                 .unwrap();
+            assert_eq!(
+                crate::rc::capture::upload_target(resumed.agit_session.as_ref().unwrap()),
+                None,
+                "no destination, no target"
+            );
             repo.set_auto_push(Some(false)).unwrap();
             std::fs::write(&fixture.exe, &script).unwrap();
             let pushes = std::fs::read(fixture.repo.join(".git/push-calls")).unwrap();

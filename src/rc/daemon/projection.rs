@@ -156,6 +156,12 @@ impl Daemon {
         {
             let mut status = crate::protocol::SessionPublicationStatus::checking();
             status.progress = crate::protocol::PublicationProgress::LocalSaved;
+            // A local save changes nothing about where the turns upload.
+            status.target = live
+                .info
+                .publication
+                .as_ref()
+                .and_then(|status| status.target.clone());
             live.info.publication = Some(status);
         }
         // `through_seq` is a journal coordinate. The supervisor cannot derive
@@ -675,6 +681,10 @@ impl Daemon {
             });
         if self.opts.local_owner && !degraded {
             let progress = info.publication.as_ref().map(|status| status.progress);
+            let target = info
+                .publication
+                .as_ref()
+                .and_then(|status| status.target.clone());
             info.publication = Some(if info.agent.is_some() && info.branch.is_some() {
                 crate::protocol::SessionPublicationStatus::checking()
             } else {
@@ -682,6 +692,9 @@ impl Daemon {
             });
             if let (Some(status), Some(progress)) = (&mut info.publication, progress) {
                 status.progress = progress;
+            }
+            if let Some(status) = &mut info.publication {
+                status.target = target;
             }
         }
         info.last_seq = self.journal.last_seq(&info.session_id);

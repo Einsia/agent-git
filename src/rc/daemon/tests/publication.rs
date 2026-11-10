@@ -469,3 +469,47 @@ async fn respond(stream: &mut BufReader<tokio::net::TcpStream>, body: &serde_jso
     stream.write_all(&body).await.unwrap();
     stream.flush().await.unwrap();
 }
+
+/// Where a session's turns upload stays on its status once the device names it: a local save
+/// keeps it, and so does the status a local-owner listing stamps, so the Hub can compare it with
+/// the project's binding at any point.
+#[tokio::test]
+async fn a_sessions_upload_target_survives_a_local_save_and_a_listing() {
+    let (tx, _rx) = mpsc::channel(1);
+    let mut live = rpc_test_live("logical", 1, tx, crate::protocol::PermissionMode::Default);
+    let target = crate::protocol::PublicationTarget {
+        repository: "sim-yuki/burrow-rc".into(),
+        agent_id: "01a175a4-858a-77d0-99ea-6137bfe71632".into(),
+    };
+    live.info.publication = Some(crate::protocol::SessionPublicationStatus {
+        target: Some(target.clone()),
+        ..crate::protocol::SessionPublicationStatus::checking()
+    });
+    let daemon = rpc_test_daemon(HashMap::from([("logical".into(), live)]), Roster::default());
+    let mut state = daemon.lock().await;
+    state.opts.local_owner = true;
+    state.latest_session_generations.insert("logical".into(), 1);
+    state.project_session_frame(tagged_test_notification(
+        "logical",
+        1,
+        method::COMMIT_LOCAL_SETTLED,
+        json!({"session_id":"logical"}),
+    ));
+    let info = state.sessions["logical"].info.clone();
+    assert_eq!(
+        info.publication.as_ref().map(|status| status.progress),
+        Some(crate::protocol::PublicationProgress::LocalSaved),
+        "the local save reached the session's status"
+    );
+    assert_eq!(
+        info.publication
+            .as_ref()
+            .and_then(|status| status.target.clone()),
+        Some(target.clone())
+    );
+    let stamped = state.stamped(info);
+    assert_eq!(
+        stamped.publication.and_then(|status| status.target),
+        Some(target)
+    );
+}
