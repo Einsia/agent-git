@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawnSync } = require('child_process');
+const os = require('os');
 const path = require('path');
 const platform = require('./platform');
 const { resolveBinary } = require('./resolve');
@@ -53,6 +54,17 @@ function run() {
   }
   if (!(args[0] === 'rc' && args[1] === 'local' && args[2] === 'bridge')) {
     scheduleReconciliation(bin, pkgRoot);
+  }
+  if (r.signal) {
+    // A run the system ends leaves no word of its own, so the shim says it, and exits as a shell
+    // does for a signal: 128 plus its number. A SIGKILL nobody typed is almost always the
+    // system reclaiming memory (the OOM killer, jetsam); a person's own Ctrl-C needs no line.
+    if (r.signal === 'SIGKILL') {
+      log.error(
+        'agit was stopped by the system before it finished (SIGKILL), most often because it ran out of memory.',
+      );
+    }
+    process.exit(128 + (os.constants.signals[r.signal] || 0));
   }
   process.exit(r.status === null ? 1 : r.status);
 }

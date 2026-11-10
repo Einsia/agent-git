@@ -80,6 +80,44 @@ test('the npm shim preserves command semantics while scheduling a daemon check',
   })
 })
 
+// A run the system killed (out of memory, most often) says so on stderr and exits as a shell
+// would, 128 plus the signal's number; a person's Ctrl-C exits the same way without a line. A
+// shim that turned every signal into a bare exit 1 left a killed save looking like an ordinary
+// failure with nothing said.
+test('a run the system killed says so and exits as a shell would', () => {
+  const said = []
+  const outcome = (signal) => {
+    const context = {
+      __dirname: '/global/node_modules/@einsia/agent-git/npm/lib',
+      module: { exports: {} },
+      process: {
+        argv: ['node', 'agit', 'commit'], env: {}, platform: 'linux', arch: 'x64',
+        exit: (code) => { throw { exitCode: code } },
+      },
+      require: (name) => ({
+        child_process: { spawnSync: () => ({ status: null, signal }) },
+        os,
+        path,
+        './platform': {},
+        './resolve': { resolveBinary: () => '/global/bin/agit' },
+        './log': { error: (message) => said.push(message) },
+        './reconcile': { scheduleReconciliation: () => {} },
+      })[name],
+    }
+    let code
+    assert.throws(() => runInNewContext(`${runScript}\nrun()`, context), error => {
+      code = error.exitCode
+      return true
+    })
+    return code
+  }
+  assert.equal(outcome('SIGKILL'), 137)
+  assert.equal(said.length, 1)
+  assert.match(said[0], /stopped by the system.*ran out of memory/)
+  assert.equal(outcome('SIGINT'), 130)
+  assert.equal(said.length, 1)
+})
+
 test('a transient package cannot replace the persistent daemon', () => {
   const calls = []
   const context = {
