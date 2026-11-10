@@ -2552,3 +2552,452 @@ fn a_transcript_past_the_snapshot_limit_is_refused_before_it_is_read() {
         "{refused:?}"
     );
 }
+
+/// What happens to a session between the commit that becomes the base and the next one.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug)]
+enum SinceTheBase {
+    Nothing,
+    Compacted,
+    OmissionChanged,
+    SecretAndEntropyAdded,
+    StrayEventFile,
+    Reverted,
+    RewrittenElsewhere,
+    SettledPartEdited,
+}
+
+#[cfg(debug_assertions)]
+impl SinceTheBase {
+    /// Whether the next commit must refuse, because the transcript no longer continues what the
+    /// branch holds.
+    fn refuses(self) -> bool {
+        matches!(
+            self,
+            Self::Reverted | Self::RewrittenElsewhere | Self::SettledPartEdited
+        )
+    }
+}
+
+/// Copies a directory tree, files and folders only, as a store holds them.
+#[cfg(debug_assertions)]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for entry in walkdir::WalkDir::new(from) {
+        let entry = entry.unwrap();
+        let target = to.join(entry.path().strip_prefix(from).unwrap());
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+        } else if entry.file_type().is_file() {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Runs git in `repo` with the lab's environment and `index` as its index file, and returns its
+/// output as it is.
+#[cfg(debug_assertions)]
+fn git_in(lab: &Lab, repo: &std::path::Path, index: &std::path::Path, args: &[&str]) -> Vec<u8> {
+    let environment = lab.command();
+    let mut command = Command::new("git");
+    command.env_clear_local();
+    for (key, value) in environment.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    let output = command
+        .env("GIT_INDEX_FILE", index)
+        .args([
+            "-c",
+            "user.name=Elsewhere",
+            "-c",
+            "user.email=elsewhere@example.test",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{args:?} {output:?}");
+    output.stdout
+}
+
+/// Moves `keep` in `repo` to a child commit made outside agit, whose tree takes `edits`: each path
+/// with the bytes it now holds, or `None` to remove it.
+#[cfg(debug_assertions)]
+fn commit_elsewhere(lab: &Lab, repo: &std::path::Path, edits: &[(String, Option<Vec<u8>>)]) {
+    let index = lab.home.join("elsewhere-index");
+    let git = |args: &[&str]| {
+        String::from_utf8(git_in(lab, repo, &index, args))
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    git(&["read-tree", "keep"]);
+    for (number, (path, bytes)) in edits.iter().enumerate() {
+        if let Some(bytes) = bytes {
+            let body = lab.home.join(format!("elsewhere-{number}"));
+            fs::write(&body, bytes).unwrap();
+            let blob = git(&["hash-object", "-w", body.to_str().unwrap()]);
+            git(&[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{path}"),
+            ]);
+        } else {
+            git(&["update-index", "--force-remove", path]);
+        }
+    }
+    let tree = git(&["write-tree"]);
+    let commit = git(&["commit-tree", &tree, "-p", "keep", "-m", "made elsewhere"]);
+    if target_git(lab, repo, &["rev-parse", "--abbrev-ref", "HEAD"]) == "keep" {
+        target_git(lab, repo, &["reset", "-q", "--hard", &commit]);
+    } else {
+        target_git(lab, repo, &["update-ref", "refs/heads/keep", &commit]);
+    }
+}
+
+/// A commit that builds only what is new onto its base, keeping the base's event files and, with
+/// a verified checkpoint, reading no settled event, does what a commit that reads, compares and
+/// writes everything again does, for the same store and transcript.
+///
+/// It builds the same tree after a plain next turn, after one whose settled part was compacted,
+/// after the tool and attachment settings or the computer's secrets and `privacy.entropy` changed
+/// since the base, and when a commit made elsewhere put an event file on the branch that its LOG
+/// does not list. It refuses the same way, leaving the branch where it was, after a revert, after a
+/// commit made elsewhere changed a settled record, and when the transcript's settled part was
+/// edited.
+///
+/// Keeping every event file of the base keeps that unlisted one, and so does keeping a file the
+/// base holds without asking whether this snapshot lists it; leaving out a listed event the base
+/// lacks loses the new turn's records. A view that starts at the transcript's beginning rather than
+/// at a compaction in the settled part holds records the full path leaves out of it. Taking the
+/// settled part without the checkpoint verifying, or with only its tip or only its hash checked,
+/// settles onto history the transcript doesn't continue.
+#[cfg(debug_assertions)]
+#[test]
+fn a_commit_building_only_what_is_new_does_what_a_full_rewrite_does() {
+    use std::io::Write as _;
+
+    const SECRET: &str = "SETTLED-CANARY-9vQ2xT7mK4pLw8";
+    const ENTROPY: &str = "Qz7mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2dF";
+    for case in [
+        SinceTheBase::Nothing,
+        SinceTheBase::Compacted,
+        SinceTheBase::OmissionChanged,
+        SinceTheBase::SecretAndEntropyAdded,
+        SinceTheBase::StrayEventFile,
+        SinceTheBase::Reverted,
+        SinceTheBase::RewrittenElsewhere,
+        SinceTheBase::SettledPartEdited,
+    ] {
+        let lab = Lab::new(1);
+        let (id, path) = lab.sources[0].clone();
+        let repo = lab.store.join("repos/me/qa");
+        let record = |uuid: &str, role: &str, content: serde_json::Value| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":role, "sessionId":id, "cwd":lab.work,
+                    "uuid":format!("{id}-{uuid}"), "message":{"role":role, "content":content}})
+            )
+        };
+        let settled = [
+            record(
+                "first-ask",
+                "user",
+                serde_json::json!(format!("SYNTHETIC-FIRST-ASK {SECRET} {ENTROPY}")),
+            ),
+            record(
+                "first-answer",
+                "assistant",
+                serde_json::json!("SYNTHETIC-FIRST-ANSWER"),
+            ),
+            if matches!(case, SinceTheBase::Compacted) {
+                // The conversation was compacted inside its settled part, so the view starts
+                // there.
+                [
+                    serde_json::json!({"type":"system", "subtype":"compact_boundary",
+                        "sessionId":id, "cwd":lab.work, "uuid":format!("{id}-boundary"),
+                        "compactMetadata":{"trigger":"auto"}}),
+                    serde_json::json!({"type":"user", "isCompactSummary":true, "sessionId":id,
+                        "cwd":lab.work, "uuid":format!("{id}-summary"),
+                        "message":{"role":"user", "content":"SYNTHETIC-COMPACT-SUMMARY"}}),
+                ]
+                .map(|record| format!("{record}\n"))
+                .concat()
+            } else {
+                String::new()
+            },
+            record(
+                "second-ask",
+                "user",
+                serde_json::json!("SYNTHETIC-SECOND-ASK"),
+            ),
+            record(
+                "second-call",
+                "assistant",
+                serde_json::json!([{"type":"tool_use", "id":"toolu_keep", "name":"Bash",
+                    "input":{"command":"SYNTHETIC-SHELL-COMMAND"}}]),
+            ),
+            record(
+                "second-result",
+                "user",
+                serde_json::json!([{"type":"tool_result", "tool_use_id":"toolu_keep",
+                    "content":"SYNTHETIC-SHELL-RESULT"}]),
+            ),
+            record(
+                "second-answer",
+                "assistant",
+                serde_json::json!("SYNTHETIC-SECOND-ANSWER"),
+            ),
+        ]
+        .concat();
+        fs::write(&path, &settled).unwrap();
+        let imported = lab
+            .command()
+            .args([
+                "import",
+                &id,
+                "--from",
+                "claude-code",
+                "--into",
+                "me/qa@keep",
+                "--independent",
+            ])
+            .output()
+            .unwrap();
+        assert!(imported.status.success(), "{case:?} {imported:?}");
+
+        let run = |args: &[&str]| {
+            let output = lab.command().args(args).output().unwrap();
+            assert!(output.status.success(), "{case:?} {args:?} {output:?}");
+        };
+        let blob = |spec: &str| {
+            git_in(
+                &lab,
+                &repo,
+                &lab.home.join("read-index"),
+                &["cat-file", "blob", spec],
+            )
+        };
+        let holding =
+            |pattern: &str| target_git(&lab, &repo, &["grep", "-l", "-F", "-e", pattern, "keep"]);
+        let mut stray = None;
+        let mut transcript = settled.clone();
+        match case {
+            SinceTheBase::Nothing | SinceTheBase::Compacted => {}
+            SinceTheBase::OmissionChanged => {
+                run(&[
+                    "privacy", "policy", "tool", "--omit", "true", "--repo", "me/qa",
+                ]);
+                run(&["privacy", "policy", "attachment", "omit", "--repo", "me/qa"]);
+            }
+            SinceTheBase::SecretAndEntropyAdded => {
+                let mut child = lab
+                    .command()
+                    .args(["secrets", "add", "canary", "--stdin"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(SECRET.as_bytes())
+                    .unwrap();
+                let added = child.wait_with_output().unwrap();
+                assert!(added.status.success(), "{added:?}");
+                run(&[
+                    "config",
+                    agit::infra::config::PRIVACY_ENTROPY_KEY,
+                    "replace",
+                ]);
+            }
+            SinceTheBase::StrayEventFile => {
+                let content = "{\"stray\":\"SYNTHETIC-STRAY-EVENT\"}";
+                let file = agit::domain::meta::event_path(
+                    &agit::domain::storage::canonical_event_id(content),
+                )
+                .unwrap();
+                commit_elsewhere(&lab, &repo, &[(file.clone(), Some(content.into()))]);
+                stray = Some(file);
+            }
+            SinceTheBase::Reverted => run(&["revert", "me/qa@keep#1"]),
+            SinceTheBase::RewrittenElsewhere => {
+                // The settled answer changes, and the LOG and VIEW name the changed record.
+                let found = holding("SYNTHETIC-FIRST-ANSWER");
+                let file = found
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("keep:"))
+                    .find(|file| file.starts_with("events/"))
+                    .unwrap();
+                let old = file.rsplit('/').next().unwrap();
+                let changed = String::from_utf8(blob(&format!("keep:{file}")))
+                    .unwrap()
+                    .replace("SYNTHETIC-FIRST-ANSWER", "SYNTHETIC-OTHER-ANSWER");
+                let new = agit::domain::storage::canonical_event_id(&changed);
+                let sequence = |name: &str| {
+                    String::from_utf8(blob(&format!("keep:{name}")))
+                        .unwrap()
+                        .replace(old, &new)
+                        .into_bytes()
+                };
+                commit_elsewhere(
+                    &lab,
+                    &repo,
+                    &[
+                        (file.to_owned(), None),
+                        (
+                            agit::domain::meta::event_path(&new).unwrap(),
+                            Some(changed.into_bytes()),
+                        ),
+                        ("LOG".into(), Some(sequence("LOG"))),
+                        ("VIEW".into(), Some(sequence("VIEW"))),
+                    ],
+                );
+            }
+            SinceTheBase::SettledPartEdited => {
+                transcript = settled.replace("SYNTHETIC-SECOND-ANSWER", "SYNTHETIC-SECOND-ANSWEX");
+            }
+        }
+
+        let next = [
+            record(
+                "third-ask",
+                "user",
+                serde_json::json!(format!("SYNTHETIC-THIRD-ASK {SECRET} {ENTROPY}")),
+            ),
+            record(
+                "third-answer",
+                "assistant",
+                serde_json::json!("SYNTHETIC-THIRD-ANSWER"),
+            ),
+        ]
+        .concat();
+        fs::write(&path, format!("{transcript}{next}")).unwrap();
+        let base = target_git(&lab, &repo, &["rev-parse", "keep"]);
+        let tree_of = |repo: &std::path::Path| target_git(&lab, repo, &["ls-tree", "-r", "keep"]);
+        if let Some(stray) = &stray {
+            assert!(tree_of(&repo).contains(stray.as_str()), "{case:?}");
+        }
+
+        // Both commits run from the same store at the same path: the rewrite in the store as it
+        // stands, the other in the copy taken before, moved back into place.
+        let before = lab.store.with_extension("before");
+        copy_tree(&lab.store, &before);
+        let commit = |rewrite: bool| {
+            let mut command = lab.command();
+            if rewrite {
+                command.env("AGIT_TEST_REWRITE_SNAPSHOT", "1");
+            }
+            let output = command.args(["commit", "me/qa@keep"]).output().unwrap();
+            if case.refuses() {
+                assert!(
+                    !output.status.success(),
+                    "{case:?} rewrite={rewrite} {output:?}"
+                );
+                assert_eq!(
+                    target_git(&lab, &repo, &["rev-parse", "keep"]),
+                    base,
+                    "{case:?}"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{case:?} rewrite={rewrite} {output:?}"
+                );
+                assert_eq!(
+                    target_git(&lab, &repo, &["rev-parse", "keep^"]),
+                    base,
+                    "{case:?}"
+                );
+            }
+            output
+        };
+        let rewrite = commit(true);
+        let rewritten = tree_of(&repo);
+        fs::rename(&lab.store, lab.store.with_extension("rewritten")).unwrap();
+        fs::rename(&before, &lab.store).unwrap();
+        // A value this commit replaces for the first time gets a random token, which the privacy
+        // dictionary then holds; the second run starts from the dictionary the rewrite left, so
+        // the same value gets the same token in both.
+        fs::remove_dir_all(lab.store.join("privacy")).unwrap();
+        copy_tree(
+            &lab.store.with_extension("rewritten").join("privacy"),
+            &lab.store.join("privacy"),
+        );
+        let built = commit(false);
+        if case.refuses() {
+            assert_eq!(
+                (built.status.code(), &built.stderr),
+                (rewrite.status.code(), &rewrite.stderr),
+                "{case:?}: {built:?} {rewrite:?}"
+            );
+            continue;
+        }
+        let kept = tree_of(&repo);
+
+        let lines = |text: &str| {
+            text.lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let (kept_lines, rewritten_lines) = (lines(&kept), lines(&rewritten));
+        // An event file that differs is shown from the repository that holds it.
+        let differing = |ours: &std::collections::BTreeSet<String>,
+                         theirs: &std::collections::BTreeSet<String>,
+                         repo: &std::path::Path| {
+            ours.difference(theirs)
+                .map(|line| {
+                    let path = line.split('\t').nth(1).unwrap();
+                    if path.starts_with("events/") {
+                        let body = target_git(&lab, repo, &["show", &format!("keep:{path}")]);
+                        format!("{line}\n{body}")
+                    } else {
+                        line.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            kept_lines == rewritten_lines,
+            "{case:?}: only when built incrementally {:#?}, only when rewritten {:#?}",
+            differing(&kept_lines, &rewritten_lines, &repo),
+            differing(
+                &rewritten_lines,
+                &kept_lines,
+                &lab.store.with_extension("rewritten").join("repos/me/qa")
+            ),
+        );
+        if let Some(stray) = &stray {
+            assert!(!kept.contains(stray.as_str()), "{case:?}");
+        }
+        holding("SYNTHETIC-THIRD-ANSWER");
+        if matches!(case, SinceTheBase::Compacted) {
+            let count = |name: &str| {
+                target_git(&lab, &repo, &["show", &format!("keep:{name}")])
+                    .lines()
+                    .count()
+            };
+            assert!(
+                count("VIEW") < count("LOG"),
+                "the view does not start at the compaction"
+            );
+        }
+        if matches!(case, SinceTheBase::SecretAndEntropyAdded) {
+            for file in holding("SYNTHETIC-THIRD-ASK").lines() {
+                let stored = target_git(&lab, &repo, &["show", file]);
+                assert!(
+                    !stored.contains(SECRET) && !stored.contains(ENTROPY),
+                    "the new turn kept a value the settings now replace: {stored}"
+                );
+            }
+        }
+    }
+}

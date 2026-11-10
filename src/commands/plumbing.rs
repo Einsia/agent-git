@@ -531,15 +531,22 @@ pub fn session_snapshot_tree(
         base_commitish,
         storage::snapshot_files(log, view)?,
         meta_text,
+        &std::collections::BTreeSet::new(),
     )
 }
 
 /// Install a validated snapshot, retaining the same namespace and upgrade preflights.
+///
+/// Every storage path of the base goes, except the event files in `keep`, which the snapshot's
+/// LOG still lists and the caller found in a v1 base. An event file is named by the hash of its
+/// bytes, so one kept is the file the snapshot would have written there; an event file the LOG
+/// doesn't list still leaves the tree.
 pub(super) fn session_snapshot_tree_files(
     repo: &Repo,
     base_commitish: &str,
     files: std::collections::BTreeMap<String, Vec<u8>>,
     meta_text: &str,
+    keep: &std::collections::BTreeSet<String>,
 ) -> Result<String> {
     let layout = storage_layout_at(repo, base_commitish)?;
     ensure_v1_upgrade_preflight(repo, base_commitish)?;
@@ -548,6 +555,7 @@ pub(super) fn session_snapshot_tree_files(
         .ls_tree_result(base_commitish)?
         .into_iter()
         .filter(|path| meta::is_storage_path_for(layout, path))
+        .filter(|path| layout != meta::LayoutVersion::V1 || !keep.contains(path))
         .map(|path| (path, None))
         .collect();
     for (path, bytes) in files {
