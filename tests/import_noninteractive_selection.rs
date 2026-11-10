@@ -2508,3 +2508,47 @@ fn a_printed_import_suggestion_runs_as_printed_and_names_a_claim_move() {
     assert!(!stderr.contains("also moves session"), "{stderr}");
     assert!(!printed(&fresh).contains("'-y'"), "{stderr}");
 }
+
+/// A transcript larger than one saved conversation can hold is refused before agit reads it, with
+/// a line that says so and what to do. Settling reads a transcript several times over, so a save
+/// left for the snapshot limit to refuse at the end runs the computer out of memory first, and
+/// the person sees the process die with nothing said.
+#[cfg(unix)]
+#[test]
+fn a_transcript_past_the_snapshot_limit_is_refused_before_it_is_read() {
+    let lab = Lab::new(1);
+    let (id, path) = &lab.sources[0];
+    let imported = lab
+        .command()
+        .args([
+            "import",
+            id,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/qa@long",
+            "--independent",
+        ])
+        .output()
+        .unwrap();
+    assert!(imported.status.success(), "{imported:?}");
+    // Sparse: past the limit in size without the bytes on disk.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(agit::domain::storage::MAX_MATERIALIZED_BYTES as u64 + 1)
+        .unwrap();
+    let refused = lab
+        .command()
+        .args(["commit", "me/qa@long"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        said.contains("more than the 512 MB agit saves as one conversation")
+            && said.contains("start a new conversation"),
+        "{refused:?}"
+    );
+}

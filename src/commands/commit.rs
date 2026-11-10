@@ -2317,6 +2317,26 @@ fn settle_local_telemetry_inner(
         return Ok(ExitCode::Policy);
     }
 
+    // A transcript past what one saved conversation holds is refused before it is read. Settling
+    // reads it several times over, so one left for the snapshot limit to refuse at the end runs
+    // the computer out of memory first, with nothing said.
+    let cap = crate::domain::storage::MAX_MATERIALIZED_BYTES as u64;
+    if let Some(size) = lk
+        .resolve()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .filter(|size| *size > cap)
+    {
+        ui::error(&format!(
+            "this conversation's transcript is {} MB, more than the {} MB agit saves as one conversation, so it wasn't saved",
+            size >> 20,
+            cap >> 20
+        ));
+        ui::hint(
+            "start a new conversation to go on saving; this one stays as it is on this computer",
+        );
+        return Ok(ExitCode::Policy);
+    }
     let bytes = lk.read_bytes().map_err(|e| {
         if quiet {
             anyhow::anyhow!("quiet: {e:#}")
@@ -2639,14 +2659,15 @@ fn settle_bytes(
     quiet: bool,
 ) -> CmdResult {
     let materialized_mode = lk.baseline_bytes.is_some();
-    let text = if materialized_mode {
-        std::str::from_utf8(bytes)
-            .map_err(|error| {
-                anyhow::anyhow!("materialized runtime transcript is not valid UTF-8: {error}")
-            })?
-            .to_owned()
+    // The transcript read as text borrows its bytes; only one that isn't valid UTF-8 gets a
+    // repaired copy. Settlement holds several transcript-sized buffers at once, so each copy that
+    // isn't needed raises the size at which a long conversation runs out of memory.
+    let text: std::borrow::Cow<'_, str> = if materialized_mode {
+        std::borrow::Cow::Borrowed(std::str::from_utf8(bytes).map_err(|error| {
+            anyhow::anyhow!("materialized runtime transcript is not valid UTF-8: {error}")
+        })?)
     } else {
-        String::from_utf8_lossy(bytes).into_owned()
+        String::from_utf8_lossy(bytes)
     };
     // Snapshot the persisted claim before parsing can fill its cwd/watermark fields. The caller
     // holds the link lock for the entire settlement, so this remains the exact CAS value.
@@ -2774,7 +2795,7 @@ fn settle_bytes(
             }
         }
         let head_turn = head_meta.as_ref().and_then(|s| s.turn).unwrap_or(0);
-        (base, text[base..].to_string(), head_turn)
+        (base, &text[base..], head_turn)
     } else {
         // Native continuation: the continuity check, against the committed envelope blob.
         let committed = match head_meta.as_ref() {
@@ -2803,12 +2824,17 @@ fn settle_bytes(
                         hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256
                     })
         });
-        let comparable = if !checkpoint_verified
+        // Compared as settled unless the live transcript diverges from it, so the settled history
+        // is borrowed rather than copied for the common case.
+        let comparable: std::borrow::Cow<'_, str> = if !checkpoint_verified
             && transcript::continuity(&committed, &text) == Continuity::Diverged
         {
-            privacy::transform(Some(repo.root()), &committed, PrivacyMode::HydrateEnvelopes).content
+            std::borrow::Cow::Owned(
+                privacy::transform(Some(repo.root()), &committed, PrivacyMode::HydrateEnvelopes)
+                    .content,
+            )
         } else {
-            committed.clone()
+            std::borrow::Cow::Borrowed(&committed)
         };
         let Some(retained) =
             crate::domain::privacy::continuity::retain_prefix(&committed, &comparable, &text)?
@@ -2872,7 +2898,7 @@ fn settle_bytes(
                 }
             }
         };
-        (0, text.clone(), settled as u32)
+        (0, &text[..], settled as u32)
     };
 
     if file_line {
@@ -2899,12 +2925,12 @@ fn settle_bytes(
             .map(|m| m.runtime.clone())
             .filter(|r| !r.is_empty())
             .unwrap_or_else(|| {
-                crate::adapter::infer_runtime(&region)
+                crate::adapter::infer_runtime(region)
                     .unwrap_or(&lk.source)
                     .to_string()
             })
     };
-    let ir = match crate::adapter::get(&runtime).and_then(|a| a.parse(&region)) {
+    let ir = match crate::adapter::get(&runtime).and_then(|a| a.parse(region)) {
         Ok(ir) => ir,
         Err(e) => {
             if !quiet {
@@ -2935,7 +2961,7 @@ fn settle_bytes(
     }
 
     let open_calls = crate::adapter::get(&runtime)
-        .map(|a| a.open_tool_calls(&region))
+        .map(|a| a.open_tool_calls(region))
         .unwrap_or_default();
     let mut in_flight = in_flight_tail(&ir, &open_calls);
     // Receipts name absolute transcript offsets; only those inside this region can cut it.
@@ -2945,7 +2971,7 @@ fn settle_bytes(
         .filter_map(|end| end.checked_sub(region_start).filter(|end| *end > 0))
         .collect();
     let completion_cut =
-        opts.completed_only || !receipts.is_empty() || records_completions(&runtime, &region, &ir);
+        opts.completed_only || !receipts.is_empty() || records_completions(&runtime, region, &ir);
     let native_completions = completion_cut
         || ir
             .events
@@ -2954,8 +2980,8 @@ fn settle_bytes(
     let chunks = if completion_cut {
         // Recovery can read a newer native snapshot than the completed turn that queued it.
         let (end, boundaries) =
-            completion_boundaries(&runtime, &region, receipts, opts.completed_only)?;
-        if in_flight.is_none() && substantive_from(&region, &ir, end) {
+            completion_boundaries(&runtime, region, receipts, opts.completed_only)?;
+        if in_flight.is_none() && substantive_from(region, &ir, end) {
             in_flight = Some(InFlight::Unfinished);
         }
         let completed = &region[..end];
@@ -2970,13 +2996,13 @@ fn settle_bytes(
         )
     } else if native_completions {
         completed_turn_chunks(
-            &region,
+            region,
             &ir,
             &open_calls,
             materialized_mode && head_turn_base > 0,
         )
     } else {
-        turn_chunks(&region, &ir, &open_calls)
+        turn_chunks(region, &ir, &open_calls)
     };
 
     let new_chunks: Vec<&Chunk> = if native_completions && !materialized_mode {
@@ -2993,7 +3019,7 @@ fn settle_bytes(
     };
     let new_chunks = without_bookkeeping_only(
         new_chunks,
-        &region,
+        region,
         &ir,
         if materialized_mode {
             0
@@ -3279,7 +3305,15 @@ fn settle_bytes(
     } else {
         native_prefix.1
     };
-    protected_full.push_str(&protected_increment.content);
+    if materialized_mode {
+        protected_full.push_str(&protected_increment.content);
+    } else if protected_full.is_empty() {
+        // Only the materialized path reads the increment again, so a native one hands its
+        // buffer over rather than holding a second copy of it.
+        protected_full = std::mem::take(&mut protected_increment.content);
+    } else {
+        protected_full.push_str(&std::mem::take(&mut protected_increment.content));
+    }
     protected_full.push_str(&text[privacy_end..]);
     let materialized_projection = if materialized_mode {
         Some(native::Projection::new(

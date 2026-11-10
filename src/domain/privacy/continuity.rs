@@ -165,43 +165,48 @@ pub fn retain_prefix(
     comparable: &str,
     live: &str,
 ) -> crate::Result<Option<(usize, String)>> {
-    let contents = committed
-        .split_inclusive('\n')
-        .map(crate::domain::storage::parse_envelope_line)
-        .collect::<crate::Result<Vec<_>>>()?;
-    let comparisons = comparable
-        .split_inclusive('\n')
-        .map(crate::domain::storage::parse_envelope_line)
-        .collect::<crate::Result<Vec<_>>>()?;
+    // One settled event and its comparable form are parsed at a time, beside the live line they
+    // are checked against. Parsing the whole committed history up front holds two parsed copies
+    // of a long conversation at once, several times its size, on every settlement.
     anyhow::ensure!(
-        contents.len() == comparisons.len(),
+        committed.split_inclusive('\n').count() == comparable.split_inclusive('\n').count(),
         "privacy comparison changed the event count"
     );
+    let mut contents = committed.split_inclusive('\n');
+    let mut comparisons = comparable.split_inclusive('\n');
+    let mut pending = contents.next();
     let mut projected = String::new();
     let mut cursor = 0;
     let mut index = 0;
     for line in live.split_inclusive('\n') {
-        if index == contents.len() {
+        let Some(settled) = pending else {
             break;
-        }
+        };
         if let Ok(value) = serde_json::from_str::<Value>(line) {
-            let content = &contents[index].content;
-            let continues = compatible(Some(content), &comparisons[index].content, &value)
-                || (index == 0 && same_thread_header(content, &value));
+            let content = crate::domain::storage::parse_envelope_line(settled)?.content;
+            let comparison = crate::domain::storage::parse_envelope_line(
+                comparisons
+                    .next()
+                    .expect("the comparable history has as many events as the settled one"),
+            )?
+            .content;
+            let continues = compatible(Some(&content), &comparison, &value)
+                || (index == 0 && same_thread_header(&content, &value));
             if !continues {
                 return Ok(None);
             }
-            projected.push_str(&serde_json::to_string(content)?);
+            projected.push_str(&serde_json::to_string(&content)?);
             if line.ends_with('\n') {
                 projected.push('\n');
             }
             index += 1;
+            pending = contents.next();
         } else {
             projected.push_str(line);
         }
         cursor += line.len();
     }
-    Ok((index == contents.len()).then_some((cursor, projected)))
+    Ok(pending.is_none().then_some((cursor, projected)))
 }
 
 #[cfg(test)]
