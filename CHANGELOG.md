@@ -8,6 +8,31 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.49] - 2026-11-11
+
+### Fixed
+
+- A question Claude Desktop or the Claude Code terminal plugin asks (AskUserQuestion) can now be answered from
+  AgentGit's remote control, and the answer reaches the conversation.
+- A session shows which repository its turns upload to, so a project bound to a different repository is visible on
+  AgentGit.
+- `agit status` says for every conversation, not only the first eight on a page, whether the Hub has it (uploaded,
+  waiting or not uploaded), from this computer's refs, without reading the transcript.
+- `agit status` counts a Claude Code or Codex conversation over about 2 MB instead of showing it as unavailable, and a
+  row it stops at one of its own limits says why ("not checked: …").
+- `agit on`, the overview and a conversation's start now say the same thing about a folder whose uploads are held, and
+  `agit on` in that folder switches its repository's automatic upload back on.
+- A remote-control turn whose privacy check didn't finish in time now finishes it, then saves and uploads on its own
+  shortly after, instead of waiting for the conversation's next turn.
+- Saving a very long conversation uses about half the memory it did, and a conversation too large to save is told so
+  instead of the process being stopped without a word.
+- Saving the next turn of a very long conversation no longer reads its whole saved history: on a 503 MB conversation it
+  takes about half the memory and a quarter of the time.
+- A remote-control message held for a running turn's next tool step no longer stays queued when that turn ends first:
+  it waits for the next turn and starts it once the conversation is idle.
+- When the Hub restarts its relay and tells devices so, remote control comes back within seconds of the new relay
+  being ready, instead of waiting out a retry delay that doubles up to 30 seconds.
+
 ## [0.2.48] - 2026-11-10
 
 ### Changed
