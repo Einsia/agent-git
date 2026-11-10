@@ -53,10 +53,15 @@ connection can create WAL coordination files. Codex inspection locates the full 
 in its JSONL tree without consulting the index. OpenCode reads pinned database and sidecar handles
 under cooperating locks, verifies the committed WAL frontier, and queries an owned in-memory image
 in a supervised worker. It does not write the source database, WAL/SHM files, or temporary snapshots.
-Missing, changing, unsafe, or over-budget evidence remains unavailable without recovery.
+Missing, changing, or unsafe evidence remains unavailable without recovery. For Claude Code and
+Codex, status reads only what follows the part of the transcript the last save recorded, after
+checking that part's digest. A session whose remaining read would pass status's bounds says
+`not checked: too large to read quickly`, and one past the page's reading allowance says
+`not checked: this page's reading allowance is used up; see it with --offset`.
 
 Each page inspects native details for at most its first eight session rows. Additional
-rows preserve their identities and say `unavailable: per-page inspection limit`; use
+rows preserve their identities and say `not checked: status reads 8 sessions per page; see it
+with --offset`; use
 `--offset` to inspect another page. Text and JSON share this bound. JSON session rows
 include `last_commit` (null when unavailable), `pending_activity`, `local_instance`, `project`,
 and `upload`.
