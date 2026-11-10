@@ -4,6 +4,12 @@
 //! every tool call the transcript left without a result, and archives what was recorded through
 //! the usual job. Without it the conversation ends in a call whose result never comes, the runtime
 //! cannot continue it, and nothing of the turn is ever archived.
+//!
+//! Ending the runtime starts with SIGTERM, and a runtime that handles it answers its own running
+//! call (Claude Code records the tool's kill exit) before it exits. That call is closed already,
+//! so [`INTERRUPTED_OUTPUT`] is written only for a call the runtime left without a result: one
+//! whose writer was already gone, ignored the signal, or was cut mid-record. Writing agit's line
+//! after the runtime's own result would give one call two results.
 
 use super::*;
 use crate::rc::roster::OpenTurn;
@@ -11,8 +17,9 @@ use anyhow::{Context, ensure};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-/// The result written for a tool call the transcript left open. It names no person and no
-/// computer: the resumed runtime reads it, and the archive keeps it.
+/// The result written for a tool call the transcript left open, and only for one: a call the
+/// runtime answered itself keeps that answer. It names no person and no computer: the resumed
+/// runtime reads it, and the archive keeps it.
 pub(crate) const INTERRUPTED_OUTPUT: &str = "[agit] interrupted: agit stopped on this computer while this tool was running; its output is not recorded.";
 
 /// How long the runtime a dead daemon left behind gets to exit after each signal.
