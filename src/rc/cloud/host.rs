@@ -344,6 +344,60 @@ fn rejection_reason(error: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// When the presence comes back after it ends. A failure backs off by doubling. A relay restart
+/// is expected and brief: the daemon returns at a random moment within a short spread, so the
+/// devices the old relay held do not all arrive at once, and while the replacement starts it keeps
+/// trying on a steady short cadence, so it is back within one step of the replacement being up
+/// instead of one doubled step. The cadence holds for one window per restart: only a presence
+/// that opened again starts another, so a relay that keeps closing with the restart code without
+/// coming up falls back to doubling.
+struct Reconnect {
+    backoff: Duration,
+    /// When the restart this daemon is reconnecting after began; cleared only by a presence that
+    /// opened.
+    restarted: Option<Instant>,
+}
+
+impl Reconnect {
+    const FIRST: Duration = Duration::from_millis(250);
+    const LONGEST: Duration = Duration::from_secs(30);
+    /// The spread the first try after a relay restart falls in.
+    const RESTART_SPREAD: Duration = Duration::from_secs(5);
+    /// The steady cadence while the replacement starts, plus up to as much again at random.
+    const RESTART_STEP: Duration = Duration::from_secs(2);
+    /// How long after a restart the steady cadence holds before failures double again.
+    const RESTART_WINDOW: Duration = Duration::from_secs(120);
+
+    fn new() -> Self {
+        Self {
+            backoff: Self::FIRST,
+            restarted: None,
+        }
+    }
+
+    fn connected(&mut self) {
+        *self = Self::new();
+    }
+
+    /// The wait before the next try after `error`, given a uniformly random `random`.
+    fn after(&mut self, error: &anyhow::Error, now: Instant, random: u64) -> Duration {
+        let within = |span: Duration| Duration::from_millis(random % span.as_millis() as u64);
+        if error.is::<agit_peer::client::RelayRestarting>() && self.restarted.is_none() {
+            self.restarted = Some(now);
+            return within(Self::RESTART_SPREAD);
+        }
+        if self
+            .restarted
+            .is_some_and(|at| now.duration_since(at) < Self::RESTART_WINDOW)
+        {
+            return Self::RESTART_STEP + within(Self::RESTART_STEP);
+        }
+        let wait = self.backoff + within(Duration::from_millis(256));
+        self.backoff = (self.backoff * 2).min(Self::LONGEST);
+        wait
+    }
+}
+
 async fn run_executor(
     hub: String,
     worker: Worker,
@@ -353,7 +407,7 @@ async fn run_executor(
     mut changed: watch::Receiver<()>,
 ) {
     let (lifetime, mut stopped) = watch::channel(());
-    let mut backoff = Duration::from_millis(250);
+    let mut reconnect = Reconnect::new();
     let mut children = tokio::task::JoinSet::new();
     loop {
         let attempt = async {
@@ -367,7 +421,7 @@ async fn run_executor(
             let mut presence = Presence::open(raw).await?;
             super::state::connected(&hub, &enrollment.credential.device.id);
             record(&log, "cloud.presence_connected", serde_json::json!({"hub":hub,"device_id":enrollment.credential.device.id,"epoch":presence.epoch,"worker_pid":presence.worker_pid,"transport_timing":transport_timing}));
-            backoff = Duration::from_millis(250);
+            reconnect.connected();
             loop {
                 let offer = next_offer(&mut presence, &mut children, &mut changed, || {
                     still_enrolled(hub.clone(), enrollment.credential.device.clone())
@@ -441,31 +495,36 @@ async fn run_executor(
         }.await;
         let error = attempt.as_ref().err();
         super::state::disconnected(&hub, error.map(super::state::failure_class));
+        let random = u64::from_be_bytes(
+            uuid::Uuid::new_v4().as_bytes()[..8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let retry = error.map(|error| reconnect.after(error, Instant::now(), random));
         record(
             &log,
             "cloud.presence_disconnected",
             serde_json::json!({
-                "hub":hub, "failed":attempt.is_err(), "retry_ms":backoff.as_millis(),
+                "hub":hub, "failed":attempt.is_err(), "retry_ms":retry.unwrap_or_default().as_millis(),
                 "slept":error.is_some_and(|error| error.is::<agit_peer::client::PresenceSlept>()),
+                "relay_restarting":error.is_some_and(|error| error.is::<agit_peer::client::RelayRestarting>()),
                 "error":error.map(|error| format!("{error:#}").chars().take(512).collect::<String>()),
             }),
         );
-        if attempt.is_ok() {
-            backoff = Duration::from_millis(250);
+        let Some(retry) = retry else {
+            reconnect.connected();
             continue;
-        }
-        let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
+        };
         tokio::select! {
-            _ = tokio::time::sleep(backoff + Duration::from_millis(jitter)) => {}
+            _ = tokio::time::sleep(retry) => {}
             _ = changed.changed() => {
                 lifetime.send_replace(());
                 stopped.borrow_and_update();
                 children.abort_all();
-                backoff = Duration::from_millis(250);
+                reconnect.connected();
                 continue;
             }
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -536,6 +595,61 @@ mod presence_tests {
     /// #298: a rejected offer is logged under the check that refused it, and only that: a fixed
     /// class, the same through any context the error picked up on the way, and nothing from the
     /// error's own text.
+    /// After a relay restart the first try falls inside the spread, the tries while the replacement
+    /// starts stay on the steady cadence however many fail, and once the window has passed failures
+    /// double again from the first step; an ordinary failure doubles from the start. A daemon that
+    /// put a restart on the doubling ladder would return up to one doubled step after the
+    /// replacement is up, and one that tried at once would bring every device the relay held in
+    /// the same instant.
+    #[test]
+    fn a_relay_restart_reconnects_within_the_spread_then_on_a_steady_cadence() {
+        let restart = anyhow::Error::new(agit_peer::client::RelayRestarting);
+        let failed = anyhow::anyhow!("connection refused");
+        let start = Instant::now();
+        for random in [0, 4_999, u64::MAX] {
+            let mut reconnect = Reconnect::new();
+            assert!(reconnect.after(&restart, start, random) < Reconnect::RESTART_SPREAD);
+            for step in 1..20 {
+                let wait = reconnect.after(&failed, start + Duration::from_secs(step * 4), random);
+                assert!(
+                    wait >= Reconnect::RESTART_STEP && wait < Reconnect::RESTART_STEP * 2,
+                    "{wait:?}"
+                );
+            }
+            let late = start + Reconnect::RESTART_WINDOW;
+            assert_eq!(
+                [0, 0].map(|_| reconnect.after(&failed, late, 0)),
+                [Reconnect::FIRST, Reconnect::FIRST * 2]
+            );
+        }
+        let mut ordinary = Reconnect::new();
+        assert_eq!(
+            [0; 4].map(|_| ordinary.after(&failed, start, 0)),
+            [1, 2, 4, 8].map(|step| Reconnect::FIRST * step)
+        );
+    }
+
+    /// The fast cadence is one window per restart. A restart code that arrives again before any
+    /// presence opened does not start a new window, so a relay that keeps closing without coming
+    /// up puts its devices back on doubling once the first window ends; after a presence opened,
+    /// the next restart gets a window of its own. A daemon that renewed the window on every
+    /// restart code would retry a crash-looping relay every few seconds for as long as it loops.
+    #[test]
+    fn a_restart_window_is_renewed_only_by_a_presence_that_opened() {
+        let restart = anyhow::Error::new(agit_peer::client::RelayRestarting);
+        let start = Instant::now();
+        let mut reconnect = Reconnect::new();
+        assert!(reconnect.after(&restart, start, 0) < Reconnect::RESTART_SPREAD);
+        let again = start + Reconnect::RESTART_WINDOW / 2;
+        assert!(reconnect.after(&restart, again, 0) >= Reconnect::RESTART_STEP);
+        let past = start + Reconnect::RESTART_WINDOW;
+        assert_eq!(reconnect.after(&restart, past, 0), Reconnect::FIRST);
+        assert_eq!(reconnect.after(&restart, past, 0), Reconnect::FIRST * 2);
+        reconnect.connected();
+        assert!(reconnect.after(&restart, past, 0) < Reconnect::RESTART_SPREAD);
+        assert!(reconnect.after(&restart, past, 0) >= Reconnect::RESTART_STEP);
+    }
+
     #[test]
     fn a_rejected_offer_names_the_check_that_refused_it() {
         use agit_peer::client::{HttpFailure, Refusal};

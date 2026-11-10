@@ -116,6 +116,9 @@ pub(crate) fn failure_class(error: &anyhow::Error) -> &'static str {
     if error.is::<agit_peer::client::PresenceSlept>() {
         return "machine_slept";
     }
+    if error.is::<agit_peer::client::RelayRestarting>() {
+        return "relay_restarting";
+    }
     if error.downcast_ref::<std::io::Error>().is_some() {
         return "local_io";
     }
