@@ -23,11 +23,23 @@ pub(super) struct QueuedTurn {
 }
 
 /// An owner's message the plugin holds for the running turn's next tool step: the conversation
-/// and id its delivery record is kept under.
+/// and id its delivery record is kept under, and the turn it was held for.
 struct StepSteer {
     queued: QueuedTurn,
     conversation: String,
     record: String,
+    turn: Option<String>,
+    /// Its place among held messages: what goes back to wait goes in the order it arrived.
+    order: u64,
+}
+
+/// What the terminal reported of a turn being over.
+#[derive(Clone, Copy)]
+pub(super) enum TurnOver<'a> {
+    /// This turn ended.
+    Ended(&'a str),
+    /// This turn began, so any other is over.
+    Started(&'a str),
 }
 
 /// How many messages may wait for the next turn; one more is refused at once.
@@ -43,6 +55,11 @@ pub(super) struct SteerQueue {
     held: HashMap<String, StepSteer>,
     /// The held message whose receipt `pending_steer_command` awaits.
     receipt: Option<String>,
+    /// The turn that message was held for is over, and whether it was stopped: once the receipt
+    /// says the plugin held it, it went undelivered.
+    receipt_turn_over: Option<bool>,
+    /// The next held message's place.
+    next_order: u64,
     /// Waiting for the next turn, in the order they arrived.
     waiting: VecDeque<QueuedTurn>,
     /// Turn starts of queued messages as their receipts come back, by client message id.
@@ -57,6 +74,8 @@ impl Default for SteerQueue {
         Self {
             held: HashMap::new(),
             receipt: None,
+            receipt_turn_over: None,
+            next_order: 0,
             waiting: VecDeque::new(),
             outcomes: mpsc::unbounded_channel(),
         }
@@ -101,16 +120,22 @@ impl Session {
             self.resolve_steer(pending, Ok(Delivery::WhenIdle)).await;
             return;
         };
+        let turn = self.driver.running_native_turn();
         let (dispatch, operation) = self.driver.steer_at_step(&framed);
         match operation {
             Some(operation) => {
                 self.steer_queue.receipt = Some(operation.clone());
+                self.steer_queue.receipt_turn_over = None;
+                let order = self.steer_queue.next_order;
+                self.steer_queue.next_order += 1;
                 self.steer_queue.held.insert(
                     operation,
                     StepSteer {
                         queued,
                         conversation,
                         record,
+                        turn,
+                        order,
                     },
                 );
             }
@@ -122,13 +147,23 @@ impl Session {
         }
     }
 
-    /// The plugin's receipt for a held message came back: one it didn't take isn't held.
-    pub(super) fn step_steer_resolved(&mut self, accepted: bool) {
-        if let Some(operation) = self.steer_queue.receipt.take()
-            && !accepted
-            && let Some(steer) = self.steer_queue.held.remove(&operation)
-        {
-            forget_record(&steer.conversation, &steer.record);
+    /// The plugin's receipt for a held message came back: one it didn't take isn't held, and one
+    /// it took for a turn this session already saw end went undelivered, as that turn ended.
+    /// Whether the turn is still running isn't judged from the terminal's latest state: the
+    /// receipt is read ahead of the events that came with it, which may say it was delivered.
+    pub(super) async fn step_steer_resolved(&mut self, accepted: bool) {
+        let over = self.steer_queue.receipt_turn_over.take();
+        let Some(operation) = self.steer_queue.receipt.take() else {
+            return;
+        };
+        if !accepted {
+            if let Some(steer) = self.steer_queue.held.remove(&operation) {
+                forget_record(&steer.conversation, &steer.record);
+            }
+            return;
+        }
+        if let Some(interrupted) = over {
+            self.step_steer_undelivered(operation, interrupted).await;
         }
     }
 
@@ -153,6 +188,33 @@ impl Session {
         }
     }
 
+    /// The terminal reported a turn over: `ended` finished, or `started` began. The plugin hands
+    /// a held message over only in the turn it was held for, and says so before that turn ends,
+    /// so whatever is still held for a turn that is over went undelivered, whether or not the
+    /// plugin says so. Each goes as an undelivered one does: it waits for the next turn, or, when
+    /// `interrupted`, is dropped, in the order they were held. One whose receipt hasn't come back
+    /// waits for it, which then decides it as this turn's end would have.
+    pub(super) async fn held_turn_over(&mut self, over: TurnOver<'_>, interrupted: bool) {
+        let mut stranded: Vec<(u64, String)> = self
+            .steer_queue
+            .held
+            .iter()
+            .filter(|(_, steer)| match over {
+                TurnOver::Ended(turn) => steer.turn.as_deref() == Some(turn),
+                TurnOver::Started(turn) => steer.turn.as_deref() != Some(turn),
+            })
+            .map(|(operation, steer)| (steer.order, operation.clone()))
+            .collect();
+        stranded.sort();
+        for (_, operation) in stranded {
+            if self.steer_queue.receipt.as_ref() == Some(&operation) {
+                self.steer_queue.receipt_turn_over = Some(interrupted);
+                continue;
+            }
+            self.step_steer_undelivered(operation, interrupted).await;
+        }
+    }
+
     /// The session ends. What waits here for the next turn goes nowhere now, so each sender is
     /// told. A message the plugin holds is the terminal's: the terminal runs on without this
     /// session and may still hand it over at its next tool step, or may already have done so
@@ -161,6 +223,7 @@ impl Session {
     /// only for that exact text, which nothing else writes.
     pub(super) async fn abandon_steers(&mut self) {
         self.steer_queue.receipt = None;
+        self.steer_queue.receipt_turn_over = None;
         self.steer_queue.held.clear();
         let waiting: Vec<QueuedTurn> = self.steer_queue.waiting.drain(..).collect();
         for queued in waiting {
@@ -329,6 +392,8 @@ mod tests {
                 queued: queued("held", true, Default::default()),
                 conversation: conversation.into(),
                 record: "held".into(),
+                turn: Some("turn".into()),
+                order: 0,
             },
         );
         session
@@ -408,6 +473,151 @@ mod tests {
         ));
         assert_eq!(turn_message(session.next_queued_turn().await), "auto");
         assert!(dropped(&mut out).is_empty());
+        session.driver.shutdown().await.unwrap();
+    }
+
+    /// Holds `id` for `turn`, as the plugin's receipt for it would, after what is held already.
+    /// It names no conversation, so dropping its delivery record reads no ledger.
+    fn hold(session: &mut Session, id: &str, turn: &str) {
+        let order = session.steer_queue.next_order;
+        session.steer_queue.next_order += 1;
+        session.steer_queue.held.insert(
+            id.into(),
+            StepSteer {
+                queued: queued(id, true, Default::default()),
+                conversation: String::new(),
+                record: id.into(),
+                turn: Some(turn.into()),
+                order,
+            },
+        );
+    }
+
+    /// Nadia's order: a message is held for the running turn's next tool step, the turn ends
+    /// before another step comes, and the terminal never reports it undelivered (the report came
+    /// with a later turn's start, or not at all). The turn's end alone moves it to wait for the
+    /// next turn, which it then starts; a held message is never left behind across later turns.
+    /// One held for a turn that is still running stays held, and one whose turn a stop ended is
+    /// dropped and its sender told.
+    #[tokio::test]
+    async fn a_message_held_for_a_turn_that_ends_starts_the_next_turn() {
+        let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+        let (mut session, mut out, _notes) =
+            super::super::tests::harness_test_session_with_channels(
+                AnyDriver::Codex(Box::new(driver)),
+                "codex",
+                SessionStatus::Idle,
+            );
+        hold(&mut session, "follow-up", "finishing");
+        hold(&mut session, "later", "next");
+        session
+            .held_turn_over(TurnOver::Ended("finishing"), false)
+            .await;
+        assert!(session.steer_queue.held.contains_key("later"));
+        assert!(!session.steer_queue.held.contains_key("follow-up"));
+        assert_eq!(turn_message(session.next_queued_turn().await), "follow-up");
+        assert!(dropped(&mut out).is_empty());
+
+        // A turn that began while one was still held ends that one's chance too.
+        session
+            .held_turn_over(TurnOver::Started("third"), false)
+            .await;
+        assert!(session.steer_queue.held.is_empty());
+        assert_eq!(turn_message(session.next_queued_turn().await), "later");
+
+        hold(&mut session, "stopped", "third");
+        session.held_turn_over(TurnOver::Ended("third"), true).await;
+        assert!(session.steer_queue.held.is_empty());
+        assert!(session.steer_queue.waiting.is_empty());
+        assert_eq!(
+            dropped(&mut out),
+            [("stopped".to_owned(), "interrupted".to_owned())]
+        );
+        session.driver.shutdown().await.unwrap();
+    }
+
+    /// The terminal can take a message, hand it to a tool step and end the turn between two
+    /// reports, so its receipt arrives with the delivery and the turn's end, read ahead of both,
+    /// while the terminal's latest state already shows no turn running. That state doesn't make
+    /// the message undelivered: it was delivered, and runs once. When that turn was stopped
+    /// instead, the message is dropped as interrupted. A receipt read after its turn's end
+    /// decides the message as that end did.
+    #[tokio::test]
+    async fn a_late_receipt_never_runs_a_delivered_message_twice() {
+        let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+        let (mut session, mut out, _notes) =
+            super::super::tests::harness_test_session_with_channels(
+                AnyDriver::Codex(Box::new(driver)),
+                "codex",
+                SessionStatus::Idle,
+            );
+        let awaiting = |session: &mut Session, id: &str| {
+            hold(session, id, "finishing");
+            session.steer_queue.receipt = Some(id.into());
+        };
+
+        // Delivered in the same batch as its receipt and the turn's end.
+        awaiting(&mut session, "delivered");
+        session.step_steer_resolved(true).await;
+        session.step_steer_delivered("delivered".into());
+        session
+            .held_turn_over(TurnOver::Ended("finishing"), false)
+            .await;
+        assert!(session.next_queued_turn().await.is_none(), "it ran once");
+        assert!(dropped(&mut out).is_empty());
+
+        // Stopped in the same batch as its receipt.
+        awaiting(&mut session, "stopped");
+        session.step_steer_resolved(true).await;
+        session
+            .held_turn_over(TurnOver::Ended("finishing"), true)
+            .await;
+        assert!(session.next_queued_turn().await.is_none());
+        assert_eq!(
+            dropped(&mut out),
+            [("stopped".to_owned(), "interrupted".to_owned())]
+        );
+
+        // The turn's end read first, then the receipt: decided as that end was.
+        for (id, interrupted) in [("after-end", false), ("after-stop", true)] {
+            awaiting(&mut session, id);
+            session
+                .held_turn_over(TurnOver::Ended("finishing"), interrupted)
+                .await;
+            assert!(session.steer_queue.held.contains_key(id));
+            session.step_steer_resolved(true).await;
+            assert!(session.steer_queue.held.is_empty());
+        }
+        assert_eq!(turn_message(session.next_queued_turn().await), "after-end");
+        assert_eq!(
+            dropped(&mut out),
+            [("after-stop".to_owned(), "interrupted".to_owned())]
+        );
+        session.driver.shutdown().await.unwrap();
+    }
+
+    /// Held messages whose turn is over wait for the next turn in the order they were held, and
+    /// start turns in that order.
+    #[tokio::test]
+    async fn held_messages_whose_turn_is_over_keep_their_order() {
+        let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+        let (mut session, _out, _notes) = super::super::tests::harness_test_session_with_channels(
+            AnyDriver::Codex(Box::new(driver)),
+            "codex",
+            SessionStatus::Idle,
+        );
+        let sent: Vec<String> = (0..8).map(|index| format!("message-{index}")).collect();
+        for id in &sent {
+            hold(&mut session, id, "finishing");
+        }
+        session
+            .held_turn_over(TurnOver::Ended("finishing"), false)
+            .await;
+        let mut started = Vec::new();
+        while let Some(command) = session.next_queued_turn().await {
+            started.push(turn_message(Some(command)));
+        }
+        assert_eq!(started, sent);
         session.driver.shutdown().await.unwrap();
     }
 }
