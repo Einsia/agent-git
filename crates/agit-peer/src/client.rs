@@ -675,6 +675,22 @@ impl std::fmt::Display for PresenceSlept {
 
 impl std::error::Error for PresenceSlept {}
 
+/// The close code a Hub's relay closes every socket with when it shuts down to be replaced: the
+/// relay is going away, nothing failed.
+pub const RELAY_RESTARTING: u16 = 1012;
+
+/// The relay closed the presence because it is restarting.
+#[derive(Debug)]
+pub struct RelayRestarting;
+
+impl std::fmt::Display for RelayRestarting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the cloud relay is restarting; reconnecting to its replacement")
+    }
+}
+
+impl std::error::Error for RelayRestarting {}
+
 impl Presence {
     pub async fn open(connection: Connection) -> anyhow::Result<Self> {
         let worker_pid = connection.worker_pid;
@@ -768,6 +784,9 @@ impl Presence {
                     );
                     return Ok(event);
                 }
+                Packet::Close(Some(close)) if close.code == RELAY_RESTARTING => {
+                    return Err(RelayRestarting.into());
+                }
                 _ => anyhow::bail!("cloud presence closed or sent invalid data"),
             }
         }
@@ -814,6 +833,36 @@ mod tests {
                 let error = waited.expect("a dead presence must fail").unwrap_err();
                 assert!(error.to_string().contains("heartbeat"));
             }
+        }
+    }
+
+    /// A relay closing the presence with 1012 is restarting, and only that code reads as a
+    /// restart: any other close is a failure the daemon backs off from. A presence that read every
+    /// close as a restart would hammer a Hub that is refusing it, and one that read none would put
+    /// every release's reconnect on the failure backoff.
+    #[tokio::test]
+    async fn only_a_service_restart_close_reads_as_a_relay_restart() {
+        for (code, restarting) in [(RELAY_RESTARTING, true), (1000, false), (1011, false)] {
+            let packets = futures_util::stream::iter([
+                Packet::Text(
+                    serde_json::to_string(&PresenceEvent::Ready {
+                        epoch: "presence".into(),
+                    })
+                    .unwrap(),
+                ),
+                Packet::Close(Some(agit_tunnel::protocol::Close {
+                    code,
+                    reason: "closing".into(),
+                })),
+            ])
+            .map(Ok);
+            let sink = futures_util::sink::drain().sink_map_err(anyhow::Error::from);
+            let mut presence =
+                Presence::open(Connection::from_parts(0, Box::pin(sink), Box::pin(packets)))
+                    .await
+                    .unwrap();
+            let error = presence.next().await.unwrap_err();
+            assert_eq!(error.is::<RelayRestarting>(), restarting, "{code}");
         }
     }
 
