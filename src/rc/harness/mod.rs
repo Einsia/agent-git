@@ -811,6 +811,16 @@ impl AnyDriver {
         }
     }
 
+    /// The turn a native Claude Code terminal last reported running, which a message held for its
+    /// next tool step belongs to.
+    pub fn running_native_turn(&self) -> Option<String> {
+        match self {
+            #[cfg(unix)]
+            Self::ClaudeNative(driver) => driver.running_turn(),
+            _ => None,
+        }
+    }
+
     /// Hands `framed` to the running turn's next tool step; see [`Self::steers_at_step`]. Its
     /// operation id comes back with it.
     pub fn steer_at_step(&mut self, framed: &str) -> (SteerDispatch, Option<String>) {

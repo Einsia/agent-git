@@ -3094,7 +3094,7 @@ impl Session {
                 }
             }
             HarnessEvent::SteerResolved(result) => {
-                self.step_steer_resolved(result.is_ok());
+                self.step_steer_resolved(result.is_ok()).await;
                 if let Some(pending) = self.pending_steer_command.take() {
                     self.resolve_steer(pending, result.map_err(anyhow::Error::msg))
                         .await;
@@ -3120,6 +3120,8 @@ impl Session {
                 }
             }
             HarnessEvent::TurnStarted { turn_id, prompt } => {
+                self.held_turn_over(steer_queue::TurnOver::Started(&turn_id), false)
+                    .await;
                 self.follow_rollover().await;
                 if let Err(message) = self
                     .announce_turn_started_once(turn_id, prompt, None, true)
@@ -3186,6 +3188,12 @@ impl Session {
                 // do this). A turn boundary is authoritative: no approval from
                 // that turn can still be answered.
                 self.abandon_pending_approvals().await;
+                // Nor can a message held for one of its tool steps still reach it.
+                self.held_turn_over(
+                    steer_queue::TurnOver::Ended(&turn_id),
+                    matches!(outcome, TurnOutcome::Interrupted),
+                )
+                .await;
                 // **One drain is not enough.** At the moment the harness writes `result` on
                 // stdout, its last transcript line need not be persisted yet: the model's final
                 // reply (`assistant_reply`) can come **after** `turn.completed`, so any client

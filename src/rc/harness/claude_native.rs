@@ -190,6 +190,11 @@ impl ClaudeNativeDriver {
 
     /// Whether a message for the running turn can wait in the plugin for that turn's next tool
     /// step: the plugin says it can, and a turn runs now.
+    /// The turn the terminal last reported running.
+    pub fn running_turn(&self) -> Option<String> {
+        self.snapshot.turn.clone()
+    }
+
     pub fn steers_at_step(&self) -> bool {
         self.client.is_some()
             && self.snapshot.turn.is_some()

@@ -431,6 +431,31 @@ test("a message for the running turn goes with its next tool step, or back to th
   assert.deepEqual(f.calls.filter(call => call[0] === "prompt"), []);
 });
 
+test("a message held for a turn goes back to the daemon when that turn ends, even after the next began", async () => {
+  const f = await fixture();
+  await f.fire("session.start");
+  await f.fire("turn.start", { turnId: "finishing" });
+  await f.poll();
+  const target = f.latest();
+  const steer = (id, turnId) => ({ ...target, id, method: "steer_context", text: "MSG " + id, turnId });
+  const settle = async () => { await f.poll(); await flush(); await flush(); await f.poll(); };
+  f.replies.push(body => ({ generation: body.generation, commands: [steer("follow-up", "finishing")] }));
+  await settle();
+  assert.deepEqual(f.latest().results, [{ id: "follow-up", outcome: "held_for_step" }]);
+  // The next turn begins before the finishing turn's end comes through.
+  await f.fire("turn.start", { turnId: "next" });
+  await f.fire("turn.complete", { turnId: "finishing", reason: "answer", durationMs: 1 });
+  await f.fire("turn.complete", { turnId: "next", reason: "answer", durationMs: 1 });
+  await f.poll();
+  const sent = [...new Map(f.requests.filter(r => r.path === "/poll")
+    .flatMap(r => r.body.events).map(e => [e.seq, e])).values()];
+  assert.deepEqual(sent.filter(e => e.kind.startsWith("steer_")).map(({ seq, ...e }) => e), [
+    { kind: "steer_undelivered", id: "follow-up", reason: "completed" },
+  ], "reported once, when the next turn began");
+  const next = await f.fire("tool.call", { tool: "Bash", tool_use_id: "late" }, async () => ({ result: "ok" }));
+  assert.deepEqual(next, { result: "ok" }, "a later turn never carries it");
+});
+
 test("native slash commands keep their receipt and activity without creating a model prompt", async () => {
   const f = await fixture();
   const completed = deferred();

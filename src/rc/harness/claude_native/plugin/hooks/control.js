@@ -599,8 +599,11 @@ export function registerControl(on) {
     // Only the main loop's turns are the conversation's: a subagent's turn runs inside one, and
     // taking it for the running turn would strand what waits for the main turn's next step or end.
     if (!ending && e.agentId === undefined) {
+      const previous = turn;
       turn = e.turnId;
       await event("turn_started", { turn: e.turnId });
+      // A turn that began before the last one's end came through ends that one here.
+      if (previous !== null && previous !== e.turnId) await steerLeftover(previous, "completed");
     }
     return next(e);
   });
@@ -608,11 +611,13 @@ export function registerControl(on) {
     // Before the turn's end reaches the daemon, which stops a writer handing over there.
     if (e.agentId === undefined && !interactive) await reportWriterLeaf($).catch(() => {});
     const result = await next(e);
-    if (e.agentId === undefined && turn === e.turnId) {
-      if (!matches(identity)) return result;
-      turn = null;
-      await event("turn_completed", { turn: e.turnId, reason: e.reason,
-        duration_ms: Number.isFinite(e.durationMs) && e.durationMs >= 0 ? Math.round(e.durationMs) : undefined });
+    if (e.agentId === undefined && matches(identity)) {
+      if (turn === e.turnId) {
+        turn = null;
+        await event("turn_completed", { turn: e.turnId, reason: e.reason,
+          duration_ms: Number.isFinite(e.durationMs) && e.durationMs >= 0 ? Math.round(e.durationMs) : undefined });
+      }
+      // Even when another turn began meanwhile, what waited for this one's next step can't go.
       await steerLeftover(e.turnId, e.reason);
     }
     return result;
