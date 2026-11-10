@@ -508,6 +508,7 @@ fn setup_response(
             },
         ),
         reason: Some(reason),
+        target: None,
     };
     json!({"session_id":logical,"items":[],"pending":records.iter().filter(|entry| entry.acknowledged.is_none()).count(),"next_after":null,"retry_after_ms":null,"publication":status})
 }
@@ -548,6 +549,7 @@ fn publication_status(
         progress,
         stage,
         reason,
+        target: None,
     }
 }
 

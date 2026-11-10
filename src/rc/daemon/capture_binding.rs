@@ -232,5 +232,6 @@ pub(super) fn binding_invalid() -> crate::protocol::SessionPublicationStatus {
         progress: crate::protocol::PublicationProgress::Idle,
         stage: Some(crate::protocol::PublicationStage::Capture),
         reason: Some(crate::protocol::PublicationReason::BindingInvalid),
+        target: None,
     }
 }

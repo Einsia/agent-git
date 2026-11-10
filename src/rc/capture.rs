@@ -262,6 +262,14 @@ pub(crate) struct PublicationDestination {
 }
 
 impl PublicationDestination {
+    /// This destination as a session's publication status names it.
+    pub(crate) fn target(&self) -> crate::protocol::PublicationTarget {
+        crate::protocol::PublicationTarget {
+            repository: self.repository.clone(),
+            agent_id: self.identity.agent_id.clone(),
+        }
+    }
+
     /// Refuses unless this computer holds a stored sign-in for the destination's Hub. There is no
     /// other Hub to fall back to, so without one nothing is sent anywhere. Callers judge the
     /// person's own off switches first: a turned-off destination waits as turned off, whatever
@@ -281,6 +289,13 @@ pub(crate) fn destination(
     lineage: &AgitSession,
 ) -> Result<Option<PublicationDestination>> {
     destination_by(repo, lineage, Authority::Process)
+}
+
+/// Where `lineage`'s turns upload from this computer, read from its capture repository: `None`
+/// when it has no destination, or one can't be read.
+pub(crate) fn upload_target(lineage: &AgitSession) -> Option<crate::protocol::PublicationTarget> {
+    let repo = Repo::open(lineage.repo_dir().ok()?)?;
+    Some(destination(&repo, lineage).ok()??.target())
 }
 
 /// Where `lineage`'s capture publishes, its device-local repository verified against `authority`.

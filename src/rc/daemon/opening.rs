@@ -430,8 +430,21 @@ impl PreparedSpawn {
         self.revalidate_capture()
             .await
             .map_err(SpawnFailure::before_launch)?;
+        let mut info = self.info.clone();
+        // The session says where its turns upload from the start, so a Hub whose binding names
+        // another repository can show that before anything is uploaded.
+        if let Some(lineage) = self.spec.agit_session.clone()
+            && let Ok(Some(target)) =
+                tokio::task::spawn_blocking(move || crate::rc::capture::upload_target(&lineage))
+                    .await
+        {
+            let status = info
+                .publication
+                .get_or_insert_with(crate::protocol::SessionPublicationStatus::checking);
+            status.target = Some(target);
+        }
         let mut session = Session::launch(
-            self.info.clone(), self.spec.clone(), out, self.notes.clone(),
+            info, self.spec.clone(), out, self.notes.clone(),
             self.confinement.clone(), self.settlement.clone(), self.generation,
         ).await.map_err(|failure| {
             if self.spec.resume_from.is_some() && failure.is_external_writer() {
