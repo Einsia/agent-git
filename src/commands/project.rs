@@ -200,9 +200,14 @@ fn enable_auto_push(project: &mut Project, repo: &Repo) -> Result<()> {
     if recorded == crate::domain::repo::automatic_upload_off::Recorded::Off
         || (repo.auto_push_override()?.is_none() && recorded.holds_off())
     {
+        let switch = if on_switches_back(&project.repository) {
+            "; `agit on` in this folder switches it back on"
+        } else {
+            ""
+        };
         println!(
-            "automatic upload into {} stays off: you turned it off on this computer; `agit config --repo {} push.auto true` turns it on",
-            project.repository, project.repository
+            "automatic upload into {} stays off: you turned it off on this computer{switch}",
+            project.repository
         );
         return Ok(());
     }
@@ -2644,6 +2649,20 @@ pub(crate) fn unsaved_folder_line(cwd: &Path) -> Option<String> {
     )
 }
 
+/// Takes the one chance to tell a conversation starting in `root`, a folder set up for a
+/// repository without saving conversations by itself, that agit isn't saving it: `true` only for
+/// the caller that records it. It is the chance [`unsaved_folder_line`] takes for a folder never
+/// bound, kept in the same record, so a folder the person declined, or one already told by either
+/// line, stays quiet.
+pub(crate) fn claim_unsaved_notice(root: &Path) -> Result<bool> {
+    let _guard = offer_lock(root)?;
+    if automatic_upload_offered(root) {
+        return Ok(false);
+    }
+    write_offer(root, "offered")?;
+    Ok(true)
+}
+
 /// Records that the person declined turning `root` on. It changes nothing else: a binding, a
 /// paused folder and its local saving stay as they were.
 pub(crate) fn record_automatic_upload_declined(root: &Path) -> Result<()> {
@@ -2747,6 +2766,19 @@ pub(crate) fn last_failure(path: &Path) -> Option<String> {
     let (project, _) = governing(path).ok()??;
     let last = project.last_result?;
     (last["ok"] == false).then(|| last["error"].as_str().unwrap_or("unknown error").to_owned())
+}
+
+/// [`last_failure`] said in a fixed sentence by its reason, for a line the person reads: a
+/// failure's own error can hold URLs, header values and paths. `None` when the last upload did
+/// not fail; a failure recorded without a reason reads as one this computer could not complete.
+pub(crate) fn last_failure_described(path: &Path) -> Option<&'static str> {
+    let (project, _) = governing(path).ok()??;
+    let last = project.last_result?;
+    (last["ok"] == false).then(|| {
+        serde_json::from_value::<UploadFailure>(last["reason"].clone())
+            .unwrap_or(UploadFailure::Other)
+            .describe()
+    })
 }
 
 /// Sessions under `root` that the policy left out when it was bound without earlier history and
@@ -4297,6 +4329,8 @@ pub(crate) struct AutomaticUpload {
     /// The git worktree the conversation started in and the main checkout whose setting uploads
     /// it, when it started in one.
     pub(crate) worktree: Option<(PathBuf, PathBuf)>,
+    /// What holds the folder's uploads, when something does: its turns then don't go up.
+    pub(crate) held: Option<Held>,
 }
 
 /// The repository a project saves a conversation into by itself, read from local state alone.
@@ -4569,7 +4603,10 @@ pub(crate) fn automatic_upload(
         None => recorded,
     };
     let sign_in = sign_in(&project);
+    // The start line is the person's own, whatever process reads the hook's answer.
+    let held = upload_held(&project, Reader::Person);
     Some(AutomaticUpload {
+        held,
         visibility: audience.visibility.filter(|v| !v.is_empty()),
         org: audience.org,
         members_read: audience.members_read,
@@ -5317,15 +5354,16 @@ fn session_json(
 /// Why a folder set to upload by itself isn't uploading: a `code` from an open set, which a
 /// reader that doesn't know one shows by its `text` and counts as needing attention, so a code
 /// added later never reads as nothing to do.
-struct Held {
-    code: &'static str,
-    text: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Held {
+    pub(crate) code: &'static str,
+    pub(crate) text: String,
     /// The Hub and account the folder was set up under, for `other_account`.
-    under: Option<(String, String)>,
+    pub(crate) under: Option<(String, String)>,
 }
 
 impl Held {
-    fn json(&self) -> serde_json::Value {
+    pub(crate) fn json(&self) -> serde_json::Value {
         let mut held = serde_json::json!({"code": self.code, "text": self.text});
         if let Some((hub, account)) = &self.under {
             held["hub"] = hub.as_str().into();
@@ -5333,6 +5371,89 @@ impl Held {
         }
         held
     }
+}
+
+/// What a folder does with a conversation that starts in it, judged from local state. `agit on`,
+/// the overview and a conversation's start all say what this says, so none of them says a
+/// conversation uploads while its upload is held, or saves where nothing saves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Saving {
+    /// No binding covers the folder.
+    NotSet,
+    /// Bound to `repository` at `root` without saving conversations by itself: one that starts
+    /// there is only registered.
+    LocalOnly { root: PathBuf, repository: String },
+    /// Turned off.
+    Off,
+    /// On, with its uploads to `repository` held for `held`'s reason. Under `push_auto_off` its
+    /// turns still save on this computer.
+    Held { repository: String, held: Held },
+    /// On, and uploading.
+    Uploads,
+}
+
+/// [`Saving`] for `folder`, a directory a conversation runs in or a folder's root.
+/// Whether `agit on` in a folder that is on switches `repository`'s automatic upload back on from
+/// being off on this computer. It writes the destination checkout's own setting and drops the off
+/// recorded for the destination, so the one off it can't end is the person's default for
+/// repositories without a setting while there is no checkout here to hold one. A surface names
+/// `agit on` for switching back on only when this holds, so it never names a command that would
+/// change nothing.
+pub(crate) fn on_switches_back(repository: &str) -> bool {
+    let Ok((owner, name)) = super::parse_slug(repository) else {
+        return false;
+    };
+    config::repo_dir(&owner, &name)
+        .ok()
+        .and_then(Repo::open)
+        .is_some()
+        || config::get_global("push.auto").ok().flatten().as_deref() != Some("false")
+}
+
+pub(crate) fn saving(folder: &Path) -> Saving {
+    let Some((project, _)) = governing(folder).ok().flatten() else {
+        return match bound_root(folder)
+            .and_then(|root| workspace::read(&root).map(|binding| (root, binding.repo)))
+        {
+            Some((root, repository)) => Saving::LocalOnly { root, repository },
+            None => Saving::NotSet,
+        };
+    };
+    if !project.enabled {
+        return Saving::Off;
+    }
+    if !project.auto_upload {
+        return Saving::LocalOnly {
+            root: project.root,
+            repository: project.repository,
+        };
+    }
+    match upload_held(&project, Reader::of_this_process()) {
+        Some(held) => Saving::Held {
+            repository: project.repository,
+            held,
+        },
+        None => Saving::Uploads,
+    }
+}
+
+/// What holds the uploads of `project`, a folder that is on, said for `reader`. Its automatic
+/// upload counts as off as the turn end decides it ([`upload_off`]), so no surface calls a folder
+/// held while its turns go up, or uploading while they stay here.
+fn upload_held(project: &Project, reader: Reader) -> Option<Held> {
+    let checkout = super::parse_slug(&project.repository)
+        .ok()
+        .and_then(|(owner, name)| Repo::open(config::repo_dir(&owner, &name).ok()?));
+    let state = if upload_off(project) { "blocked" } else { "on" };
+    let last = project.last_result.as_ref().map(last_upload);
+    held(
+        project,
+        state,
+        checkout.as_ref(),
+        last.as_ref(),
+        &config::hub_url(),
+        reader,
+    )
 }
 
 /// What the Hub last said about the signed-in account pushing to the repository `checkout` is
@@ -5858,10 +5979,20 @@ fn list() -> CmdResult {
         );
         if folder["state"] == "blocked" {
             let waiting = folder["awaiting_upload"].as_u64().unwrap_or_default();
+            let place = ui::tilde(Path::new(folder["folder"].as_str().unwrap_or_default()));
+            let switch = if !on_switches_back(repository) {
+                String::new()
+            } else {
+                match Reader::of_this_process() {
+                    Reader::Person => format!("; `agit on {place}` switches it back on"),
+                    Reader::Agent => {
+                        format!("; the user switches it back on with `agit on {place}`")
+                    }
+                }
+            };
             println!(
                 "  {} automatic upload (push.auto) is off for {repository} on this computer, so \
-                 {waiting} conversation{} here {} saved but not uploaded; turn it on with \
-                 `agit config --repo {repository} push.auto true`",
+                 {waiting} conversation{} here {} saved but not uploaded{switch}",
                 ui::warn_text("blocked:"),
                 if waiting == 1 { "" } else { "s" },
                 if waiting == 1 { "is" } else { "are" },

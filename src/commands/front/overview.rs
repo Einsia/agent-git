@@ -82,6 +82,14 @@ pub fn run() -> CmdResult {
     let failure = root
         .as_deref()
         .and_then(crate::commands::project::last_failure);
+    let failure_said = root
+        .as_deref()
+        .and_then(crate::commands::project::last_failure_described);
+    // An on folder whose uploads are held is said to be on and held, never to upload.
+    let held = match (state, root.as_deref().map(crate::commands::project::saving)) {
+        (FolderState::On, Some(crate::commands::project::Saving::Held { held, .. })) => Some(held),
+        _ => None,
+    };
     let codex_untrusted = state == FolderState::On && codex_hooks_silent(&sessions);
     // An old agit section in a folder agit set up still tells agents to run agit at every session
     // start; the person removes it, as the file may be committed.
@@ -114,6 +122,7 @@ pub fn run() -> CmdResult {
                 "sessions_here": total,
                 "recent": sessions.iter_mut().map(row_json).collect::<Vec<_>>(),
                 "last_upload_error": failure,
+                "held": held.as_ref().map(crate::commands::project::Held::json),
                 "codex_hooks_not_running": codex_untrusted,
                 "legacy_agents_sections": legacy.iter().map(|section| serde_json::json!({
                     "file": section.file,
@@ -146,8 +155,40 @@ pub fn run() -> CmdResult {
         Some(root) => {
             let folder = ui::tilde(root);
             let repository = repository.as_deref().unwrap_or_default();
-            match state {
-                FolderState::On => match &through {
+            match (state, held.as_ref()) {
+                (FolderState::On, Some(held)) => {
+                    let place = match &through {
+                        Some(main) => format!(" through {} (git worktree)", ui::tilde(main)),
+                        None => String::new(),
+                    };
+                    match held.code {
+                        // Named as the start line and `agit status` name it, with what ends it.
+                        "push_auto_off" => println!(
+                            "{folder} is on{place}, but automatic upload to {} is off on this computer: sessions here are saved on this computer and not uploaded; {} publishes them{}",
+                            ui::bold(repository),
+                            ui::accent(&format!("agit push {repository}")),
+                            if crate::commands::project::on_switches_back(repository) {
+                                format!(
+                                    ", and {} switches automatic upload back on",
+                                    ui::accent("agit on")
+                                )
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        "public_needs_consent" => println!(
+                            "{folder} is on{place}, but {} is public, and automatic upload into it waits until you switch it on: {}",
+                            ui::bold(repository),
+                            ui::accent("agit on")
+                        ),
+                        _ => println!(
+                            "{folder} is on{place}, but its uploads to {} are held: {}",
+                            ui::bold(repository),
+                            held.text
+                        ),
+                    }
+                }
+                (FolderState::On, None) => match &through {
                     Some(main) => println!(
                         "{folder} is on through {} (git worktree): sessions upload to {}",
                         ui::tilde(main),
@@ -158,11 +199,11 @@ pub fn run() -> CmdResult {
                         ui::bold(repository)
                     ),
                 },
-                FolderState::LocalOnly => println!(
+                (FolderState::LocalOnly, _) => println!(
                     "{folder} is set up for {repository}, but its sessions are not saved or uploaded by themselves"
                 ),
-                FolderState::Off => println!("{folder} is off"),
-                FolderState::NotSaved => println!("{folder} is not saved"),
+                (FolderState::Off, _) => println!("{folder} is off"),
+                (FolderState::NotSaved, _) => println!("{folder} is not saved"),
             }
             if codex_untrusted {
                 println!(
@@ -170,12 +211,8 @@ pub fn run() -> CmdResult {
                     ui::warn_text("Codex has not run AgentGit's save hook:")
                 );
             }
-            if let Some(failure) = &failure {
-                println!(
-                    "  {} {}",
-                    ui::warn_text("the last upload failed:"),
-                    ui::truncate(failure, 160)
-                );
+            if let Some(failure) = failure_said {
+                println!("  {} {failure}", ui::warn_text("the last upload failed:"));
             }
             for (worktree, count) in earlier.iter().filter(|(_, count)| *count > 0) {
                 let place = if through.is_some() {
