@@ -81,13 +81,32 @@ pub struct Snapshot {
     pub records: usize,
 }
 
+/// How many bytes one inspection may stream through a digest without keeping them.
+#[cfg(feature = "cli")]
+pub(crate) const HASHING_ALLOWANCE: usize = 512 * 1024 * 1024;
+
 pub(crate) struct Budget {
     remaining: usize,
+    #[cfg(feature = "cli")]
+    hashing: usize,
 }
 
 impl Budget {
     pub(crate) fn new(bytes: usize) -> Self {
-        Self { remaining: bytes }
+        Self {
+            remaining: bytes,
+            #[cfg(feature = "cli")]
+            hashing: HASHING_ALLOWANCE,
+        }
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn reserve_hashing(&mut self, bytes: usize) -> Result<()> {
+        self.hashing = self
+            .hashing
+            .checked_sub(bytes)
+            .ok_or(Unavailable::BudgetExceeded)?;
+        Ok(())
     }
 
     pub(crate) fn reserve(&mut self, bytes: usize) -> Result<()> {
@@ -295,6 +314,122 @@ pub(crate) fn read_file(source: &Source, limits: Limits) -> Result<Snapshot> {
 
 /// Byte inspection pins a regular carrier; record completeness belongs to the caller.
 pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
+    let (file, opened) = open_unchanged(path, |len| {
+        if len > limits.bytes || len > limits.working_bytes {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        Ok(())
+    })?;
+    let capacity = usize::try_from(opened.len()).map_err(|_| Unavailable::BudgetExceeded)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| Unavailable::BudgetExceeded)?;
+    read_bounded(&file, &mut bytes, limits)?;
+    finish_unchanged(&file, path, &opened, bytes.len())?;
+    Ok(bytes)
+}
+
+/// The longest first line [`read_file_after`] keeps.
+#[cfg(feature = "cli")]
+pub(crate) const FIRST_LINE_LIMIT: usize = 1024 * 1024;
+
+/// What [`read_file_after`] found past a recorded prefix.
+#[cfg(feature = "cli")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum After {
+    /// Every byte past the prefix, which matched its digest and ended a line, and the prefix's
+    /// first line when it fits in [`FIRST_LINE_LIMIT`] (empty when it doesn't, or there is no
+    /// prefix). The first line is part of what the digest vouched for.
+    Bytes { first_line: Vec<u8>, tail: Vec<u8> },
+    /// The file no longer starts with that prefix: shorter, different, or cut inside a line.
+    PrefixDiffers,
+}
+
+/// Reads what follows the first `start` bytes of `path` once they match `sha256`. The prefix is
+/// streamed through the digest and never kept, so only the bytes after it count against
+/// `limits`. A read that outlasts `expired` stops as over budget.
+#[cfg(feature = "cli")]
+pub(crate) fn read_file_after(
+    path: &Path,
+    start: u64,
+    sha256: &str,
+    limits: Limits,
+    expired: impl Fn() -> bool,
+) -> Result<After> {
+    use sha2::Digest as _;
+    let (file, opened) = open_unchanged(path, |_| Ok(()))?;
+    let Some(after) = opened.len().checked_sub(start) else {
+        return Ok(After::PrefixDiffers);
+    };
+    let capacity = usize::try_from(after).map_err(|_| Unavailable::BudgetExceeded)?;
+    if capacity > limits.bytes || capacity > limits.working_bytes {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    let mut digest = sha2::Sha256::new();
+    let mut prefix = (&file).take(start);
+    let mut chunk = vec![0; 1 << 20];
+    let mut read = 0u64;
+    let mut last = None;
+    let mut first_line = Vec::new();
+    let mut first_line_done = false;
+    loop {
+        if expired() {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        let count = prefix.read(&mut chunk).map_err(|_| Unavailable::Read)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&chunk[..count]);
+        if !first_line_done {
+            match chunk[..count].iter().position(|byte| *byte == b'\n') {
+                Some(end) => {
+                    first_line.extend_from_slice(&chunk[..=end]);
+                    first_line_done = true;
+                }
+                None => first_line.extend_from_slice(&chunk[..count]),
+            }
+            if !first_line_done && first_line.len() > FIRST_LINE_LIMIT {
+                first_line = Vec::new();
+                first_line_done = true;
+            }
+        }
+        last = Some(chunk[count - 1]);
+        read += count as u64;
+    }
+    if read != start
+        || last.is_some_and(|byte| byte != b'\n')
+        || hex::encode(digest.finalize()) != sha256
+    {
+        return Ok(After::PrefixDiffers);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| Unavailable::BudgetExceeded)?;
+    read_bounded(&file, &mut bytes, limits)?;
+    let total = usize::try_from(start)
+        .ok()
+        .and_then(|start| start.checked_add(bytes.len()))
+        .ok_or(Unavailable::BudgetExceeded)?;
+    finish_unchanged(&file, path, &opened, total)?;
+    // A first line that never ended inside the limit is not kept.
+    if !first_line.ends_with(b"\n") {
+        first_line.clear();
+    }
+    Ok(After::Bytes {
+        first_line,
+        tail: bytes,
+    })
+}
+
+/// Opens `path` as the same regular file its name showed before the open, once `admit` accepts
+/// its length.
+fn open_unchanged(
+    path: &Path,
+    admit: impl FnOnce(usize) -> Result<()>,
+) -> Result<(std::fs::File, std::fs::Metadata)> {
     // Windows timestamps can survive replacement; keep the initial file identity alive.
     #[cfg(windows)]
     let initial = open_attributes(path).map_err(|_| Unavailable::Read)?;
@@ -307,14 +442,7 @@ pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
     }
     #[cfg(windows)]
     let initial_identity = file_identity(&initial)?;
-    let cap = limits
-        .bytes
-        .checked_add(1)
-        .ok_or(Unavailable::BudgetExceeded)?;
-    let capacity = usize::try_from(before.len()).map_err(|_| Unavailable::BudgetExceeded)?;
-    if capacity > limits.bytes || capacity > limits.working_bytes {
-        return Err(Unavailable::BudgetExceeded);
-    }
+    admit(usize::try_from(before.len()).map_err(|_| Unavailable::BudgetExceeded)?)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -339,44 +467,58 @@ pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
     if file_identity(&file)? != initial_identity {
         return Err(Unavailable::Changed);
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(capacity)
-        .map_err(|_| Unavailable::BudgetExceeded)?;
+    Ok((file, opened))
+}
+
+/// Appends the rest of `file` to `bytes`, refusing to grow past `limits`.
+fn read_bounded(file: &std::fs::File, bytes: &mut Vec<u8>, limits: Limits) -> Result<()> {
+    let cap = limits
+        .bytes
+        .checked_add(1)
+        .ok_or(Unavailable::BudgetExceeded)?;
+    let start = bytes.len();
     let allowed = cap.min(limits.working_bytes);
-    let mut reader = (&file).take(u64::try_from(allowed).map_err(|_| Unavailable::BudgetExceeded)?);
+    let mut reader = file.take(u64::try_from(allowed).map_err(|_| Unavailable::BudgetExceeded)?);
     let mut chunk = [0; 8192];
     loop {
         let read = reader.read(&mut chunk).map_err(|_| Unavailable::Read)?;
         if read == 0 {
-            break;
+            return Ok(());
         }
-        let next = bytes
-            .len()
+        let next = (bytes.len() - start)
             .checked_add(read)
             .ok_or(Unavailable::BudgetExceeded)?;
         if next > limits.bytes || next > limits.working_bytes {
             return Err(Unavailable::BudgetExceeded);
         }
-        if next > bytes.capacity() {
+        if bytes.len() + read > bytes.capacity() {
             bytes
-                .try_reserve_exact(next - bytes.len())
+                .try_reserve_exact(read)
                 .map_err(|_| Unavailable::BudgetExceeded)?;
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
+}
+
+/// The file read through `file` is still the one `opened` described, all `read` bytes of it.
+fn finish_unchanged(
+    file: &std::fs::File,
+    path: &Path,
+    opened: &std::fs::Metadata,
+    read: usize,
+) -> Result<()> {
     #[cfg(test)]
     read_observation::notify(read_observation::Stage::BeforeVerify);
     let after = file.metadata().map_err(|_| Unavailable::Read)?;
     let current = std::fs::symlink_metadata(path).map_err(|_| Unavailable::Changed)?;
-    if u64::try_from(bytes.len()).ok() != Some(opened.len())
-        || !same_file(&opened, &after)
-        || !same_file(&opened, &current)
-        || !is_current_file(&file, path)?
+    if u64::try_from(read).ok() != Some(opened.len())
+        || !same_file(opened, &after)
+        || !same_file(opened, &current)
+        || !is_current_file(file, path)?
     {
         return Err(Unavailable::Changed);
     }
-    Ok(bytes)
+    Ok(())
 }
 
 #[cfg(test)]

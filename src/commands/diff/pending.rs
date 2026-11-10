@@ -122,6 +122,25 @@ pub(super) fn inspect(repo: &Repo, slug: &str, branch: &str) -> crate::Result<St
     Ok(summary)
 }
 
+/// A status read that stopped at one of its bounds, not at anything wrong with the session.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NotChecked {
+    #[error("the session is too large to read quickly")]
+    TooLarge,
+    #[error("this page's reading allowance is used up")]
+    Allowance,
+}
+
+/// What status reads after the saved part of a Claude Code or Codex transcript.
+fn tail_limits() -> crate::adapter::native_snapshot::Limits {
+    crate::adapter::native_snapshot::Limits {
+        bytes: 8 * 1024 * 1024,
+        working_bytes: 8 * 1024 * 1024,
+        records: 16_384,
+        lookup_entries: 4_096,
+    }
+}
+
 /// Status reserves one bounded evidence allowance before inspecting a displayed claim.
 /// The caller rechecks the exact link inventory and branch head before publishing the row.
 pub(crate) fn inspect_status(
@@ -131,9 +150,12 @@ pub(crate) fn inspect_status(
     budget: &mut crate::adapter::native_snapshot::Budget,
     deadline: crate::infra::local_git::Deadline,
 ) -> crate::Result<String> {
-    budget.reserve(32 * 1024 * 1024)?;
+    let allowance = |_| NotChecked::Allowance;
+    budget.reserve(32 * 1024 * 1024).map_err(allowance)?;
     if claim.source == "opencode" {
-        budget.reserve(status_opencode::RESERVATION - 32 * 1024 * 1024)?;
+        budget
+            .reserve(status_opencode::RESERVATION - 32 * 1024 * 1024)
+            .map_err(allowance)?;
     }
     let limits = status_opencode::limits();
     let output = repo.inspection_output_with_deadline(
@@ -150,6 +172,11 @@ pub(crate) fn inspect_status(
         snapshot.is_session_line(),
         "the claimed branch is not a session line"
     );
+    if claim.source != "opencode"
+        && let Some(summary) = inspect_after_save(claim, tip, &snapshot, budget, deadline)?
+    {
+        return Ok(summary);
+    }
     let (log, _view) = if snapshot.session.is_empty() {
         (String::new(), String::new())
     } else {
@@ -166,6 +193,89 @@ pub(crate) fn inspect_status(
     } else {
         inspect_append_only_with_limits(repo, claim, tip, &log, &snapshot.runtime, Some(limits))
     }
+}
+
+/// Where the last save at `tip` left the transcript: its length and digest.
+fn saved_at<'a>(claim: &'a link::Link, tip: &str) -> Option<(u64, &'a str)> {
+    if claim.materialized_from.as_deref() == Some(tip) {
+        return claim.baseline_bytes.zip(claim.baseline_hash.as_deref());
+    }
+    claim
+        .native_checkpoint
+        .as_ref()
+        .filter(|checkpoint| checkpoint.tip == tip)
+        .map(|checkpoint| (checkpoint.bytes, checkpoint.sha256.as_str()))
+}
+
+/// Counts what follows the part of a Claude Code or Codex transcript the last save at `tip`
+/// recorded, reading only that part's digest and the bytes after it, never the committed log.
+/// `None` when nothing recorded says where that part ends, or the transcript no longer starts
+/// with it: the full comparison decides those.
+fn inspect_after_save(
+    claim: &link::Link,
+    tip: &str,
+    snapshot: &meta::Meta,
+    budget: &mut crate::adapter::native_snapshot::Budget,
+    deadline: crate::infra::local_git::Deadline,
+) -> crate::Result<Option<String>> {
+    use crate::adapter::native_snapshot::{self as native, After};
+    let Some((end, sha256)) = saved_at(claim, tip) else {
+        return Ok(None);
+    };
+    let adapter = if claim.source == "claude-desktop" {
+        "claude-code"
+    } else {
+        &claim.source
+    };
+    let adapter = crate::adapter::get(adapter)?.id();
+    if !matches!(adapter, "claude-code" | "codex") {
+        return Ok(None);
+    }
+    let runtime = &snapshot.runtime;
+    if claim.materialized_from.is_none() {
+        ensure!(
+            runtime.is_empty() || *runtime == claim.source,
+            "the native runtime differs from the committed session runtime"
+        );
+    }
+    let limits = tail_limits();
+    let source = native::lookup_files_without_database(adapter, &claim.session_id, limits)?;
+    if crate::adapter::codex_rollout::is_compressed(&source.path) {
+        return Ok(None);
+    }
+    let hashed = usize::try_from(end)
+        .ok()
+        .filter(|end| *end <= native::HASHING_ALLOWANCE)
+        .ok_or(NotChecked::TooLarge)?;
+    budget
+        .reserve_hashing(hashed)
+        .map_err(|_| NotChecked::Allowance)?;
+    let After::Bytes { first_line, tail } =
+        native::read_file_after(&source.path, end, sha256, limits, || deadline.expired())?
+    else {
+        return Ok(None);
+    };
+    // A Codex header says which recipient owns the conversation, which decides whether a delegated
+    // task is its request or an interjection, so it goes in front of what follows the save.
+    let header = if adapter == "codex" {
+        // Without that header in hand, only the full comparison reads the tail as it should.
+        let is_header = serde_json::from_slice::<serde_json::Value>(&first_line)
+            .is_ok_and(|record| record["type"] == "session_meta");
+        if !is_header {
+            return Ok(None);
+        }
+        first_line
+    } else {
+        Vec::new()
+    };
+    let mut bytes = header;
+    let boundary = bytes.len();
+    bytes.extend_from_slice(&tail);
+    let text = std::str::from_utf8(&bytes).context("the native transcript is not valid UTF-8")?;
+    let records = records_with_limit(text, claim, limits.records)?;
+    // A saved turn means the saved part holds a prompt whose turn the bytes after it may go on.
+    let continues = snapshot.turn.is_some_and(|turn| turn > 0);
+    summarize_after(claim, text, boundary, &records, continues).map(Some)
 }
 
 fn inspect_append_only(
@@ -461,6 +571,18 @@ fn summarize(
     boundary: usize,
     records: &Records,
 ) -> crate::Result<String> {
+    summarize_after(claim, text, boundary, records, false)
+}
+
+/// `continues`: `text` starts inside a turn the saved part already opened, so what comes before
+/// its first prompt belongs to that turn rather than the next one.
+fn summarize_after(
+    claim: &link::Link,
+    text: &str,
+    boundary: usize,
+    records: &Records,
+    continues: bool,
+) -> crate::Result<String> {
     let pending: Vec<_> = records
         .records
         .iter()
@@ -511,14 +633,33 @@ fn summarize(
         .iter()
         .filter(|event| selected(event) && event.kind == EventKind::ToolUse)
         .count();
-    let turns = crate::domain::turn::groups_of(&session)
+    let active = |index: &usize| {
+        selected(&session.events[*index]) && session.events[*index].kind != EventKind::Other
+    };
+    let groups = crate::domain::turn::groups_of(&session);
+    let mut turns = groups
         .iter()
-        .filter(|group| {
-            group.iter().any(|index| {
-                selected(&session.events[*index]) && session.events[*index].kind != EventKind::Other
-            })
-        })
+        .filter(|group| group.iter().any(active))
         .count();
+    let first_prompt = session
+        .events
+        .iter()
+        .position(|event| event.kind == EventKind::UserPrompt)
+        .unwrap_or(session.events.len());
+    // Grouping folds what precedes the first prompt into that prompt's turn; here it is the rest
+    // of the turn the save ended inside, so it counts once more unless the first turn has
+    // nothing else of its own.
+    if continues
+        && (0..first_prompt).any(|index| active(&index))
+        && groups.first().is_none_or(|first| {
+            first
+                .iter()
+                .filter(|index| **index >= first_prompt)
+                .any(active)
+        })
+    {
+        turns += 1;
+    }
     let unattributed = session.events.iter().any(|event| event.line.is_none());
     let modeled: std::collections::HashSet<_> = session
         .events
@@ -619,6 +760,46 @@ mod tests {
             summary(&text, prefix.len()),
             "1 events, 1 user turns with pending activity (0 newly started), 0 ToolUse calls"
         );
+    }
+
+    /// Read from where a save ended, what precedes the first prompt is the rest of the saved turn:
+    /// it counts as that turn, as it would when read with the saved part before it.
+    #[test]
+    fn a_read_from_the_last_save_keeps_the_saved_turns_continuation_apart() {
+        let tail = |text: &str, continues: bool| {
+            summarize_after(
+                &claim(),
+                text,
+                0,
+                &records(text, &claim()).unwrap(),
+                continues,
+            )
+            .unwrap()
+        };
+        let reply = message("assistant", "answer");
+        let next = format!("{reply}{}", message("user", "next request"));
+        assert!(
+            tail(&reply, true).contains("1 user turns"),
+            "{}",
+            tail(&reply, true)
+        );
+        assert!(
+            tail(&reply, false).contains("0 user turns"),
+            "{}",
+            tail(&reply, false)
+        );
+        assert!(
+            tail(&next, true).contains("2 user turns"),
+            "{}",
+            tail(&next, true)
+        );
+        assert!(
+            tail(&next, false).contains("1 user turns"),
+            "{}",
+            tail(&next, false)
+        );
+        let prompt = message("user", "only a new request");
+        assert_eq!(tail(&prompt, true), tail(&prompt, false));
     }
 
     #[test]

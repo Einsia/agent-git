@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 const SID: &str = "00000000-0000-4000-8000-000000000017";
+const TOO_LARGE: &str = "not checked: too large to read quickly";
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Entry {
@@ -447,6 +448,56 @@ impl Lab {
 
     fn save(&self) {
         link::write(&self.store, &self.claim).unwrap();
+    }
+
+    /// Records on the claim, as a save does, that the transcript's first `settled` bytes are
+    /// what the branch head holds.
+    fn record_save(&mut self, settled: &str) {
+        use sha2::Digest as _;
+        self.claim.native_checkpoint = Some(link::NativeCheckpoint {
+            tip: self.head.clone(),
+            bytes: settled.len() as u64,
+            sha256: hex::encode(sha2::Sha256::digest(settled)),
+        });
+        self.save();
+    }
+
+    /// Makes the session a Claude Code one whose branch holds `settled`, with `pending` after it.
+    fn use_claude_code(&mut self, settled: &str, pending: &str) {
+        fs::remove_file(link::link_path(&self.store, "codex", SID)).unwrap();
+        fs::remove_file(&self.native).unwrap();
+        self.native = self
+            .root
+            .path()
+            .join("claude/projects/-fixture")
+            .join(format!("{SID}.jsonl"));
+        fs::create_dir_all(self.native.parent().unwrap()).unwrap();
+        fs::write(&self.native, format!("{settled}{pending}")).unwrap();
+        let session = format!("agit-{}", "a".repeat(40));
+        let log = transcript::wrap_lines(settled, "claude-code", &session);
+        storage::write_snapshot(self.repo.root(), &log, &log).unwrap();
+        let mut snapshot = meta::Meta::new(session, "claude-code".into(), "/fixture".into());
+        snapshot.turn = Some(1);
+        meta::write(self.repo.root(), &snapshot).unwrap();
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-m", "claude code session prefix"]);
+        self.head = self.git(&["rev-parse", "HEAD"]);
+        self.git(&["branch", "-f", "topic", "HEAD"]);
+        self.claim.source = "claude-code".into();
+        self.claim.native_checkpoint = None;
+        self.save();
+    }
+
+    /// The pending-activity cell of the session's row in plain `agit status`.
+    fn pending_cell(&self, runtime: &str) -> String {
+        let output = status_output(self.command(env!("CARGO_BIN_EXE_agit")).arg("status"));
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        native_session_row(&text, runtime, SID)
+            .split('\t')
+            .nth(5)
+            .unwrap_or_else(|| panic!("no pending cell: {text}"))
+            .to_owned()
     }
 
     fn commit_protected_prefix(&mut self, protected: &str) {
@@ -1216,7 +1267,7 @@ fn status_observes_codex_fork_history_without_opening_indexes_or_changing_carrie
             let row = native_session_row(text, "codex", SID);
             assert!(row.contains(expected), "{text}");
             assert!(row.contains("current claim; process unverified"), "{text}");
-            if expected.starts_with("unavailable:") || expected.contains("budget") {
+            if expected.starts_with("unavailable:") || expected.starts_with("not checked:") {
                 assert!(!row.contains(pending), "{text}");
                 assert!(
                     !row.contains("no unsettled content in the verified native snapshot"),
@@ -1233,7 +1284,7 @@ fn status_observes_codex_fork_history_without_opening_indexes_or_changing_carrie
     fs::write(&parent_path, &parent_header).unwrap();
     check("unavailable: incomplete or inaccessible native evidence");
     fs::write(&parent_path, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
-    check("unavailable: inspection budget exhausted");
+    check("not checked: too large to read quickly");
     fs::write(&parent_path, &parent_full).unwrap();
     check(pending);
     fs::write(&lab.native, format!("{child_full}{{\"type\":")).unwrap();
@@ -1421,12 +1472,203 @@ fn status_distinguishes_merge_exploration_from_superseded_instances() {
     );
 }
 
+/// Settled history that a full read would take past the bounds status keeps for itself.
+fn filler(record: impl Fn(usize) -> String) -> String {
+    let mut text = String::new();
+    let mut index = 0;
+    while text.len() < 3 * 1024 * 1024 {
+        text.push_str(&record(index));
+        index += 1;
+    }
+    text
+}
+
+/// A Codex session past 2 MiB is counted from what follows its last save, with the same answer a
+/// full comparison gives a small one. A transcript that no longer starts with what was saved goes
+/// to the full comparison: a small one still reads as damaged, a large one says it wasn't checked.
+#[test]
+fn status_counts_a_large_codex_session_from_its_last_save() {
+    let mut lab = Lab::new();
+    let small = lab.pending_cell("codex");
+    assert!(
+        small.starts_with("2 events, 1 user turns with pending activity (1 newly started)"),
+        "{small}"
+    );
+    let pending = format!(
+        "{}{}",
+        message("user", "PRIVATE_PENDING_PROMPT"),
+        message("assistant", "PRIVATE_PENDING_REPLY")
+    );
+    let settled = format!(
+        "{}{}",
+        lab.prefix,
+        filler(|index| message(
+            "assistant",
+            &format!("PRIVATE_SETTLED_{index}_{}", "x".repeat(1000))
+        ))
+    );
+    lab.commit_protected_prefix(&settled);
+    fs::write(&lab.native, format!("{settled}{pending}")).unwrap();
+    lab.record_save(&settled);
+    assert_eq!(lab.pending_cell("codex"), small);
+
+    let rewritten = settled.replacen("PRIVATE_SETTLED_7_", "PRIVATE_REWRITE_7_", 1);
+    assert_eq!(rewritten.len(), settled.len());
+    fs::write(&lab.native, format!("{rewritten}{pending}")).unwrap();
+    assert_eq!(lab.pending_cell("codex"), TOO_LARGE);
+
+    let mut lab = Lab::new();
+    let settled = lab.prefix.clone();
+    lab.record_save(&settled);
+    let tampered = settled.replace("PRIVATE_SETTLED_REPLY", "PRIVATE_SETTLED_REPLX");
+    fs::write(&lab.native, format!("{tampered}{pending}")).unwrap();
+    assert_eq!(
+        lab.pending_cell("codex"),
+        "unavailable: incomplete or inaccessible native evidence"
+    );
+}
+
+/// A Codex sub-agent's header says which recipient owns its conversation, and so whether a
+/// delegated task opens a turn or only interjects. Counted from its last save, a large sub-agent
+/// session that gets a new task after the reply to its previous one gives the full comparison's
+/// answer for the same session when small.
+#[test]
+fn status_counts_a_new_delegated_task_after_a_large_sub_agent_save() {
+    let header = format!(
+        "{}\n",
+        json!({"type":"session_meta","payload":{
+            "id":SID,"cwd":"/workspace","thread_source":"subagent",
+            "source":{"subagent":{"thread_spawn":{"depth":1,"agent_path":"/root/worker"}}}
+        }})
+    );
+    let task = |body: &str| {
+        format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{
+                "type":"agent_message","author":"/root","recipient":"/root/worker",
+                "content":[{"type":"input_text","text":format!(
+                    "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n{body}"
+                )}]
+            }})
+        )
+    };
+    let pending = format!(
+        "{}{}{}",
+        message("assistant", "PRIVATE_PREVIOUS_REPLY"),
+        task("PRIVATE_NEXT_TASK"),
+        message("assistant", "PRIVATE_NEXT_REPLY")
+    );
+    let saved_turn = |lab: &mut Lab, settled: &str| {
+        let mut snapshot = meta::read(lab.repo.root()).unwrap();
+        snapshot.turn = Some(1);
+        meta::write(lab.repo.root(), &snapshot).unwrap();
+        lab.commit_protected_prefix(settled);
+        fs::write(&lab.native, format!("{settled}{pending}")).unwrap();
+    };
+
+    let mut lab = Lab::new();
+    let opening = format!("{header}{}", task("PRIVATE_FIRST_TASK"));
+    saved_turn(&mut lab, &opening);
+    let small = lab.pending_cell("codex");
+    assert!(
+        small.starts_with("3 events, 2 user turns with pending activity (1 newly started)"),
+        "{small}"
+    );
+
+    let mut lab = Lab::new();
+    let settled = format!(
+        "{opening}{}",
+        filler(|index| message(
+            "assistant",
+            &format!("PRIVATE_SETTLED_{index}_{}", "x".repeat(1000))
+        ))
+    );
+    saved_turn(&mut lab, &settled);
+    assert_eq!(lab.pending_cell("codex"), TOO_LARGE);
+    lab.record_save(&settled);
+    assert_eq!(lab.pending_cell("codex"), small);
+}
+
+/// What was appended since the last save is still bounded: past it, the row says it wasn't
+/// checked rather than that anything is wrong.
+#[test]
+fn status_says_a_large_unsaved_tail_was_not_checked() {
+    let mut lab = Lab::new();
+    let settled = lab.prefix.clone();
+    lab.record_save(&settled);
+    let tail = filler(|index| {
+        message(
+            "user",
+            &format!("PRIVATE_PENDING_{index}_{}", "y".repeat(1000)),
+        )
+    });
+    let tail = format!("{tail}{tail}{tail}{tail}");
+    assert!(tail.len() > 8 * 1024 * 1024);
+    fs::write(&lab.native, format!("{settled}{tail}")).unwrap();
+    assert_eq!(lab.pending_cell("codex"), TOO_LARGE);
+}
+
+/// A Claude Code session past 2 MiB is counted from what follows its last save, with the answer
+/// a full comparison gives the same session when small, a tool result that answers a call made
+/// before the save included.
+#[test]
+fn status_counts_a_large_claude_code_session_from_its_last_save() {
+    let record = |value: serde_json::Value| format!("{value}\n");
+    let user = |uuid: &str, content: serde_json::Value| {
+        record(
+            json!({"type":"user","sessionId":SID,"uuid":uuid,"message":{"role":"user","content":content}}),
+        )
+    };
+    let assistant = |uuid: &str, content: serde_json::Value| {
+        record(
+            json!({"type":"assistant","sessionId":SID,"uuid":uuid,"message":{"role":"assistant","content":content}}),
+        )
+    };
+    let opening = format!(
+        "{}{}",
+        user("u0", json!("PRIVATE_SETTLED_PROMPT")),
+        assistant(
+            "a0",
+            json!([{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}])
+        )
+    );
+    let pending = format!(
+        "{}{}{}",
+        user(
+            "u1",
+            json!([{"type":"tool_result","tool_use_id":"toolu_1","content":"README.md"}])
+        ),
+        user("u2", json!("PRIVATE_PENDING_PROMPT")),
+        assistant(
+            "a2",
+            json!([{"type":"text","text":"PRIVATE_PENDING_REPLY"}])
+        )
+    );
+    let mut lab = Lab::new();
+    lab.use_claude_code(&opening, &pending);
+    let small = lab.pending_cell("claude-code");
+    assert!(small.contains("(1 newly started)"), "{small}");
+
+    let mut lab = Lab::new();
+    let settled = format!(
+        "{opening}{}",
+        filler(|index| assistant(
+            &format!("f{index}"),
+            json!([{"type":"text","text":format!("PRIVATE_SETTLED_{index}_{}", "x".repeat(1000))}])
+        ))
+    );
+    lab.use_claude_code(&settled, &pending);
+    assert_eq!(lab.pending_cell("claude-code"), TOO_LARGE);
+    lab.record_save(&settled);
+    assert_eq!(lab.pending_cell("claude-code"), small);
+}
+
 #[test]
 fn status_reports_oversized_native_evidence_and_competing_claims_without_guessing_zero() {
     let lab = Lab::new();
     fs::write(&lab.native, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
     lab.expect(
-        "inspection budget exhausted",
+        "not checked: too large to read quickly",
         "current claim; process unverified",
     );
     let mut other = lab.claim.clone();
@@ -1445,7 +1687,7 @@ fn status_stops_dense_native_records_at_the_record_budget() {
     assert!(dense.len() < 2 * 1024 * 1024);
     fs::write(&lab.native, dense).unwrap();
     lab.expect(
-        "inspection budget exhausted",
+        "not checked: too large to read quickly",
         "current claim; process unverified",
     );
 }
@@ -1508,7 +1750,7 @@ fn pagination_preserves_identity_rows_and_bounds_native_detail_inspection() {
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
             let expected = if offset == 0 {
-                "unavailable: per-page inspection limit"
+                "not checked: status reads 8 sessions per page; see it with --offset"
             } else {
                 "2 events, 1 user turns with pending activity (1 newly started), 0 ToolUse calls"
             };
@@ -1610,7 +1852,7 @@ fn every_status_row_says_whether_the_hub_has_it_without_inspecting_the_transcrip
                 let row = rows.iter().find(|row| row["session_id"] == SID).unwrap();
                 assert_eq!(
                     row["pending_activity"],
-                    "unavailable: per-page inspection limit"
+                    "not checked: status reads 8 sessions per page; see it with --offset"
                 );
                 assert_eq!(row["upload"].as_str(), token, "{row:#}");
                 let others = rows.iter().filter(|row| row["session_id"] != SID);
@@ -1627,7 +1869,8 @@ fn every_status_row_says_whether_the_hub_has_it_without_inspecting_the_transcrip
                     .split('\t')
                     .collect::<Vec<_>>();
                 assert_eq!(
-                    fields[5], "unavailable: per-page inspection limit",
+                    fields[5],
+                    "not checked: status reads 8 sessions per page; see it with --offset",
                     "{text}"
                 );
                 assert_eq!(fields[8], expected, "{text}");
@@ -2217,10 +2460,14 @@ mod opencode_status {
         );
         fixture.close();
         let original = fs::read(&fixture.path).unwrap();
-        for bytes in [b"not SQLite".to_vec(), vec![0; 16 * 1024 * 1024 + 1]] {
+        // A database that isn't one is unavailable; one too large to read says it wasn't checked.
+        for (bytes, expected) in [
+            (b"not SQLite".to_vec(), "unavailable:"),
+            (vec![0; 16 * 1024 * 1024 + 1], TOO_LARGE),
+        ] {
             fs::write(&fixture.path, bytes).unwrap();
             fixture.check(
-                &["unavailable:"],
+                &[expected],
                 &["no unsettled content", "user turns with pending activity"],
             );
         }

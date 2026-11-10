@@ -36,16 +36,29 @@ fn cell(value: &str) -> String {
         .collect()
 }
 
+const TOO_LARGE: &str = "not checked: too large to read quickly";
+
 fn pending_failure(error: &anyhow::Error) -> &'static str {
+    use super::super::diff::pending::NotChecked;
+    match error.downcast_ref::<NotChecked>() {
+        Some(NotChecked::TooLarge) => return TOO_LARGE,
+        Some(NotChecked::Allowance) => {
+            return "not checked: this page's reading allowance is used up; see it with --offset";
+        }
+        None => {}
+    }
     if error
         .downcast_ref::<crate::domain::secret_filter::HydrationBudgetExceeded>()
         .is_some()
+        || error
+            .downcast_ref::<crate::domain::storage::ReadLimitExceeded>()
+            .is_some()
     {
-        return "unavailable: inspection budget exhausted";
+        return TOO_LARGE;
     }
     match error.downcast_ref::<Unavailable>() {
         Some(Unavailable::NotFound) => "unavailable: native session missing",
-        Some(Unavailable::BudgetExceeded) => "unavailable: inspection budget exhausted",
+        Some(Unavailable::BudgetExceeded) => TOO_LARGE,
         Some(Unavailable::Changed) => "unavailable: native source changed",
         Some(Unavailable::Unsupported) => "unavailable: no read-only native provider",
         Some(Unavailable::Database) => "unavailable: native database evidence is invalid",
@@ -372,7 +385,8 @@ pub(super) fn rows(
                 inspect(store, claim, links, complete, &mut budget, deadline)
             } else {
                 let mut row = initial_row(claim);
-                row[5] = "unavailable: per-page inspection limit".into();
+                row[5] =
+                    "not checked: status reads 8 sessions per page; see it with --offset".into();
                 row[6] = "not inspected; process unverified".into();
                 row
             };
