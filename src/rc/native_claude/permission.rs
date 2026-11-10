@@ -76,7 +76,7 @@ pub(super) fn decide_for(registration: &Registration, payload: &Value) -> Option
                     return None;
                 }
                 if !reply["decision"].is_null() {
-                    return permitted(&reply["decision"]);
+                    return permitted(&reply["decision"], payload);
                 }
             }
             tokio::time::sleep(CHECK_IN).await;
@@ -93,14 +93,22 @@ fn present(parent: Option<&Process>) -> bool {
     })
 }
 
-/// What of an answer from shared control the hook hands Claude Code: allow, or deny with the
-/// person's message when it is within the bound a native message has, and nothing else. A field such as `updatedPermissions` would add standing
-/// rules on this computer, and `updatedInput` would rewrite the call the person answered; an
-/// allow that carries `updatedInput` (a question answered there) decides nothing, since allowing
-/// it without its answers would run the question unanswered, and the terminal asks instead.
-fn permitted(decision: &Value) -> Option<Value> {
+/// What of an answer from shared control the hook hands Claude Code for the ask in `payload`:
+/// allow, or deny with the person's message when it is within the bound a native message has, and
+/// nothing else. A field such as `updatedPermissions` would add standing rules on this computer,
+/// and `updatedInput` would rewrite the call the person answered, so neither is passed on.
+///
+/// The one exception is a question answered there (AskUserQuestion): its allow carries the
+/// answers, and allowing it without them would run the question unanswered. The hook builds that
+/// input itself, as [`answered`] says; an allow with `updatedInput` it can't build, or for any
+/// other tool, decides nothing, and the terminal asks instead.
+fn permitted(decision: &Value, payload: &Value) -> Option<Value> {
     match decision["behavior"].as_str()? {
         "allow" if decision.get("updatedInput").is_none() => Some(json!({"behavior": "allow"})),
+        "allow" if payload["tool_name"] == "AskUserQuestion" => {
+            let input = answered(&payload["tool_input"], &decision["updatedInput"])?;
+            Some(json!({"behavior": "allow", "updatedInput": input}))
+        }
         "deny" => Some(
             match decision["message"]
                 .as_str()
@@ -113,6 +121,59 @@ fn permitted(decision: &Value) -> Option<Value> {
         _ => None,
     }
 }
+
+/// The input Claude Code gave this hook for its question, `asked`, unchanged but for the answers
+/// in `decided`, the input shared control sent back; `None` unless every answer holds. Nothing
+/// else from shared control reaches Claude Code: questions that differ from the hook's own
+/// answer a question nobody asked here. Each question asked has exactly one answer, keyed by its
+/// text, with no other keys, and the answers together stay within a few native messages' bound.
+///
+/// A single-select answer is one string, not blank and within the bound a native message has. A
+/// multiSelect answer is its choices joined by ", ", as shared control joins them, and each
+/// choice is checked the same way, up to a fixed number of them. Whether a question is
+/// multiSelect comes from the hook's own input, never from the answer. A question the tool asks
+/// always allows free text, so an answer need not be one of its option labels.
+fn answered(asked: &Value, decided: &Value) -> Option<Value> {
+    let questions = asked["questions"].as_array().filter(|q| !q.is_empty())?;
+    if decided["questions"] != asked["questions"] {
+        return None;
+    }
+    let answers = decided["answers"].as_object()?;
+    if answers.len() != questions.len() {
+        return None;
+    }
+    let fits = |value: &str| {
+        !value.trim().is_empty() && value.len() <= crate::rc::native_inbox::MAX_MESSAGE
+    };
+    let mut total = 0usize;
+    for question in questions {
+        let answer = answers.get(question["question"].as_str()?)?.as_str()?;
+        let held = if question["multiSelect"] == true {
+            let choices: Vec<&str> = answer.split(", ").collect();
+            choices.len() <= MAX_CHOICES && choices.iter().all(|choice| fits(choice))
+        } else {
+            fits(answer)
+        };
+        if !held {
+            return None;
+        }
+        total += answer.len();
+    }
+    if total > MAX_ANSWERS {
+        return None;
+    }
+    let mut input = asked.clone();
+    input
+        .as_object_mut()?
+        .insert("answers".into(), Value::Object(answers.clone()));
+    Some(input)
+}
+
+/// The most the answers to one ask may hold together: a few native messages' worth.
+const MAX_ANSWERS: usize = 4 * crate::rc::native_inbox::MAX_MESSAGE;
+
+/// The most choices one multiSelect answer may name.
+const MAX_CHOICES: usize = 64;
 
 /// Reports the session's live permission mode, which its settings hooks see and its module may
 /// not.
@@ -152,6 +213,8 @@ mod tests {
     /// allow would run it unanswered.
     #[test]
     fn only_an_allow_or_a_deny_with_its_message_leaves_the_hook() {
+        let bash = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+        let permitted = |decision: &Value| permitted(decision, &bash);
         let rules =
             json!([{"type": "addRules", "rules": [{"toolName": "Bash"}], "behavior": "allow"}]);
         assert_eq!(
@@ -175,6 +238,80 @@ mod tests {
             Some(json!({"behavior": "deny"}))
         );
         assert_eq!(permitted(&json!({"behavior": "ask"})), None);
+    }
+
+    /// A question answered in shared control reaches Claude Code with the hook's own question and
+    /// the answers only, and only when every answer holds. A hook that passed shared control's
+    /// input through would let it rewrite the question; one that took any answers would hand Claude
+    /// Code an extra key, a missing answer or an unbounded value; and one that let any tool's
+    /// `updatedInput` through would let shared control rewrite a command.
+    #[test]
+    fn a_question_reaches_claude_with_its_own_input_and_checked_answers() {
+        let questions = json!([
+            {"question": "Which color?", "header": "Color", "multiSelect": false,
+             "options": [{"label": "Red", "description": "warm"}, {"label": "Blue", "description": "cool"}]},
+            {"question": "Which sizes?", "header": "Size", "multiSelect": true,
+             "options": [{"label": "S", "description": ""}, {"label": "M", "description": ""}]},
+        ]);
+        let asked = json!({"tool_name": "AskUserQuestion",
+            "tool_input": {"questions": questions, "metadata": {"source": "native"}}});
+        let allow = |input: Value| {
+            json!({"behavior": "allow", "updatedInput": input,
+            "updatedPermissions": [{"type": "addRules"}]})
+        };
+        let answers = json!({"Which color?": "Blue", "Which sizes?": "S, M"});
+        let decided = |answers: &Value| {
+            permitted(
+                &allow(
+                    json!({"questions": questions, "metadata": {"source": "web"},
+                    "answers": answers, "extra": true}),
+                ),
+                &asked,
+            )
+        };
+        assert_eq!(
+            decided(&answers),
+            Some(
+                json!({"behavior": "allow", "updatedInput": {"questions": questions,
+                "metadata": {"source": "native"}, "answers": answers}})
+            )
+        );
+        // Free text is an answer too.
+        assert!(decided(&json!({"Which color?": "Green, please", "Which sizes?": "M"})).is_some());
+        // Questions other than the hook's own decide nothing.
+        let mut altered = questions.clone();
+        altered[0]["question"] = json!("Which colour?");
+        assert_eq!(
+            permitted(
+                &allow(
+                    json!({"questions": altered, "answers": {"Which colour?": "Blue", "Which sizes?": "S"}})
+                ),
+                &asked,
+            ),
+            None
+        );
+        // Only the hook's own input says a question is multiSelect; each choice is checked.
+        assert!(decided(&json!({"Which color?": "Blue", "Which sizes?": "S, "})).is_none());
+        let many = vec!["S"; MAX_CHOICES + 1].join(", ");
+        assert!(decided(&json!({"Which color?": "Blue", "Which sizes?": many})).is_none());
+        for wrong in [
+            json!({"Which color?": "Blue"}),
+            json!({"Which color?": "Blue", "Which sizes?": "S", "Other": "x"}),
+            json!({"Which color?": "Blue", "Which sizes?": "  "}),
+            json!({"Which color?": ["Blue"], "Which sizes?": "S"}),
+            json!({"Which color?": "x".repeat(crate::rc::native_inbox::MAX_MESSAGE + 1),
+                "Which sizes?": "S"}),
+        ] {
+            assert_eq!(decided(&wrong), None, "{wrong}");
+        }
+        // Any other tool's input still decides nothing.
+        assert_eq!(
+            permitted(
+                &allow(json!({"command": "rm -rf ~"})),
+                &json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            ),
+            None
+        );
     }
 
     /// A waiting hook stops waiting once the process that ran it is gone, as when Claude Code
