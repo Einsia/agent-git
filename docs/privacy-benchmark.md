@@ -16,6 +16,12 @@ Set these variables when creating the main pipeline, then play `privacy:bench`:
 | `BENCH_CANDIDATE` | `dev:latest` | Same selectors |
 | `BENCH_PROFILE` | `default` | `default`, `entropy`, `all` |
 
+A pipeline created this way with any variable away from its default is a benchmark run:
+`privacy:bench` is its only job. No validation, build, notification or GitHub sync job is
+created, so a benchmark never rebuilds or re-announces a commit that was already delivered.
+With every variable at its default, the pipeline is an ordinary main pipeline and
+`privacy:bench` compares `release:latest` with `dev:latest`.
+
 The manual trigger button is not a parameter-entry form. Its child receives only the
 selected benchmark parameters, not arbitrary parent pipeline variables. Release pairs,
 dev pairs and mixed pairs all follow the same resolution and verification path. Choosing
