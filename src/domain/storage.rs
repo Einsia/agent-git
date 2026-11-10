@@ -432,7 +432,7 @@ pub fn snapshot_files(
     validate_envelope_input_bounds("LOG", log_envelopes)?;
     validate_envelope_input_bounds("VIEW", view_envelopes)?;
 
-    let mut log = SnapshotLog::default();
+    let mut log: SnapshotLog = SnapshotLog::default();
     for (index, line) in log_envelopes.split_inclusive('\n').enumerate() {
         log.push(line)
             .with_context(|| format!("invalid LOG envelope at line {}", index + 1))?;
@@ -461,15 +461,63 @@ pub fn snapshot_files(
     Ok(files)
 }
 
-/// A bounded, strictly validated LOG whose event bytes are retained without parsed JSON trees.
-#[derive(Default)]
-pub(crate) struct SnapshotLog {
+/// What a [`SnapshotLog`] keeps of each event besides its id: the bytes themselves, or only a
+/// digest of them for a caller that writes each body later from where it came.
+pub(crate) trait Retained: PartialEq + Sized {
+    fn of(line: &str) -> Self;
+}
+
+impl Retained for Vec<u8> {
+    fn of(line: &str) -> Self {
+        line.as_bytes().to_vec()
+    }
+}
+
+impl Retained for [u8; 32] {
+    fn of(line: &str) -> Self {
+        Sha256::digest(line.as_bytes()).into()
+    }
+}
+
+/// A bounded, strictly validated LOG whose events are kept without parsed JSON trees, each as
+/// `R`. What is kept is also what tells a reused id with other bytes from the same event seen
+/// again.
+pub(crate) struct SnapshotLog<R = Vec<u8>> {
     ids: Vec<String>,
-    files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, R>,
     bytes: usize,
 }
 
-impl SnapshotLog {
+impl<R> Default for SnapshotLog<R> {
+    fn default() -> Self {
+        Self {
+            ids: Vec::new(),
+            files: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<R: Retained> SnapshotLog<R> {
+    /// A LOG that goes on after `ids`, settled events whose bodies take `bytes` in all and are
+    /// already stored: the limits count them, and nothing is kept of them.
+    #[cfg(feature = "cli")]
+    pub(crate) fn after(ids: Vec<String>, bytes: usize) -> Result<Self> {
+        anyhow::ensure!(
+            bytes <= MAX_MATERIALIZED_BYTES,
+            "LOG exceeds the snapshot byte limit"
+        );
+        anyhow::ensure!(
+            ids.len() <= MAX_SEQUENCE_EVENTS,
+            "LOG exceeds the snapshot event limit"
+        );
+        Ok(Self {
+            ids,
+            files: BTreeMap::new(),
+            bytes,
+        })
+    }
+
     pub(crate) fn push(&mut self, line: &str) -> Result<()> {
         anyhow::ensure!(
             line.len() <= MAX_EVENT_BYTES,
@@ -489,13 +537,12 @@ impl SnapshotLog {
         );
         let id = event_id(line)?;
         let path = meta::event_path(&id)?;
+        let retained = R::of(line);
         match self.files.entry(path) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(line.as_bytes().to_vec());
+                entry.insert(retained);
             }
-            std::collections::btree_map::Entry::Occupied(entry)
-                if entry.get().as_slice() != line.as_bytes() =>
-            {
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != retained => {
                 anyhow::bail!("event id collision for {id}");
             }
             std::collections::btree_map::Entry::Occupied(_) => {}
@@ -505,7 +552,8 @@ impl SnapshotLog {
         Ok(())
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
+    /// The event ids in order, and what was kept of each event by its path.
+    pub(crate) fn into_parts(self) -> (Vec<String>, BTreeMap<String, R>) {
         (self.ids, self.files)
     }
 }
@@ -3402,7 +3450,7 @@ mod tests {
     #[test]
     fn snapshot_log_rejects_invalid_or_over_budget_input_without_advancing() {
         let valid = line(SID_A, 1);
-        let mut log = SnapshotLog {
+        let mut log: SnapshotLog = SnapshotLog {
             bytes: MAX_MATERIALIZED_BYTES - valid.len(),
             ..SnapshotLog::default()
         };

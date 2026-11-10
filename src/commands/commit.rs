@@ -2643,6 +2643,31 @@ fn unborn_session_snapshot_files(
     super::plumbing::tree_apply_owned(repo, base_tree, edits.into_iter().collect())
 }
 
+/// Whether a native commit builds only what is new onto its base: it keeps the base's event files
+/// it would write again unchanged, and with a verified checkpoint it reads no settled event. A
+/// debug build's `AGIT_TEST_REWRITE_SNAPSHOT` turns both off, so a test can build the same
+/// snapshot both ways and compare the trees; a release build ignores the variable.
+fn settles_incrementally() -> bool {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("AGIT_TEST_REWRITE_SNAPSHOT").is_some() {
+        return false;
+    }
+    true
+}
+
+/// Where the link's native checkpoint ends, when it is for `tip` and the transcript's first that
+/// many bytes still hash to what it recorded.
+fn verified_checkpoint(lk: &Link, tip: Option<&str>, bytes: &[u8]) -> Option<usize> {
+    use sha2::Digest as _;
+    let checkpoint = lk.native_checkpoint.as_ref()?;
+    let end = usize::try_from(checkpoint.bytes).ok()?;
+    (Some(checkpoint.tip.as_str()) == tip
+        && bytes
+            .get(..end)
+            .is_some_and(|prefix| hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256))
+    .then_some(end)
+}
+
 /// The content half of a settlement (its own function so tests can build bytes directly and skip
 /// the runtime-directory lookup).
 #[allow(clippy::too_many_arguments)]
@@ -2768,6 +2793,7 @@ fn settle_bytes(
         service as privacy,
     };
     let mut native_prefix = (0usize, String::new());
+    let mut settled_prefix: Option<native::Settled> = None;
 
     // ── Materialized baseline or native continuation ──
     let (region_start, region, head_turn_base) = if let Some(base) = lk.baseline_bytes {
@@ -2796,6 +2822,29 @@ fn settle_bytes(
         }
         let head_turn = head_meta.as_ref().and_then(|s| s.turn).unwrap_or(0);
         (base, &text[base..], head_turn)
+    } else if let Some(prefix) = verified_checkpoint(&lk, settlement_tip.as_deref(), bytes)
+        .filter(|_| settles_incrementally())
+        .zip(settlement_tip.as_deref())
+        .filter(|_| {
+            head_meta.as_ref().is_some_and(|snapshot| {
+                !snapshot.is_file_line()
+                    && !snapshot.session.is_empty()
+                    && snapshot.turn.is_some()
+                    && snapshot.layout == meta::LayoutVersion::V1
+            })
+        })
+        .and_then(|(checkpoint, tip)| native::Settled::at(repo, tip, &text[..], checkpoint))
+    {
+        // Native continuation through a verified checkpoint: the transcript's first bytes are the
+        // ones the branch tip settled, which the continuity compare would prove by reading every
+        // settled event. The settled ids come from the tip's LOG instead, and its event files stay.
+        native_prefix = (prefix.end(), String::new());
+        let settled = head_meta
+            .as_ref()
+            .and_then(|snapshot| snapshot.turn)
+            .expect("a settled part is taken only with a turn ordinal");
+        settled_prefix = Some(prefix);
+        (0, &text[..], settled)
     } else {
         // Native continuation: the continuity check, against the committed envelope blob.
         let committed = match head_meta.as_ref() {
@@ -2814,16 +2863,8 @@ fn settle_bytes(
                 })?
             }
         };
-        let checkpoint_verified = lk.native_checkpoint.as_ref().is_some_and(|checkpoint| {
-            use sha2::Digest as _;
-            Some(checkpoint.tip.as_str()) == settlement_tip.as_deref()
-                && usize::try_from(checkpoint.bytes)
-                    .ok()
-                    .and_then(|end| bytes.get(..end))
-                    .is_some_and(|prefix| {
-                        hex::encode(sha2::Sha256::digest(prefix)) == checkpoint.sha256
-                    })
-        });
+        let checkpoint_verified =
+            verified_checkpoint(&lk, settlement_tip.as_deref(), bytes).is_some();
         // Compared as settled unless the live transcript diverges from it, so the settled history
         // is borrowed rather than copied for the common case.
         let comparable: std::borrow::Cow<'_, str> = if !checkpoint_verified
@@ -3582,6 +3623,7 @@ fn settle_bytes(
             source,
             &claim,
             new_chunks.last().expect("non-empty chunks").end_byte,
+            settled_prefix.as_ref(),
         )?)
     } else {
         None
@@ -3702,12 +3744,35 @@ fn settle_bytes(
             .or(unborn_base_tree.as_deref())
             .expect("snapshot base tree");
         let tree = if let Some(native) = native.as_mut() {
-            let mut files = native.files(c.end_byte)?;
+            // The first snapshot replaces the base's storage; the event files a v1 base already
+            // holds for events still listed are kept rather than wrapped and written again, so a
+            // long conversation's settled history isn't rebuilt in memory on every commit.
+            let kept = if i == 0
+                && old_head.is_some()
+                && settles_incrementally()
+                && super::plumbing::storage_layout_at(repo, base)? == meta::LayoutVersion::V1
+            {
+                let paths = repo
+                    .ls_tree_result(base)?
+                    .into_iter()
+                    .filter(|path| path.starts_with(&format!("{}/", meta::EVENTS_DIR)))
+                    .collect();
+                let mut kept = native.reuse(c.end_byte, &paths)?;
+                if let Some(settled) = settled_prefix.as_ref() {
+                    kept.extend(settled.paths().iter().cloned());
+                }
+                kept
+            } else {
+                std::collections::BTreeSet::new()
+            };
+            let mut files = native.files(&protected_full, c.end_byte)?;
             if i == 0 {
                 if old_head.is_none() {
                     unborn_session_snapshot_files(repo, base, files, &snap_text)?
                 } else {
-                    super::plumbing::session_snapshot_tree_files(repo, base, files, &snap_text)?
+                    super::plumbing::session_snapshot_tree_files(
+                        repo, base, files, &snap_text, &kept,
+                    )?
                 }
             } else {
                 files.insert(meta::FILE.into(), snap_text.as_bytes().to_vec());
