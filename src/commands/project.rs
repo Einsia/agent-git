@@ -5298,22 +5298,41 @@ fn standing(
     let saved_at = local.and_then(|(_, at)| *at);
     let head = local.map(|(commit, _)| commit);
     let pushed = last.is_some_and(|last| head.is_some() && last.uploaded.get(&session.id) == head);
-    let projected = remote.is_some()
-        && checkout
-            .as_ref()
-            .is_some_and(|(repo, _)| crate::domain::privacy_git::hub_holds_head(repo, branch));
-    let status = if pushed || (remote.is_some() && remote == head) || projected {
-        "uploaded"
-    } else if remote.is_some() {
-        "waiting"
-    } else {
-        "not_uploaded"
-    };
+    let status = hub_standing(
+        head.map(String::as_str),
+        remote.map(String::as_str),
+        pushed,
+        || {
+            checkout
+                .as_ref()
+                .is_some_and(|(repo, _)| crate::domain::privacy_git::hub_holds_head(repo, branch))
+        },
+    );
     Standing {
         status,
         on_hub: remote.is_some(),
         saved_at,
         saved,
+    }
+}
+
+/// Where a saved branch whose local head is `head` stands on the Hub, whose head this checkout
+/// last saw as `remote`. `uploaded` when the Hub has `head`: the last upload pushed it, the Hub's
+/// head is it, or `holds` finds the Hub's head is its published form. `waiting` when the Hub has
+/// an older head; `not_uploaded` when it has none this checkout knows of. `agit status` answers
+/// with this too, from its own bounded reads.
+pub(crate) fn hub_standing(
+    head: Option<&str>,
+    remote: Option<&str>,
+    pushed: bool,
+    holds: impl FnOnce() -> bool,
+) -> &'static str {
+    if pushed || (remote.is_some() && remote == head) || (remote.is_some() && holds()) {
+        "uploaded"
+    } else if remote.is_some() {
+        "waiting"
+    } else {
+        "not_uploaded"
     }
 }
 

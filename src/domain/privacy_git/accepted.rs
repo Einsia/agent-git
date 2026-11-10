@@ -85,13 +85,29 @@ pub(super) struct Ledger {
 
 impl Ledger {
     pub fn open(source: &Repo, identity: &RemoteIdentity) -> Result<Self> {
+        Self::open_in(&source.common_dir()?, identity)
+    }
+
+    /// [`Ledger::open`], with the Git read that finds the common directory within `deadline`.
+    #[cfg(feature = "cli")]
+    pub(crate) fn open_within(
+        source: &Repo,
+        identity: &RemoteIdentity,
+        deadline: crate::infra::local_git::Deadline,
+    ) -> Result<Self> {
+        let common = source.inspection_common_dir_using(&mut |command, limit| {
+            deadline.output(command, None, limit)
+        })?;
+        Self::open_in(&common, identity)
+    }
+
+    fn open_in(common: &Path, identity: &RemoteIdentity) -> Result<Self> {
         ensure!(
             RemoteIdentity::new(&identity.hub, &identity.agent_id)? == *identity,
             "invalid accepted publication identity"
         );
         let scope = digest_json(&json!({"version":1, "destination":identity}))?;
-        let directory = source
-            .common_dir()?
+        let directory = common
             .join("agit/privacy-accepted")
             .join(scope.trim_start_matches("sha256:"));
         let branches =

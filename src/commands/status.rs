@@ -298,7 +298,8 @@ pub fn run(args: Args) -> CmdResult {
                     "last commit",
                     "pending activity",
                     "local instance",
-                    "project"
+                    "project",
+                    "upload"
                 ],
                 &page.rows
             )
@@ -721,7 +722,8 @@ fn structured(args: &Args) -> CmdResult {
                 "active": link.is_active(), "superseded_by": link.superseded_by,
                 "last_commit": (detail[4] != "—").then_some(&detail[4]),
                 "pending_activity": detail[5], "local_instance": detail[6],
-                "project": detail[7], "publication_wait": publication_wait,
+                "project": detail[7], "upload": sessions::upload_json(&detail[8]),
+                "publication_wait": publication_wait,
             })
         })
         .collect();

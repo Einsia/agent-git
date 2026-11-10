@@ -340,6 +340,18 @@ impl Projections {
         )
     }
 
+    /// [`Projections::open`], with every Git read within `deadline`: `agit status` reads the
+    /// record this way and must not wait on Git. Empty once the deadline has passed.
+    #[cfg(feature = "cli")]
+    pub(crate) fn open_within(repo: &Repo, deadline: crate::infra::local_git::Deadline) -> Self {
+        Self(
+            crate::hub::identity::read_within(repo, deadline)
+                .ok()
+                .flatten()
+                .and_then(|identity| accepted::Ledger::open_within(repo, &identity, deadline).ok()),
+        )
+    }
+
     /// The local commit that the Hub's `public` commit on `branch` is the published projection
     /// of, from the accepted publication record. `None` when `public` is no projection of a local
     /// commit.
@@ -1351,6 +1363,36 @@ fn parent_first(parents: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>> 
         }
     }
     Ok(order)
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::infra::local_git::Deadline;
+
+    /// The bounded record read opens what `open` opens while its deadline holds, and nothing
+    /// once it has passed, its Git reads included: `agit status` must not wait on Git.
+    #[test]
+    fn the_bounded_record_read_opens_only_within_its_deadline() {
+        let d = tempfile::tempdir().unwrap();
+        let repo = Repo::init(d.path()).unwrap();
+        let identity = crate::hub::identity::RemoteIdentity::new(
+            "https://hub.test",
+            &uuid::Uuid::from_u128(1).to_string(),
+        )
+        .unwrap();
+        crate::hub::identity::pin(&repo, &identity).unwrap();
+        let inspection = repo.clone().exact_root_inspection();
+        assert!(Projections::open(&inspection).0.is_some());
+        assert!(
+            Projections::open_within(&inspection, Deadline::new())
+                .0
+                .is_some()
+        );
+        let passed = Deadline::at(std::time::Instant::now());
+        assert!(Projections::open_within(&inspection, passed).0.is_none());
+        assert!(accepted::Ledger::open_within(&inspection, &identity, passed).is_err());
+    }
 }
 
 #[cfg(test)]

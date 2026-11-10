@@ -58,7 +58,14 @@ Missing, changing, unsafe, or over-budget evidence remains unavailable without r
 Each page inspects native details for at most its first eight session rows. Additional
 rows preserve their identities and say `unavailable: per-page inspection limit`; use
 `--offset` to inspect another page. Text and JSON share this bound. JSON session rows
-include `last_commit` (null when unavailable), `pending_activity`, `local_instance`, and `project`.
+include `last_commit` (null when unavailable), `pending_activity`, `local_instance`, `project`,
+and `upload`.
+
+The `upload` column is read from the repository's refs alone, for every row, inspected or not.
+It is `uploaded` when the Hub has the branch's local head, `waiting` when the Hub has an older
+head, `not uploaded` when it has none this computer knows of, and `—` when this computer has no
+such branch or its refs can't be read in time. In JSON it is `uploaded`, `waiting`,
+`not_uploaded` or null, as in `agit project list --json`.
 `sessions.incomplete=true` means the total is only the number of claims observed, not a verified
 current count or a guaranteed lower bound. A failed final inventory recheck also prevents
 unadopted-session classification.
