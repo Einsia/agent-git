@@ -975,6 +975,120 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
     assert!(pending.exists());
 }
 
+/// What a folder does with a conversation is said the same way by a conversation's start, the
+/// overview and `agit on`. A folder that is on while its repository's automatic upload is off on
+/// this computer saves turns here and uploads nothing, so its start says the conversation stays on
+/// this computer, the overview names the hold, and `agit on --yes` switches the repository back
+/// on, the off recorded for it before its checkout existed included, after which the start says
+/// it is uploaded; without a terminal or `--yes`, `agit on` names the hold and promises no upload. A folder set up for a repository without saving
+/// by itself says at a conversation's start, once per folder, that it isn't being saved there. A
+/// folder turned off says nothing at a conversation's start. A surface that read only the folder's
+/// own switch would promise uploads that never happen; an `agit on` that moved only the checkout's
+/// setting would leave the recorded off in force while saying it is back on; one that repeated
+/// itself at every start, or spoke in a folder the person turned off, would be noise.
+#[test]
+fn every_surface_says_what_a_folder_does_with_its_conversations() {
+    let lab = Lab::new();
+    let value = |at: &std::path::Path, args: &[&str]| {
+        let out = lab.agit(at, args);
+        let document: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{args:?}: {out:?}"));
+        document["result"]["value"].clone()
+    };
+    let said_at_start = |cwd: &std::path::Path, id: &str| {
+        lab.resume(cwd, id)["systemMessage"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    // On, with the repository's automatic upload off on this computer.
+    let dir = lab.folder("solo", false);
+    // `agit on` records the folder's binding and its project.
+    lab.bind(&dir, "me/solo");
+    lab.turn_on(&dir, "me/solo");
+    // Turned off for the repository before its checkout existed, which outranks the checkout's
+    // own setting, and off in the checkout as well.
+    let recorded = lab.agit(&dir, &["config", "--repo", "me/solo", "push.auto", "false"]);
+    assert!(recorded.status.success(), "{recorded:?}");
+    let checkout = lab.agit_home.join("repos/me/solo");
+    std::fs::create_dir_all(&checkout).unwrap();
+    for args in [&["init", "-q"][..], &["config", "agit.autoPush", "false"]] {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&checkout)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+    lab.conversation(
+        &dir,
+        "21212121-2121-4212-8212-212121212121",
+        "Fix the parser",
+    );
+    let said = said_at_start(&dir, "21212121-2121-4212-8212-212121212121");
+    assert!(
+        said.contains("this conversation is saved on this computer for me/solo")
+            && said.contains("Automatic upload is off")
+            && !said.contains("is uploaded to"),
+        "{said}"
+    );
+    let overview = value(&dir, &["--json"]);
+    assert_eq!(overview["held"]["code"], "push_auto_off", "{overview}");
+    // Without a terminal or --yes, `agit on` names the hold and promises no upload.
+    let unattended = lab.agit(&dir, &["on"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unattended.stdout),
+        String::from_utf8_lossy(&unattended.stderr)
+    );
+    assert!(
+        said.contains("automatic upload to me/solo is off on this computer")
+            && !said.contains("sessions here upload to"),
+        "{said}"
+    );
+    let on = value(&dir, &["--json", "--yes", "on"]);
+    assert_eq!(on["resumed"], "push_auto_off", "{on}");
+    assert_eq!(on["held"], serde_json::Value::Null, "{on}");
+    assert_eq!(value(&dir, &["--json"])["held"], serde_json::Value::Null);
+    let said = said_at_start(&dir, "21212121-2121-4212-8212-212121212121");
+    assert!(said.contains("is uploaded to me/solo "), "{said}");
+
+    // Set up for a repository, without saving by itself: told once.
+    let bound = lab.folder("bound", false);
+    lab.bind(&bound, "me/bound");
+    for id in [
+        "22222222-2222-4222-8222-222222222222",
+        "24242424-2424-4242-8242-242424242424",
+    ] {
+        lab.conversation(&bound, id, "Plan the release");
+    }
+    let said = said_at_start(&bound, "22222222-2222-4222-8222-222222222222");
+    assert!(
+        said.contains("this conversation isn't being saved to me/bound")
+            && said.contains("`agit save`")
+            && said.contains("`agit on` saves this folder's conversations from then on"),
+        "{said}"
+    );
+    let again = said_at_start(&bound, "24242424-2424-4242-8242-242424242424");
+    assert!(!again.contains("isn't being saved"), "{again}");
+
+    // Turned off.
+    let off = lab.agit(&dir, &["off"]);
+    assert!(off.status.success(), "{off:?}");
+    lab.conversation(
+        &dir,
+        "23232323-2323-4232-8232-232323232323",
+        "Sketch the docs",
+    );
+    assert_eq!(
+        lab.resume(&dir, "23232323-2323-4232-8232-232323232323"),
+        serde_json::Value::Null
+    );
+}
+
 /// A folder that is on covers the git worktrees of its checkout (#162), from when it covers each
 /// one. Its overview names each worktree with the sessions there from before; in a worktree, the
 /// overview and `agit status` name the folder whose setting it follows and count those sessions

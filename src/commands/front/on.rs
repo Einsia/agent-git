@@ -106,6 +106,11 @@ pub(crate) struct Enabled {
     pub granted: Vec<String>,
     /// Where an owner gives teams access, for an organization repository this call created.
     pub grant_page: Option<String>,
+    /// The hold on a folder that was already on that this call ended: `push_auto_off` or
+    /// `public_needs_consent`.
+    pub resumed: Option<&'static str>,
+    /// What still holds the uploads of a folder that was already on.
+    pub held: Option<crate::commands::project::Held>,
 }
 
 /// Turns `root` on: chooses the destination, refuses a public one the person did not name with
@@ -126,6 +131,7 @@ pub(crate) fn enable(
         && super::bound(root).as_deref() == Some(slug.as_str())
         && crate::commands::project::uploads_automatically(root) == Some(true)
     {
+        let (resumed, held) = resume_held(root)?;
         return Ok(Enabled {
             repository: slug,
             previous: None,
@@ -136,6 +142,8 @@ pub(crate) fn enable(
             note: None,
             granted: Vec::new(),
             grant_page: None,
+            resumed,
+            held,
         });
     }
     // Nothing is created on the Hub for a folder that no agent here can upload from by itself.
@@ -216,7 +224,60 @@ pub(crate) fn enable(
         note: destination.note,
         granted,
         grant_page,
+        resumed: None,
+        held: None,
     })
+}
+
+/// For a folder that is on with its uploads held, ends the hold `agit on` can end: its
+/// repository's automatic upload switched off on this computer, and a public repository's switch
+/// on, which is asked or refused as `agit config` asks it. The repository's own switch moves only
+/// for a person at a terminal or with `--yes`, from any session; otherwise it is named. It moves
+/// as every choice that turns automatic upload on does: the checkout's own setting, then the off
+/// recorded for the destination, which would otherwise outrank it; with no checkout here yet, the
+/// recorded off alone. What only the person's default for repositories without a setting keeps
+/// off, with no checkout to hold one, stays ([`crate::commands::project::on_switches_back`]).
+/// Returns the code of the hold this ended, and what still holds the folder.
+fn resume_held(
+    root: &Path,
+) -> Result<(Option<&'static str>, Option<crate::commands::project::Held>)> {
+    use crate::commands::project::Saving;
+    let Saving::Held {
+        repository, held, ..
+    } = crate::commands::project::saving(root)
+    else {
+        return Ok((None, None));
+    };
+    let attended = std::env::var_os("AGIT_YES").is_some() || ui::prompt::may_prompt();
+    if !matches!(held.code, "push_auto_off" | "public_needs_consent")
+        || (held.code == "push_auto_off" && !attended)
+    {
+        return Ok((None, Some(held)));
+    }
+    let (owner, name) = crate::commands::parse_slug(&repository)?;
+    match crate::domain::repo::Repo::open(crate::infra::config::repo_dir(&owner, &name)?) {
+        Some(checkout) => {
+            crate::commands::push::enroll_public_destination(
+                &checkout,
+                &repository,
+                "agit on",
+                None,
+            )?;
+            if held.code == "push_auto_off" {
+                checkout.set_auto_push(Some(true))?;
+                crate::domain::repo::automatic_upload_off::set(&owner, &name, false)?;
+            }
+        }
+        None if held.code == "push_auto_off" => {
+            crate::domain::repo::automatic_upload_off::set(&owner, &name, false)?;
+        }
+        None => return Ok((None, Some(held))),
+    }
+    let still = match crate::commands::project::saving(root) {
+        Saving::Held { held, .. } => Some(held),
+        _ => None,
+    };
+    Ok((Some(held.code), still))
 }
 
 /// After creating a repository in an organization the account owns, asks once per team the
@@ -437,6 +498,8 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "chosen": enabled.chosen,
                 "created": enabled.created,
                 "already_on": enabled.already,
+                "resumed": enabled.resumed,
+                "held": enabled.held.as_ref().map(crate::commands::project::Held::json),
                 "through": through,
                 "worktrees": worktrees.iter().map(|(folder, count)| serde_json::json!({
                     "folder": folder,
@@ -457,12 +520,45 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
     let folder = ui::tilde(root);
+    let held_line = |held: &crate::commands::project::Held| {
+        if held.code == "push_auto_off"
+            && crate::commands::project::on_switches_back(&enabled.repository)
+        {
+            format!(
+                "{folder} is on, but automatic upload to {} is off on this computer, so sessions here are saved and not uploaded; {} switches it back on{}",
+                enabled.repository,
+                ui::accent("agit on --yes"),
+                match super::Reader::of_this_process() {
+                    super::Reader::Person => "",
+                    super::Reader::Agent => " only when the user asks to",
+                }
+            )
+        } else {
+            format!("{folder} is on, but its uploads are held: {}", held.text)
+        }
+    };
     match (&through, enabled.already) {
-        (Some(main), _) => ui::success(&format!(
-            "{folder} is already on through {} (git worktree)",
-            ui::tilde(main)
-        )),
-        (None, true) => ui::success(&format!("{folder} is already on")),
+        (Some(main), _) => {
+            ui::success(&format!(
+                "{folder} is already on through {} (git worktree)",
+                ui::tilde(main)
+            ));
+            if let Some(held) = &enabled.held {
+                ui::warning(&held_line(held));
+            }
+        }
+        (None, true) => match (enabled.resumed, &enabled.held) {
+            (_, Some(held)) => ui::warning(&held_line(held)),
+            (Some("push_auto_off"), None) => ui::success(&format!(
+                "{folder} was on, and automatic upload to {} was off on this computer; it is back on",
+                enabled.repository
+            )),
+            (Some(_), None) => ui::success(&format!(
+                "{folder} is on, and automatic upload into {} is switched on",
+                enabled.repository
+            )),
+            (None, None) => ui::success(&format!("{folder} is already on")),
+        },
         (None, false) => ui::success(&format!("{folder} is on")),
     }
     let how = match (enabled.chosen, enabled.created) {
@@ -477,10 +573,18 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
         .as_deref()
         .map(|v| format!(", {v}"))
         .unwrap_or_default();
-    println!(
-        "  sessions here upload to {}{visibility}{how}",
-        ui::bold(enabled.repository.as_str())
-    );
+    // A held folder uploads nothing, so it names its repository without promising an upload.
+    if enabled.held.is_some() {
+        println!(
+            "  its repository: {}{visibility}{how}",
+            ui::bold(enabled.repository.as_str())
+        );
+    } else {
+        println!(
+            "  sessions here upload to {}{visibility}{how}",
+            ui::bold(enabled.repository.as_str())
+        );
+    }
     for (worktree, _) in &worktrees {
         println!("  also covers {} (git worktree)", ui::tilde(worktree));
     }

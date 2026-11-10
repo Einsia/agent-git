@@ -960,10 +960,16 @@ fn upload_announcement(
         .filter(|_| ev.source == Source::Resume)
         .and_then(|origin| super::project::held_earlier(rt, &ev.session_id, origin))
         .map(|held| held_notice(&held, &ev.session_id));
+    let unsaved = origin
+        .filter(|_| notice.is_none() && held.is_none())
+        .and_then(|origin| not_saved_notice(rt, &ev.session_id, origin));
     // The Stop hook tells only a Claude Code conversation of an upload that didn't go through; a
     // Codex one is told here, when it next starts.
     let failure = failure_line(rt, &ev.session_id);
-    let lines: Vec<String> = [notice.or(held), failure].into_iter().flatten().collect();
+    let lines: Vec<String> = [notice.or(held).or(unsaved), failure]
+        .into_iter()
+        .flatten()
+        .collect();
     if lines.is_empty() {
         return None;
     }
@@ -1101,6 +1107,28 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
         ),
         None => String::new(),
     };
+    // A folder held for anything but its automatic upload being off, which the lines below
+    // name, uploads nothing, whatever the sign-in: the notice says what holds it and, where
+    // `agit on` can end it, that. A hold for sign-in when the saved sign-in still reads as current
+    // is said by its reason, as the line below would promise an upload. Under another account
+    // the project saves nothing either, so that notice doesn't say the conversation is saved.
+    if let Some(held) = upload.held.as_ref().filter(|held| {
+        !upload.upload_off && (held.code != "signed_out" || upload.sign_in == SignIn::Current)
+    }) {
+        return match held.code {
+            "public_needs_consent" => format!(
+                "agit: this conversation is saved on this computer; {repository} is public, and automatic upload into it waits until you switch it on: `agit on`{because}."
+            ),
+            "other_account" => format!(
+                "agit: this conversation isn't saved or uploaded for {repository}, because {}{because}.",
+                held_reason(held.code, repository)
+            ),
+            _ => format!(
+                "agit: this conversation is saved on this computer, and it isn't uploaded because {}{because}.",
+                held_reason(held.code, repository)
+            ),
+        };
+    }
     // A signed-out notice says what signing in will do, so the turns held meanwhile do not reach
     // their audience by surprise when the person signs in. With automatic upload off, nothing goes
     // up at a turn's end, so the notice names the push that publishes instead.
@@ -1124,6 +1152,55 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
             "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included{because}. Automatic upload is off for it here, so `agit push {repository}` then publishes it ({audience}). Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
     }
+}
+
+/// What holds a folder's uploads, said in a conversation's start line by its class and the
+/// repository alone. That line is hook output, which can land in the conversation's transcript
+/// and be published with it, so it never names the account or the Hub that a hold's own text
+/// names for the person's local surfaces.
+fn held_reason(code: &str, repository: &str) -> String {
+    match code {
+        "other_account" => {
+            "agit is signed in as another account than the one this folder uploads as".to_owned()
+        }
+        "signed_out" => "agit isn't signed in as the account this folder uploads as".to_owned(),
+        "no_write_access" => format!("{repository} doesn't let this folder's account upload to it"),
+        _ => "its uploads are held; `agit status` says why".to_owned(),
+    }
+}
+
+/// The line for a conversation that starts in a folder set up for a repository but not saving
+/// conversations by itself, said once per folder as [`super::project::unsaved_folder_line`] says
+/// its own: not when agit saves it another way (it records into a branch), not in a folder the
+/// person declined turning on or that was already told, and nowhere once `notice.unsaved` is
+/// false. A folder that was turned off says nothing: the person said no there, and the overview
+/// still says it is off. Only saving to AgentGit is missing; the runtime keeps its own transcript.
+fn not_saved_notice(runtime: &str, session: &str, origin: &std::path::Path) -> Option<String> {
+    if super::config::get("notice.unsaved").as_deref() == Some("false") {
+        return None;
+    }
+    let origin = origin
+        .canonicalize()
+        .unwrap_or_else(|_| origin.to_path_buf());
+    let super::project::Saving::LocalOnly { root, repository } = super::project::saving(&origin)
+    else {
+        return None;
+    };
+    let recorded = crate::domain::store::Store::open()
+        .ok()
+        .flatten()
+        .and_then(|store| crate::domain::link::get(&store, runtime, session))
+        .is_some_and(|link| link.branch.is_some());
+    // Read before anything is written: a start in a folder already told leaves no file behind.
+    if recorded
+        || super::project::automatic_upload_offered(&root)
+        || !super::project::claim_unsaved_notice(&root).ok()?
+    {
+        return None;
+    }
+    Some(format!(
+        "agit: this conversation isn't being saved to {repository}: this folder is set up for it but doesn't save by itself. To save it, run `agit save` (or ask your agent to); `agit on` saves this folder's conversations from then on. Said once per folder; `agit config notice.unsaved false` stops it everywhere."
+    ))
 }
 
 /// Write the binding into the harness's "session environment" file.
@@ -2107,7 +2184,11 @@ mod tests {
     /// without having told the agent anything.
     /// Signed out, it says that nothing is uploaded now and what `agit login` will then upload and
     /// to whom; a notice that still promised an upload would hide the stop, and one that left out
-    /// the login would let the held turns reach their audience by surprise.
+    /// the login would let the held turns reach their audience by surprise. A folder whose uploads
+    /// are held for another reason than its automatic upload being off (a public repository not
+    /// switched on, no write access) says the conversation is saved here and what holds the
+    /// upload, and under another account that nothing is saved; never that it is uploaded. A
+    /// notice that read only the folder's own switch would promise an upload the hold stops.
     #[test]
     fn an_automatic_upload_is_announced_at_every_start() {
         for runtime in ["claude-code", "codex"] {
@@ -2126,6 +2207,7 @@ mod tests {
                 sign_in,
                 upload_off: false,
                 worktree: None,
+                held: None,
             })
         };
         assert_eq!(
@@ -2145,6 +2227,7 @@ mod tests {
                 sign_in: SignIn::Current,
                 upload_off: false,
                 worktree: None,
+                held: None,
             })
         };
         let notice =
@@ -2184,6 +2267,7 @@ mod tests {
             sign_in: SignIn::Current,
             upload_off: false,
             worktree: Some(("/w/widget-tree".into(), "/w/widget".into())),
+            held: None,
         });
         assert!(
             through.contains(
@@ -2191,6 +2275,66 @@ mod tests {
             ),
             "{through}"
         );
+        // A held folder says what holds the upload, whatever the sign-in reads; with automatic
+        // upload off, the line that names the push wins.
+        let held = |code: &'static str, text: &str, sign_in, upload_off| {
+            super::upload_notice(&crate::commands::project::AutomaticUpload {
+                repository: "acme/widget".into(),
+                visibility: Some("public".into()),
+                org: Some(true),
+                members_read: None,
+                sign_in,
+                upload_off,
+                worktree: None,
+                held: Some(crate::commands::project::Held {
+                    code,
+                    text: text.into(),
+                    under: None,
+                }),
+            })
+        };
+        // Each hold's own text names the account and the Hub; the start line, which can be
+        // published with the conversation, says the hold by its class alone.
+        let denied = "acme/widget doesn't let ada upload to it on https://hub.example";
+        let elsewhere = "this folder uploads as ada on https://hub.example, and agit is signed in as another account";
+        assert_eq!(
+            held("public_needs_consent", denied, SignIn::Current, false),
+            "agit: this conversation is saved on this computer; acme/widget is public, and automatic upload into it waits until you switch it on: `agit on`."
+        );
+        assert_eq!(
+            held("no_write_access", denied, SignIn::Current, false),
+            "agit: this conversation is saved on this computer, and it isn't uploaded because acme/widget doesn't let this folder's account upload to it."
+        );
+        assert_eq!(
+            held("other_account", elsewhere, SignIn::Absent, false),
+            "agit: this conversation isn't saved or uploaded for acme/widget, because agit is signed in as another account than the one this folder uploads as."
+        );
+        for (code, text, sign_in) in [
+            ("no_write_access", denied, SignIn::Current),
+            ("other_account", elsewhere, SignIn::Absent),
+            ("signed_out", denied, SignIn::Current),
+        ] {
+            let line = held(code, text, sign_in, false);
+            assert!(
+                !line.contains("ada") && !line.contains("hub.example"),
+                "{line}"
+            );
+        }
+        assert!(
+            held("signed_out", denied, SignIn::Absent, false).starts_with("agit: not signed in")
+        );
+        assert!(
+            held("push_auto_off", denied, SignIn::Current, true)
+                .contains("`agit push acme/widget` publishes it")
+        );
+        for notice in [
+            held("public_needs_consent", denied, SignIn::Current, false),
+            held("no_write_access", denied, SignIn::Current, false),
+            held("signed_out", denied, SignIn::Current, false),
+            held("other_account", elsewhere, SignIn::Current, false),
+        ] {
+            assert!(!notice.contains("is uploaded to"), "{notice}");
+        }
     }
 
     /// With automatic upload off for the repository, nothing goes up at a turn's end, so the start
@@ -2209,6 +2353,7 @@ mod tests {
                 sign_in,
                 upload_off: true,
                 worktree: worktree.map(|(tree, main)| (tree.into(), main.into())),
+                held: None,
             })
         };
         let off = |sign_in, worktree| off_reading(None, sign_in, worktree);
