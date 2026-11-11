@@ -149,8 +149,17 @@ mod tests {
     }
 }
 
+/// How a local commit came out: `Ok` with its result, or `Err(true)` when its subprocess couldn't
+/// be started at all, apart from every other way it didn't finish (`Err(false)`).
+pub(super) type LocalCommitOutcome = Result<LocalCommit, bool>;
+
 impl LocalCommitRequest {
-    pub async fn run(mut self) -> Option<LocalCommit> {
+    pub async fn run(self) -> LocalCommitOutcome {
+        let mut unstartable = false;
+        self.run_noting(&mut unstartable).await.ok_or(unstartable)
+    }
+
+    async fn run_noting(mut self, unstartable: &mut bool) -> Option<LocalCommit> {
         let _prepared_file = self.prepared_file;
         let started = std::time::Instant::now();
         let before = self.watermark.read(&mut self.settlement, self.lease).await;
@@ -158,7 +167,8 @@ impl LocalCommitRequest {
         let before = before?.unwrap_or_default();
 
         let started = std::time::Instant::now();
-        let output = guarded_output(&mut self.settlement, self.lease, self.commit).await;
+        let output =
+            guarded_output_noting(&mut self.settlement, self.lease, self.commit, unstartable).await;
         trace_phase(&self.session_id, "settlement.commit", started);
         let output = output?;
         let started = std::time::Instant::now();
@@ -179,7 +189,7 @@ impl LocalCommitRequest {
     }
 }
 
-struct LocalCommitTask(tokio::task::JoinHandle<Option<LocalCommit>>);
+struct LocalCommitTask(tokio::task::JoinHandle<LocalCommitOutcome>);
 
 impl Drop for LocalCommitTask {
     fn drop(&mut self) {
@@ -205,7 +215,39 @@ pub(super) struct LocalSettlement {
     context: LocalSettlementContext,
 }
 
+/// How a conversation is named where its saving waits.
+pub(super) fn settle_target(slug: &str, branch: &str) -> String {
+    format!("{slug}@{branch}")
+}
+
 impl Session {
+    /// The saving step couldn't start: the turns wait, `agit status` says so, and the daemon may
+    /// restart into the installed build once this turn is over.
+    pub(super) async fn settlement_unstartable(&mut self, slug: &str, branch: &str) {
+        let note = self.note_settlement_unstartable(slug, branch);
+        let _ = self.notes.send(note).await;
+    }
+
+    /// The record and log line for [`Self::settlement_unstartable`], and the note the daemon
+    /// is sent.
+    pub(super) fn note_settlement_unstartable(&self, slug: &str, branch: &str) -> SessionNote {
+        let target = settle_target(slug, branch);
+        crate::rc::settle_blocked::record(&target);
+        tracing_note(
+            &serde_json::json!({
+                "event": "settlement.unstartable",
+                "time": chrono::Utc::now().to_rfc3339(),
+                "session_id": self.info.session_id,
+                "target": target,
+            })
+            .to_string(),
+        );
+        SessionNote::SettlementUnstartable {
+            session_id: self.info.session_id.clone(),
+            generation: self.generation,
+        }
+    }
+
     pub(super) async fn finish_local_settlement(&mut self, wait: bool) {
         if !self
             .local_settlement
@@ -219,8 +261,17 @@ impl Session {
             .take()
             .expect("local settlement is present");
         match (&mut task.0).await {
-            Ok(Some(result)) => self.finish_local_commit(context, result).await,
-            Ok(None) => self.publication_retry.failed(),
+            Ok(Ok(result)) => {
+                crate::rc::settle_blocked::clear(&settle_target(&context.slug, &context.branch));
+                self.finish_local_commit(context, result).await
+            }
+            Ok(Err(unstartable)) => {
+                if unstartable {
+                    self.settlement_unstartable(&context.slug, &context.branch)
+                        .await;
+                }
+                self.publication_retry.failed()
+            }
             Err(error) => {
                 self.publication_retry.failed();
                 tracing_note(&format!("local settlement worker failed: {error}"));

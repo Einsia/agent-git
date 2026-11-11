@@ -363,8 +363,10 @@ impl SettlementProgram {
     fn command(&self) -> tokio::process::Command {
         // Fixture scripts are input to the interpreter: writable script handles must not
         // prevent settlement or landing from starting under concurrent test execution.
+        // A fixture script that is gone is started as the program itself, so it fails to start
+        // the way a replaced installation does.
         #[cfg(all(test, unix))]
-        if self.script {
+        if self.script && self.exe.exists() {
             let mut command = tokio::process::Command::new("/bin/sh");
             command.arg(&self.exe);
             return command;
@@ -397,7 +399,18 @@ enum SettlementBoundary {
 pub(in crate::rc) async fn guarded_output(
     state: &mut tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
+    command: tokio::process::Command,
+) -> Option<std::process::Output> {
+    guarded_output_noting(state, lease, command, &mut false).await
+}
+
+/// [`guarded_output`], setting `unstartable` when the subprocess couldn't be started at all, as
+/// apart from it being fenced or failing once started.
+pub(in crate::rc) async fn guarded_output_noting(
+    state: &mut tokio::sync::watch::Receiver<SettlementState>,
+    lease: SettlementState,
     mut command: tokio::process::Command,
+    unstartable: &mut bool,
 ) -> Option<std::process::Output> {
     if !settlement_lease_is_current(state, lease) {
         return None;
@@ -428,7 +441,7 @@ pub(in crate::rc) async fn guarded_output(
     let job = crate::rc::windows_job::Job::new().ok()?;
     #[cfg(windows)]
     crate::rc::windows_job::Job::configure(&mut command);
-    let child = guarded_spawn(state, lease, &mut command).await?;
+    let child = guarded_spawn(state, lease, &mut command, unstartable).await?;
 
     #[cfg(windows)]
     let child = {
@@ -545,12 +558,35 @@ fn executable_is_busy(error: &std::io::Error) -> bool {
     }
 }
 
+/// Says, with the time, what could not be started and from where, and tells the installation
+/// watch: a replaced installation can leave the daemon unable to start its own image, and only a
+/// restart into the installed build saves the turns waiting meanwhile.
+fn spawn_failed(command: &tokio::process::Command, error: &std::io::Error) {
+    let command = command.as_std();
+    tracing_note(
+        &serde_json::json!({
+            "event": "settlement.spawn_failed",
+            "time": chrono::Utc::now().to_rfc3339(),
+            "program": command.get_program().to_string_lossy(),
+            "folder": command.get_current_dir().map(|folder| folder.to_string_lossy()),
+            "error": error.to_string(),
+        })
+        .to_string(),
+    );
+    let raised = error.raw_os_error().map_or_else(
+        || std::io::Error::new(error.kind(), error.to_string()),
+        std::io::Error::from_raw_os_error,
+    );
+    crate::rc::lifecycle::helper_failed_to_start(&anyhow::Error::new(raised));
+}
+
 /// An executable held open for writing has not started when exec rejects it.
 /// Retrying that refusal is bounded and requires the same current authority lease.
 async fn guarded_spawn(
     state: &mut tokio::sync::watch::Receiver<SettlementState>,
     lease: SettlementState,
     command: &mut tokio::process::Command,
+    unstartable: &mut bool,
 ) -> Option<tokio::process::Child> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
@@ -571,7 +607,8 @@ async fn guarded_spawn(
                 }
             }
             Err(error) => {
-                tracing_note(&format!("could not start settlement subprocess: {error}"));
+                spawn_failed(command, &error);
+                *unstartable = true;
                 return None;
             }
         }
@@ -1141,6 +1178,10 @@ pub enum SessionNote {
         generation: u64,
         arm: u64,
     },
+    /// This session's saving step couldn't start: its finished turns wait. Restarting the daemon
+    /// into the installed build is what saves them, so an upgrade waiting for this session need
+    /// not also wait for it to sit idle.
+    SettlementUnstartable { session_id: String, generation: u64 },
     /// Notification-only acceptance consumed a pre-armed token. Persist the
     /// actual mode while that token continues forcing Plan on restart.
     ObserveTurnGuard {

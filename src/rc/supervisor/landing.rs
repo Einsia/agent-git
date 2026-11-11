@@ -21,6 +21,8 @@ pub(super) struct Landing {
     session_id: String,
     cwd: PathBuf,
     exe: Option<SettlementProgram>,
+    /// The landing subprocess couldn't be started at all.
+    unstartable: bool,
 }
 
 impl Landing {
@@ -37,6 +39,7 @@ impl Landing {
             session_id: session.info.session_id.clone(),
             cwd: session.cwd.clone(),
             exe: session.settlement_exe(),
+            unstartable: false,
         }
     }
 
@@ -114,7 +117,7 @@ impl Landing {
                     .env(crate::commands::commit::archive::NATIVE_ENV, native)
                     .env(crate::commands::commit::archive::ROLE_ENV, role);
             }
-            guarded_output(&mut self.settlement, lease, command).await
+            guarded_output_noting(&mut self.settlement, lease, command, &mut self.unstartable).await
         } else {
             None
         };
@@ -202,6 +205,7 @@ impl Session {
         };
         match (&mut task.0).await {
             Ok(landing) => {
+                self.landing_ran(&landing).await;
                 if self.driver.runtime_thread_id().as_deref() == Some(landing.thread_id.as_str())
                     && settlement_lease_is_current(&self.settlement, landing.lease)
                 {
@@ -213,12 +217,24 @@ impl Session {
         }
     }
 
+    /// What any landing tells the session, from the background job or the one a turn runs
+    /// before it saves: a landing step that couldn't start means the turns wait.
+    async fn landing_ran(&mut self, landing: &Landing) {
+        if landing.unstartable
+            && let Some(session) = &landing.agit_session
+        {
+            self.settlement_unstartable(&session.slug(), session.branch())
+                .await;
+        }
+    }
+
     /// Settlement serializes with startup preparation and refreshes repository authority
     /// before committing. A finished background task alone never authorizes publication.
     pub(super) async fn land(&mut self, thread_id: &str, lease: SettlementState) {
         self.finish_landing().await;
         let mut landing = Landing::capture(self, thread_id, lease);
         landing.run().await;
+        self.landing_ran(&landing).await;
         self.landed_thread = landing.landed_thread;
         self.archive_handoff = landing.archive_handoff;
     }

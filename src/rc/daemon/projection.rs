@@ -272,6 +272,18 @@ impl Daemon {
                 // the journal's ring anyway — see `Stream::retained`.)
                 self.terminals.remove(&terminal_id);
             }
+            SessionNote::SettlementUnstartable {
+                session_id,
+                generation,
+            } => {
+                if let Some(live) = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .filter(|live| live.generation == generation)
+                {
+                    live.settlement_unstartable = true;
+                }
+            }
             SessionNote::DangerDisarmed {
                 session_id,
                 generation,
@@ -969,6 +981,7 @@ mod bound_lineage_tests {
                         danger_arm: 0,
                         pending_mode: None,
                         approval_requests: HashMap::new(),
+                        settlement_unstartable: false,
                         handed_approvals: Default::default(),
                         rpc_gate: Arc::new(Mutex::new(())),
                         interrupt_gate: Arc::new(Mutex::new(())),

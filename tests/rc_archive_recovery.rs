@@ -403,6 +403,58 @@ fn daemon_restart_recovers_a_completed_turn_without_resuming_the_model() {
     assert!(job_path.exists(), "a failed publication keeps its job");
 }
 
+/// Turns a session left waiting to be saved, because its daemon couldn't start its saving step,
+/// stop being listed by `agit status` once a restarted daemon's archive recovery saves them. The
+/// session is gone by then, so only recovery's save can end the wait.
+#[test]
+fn a_wait_to_be_saved_ends_when_recovery_saves_the_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let rc = root.join("agit-home").join("desktop-rc");
+    let turn = completed_turn(&root);
+    turn.queue();
+    let target = "desktop-fixture/project@conversation";
+    // The record the session left: one file per conversation, named by a digest of its target.
+    let waits = root.join("agit-home").join("settle-blocked");
+    std::fs::create_dir_all(&waits).unwrap();
+    std::fs::write(
+        waits.join(format!(
+            "{}.json",
+            &blake3::hash(target.as_bytes()).to_hex()[..32]
+        )),
+        serde_json::json!({"target": target, "since": 1_700_000_000u64}).to_string(),
+    )
+    .unwrap();
+    let save_waits = || {
+        let status = command(&root, &["status", "--json"]).output().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap_or_default();
+        value["result"]["value"]["save_waits"].clone()
+    };
+    assert_eq!(save_waits()[0]["target"], target, "the wait is listed");
+    let before = turn.head();
+    let _stop = Stop(&root);
+    let started = command(&root, &["rc", "local", "start", "--detach"])
+        .output()
+        .unwrap();
+    assert!(
+        started.status.success(),
+        "daemon start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    // The wait ends just after the commit moves the branch, so both are waited for.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while turn.head() == before || save_waits() != serde_json::json!([]) {
+        assert!(
+            Instant::now() < deadline,
+            "the turn was not recovered (head moved: {}) or still waits: {}\n{}",
+            turn.head() != before,
+            save_waits(),
+            daemon_output(&rc)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A daemon whose executable an upgrade replaces while it runs still settles its work: every
 /// subprocess it starts for it (landing, the commit, its privacy worker) runs the daemon's own
 /// build, not what now sits at the installed path. One that started from the path would run the
