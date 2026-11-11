@@ -276,6 +276,7 @@ pub fn run(args: Args) -> CmdResult {
     let not_through = uploads_not_through(&scope);
     let upload_off = automatic_upload_off(&scope);
     print_upload_waits(&scope);
+    print_save_waits(&scope);
     print_uploads_not_through(&not_through);
     print_automatic_upload_off(&upload_off);
     print_held_branches(&scope);
@@ -973,6 +974,7 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
             "ask_user": super::front::earlier_note(count, "here", super::front::Reader::Agent),
         })),
         "upload_waits": upload_waits_json(scope),
+        "save_waits": save_waits_json(scope),
         "uploads_not_through": not_through_json(&not_through),
         "automatic_upload_off": upload_off,
         "store_path": store.as_ref().map(|store| store.root()),
@@ -1333,6 +1335,36 @@ fn print_held_branches(scope: &Scope) {
             ));
         }
     }
+}
+
+/// Conversations whose finished turns wait to be saved because the local daemon couldn't start
+/// its saving step. The daemon restarts into the installed build once the busy turn ends, which
+/// saves them; the person may also restart it now.
+fn print_save_waits(scope: &Scope) {
+    for (target, entry) in save_waits(scope) {
+        let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
+        ui::warning(&format!(
+            "{target}: finished turns wait to be saved since {}; agit saves them when this turn \
+             ends, or now with: agit rc local restart --if-idle",
+            ui::ago(since),
+        ));
+    }
+}
+
+/// The conversations in `scope` whose finished turns wait to be saved, by `owner/repo@branch`.
+fn save_waits(scope: &Scope) -> Vec<(String, crate::rc::settle_blocked::Waiting)> {
+    crate::rc::settle_blocked::load()
+        .into_iter()
+        .filter(|(target, _)| scope.covers_target(target))
+        .collect()
+}
+
+/// [`print_save_waits`] for `status --json`.
+fn save_waits_json(scope: &Scope) -> Vec<serde_json::Value> {
+    save_waits(scope)
+        .into_iter()
+        .map(|(target, entry)| serde_json::json!({"target": target, "since": entry.since}))
+        .collect()
 }
 
 /// Uploads the privacy check holds back, for every target on this computer: an automatic upload

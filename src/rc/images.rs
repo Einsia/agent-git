@@ -1,5 +1,8 @@
-//! The copy of its own executable a daemon starts its subprocesses from, where the kernel keeps
-//! no link to the running image (see [`crate::infra::own_image`]).
+//! The copy of its own executable a daemon starts its subprocesses from (see
+//! [`crate::infra::own_image`]). On Linux the kernel keeps a link to the running image, but where
+//! the install directory is a mount shared from a host (a VM's or container's virtiofs or bind
+//! mount), an update renaming a new binary over it leaves that link unable to start: the copy
+//! on this machine's own disk still can.
 //!
 //! One copy per build, under `<rc dir>/images/<build>/`, reused by every daemon of that build and
 //! removed by a later daemon once none holds it. A copy made per start would grow the disk with
@@ -11,9 +14,8 @@
 //! The copy is something agit runs, so it is made the way an install is: in an owner-only
 //! directory, written to a temporary name and renamed into place, and checked against the running
 //! image before it is reused, never run when it differs.
-#![cfg_attr(target_os = "linux", allow(dead_code))]
 
-use anyhow::{Context, ensure};
+use anyhow::ensure;
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
@@ -40,7 +42,13 @@ pub(crate) struct Image {
 /// Make or reuse this build's copy of the running executable, and remove the copies of builds no
 /// daemon holds any more.
 pub(crate) fn prepare() -> crate::Result<Image> {
-    let running = std::env::current_exe().context("the running executable is unknown")?;
+    // The image this process runs, not the installed path: an update may have replaced that
+    // already.
+    #[cfg(target_os = "linux")]
+    let running = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let running = std::env::current_exe()
+        .map_err(|error| anyhow::anyhow!("the running executable is unknown: {error}"))?;
     prepare_in(
         &super::rc_dir()?.join("images"),
         crate::infra::own_image::BUILD,
@@ -86,14 +94,14 @@ fn same_contents(copy: &Path, running: &Path) -> crate::Result<bool> {
     let Ok(metadata) = std::fs::symlink_metadata(copy) else {
         return Ok(false);
     };
-    if !metadata.file_type().is_file() || metadata.len() != std::fs::metadata(running)?.len() {
+    if !metadata.file_type().is_file() || metadata.len() != open_running(running)?.metadata()?.len()
+    {
         return Ok(false);
     }
-    Ok(digest(copy)? == digest(running)?)
+    Ok(digest(open_no_follow(copy)?)? == digest(open_running(running)?)?)
 }
 
-fn digest(path: &Path) -> crate::Result<[u8; 32]> {
-    let mut file = open_no_follow(path)?;
+fn digest(mut file: File) -> crate::Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 1 << 20];
     loop {
@@ -104,6 +112,16 @@ fn digest(path: &Path) -> crate::Result<[u8; 32]> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// The running image, to read. Linux names it through the kernel's link to it, which has to be
+/// followed; anywhere else a link here is refused.
+fn open_running(running: &Path) -> std::io::Result<File> {
+    #[cfg(target_os = "linux")]
+    if running == Path::new("/proc/self/exe") {
+        return File::open(running);
+    }
+    open_no_follow(running)
 }
 
 fn open_no_follow(path: &Path) -> std::io::Result<File> {
@@ -119,7 +137,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<File> {
 
 /// Copy `running` to `path` through a temporary file in `directory`, replacing whatever was there.
 fn copy_into(directory: &Path, running: &Path, path: &Path) -> crate::Result<()> {
-    let mut source = open_no_follow(running)?;
+    let mut source = open_running(running)?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".image-")
         .tempfile_in(directory)?;
@@ -325,5 +343,31 @@ mod tests {
                 .count();
             assert_eq!(builds, 2);
         });
+    }
+
+    /// The copy is what a subprocess starts from once an update has replaced the installed file:
+    /// with the file this build was started from gone, the copy still holds this build and still
+    /// starts. On Linux it is taken from the running image itself, so even an install that
+    /// replaced the file before the daemon took its copy can't give it another build.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_copy_still_starts_once_the_installed_file_is_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let installed = home.path().join("installed-agit");
+        std::fs::write(&installed, b"#!/bin/sh\necho copy-of-this-build\n").unwrap();
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = home.path().join("images");
+        let image = prepare_in(&root, "this-build", &installed).unwrap();
+        std::fs::remove_file(&installed).unwrap();
+        let output = std::process::Command::new(&image.path).output().unwrap();
+        assert_eq!(output.stdout, b"copy-of-this-build\n");
+        #[cfg(target_os = "linux")]
+        {
+            let running = std::fs::read("/proc/self/exe").unwrap();
+            let taken =
+                prepare_in(&root, "running", std::path::Path::new("/proc/self/exe")).unwrap();
+            assert_eq!(std::fs::read(&taken.path).unwrap(), running);
+        }
     }
 }

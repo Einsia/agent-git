@@ -236,6 +236,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     )]
                     .into_iter()
                     .collect(),
+                    settlement_unstartable: false,
                     handed_approvals: Default::default(),
                     rpc_gate: Arc::new(Mutex::new(())),
                     interrupt_gate: Arc::new(Mutex::new(())),

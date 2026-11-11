@@ -11,8 +11,8 @@ impl Daemon {
     pub async fn run(opts: Options) -> crate::Result<()> {
         let identity = crate::rc::build_identity::DaemonIdentity::current()?;
         // Subprocesses start from this build's own copy: an upgrade can replace the installed
-        // file while this daemon still runs. Linux reaches the running image through /proc.
-        #[cfg(not(target_os = "linux"))]
+        // file while this daemon still runs, and on a mount shared from a host even Linux's link
+        // to the running image stops starting then.
         let _image = match crate::rc::images::prepare() {
             Ok(image) => {
                 crate::infra::own_image::pin(image.path.clone());

@@ -28,12 +28,13 @@ impl From<RestartRefusal> for control::Reply {
 impl Live {
     /// A conversation on a runtime only the daemon runs that has sat idle past [`IDLE_DETACH`]
     /// with nothing queued or pending: an upgrade may end it, and it continues with the next
-    /// message.
+    /// message. One whose saving step couldn't start need not wait that long: only the restart
+    /// saves its turns, so it may go as soon as its turn is over.
     pub(super) fn idle_detachable(&self) -> bool {
         !self.shared_executor
             && self.started_process
             && self.info.status == SessionStatus::Idle
-            && self.status_since.elapsed() >= IDLE_DETACH
+            && (self.settlement_unstartable || self.status_since.elapsed() >= IDLE_DETACH)
             && self.tx.capacity() == COMMAND_QUEUE_CAPACITY
             && !self.rpc_guard_sensitive
             && self.pending_mode.is_none()
@@ -126,6 +127,33 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An idle conversation normally holds an upgrade for [`IDLE_DETACH`], so a person who
+    /// steps away comes back to it as they left it. One whose saving step couldn't start holds
+    /// it only until its turn is over: only the restart saves its turns. A running one still
+    /// holds it, so a turn in progress is never cut off.
+    #[tokio::test]
+    async fn a_session_that_cannot_save_holds_an_upgrade_only_until_its_turn_ends() {
+        let (tx, _commands) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let mut live = super::super::tests::rpc_test_live(
+            "busy",
+            1,
+            tx,
+            crate::protocol::PermissionMode::Default,
+        );
+        live.shared_executor = false;
+        live.started_process = true;
+        live.info.status = SessionStatus::Idle;
+        live.status_since = std::time::Instant::now();
+        assert!(
+            !live.idle_detachable(),
+            "a fresh idle session holds the upgrade"
+        );
+        live.settlement_unstartable = true;
+        assert!(live.idle_detachable());
+        live.info.status = SessionStatus::Running;
+        assert!(!live.idle_detachable(), "a running turn is never cut off");
+    }
 
     #[tokio::test]
     async fn safe_stop_preserves_live_sessions_and_launch_reservations() {

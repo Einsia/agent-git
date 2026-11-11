@@ -4,10 +4,11 @@
 //! and npm replaces the package directory under it. A subprocess started from that path then runs
 //! another build, whose arguments and replies this one cannot speak safely, or finds nothing there
 //! at all. So every place agit starts itself goes through [`command`], which names the image this
-//! process runs: on Linux the kernel's link to it, which still opens after the rename; elsewhere a
-//! copy kept per build, which the daemon pins when it starts ([`pin`]). A process that pinned
-//! nothing falls back to its own path, which is still the file it was started from unless an
-//! install replaces it while it runs.
+//! process runs: a copy kept per build on this machine's own disk, which the daemon pins when it
+//! starts ([`pin`]). A process that pinned nothing falls back, on Linux, to the kernel's link to
+//! its image, which still opens after a rename on a local disk but not where the install
+//! directory is a mount shared from a host; elsewhere to its own path, which is still the file it
+//! was started from unless an install replaces it while it runs.
 //!
 //! Every child carries [`PARENT_BUILD`]. A child of another build refuses before it reads, writes
 //! or sends anything ([`refuse_foreign_parent`]), so a fallback that still reached another build
@@ -28,23 +29,22 @@ pub const BUILD: &str = env!("AGIT_BUILD_ID");
 static PINNED: OnceLock<PathBuf> = OnceLock::new();
 
 /// Start every later self-spawn from `image`, a copy of this build. Only the first pin counts.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn pin(image: PathBuf) {
     let _ = PINNED.set(image);
 }
 
 /// The image this process runs, to start another of itself from.
 pub fn own_image() -> std::io::Result<PathBuf> {
+    if let Some(image) = PINNED.get() {
+        return Ok(image.clone());
+    }
     #[cfg(target_os = "linux")]
     {
         Ok(PathBuf::from(format!("/proc/{}/exe", std::process::id())))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        match PINNED.get() {
-            Some(image) => Ok(image.clone()),
-            None => std::env::current_exe(),
-        }
+        std::env::current_exe()
     }
 }
 
@@ -69,5 +69,19 @@ pub fn refuse_foreign_parent() {
     if parent != BUILD {
         eprintln!("agit: started by another agit build; nothing was done");
         std::process::exit(FOREIGN_PARENT_EXIT);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Once the daemon pins its copy, every self-spawn starts from it, on Linux too: the kernel's
+    /// link to the running image doesn't start where the install directory is a mount shared
+    /// from a host and an update renamed a new binary over it.
+    #[test]
+    fn a_pinned_copy_is_what_self_spawns_start_from() {
+        let copy = tempfile::tempdir().unwrap().keep().join("agit");
+        super::pin(copy.clone());
+        assert_eq!(super::own_image().unwrap(), copy);
+        assert_eq!(super::command().unwrap().get_program(), copy.as_os_str());
     }
 }

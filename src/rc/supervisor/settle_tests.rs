@@ -3388,3 +3388,131 @@ fn an_unattended_stop_archives_the_turn_it_interrupts_and_a_persons_stop_holds_i
         });
     }
 }
+
+/// A saving step that can't start at all is told apart from one that fails once started: the
+/// caller learns it, so the session can say its turns wait and the daemon can restart into the
+/// installed build. One that starts and fails, or is fenced by its lease, isn't reported so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_saving_step_that_cannot_start_is_reported_as_such() {
+    let lease = SettlementState {
+        local_owner: true,
+        epoch: 1,
+        agent_identity_v1: true,
+        session_start_idempotency_v1: false,
+    };
+    let (state_tx, mut state) = tokio::sync::watch::channel(lease);
+    let missing = tempfile::tempdir().unwrap();
+    let mut unstartable = false;
+    let command = tokio::process::Command::new(missing.path().join("agit"));
+    assert!(
+        guarded_output_noting(&mut state, lease, command, &mut unstartable)
+            .await
+            .is_none()
+    );
+    assert!(
+        unstartable,
+        "a missing image is a saving step that cannot start"
+    );
+
+    let mut unstartable = false;
+    let output = guarded_output_noting(
+        &mut state,
+        lease,
+        touch(&missing.path().join("x")),
+        &mut unstartable,
+    )
+    .await
+    .unwrap();
+    assert!(output.status.success());
+    assert!(!unstartable);
+    let mut failing = tokio::process::Command::new("sh");
+    failing.args(["-c", "exit 3"]);
+    let output = guarded_output_noting(&mut state, lease, failing, &mut unstartable)
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !unstartable,
+        "one that started and failed is not unstartable"
+    );
+
+    state_tx.send_modify(|state| state.epoch += 1);
+    let command = tokio::process::Command::new(missing.path().join("agit"));
+    assert!(
+        guarded_output_noting(&mut state, lease, command, &mut unstartable)
+            .await
+            .is_none()
+    );
+    assert!(!unstartable, "a fenced one never tried to start");
+}
+
+/// A session whose saving step couldn't start says so where the person and the daemon read it:
+/// `agit status` lists the conversation as waiting to be saved, with when it began, and the
+/// daemon hears that this session's turns wait. Once a save runs, the wait is gone.
+#[tokio::test]
+async fn a_session_that_cannot_save_says_so_until_a_save_runs() {
+    let home = tempfile::tempdir().unwrap();
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let session = super::tests::harness_test_session_with_channels(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Idle,
+    )
+    .0;
+    let (note, recorded) = crate::rc::with_agit_home(home.path(), || {
+        assert!(crate::rc::settle_blocked::load().is_empty());
+        let note = session.note_settlement_unstartable("alice/notes", "talk");
+        (note, crate::rc::settle_blocked::load())
+    });
+    assert_eq!(recorded.keys().collect::<Vec<_>>(), ["alice/notes@talk"]);
+    match note {
+        SessionNote::SettlementUnstartable { session_id, .. } => {
+            assert_eq!(session_id, session.info.session_id)
+        }
+        _ => panic!("the daemon is told this session's turns wait"),
+    }
+    crate::rc::with_agit_home(home.path(), || {
+        crate::rc::settle_blocked::clear(&settlement_io::settle_target("alice/notes", "talk"));
+        assert!(crate::rc::settle_blocked::load().is_empty());
+    });
+}
+
+/// A landing that first starts and later can't (an update replaced the installed file between
+/// turns) says the turns wait from the landing a turn runs before it saves, not only from the
+/// background one.
+#[cfg(unix)]
+#[test]
+fn a_turns_own_landing_that_cannot_start_says_the_turns_wait() {
+    let home = tempfile::tempdir().unwrap();
+    crate::rc::with_agit_home(home.path(), || {
+        let fixture = SettlementFixture::new(false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mut session, _out, mut notes, _tx, lease) = fixture.session();
+            let thread = session.driver.runtime_thread_id().unwrap();
+            let unstartable = |notes: &mut mpsc::Receiver<SessionNote>| {
+                std::iter::from_fn(|| notes.try_recv().ok())
+                    .any(|note| matches!(note, SessionNote::SettlementUnstartable { .. }))
+            };
+            std::fs::write(&fixture.exe, "#!/bin/sh\nexit 0\n").unwrap();
+            session.land(&thread, lease).await;
+            assert_eq!(session.landed_thread.as_deref(), Some(thread.as_str()));
+            assert!(crate::rc::settle_blocked::load().is_empty());
+            assert!(!unstartable(&mut notes));
+
+            std::fs::remove_file(&fixture.exe).unwrap();
+            session.land(&thread, lease).await;
+            assert!(session.landed_thread.is_none());
+            let target = settlement_io::settle_target("alice/photo", &fixture.branch);
+            assert!(crate::rc::settle_blocked::load().contains_key(&target));
+            assert!(
+                unstartable(&mut notes),
+                "the daemon hears this session's turns wait"
+            );
+        });
+    });
+}

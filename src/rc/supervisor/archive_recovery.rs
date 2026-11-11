@@ -290,6 +290,7 @@ pub(crate) async fn prepare(
     }
     .run()
     .await
+    .ok()
     .context("archive settlement did not return a verified result")?;
     require_success(&committed.output, "commit")?;
     strict_settlement_candidate(
@@ -300,6 +301,12 @@ pub(crate) async fn prepare(
         None,
     )
     .map_err(anyhow::Error::msg)?;
+    // The save ran: turns a session that is gone left waiting are saved now, so `agit status`
+    // stops listing them.
+    crate::rc::settle_blocked::clear(&settlement_io::settle_target(
+        &lineage.slug(),
+        lineage.branch(),
+    ));
     ensure!(
         committed.reported.as_deref() != Some(crate::commands::commit::archive::WITHHELD_RESULT),
         "archive exploration is withheld from publication"

@@ -573,6 +573,9 @@ struct Live {
     /// Machine-originated events own both presence and policy; viewer responses
     /// cannot invent a pending request or its permission effect.
     approval_requests: HashMap<String, Option<crate::protocol::PermissionMode>>,
+    /// This session's saving step couldn't start since it was launched: an upgrade that waits for
+    /// it may restart the daemon as soon as its turn is over.
+    settlement_unstartable: bool,
     /// Native asks whose decision was handed over and that haven't resolved yet: the approval
     /// lane is free while their hooks take them, and viewers still read them as changing.
     handed_approvals: std::collections::HashSet<String>,
