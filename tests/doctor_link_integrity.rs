@@ -400,7 +400,7 @@ fn doctor_reports_corrupt_links_without_misattribution_or_private_values() {
         assert!(text.contains("repository scope unavailable"), "{text}");
         assert!(!text.contains("unrelated.json"), "{text}");
         assert!(!text.contains("PRIVATE-LINK-SENTINEL"), "{text}");
-        assert!(text.contains("alice/fixture@work"), "{text}");
+        // A clean claim prints no line of its own; the count is what says it was compared.
         assert!(
             text.contains("checked 1 live transcripts: 1 matches what was saved"),
             "{text}"

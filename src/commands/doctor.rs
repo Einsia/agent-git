@@ -74,7 +74,9 @@ pub struct Args {
     #[arg(long)]
     pub check_backend: bool,
 
-    /// Inspect the committed history reachable from local branches, tracking refs, tags, and HEAD
+    /// Also check every session branch's VIEW against its saved LOG, and inspect the committed
+    /// history reachable from local branches, tracking refs, tags, and HEAD. Without it doctor
+    /// reads each branch's metadata and the live transcripts on this computer, and does neither
     #[arg(long)]
     pub deep: bool,
 }
@@ -605,10 +607,14 @@ pub fn run(args: Args) -> CmdResult {
         }
 
         // ── View comparison: every event the VIEW references must be reachable in the log ──
+        // It reads every branch's LOG and VIEW, which grows with the saved conversations, so it
+        // runs with `--deep`; without it doctor reads only each branch's metadata here.
         let mut view_ok = 0usize;
         let mut view_errs: Vec<String> = vec![];
         let mut view_skipped: Vec<String> = vec![];
-        for (slug, root) in views {
+        let views_read = args.deep;
+        let unread = if views_read { 0 } else { views.len() };
+        for (slug, root) in views.into_iter().filter(|_| views_read) {
             match view_verdict(&slug, &root) {
                 None => {}
                 Some(ViewVerdict::Ok) => view_ok += 1,
@@ -640,6 +646,12 @@ pub fn run(args: Args) -> CmdResult {
         }
 
         match view_errs.len() {
+            _ if unread > 0 => println!(
+                "  {}",
+                ui::dim(
+                    "session VIEWs and committed history were not read; `agit doctor --deep` checks them"
+                )
+            ),
             0 if view_ok == 0 && view_skipped.is_empty() => println!(
                 "  {}",
                 ui::dim("no views to compare yet (no repo has a session log)")

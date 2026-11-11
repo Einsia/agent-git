@@ -263,7 +263,8 @@ fn a_duplicate_branch_registration_cannot_hide_the_primary_worktree_view() {
         .unwrap();
     let invalid = b"not a valid event id\n";
     fs::write(lab.repo.root().join(meta::VIEW_FILE), invalid).unwrap();
-    let output = lab.doctor();
+    // The VIEW check reads each branch's LOG and VIEW, so it runs with --deep.
+    let output = lab.doctor_command().arg("--deep").output().unwrap();
     let rendered = text(&output);
     assert!(output.status.success(), "{rendered}");
     assert!(rendered.contains("VIEW is unreadable"), "{rendered}");
