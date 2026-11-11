@@ -162,13 +162,27 @@ jobs:
           echo "$assets" | grep -qx 'SHA256SUMS' \
             || { echo "::error::Release is missing SHA256SUMS"; exit 1; }
 
+      # Right after the Release run publishes, GitHub can still refuse to serve
+      # the new assets for a moment. Each failed try shows gh's own error; only
+      # the last one fails the step.
       - name: Download the Release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release download "$TAG" -p 'agit-*.tar.gz' -D dist
-          ls -l dist
+          for attempt in 1 2 3 4 5; do
+            rm -rf dist
+            if gh release download "$TAG" -p 'agit-*.tar.gz' -D dist; then
+              ls -l dist
+              exit 0
+            fi
+            echo "::warning::downloading the Release artifacts failed (attempt $attempt of 5)"
+            if [ "$attempt" -lt 5 ]; then
+              sleep $((attempt * 15))
+            fi
+          done
+          echo "::error::the Release artifacts could not be downloaded after 5 attempts"
+          exit 1
 
       # publish.mjs unpacks and verifies every binary (version, architecture
       # magic), then publishes one package at a time.
