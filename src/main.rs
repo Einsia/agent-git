@@ -336,7 +336,8 @@ fn reads(command: &Commands) -> commands::migration::Reads {
         Commands::Doctor(args) if args.repair_objects.is_none() => {
             commands::migration::Reads::Findings
         }
-        Commands::Status(_) | Commands::Overview => commands::status::reads_here(),
+        Commands::Status(args) => commands::status::reads_here(args.repo.as_deref()),
+        Commands::Overview => commands::status::reads_here(None),
         _ => commands::migration::Reads::Every,
     }
 }

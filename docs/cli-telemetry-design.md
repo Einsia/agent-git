@@ -251,7 +251,7 @@ The root canonical `command` remains the actual top-level command.
 | `repo invite` | Validated read/write/owner role, target and `-b` presence; never the repository, branch name, token, or link |
 | `repo rename`, `delete` | Rename/delete action, local/remote deletion, outcome; names excluded |
 | `import` | Runtime, link-only/privacy/propose-lineage/independent, supplied target/base flags; linked/adopted/already-adopted/refused; lineage mode and imported-turn count bucket |
-| `status` | Check-missing, limit/offset buckets; adoption/pagination count buckets from existing results |
+| `status` | Check-missing, all, repo presence (never the name), limit/offset buckets; adoption/pagination count buckets from existing results |
 | `branch` default list; `rename`, `rm`, `seal` | Verbose/all/force, action, branch count bucket, outcome; no branch names |
 | `commit` | Code/from-hook/from-supervisor, milestone/tag/message presence, path count; turns/file-line/no-op/deferred operation mode; settled count, auto-push effective/source |
 | `file cwd`, `add`, `status`, `diff`, `commit`, `list`, `get`, `rm`, `mv`, `restore`, `link` | LFS/staged/cached flags, explicit ref/output/destination presence, path and result count buckets; broad file kind and payload-size buckets only if already known; no MIME parameters, filenames, commit IDs, or links |

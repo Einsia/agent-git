@@ -29,8 +29,11 @@ use std::sync::{Condvar, Mutex, PoisonError};
 mod branches;
 mod merges;
 mod project;
+mod scope;
 mod sessions;
 mod shared;
+
+use scope::Scope;
 
 /// How many branch rows the repositories of one status page show in all.
 const BRANCH_ROWS: usize = 128;
@@ -177,8 +180,14 @@ fn in_order<T: Sync, R: Send>(
 #[derive(ClapArgs)]
 pub struct Args {
     /// Also inspect runtime indexes for unadopted sessions (slower; SQLite may maintain sidecars)
-    #[arg(long)]
+    #[arg(long, visible_alias = "unsaved")]
     pub check_missing: bool,
+    /// Only this repository: its sessions, branches and what needs attention in it.
+    #[arg(long, value_name = "owner/repo", conflicts_with = "all")]
+    pub repo: Option<String>,
+    /// Every repository on this computer, with a summary row for each before the full report.
+    #[arg(long)]
+    pub all: bool,
     /// Session rows per page (text: 8; JSON: 100).
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
     pub limit: Option<u16>,
@@ -188,8 +197,12 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    let scope = match resolve_scope(args.repo.as_deref()) {
+        Ok(scope) => scope,
+        Err(code) => return Ok(code),
+    };
     if super::json::requested() {
-        return structured(&args);
+        return structured(&args, &scope);
     }
     let s = ui::theme::symbols();
     let cwd = std::env::current_dir()?;
@@ -198,17 +211,20 @@ pub fn run(args: Args) -> CmdResult {
         mut links,
         issues: link_issues,
     } = claim_inventory(config::store_root()?);
-    let in_folder = order(&mut links, &cwd);
+    let (in_folder, in_scope) = order_in(&mut links, &cwd, &scope);
     // The display budget never cuts the current folder's sessions; it applies to the rest.
     let limit = (args.limit.unwrap_or(8) as usize).max(in_folder.saturating_sub(args.offset));
+    // A page never runs past the claims the scope covers into the ones after them.
+    let take = limit.min(in_scope.saturating_sub(args.offset));
     let page = observe_page(
         store.as_ref(),
         &links,
         link_issues.is_empty(),
         args.offset,
-        limit,
+        take,
     );
     let inventory_complete = page.inventory_complete;
+    let scoped = &links[..in_scope];
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
     ui::section("who am I");
@@ -244,7 +260,9 @@ pub fn run(args: Args) -> CmdResult {
         println!("  {said}");
     }
     // Told once: branches already on the Hub that the folder they ran in keeps back.
-    if let Ok(uploads) = super::project::kept_back_uploads_to_tell() {
+    if let Ok(uploads) =
+        super::project::kept_back_uploads_to_tell(|repository| scope.covers(repository))
+    {
         for upload in uploads {
             println!("  {}", upload.describe());
         }
@@ -255,10 +273,15 @@ pub fn run(args: Args) -> CmdResult {
             super::front::earlier_note(count, "here", super::front::Reader::of_this_process())
         );
     }
-    print_upload_waits();
-    print_uploads_not_through();
-    print_automatic_upload_off();
-    print_held_branches();
+    let not_through = uploads_not_through(&scope);
+    let upload_off = automatic_upload_off(&scope);
+    print_upload_waits(&scope);
+    print_uploads_not_through(&not_through);
+    print_automatic_upload_off(&upload_off);
+    print_held_branches(&scope);
+    if args.all {
+        print_summary(&summary_rows(&links, &not_through, &upload_off, &cwd));
+    }
 
     // ── Local store ──
     ui::section("local");
@@ -269,7 +292,7 @@ pub fn run(args: Args) -> CmdResult {
         );
     }
 
-    let committed = links.iter().filter(|l| l.agent.is_some()).count();
+    let committed = scoped.iter().filter(|l| l.agent.is_some()).count();
 
     print!(
         "{}",
@@ -278,11 +301,11 @@ pub fn run(args: Args) -> CmdResult {
             (
                 "adopted sessions",
                 if inventory_complete {
-                    format!("{} ({committed} with a recorded repository)", links.len())
+                    format!("{} ({committed} with a recorded repository)", scoped.len())
                 } else {
                     format!(
                         "{} observed ({committed} with a recorded repository; incomplete inventory)",
-                        links.len()
+                        scoped.len()
                     )
                 }
             ),
@@ -290,7 +313,7 @@ pub fn run(args: Args) -> CmdResult {
     );
 
     // ── Adopted sessions ──
-    if !links.is_empty() {
+    if !scoped.is_empty() {
         println!(
             "{}",
             ui::table::render(
@@ -310,7 +333,7 @@ pub fn run(args: Args) -> CmdResult {
         );
         // A conversation nothing saves says so, with the command that saves it. Turning saving
         // on for its folder is the person's own choice, not one this line makes for them.
-        for (link, row) in links.iter().skip(args.offset).zip(&page.rows) {
+        for (link, row) in scoped.iter().skip(args.offset).zip(&page.rows) {
             if row[5] == sessions::NOT_SAVED {
                 ui::hint(&format!(
                     "{} isn't saved: nothing asked agit to save this folder's conversations. `agit import {}` saves it.",
@@ -320,7 +343,7 @@ pub fn run(args: Args) -> CmdResult {
             }
         }
         let leading = in_folder.saturating_sub(args.offset).min(page.rows.len());
-        if leading > 0 && in_folder < links.len() {
+        if leading > 0 && in_folder < scoped.len() {
             println!(
                 "{}",
                 ui::dim(&if leading == 1 {
@@ -331,7 +354,7 @@ pub fn run(args: Args) -> CmdResult {
             );
         }
         let next = args.offset.saturating_add(limit);
-        let remaining = links.len().saturating_sub(next);
+        let remaining = scoped.len().saturating_sub(next);
         if remaining > 0 {
             let page_size = args
                 .limit
@@ -340,14 +363,16 @@ pub fn run(args: Args) -> CmdResult {
             println!(
                 "{}",
                 ui::dim(&format!(
-                    "… {remaining} more; next page: `agit status --offset {next}{page_size}`"
+                    "… {remaining} more; next page: `agit status{} --offset {next}{page_size}`",
+                    scope_argument(&scope)
                 ))
             );
         }
-        print_publication_waits(&links);
+        print_publication_waits(scoped);
     }
-    // Also with no links yet: a conversation waiting for its first landing has none.
-    print_privacy_waits(&links);
+    // Also with no links yet: a conversation waiting for its first landing has none. It belongs
+    // to no one repository, so only a report on every repository shows it.
+    print_privacy_waits(scoped, scope == Scope::Machine);
 
     if !inventory_complete {
         ui::warning("status is incomplete: some local session claims cannot be inspected");
@@ -358,7 +383,7 @@ pub fn run(args: Args) -> CmdResult {
     // The test for "to publish" is git's ahead / behind, not whether some staging directory
     // exists — the local repo is the authoritative copy, and whether a push succeeded shows up
     // in the refs.
-    let agents = super::clone::list_local()?;
+    let agents = in_scope_of(super::clone::list_local()?, &scope);
     if !agents.is_empty() {
         ui::section("agent repos");
         let mut rows = Vec::new();
@@ -569,6 +594,148 @@ fn order(links: &mut Vec<link::Link>, cwd: &std::path::Path) -> usize {
     leading
 }
 
+/// [`order`], then the claims `scope` covers ahead of the rest, each part in that order. Returns
+/// how many of the current folder's claims lead and how many claims the scope covers: the
+/// folder's covered claims come first, so an index below the first count is in the folder.
+fn order_in(links: &mut Vec<link::Link>, cwd: &std::path::Path, scope: &Scope) -> (usize, usize) {
+    let in_folder = order(links, cwd);
+    let in_folder = links[..in_folder]
+        .iter()
+        .filter(|link| scope.covers_link(link))
+        .count();
+    (in_folder, scope::lead(links, scope))
+}
+
+/// The scope `--repo` names: every repository without it. A repository this computer has no
+/// checkout of is refused, as `agit branch --repo` refuses it, and the exit code is returned.
+fn resolve_scope(repo: Option<&str>) -> Result<Scope, ExitCode> {
+    let Some(repo) = repo else {
+        return Ok(Scope::Machine);
+    };
+    let slug = match super::parse_slug(&super::context::qualify(repo)) {
+        Ok((owner, name)) => format!("{owner}/{name}"),
+        Err(error) => {
+            ui::error(&format!("{error:#}"));
+            return Err(ExitCode::Usage);
+        }
+    };
+    let known = super::clone::list_local()
+        .unwrap_or_default()
+        .iter()
+        .any(|(owner, name, _)| format!("{owner}/{name}") == slug);
+    if !known {
+        ui::error(&format!("{slug} doesn’t exist locally."));
+        ui::hint(&format!("fetch it first: `agit clone {slug}`"));
+        return Err(ExitCode::Precondition);
+    }
+    Ok(Scope::Repository(slug))
+}
+
+/// The local checkouts `scope` covers.
+fn in_scope_of(
+    agents: Vec<(String, String, std::path::PathBuf)>,
+    scope: &Scope,
+) -> Vec<(String, String, std::path::PathBuf)> {
+    agents
+        .into_iter()
+        .filter(|(owner, name, _)| scope.covers(&format!("{owner}/{name}")))
+        .collect()
+}
+
+/// The `--repo` argument a printed status command repeats, with its leading space.
+fn scope_argument(scope: &Scope) -> String {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    match scope {
+        Scope::Machine => String::new(),
+        Scope::Repository(repository) => format!(" --repo {}", quote_arg(repository)),
+    }
+}
+
+/// The `--all` summary: one row per repository on this computer, with what needs attention in
+/// each, counted from the records the report itself reads.
+fn summary_rows(
+    links: &[link::Link],
+    not_through: &UploadsNotThrough,
+    upload_off: &[String],
+    cwd: &std::path::Path,
+) -> Vec<scope::Repository> {
+    let repositories: Vec<String> = super::clone::list_local()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(owner, name, _)| format!("{owner}/{name}"))
+        .collect();
+    let mut attention: Vec<String> = not_through
+        .items
+        .iter()
+        .map(|(target, _)| scope::repository_of_target(target).to_owned())
+        .collect();
+    attention.extend(
+        crate::domain::privacy::pending::upload::load()
+            .keys()
+            .map(|target| scope::repository_of_target(target).to_owned()),
+    );
+    attention.extend(upload_off.iter().cloned());
+    if let Some(store) = Store::open().ok().flatten() {
+        attention.extend(
+            crate::domain::link::launch::all_holds(&store)
+                .into_iter()
+                .map(|hold| hold.slug),
+        );
+    }
+    let waiting = crate::domain::privacy::pending::load();
+    let parked = crate::rc::supervisor::archive_recovery::publication_waits().unwrap_or_default();
+    for link in links {
+        let Some(repository) = scope::repository_of(link) else {
+            continue;
+        };
+        if waiting.contains_key(&link.session_id) {
+            attention.push(repository.clone());
+        }
+        if parked.contains_key(&(link.source.clone(), link.session_id.clone())) {
+            attention.push(repository);
+        }
+    }
+    let here = super::front::folder(cwd)
+        .ok()
+        .and_then(|folder| super::front::bound(&folder))
+        .or_else(|| crate::domain::workspace::read(cwd).map(|binding| binding.repo));
+    scope::summarize(&repositories, links, &attention, here.as_deref())
+}
+
+/// [`summary_rows`] as the text report shows them, after the first block.
+fn print_summary(rows: &[scope::Repository]) {
+    if rows.is_empty() {
+        return;
+    }
+    ui::section("repositories");
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.repository.clone(),
+                if row.here {
+                    "here".into()
+                } else {
+                    String::new()
+                },
+                row.conversations.to_string(),
+                row.attention.to_string(),
+            ]
+        })
+        .collect();
+    println!(
+        "{}",
+        ui::table::render(
+            &["repo", "folder", "conversations", "need attention"],
+            &rows
+        )
+    );
+    ui::hint("`agit status --repo <owner/repo>` shows one repository");
+}
+
 /// Whether a claim's recorded working directory is `folder` or below it, as written or once
 /// symlinks resolve: `folder` is canonical, and the runtime may record either form.
 fn ran_in(link: &link::Link, folder: &std::path::Path) -> bool {
@@ -665,7 +832,7 @@ fn runtime_session_json(sessions: &[super::context::RuntimeSession]) -> serde_js
     })
 }
 
-fn structured(args: &Args) -> CmdResult {
+fn structured(args: &Args, scope: &Scope) -> CmdResult {
     let cwd = std::env::current_dir()?;
     let earlier = worktree_left_out(&cwd);
     let ClaimInventory {
@@ -674,14 +841,15 @@ fn structured(args: &Args) -> CmdResult {
         issues: link_issues,
     } = claim_inventory(config::store_root()?);
 
-    let in_folder = order(&mut links, &cwd);
+    let (in_folder, in_scope) = order_in(&mut links, &cwd, scope);
     let limit = args.limit.unwrap_or(100) as usize;
+    let take = limit.min(in_scope.saturating_sub(args.offset));
     let page = observe_page(
         store.as_ref(),
         &links,
         link_issues.is_empty(),
         args.offset,
-        limit,
+        take,
     );
     let inventory_complete = page.inventory_complete;
     let selection = match super::context::from_env_with_claims(&links, inventory_complete) {
@@ -697,7 +865,7 @@ fn structured(args: &Args) -> CmdResult {
         .iter()
         .enumerate()
         .skip(args.offset)
-        .take(limit)
+        .take(take)
         .zip(page.rows)
         .map(|((index, link), detail)| {
             let target = match (&link.owner, &link.agent, &link.branch) {
@@ -732,7 +900,7 @@ fn structured(args: &Args) -> CmdResult {
         })
         .collect();
     let next = args.offset.saturating_add(items.len());
-    let agents = super::clone::list_local()?;
+    let agents = in_scope_of(super::clone::list_local()?, scope);
     let mut repositories = Vec::new();
     let mut remaining = BRANCH_ROWS;
     let mut repositories_omitted = 0;
@@ -779,6 +947,11 @@ fn structured(args: &Args) -> CmdResult {
     } else {
         None
     };
+    let not_through = uploads_not_through(scope);
+    let upload_off = automatic_upload_off(scope);
+    let summary = args
+        .all
+        .then(|| summary_rows(&links, &not_through, &upload_off, &cwd));
     let code_repo = config::repo_root();
     let adopted_here = code_repo
         .as_ref()
@@ -799,12 +972,19 @@ fn structured(args: &Args) -> CmdResult {
             "count": count,
             "ask_user": super::front::earlier_note(count, "here", super::front::Reader::Agent),
         })),
-        "upload_waits": upload_waits_json(),
-        "uploads_not_through": uploads_not_through_json(),
-        "automatic_upload_off": automatic_upload_off(),
+        "upload_waits": upload_waits_json(scope),
+        "uploads_not_through": not_through_json(&not_through),
+        "automatic_upload_off": upload_off,
         "store_path": store.as_ref().map(|store| store.root()),
-        "sessions": {"items": items, "total": links.len(), "offset": args.offset,
-            "limit": limit, "next_offset": (next < links.len()).then_some(next),
+        "scope": match scope {
+            Scope::Machine => serde_json::json!({"kind": "machine", "repository": null}),
+            Scope::Repository(repository) => {
+                serde_json::json!({"kind": "repository", "repository": repository})
+            }
+        },
+        "repository_summary": summary,
+        "sessions": {"items": items, "total": in_scope, "offset": args.offset,
+            "limit": limit, "next_offset": (next < in_scope).then_some(next),
              "incomplete": !inventory_complete},
         "repositories": repositories, "repositories_omitted": repositories_omitted,
         "shared_files": shared_files, "merge_transactions": merge_transactions,
@@ -860,10 +1040,10 @@ fn observe_page(
 }
 
 /// The repositories status and the overview read in the current folder: the one the folder is
-/// bound to, and those of the conversations recorded as run in it. A record of conversations that
-/// can't be read in full reads as every repository, so a repository whose state is unknown is
-/// never left out of what this folder needs.
-pub fn reads_here() -> super::migration::Reads {
+/// bound to, those of the conversations recorded as run in it, and the one `--repo` names. A
+/// record of conversations that can't be read in full reads as every repository, so a repository
+/// whose state is unknown is never left out of what this folder needs.
+pub fn reads_here(named: Option<&str>) -> super::migration::Reads {
     use super::migration::Reads;
     let Ok(cwd) = std::env::current_dir() else {
         return Reads::Every;
@@ -883,6 +1063,11 @@ pub fn reads_here() -> super::migration::Reads {
         .collect();
     read.extend(folder.as_deref().and_then(super::front::bound));
     read.extend(crate::domain::workspace::read(&cwd).map(|binding| binding.repo));
+    read.extend(
+        named
+            .and_then(|repo| super::parse_slug(&super::context::qualify(repo)).ok())
+            .map(|(owner, name)| format!("{owner}/{name}")),
+    );
     Reads::Only(read)
 }
 
@@ -1035,8 +1220,9 @@ fn print_publication_waits(links: &[crate::domain::link::Link]) {
 
 /// Sessions whose settlement waits for the privacy check. A hook settles quietly, so this is
 /// where such a wait becomes visible. A wait that does not end by itself names the step that ends
-/// it, once for every wait it ends.
-fn print_privacy_waits(links: &[crate::domain::link::Link]) {
+/// it, once for every wait it ends. `with_unsaved` also shows the waits of conversations no claim
+/// names yet; `links` must then be every claim, or another repository's would show as one.
+fn print_privacy_waits(links: &[crate::domain::link::Link], with_unsaved: bool) {
     let waiting = crate::domain::privacy::pending::load();
     let mut steps = Vec::new();
     for link in links {
@@ -1095,7 +1281,7 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
     // A conversation the daemon observes has no link until its first landing, and a landing
     // that waited for the privacy check left none: its wait shows here, so it never stalls
     // unseen.
-    for (session, entry) in &waiting {
+    for (session, entry) in waiting.iter().filter(|_| with_unsaved) {
         if links.iter().any(|link| &link.session_id == session) {
             continue;
         }
@@ -1125,11 +1311,14 @@ fn print_privacy_waits(links: &[crate::domain::link::Link]) {
 
 /// Branches that stay on this computer because a Codex link that may be another conversation's
 /// names them.
-fn print_held_branches() {
+fn print_held_branches(scope: &Scope) {
     let Some(store) = crate::domain::store::Store::open().ok().flatten() else {
         return;
     };
-    for hold in crate::domain::link::launch::all_holds(&store) {
+    for hold in crate::domain::link::launch::all_holds(&store)
+        .into_iter()
+        .filter(|hold| scope.covers(&hold.slug))
+    {
         ui::info(format_args!(
             "{}",
             crate::domain::link::launch::explain(&hold)
@@ -1148,9 +1337,12 @@ fn print_held_branches() {
 
 /// Uploads the privacy check holds back, for every target on this computer: an automatic upload
 /// has nobody watching it, and its wait is not tied to the folder status runs in.
-fn print_upload_waits() {
+fn print_upload_waits(scope: &Scope) {
     let mut steps = Vec::new();
-    for (target, entry) in crate::domain::privacy::pending::upload::load() {
+    for (target, entry) in crate::domain::privacy::pending::upload::load()
+        .into_iter()
+        .filter(|(target, _)| scope.covers_target(target))
+    {
         let since = std::time::UNIX_EPOCH + std::time::Duration::from_secs(entry.since);
         let ends = crate::domain::privacy::pending::steps(&entry.reason);
         ui::warning(&format!(
@@ -1185,7 +1377,7 @@ struct UploadsNotThrough {
     unreadable: Vec<(String, String)>,
 }
 
-fn uploads_not_through() -> UploadsNotThrough {
+fn uploads_not_through(scope: &Scope) -> UploadsNotThrough {
     let mut found = UploadsNotThrough::default();
     let checkouts = match super::clone::list_local() {
         Ok(checkouts) => checkouts,
@@ -1196,7 +1388,10 @@ fn uploads_not_through() -> UploadsNotThrough {
             return found;
         }
     };
-    for (owner, name, path) in checkouts {
+    for (owner, name, path) in checkouts
+        .into_iter()
+        .filter(|(owner, name, _)| scope.covers(&format!("{owner}/{name}")))
+    {
         let repository = format!("{owner}/{name}");
         let branches = || -> crate::Result<Vec<String>> {
             Ok(Repo::at(&path)
@@ -1238,10 +1433,11 @@ fn inspect_command(target: &str) -> String {
 /// Repositories a folder here would upload to by itself, while the repository's own setting keeps
 /// automatic upload off. The setting wins, and this says so: the folder's setting alone would read
 /// as though its turns were on their way.
-fn automatic_upload_off() -> Vec<String> {
+fn automatic_upload_off(scope: &Scope) -> Vec<String> {
     super::clone::list_local()
         .unwrap_or_default()
         .into_iter()
+        .filter(|(owner, name, _)| scope.covers(&format!("{owner}/{name}")))
         .filter_map(|(owner, name, path)| {
             let repository = format!("{owner}/{name}");
             let repo = Repo::open(&path)?;
@@ -1252,8 +1448,8 @@ fn automatic_upload_off() -> Vec<String> {
         .collect()
 }
 
-fn print_automatic_upload_off() {
-    for repository in automatic_upload_off() {
+fn print_automatic_upload_off(upload_off: &[String]) {
+    for repository in upload_off {
         println!(
             "  {repository}: automatic upload is off: turns are saved here; `agit push {repository}` publishes them"
         );
@@ -1268,9 +1464,8 @@ fn said_at(target: &str) -> Option<String> {
     super::upload_outcome::said(repository, branch)
 }
 
-/// [`uploads_not_through`] as `agit status` shows it.
-fn print_uploads_not_through() {
-    let found = uploads_not_through();
+/// The uploads [`uploads_not_through`] found, as `agit status` shows them.
+fn print_uploads_not_through(found: &UploadsNotThrough) {
     if found.items.is_empty() && found.unreadable.is_empty() {
         return;
     }
@@ -1296,7 +1491,11 @@ fn print_uploads_not_through() {
 /// [`print_uploads_not_through`] for `status --json`, and for `project list --json`, which the menu
 /// bar reads on every poll: both answer from the same records, in the same shape.
 pub(crate) fn uploads_not_through_json() -> serde_json::Value {
-    let found = uploads_not_through();
+    not_through_json(&uploads_not_through(&Scope::Machine))
+}
+
+/// [`uploads_not_through_json`] for uploads already read.
+fn not_through_json(found: &UploadsNotThrough) -> serde_json::Value {
     let reader = super::project::Reader::of_this_process();
     serde_json::json!({
         "items": found.items.iter().map(|(target, undone)| {
@@ -1318,9 +1517,10 @@ pub(crate) fn uploads_not_through_json() -> serde_json::Value {
 }
 
 /// [`print_upload_waits`] for `status --json`.
-fn upload_waits_json() -> Vec<serde_json::Value> {
+fn upload_waits_json(scope: &Scope) -> Vec<serde_json::Value> {
     crate::domain::privacy::pending::upload::load()
         .into_iter()
+        .filter(|(target, _)| scope.covers_target(target))
         .map(|(target, entry)| {
             serde_json::json!({
                 "target": target,
@@ -1374,6 +1574,8 @@ mod tests {
         assert!(
             !super::Args {
                 check_missing: false,
+                repo: None,
+                all: false,
                 limit: None,
                 offset: 0,
             }
