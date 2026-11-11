@@ -1689,7 +1689,6 @@ impl ProjectedHistory {
             &repo,
             &candidates,
             ledger.withheld(),
-            redactor,
             &mut references,
             &mut left_out_tags,
         )?;
@@ -1702,7 +1701,6 @@ impl ProjectedHistory {
             branches,
             &selected.remote,
             &held,
-            redactor,
             &mut references,
             &mut on_hub,
             &mut left_out_tags,
@@ -1726,7 +1724,6 @@ impl ProjectedHistory {
             &candidates,
             &selected.remote,
             &handled,
-            redactor,
             &mut references,
             &mut carried,
             &mut on_hub,
@@ -2912,7 +2909,6 @@ fn retain_tags(
     destination: &Repo,
     candidates: &BTreeMap<String, accepted::Candidate>,
     withheld: &BTreeSet<String>,
-    redactor: &Redactor,
     references: &mut BTreeMap<String, String>,
     left_out: &mut Vec<LeftOutTag>,
 ) -> Result<BTreeSet<String>> {
@@ -2951,7 +2947,7 @@ fn retain_tags(
             .iter()
             .map(|entry| entry.public.as_str())
             .collect::<BTreeSet<_>>();
-        match session_tag_target(tag.name(), tag.oid(), &commit, &publics, redactor)? {
+        match session_tag_target(tag.oid(), &commit, &publics) {
             Ok(public) => {
                 insert_tag(references, tag.name(), &public)?;
                 moved.insert(tag.name().to_owned());
@@ -3024,7 +3020,6 @@ fn carry_tags(
     branches: &[String],
     remote: &RemoteRefs,
     held: &BTreeSet<String>,
-    redactor: &Redactor,
     references: &mut BTreeMap<String, String>,
     on_hub: &mut BTreeMap<String, String>,
     left_out: &mut Vec<LeftOutTag>,
@@ -3067,7 +3062,7 @@ fn carry_tags(
                 .iter()
                 .map(|(_, entry)| entry.public.as_str())
                 .collect::<BTreeSet<_>>();
-            match session_tag_target(tag.name(), tag.oid(), &commit, &publics, redactor)? {
+            match session_tag_target(tag.oid(), &commit, &publics) {
                 Ok(public) if remote.refs.get(tag.name()) == Some(&public) => {
                     on_hub.insert(tag.name().to_owned(), public);
                 }
@@ -3130,8 +3125,6 @@ impl LeftOutTag {
 pub(crate) enum TagLeftOut {
     /// An annotated tag object names the local commit and carries a message nothing protects.
     Annotated,
-    /// Its name holds text the privacy check would change.
-    Name,
     /// Its turn was published as more than one public commit.
     Ambiguous,
     /// Its turn is not part of this upload and not on the Hub.
@@ -3145,9 +3138,6 @@ impl TagLeftOut {
         match self {
             Self::Annotated => {
                 "it has a message; a tag on a session turn is published only without one (`agit tag NAME TARGET`)"
-            }
-            Self::Name => {
-                "its name holds text the privacy check would change; tag the turn again under a plain name"
             }
             Self::Ambiguous => {
                 "its turn was published more than once; tag the published commit you mean"
@@ -3163,25 +3153,20 @@ impl TagLeftOut {
 }
 
 /// The public commit a tag on a session turn is published on: the one commit `publics` names,
-/// when the tag is lightweight and its name is published as it is.
+/// when the tag is lightweight. Its name is published as it is.
 fn session_tag_target(
-    name: &str,
     oid: &str,
     commit: &str,
     publics: &BTreeSet<&str>,
-    redactor: &Redactor,
-) -> Result<std::result::Result<String, TagLeftOut>> {
+) -> std::result::Result<String, TagLeftOut> {
     let mut each = publics.iter();
     let (Some(public), None) = (each.next(), each.next()) else {
-        return Ok(Err(TagLeftOut::Ambiguous));
+        return Err(TagLeftOut::Ambiguous);
     };
     if oid != commit {
-        return Ok(Err(TagLeftOut::Annotated));
+        return Err(TagLeftOut::Annotated);
     }
-    if !redactor.publishes_unchanged(name.strip_prefix("refs/tags/").unwrap_or(name))? {
-        return Ok(Err(TagLeftOut::Name));
-    }
-    Ok(Ok((*public).to_owned()))
+    Ok((*public).to_owned())
 }
 
 /// The tags this publication sends on another commit than the one the same local tag names: a
@@ -3238,7 +3223,6 @@ fn place_unreached_tags(
     candidates: &BTreeMap<String, accepted::Candidate>,
     remote: &RemoteRefs,
     handled: &BTreeSet<String>,
-    redactor: &Redactor,
     references: &mut BTreeMap<String, String>,
     carried: &mut BTreeSet<String>,
     on_hub: &mut BTreeMap<String, String>,
@@ -3292,7 +3276,7 @@ fn place_unreached_tags(
             left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent));
             continue;
         }
-        match session_tag_target(name, oid, &commit, &publics, redactor)? {
+        match session_tag_target(oid, &commit, &publics) {
             Ok(public) if remote.refs.get(name) == Some(&public) => {
                 on_hub.insert(name.to_owned(), public);
             }
@@ -4248,7 +4232,6 @@ mod tests {
                 &["main".into()],
                 &remote,
                 &held,
-                &Redactor::new(Default::default()),
                 &mut references,
                 &mut BTreeMap::new(),
                 &mut left_out,

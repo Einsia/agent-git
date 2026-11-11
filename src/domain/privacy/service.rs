@@ -322,18 +322,6 @@ fn lock_within(wait: Duration) -> Option<std::sync::MutexGuard<'static, State>> 
     }
 }
 
-/// Wait until a worker that failed may be started again, at most one back-off.
-pub(crate) fn wait_for_retry() {
-    let until = shared().lock().ok().and_then(|state| state.failed_until);
-    if let Some(until) = until {
-        std::thread::sleep(
-            until
-                .saturating_duration_since(Instant::now())
-                .min(RETRY_DELAY),
-        );
-    }
-}
-
 fn shared() -> &'static Mutex<State> {
     static STATE: Mutex<State> = Mutex::new(State {
         process: None,
