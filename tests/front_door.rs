@@ -1693,3 +1693,47 @@ fn an_explicit_save_brings_an_old_policy_forward_so_later_opencode_conversations
     let named = save(&["--json", "save", "Write the notes"]);
     assert_eq!(taken(&named), ["ses_before_two"], "{named}");
 }
+
+/// `agit on` in a folder inside one the person turned off takes that inner folder (here its own Git
+/// checkout), not the enclosing one: the refusal for a public destination, which stops before
+/// anything changes, names the inner folder, and the enclosing folder stays off. An `on` that took
+/// the enclosing folder, as the inner folder belongs to it while it has a record, would turn back
+/// on a folder the person had stopped and upload every new conversation in it.
+#[test]
+fn on_inside_a_folder_that_is_off_takes_only_the_inner_folder() {
+    let lab = Lab::new();
+    let parent = lab.folder("einsia", false);
+    lab.turn_on(&parent, "me/app");
+    let off = lab.agit(&parent, &["off"]);
+    assert!(off.status.success(), "{off:?}");
+    let child = parent.join("quant-work");
+    std::fs::create_dir_all(&child).unwrap();
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&child)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", &lab.home)
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "{init:?}");
+    let child = child.canonicalize().unwrap();
+    let state = |at: &std::path::Path| {
+        let out = lab.agit(at, &["--json"]);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"]["state"].clone()
+    };
+
+    let on = lab.agit(&child, &["on"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&on.stdout),
+        String::from_utf8_lossy(&on.stderr)
+    );
+    assert_eq!(on.status.code(), Some(4), "{said}");
+    assert!(
+        said.contains("~/code/einsia/quant-work is set up to save to me/app, which is public"),
+        "{said}"
+    );
+    assert_eq!(state(&parent), "off", "{said}");
+    assert!(lab.created().is_empty(), "{said}");
+}
