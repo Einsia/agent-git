@@ -30,6 +30,8 @@ including ACLs, process trees, JSON capture, filesystem paths, and CLI launches.
 Do not add platform-independent business or presentation matrices to this list.
 Use `-Suite unit` or `-Suite integration` for focused local runs.
 Linux validation runs shared unit tests, every integration test, and product Clippy.
+The Windows target's Clippy also runs on Linux, in `rust:clippy:windows`
+(`scripts/preturn-clippy-windows.sh`), and `rust:test:windows` starts only after it passes.
 See [CI validation scope](ci-validation.md) for the Linux suite. Native Windows tests compile the
 Windows code directly; CI does not also download an SDK to cross-compile it.
 
