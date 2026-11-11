@@ -1329,6 +1329,9 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
     if !snapshot.is_session_line() || snapshot.session.is_empty() {
         anyhow::bail!("claimed branch is not a recorded session line");
     }
+    if let Some(note) = saved_part_unchanged(lk, &head) {
+        return Ok((note, None));
+    }
     let live = lk.read_bytes().context("live transcript cannot be read")?;
     if lk.baseline_bytes.is_some() || lk.baseline_hash.is_some() || lk.materialized_from.is_some() {
         let lineage = match lk.materialized_from.as_deref() {
@@ -1355,6 +1358,42 @@ fn compare_claim(lk: &link::Link) -> crate::Result<(ContinuityNote, Option<Strin
         "secret mappings needed for comparison are unavailable"
     );
     Ok((check_continuity(&committed.content, &live.content)?, None))
+}
+
+/// The transcript still starts with what the last save at `head` recorded, shown without reading
+/// it whole: the save kept the transcript's length and digest, so that prefix streams through the
+/// digest and only what follows it is read and parsed, within a bound. `None` when this can't show
+/// it (nothing recorded for this tip, a transcript that isn't one plain file, a prefix that differs,
+/// or more after it than the bound); the full comparison then decides, and says what differs.
+fn saved_part_unchanged(lk: &link::Link, head: &str) -> Option<ContinuityNote> {
+    use crate::adapter::native_snapshot::{self as native, After};
+    if lk.native_binding.is_some() {
+        return None;
+    }
+    let (end, sha256) = if lk.materialized_from.as_deref() == Some(head) {
+        (lk.baseline_bytes?, lk.baseline_hash.as_deref()?)
+    } else {
+        let checkpoint = lk
+            .native_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.tip == head)?;
+        (checkpoint.bytes, checkpoint.sha256.as_str())
+    };
+    let limits = native::Limits {
+        bytes: 8 * 1024 * 1024,
+        working_bytes: 8 * 1024 * 1024,
+        records: 16_384,
+        lookup_entries: 4_096,
+    };
+    let After::Bytes { tail, .. } =
+        native::read_file_after(&lk.resolve()?, end, sha256, limits, || false).ok()?
+    else {
+        return None;
+    };
+    let records = raw_hashes(std::str::from_utf8(&tail).ok()?).ok()?;
+    Some(ContinuityNote::Clean {
+        appended: records.len(),
+    })
 }
 
 fn committed_content(log: &str) -> crate::Result<String> {
@@ -1395,7 +1434,7 @@ fn check_materialized(lk: &link::Link, live: &[u8]) -> crate::Result<ContinuityN
 fn print_live_comparisons(links: &[link::Link]) {
     ui::section("live transcript comparison");
     let mut checked = 0;
-    let mut appended = 0;
+    let mut matched = 0;
     let mut truncated = 0;
     let mut rewritten = 0;
     let mut unavailable = 0;
@@ -1420,12 +1459,14 @@ fn print_live_comparisons(links: &[link::Link]) {
             Ok((note, lineage)) => {
                 checked += 1;
                 let (status, detail) = match note {
-                    ContinuityNote::Clean { appended: 0 } => {
-                        ("clean", "recorded content is unchanged")
-                    }
+                    // Unchanged recorded content needs nothing, whatever follows it (turns not
+                    // saved yet are status's to count), so it has no line unless its lineage does.
                     ContinuityNote::Clean { .. } => {
-                        appended += 1;
-                        ("appended", "new content follows the recorded content")
+                        matched += 1;
+                        if lineage.is_none() {
+                            continue;
+                        }
+                        ("clean", "recorded content is unchanged")
                     }
                     ContinuityNote::Truncated => {
                         truncated += 1;
@@ -1464,8 +1505,23 @@ fn print_live_comparisons(links: &[link::Link]) {
     if checked == 0 && unavailable == 0 {
         println!("  {}", ui::dim("no active claimed transcripts to compare"));
     } else {
+        let mut found = vec![format!(
+            "{matched} {} what was saved",
+            if matched == 1 { "matches" } else { "match" }
+        )];
+        for (count, state) in [(truncated, "truncated"), (rewritten, "rewritten")] {
+            if count > 0 {
+                found.push(format!("{count} {state}"));
+            }
+        }
+        let unavailable = if unavailable > 0 {
+            format!("; {unavailable} unavailable")
+        } else {
+            String::new()
+        };
         println!(
-            "  checked {checked} live transcripts: {appended} appended, {truncated} truncated, {rewritten} rewritten; {unavailable} unavailable"
+            "  checked {checked} live transcripts: {}{unavailable}",
+            found.join(", ")
         );
     }
     if truncated > 0 || rewritten > 0 {
