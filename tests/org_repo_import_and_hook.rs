@@ -4140,7 +4140,7 @@ fn a_conversation_starting_with_automatic_upload_off_is_told_it_stays_on_this_co
     let said = String::from_utf8_lossy(&started.stdout);
     assert!(
         said.contains(
-            "agit: this conversation is saved on this computer for einsia/qa at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push einsia/qa` publishes it (visibility not confirmed)."
+            "agit: this conversation is saved on this computer for einsia/qa at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push einsia/qa` publishes it."
         ),
         "{started:?}"
     );

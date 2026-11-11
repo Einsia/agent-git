@@ -9498,6 +9498,17 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     let kept = run_in(&laptop, &["push", "alice/app@work", "--keep-both"]);
     assert_success(&kept);
     let said = String::from_utf8_lossy(&kept.stdout);
+    // With nothing asked, the branch it creates is named before anything is published.
+    let named = said
+        .find("keeping both: this checkout's line goes up as alice/app@work-local (")
+        .expect("the kept branch is named first");
+    assert!(
+        said[named..].contains("), and work stays as the Hub has it")
+            && said
+                .find("published this checkout's line")
+                .is_some_and(|done| named < done),
+        "{kept:?}"
+    );
     assert!(
         said.contains("published this checkout's line as alice/app@work-local (")
             && said.contains(

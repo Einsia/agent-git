@@ -159,8 +159,8 @@ fn keep_both(
     let repository = &diverged.repository;
     let kept = format!("{repository}@{}", diverged.keep_both);
     let client = crate::hub::Client::from_env_with_timeout(std::time::Duration::from_secs(20));
-    let readers =
-        readers_of(&client, repository).unwrap_or_else(|| "visibility not confirmed".to_owned());
+    let readers = readers_of(&client, repository)
+        .unwrap_or_else(|| super::project::visibility_pointer(repository));
     if !args.keep_both {
         super::fix::register_terminal_error(refusal);
         ui::error(&super::terminal_error_message(refusal));
@@ -194,6 +194,14 @@ fn keep_both(
     .is_none()
     {
         return Ok(ExitCode::Precondition);
+    }
+    // With --keep-both nothing asked, so the branch it creates is named before the push's own
+    // confirmation asks to publish it.
+    if args.keep_both {
+        ui::info(format_args!(
+            "keeping both: this checkout's line goes up as {kept} ({readers}), and {} stays as the Hub has it",
+            diverged.branch
+        ));
     }
     let pushed = publish(Args {
         agent: Some(kept.clone()),

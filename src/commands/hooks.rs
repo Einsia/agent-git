@@ -1091,14 +1091,22 @@ fn announces_upload(runtime: &str, source: Source) -> bool {
 /// is not the folder it started in, and how to stop the upload. The agent was told nothing, so
 /// stopping is a command the person runs or asks their agent to run.
 fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
-    let audience = super::project::readers(
+    let readers = super::project::readers(
         &upload.repository,
         upload.visibility.as_deref(),
         upload.org,
         upload.members_read,
-    )
-    .unwrap_or_else(|| "visibility not confirmed".to_owned());
+    );
     let repository = &upload.repository;
+    // Where turns upload by themselves, the line says who reads them, or how to find out. Where
+    // `agit push` publishes them, that push names the visibility before anything goes up, so the
+    // line says nothing when the Hub didn't.
+    let audience = readers
+        .clone()
+        .unwrap_or_else(|| super::project::visibility_pointer(repository));
+    let push_audience = readers
+        .map(|readers| format!(" ({readers})"))
+        .unwrap_or_default();
     let because = match &upload.worktree {
         Some((worktree, main)) => format!(
             ", because {} is a git worktree of {}",
@@ -1137,19 +1145,19 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
             "agit: this conversation is uploaded to {repository} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
         (SignIn::Current, true) => format!(
-            "agit: this conversation is saved on this computer for {repository} at the end of each turn{because}. Automatic upload is off for it here, so nothing goes up by itself: `agit push {repository}` publishes it ({audience}). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is saved on this computer for {repository} at the end of each turn{because}. Automatic upload is off for it here, so nothing goes up by itself: `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
         (SignIn::Expired, false) => format!(
             "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to {repository} ({audience}) as before{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
         (SignIn::Expired, true) => format!(
-            "agit: signed out. This conversation is still saved on this computer for {repository}{because}. Automatic upload is off for it here: after `agit login`, `agit push {repository}` publishes it ({audience}). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: signed out. This conversation is still saved on this computer for {repository}{because}. Automatic upload is off for it here: after `agit login`, `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
         (SignIn::Absent, false) => format!(
             "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to {repository} ({audience}){because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
         (SignIn::Absent, true) => format!(
-            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included{because}. Automatic upload is off for it here, so `agit push {repository}` then publishes it ({audience}). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included{because}. Automatic upload is off for it here, so `agit push {repository}` then publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
         ),
     }
 }
@@ -2256,7 +2264,9 @@ mod tests {
                 .contains("(private to acme: the people with access to acme/widget can read it)")
         );
         assert!(notice(Some("public"), Some(true)).contains("(public: anyone can read it)"));
-        assert!(notice(None, None).contains("(visibility not confirmed)"));
+        // Without the Hub's answer, a line about turns that upload by themselves says how to find
+        // out who reads them.
+        assert!(notice(None, None).contains("(`agit repo info acme/widget` shows its visibility)"));
         // A conversation in a git worktree that an on folder covers is told which folder's
         // setting uploads it.
         let through = super::upload_notice(&crate::commands::project::AutomaticUpload {
@@ -2359,7 +2369,7 @@ mod tests {
         let off = |sign_in, worktree| off_reading(None, sign_in, worktree);
         assert_eq!(
             off(SignIn::Current, None),
-            "agit: this conversation is saved on this computer for acme/widget at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push acme/widget` publishes it (visibility not confirmed). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is saved on this computer for acme/widget at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push acme/widget` publishes it. Not this one? Run `agit project drop` (or ask your agent to run it)."
         );
         assert_eq!(
             off_reading(Some("public"), SignIn::Expired, None),
@@ -2367,7 +2377,7 @@ mod tests {
         );
         assert_eq!(
             off(SignIn::Absent, None),
-            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included. Automatic upload is off for it here, so `agit push acme/widget` then publishes it (visibility not confirmed). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included. Automatic upload is off for it here, so `agit push acme/widget` then publishes it. Not this one? Run `agit project drop` (or ask your agent to run it)."
         );
         for sign_in in [SignIn::Current, SignIn::Expired, SignIn::Absent] {
             let line = off(sign_in, Some(("/w/widget-tree", "/w/widget")));

@@ -155,7 +155,8 @@ fn started_here_lines(slug: &str, carried: &[String]) -> Vec<String> {
             "{started}; it added nothing of its own, so main continues from the Hub's"
         )];
     }
-    let readers = readers_of(slug).unwrap_or_else(|| "visibility not confirmed".to_owned());
+    let readers =
+        readers_of(slug).unwrap_or_else(|| crate::commands::project::visibility_pointer(slug));
     let mut lines = vec![format!(
         "{started}; these files you added at its start are merged in ({readers}):"
     )];
