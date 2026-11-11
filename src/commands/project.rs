@@ -5411,6 +5411,23 @@ pub(crate) enum Saving {
     Uploads,
 }
 
+/// How `folder`, a directory a conversation runs in or a folder's root, treats an OpenCode
+/// conversation when it uploads by itself: OpenCode tells agit nothing when a turn ends, so one of
+/// its conversations goes up when its agent runs `agit commit` or the person runs `agit save`,
+/// never at the end of each turn. `None` unless OpenCode is installed here and [`saving`] says
+/// [`Saving::Uploads`]: in a folder that is off, only bound, never set up, or on with its uploads
+/// held, an agent's `agit commit` uploads nothing, so the sentence would promise uploads that
+/// never happen. Every surface asks this one function, so none of them says it where another
+/// stays silent.
+pub(crate) fn opencode_not_captured(folder: &Path) -> Option<&'static str> {
+    (crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available())
+        && saving(folder) == Saving::Uploads)
+        .then_some(OPENCODE_NOT_CAPTURED)
+}
+
+/// The sentence every surface uses for [`opencode_not_captured`].
+pub(crate) const OPENCODE_NOT_CAPTURED: &str = "OpenCode doesn't tell agit when a turn ends, so its conversations here go up when its agent runs `agit commit` or you run `agit save`, not at the end of each turn";
+
 /// [`Saving`] for `folder`, a directory a conversation runs in or a folder's root.
 /// Whether `agit on` in a folder that is on switches `repository`'s automatic upload back on from
 /// being off on this computer. It writes the destination checkout's own setting and drops the off

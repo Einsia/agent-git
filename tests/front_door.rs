@@ -980,12 +980,16 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
 /// this computer saves turns here and uploads nothing, so its start says the conversation stays on
 /// this computer, the overview names the hold, and `agit on --yes` switches the repository back
 /// on, the off recorded for it before its checkout existed included, after which the start says
-/// it is uploaded; without a terminal or `--yes`, `agit on` names the hold and promises no upload. A folder set up for a repository without saving
-/// by itself says at a conversation's start, once per folder, that it isn't being saved there. A
-/// folder turned off says nothing at a conversation's start. A surface that read only the folder's
-/// own switch would promise uploads that never happen; an `agit on` that moved only the checkout's
-/// setting would leave the recorded off in force while saying it is back on; one that repeated
-/// itself at every start, or spoke in a folder the person turned off, would be noise.
+/// it is uploaded; without a terminal or `--yes`, `agit on` names the hold and promises no upload.
+/// A folder set up for a repository without saving by itself says at a conversation's start, once
+/// per folder, that it isn't being saved there. A folder turned off says nothing at a
+/// conversation's start. A folder that uploads by itself says, once OpenCode is installed, that
+/// OpenCode's conversations go up only when its agent commits or the person saves, not at each
+/// turn's end; the overview, `agit status`, `agit doctor` and `agit on` say it only there, never
+/// in a folder that is held, only set up for a repository, or off. A surface that read only the
+/// folder's own switch would promise uploads that never happen; an `agit on` that moved only the
+/// checkout's setting would leave the recorded off in force while saying it is back on; one that
+/// repeated itself at every start, or spoke in a folder the person turned off, would be noise.
 #[test]
 fn every_surface_says_what_a_folder_does_with_its_conversations() {
     let lab = Lab::new();
@@ -1000,6 +1004,30 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
             .as_str()
             .unwrap_or_default()
             .to_owned()
+    };
+    let opencode = |installed: bool| {
+        for (file, script) in [
+            ("opencode", "#!/bin/sh\nexit 0\n"),
+            ("opencode.cmd", "@exit /b 0\r\n"),
+        ] {
+            if installed {
+                std::fs::write(lab.bin.join(file), script).unwrap();
+            } else {
+                std::fs::remove_file(lab.bin.join(file)).unwrap();
+            }
+        }
+    };
+    // Whether the overview, `agit status` and `agit doctor` in `at` say that OpenCode's
+    // conversations don't go up at each turn's end.
+    let says_opencode = |at: &std::path::Path| {
+        let tail = "not at the end of each turn";
+        [
+            value(at, &["--json"])["opencode_not_captured"]
+                .as_str()
+                .is_some_and(|said| said.contains(tail)),
+            String::from_utf8_lossy(&lab.agit(at, &["status"]).stdout).contains(tail),
+            String::from_utf8_lossy(&lab.agit(at, &["doctor"]).stdout).contains(tail),
+        ]
     };
 
     // On, with the repository's automatic upload off on this computer.
@@ -1037,6 +1065,9 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
     );
     let overview = value(&dir, &["--json"]);
     assert_eq!(overview["held"]["code"], "push_auto_off", "{overview}");
+    // A held folder uploads nothing when OpenCode's agent commits, so nothing says it does.
+    opencode(true);
+    assert_eq!(says_opencode(&dir), [false; 3]);
     // Without a terminal or --yes, `agit on` names the hold and promises no upload.
     let unattended = lab.agit(&dir, &["on"]);
     let said = format!(
@@ -1046,15 +1077,38 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
     );
     assert!(
         said.contains("automatic upload to me/solo is off on this computer")
-            && !said.contains("sessions here upload to"),
+            && !said.contains("sessions here upload to")
+            && !said.contains("not at the end of each turn"),
         "{said}"
     );
     let on = value(&dir, &["--json", "--yes", "on"]);
     assert_eq!(on["resumed"], "push_auto_off", "{on}");
+    assert!(
+        on["runtimes"].as_array().is_some_and(|runtimes| runtimes
+            .iter()
+            .any(|runtime| runtime["runtime"] == "opencode" && runtime["state"] == "not_captured")),
+        "{on}"
+    );
     assert_eq!(on["held"], serde_json::Value::Null, "{on}");
     assert_eq!(value(&dir, &["--json"])["held"], serde_json::Value::Null);
     let said = said_at_start(&dir, "21212121-2121-4212-8212-212121212121");
     assert!(said.contains("is uploaded to me/solo "), "{said}");
+    // An installed OpenCode tells agit nothing when a turn ends, so a folder that uploads by
+    // itself says that OpenCode's conversations aren't, where the person looks at the folder.
+    let overview = value(&dir, &["--json"]);
+    let said = overview["opencode_not_captured"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        said.contains("its agent runs `agit commit`")
+            && said.contains("`agit save`")
+            && said.contains("not at the end of each turn"),
+        "{overview}"
+    );
+    assert_eq!(says_opencode(&dir), [true; 3]);
+    opencode(false);
+    assert_eq!(says_opencode(&dir), [false; 3]);
+    opencode(true);
 
     // Set up for a repository, without saving by itself: told once.
     let bound = lab.folder("bound", false);
@@ -1074,10 +1128,12 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
     );
     let again = said_at_start(&bound, "24242424-2424-4242-8242-242424242424");
     assert!(!again.contains("isn't being saved"), "{again}");
+    assert_eq!(says_opencode(&bound), [false; 3]);
 
     // Turned off.
     let off = lab.agit(&dir, &["off"]);
     assert!(off.status.success(), "{off:?}");
+    assert_eq!(says_opencode(&dir), [false; 3]);
     lab.conversation(
         &dir,
         "23232323-2323-4232-8232-232323232323",
