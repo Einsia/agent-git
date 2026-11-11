@@ -7,7 +7,7 @@ description: List, rename, remove, or seal Agent repo session branches.
 
 ## Purpose
 
-Operate on the branches of one Agent repo. Name the repo with `--repo <owner/repo>` or supply `AGIT_SESSION`. Directory bindings do not select the target.
+Operate on the branches of one Agent repo. Name the repo with `--repo <owner/repo>` or supply `AGIT_SESSION`. Only the listing falls back to the repo the current folder saves to, and says so; `rename`, `rm`, `seal`, `confirm` and `unhold` never take the target from the folder. With no repo named and none for the folder, the listing exits 4 and names the Agent repos on this computer.
 
 The ordinary text listing reads current ref metadata without walking history. `-v` adds
 sync comparisons; `--json` includes the session's opening subject and therefore reads history.
@@ -15,7 +15,7 @@ sync comparisons; `--json` includes the session's opening subject and therefore 
 ## Synopsis
 
 ```bash
-agit branch --repo <owner/repo> [--all] [-v]
+agit branch [--repo <owner/repo>] [--all] [-v]
 agit branch rename <OLD> <NEW>
 agit branch rm [--force] <NAME>
 agit branch seal <NAME>

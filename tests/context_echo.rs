@@ -911,6 +911,43 @@ fn file_diff_keeps_git_patch_bytes_at_the_explicit_historical_points() {
     assert_eq!(output.stdout, expected.trim_end().as_bytes());
 }
 
+/// A bare `agit branch` lists the repository the lab's folder is bound to and says so, while a
+/// change in the same folder is refused, and a folder bound to nothing gets the agent repos named:
+/// a listing that ignored the binding, or a rename that took it, fails here. Every refusal names
+/// `--repo`, never the session-branch form the command doesn't take.
+#[test]
+fn a_bare_branch_lists_the_folders_repository_and_every_change_still_names_one() {
+    let lab = Lab::new();
+    let listed = notice(
+        lab.run(None, &["branch"]),
+        &format!("target: {REPO} (via this folder)"),
+    );
+    assert!(listed.contains("selected"), "{listed}");
+
+    let renamed = lab.run(None, &["branch", "rename", "selected", "renamed"]);
+    assert_eq!(renamed.status.code(), Some(4), "{renamed:?}");
+    let said = String::from_utf8(renamed.stderr).unwrap();
+    assert!(said.contains("no agent repo named"), "{said}");
+    assert!(said.contains("--repo <owner>/<repo>"), "{said}");
+    assert!(!said.contains("@<branch>"), "{said}");
+
+    let unbound = lab.temporary.path().join("unbound");
+    fs::create_dir_all(&unbound).unwrap();
+    let elsewhere = lab
+        .command(None, &["branch"])
+        .current_dir(&unbound)
+        .output()
+        .unwrap();
+    assert_eq!(elsewhere.status.code(), Some(4), "{elsewhere:?}");
+    let said = String::from_utf8(elsewhere.stderr).unwrap();
+    assert!(
+        said.contains("no agent repo named, and this folder doesn’t save to one"),
+        "{said}"
+    );
+    assert!(said.contains(&format!("  {REPO}\n")), "{said}");
+    assert!(!said.contains("@<branch>"), "{said}");
+}
+
 #[test]
 fn branch_and_tag_notices_match_the_repository_and_refs_actually_changed() {
     let lab = Lab::new();

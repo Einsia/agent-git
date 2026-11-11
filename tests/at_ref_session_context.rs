@@ -279,11 +279,7 @@ fn ordinary_commands_ignore_legacy_pins_and_adopted_cwd() {
     )
     .unwrap();
 
-    for args in [
-        vec!["log", "--oneline"],
-        vec!["branch"],
-        vec!["log", BRANCH],
-    ] {
+    for args in [vec!["log", "--oneline"], vec!["log", BRANCH]] {
         let out = agit(&home, &work, None, &args);
         assert!(!out.status.success(), "directory state selected {args:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("AGIT_SESSION"));
