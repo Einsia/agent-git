@@ -3889,11 +3889,28 @@ fn settle_bytes(
     if materialized_mode {
         lk.privacy_recovery = None;
         lk.privacy_recovery_format = None;
+        // The baseline being replaced still proves the tip it was recorded for.
+        if let (Some(tip), Some(bytes), Some(sha256)) = (
+            lk.materialized_from.clone(),
+            lk.baseline_bytes,
+            lk.baseline_hash.clone(),
+        ) {
+            lk.retain_settled_prefix(link::NativeCheckpoint { tip, bytes, sha256 });
+        }
         use sha2::Digest as _;
         lk.baseline_bytes = Some(new_baseline as u64);
         lk.baseline_hash = Some(hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])));
         lk.materialized_from = Some(last_sha.clone());
     } else if std::str::from_utf8(bytes).is_ok() {
+        // The checkpoint being replaced was verified or proven again for this settlement's frozen
+        // tip above, so it still proves that tip after the branch moves on.
+        if let Some(previous) = lk
+            .native_checkpoint
+            .take()
+            .filter(|previous| Some(previous.tip.as_str()) == old_head.as_deref())
+        {
+            lk.retain_settled_prefix(previous);
+        }
         use sha2::Digest as _;
         lk.native_checkpoint = Some(link::NativeCheckpoint {
             tip: last_sha.clone(),
@@ -6325,6 +6342,13 @@ mod tests {
             assert_eq!(view.contains("turn_context"), revision == "HEAD");
             assert!(!view.contains("uncompleted continuation"));
         }
+        // The settlement keeps the evidence it proved for its frozen tip once the branch moves
+        // on, so a reader whose saved copy is that tip can still be served only what follows.
+        let kept = link::get(&store, "codex", "AB").unwrap().settled_prefixes;
+        assert_eq!(
+            kept.first().map(|prefix| prefix.tip.as_str()),
+            Some(continued_tip.as_str())
+        );
         let caught_up = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
         // A checkpoint naming another tip never verifies. A settlement that lands nothing must
         // still leave the current tip's checkpoint, or every retry repeats the full comparison.

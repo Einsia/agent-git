@@ -721,10 +721,7 @@ fn landed_link(
     if previous_owner.as_deref() != Some(owner.as_str())
         || !crate::domain::link::claims_branch(&lk, &owner, agent, &args.branch)
     {
-        lk.native_checkpoint = None;
-        lk.baseline_bytes = None;
-        lk.baseline_hash = None;
-        lk.materialized_from = None;
+        lk.clear_native_evidence();
     }
     lk.cwd = Some(args.cwd.clone());
     lk.agent = Some(agent.to_string());
@@ -1471,6 +1468,11 @@ mod tests {
             bytes: 4096,
             sha256: "f00d".into(),
         });
+        resumed.retain_settled_prefix(link::NativeCheckpoint {
+            tip: "c".repeat(40),
+            bytes: 2048,
+            sha256: "beef".into(),
+        });
         link::write(&store, &resumed).unwrap();
         let mut args = super::LandArgs {
             adopt_unclaimed: false,
@@ -1489,6 +1491,7 @@ mod tests {
         assert_eq!(repeated.baseline_hash, resumed.baseline_hash);
         assert_eq!(repeated.materialized_from, resumed.materialized_from);
         assert!(repeated.native_checkpoint.is_some());
+        assert_eq!(repeated.settled_prefixes.len(), 1);
         assert_eq!(repeated.cwd.as_deref(), Some(args.cwd.as_str()));
 
         args.adopt_unclaimed = true;
@@ -1501,7 +1504,7 @@ mod tests {
         assert!(rerouted.baseline_hash.is_none());
         assert!(rerouted.materialized_from.is_none());
         assert!(
-            rerouted.native_checkpoint.is_none(),
+            rerouted.native_checkpoint.is_none() && rerouted.settled_prefixes.is_empty(),
             "a checkpoint names a tip of the old destination; kept, it never verifies there"
         );
         assert_eq!(rerouted.branch.as_deref(), Some("recovery"));
