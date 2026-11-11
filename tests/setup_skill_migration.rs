@@ -559,6 +559,23 @@ fn a_skill_turned_off_stays_off_until_setup_names_its_runtime() {
     assert!(!root.join("agit/skill-off.json").exists());
 }
 
+/// Doctor names a missing Skill only for a runtime on this computer: one installed without its
+/// Skill gets one short line with the command that installs it, and one that isn't installed and
+/// has no Skill folder gets none. A check that listed every missing file, or warned for every
+/// runtime agit supports, would bury doctor's other lines under tools the person doesn't use.
+#[test]
+fn doctor_names_a_missing_skill_only_for_a_runtime_on_this_computer() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    let doctor = said(&without_runtimes(root, &["doctor"]));
+    assert!(
+        doctor.contains("not installed; run `agit setup --runtime claude-code --skill`"),
+        "{doctor}"
+    );
+    assert!(!doctor.contains("skill cursor"), "{doctor}");
+}
+
 /// A runtime installed after the last setup is set up by the next upgrade, as the bare setup that
 /// once wrote for every runtime ahead of time did: with Codex set up first, Claude Code installed
 /// later is named by doctor, and the setup `agit upgrade` runs after refreshing Skills

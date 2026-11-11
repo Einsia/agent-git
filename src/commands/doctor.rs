@@ -950,6 +950,7 @@ fn codex_hooks_row() -> Option<Check> {
 fn skill_installation_checks() -> Vec<(String, Check)> {
     let mut checks = Vec::new();
     let off = super::setup::skill_off::read();
+    let installed = super::setup::presence::installed();
     for runtime in crate::adapter::setup_runtimes() {
         if off.contains(runtime) {
             checks.push((
@@ -959,7 +960,19 @@ fn skill_installation_checks() -> Vec<(String, Check)> {
                 )),
             ));
         } else if let Some(path) = super::setup::skill_path(runtime) {
-            checks.push((format!("skill {runtime}"), check_skill_dir(&path, runtime)));
+            // With no Skill folder there is nothing to compare: one line for a runtime on this
+            // computer, and none for one that isn't, which would read as a fault in a tool the
+            // person doesn't use.
+            if path.symlink_metadata().is_ok() {
+                checks.push((format!("skill {runtime}"), check_skill_dir(&path, runtime)));
+            } else if installed.contains(&runtime) {
+                checks.push((
+                    format!("skill {runtime}"),
+                    Check::Warn(format!(
+                        "not installed; run `agit setup --runtime {runtime} --skill`"
+                    )),
+                ));
+            }
         }
         if let Some(path) = super::setup::legacy_inline_skill_path(runtime)
             && super::setup::legacy_inline_skill_exists(&path, runtime)
@@ -1065,21 +1078,20 @@ fn check_skill_dir(dir: &Path, runtime: &str) -> Check {
     let entrypoint = dir.join("SKILL.md");
     let version_file = dir.join(skill_bundle::VERSION_FILE);
     let refs = dir.join(skill_bundle::REFERENCES_DIR);
-    let mut issues = Vec::new();
+    // Counts, not file names: a Skill has a file per command, and a line naming each one outgrows
+    // any terminal while saying no more than "reinstall it".
+    let (mut missing, mut stale, mut obsolete) = (0, 0, 0);
+    let mut installed_version = None;
 
     match std::fs::read_to_string(&entrypoint) {
         Ok(body) if body == skill_bundle::entrypoint() => {}
-        Ok(_) => issues.push("the entrypoint manual is out of date".to_string()),
-        Err(_) => issues.push("the entrypoint manual is missing".to_string()),
+        Ok(_) => stale += 1,
+        Err(_) => missing += 1,
     }
     match std::fs::read_to_string(&version_file) {
         Ok(version) if version.trim() == skill_bundle::version() => {}
-        Ok(version) => issues.push(format!(
-            "version {}, current {}",
-            version.trim(),
-            skill_bundle::version()
-        )),
-        Err(_) => issues.push("the version file is missing".to_string()),
+        Ok(version) => installed_version = Some(version.trim().to_owned()),
+        Err(_) => missing += 1,
     }
 
     let expected: std::collections::BTreeSet<&str> = skill_bundle::SUBSKILLS
@@ -1089,8 +1101,8 @@ fn check_skill_dir(dir: &Path, runtime: &str) -> Check {
     for (name, expected_body) in skill_bundle::SUBSKILLS {
         match std::fs::read_to_string(refs.join(format!("{name}.md"))) {
             Ok(body) if body == *expected_body => {}
-            Ok(_) => issues.push(format!("sub-skill {name} is out of date")),
-            Err(_) => issues.push(format!("sub-skill {name} is missing")),
+            Ok(_) => stale += 1,
+            Err(_) => missing += 1,
         }
     }
     if let Ok(entries) = std::fs::read_dir(&refs) {
@@ -1102,14 +1114,29 @@ fn check_skill_dir(dir: &Path, runtime: &str) -> Check {
                     .and_then(|x| x.to_str())
                     .is_some_and(|name| !expected.contains(name))
             {
-                issues.push(format!(
-                    "obsolete sub-skill {} is present",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                obsolete += 1;
             }
         }
     }
 
+    let mut issues = Vec::new();
+    if let Some(version) = installed_version {
+        issues.push(format!(
+            "version {version}, current {}",
+            skill_bundle::version()
+        ));
+    }
+    for (count, state) in [
+        (missing, "missing"),
+        (stale, "out of date"),
+        (obsolete, "no longer used"),
+    ] {
+        match count {
+            0 => {}
+            1 => issues.push(format!("1 file {state}")),
+            _ => issues.push(format!("{count} files {state}")),
+        }
+    }
     if issues.is_empty() {
         Check::Ok(format!(
             "v{} · {} command references · {}",
@@ -1120,7 +1147,7 @@ fn check_skill_dir(dir: &Path, runtime: &str) -> Check {
     } else {
         Check::Warn(format!(
             "{}; run `agit setup --runtime {runtime} --skill`",
-            issues.join("; ")
+            issues.join(", ")
         ))
     }
 }
@@ -1924,10 +1951,19 @@ mod tests {
             "old",
         )
         .unwrap();
-        assert!(matches!(
-            check_skill_dir(dir.path(), "codex"),
-            Check::Warn(_)
-        ));
+        std::fs::remove_file(
+            dir.path()
+                .join(crate::commands::skill_bundle::REFERENCES_DIR)
+                .join("save.md"),
+        )
+        .unwrap();
+        let Check::Warn(line) = check_skill_dir(dir.path(), "codex") else {
+            panic!("a Skill with a missing and a stale file must warn");
+        };
+        assert_eq!(
+            line,
+            "1 file missing, 1 file out of date; run `agit setup --runtime codex --skill`"
+        );
     }
 
     // ── Runtime rows: capability + format + next step ──
