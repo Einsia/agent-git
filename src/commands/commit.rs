@@ -1174,6 +1174,11 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
 
     if !quiet {
         ui::error("no explicit settlement target; provide owner/repo@branch or set AGIT_SESSION.");
+        if let Some((slug, branch)) = super::status::folder_saved_session(&cwd) {
+            ui::hint(&format!(
+                "the conversation saved from this folder: `agit commit {slug}@{branch}`"
+            ));
+        }
         ui::hint("use `agit commit <owner>/<repo>@<branch>`, or an adopted native session id");
     }
     Ok(None)

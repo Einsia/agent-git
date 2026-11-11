@@ -460,8 +460,18 @@ fn publish(mut args: Args) -> CmdResult {
         .filter(|c| c.repo == checkout.slug())
         .map(|c| c.branch.clone());
     let heads = repo.local_branches();
-    let branches = match plan_branches(&explicit_branches, args.all, ctx_branch.as_deref(), &heads)
-    {
+    let folder_session = super::status::folder_saved_session(&cwd)
+        .filter(|(slug, _)| *slug == checkout.slug())
+        .map(|(_, branch)| branch);
+    let branches = match plan_branches(
+        &explicit_branches,
+        args.all,
+        ctx_branch.as_deref(),
+        &heads,
+        folder_session
+            .as_deref()
+            .map(|branch| (checkout.slug(), branch)),
+    ) {
         Ok(b) => b,
         Err(r) => {
             if r.code == ExitCode::Ok {
@@ -1403,6 +1413,7 @@ fn plan_branches(
     all: bool,
     ctx_branch: Option<&str>,
     heads: &[String],
+    folder_session: Option<(String, &str)>,
 ) -> std::result::Result<Vec<String>, Refusal> {
     if !explicit.is_empty() {
         let unknown: Vec<&str> = explicit
@@ -1454,10 +1465,19 @@ fn plan_branches(
         }),
         _ => Err(Refusal {
             msg: "no explicit publish branch; name a branch or set AGIT_SESSION.".into(),
-            hints: vec![
-                "agit push <owner>/<repo> -b <branch>".into(),
-                "or publish all local branches: agit push <owner>/<repo> --all".into(),
-            ],
+            // The one conversation saved from this folder is named, never chosen: a push names
+            // what it publishes.
+            hints: folder_session
+                .filter(|(_, branch)| heads.iter().any(|head| head == branch))
+                .map(|(slug, branch)| {
+                    format!("the conversation saved from this folder: agit push {slug} -b {branch}")
+                })
+                .into_iter()
+                .chain([
+                    "agit push <owner>/<repo> -b <branch>".into(),
+                    "or publish all local branches: agit push <owner>/<repo> --all".into(),
+                ])
+                .collect(),
             code: ExitCode::Ref,
         }),
     }
@@ -2081,7 +2101,7 @@ mod tests {
         let (dir, repo) = fixture("ctx");
         assert_eq!(repo.current_branch().as_deref(), Some("ghost"));
         let heads = repo.local_branches();
-        let got = plan_branches(&[], false, Some("refund-fix"), &heads).unwrap();
+        let got = plan_branches(&[], false, Some("refund-fix"), &heads, None).unwrap();
         assert_eq!(got, ["refund-fix"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2091,7 +2111,7 @@ mod tests {
     fn several_branches_without_a_context_are_refused_not_guessed() {
         let (dir, repo) = fixture("ambig");
         let heads = repo.local_branches();
-        let err = plan_branches(&[], false, None, &heads).unwrap_err();
+        let err = plan_branches(&[], false, None, &heads, None).unwrap_err();
         assert_eq!(err.code, ExitCode::Ref);
         assert!(
             err.hints.iter().any(|h| h.contains("--all")),
@@ -2099,8 +2119,30 @@ mod tests {
             err.hints
         );
         let one = ["solo".to_string()];
-        assert!(plan_branches(&[], false, None, &one).is_err());
+        assert!(plan_branches(&[], false, None, &one, None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The refusal names the one conversation saved from the folder it ran in, with the exact
+    /// push, and still publishes nothing by itself. A folder session that isn't a branch here is
+    /// not named.
+    #[test]
+    fn a_refused_push_names_the_folders_saved_conversation() {
+        let heads = ["main".to_string(), "talk".to_string()];
+        let err =
+            plan_branches(&[], false, None, &heads, Some(("me/app".into(), "talk"))).unwrap_err();
+        assert_eq!(err.code, ExitCode::Ref);
+        assert_eq!(
+            err.hints[0],
+            "the conversation saved from this folder: agit push me/app -b talk"
+        );
+        let err =
+            plan_branches(&[], false, None, &heads, Some(("me/app".into(), "gone"))).unwrap_err();
+        assert!(
+            !err.hints.iter().any(|hint| hint.contains("gone")),
+            "{:?}",
+            err.hints
+        );
     }
 
     /// `-b` pushes only the branches named; naming one that does not exist is said out loud.
@@ -2113,10 +2155,11 @@ mod tests {
             false,
             Some("ghost"),
             &heads,
+            None,
         )
         .unwrap();
         assert_eq!(got, ["refund-fix", "main"]);
-        let err = plan_branches(&["nope".into()], false, None, &heads).unwrap_err();
+        let err = plan_branches(&["nope".into()], false, None, &heads, None).unwrap_err();
         assert_eq!(err.code, ExitCode::Ref);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2126,12 +2169,12 @@ mod tests {
     fn all_projects_every_branch_despite_source_tracking_refs() {
         let (dir, repo) = fixture("all");
         let heads = repo.local_branches();
-        let mut got = plan_branches(&[], true, None, &heads).unwrap();
+        let mut got = plan_branches(&[], true, None, &heads, None).unwrap();
         got.sort();
         assert_eq!(got, ["ghost", "main", "refund-fix"]);
         repo.git(&["update-ref", "refs/remotes/origin/main", "main"])
             .unwrap();
-        let mut got = plan_branches(&[], true, None, &heads).unwrap();
+        let mut got = plan_branches(&[], true, None, &heads, None).unwrap();
         got.sort();
         assert_eq!(got, ["ghost", "main", "refund-fix"]);
         let _ = std::fs::remove_dir_all(&dir);

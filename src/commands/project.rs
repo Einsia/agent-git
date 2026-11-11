@@ -2875,14 +2875,40 @@ pub(crate) fn worktree_notice(path: &Path) -> Option<String> {
     let (project, Via::Worktree(worktree)) = governing(path).ok()?? else {
         return None;
     };
-    (project.enabled && project.auto_upload).then(|| {
+    if !(project.enabled && project.auto_upload) {
+        return None;
+    }
+    // Said as `agit status`'s automatic-upload line says it: with automatic upload off for the
+    // repository, the folder saves new sessions there and a push publishes them.
+    let publishes = super::parse_slug(&project.repository)
+        .ok()
+        .and_then(|(owner, name)| Repo::open(config::repo_dir(&owner, &name).ok()?))
+        .is_none_or(|repo| {
+            super::auto_push::publication_allowed(&repo, &project.repository).unwrap_or(true)
+        });
+    Some(if publishes {
         format!(
             "{} is a git worktree of {}, which uploads new sessions to {}; to stop here: `agit off`",
             ui::tilde(&worktree),
             ui::tilde(&project.root),
             project.repository
         )
+    } else {
+        format!(
+            "{} is a git worktree of {}, which saves new sessions to {}; automatic upload is off for it: `agit push {}` publishes them; to stop here: `agit off`",
+            ui::tilde(&worktree),
+            ui::tilde(&project.root),
+            project.repository,
+            project.repository
+        )
     })
+}
+
+/// The repository the project policy covering `path` saves into, its own folder's, a folder's
+/// above it or, for a git worktree, its main checkout's: what a command that reads history can
+/// fall back to where no binding of `path` itself names one.
+pub(crate) fn covering_repository(path: &Path) -> Option<String> {
+    governing(path).ok()?.map(|(project, _)| project.repository)
 }
 
 /// The last automatic upload's error, when it failed.

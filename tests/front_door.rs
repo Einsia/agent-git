@@ -1542,6 +1542,252 @@ fn without_a_terminal_no_output_hands_an_agent_save_all_for_earlier_sessions() {
     assert!(asked > 0, "no output mentioned the sessions from before");
 }
 
+/// A push or a commit that names no target, run in a folder one saved conversation ran in, names
+/// that conversation with the exact command and still does nothing by itself. With a second saved
+/// conversation there, neither is named: naming one would be a guess.
+#[test]
+fn a_command_without_a_target_names_the_folders_one_saved_conversation() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
+    repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic shared history").unwrap();
+    repo.git(&["branch", "talk"]).unwrap();
+    repo.git(&["branch", "other"]).unwrap();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let saved = |id: &str, branch: &str| {
+        let mut link = agit::domain::link::Link::new("claude-code", id, Some(&dir));
+        link.owner = Some("me".into());
+        link.agent = Some("parley".into());
+        link.branch = Some(branch.into());
+        agit::domain::link::write(&store, &link).unwrap();
+    };
+    saved("17171717-1717-4171-8171-171717171717", "talk");
+    let said = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        assert_ne!(out.status.code(), Some(0), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let push = said(&["push", "me/parley"]);
+    assert!(
+        push.contains("no explicit publish branch")
+            && push
+                .contains("the conversation saved from this folder: agit push me/parley -b talk"),
+        "{push}"
+    );
+    let commit = said(&["commit"]);
+    assert!(
+        commit.contains("the conversation saved from this folder: `agit commit me/parley@talk`"),
+        "{commit}"
+    );
+
+    saved("18181818-1818-4181-8181-181818181818", "other");
+    let push = said(&["push", "me/parley"]);
+    assert!(
+        push.contains("no explicit publish branch") && !push.contains("saved from this folder"),
+        "{push}"
+    );
+    assert!(!said(&["commit"]).contains("saved from this folder"));
+}
+
+/// A second saved conversation that cannot be read may be the folder's other candidate, so a push
+/// or a commit that names no target names neither: with only the one readable record the folder
+/// names it, and with a corrupt record beside it the hint is gone.
+#[test]
+fn a_folder_with_an_unreadable_saved_conversation_names_no_one() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
+    repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic shared history").unwrap();
+    repo.git(&["branch", "talk"]).unwrap();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let mut link = agit::domain::link::Link::new(
+        "claude-code",
+        "17171717-1717-4171-8171-171717171717",
+        Some(&dir),
+    );
+    link.owner = Some("me".into());
+    link.agent = Some("parley".into());
+    link.branch = Some("talk".into());
+    agit::domain::link::write(&store, &link).unwrap();
+    let said = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        assert_ne!(out.status.code(), Some(0), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    assert!(
+        said(&["commit"])
+            .contains("the conversation saved from this folder: `agit commit me/parley@talk`")
+    );
+
+    let unreadable = agit::domain::link::link_path(
+        &store,
+        "claude-code",
+        "18181818-1818-4181-8181-181818181818",
+    );
+    std::fs::write(&unreadable, "not a record").unwrap();
+    let push = said(&["push", "me/parley"]);
+    assert!(
+        push.contains("no explicit publish branch") && !push.contains("saved from this folder"),
+        "{push}"
+    );
+    assert!(!said(&["commit"]).contains("saved from this folder"));
+}
+
+/// In a git worktree of a folder that saves into a repository, `agit log --branches` reads that
+/// repository, as `agit status` names it there, and lists the worktree's saved conversation; a
+/// bare `agit log` names that conversation. `agit status` says the same thing about uploads in
+/// both its lines: with automatic upload off for the repository, the worktree line says sessions
+/// are saved there and a push publishes them, beside the automatic-upload-off line; with it on,
+/// it says they upload and nothing lists the repository as off.
+#[test]
+fn a_worktree_reads_and_describes_the_repository_its_folder_saves_to() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "start"]);
+    git(&["worktree", "add", "-q", "../parley-g"]);
+    let tree = dir
+        .parent()
+        .unwrap()
+        .join("parley-g")
+        .canonicalize()
+        .unwrap();
+    lab.turn_on(&dir, "me/parley");
+    let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
+    repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic shared history").unwrap();
+    repo.git(&["branch", "retries-ec36"]).unwrap();
+    let mut link =
+        agit::domain::link::Link::new("codex", "01a1c6f8-e3b9-7850-8618-98fe760aa219", Some(&tree));
+    link.owner = Some("me".into());
+    link.agent = Some("parley".into());
+    link.branch = Some("retries-ec36".into());
+    agit::domain::link::write(
+        &agit::domain::store::Store::at(lab.agit_home.join("store")),
+        &link,
+    )
+    .unwrap();
+
+    let branches = lab.agit(&tree, &["log", "--branches"]);
+    assert_eq!(branches.status.code(), Some(0), "{branches:?}");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("retries-ec36"),
+        "{branches:?}"
+    );
+    let bare = lab.agit(&tree, &["log"]);
+    assert!(
+        String::from_utf8_lossy(&bare.stderr)
+            .contains("the conversation saved from this folder: `agit log me/parley@retries-ec36`"),
+        "{bare:?}"
+    );
+
+    let status = |at: &std::path::Path| {
+        let out = lab.agit(at, &["status", "--json"]);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        document["result"]["value"].clone()
+    };
+    repo.set_auto_push(Some(false)).unwrap();
+    let off = status(&tree);
+    assert_eq!(
+        off["automatic_upload_off"],
+        serde_json::json!(["me/parley"]),
+        "{off}"
+    );
+    let said = off["worktree"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("which saves new sessions to me/parley")
+            && said
+                .contains("automatic upload is off for it: `agit push me/parley` publishes them")
+            && !said.contains("uploads new sessions"),
+        "{said}"
+    );
+    repo.set_auto_push(Some(true)).unwrap();
+    let on = status(&tree);
+    assert_eq!(on["automatic_upload_off"], serde_json::json!([]), "{on}");
+    assert!(
+        on["worktree"]
+            .as_str()
+            .is_some_and(|said| said.contains("which uploads new sessions to me/parley")),
+        "{on}"
+    );
+}
+
+/// In a git worktree with no session from before its folder covered it, nothing asks the person
+/// about earlier sessions: a request to ask about none reads as something waiting.
+#[test]
+fn a_worktree_with_no_earlier_session_has_nothing_to_ask() {
+    let lab = Lab::new();
+    let dir = lab.folder("ideas", false);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "start"]);
+    git(&["worktree", "add", "-q", "../ideas-tree"]);
+    let tree = dir
+        .parent()
+        .unwrap()
+        .join("ideas-tree")
+        .canonicalize()
+        .unwrap();
+    lab.turn_on(&dir, "me/ideas");
+    let out = lab.agit(&tree, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let status = &status["result"]["value"];
+    assert!(
+        status["worktree"]
+            .as_str()
+            .is_some_and(|said| said.contains("is a git worktree of")),
+        "{status}"
+    );
+    assert_eq!(
+        status["earlier_sessions_not_uploaded"],
+        serde_json::Value::Null,
+        "{status}"
+    );
+}
+
 #[test]
 fn a_folder_covers_its_git_worktrees_from_now_on() {
     let lab = Lab::new();
