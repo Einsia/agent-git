@@ -497,17 +497,26 @@ pub enum SteerDispatch {
 /// write as the one-shot decision. An I/O error may therefore mean either
 /// "nothing happened" or "the looser mode is already live"; callers must not
 /// flatten that ambiguity into an ordinary expired-card error.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ApprovalOutcome {
     /// The shared native request closed; the protocol does not report the winning client.
     Resolved,
     /// Retain the card and observe the shared service without resending the decision.
     AwaitingResolution { message: String },
+    /// A one-shot decision handed to a native Claude Code ask, which its settings hook takes on
+    /// its next check-in. `taken` turns true once it has, and closes, unconfirmed, if the
+    /// decision is withdrawn first. The card stays until the ask resolves.
+    Handed {
+        taken: tokio::sync::watch::Receiver<bool>,
+    },
     Applied {
         /// Exact effective session mode carried by the machine-originated
         /// suggestion, or `None` for a one-shot/native-only decision.
         effective_mode: Option<PermissionMode>,
     },
+    /// The decision's own content doesn't fit its ask: answers on an ask that takes none, or
+    /// answers that don't match its questions. Nothing was handed over, and the ask still waits.
+    MalformedDecision { message: String },
     /// No native bytes were written, so a sticky guard change is proven absent.
     ExplicitRefusal {
         message: String,
@@ -523,6 +532,43 @@ pub enum ApprovalOutcome {
         attempted_mode: Option<PermissionMode>,
     },
 }
+
+/// Outcomes compare by what they say happened; two hand-overs are the same outcome whatever
+/// their receivers will see later.
+impl PartialEq for ApprovalOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        use ApprovalOutcome::*;
+        match (self, other) {
+            (Resolved, Resolved) | (Handed { .. }, Handed { .. }) => true,
+            (AwaitingResolution { message: a }, AwaitingResolution { message: b })
+            | (MalformedDecision { message: a }, MalformedDecision { message: b }) => a == b,
+            (Applied { effective_mode: a }, Applied { effective_mode: b }) => a == b,
+            (
+                ExplicitRefusal {
+                    message: a,
+                    retained: x,
+                },
+                ExplicitRefusal {
+                    message: b,
+                    retained: y,
+                },
+            ) => a == b && x == y,
+            (
+                Unknown {
+                    message: a,
+                    attempted_mode: x,
+                },
+                Unknown {
+                    message: b,
+                    attempted_mode: y,
+                },
+            ) => a == b && x == y,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ApprovalOutcome {}
 
 /// Why a harness could not apply a permission-mode change.
 ///

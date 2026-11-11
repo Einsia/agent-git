@@ -90,6 +90,7 @@ impl Daemon {
             && let Some(live) = self.sessions.get_mut(&stream)
         {
             live.approval_requests.remove(&p.approval_id);
+            live.handed_approvals.remove(&p.approval_id);
         }
         self.observe_lease_frame(&stream, &frame);
         #[cfg(unix)]
@@ -108,6 +109,7 @@ impl Daemon {
             // boundary; daemon-side preflight metadata must not make an old
             // card look armable.
             live.approval_requests.clear();
+            live.handed_approvals.clear();
         }
         // `stamped()` promises that `Live.info.status` reflects every event up
         // through its watermark, so project the authoritative status event.
@@ -121,6 +123,7 @@ impl Daemon {
             live.info.status = p.status;
             if p.status != SessionStatus::AwaitingApproval {
                 live.approval_requests.clear();
+                live.handed_approvals.clear();
             }
         }
         // `updated_at` is the session's last activity: team activity reports it and orders by
@@ -966,6 +969,7 @@ mod bound_lineage_tests {
                         danger_arm: 0,
                         pending_mode: None,
                         approval_requests: HashMap::new(),
+                        handed_approvals: Default::default(),
                         rpc_gate: Arc::new(Mutex::new(())),
                         interrupt_gate: Arc::new(Mutex::new(())),
                         approval_gate: Arc::new(Mutex::new(())),

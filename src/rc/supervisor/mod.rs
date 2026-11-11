@@ -2742,7 +2742,9 @@ impl Session {
                                     self.announce_mode(None).await;
                                 }
                                 ApprovalOutcome::ExplicitRefusal { .. } => {}
-                                ApprovalOutcome::AwaitingResolution { .. } => {
+                                ApprovalOutcome::MalformedDecision { .. }
+                                | ApprovalOutcome::Handed { .. }
+                                | ApprovalOutcome::AwaitingResolution { .. } => {
                                     self.pending.insert(response.approval_id.clone(), pending);
                                 }
                                 ApprovalOutcome::Unknown { message, .. } => {

@@ -1699,6 +1699,51 @@ impl PreparedSessionRpc {
                     .await;
                 }
                 match reply_within_state(reply.get_mut(), stop).await {
+                    ReplyWait::Done(Ok(ApprovalOutcome::Handed { taken }))
+                        if session_mode.is_none() =>
+                    {
+                        // The approval lane is free once the decision is with the native ask:
+                        // the ask's own claim keeps a different decision out, and another ask
+                        // can be answered while this one's hook takes its decision. Viewers read
+                        // the card as changing until the ask resolves.
+                        {
+                            let mut state = daemon.lock().await;
+                            if let Some(live) = state
+                                .sessions
+                                .get_mut(&session_id)
+                                .filter(|live| live.generation == generation)
+                                && live.approval_requests.contains_key(&approval_id)
+                            {
+                                live.handed_approvals.insert(approval_id.clone());
+                            }
+                        }
+                        complete_prepared_session_rpc(
+                            daemon,
+                            session_id,
+                            generation,
+                            serial,
+                            SessionRpcCompletion::Approval {
+                                approval_id,
+                                resolved: false,
+                                effective_mode: None,
+                                fail_closed: false,
+                                rollback_arm: None,
+                                retire_generation: false,
+                            },
+                        )
+                        .await;
+                        ExecutedSessionRpc {
+                            response: applied_once_reply(
+                                (
+                                    SessionRpcCompletion::None,
+                                    await_native_take(taken, stop).await,
+                                ),
+                                applied_once,
+                            )
+                            .1,
+                            pending: None,
+                        }
+                    }
                     ReplyWait::Done(result) => {
                         let (completion, response) = match result {
                             Ok(outcome) => {
@@ -1828,6 +1873,35 @@ impl PreparedSessionRpc {
 
 /// An answer a colleague gave for the whole session, applied once: its reply says so, so the Hub
 /// can tell them.
+/// How long a native ask's settings hook is given to take a decision handed to it. It checks in
+/// once a second.
+const NATIVE_TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The reply to a decision handed to a native ask: applied once its hook takes it within
+/// [`NATIVE_TAKE_WAIT`]; otherwise, or if the decision is withdrawn or the daemon stops first,
+/// not confirmed. The card stays until the ask resolves either way.
+async fn await_native_take(
+    mut taken: tokio::sync::watch::Receiver<bool>,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<serde_json::Value, RpcError> {
+    let took = async {
+        // A sender dropped before the take closes the channel: the wait ends unconfirmed.
+        taken.wait_for(|taken| *taken).await.is_ok()
+    };
+    let took = tokio::select! {
+        took = tokio::time::timeout(NATIVE_TAKE_WAIT, took) => took.unwrap_or(false),
+        () = rpc_stop_requested(stop) => false,
+    };
+    if took {
+        return Ok(serde_json::json!({}));
+    }
+    Err(RpcError {
+        code: ErrorCode::SessionBusy.code(),
+        message: "Waiting for the native approval to resolve".into(),
+        data: Some(serde_json::json!({"outcome":"unknown","retryable":false})),
+    })
+}
+
 fn applied_once_reply(
     (completion, response): (SessionRpcCompletion, Result<serde_json::Value, RpcError>),
     applied_once: bool,

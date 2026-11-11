@@ -573,6 +573,9 @@ struct Live {
     /// Machine-originated events own both presence and policy; viewer responses
     /// cannot invent a pending request or its permission effect.
     approval_requests: HashMap<String, Option<crate::protocol::PermissionMode>>,
+    /// Native asks whose decision was handed over and that haven't resolved yet: the approval
+    /// lane is free while their hooks take them, and viewers still read them as changing.
+    handed_approvals: std::collections::HashSet<String>,
     /// Input and policy mutations remain ordered until their receipts are projected.
     rpc_gate: Arc<Mutex<()>>,
     /// Stops and approval responses must reach a runtime whose input receipt is
@@ -1541,6 +1544,30 @@ fn project_approval_outcome(
                 Ok(serde_json::json!({})),
             ))
         }
+        // A hand-over is answered by the RPC task once the hook takes it; one reaching here (a
+        // sticky answer, or a reply that came after its RPC stopped waiting) is not confirmed.
+        ApprovalOutcome::Handed { .. } => project_approval_outcome(
+            ApprovalOutcome::AwaitingResolution {
+                message: "Waiting for the native approval to resolve".into(),
+            },
+            approval_id,
+            trusted_mode,
+            danger,
+        ),
+        ApprovalOutcome::MalformedDecision { message } => Some((
+            SessionRpcCompletion::Approval {
+                approval_id,
+                resolved: false,
+                effective_mode: None,
+                fail_closed: false,
+                rollback_arm: danger.arm(),
+                retire_generation: false,
+            },
+            Err(RpcError {
+                code: ErrorCode::MalformedFrame.code(), message,
+                data: Some(serde_json::json!({"outcome":"not_sent","retryable":false,"resolved":false})),
+            }),
+        )),
         ApprovalOutcome::ExplicitRefusal { message, retained } => Some((
             SessionRpcCompletion::Approval {
                 approval_id,

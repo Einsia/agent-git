@@ -271,9 +271,12 @@ impl ClaudeNativeDriver {
             };
         }
         match self.client().and_then(|client| client.answer(response)) {
-            Ok(()) => ApprovalOutcome::AwaitingResolution {
-                message: "Waiting for the native approval to resolve".into(),
-            },
+            Ok(taken) => ApprovalOutcome::Handed { taken },
+            Err(error) if error.is::<crate::rc::native_claude::MalformedDecision>() => {
+                ApprovalOutcome::MalformedDecision {
+                    message: error.to_string(),
+                }
+            }
             Err(error) => ApprovalOutcome::ExplicitRefusal {
                 message: error.to_string(),
                 retained: self.approvals.contains(&response.approval_id),

@@ -77,6 +77,52 @@ fn shared_approval_receipts_distinguish_resolution_from_an_unconfirmed_decision(
     ));
 }
 
+/// A decision whose own content doesn't fit its native ask is refused as malformed, never as an
+/// expired card: the ask still waits, and a well-formed answer can still be given. A stale or
+/// already answered ask is still refused as expired.
+#[test]
+fn a_malformed_native_decision_is_refused_as_malformed_and_its_card_kept() {
+    let (completion, reply) = project_approval_outcome(
+        ApprovalOutcome::MalformedDecision {
+            message: "this native approval does not accept answers".into(),
+        },
+        "approval".into(),
+        None,
+        DangerAuthorization::NotRequired,
+    )
+    .unwrap();
+    let error = reply.unwrap_err();
+    assert!(error.is(ErrorCode::MalformedFrame));
+    assert_eq!(
+        error.message,
+        "this native approval does not accept answers"
+    );
+    assert_eq!(
+        error.data.unwrap(),
+        serde_json::json!({"outcome":"not_sent","retryable":false,"resolved":false})
+    );
+    assert!(matches!(
+        completion,
+        SessionRpcCompletion::Approval {
+            resolved: false,
+            retire_generation: false,
+            fail_closed: false,
+            ..
+        }
+    ));
+    let (_, reply) = project_approval_outcome(
+        ApprovalOutcome::ExplicitRefusal {
+            message: "native approval is no longer pending".into(),
+            retained: false,
+        },
+        "approval".into(),
+        None,
+        DangerAuthorization::NotRequired,
+    )
+    .unwrap();
+    assert!(reply.unwrap_err().is(ErrorCode::ApprovalExpired));
+}
+
 /// One session can spend the full receipt window waiting for its
 /// supervisor without pinning the daemon state lock or another session's
 /// command path. This exercises the same prepare/execute split used by the
@@ -2569,4 +2615,190 @@ fn a_colleagues_session_wide_allow_says_it_applied_once() {
                 }
             });
     });
+}
+
+/// Answers `approval_id` through `approval.decide` on a daemon whose supervisor is `rx`, as the
+/// owner, once; the stand-in supervisor hands the decision to a native ask and gives back the
+/// sender its hook's take is reported on.
+async fn hand_native_decision(
+    daemon: &Arc<Mutex<Daemon>>,
+    rx: &mut mpsc::Receiver<Command>,
+    approval_id: &str,
+    stop: tokio::sync::watch::Receiver<bool>,
+) -> (
+    tokio::task::JoinHandle<ExecutedSessionRpc>,
+    tokio::sync::watch::Sender<bool>,
+) {
+    use crate::protocol::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+    let mut frame = Frame::request(
+        method::APPROVAL_DECIDE,
+        ApprovalResponse {
+            approval_id: approval_id.into(),
+            session_id: "session-a".into(),
+            decision: ApprovalDecision::Allow,
+            scope: ApprovalScope::Once,
+            message: None,
+            answers: None,
+            by: Some("owner".into()),
+        },
+    );
+    frame.caller = Some(claim("owner", "ws-a"));
+    let prepared = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
+    let worker_daemon = daemon.clone();
+    let worker = tokio::spawn(async move {
+        let mut stop = stop;
+        prepared.execute(worker_daemon, &mut stop).await
+    });
+    let (take, taken) = tokio::sync::watch::channel(false);
+    match rx.recv().await.unwrap() {
+        Command::Approve { reply, .. } => {
+            assert!(reply.accept());
+            reply.finish(Ok(ApprovalOutcome::Handed { taken }));
+        }
+        _ => panic!("wrong command"),
+    }
+    // Once the daemon has taken the hand-over, the ask is listed as handed and its lane is free.
+    let freed = async {
+        while !daemon.lock().await.sessions["session-a"]
+            .handed_approvals
+            .contains(approval_id)
+            || daemon.lock().await.sessions["session-a"]
+                .approval_gate
+                .try_lock()
+                .is_err()
+        {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), freed)
+        .await
+        .expect("the approval lane is free once the decision is handed over");
+    (worker, take)
+}
+
+async fn approvals_changing(daemon: &Arc<Mutex<Daemon>>) -> bool {
+    let mut request = Frame::request(
+        method::SESSION_APPROVALS,
+        serde_json::json!({"session_id":"session-a"}),
+    );
+    request.caller = Some(claim("viewer", "ws-a"));
+    let (frames, _received) = mpsc::channel(1);
+    daemon
+        .lock()
+        .await
+        .dispatch(&request, &frames)
+        .await
+        .unwrap()["changing"]
+        .as_bool()
+        .unwrap()
+}
+
+/// A decision handed to a native Claude Code ask frees the session's approval lane at once, so a
+/// second ask answered while the first one's hook takes its decision is answered too, not
+/// refused as busy. Each replies applied once its hook has taken it. Viewers read the session's
+/// approvals as changing from the hand-over until the ask resolves.
+#[tokio::test]
+async fn native_decisions_handed_back_to_back_both_reply_applied() {
+    use crate::protocol::PermissionMode;
+    let (tx, mut rx) = mpsc::channel(2);
+    let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
+    live.approval_requests.insert("ask-1".into(), None);
+    live.approval_requests.insert("ask-2".into(), None);
+    let daemon = rpc_test_daemon(
+        [("session-a".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    daemon
+        .lock()
+        .await
+        .latest_session_generations
+        .insert("session-a".into(), 1);
+    let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+    assert!(!approvals_changing(&daemon).await);
+    let (first, take_first) = hand_native_decision(&daemon, &mut rx, "ask-1", stop.clone()).await;
+    // The lane frees at hand-over; the second answer is prepared without waiting for the first.
+    let (second, take_second) = hand_native_decision(&daemon, &mut rx, "ask-2", stop.clone()).await;
+    assert!(approvals_changing(&daemon).await);
+    take_second.send_replace(true);
+    take_first.send_replace(true);
+    assert_eq!(
+        first.await.unwrap().response.unwrap(),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        second.await.unwrap().response.unwrap(),
+        serde_json::json!({})
+    );
+    assert!(
+        approvals_changing(&daemon).await,
+        "taken is not resolved: the cards stay until their asks resolve"
+    );
+    for id in ["ask-1", "ask-2"] {
+        let resolved = tagged_test_notification(
+            "session-a",
+            1,
+            method::APPROVAL_RESOLVED,
+            serde_json::json!({"session_id":"session-a","approval_id":id}),
+        );
+        daemon.lock().await.project_session_frame(resolved);
+    }
+    assert!(!approvals_changing(&daemon).await);
+}
+
+/// A handed decision its hook doesn't take within the wait, or that is withdrawn, or whose RPC
+/// stops, replies as not confirmed, never hanging past the wait. A turn's end that expires the
+/// still-listed ask ends its changing too.
+#[tokio::test(start_paused = true)]
+async fn an_untaken_native_decision_replies_unconfirmed_within_the_wait() {
+    use crate::protocol::PermissionMode;
+    let unconfirmed = |executed: ExecutedSessionRpc| {
+        let error = executed.response.unwrap_err();
+        assert!(error.is(ErrorCode::SessionBusy), "{error:?}");
+        assert_eq!(
+            error.data.unwrap(),
+            serde_json::json!({"outcome":"unknown","retryable":false})
+        );
+    };
+    let (tx, mut rx) = mpsc::channel(3);
+    let mut live = rpc_test_live("session-a", 1, tx, PermissionMode::Default);
+    for id in ["late", "withdrawn", "stopped"] {
+        live.approval_requests.insert(id.into(), None);
+    }
+    let daemon = rpc_test_daemon(
+        [("session-a".into(), live)].into_iter().collect(),
+        Roster::default(),
+    );
+    daemon
+        .lock()
+        .await
+        .latest_session_generations
+        .insert("session-a".into(), 1);
+    let (_stop_tx, stop) = tokio::sync::watch::channel(false);
+
+    let started = tokio::time::Instant::now();
+    let (late, _take) = hand_native_decision(&daemon, &mut rx, "late", stop.clone()).await;
+    unconfirmed(late.await.unwrap());
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    assert!(started.elapsed() < std::time::Duration::from_secs(4));
+
+    let (withdrawn, take) = hand_native_decision(&daemon, &mut rx, "withdrawn", stop.clone()).await;
+    drop(take);
+    unconfirmed(withdrawn.await.unwrap());
+
+    let (stop_tx, stopping) = tokio::sync::watch::channel(false);
+    let started = tokio::time::Instant::now();
+    let (stopped, _take) = hand_native_decision(&daemon, &mut rx, "stopped", stopping).await;
+    stop_tx.send_replace(true);
+    unconfirmed(stopped.await.unwrap());
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+    assert!(approvals_changing(&daemon).await);
+    let completed = tagged_test_notification(
+        "session-a",
+        1,
+        method::TURN_COMPLETED,
+        serde_json::json!({"turn_id":"turn-a","outcome":"ok"}),
+    );
+    daemon.lock().await.project_session_frame(completed);
+    assert!(!approvals_changing(&daemon).await);
 }

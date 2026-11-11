@@ -1732,6 +1732,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         danger_arm: 0,
         pending_mode: Some(crate::protocol::PermissionMode::Plan),
         approval_requests: HashMap::new(),
+        handed_approvals: Default::default(),
         rpc_gate: Arc::new(Mutex::new(())),
         interrupt_gate: Arc::new(Mutex::new(())),
         approval_gate: Arc::new(Mutex::new(())),

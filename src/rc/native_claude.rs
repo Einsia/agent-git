@@ -9,10 +9,10 @@ pub(crate) mod status;
 mod transport;
 pub(crate) use approval::wait_approval;
 pub use install::install_plugin;
-pub(crate) use transport::TerminalActivity;
 #[cfg(test)]
 pub(crate) use transport::fixture;
 pub use transport::{Client, Endpoint, STEER_AT_STEP, Snapshot, Update};
+pub(crate) use transport::{MalformedDecision, TerminalActivity};
 
 use anyhow::{Context, ensure};
 use fs2::FileExt;
