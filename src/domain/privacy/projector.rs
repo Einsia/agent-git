@@ -650,7 +650,53 @@ fn encoded_fields(text: &str, value: &Value) -> crate::Result<Vec<EncodedField>>
     let raw = serde_json::from_str::<&RawValue>(text)?;
     let mut fields = Vec::new();
     collect(raw, value, text.as_ptr() as usize, None, &mut fields)?;
+    // Members are collected by name, which is not the order they sit in the text.
+    fields.sort_by_key(|field| field.range.start);
     Ok(fields)
+}
+
+/// Whether any object in `text` names a member twice (names compared after escapes are undone).
+/// Parsing into a map keeps only the last of them, so the others would go unread.
+fn has_duplicate_members(text: &str) -> bool {
+    struct Members<'a>(Vec<(String, &'a RawValue)>);
+    impl<'de> Deserialize<'de> for Members<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = Members<'de>;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("an object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut members = Vec::new();
+                    while let Some(member) = map.next_entry::<String, &'de RawValue>()? {
+                        members.push(member);
+                    }
+                    Ok(Members(members))
+                }
+            }
+            deserializer.deserialize_map(Visit)
+        }
+    }
+    fn walk(raw: &RawValue) -> bool {
+        match raw.get().as_bytes().first() {
+            Some(b'{') => {
+                serde_json::from_str::<Members>(raw.get()).map_or(true, |Members(members)| {
+                    let mut names = std::collections::HashSet::new();
+                    members
+                        .iter()
+                        .any(|(name, value)| !names.insert(name.as_str()) || walk(value))
+                })
+            }
+            Some(b'[') => serde_json::from_str::<Vec<&RawValue>>(raw.get())
+                .map_or(true, |values| values.into_iter().any(walk)),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<&RawValue>(text).map_or(true, walk)
 }
 
 impl Projector {
@@ -992,7 +1038,14 @@ impl Projector {
                     continue;
                 };
                 let next = if let Some(batch) = self.encoded_findings(text, false) {
-                    self.protect_batch(text, batch)
+                    serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|decoded| {
+                            self.protect_in_place(text, &decoded, |projector, protected, _| {
+                                projector.encoded_findings(protected, false).is_some()
+                            })
+                        })
+                        .unwrap_or_else(|| self.protect_batch(text, batch))
                 } else if let Some(protected) = self.protect_encoded_media(text) {
                     protected
                 } else {
@@ -1163,6 +1216,101 @@ impl Projector {
         } else {
             self.data_keys(value, hydrate, outcome, KeyContext::Data);
         }
+    }
+
+    /// The encoded carrier `text` with each value the check finds replaced where it stands, inside
+    /// one of its string values and between escapes, every other byte kept: the carrier stays the
+    /// same JSON, and hydration restores its spelling byte for byte. `None` when that can't be done
+    /// without leaving a found value behind (see [`Self::leaves_a_value`]); the caller then
+    /// replaces the carrier whole.
+    fn protect_in_place(
+        &mut self,
+        text: &str,
+        decoded: &Value,
+        finds: impl Fn(&Self, &str, &Value) -> bool,
+    ) -> Option<Outcome> {
+        if self.encoded_findings(text, true).is_some() || has_duplicate_members(text) {
+            return None;
+        }
+        let fields = encoded_fields(text, decoded).ok()?;
+        let mut findings = Vec::new();
+        for field in &fields {
+            let mut start = field.range.start + 1;
+            let stops = field
+                .escapes
+                .iter()
+                .map(|escape| (escape.start, escape.end))
+                .chain(std::iter::once((field.range.end - 1, field.range.end - 1)));
+            for (stop, resume) in stops {
+                let batch = self.policy.scan(&text[start..stop], MAX_FINDINGS);
+                if !batch.complete || (field.media && !batch.findings.is_empty()) {
+                    return None;
+                }
+                findings.extend(batch.findings.into_iter().map(|mut finding| {
+                    finding.start += start;
+                    finding.end += start;
+                    finding
+                }));
+                start = resume;
+            }
+        }
+        let explicit = self.policy.explicit_findings(text, MAX_FINDINGS);
+        if findings.is_empty()
+            || !explicit.complete
+            || explicit.findings.iter().any(|hit| {
+                !findings
+                    .iter()
+                    .any(|found| found.start <= hit.start && hit.end <= found.end)
+            })
+        {
+            return None;
+        }
+        let values: Vec<String> = findings
+            .iter()
+            .map(|finding| text[finding.start..finding.end].to_owned())
+            .collect();
+        let next = self.protect_batch(
+            text,
+            Batch {
+                findings,
+                complete: true,
+            },
+        );
+        if next.status != Status::Complete || self.leaves_a_value(&next.content, &values, finds) {
+            return None;
+        }
+        Some(next)
+    }
+
+    /// Whether `protected`, a carrier replaced in place, still holds anything the check would
+    /// keep back: it no longer parses, one of the replaced `values` appears in its raw text or in
+    /// any decoded string or member name (escapes undone), or the check (`finds`, the one that
+    /// found them) finds something in it again. Any of these falls back to replacing the carrier
+    /// whole.
+    fn leaves_a_value(
+        &self,
+        protected: &str,
+        values: &[String],
+        finds: impl Fn(&Self, &str, &Value) -> bool,
+    ) -> bool {
+        fn holds(value: &Value, found: &str) -> bool {
+            match value {
+                Value::String(text) => text.contains(found),
+                Value::Array(values) => values.iter().any(|value| holds(value, found)),
+                Value::Object(values) => values
+                    .iter()
+                    .any(|(name, value)| name.contains(found) || holds(value, found)),
+                _ => false,
+            }
+        }
+        let Ok(decoded) = serde_json::from_str::<Value>(protected) else {
+            return true;
+        };
+        values
+            .iter()
+            .any(|found| protected.contains(found.as_str()) || holds(&decoded, found))
+            || self.scan_encoded(protected, &decoded).is_some()
+            || finds(self, protected, &decoded)
     }
 
     /// Escaped JSON payloads retain their exact spelling for native continuation. A decoded
@@ -3411,5 +3559,189 @@ mod tests {
             projector.transform("{\"text\":\"plain\"}\nplain line\n", Mode::HydrateJsonl);
         assert!(restored.status == Status::Partial);
         assert_eq!(restored.reason, Some(Reason::LegacyRules));
+    }
+
+    fn blocking(
+        value: &'static str,
+        entropy: crate::domain::privacy::detector::Entropy,
+    ) -> (tempfile::TempDir, Projector) {
+        let root = tempfile::tempdir().unwrap();
+        let projector = Projector {
+            store: Store::open(&root.path().join("privacy"), None).unwrap(),
+            dictionary: Dictionary::default(),
+            policy: Snapshot::compile(
+                &[super::super::policy::Literal {
+                    value,
+                    source: Source::RepositoryUser,
+                }],
+                &[],
+                false,
+            )
+            .unwrap()
+            .with_entropy(entropy),
+            key: None,
+            complete: true,
+            missing: None,
+            hydration_growth: Default::default(),
+        };
+        (root, projector)
+    }
+
+    const CALL: &str = "call_V9qB3nR7mK2xH8pL4sW6cF1a";
+
+    /// A Codex call whose own call_id is a blocked value keeps that call_id, and its arguments
+    /// keep every byte but the blocked occurrence, which becomes a placeholder where it stands:
+    /// they stay JSON with their own spelling, so the call still reads and pairs with its result,
+    /// and hydration gives back the record byte for byte. That holds with and without entropy
+    /// replacement. Replacing the arguments whole leaves the call with an input no runtime can
+    /// read back.
+    #[test]
+    fn a_blocked_call_id_keeps_the_call_and_its_encoded_arguments() {
+        let arguments =
+            format!("{{\"cmd\":\"printf '%s\\\\n' '{CALL}'\",\"workdir\":\"/workspace/demo\"}}");
+        let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":CALL,"name":"exec_command","arguments":arguments}});
+        let output = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":CALL,"output":format!("Private correlation value: {CALL}")}});
+        let input = format!("{call}\n{output}\n");
+        for entropy in [
+            crate::domain::privacy::detector::Entropy::Exclude,
+            crate::domain::privacy::detector::Entropy::Include,
+        ] {
+            let (_root, mut projector) = blocking(CALL, entropy);
+            let protected = projector.transform(&input, Mode::ProtectJsonl);
+            assert!(protected.status == Status::Complete, "{entropy:?}");
+            let records: Vec<Value> = protected
+                .content
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records[0]["payload"]["call_id"], CALL, "{entropy:?}");
+            assert_eq!(records[1]["payload"]["call_id"], CALL, "{entropy:?}");
+            let encoded = records[0]["payload"]["arguments"].as_str().unwrap();
+            let (before, after) = arguments.split_once(CALL).unwrap();
+            let token = encoded
+                .strip_prefix(before)
+                .and_then(|rest| rest.strip_suffix(after))
+                .unwrap_or_else(|| panic!("{entropy:?}: {encoded}"));
+            assert!(whole_token(token), "{entropy:?}: {encoded}");
+            let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+            assert_eq!(restored.content, input, "{entropy:?}");
+        }
+    }
+
+    /// A value written once plainly and once escaped (`\u0063` for its first letter) can't be
+    /// replaced where it stands: the escaped occurrence is no literal run of its bytes. The
+    /// arguments are then replaced whole, as before, so neither occurrence reaches the record, and
+    /// hydration still gives them back byte for byte. Replacing only the plain occurrence leaves
+    /// the value in the decoded arguments.
+    #[test]
+    fn a_value_also_written_escaped_falls_back_to_the_whole_arguments() {
+        let arguments = format!(
+            "{{\"plain\":\"{CALL}\",\"escaped\":\"\\u0063{}\"}}",
+            &CALL[1..]
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).unwrap()["escaped"],
+            CALL
+        );
+        let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call_other","name":"exec_command","arguments":arguments}});
+        let input = format!("{call}\n");
+        let (_root, mut projector) =
+            blocking(CALL, crate::domain::privacy::detector::Entropy::Exclude);
+        let protected = projector.transform(&input, Mode::ProtectJsonl);
+        let record: Value = serde_json::from_str(protected.content.trim_end()).unwrap();
+        let encoded = record["payload"]["arguments"].as_str().unwrap();
+        assert!(!protected.content.contains(&CALL[1..]), "{encoded}");
+        assert!(
+            serde_json::from_str::<Value>(encoded)
+                .map_or(true, |decoded| !decoded.to_string().contains(&CALL[1..])),
+            "{encoded}"
+        );
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        assert_eq!(restored.content, input);
+    }
+
+    /// A Hermes record's tool calls, one JSON-encoded carrier, hold two calls: the first with a
+    /// blocked value, the second with a value only its key (`password`) marks as a credential,
+    /// and no backslash anywhere. Each call's values are checked with their keys, so neither value
+    /// appears raw or decoded, and hydration restores the record byte for byte. Replacing values
+    /// where they stand in this carrier finds the blocked value but leaves the second, which only
+    /// the key around it reveals.
+    #[test]
+    fn a_key_marked_value_in_a_hermes_carrier_is_replaced() {
+        const PASSWORD: &str = "Kq7mTz9vLp2wXr4n";
+        let calls = json!([
+            {"id":"call_1","function":{"name":"read","arguments":{"note":CALL}}},
+            {"id":"call_2","function":{"name":"login","arguments":{"password":PASSWORD}}}
+        ])
+        .to_string();
+        assert!(!calls.contains('\\'), "{calls}");
+        let record =
+            json!({"type":"hermes_message","data":{"role":"assistant","tool_calls":calls}});
+        let input = format!("{record}\n");
+        let (_root, mut projector) =
+            blocking(CALL, crate::domain::privacy::detector::Entropy::Exclude);
+        let protected = projector.transform(&input, Mode::ProtectJsonl);
+        let carrier = serde_json::from_str::<Value>(protected.content.trim_end()).unwrap()["data"]
+            ["tool_calls"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for value in [CALL, PASSWORD] {
+            assert!(!protected.content.contains(value), "{carrier}");
+            if let Ok(decoded) = serde_json::from_str::<Value>(&carrier) {
+                assert!(!decoded.to_string().contains(value), "{carrier}");
+            }
+        }
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        assert_eq!(restored.content, input);
+    }
+
+    /// The members of an encoded call are read by name, not in the order they sit in the text:
+    /// `a` is read before `z` though it comes after. A value in both, with the later-read one
+    /// holding an escape, is replaced where it stands without slicing backwards.
+    #[test]
+    fn values_in_members_out_of_name_order_are_replaced_where_they_stand() {
+        let arguments = format!("{{\"z\":\"{CALL}\",\"a\":\"{CALL}\\n\"}}");
+        let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call_other","name":"exec_command","arguments":arguments}});
+        let input = format!("{call}\n");
+        let (_root, mut projector) =
+            blocking(CALL, crate::domain::privacy::detector::Entropy::Exclude);
+        let protected = projector.transform(&input, Mode::ProtectJsonl);
+        assert!(protected.status == Status::Complete);
+        let record: Value = serde_json::from_str(protected.content.trim_end()).unwrap();
+        let encoded = record["payload"]["arguments"].as_str().unwrap();
+        assert!(!protected.content.contains(CALL), "{encoded}");
+        let decoded: Value = serde_json::from_str(encoded).unwrap();
+        assert!(decoded["z"].as_str().is_some_and(whole_token), "{encoded}");
+        assert!(decoded["a"].as_str().unwrap().ends_with('\n'), "{encoded}");
+        let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+        assert_eq!(restored.content, input);
+    }
+
+    /// An object that names a member twice reads as its last one only, so a check of the decoded
+    /// arguments never sees the first. Here the first holds either the blocked value with an
+    /// escaped first letter, which no raw match finds, or a value only its key (`password`)
+    /// marks; the last is harmless. Such arguments are replaced whole instead, and the value is
+    /// nowhere in them, raw or with its escape undone.
+    #[test]
+    fn a_member_named_twice_falls_back_to_the_whole_arguments() {
+        const PASSWORD: &str = "Kq7mTz9vLp2wXr4n";
+        for (name, first, hidden) in [
+            ("shadow", format!("\\u0063{}", &CALL[1..]), &CALL[1..]),
+            ("password", PASSWORD.to_owned(), PASSWORD),
+        ] {
+            let arguments =
+                format!("{{\"{name}\":\"{first}\",\"{name}\":\"safe\",\"note\":\"{CALL}\\n\"}}");
+            let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"call_other","name":"exec_command","arguments":arguments}});
+            let input = format!("{call}\n");
+            let (_root, mut projector) =
+                blocking(CALL, crate::domain::privacy::detector::Entropy::Exclude);
+            let protected = projector.transform(&input, Mode::ProtectJsonl);
+            let record: Value = serde_json::from_str(protected.content.trim_end()).unwrap();
+            let encoded = record["payload"]["arguments"].as_str().unwrap();
+            assert!(!protected.content.contains(hidden), "{name}: {encoded}");
+            let restored = projector.transform(&protected.content, Mode::HydrateJsonl);
+            assert_eq!(restored.content, input, "{name}");
+        }
     }
 }
