@@ -39,6 +39,10 @@ pub const RPC_FEATURES: &[&str] = &[
     // only in Claude Code and never for the owner, and recorded as such through resume and
     // takeover. Any other origin is refused (`rc::project_share`).
     "project-share-v1",
+    // A message a non-owner leaves waiting for the next turn is delivered only while that account
+    // keeps sending this session admitted requests, or `session.enqueue.keep`; one left longer
+    // than the limit without either is dropped as access_ended.
+    "queued-keep-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

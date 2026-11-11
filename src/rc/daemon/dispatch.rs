@@ -574,6 +574,25 @@ impl Daemon {
                 .unwrap())
             }
 
+            method::SESSION_ENQUEUE_KEEP => {
+                let p: crate::protocol::SessionEnqueueKeep = f.params_as()?;
+                let d = self.session_channel(&p.session_id, &caller, Need::Brake)?;
+                let keep = d.tx.try_reserve().map_err(|_| {
+                    RpcError::new(
+                        ErrorCode::SessionBusy,
+                        "that session's queue is full; the keep was not taken",
+                    )
+                })?;
+                keep.send(Command::Keep {
+                    attribution: MessageAttribution::from_caller(
+                        &caller,
+                        None,
+                        Some(p.client_msg_id),
+                    ),
+                });
+                Ok(serde_json::json!({ "session_id": p.session_id, "kept": true }))
+            }
+
             method::SESSION_STOP | method::SESSION_CLOSE => {
                 let p: crate::protocol::SessionStop = f.params_as()?;
                 // A brake, like interrupt: anyone who may instruct the session may stop it,

@@ -1691,6 +1691,8 @@ fn min_role(method_name: &str) -> Role {
         // acquire the writer lock or start a turn, so an operator may enqueue text while the
         // original process remains the sole transcript writer.
         method::SESSION_ENQUEUE => Role::Operator,
+        // Only says its sender is still there: it starts nothing and takes no queue slot.
+        method::SESSION_ENQUEUE_KEEP => Role::Operator,
         // Close also stops this machine's collection of the session's transcript, which decides
         // what of the owner's work gets saved; an operator may only stop.
         method::SESSION_CLOSE => Role::Owner,

@@ -1154,6 +1154,14 @@ pub struct TurnSteer {
     pub client_msg_id: Option<String>,
 }
 
+/// `session.enqueue.keep`: the sender of `client_msg_id`, which waits for this session's next
+/// turn, is still allowed to send it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnqueueKeep {
+    pub session_id: String,
+    pub client_msg_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSteerResult {
     /// The UI shows a "queued" state when this is `AtToolBoundary`.
@@ -1168,6 +1176,9 @@ pub struct TurnSteerDropped {
     /// `mode_owner_only` or `home_folder` (the session's gates refused it when it went), or
     /// `not_sent` (its turn didn't start).
     pub reason: String,
+    /// Who sent it, as `turn.started` names them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<MessageSender>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

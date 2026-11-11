@@ -1281,6 +1281,8 @@ pub enum Command {
         armed: Option<u64>,
         reply: Ticket<PermissionModeOutcome>,
     },
+    /// The sender of a message waiting for the next turn is still allowed to send it.
+    Keep { attribution: MessageAttribution },
     /// Stop at a person's request: a turn it cuts is held like their own interrupt.
     Shutdown,
     /// Stop that nobody chose for the running turn: it ends where agit stops it.
@@ -1300,7 +1302,7 @@ pub enum Command {
 fn accept(c: &Command) -> bool {
     match c {
         Command::ClaudeRestartGuardReady => true,
-        Command::InitialTurn { .. } => true,
+        Command::InitialTurn { .. } | Command::Keep { .. } => true,
         Command::Model { reply, .. }
         | Command::Runtime { reply, .. }
         | Command::Enqueue { reply, .. } => reply.accept(),
@@ -1314,6 +1316,20 @@ fn accept(c: &Command) -> bool {
 }
 
 impl Command {
+    /// The account whose admitted request this is, when it names one.
+    fn sender_account(&self) -> Option<&str> {
+        match self {
+            Command::InitialTurn { attribution, .. }
+            | Command::Turn { attribution, .. }
+            | Command::Steer { attribution, .. }
+            | Command::Keep { attribution } => attribution
+                .sender
+                .as_ref()
+                .map(|sender| sender.account_id.as_str()),
+            _ => None,
+        }
+    }
+
     /// The sender's own id for the words this command carries, when it carries words.
     pub(crate) fn client_msg_id(&self) -> Option<&str> {
         match self {
@@ -2449,6 +2465,9 @@ impl Session {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut deferred_command = None;
+        // Whether `deferred_command` is a waiting message the session took up itself, not a
+        // request the daemon sent.
+        let mut dequeued = false;
         loop {
             if self
                 .landing
@@ -2463,6 +2482,7 @@ impl Session {
                 && let Some(command) = self.next_queued_turn().await
             {
                 deferred_command = Some(Some(command));
+                dequeued = true;
             }
             tokio::select! {
                 biased;
@@ -2472,6 +2492,7 @@ impl Session {
                         None => commands.recv().await,
                     }
                 }, if self.stopping_turn.is_none() => {
+                    let from_queue = std::mem::take(&mut dequeued);
                     // **Do not do it when nobody is waiting.**
                     //
                     // The daemon's wait for an answer is bounded (a slow settlement can hold it
@@ -2503,6 +2524,11 @@ impl Session {
                         }
                         other => other,
                     };
+                    // An admitted request from an account says that account is still there, for
+                    // its messages waiting for the next turn.
+                    if let Some(command) = &cmd {
+                        self.steer_queue.admitted(command, from_queue);
+                    }
                     if let Some(command) = &cmd
                         && let Err(error) = self.prepare_fallback_instruction(command).await {
                             self.reject_fallback_instruction(cmd.expect("command was checked"), error).await;
@@ -2637,6 +2663,7 @@ impl Session {
                             }
                             if self.info.status == SessionStatus::Ended { return; }
                         }
+                        Some(Command::Keep { .. }) => {}
                         Some(Command::Interrupt { expected_turn_id, reply }) => {
                             if self.pending_interrupt_command.is_some() {
                                 reply.finish(Err(anyhow::anyhow!("a native stop is awaiting its receipt")));
@@ -2875,6 +2902,7 @@ impl Session {
                         }
                         Some(e) => {
                             deferred_command = self.on_harness_event_with_commands(e, Some(commands)).await;
+                            dequeued = false;
                             if self.info.status == SessionStatus::Ended {
                                 return;
                             }
@@ -2886,8 +2914,8 @@ impl Session {
                     }
                 }
 
-                Some((client_msg_id, outcome)) = self.steer_queue.outcomes.1.recv() => {
-                    self.queued_turn_outcome(client_msg_id, outcome).await;
+                Some((attribution, outcome)) = self.steer_queue.outcomes.1.recv() => {
+                    self.queued_turn_outcome(&attribution, outcome).await;
                 }
 
                 _ = ticker.tick() => {
@@ -2902,6 +2930,7 @@ impl Session {
                     self.finish_publication(false).await;
                     if self.idle_settlement_ready() {
                         deferred_command = self.settle_until_command(commands).await;
+                        dequeued = false;
                     }
                     // **The mode is a value to poll, not a series of events each call site
                     // must remember to broadcast.**
