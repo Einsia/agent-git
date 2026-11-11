@@ -17,7 +17,7 @@ from adapter import ADAPTER_VERSION, Worker, cleanup, dumps, version, telemetry
 from evaluate import compare, score, succeeds
 from contracts import validate_case
 from report import render, write_json
-from sources import BenchError, Sources
+from sources import BenchError, sources_for
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER_VERSION = 3
@@ -210,8 +210,7 @@ def main():
             if response.returncode:
                 raise BenchError('Cannot read the explicitly selected local glab credential')
             token = response.stdout.strip()
-        sources = Sources(token)
-        sources.preflight()
+        sources = sources_for((args.baseline, args.candidate), token)
         with tempfile.TemporaryDirectory(prefix='privacy-bench-') as temporary:
             work = Path(temporary)
             binaries = {}

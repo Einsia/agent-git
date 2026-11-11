@@ -15,7 +15,7 @@ from adapter import Worker, clean_env
 from evaluate import compare, score, summarize, succeeds
 from contracts import lookup, MISSING, RUNTIMES, layout_records, policy_record_contracts, record_contracts, validate_case, validate_stream
 from report import render
-from sources import BenchError, Sources, tar_members
+from sources import BenchError, Sources, sources_for, tar_members
 
 PLACEHOLDER = '‹secret:credential:abcdefghijkl›'
 
@@ -340,6 +340,39 @@ class DistributionContract(unittest.TestCase):
                 with self.assertRaises(BenchError) as caught:
                     source.preflight()
                 self.assertEqual(str(caught.exception), f'Distribution request failed: HTTP {status}')
+
+    def test_release_pairs_need_no_token_and_only_dev_selectors_reach_gitlab(self):
+        """Two release: selectors come only from public npm, so the run's sources hold no credential,
+        make no preflight and refuse any GitLab request, with or without a token in the environment.
+        A run with any dev: selector still needs the token: without one it fails with the same message
+        before any request, and with one it makes the preflight. Sources that required the token for a
+        release pair would stop a comparison of shipped releases on a credential it never uses; sources
+        that dropped it for a dev: selector would send unauthenticated requests to GitLab."""
+        unreachable = AssertionError('no request is expected')
+        with patch('urllib.request.OpenerDirector.open', side_effect=unreachable):
+            for token in (None, 'synthetic-noncredential'):
+                source = sources_for(('release:0.2.46', 'release:0.2.48'), token)
+                self.assertIsNone(source.token)
+                with self.assertRaises(BenchError) as caught:
+                    source.dev('dev:latest')
+                self.assertEqual(str(caught.exception), 'BENCH_GITLAB_READ_TOKEN is required (read_api for project 87)')
+            for selectors in (('release:latest', 'dev:latest'), ('dev:42', 'release:0.2.48'), ('dev:latest', 'dev:latest')):
+                for token in (None, '', ' '):
+                    with self.subTest(selectors=selectors, token=token), self.assertRaises(BenchError) as caught:
+                        sources_for(selectors, token)
+                    self.assertEqual(str(caught.exception), 'BENCH_GITLAB_READ_TOKEN is required (read_api for project 87)')
+        source.stable = ['1.0.0']
+        metadata = {'name': '@einsia/agent-git-linux-x64', 'version': '1.0.0',
+                    'dist': {'tarball': 'https://registry.npmjs.org/fixture.tgz', 'integrity': 'sha512-invalid'}}
+        with patch.object(source, 'npm', return_value=metadata), \
+             patch.object(source, 'get', return_value=b'tampered') as get:
+            with self.assertRaisesRegex(BenchError, 'integrity verification failed'):
+                source.release('release:1.0.0')
+            get.assert_called_once_with('https://registry.npmjs.org/fixture.tgz')
+        with patch.object(Sources, 'preflight') as preflight:
+            source = sources_for(('release:latest', 'dev:latest'), 'synthetic-noncredential')
+        preflight.assert_called_once_with()
+        self.assertEqual(source.token, 'synthetic-noncredential')
 
     def test_archive_integrity_links_and_duplicate_members_are_not_executed(self):
         source = Sources('synthetic-noncredential')

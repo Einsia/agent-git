@@ -17,6 +17,7 @@ TARGET = 'x86_64-unknown-linux-gnu'
 PACKAGE = '@einsia/agent-git-linux-x64'
 STABLE = re.compile(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')
 MAX_ARCHIVE = 256 * 1024 * 1024
+TOKEN_REQUIRED = 'BENCH_GITLAB_READ_TOKEN is required (read_api for project 87)'
 
 
 class BenchError(Exception):
@@ -34,15 +35,18 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Sources:
-    def __init__(self, token):
-        if not token or not token.strip():
-            raise BenchError('BENCH_GITLAB_READ_TOKEN is required (read_api for project 87)')
-        self.token = token
+    def __init__(self, token, public=False):
+        # Public sources hold no credential and can never send a request to GitLab.
+        if not public and (not token or not token.strip()):
+            raise BenchError(TOKEN_REQUIRED)
+        self.token = None if public else token
         self.opener = urllib.request.build_opener(NoRedirect())
         self.stable = None
         self.resolved = {}
 
     def get(self, url, private=False):
+        if private and self.token is None:
+            raise BenchError(TOKEN_REQUIRED)
         expected = GITLAB if private else REGISTRY
         if (urllib.parse.urlsplit(url).scheme != 'https'
                 or urllib.parse.urlsplit(url).netloc != urllib.parse.urlsplit(expected).netloc):
@@ -180,6 +184,18 @@ class Sources:
         path.chmod(0o700)
         record['binary_sha256'] = sha(binary)
         return path, record
+
+
+def sources_for(selectors, token):
+    """The sources a run of these selectors needs. A release: selector comes only from public npm,
+    checked against its sha512 integrity, so a run of release: selectors alone gets public sources and
+    makes no preflight; any other selector needs the read token, and the run fails before any request
+    when it is missing."""
+    if all(selector.startswith('release:') for selector in selectors):
+        return Sources(token, public=True)
+    source = Sources(token)
+    source.preflight()
+    return source
 
 
 def eligible(job):

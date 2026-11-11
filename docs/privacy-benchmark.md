@@ -27,12 +27,13 @@ selected benchmark parameters, not arbitrary parent pipeline variables. Release 
 dev pairs and mixed pairs all follow the same resolution and verification path. Choosing
 the same selector on both sides explicitly requests a consistency comparison.
 
-Provision `BENCH_GITLAB_READ_TOKEN` as a **masked, protected** project CI variable with
-`read_api` access to CLI project 87. It is required even for a release pair so a missing
-credential never silently changes the configured execution mode. It is used only for
-build queries and artifact downloads. Never put its value in Git, command arguments,
-fixtures, reports or ordinary runtime secrets. No Hub login, GitOps key, AWS permission,
-report-repository credential or real session is needed.
+A run that names a `dev:` selector needs `BENCH_GITLAB_READ_TOKEN`, a **masked, protected**
+project CI variable with `read_api` access to CLI project 87, and fails before any request
+without it. The token is used only for build queries and artifact downloads. Never put its
+value in Git, command arguments, fixtures, reports or ordinary runtime secrets. A run of two
+`release:` selectors needs no token: both sides come only from public npm, checked against
+its sha512 integrity, and the run sends nothing to GitLab. No Hub login, GitOps key, AWS
+permission, report-repository credential or real session is needed.
 
 The child uses the protected `sg-network-io` runner pool instead of the CLI's ordinary
 Rust validation pool. `resource_group` permits one benchmark job at a time; the Python
