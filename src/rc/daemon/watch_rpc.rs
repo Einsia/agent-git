@@ -1163,36 +1163,72 @@ mod watch_activity_tests {
 }
 
 /// Recover lifecycle state before the display window without retaining transcript contents.
+///
+/// The newest marker before the window is the state, so the lines are read backward from the
+/// window and the first marker ends the read: a long session pays for its current turn, not for
+/// every turn before it. Only complete lines short enough to be markers are parsed.
 fn watch_seed_event(runtime: &str, path: &std::path::Path, before: u64) -> Option<Frame> {
-    use std::io::{BufRead, Read};
+    use std::io::{Read, Seek, SeekFrom};
+    /// The longest line, newline included, that can hold a turn marker.
+    const LONGEST: usize = 65537;
+    const CHUNK: u64 = 64 * 1024;
     if runtime != "codex" || before == 0 {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file.take(before));
-    let mut last = None;
-    let mut skipping = false;
-    loop {
-        let mut bytes = Vec::new();
-        let count = reader
-            .by_ref()
-            .take(65537)
-            .read_until(b'\n', &mut bytes)
-            .ok()?;
-        if count == 0 {
-            break;
+    let mut file = std::fs::File::open(path).ok()?;
+    let marker = |line: &[u8]| {
+        std::str::from_utf8(line)
+            .ok()
+            .and_then(|line| watch_turn_event(runtime, line))
+    };
+    // `carried` holds, in file order, the bytes after the newest newline found so far that began
+    // in a later read. Before the first newline it is the window's own unterminated remainder,
+    // which is never a whole line. A line inside one read is parsed where it lies; only a line
+    // that spans reads is copied, and each copy is a bulk one.
+    let mut carried: Vec<u8> = Vec::new();
+    let mut too_long = false;
+    let mut terminated = false;
+    let mut chunk = vec![0; CHUNK as usize];
+    let mut end = before;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let bytes = &mut chunk[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(bytes).ok()?;
+        let bytes = &*bytes;
+        let mut segment_end = bytes.len();
+        for index in memchr::memrchr_iter(b'\n', bytes) {
+            let segment = &bytes[index + 1..segment_end];
+            if terminated && !too_long && carried.len() + segment.len() < LONGEST {
+                let found = if carried.is_empty() {
+                    marker(segment)
+                } else {
+                    marker(&[segment, &carried].concat())
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            carried.clear();
+            too_long = false;
+            terminated = true;
+            segment_end = index;
         }
-        let complete = bytes.last() == Some(&b'\n');
-        if !skipping
-            && complete
-            && let Ok(line) = std::str::from_utf8(&bytes)
-            && let Some(frame) = watch_turn_event(runtime, line)
-        {
-            last = Some(frame);
+        let rest = &bytes[..segment_end];
+        if !too_long {
+            if carried.len() + rest.len() < LONGEST {
+                carried = [rest, &carried].concat();
+            } else {
+                too_long = true;
+                carried.clear();
+            }
         }
-        skipping = !complete;
+        end = start;
     }
-    last
+    if terminated && !too_long {
+        return marker(&carried);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1218,6 +1254,19 @@ mod watch_seed_tests {
         )
         .unwrap();
         assert_eq!(event.method(), "turn.completed");
+
+        // A marker split across two of the backward reads is still found whole: its halves are
+        // joined before it is parsed, and either half alone parses as nothing.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{{\"type\":\"token_usage_record\"}}").unwrap();
+        let marker = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"split\"}}\n";
+        file.write_all(marker.as_bytes()).unwrap();
+        // One read back from `before` ends halfway through the marker.
+        let filler = 64 * 1024 - marker.len() / 2;
+        writeln!(file, "{}", "x".repeat(filler - 1)).unwrap();
+        let before = file.as_file().metadata().unwrap().len();
+        let event = watch_seed_event("codex", file.path(), before).unwrap();
+        assert_eq!(event.method(), "turn.started");
     }
 }
 

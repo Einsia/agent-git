@@ -255,6 +255,9 @@ regex = "1"
 # Not a new dependency: regex already depends on it; this only promotes it to a
 # direct dependency so the domain layer can use it too.
 aho-corasick = "1"
+# Not a new dependency either (regex and aho-corasick depend on it): the RC watch scans find
+# line breaks in transcripts with it.
+memchr = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 # git-parity: restores the default SIGPIPE disposition, so `agit log | head`
 # exits cleanly.
