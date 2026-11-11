@@ -797,7 +797,8 @@ fn noninteractive_login_returns_a_human_link_and_completion_claims_it() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(text.contains(url));
-        assert!(text.contains("Ask the human"));
+        assert!(text.contains("Open the login link, sign in, and approve CLI access."));
+        assert!(!text.contains("Ask the human"));
         assert!(!text.contains("how do you want to sign in"));
         let command = [
             "agit",

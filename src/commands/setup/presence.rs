@@ -30,7 +30,7 @@ const QUIET_PERIOD: chrono::Duration = chrono::Duration::hours(24);
 
 /// The line for a caller that cannot answer. An agent reads it too, so it tells the reader to ask
 /// the person instead of handing it a command to run.
-pub(crate) const UNATTENDED_LINE: &str = "agit is not set up on this computer, so nothing is captured. Ask the person before running `agit setup`.";
+pub(crate) const UNATTENDED_LINE: &str = "agit is not set up on this computer, so nothing is captured. `agit setup` sets it up; an agent asks the person before running it.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Presence {
@@ -48,7 +48,7 @@ pub(crate) enum Presence {
 /// [`UNATTENDED_LINE`] for runtimes here that the last setup did not cover.
 fn unattended_partly(runtimes: &[&str]) -> String {
     format!(
-        "agit is not set up for {} on this computer, so their conversations are not captured. Ask the person before running `agit setup`.",
+        "agit is not set up for {} on this computer, so their conversations are not captured. `agit setup` sets it up; an agent asks the person before running it.",
         labels(runtimes)
     )
 }

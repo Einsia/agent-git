@@ -763,7 +763,7 @@ pub(super) fn run(
             || {
                 if !interactive_part && encrypted && nobody_to_ask {
                     return Err(crate::commands::InteractionRequired(format!(
-                        "{published} of {total} parts are published; part {part} carries encrypted sessions, which need the person's confirmation: run `{retry_command}` in a terminal, or pass --yes once they have confirmed it in this conversation"
+                        "{published} of {total} parts are published; part {part} carries encrypted sessions, which need a yes from the person: run `{retry_command}` in an interactive terminal to be asked, or add --yes once they have said yes in this conversation"
                     ))
                     .into());
                 }
@@ -804,7 +804,7 @@ pub(super) fn run(
                     .into());
                 }
                 if public && !args.audit && !ui::prompt::can_ask() {
-                    return Err(crate::commands::InteractionRequired("publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation".into()).into());
+                    return Err(crate::commands::InteractionRequired("publishing to a public repository needs a yes from the person: run it in an interactive terminal to be asked, or add --yes once they have said yes in this conversation".into()).into());
                 }
                 let question = match (person_only, in_parts, part == 1) {
                     (true, false, _) => format!(
