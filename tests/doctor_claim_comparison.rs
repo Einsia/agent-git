@@ -78,8 +78,10 @@ fn doctor_repository_scope_filters_complete_claim_identity_before_native_reads()
             String::from_utf8_lossy(&output.stderr)
         );
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("alice/qa@work"), "{text}");
-        assert!(text.contains("checked 1 live transcripts"), "{text}");
+        assert!(
+            text.contains("checked 1 live transcripts: 1 matches what was saved"),
+            "{text}"
+        );
         for excluded in ["bob/qa", "alice/other", "unknown-owner", ": unavailable"] {
             assert!(!text.contains(excluded), "{text}");
         }
@@ -248,6 +250,21 @@ impl Lab {
         assert!(out.contains(&format!("): {status} —")), "{out}");
         out
     }
+
+    /// Every one of the `count` compared transcripts still starts with what was saved: they have
+    /// no rows, only the summary says so.
+    fn assert_matches(&self, count: usize) -> String {
+        let out = self.comparison();
+        let verb = if count == 1 { "matches" } else { "match" };
+        assert!(
+            out.contains(&format!(
+                "checked {count} live transcripts: {count} {verb} what was saved"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("): "), "{out}");
+        out
+    }
 }
 
 #[test]
@@ -266,7 +283,7 @@ fn doctor_refuses_malformed_claim_repository_identity_before_resolving_paths() {
             outside.to_str().unwrap(),
         ],
     );
-    lab.assert_status("clean");
+    lab.assert_matches(1);
     let outside_refs = lab.git(&outside, &["show-ref"]);
     for (owner, agent) in [
         ("..", "outside"),
@@ -329,10 +346,8 @@ fn doctor_compares_exact_owner_and_committed_branch_without_changing_claims() {
     .unwrap();
     let refs = lab.git(&lab.repo(), &["show-ref"]);
     let claim = fs::read(&lab.link).unwrap();
-    let out = lab.assert_status("clean");
-    assert!(out.contains("alice/qa@work"), "{out}");
+    let out = lab.assert_matches(1);
     assert!(!out.contains("bob/qa"), "{out}");
-    assert!(out.contains("checked 1 live transcripts"), "{out}");
     assert_eq!(lab.git(&lab.repo(), &["show-ref"]), refs);
     assert_eq!(fs::read(&lab.link).unwrap(), claim);
     assert_eq!(
@@ -382,9 +397,10 @@ fn doctor_reports_missing_claim_evidence_without_falling_back_to_other_refs() {
 fn doctor_distinguishes_native_growth_truncation_rewrite_and_incomplete_evidence() {
     let lab = Lab::new(false);
     let original = fs::read_to_string(&lab.live).unwrap();
-    lab.assert_status("clean");
+    lab.assert_matches(1);
+    // Turns after the save leave what was saved as it was, so they need nothing from doctor.
     fs::write(&lab.live, format!("{original}{}", lab.turn(3))).unwrap();
-    lab.assert_status("appended");
+    lab.assert_matches(1);
     fs::write(&lab.live, lab.turn(1)).unwrap();
     lab.assert_status("truncated");
     fs::write(
@@ -423,16 +439,15 @@ fn doctor_checks_real_cross_runtime_materialization_against_its_own_baseline() {
         .unwrap()
         .into_path();
     let original = fs::read(&live).unwrap();
-    let out = lab.assert_status("clean");
-    assert!(out.contains("codex"), "{out}");
-    assert!(!out.contains("claude-code"), "{out}");
-    assert!(out.contains("checked 1 live transcripts"), "{out}");
+    lab.assert_matches(1);
     let mut appended = original.clone();
     appended.extend_from_slice(b"{\"appended\":true}\n");
     fs::write(&live, appended).unwrap();
-    lab.assert_status("appended");
+    lab.assert_matches(1);
     fs::write(&live, &original[..original.len() - 1]).unwrap();
-    lab.assert_status("truncated");
+    let out = lab.assert_status("truncated");
+    assert!(out.contains("codex"), "{out}");
+    assert!(!out.contains("claude-code"), "{out}");
     let mut rewritten = original.clone();
     rewritten[0] ^= 1;
     fs::write(&live, rewritten).unwrap();
@@ -506,14 +521,7 @@ fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
         .into_path();
     let before = fs::read(&dictionary).unwrap();
     let modified = fs::metadata(&dictionary).unwrap().modified().unwrap();
-    let out = lab.comparison();
-    for branch in ["work", "after-mapping"] {
-        let row = out
-            .lines()
-            .find(|line| line.contains(&format!("alice/qa@{branch} (")))
-            .unwrap();
-        assert!(row.contains("): clean —"), "{out}");
-    }
+    lab.assert_matches(2);
     assert_eq!(fs::read(&dictionary).unwrap(), before);
     assert_eq!(
         fs::metadata(&dictionary).unwrap().modified().unwrap(),
@@ -521,12 +529,23 @@ fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
     );
     let backup = dictionary.with_extension("saved");
     fs::rename(&dictionary, &backup).unwrap();
+    // What the last save recorded is checked by its digest, which needs no secret mappings.
+    lab.assert_matches(2);
+    assert!(!dictionary.exists());
+    // Without that record the whole transcript is compared, and the mappings are needed.
+    let later_link = lab.link.with_file_name(format!("{later}.json"));
+    let mut later_claim: Value = serde_json::from_slice(&fs::read(&later_link).unwrap()).unwrap();
+    assert!(
+        later_claim.get("native_checkpoint").is_some(),
+        "{later_claim}"
+    );
+    later_claim
+        .as_object_mut()
+        .unwrap()
+        .remove("native_checkpoint");
+    fs::write(&later_link, later_claim.to_string()).unwrap();
     let out = lab.comparison();
-    let old = out
-        .lines()
-        .find(|line| line.contains("alice/qa@work ("))
-        .unwrap();
-    assert!(old.contains("): clean —"), "{out}");
+    assert!(!out.contains("alice/qa@work ("), "{out}");
     let protected = out
         .lines()
         .find(|line| line.contains("alice/qa@after-mapping ("))

@@ -401,8 +401,10 @@ fn doctor_reports_corrupt_links_without_misattribution_or_private_values() {
         assert!(!text.contains("unrelated.json"), "{text}");
         assert!(!text.contains("PRIVATE-LINK-SENTINEL"), "{text}");
         assert!(text.contains("alice/fixture@work"), "{text}");
-        assert!(text.contains(": clean"), "{text}");
-        assert!(text.contains("checked 1 live transcripts"), "{text}");
+        assert!(
+            text.contains("checked 1 live transcripts: 1 matches what was saved"),
+            "{text}"
+        );
         assert_unchanged(lab._root.path(), &before);
     }
     let global = lab.doctor(&[]);
