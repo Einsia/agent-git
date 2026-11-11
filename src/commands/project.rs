@@ -5795,7 +5795,16 @@ struct Runtimes {
 /// seen for the folder's newest Codex conversation. A Codex that can't be asked in time reads
 /// as unknown, never as a failed listing. A `fix` tells a person the step; an agent is told whose
 /// step it is, since installing hooks or trusting them in Codex is the person's to decide.
+/// `used_here` says whether any of the folder's conversations, not only the listed recent ones,
+/// is one of that runtime's, so a reader can tell a runtime that isn't saving here from one never
+/// used here.
 fn capture_json(folder: &Listed, runtimes: &Runtimes, reader: Reader) -> Vec<serde_json::Value> {
+    let used_here = |runtime: &str| {
+        folder
+            .sessions
+            .iter()
+            .any(|session| session.runtime == runtime)
+    };
     let mut rows = Vec::new();
     if let Some(hooks) = runtimes.claude_code {
         let fix = (hooks == Some(false)).then_some(match reader {
@@ -5806,7 +5815,12 @@ fn capture_json(folder: &Listed, runtimes: &Runtimes, reader: Reader) -> Vec<ser
                 "When the user asks, install AgentGit's Claude Code hooks: `agit setup --runtime claude-code --hooks`"
             }
         });
-        rows.push(serde_json::json!({"runtime": "claude-code", "ready": hooks, "fix": fix}));
+        rows.push(serde_json::json!({
+            "runtime": "claude-code",
+            "ready": hooks,
+            "fix": fix,
+            "used_here": used_here("claude-code"),
+        }));
     }
     if let Some(hooks) = runtimes.codex {
         let newest = folder
@@ -5842,7 +5856,12 @@ fn capture_json(folder: &Listed, runtimes: &Runtimes, reader: Reader) -> Vec<ser
             }
             Some(true) => (Some(true), None),
         };
-        rows.push(serde_json::json!({"runtime": "codex", "ready": ready, "fix": fix}));
+        rows.push(serde_json::json!({
+            "runtime": "codex",
+            "ready": ready,
+            "fix": fix,
+            "used_here": used_here("codex"),
+        }));
     }
     rows
 }
@@ -7771,29 +7790,45 @@ mod tests {
 
     /// A Codex conversation is saved by itself only once Codex's hooks are on and the person
     /// trusted AgentGit's, which the folder's newest Codex conversation shows. A Codex that can't
-    /// be asked is unknown rather than ready or broken, so a listing never claims either.
+    /// be asked is unknown rather than ready or broken, so a listing never claims either. A
+    /// runtime is used here when any of the folder's conversations is one of its, so a Codex
+    /// conversation older than the listed recent ones still counts; a listing that looked only at
+    /// the recent ones would call Codex unused here while none of its conversations are saved.
     #[test]
     fn capture_says_what_each_runtime_still_needs_here() {
         if !isolated("capture_says_what_each_runtime_still_needs_here") {
             return;
         }
         let work = tempfile::tempdir().unwrap();
-        let session = |id: &str| adapter::SessionRef {
+        let session = |id: &str, runtime: &'static str| adapter::SessionRef {
             id: id.into(),
             path: work.path().join(id),
-            runtime: "codex",
+            runtime,
             cwd: None,
             mtime: std::time::SystemTime::now(),
             gist: None,
             title: None,
         };
-        let folder = Listed {
+        let listed = |sessions: Vec<adapter::SessionRef>| Listed {
             root: work.path().to_path_buf(),
             repository: "alice/app".into(),
             hub: "https://example.test".into(),
             project: None,
-            sessions: vec![session("codex-newest"), session("codex-older")],
+            sessions,
         };
+        let newer_claude: Vec<_> = (0..LISTED_SESSIONS)
+            .map(|n| session(&format!("claude-{n}"), "claude-code"))
+            .collect();
+        let folder = listed(
+            newer_claude
+                .iter()
+                .cloned()
+                .chain([
+                    session("codex-newest", "codex"),
+                    session("codex-older", "codex"),
+                ])
+                .collect(),
+        );
         let codex = |hooks: Option<bool>| {
             let rows = capture_json(
                 &folder,
@@ -7804,8 +7839,21 @@ mod tests {
                 Reader::Person,
             );
             assert_eq!(rows[0]["runtime"], "claude-code");
+            assert_eq!(rows[1]["used_here"], true, "{:?}", rows[1]);
             (rows[1]["ready"].clone(), rows[1]["fix"].clone())
         };
+        let claude_only = capture_json(
+            &listed(newer_claude.clone()),
+            &Runtimes {
+                claude_code: Some(Some(true)),
+                codex: Some(Some(true)),
+            },
+            Reader::Person,
+        );
+        assert_eq!(
+            [&claude_only[0]["used_here"], &claude_only[1]["used_here"]],
+            [true, false]
+        );
         codex_hooks_seen("codex-older");
         let (ready, fix) = codex(Some(true));
         assert_eq!(ready, false);
