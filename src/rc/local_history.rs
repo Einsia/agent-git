@@ -44,7 +44,7 @@ pub fn read_timed(params: Value, timings: &mut Timings) -> crate::Result<Value> 
 }
 
 fn read_page(params: Value, timings: &mut Timings) -> crate::Result<Value> {
-    let roster = timings.measure("roster_ms", super::roster::Roster::try_load)?;
+    let roster = timings.measure("roster_ms", super::roster::Roster::read_only)?;
     let compressed = params["response_encoding"] == transfer::ENCODING;
     let page = read_with_roster(params, &roster, timings)?;
     if compressed {

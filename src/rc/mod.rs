@@ -286,6 +286,19 @@ pub fn load_ledger<T: serde::de::DeserializeOwned>(name: &str) -> Ledger<T> {
     }
 }
 
+/// Read a ledger without changing anything on disk, for a reader that doesn't own it: an
+/// unusable file stays where it is for the owner's [`load_ledger`] to set aside.
+pub fn read_ledger<T: serde::de::DeserializeOwned>(name: &str) -> Ledger<T> {
+    let Ok(dir) = rc_dir() else {
+        return Ledger::Unusable;
+    };
+    match std::fs::read_to_string(dir.join(name)) {
+        Ok(text) => serde_json::from_str(&text).map_or(Ledger::Unusable, Ledger::Loaded),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ledger::Missing,
+        Err(_) => Ledger::Unusable,
+    }
+}
+
 /// Write one of `~/.agit/rc/*.json` atomically (write-temp-then-rename), so a
 /// crash mid-write can't leave a truncated file behind. The file and, on Unix,
 /// the containing directory are synced before success: start idempotency uses

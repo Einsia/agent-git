@@ -404,13 +404,18 @@ impl Roster {
     }
 
     fn read_fail_closed_snapshot() -> crate::Result<Option<Roster>> {
+        let snapshot = Self::peek_fail_closed_snapshot()?;
+        if snapshot.is_none() {
+            super::sync_rc_dir()?;
+        }
+        Ok(snapshot)
+    }
+
+    fn peek_fail_closed_snapshot() -> crate::Result<Option<Roster>> {
         let path = super::rc_dir()?.join(FAIL_CLOSED_FILE);
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                super::sync_rc_dir()?;
-                return Ok(None);
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
                 return Err(anyhow::anyhow!(
                     "could not read fail-closed roster snapshot {}: {error}",
@@ -443,6 +448,25 @@ impl Roster {
         }
         super::remove_json(FAIL_CLOSED_FILE)?;
         Ok(snapshot)
+    }
+
+    /// Read the roster for a reader outside the daemon's own state, changing nothing on disk.
+    ///
+    /// Only a daemon launch recovers a fail-closed snapshot ([`try_load`](Self::try_load)). A
+    /// reader that promoted it too would race the running daemon's own save: it reads the older
+    /// snapshot, the daemon saves a newer roster and removes the snapshot, and the reader then
+    /// writes the older one over the primary, rolling back a danger record that lives nowhere
+    /// else. While a snapshot exists it is the newest roster, so it is what a reader reads; a
+    /// primary that cannot be parsed reads as unusable and is left in place for the daemon.
+    pub fn read_only() -> crate::Result<Roster> {
+        if let Some(snapshot) = Self::peek_fail_closed_snapshot()? {
+            return Ok(snapshot);
+        }
+        Ok(match super::read_ledger(FILE) {
+            super::Ledger::Loaded(roster) => roster,
+            super::Ledger::Missing => Roster::default(),
+            super::Ledger::Unusable => Self::unusable(),
+        })
     }
 
     pub fn load() -> Roster {
@@ -1351,6 +1375,75 @@ mod tests {
             );
         });
     }
+    // A history page reads the roster while the daemon saves it. If the reader promoted a
+    // fail-closed snapshot, as a daemon launch does, the older snapshot it read would land over
+    // the daemon's newer save and roll a danger record back. The reader's read is held open on a
+    // pipe until the daemon has saved, so the race happens in that order every time: a reader
+    // that writes anything after reading fails it, and one that read only the primary would
+    // return a roster without the snapshot's rows.
+    #[cfg(unix)]
+    #[test]
+    fn a_history_read_never_rolls_back_a_roster_the_daemon_saves_while_it_reads() {
+        use std::io::Write;
+        let home = tempfile::tempdir().expect("temp AGIT_HOME");
+        super::super::with_agit_home(home.path(), || {
+            let dir = super::super::rc_dir().unwrap();
+            let (primary, fallback) = (dir.join(FILE), dir.join(FAIL_CLOSED_FILE));
+            let older = Roster {
+                unconfirmed_dangerous_bindings: ["older".to_owned()].into(),
+                ..Roster::default()
+            };
+            fail_next_saves(1, 0);
+            older.save_fail_closed().unwrap();
+            let older_bytes = std::fs::read(&fallback).unwrap();
+            let mut newer: Roster = serde_json::from_slice(&older_bytes).unwrap();
+            newer.unconfirmed_dangerous_bindings.insert("newer".into());
+            let newer_bytes = serde_json::to_vec_pretty(&newer).unwrap();
+
+            std::fs::remove_file(&fallback).unwrap();
+            let path = std::ffi::CString::new(fallback.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let daemon = {
+                let (primary, fallback) = (primary.clone(), fallback.clone());
+                std::thread::spawn(move || {
+                    // Opening the pipe waits for the reader to open it; its read then waits
+                    // for what this side writes.
+                    let mut pipe = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&fallback)
+                        .unwrap();
+                    // The daemon's own save: the newer roster replaces the primary and the
+                    // snapshot is removed, as `save` does while a snapshot is active.
+                    let temporary = primary.with_extension("json.saving");
+                    std::fs::write(&temporary, &newer_bytes).unwrap();
+                    std::fs::rename(&temporary, &primary).unwrap();
+                    std::fs::remove_file(&fallback).unwrap();
+                    pipe.write_all(&older_bytes).unwrap();
+                })
+            };
+            let read = Roster::read_only().unwrap();
+            // A reader that never opened the snapshot leaves the daemon side waiting to open the
+            // pipe; opening it here lets that side finish, so such a reader fails below instead of
+            // hanging the test.
+            let _unblock = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fallback)
+            };
+            daemon.join().unwrap();
+
+            assert!(read.unconfirmed_dangerous_bindings.contains("older"));
+            let disk: Roster = serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+            assert!(
+                disk.unconfirmed_dangerous_bindings.contains("newer"),
+                "the daemon's save must survive a read that overlapped it"
+            );
+            assert!(!fallback.exists());
+        });
+    }
+
     use super::*;
 
     #[test]

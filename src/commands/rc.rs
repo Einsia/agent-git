@@ -776,7 +776,9 @@ fn start(args: StartArgs) -> CmdResult {
     {
         ui::warning(warning);
     }
-    if let Err(error) = crate::rc::roster::Roster::try_load() {
+    // The daemon recovers a fail-closed roster when it launches; this only refuses a roster it
+    // could not recover. Promoting it here could race a daemon that is already running.
+    if let Err(error) = crate::rc::roster::Roster::read_only() {
         ui::error(&format!("{error:#}"));
         return Ok(ExitCode::Precondition);
     }
