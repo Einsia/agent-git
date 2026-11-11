@@ -48,7 +48,7 @@ fn turn_on(args: OnArgs) -> CmdResult {
             return report_bound_on(&lifted);
         }
     }
-    let root = super::folder(&dir)?;
+    let (root, stays_off) = folder_to_turn_on(&dir)?;
     let mut again = String::from("agit on");
     if let Some(repo) = &args.repo {
         again.push_str(&format!(" --repo {repo}"));
@@ -79,7 +79,7 @@ fn turn_on(args: OnArgs) -> CmdResult {
     })?;
     // An explicit `agit on` brings a policy that never looked at OpenCode's store forward, once.
     let look = crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None);
-    let code = report(&root, &enabled)?;
+    let code = report(&root, &enabled, stays_off.as_deref())?;
     if !crate::commands::json::is_capturing()
         && let Some(line) = look
             .as_ref()
@@ -88,6 +88,25 @@ fn turn_on(args: OnArgs) -> CmdResult {
         println!("{line}");
     }
     Ok(code)
+}
+
+/// The folder `agit on` turns on in `dir`, and the folder above it that stays off, if any. It is the
+/// folder `dir` belongs to, except below a folder that is off: there it is `dir`'s own Git checkout,
+/// or `dir` itself, since turning on a folder inside one the person turned off must not turn that
+/// one back on with it. `agit on` in the folder that is off turns that folder back on.
+fn folder_to_turn_on(dir: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
+    let root = super::folder(dir)?;
+    let dir = dir.canonicalize()?;
+    if dir == root
+        || !dir.starts_with(&root)
+        || crate::commands::project::uploads_automatically(&root) != Some(false)
+    {
+        return Ok((root, None));
+    }
+    let own = super::git_top_level(&dir)
+        .filter(|top| *top != root && top.starts_with(&root))
+        .unwrap_or(dir);
+    Ok((own, Some(root)))
 }
 
 /// A folder that uploads automatically, and how it came to.
@@ -534,7 +553,7 @@ pub(super) fn run_child(arguments: &[&str], cwd: &Path) -> Result<()> {
     .into())
 }
 
-fn report(root: &Path, enabled: &Enabled) -> CmdResult {
+fn report(root: &Path, enabled: &Enabled, stays_off: Option<&Path>) -> CmdResult {
     // A git worktree its main checkout covers follows that folder's setting; a main checkout
     // names the worktrees it covers, each with the sessions from before it covered them.
     let through = crate::commands::project::worktree_of(root);
@@ -582,6 +601,7 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "teams_granted": enabled.granted,
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
+                "stays_off": stays_off,
                 "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).chain(crate::commands::project::opencode_not_captured(root).map(|said| serde_json::json!({"runtime": "opencode", "state": "not_captured", "says": said}))).collect::<Vec<_>>(),
                 // Uploading the sessions from before is the person's choice: the agent asks.
                 "next": (waiting > 0).then(|| serde_json::json!({
@@ -659,6 +679,13 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
     }
     for (worktree, _) in &worktrees {
         println!("  also covers {} (git worktree)", ui::tilde(worktree));
+    }
+    if let Some(parent) = stays_off {
+        println!(
+            "  {} stays off; `agit on {}` turns it back on",
+            ui::tilde(parent),
+            ui::tilde(parent)
+        );
     }
     if let Some(previous) = &enabled.previous {
         println!(

@@ -24,9 +24,15 @@ the user's choice: ask whether to upload one (`agit save <id>`) or all of them
 
 A second project folder is turned on the same way: `agit on` in that folder, with `--repo` to
 choose its repository when it shouldn't be the one chosen for it. A conversation already run
-there before it was on is saved by naming it: `agit save <id>`. In a folder nothing saves, a
-conversation's start tells the person once that agit isn't saving it;
-`agit config notice.unsaved false` stops that everywhere.
+there before it was on is saved by naming it: `agit save <id>`.
+
+A folder inside one that is on belongs to it: its conversations upload to that folder's
+repository. Inside a folder that is off, `agit on` turns on only the folder it runs in (its own
+Git checkout, or that directory) and leaves the one around it off; `agit on` in the outer folder
+turns that one back on.
+
+In a folder nothing saves, a conversation's start tells the person once that agit isn't saving
+it; `agit config notice.unsaved false` stops that everywhere.
 
 A folder that is a Git main checkout also covers its linked worktrees (`git worktree add`) that
 have no setting of their own, and the result names each one (`also covers … (git worktree)`).
