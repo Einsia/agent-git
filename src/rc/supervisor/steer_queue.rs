@@ -20,6 +20,8 @@ pub(super) struct QueuedTurn {
     attribution: MessageAttribution,
     authority: crate::rc::authority::Guard,
     owner: bool,
+    /// When it was queued.
+    arrived: tokio::time::Instant,
 }
 
 /// An owner's message the plugin holds for the running turn's next tool step: the conversation
@@ -45,10 +47,16 @@ pub(super) enum TurnOver<'a> {
 /// How many messages may wait for the next turn; one more is refused at once.
 const MAX_WAITING: usize = 16;
 
+/// How long a non-owner's waiting message stands on what admitted it. The device learns that a
+/// sender lost access to a session only through the requests it is sent, so past this, without
+/// an admitted request from that account since (a turn, a steer, or a keep for its waiting
+/// messages), the message is dropped rather than delivered.
+pub(super) const RECONFIRM_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// How a queued message's turn start came out, as its receipt says.
 type Outcome = Result<crate::Result<TurnStartOutcome>, tokio::sync::oneshot::error::RecvError>;
 /// A queued message's client message id, with how its turn start came out.
-type Started = (Option<String>, Outcome);
+type Started = (MessageAttribution, Outcome);
 
 pub(super) struct SteerQueue {
     /// Held by the plugin, by operation id.
@@ -62,11 +70,43 @@ pub(super) struct SteerQueue {
     next_order: u64,
     /// Waiting for the next turn, in the order they arrived.
     waiting: VecDeque<QueuedTurn>,
+    /// When this session last admitted a request from each account.
+    confirmed: HashMap<String, tokio::time::Instant>,
     /// Turn starts of queued messages as their receipts come back, by client message id.
     pub(super) outcomes: (
         mpsc::UnboundedSender<Started>,
         mpsc::UnboundedReceiver<Started>,
     ),
+}
+
+impl SteerQueue {
+    /// This session just admitted `command`: when it names its sender's account, that account
+    /// is still there. A waiting message the session took up itself (`from_queue`) was admitted
+    /// when it arrived and says nothing about now, so one waiting message never vouches for
+    /// another.
+    pub(super) fn admitted(&mut self, command: &Command, from_queue: bool) {
+        if from_queue {
+            return;
+        }
+        if let Some(account) = command.sender_account() {
+            self.confirmed
+                .insert(account.to_owned(), tokio::time::Instant::now());
+        }
+    }
+
+    /// Whether `queued` may still go on what admitted it: an owner's always; anyone else's
+    /// while it is fresh, or while its account keeps being admitted.
+    fn still_confirmed(&self, queued: &QueuedTurn) -> bool {
+        if queued.owner || queued.arrived.elapsed() <= RECONFIRM_WITHIN {
+            return true;
+        }
+        queued
+            .attribution
+            .sender
+            .as_ref()
+            .and_then(|sender| self.confirmed.get(&sender.account_id))
+            .is_some_and(|at| at.elapsed() <= RECONFIRM_WITHIN)
+    }
 }
 
 impl Default for SteerQueue {
@@ -77,6 +117,7 @@ impl Default for SteerQueue {
             receipt_turn_over: None,
             next_order: 0,
             waiting: VecDeque::new(),
+            confirmed: HashMap::new(),
             outcomes: mpsc::unbounded_channel(),
         }
     }
@@ -91,6 +132,7 @@ impl Session {
             attribution: pending.attribution.clone(),
             authority: pending.reply.authority(),
             owner: pending.reply.owner_control(),
+            arrived: tokio::time::Instant::now(),
         };
         let framed = step_delivery::framed(&queued.message);
         // The record comes first, so it exists before the plugin can hand the text over. Without
@@ -252,11 +294,11 @@ impl Session {
                 continue;
             }
             let (ticket, mut receipt) = crate::rc::ticket::ticket_authorized(queued.authority);
-            let client_msg_id = queued.attribution.client_msg_id.clone();
+            let attribution = queued.attribution.clone();
             let outcomes = self.steer_queue.outcomes.0.clone();
             tokio::spawn(async move {
                 let outcome = receipt.wait_until_closed().await;
-                let _ = outcomes.send((client_msg_id, outcome));
+                let _ = outcomes.send((attribution, outcome));
             });
             return Some(Command::Turn {
                 message: queued.message,
@@ -269,7 +311,7 @@ impl Session {
 
     /// Why the session's gates refuse `queued` now, read as they stand when it goes.
     fn refused_at_delivery(&self, queued: &QueuedTurn) -> Option<&'static str> {
-        if queued.authority.check().is_err() {
+        if queued.authority.check().is_err() || !self.steer_queue.still_confirmed(queued) {
             return Some("access_ended");
         }
         None
@@ -278,7 +320,7 @@ impl Session {
     /// A queued message's turn start came back: one that didn't start is reported dropped.
     pub(super) async fn queued_turn_outcome(
         &mut self,
-        client_msg_id: Option<String>,
+        attribution: &MessageAttribution,
         outcome: Outcome,
     ) {
         let reason = match outcome {
@@ -291,22 +333,19 @@ impl Session {
             // Never taken: the request's authority no longer admitted it.
             Err(_) => "access_ended",
         };
-        self.report_dropped(client_msg_id.as_deref(), reason).await;
+        self.report_steer_dropped(attribution, reason).await;
     }
 
+    /// Tells the sender a message the device took won't reach a turn: ids, who sent it, and a
+    /// code only.
     async fn report_steer_dropped(&self, attribution: &MessageAttribution, reason: &str) {
-        self.report_dropped(attribution.client_msg_id.as_deref(), reason)
-            .await;
-    }
-
-    /// Tells the sender a message the device took won't reach a turn: ids and a code only.
-    async fn report_dropped(&self, client_msg_id: Option<&str>, reason: &str) {
-        if let Some(client_msg_id) = client_msg_id {
+        if let Some(client_msg_id) = &attribution.client_msg_id {
             self.emit(
                 method::TURN_STEER_DROPPED,
                 crate::protocol::TurnSteerDropped {
-                    client_msg_id: client_msg_id.to_owned(),
+                    client_msg_id: client_msg_id.clone(),
                     reason: reason.into(),
+                    sender: attribution.sender.clone(),
                 },
             )
             .await;
@@ -345,7 +384,51 @@ mod tests {
             },
             authority,
             owner,
+            arrived: tokio::time::Instant::now(),
         }
+    }
+
+    fn sent_by(account: Option<&str>) -> MessageAttribution {
+        MessageAttribution {
+            sender: account.map(|account| crate::protocol::MessageSender {
+                account_id: account.into(),
+                username: String::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// How the device names a Hub account: the issuer and the account, as one string.
+    const MEMBER: &str = r#"["https://cloud.example","member"]"#;
+
+    fn from_member(message: &str) -> QueuedTurn {
+        let mut queued = queued(message, false, Default::default());
+        queued.attribution.sender = sent_by(Some(MEMBER)).sender;
+        queued
+    }
+
+    fn keep(account: Option<&str>) -> Command {
+        Command::Keep {
+            attribution: sent_by(account),
+        }
+    }
+
+    fn steer(account: Option<&str>) -> Command {
+        Command::Steer {
+            message: "more".into(),
+            attribution: sent_by(account),
+            reply: crate::rc::ticket::ticket().0,
+        }
+    }
+
+    fn idle_session() -> (Session, mpsc::Receiver<Frame>) {
+        let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+        let (session, out, _notes) = super::super::tests::harness_test_session_with_channels(
+            AnyDriver::Codex(Box::new(driver)),
+            "codex",
+            SessionStatus::Idle,
+        );
+        (session, out)
     }
 
     fn dropped(out: &mut mpsc::Receiver<Frame>) -> Vec<(String, String)> {
@@ -476,6 +559,48 @@ mod tests {
         session.driver.shutdown().await.unwrap();
     }
 
+    /// A member's message waits through a turn longer than the limit, and the member, removed
+    /// meanwhile, sends nothing more. The device never hears of the removal, so what decides is
+    /// that nothing from that account was admitted here for the whole limit: the message is
+    /// dropped as access_ended, while the owner's goes. Requests that name no sender, or another
+    /// account, vouch for nobody here. Trusting the stamp the message got on arrival would carry
+    /// a removed member's words into the next turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_silent_past_the_limit_loses_the_waiting_message() {
+        let (mut session, mut out) = idle_session();
+        session.steer_queue.waiting.push_back(from_member("member"));
+        session
+            .steer_queue
+            .waiting
+            .push_back(queued("owner", true, Default::default()));
+        for _ in 0..4 {
+            tokio::time::advance(RECONFIRM_WITHIN / 3).await;
+            for command in [
+                keep(None),
+                steer(None),
+                keep(Some("other")),
+                steer(Some("other")),
+            ] {
+                session.steer_queue.admitted(&command, false);
+            }
+        }
+        assert_eq!(turn_message(session.next_queued_turn().await), "owner");
+        // The drop names its sender as turn.started does, so only that account is told.
+        let drops = std::iter::from_fn(|| out.try_recv().ok())
+            .filter(|frame| frame.method() == method::TURN_STEER_DROPPED)
+            .map(|frame| frame.params.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            drops,
+            [serde_json::json!({
+                "client_msg_id": "member",
+                "reason": "access_ended",
+                "sender": {"account_id": MEMBER, "username": ""},
+            })]
+        );
+        session.driver.shutdown().await.unwrap();
+    }
+
     /// Holds `id` for `turn`, as the plugin's receipt for it would, after what is held already.
     /// It names no conversation, so dropping its delivery record reads no ledger.
     fn hold(session: &mut Session, id: &str, turn: &str) {
@@ -534,6 +659,25 @@ mod tests {
             [("stopped".to_owned(), "interrupted".to_owned())]
         );
         session.driver.shutdown().await.unwrap();
+    }
+
+    /// A member who still has access and keeps being admitted here, by a keep for the waiting
+    /// message or by any other request of theirs, gets the message delivered however long the
+    /// turn before it ran.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_still_admitted_past_the_limit_gets_the_waiting_message_delivered() {
+        for confirm in [keep(Some(MEMBER)), steer(Some(MEMBER))] {
+            let (mut session, mut out) = idle_session();
+            session.steer_queue.waiting.push_back(from_member("member"));
+            for _ in 0..4 {
+                tokio::time::advance(RECONFIRM_WITHIN / 2).await;
+                session.steer_queue.admitted(&confirm, false);
+            }
+            tokio::time::advance(RECONFIRM_WITHIN / 2).await;
+            assert_eq!(turn_message(session.next_queued_turn().await), "member");
+            assert!(dropped(&mut out).is_empty());
+            session.driver.shutdown().await.unwrap();
+        }
     }
 
     /// The terminal can take a message, hand it to a tool step and end the turn between two
@@ -618,6 +762,30 @@ mod tests {
             started.push(turn_message(Some(command)));
         }
         assert_eq!(started, sent);
+        session.driver.shutdown().await.unwrap();
+    }
+
+    /// A member's two messages wait for later turns. Taking up the first starts its turn, but
+    /// says nothing about whether the member is still there: past the limit after the member's
+    /// last admitted request, the second is dropped as access_ended. One waiting message
+    /// vouching for the next would keep a removed member's words going turn after turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_members_waiting_message_does_not_keep_the_next_one_admitted() {
+        let (mut session, mut out) = idle_session();
+        session.steer_queue.admitted(&steer(Some(MEMBER)), false);
+        session.steer_queue.waiting.push_back(from_member("first"));
+        session.steer_queue.waiting.push_back(from_member("second"));
+        tokio::time::advance(RECONFIRM_WITHIN / 2).await;
+        let first = session.next_queued_turn().await;
+        let first = first.expect("the first message is taken up within the limit");
+        session.steer_queue.admitted(&first, true);
+        assert_eq!(turn_message(Some(first)), "first");
+        tokio::time::advance(RECONFIRM_WITHIN).await;
+        assert!(session.next_queued_turn().await.is_none());
+        assert_eq!(
+            dropped(&mut out),
+            [("second".to_owned(), "access_ended".to_owned())]
+        );
         session.driver.shutdown().await.unwrap();
     }
 }

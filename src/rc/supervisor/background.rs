@@ -16,7 +16,10 @@ fn instruction(command: &Command) -> bool {
                 .is_some_and(|value| !value.trim().is_empty()),
             _ => true,
         },
-        Command::Shutdown | Command::ShutdownUnattended | Command::ClaudeRestartGuardReady => false,
+        Command::Keep { .. }
+        | Command::Shutdown
+        | Command::ShutdownUnattended
+        | Command::ClaudeRestartGuardReady => false,
         _ => true,
     }
 }
@@ -92,6 +95,7 @@ impl Session {
                 reply.check_control(mode.loosens_from(self.driver.permission_mode()))
             }
             Command::InitialTurn { .. }
+            | Command::Keep { .. }
             | Command::Shutdown
             | Command::ShutdownUnattended
             | Command::ClaudeRestartGuardReady => Ok(()),
@@ -190,7 +194,10 @@ impl Session {
                 )
                 .await;
             }
-            Command::Shutdown | Command::ShutdownUnattended | Command::ClaudeRestartGuardReady => {}
+            Command::Keep { .. }
+            | Command::Shutdown
+            | Command::ShutdownUnattended
+            | Command::ClaudeRestartGuardReady => {}
         }
     }
 }
