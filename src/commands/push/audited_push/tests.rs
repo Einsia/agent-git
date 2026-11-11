@@ -208,6 +208,27 @@ fn creation_intent_retains_its_audience_before_repository_registration() {
     assert_eq!(intent.json()["repo_origins"], json!([]));
 }
 
+/// The line a push prints for its destination reads back as the visibility it publishes under,
+/// for a destination it creates and one that exists. A save that reported a one-off upload with
+/// the folder's last recorded audience instead could call a repository made public since then
+/// private.
+#[test]
+fn the_destination_line_reads_back_as_its_visibility() {
+    for (visibility, create) in [("public", true), ("private", false)] {
+        let mut intent = intent();
+        intent.visibility = visibility.into();
+        if create {
+            intent.action = Action::Create;
+        }
+        let line = format!("{DESTINATION_LINE}{}", intent.describe());
+        assert_eq!(
+            published_visibility(["Privacy preview: /tmp/p.json", line.as_str()]),
+            Some(visibility.to_owned())
+        );
+    }
+    assert_eq!(published_visibility(["already up to date."]), None);
+}
+
 #[test]
 fn noncanonical_or_credentialed_git_destinations_are_refused() {
     for url in [

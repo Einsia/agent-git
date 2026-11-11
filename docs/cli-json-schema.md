@@ -277,7 +277,8 @@ Each folder has:
 - `last_upload`: null, or the last automatic or `project sync` attempt as `at`, `ok`, `error` (the
   failure's own words, without the diagnostic envelope), `reason` (the failure's code:
   `signed_out`, `hub`, `privacy_incomplete`, `too_large`, `builds_on_withdrawn`,
-  `public_needs_consent`, `refused` or `other`; null when it succeeded or predates codes) and
+  `public_needs_consent`, `refused`, `local_busy`, `local_unwritable` or `other`; null when it
+  succeeded or predates codes) and
   `session_id` (the conversation it failed on, or the one it uploaded). A `project sync` result
   also has `uploaded`, `failed`, `skipped` and `pending` counts; a session left out or still in
   its first turn is not a failure. A refusal recorded while `push.auto` was off is left out once

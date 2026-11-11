@@ -572,6 +572,21 @@ struct Intent {
     visibility_asked: bool,
 }
 
+/// How a push names the destination it publishes to, on a line of its own: the line starts with
+/// this, and goes on with the destination as [`Intent::describe`] writes it.
+pub(crate) const DESTINATION_LINE: &str = "Publication destination: ";
+
+/// The visibility a push read for its destination, from the lines it printed; `None` when it
+/// printed no destination.
+pub(crate) fn published_visibility<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let described = lines
+        .into_iter()
+        .find_map(|line| line.strip_prefix(DESTINATION_LINE))?;
+    let (_, after) = described.split_once(" (")?;
+    let (visibility, _) = after.split_once(", ")?;
+    Some(visibility.to_owned())
+}
+
 impl Intent {
     fn resolve(
         args: &Args,

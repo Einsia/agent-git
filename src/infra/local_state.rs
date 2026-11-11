@@ -51,19 +51,26 @@ pub enum LocalStateError {
     Contended { what: &'static str, path: PathBuf },
 }
 
+/// How [`LocalStateError::Contended`] begins, for a parent that reads a child's error text.
+pub const CONTENDED: &str = "another agit process is holding";
+/// What [`LocalStateError::NotWritable`] says before the path it couldn't write, for a parent that
+/// reads a child's error text. It goes on to the path, so it isn't read from a refusal that only
+/// says something is not writable, such as a namespace on the Hub.
+pub const NOT_WRITABLE: &str = "is not writable: cannot write";
+
 impl std::fmt::Display for LocalStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotWritable { home, path, source } => {
                 match home {
-                    Some(home) => write!(f, "AGIT_HOME ({}) is not writable", home.display())?,
-                    None => f.write_str("agit's local state is not writable")?,
+                    Some(home) => write!(f, "AGIT_HOME ({}) {NOT_WRITABLE}", home.display())?,
+                    None => write!(f, "agit's local state {NOT_WRITABLE}")?,
                 }
-                write!(f, ": cannot write {}: {source}", path.display())
+                write!(f, " {}: {source}", path.display())
             }
             Self::Contended { what, path } => write!(
                 f,
-                "another agit process is holding {what} ({}) and did not release it within {} seconds",
+                "{CONTENDED} {what} ({}) and did not release it within {} seconds",
                 path.display(),
                 LOCK_WAIT.as_secs()
             ),

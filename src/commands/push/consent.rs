@@ -212,8 +212,9 @@ fn read_unattended(path: &std::path::Path) -> Vec<UnattendedSwitchOn> {
 /// Records the enrollment when switching automatic upload on for a checkout pinned to a public
 /// repository, and refuses the switch when nobody answered it.
 ///
-/// A checkout whose destination or audience cannot be read records nothing; automatic
-/// publication then refuses a public destination by itself.
+/// A checkout whose destination or audience cannot be read records nothing, and an unread
+/// audience says so: automatic publication then refuses a public destination by itself, and the
+/// person learns why its uploads may wait.
 pub(crate) fn enroll_public_destination(
     repo: &Repo,
     repository: &str,
@@ -224,6 +225,9 @@ pub(crate) fn enroll_public_destination(
         return Ok(());
     };
     let Ok(consent) = super::publication_consent(repo, repository, &identity) else {
+        crate::ui::warning(&format!(
+            "agit couldn't read who can see {repository}; if it is public, automatic uploads into it wait until you switch it on again once agit can read that"
+        ));
         return Ok(());
     };
     if consent.visibility != "public" {

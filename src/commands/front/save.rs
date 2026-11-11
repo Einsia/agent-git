@@ -463,7 +463,7 @@ fn report(
             .iter()
             .map(|r| {
                 let (status, branch, error) = match &r.outcome {
-                    Saved::Uploaded(b) => ("uploaded", Some(b), None),
+                    Saved::Uploaded(b, _) => ("uploaded", Some(b), None),
                     Saved::Pending(b) => ("pending", Some(b), None),
                     Saved::Failed(e) | Saved::Refused(e) => ("failed", None, Some(e.clone())),
                     Saved::Elsewhere { .. } => ("elsewhere", None, None),
@@ -486,7 +486,7 @@ fn report(
                     "repository": r.repository,
                     "status": status,
                     "link": match &r.outcome {
-                        Saved::Uploaded(b) => Some(link(&r.repository, b)),
+                        Saved::Uploaded(b, _) => Some(link(&r.repository, b)),
                         Saved::Pending(_) => Some(super::repository_link(&r.repository)),
                         Saved::Failed(_)
                         | Saved::Refused(_)
@@ -554,13 +554,26 @@ fn report(
         );
     } else {
         for row in rows {
+            // While the repository's automatic upload is off, the end of this reply uploads
+            // nothing: only another save of it does.
+            let automatic_off = matches!(
+                crate::commands::project::saving(&row.folder),
+                crate::commands::project::Saving::Held { ref held, .. } if held.code == "push_auto_off"
+            );
             match &row.outcome {
-                Saved::Uploaded(branch) => {
+                Saved::Uploaded(branch, once) => {
                     ui::success(&format!("uploaded \"{}\"", ui::truncate(&row.title, 60)));
-                    println!("  {}", link(&row.repository, branch));
-                    if row.was_dropped {
-                        println!("  you had stopped uploading it; its new turns upload again");
+                    for line in uploaded_lines(row, branch, once.as_deref()) {
+                        println!("  {line}");
                     }
+                }
+                Saved::Pending(_) if this_conversation && automatic_off => {
+                    ui::success(&format!(
+                        "saved \"{}\" on this computer; automatic upload to {} is off, so run {} again once this reply finishes to upload it",
+                        ui::truncate(&row.title, 60),
+                        row.repository,
+                        ui::accent("agit save")
+                    ));
                 }
                 Saved::Pending(_) if this_conversation => {
                     ui::success(&format!("saving \"{}\"", ui::truncate(&row.title, 60)));
@@ -629,8 +642,71 @@ fn report(
     })
 }
 
+/// What a save says under an uploaded row: its link; with `once`, who can read it after it went
+/// up as the person's own push, once, while automatic upload stays off; and whether naming it let
+/// a dropped conversation back in.
+fn uploaded_lines(row: &Row, branch: &str, once: Option<&str>) -> Vec<String> {
+    let mut lines = vec![link(&row.repository, branch)];
+    if let Some(audience) = once {
+        lines.push(format!(
+            "published once to {} ({audience}); automatic upload stays off; {} switches it back on",
+            row.repository,
+            ui::accent("agit on")
+        ));
+    }
+    if row.was_dropped {
+        lines.push("you had stopped uploading it; its new turns upload again".into());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
+    /// Each uploaded row of one save says where its own one-off upload went, from the result of
+    /// its own push: two conversations of one folder, uploaded by one save while the repository's
+    /// automatic upload is off, each name the readers their push read. A save that passed this
+    /// through one record per folder would let the second upload overwrite the first, and print
+    /// the line for one row at most.
+    #[test]
+    fn each_uploaded_row_of_one_save_says_where_its_own_one_off_upload_went() {
+        let said = |session: &str, once: Option<&str>| {
+            let branch = format!("talk-{session}");
+            let row = super::Row {
+                title: format!("Conversation {session}"),
+                runtime: "claude-code",
+                session_id: session.to_owned(),
+                folder: std::path::PathBuf::from("/work/app"),
+                repository: "me/app".to_owned(),
+                outcome: crate::commands::project::Saved::Uploaded(
+                    branch.clone(),
+                    once.map(str::to_owned),
+                ),
+                was_dropped: false,
+            };
+            super::uploaded_lines(&row, &branch, once)
+        };
+        for (session, audience) in [
+            ("first", "public: anyone can read it"),
+            ("second", "private: only you"),
+        ] {
+            let lines = said(session, Some(audience));
+            assert!(
+                lines.iter().any(|line| {
+                    line.starts_with("published once to me/app (")
+                        && line.contains(&format!("({audience})"))
+                        && line.contains("automatic upload stays off")
+                }),
+                "{session}: {lines:?}"
+            );
+        }
+        assert!(
+            !said("third", None)
+                .iter()
+                .any(|line| line.contains("published once")),
+            "an upload that wasn't a one-off says nothing of one"
+        );
+    }
+
     /// A conversation remote control keeps for a folder enrolled with the Hub is named by the Hub
     /// repository it is for, or as having none yet, never by the device-local slug and branch,
     /// which nobody can find on the Hub; any other repository is named as it is. A row that kept
