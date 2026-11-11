@@ -869,7 +869,7 @@ fn setup_row() -> (String, Check) {
             Check::Warn(setup_warning(&runtimes, presence::record().declined_at))
         }
         Presence::Partly(runtimes) => Check::Warn(format!(
-            "not set up for {}, so their conversations are not captured. Ask the person before running `agit setup`",
+            "not set up for {}, so their conversations are not captured. `agit setup` sets it up; an agent asks the person before running it",
             presence::labels(&runtimes)
         )),
     };
@@ -891,7 +891,7 @@ fn setup_warning(runtimes: &[&str], declined_at: Option<chrono::DateTime<chrono:
         })
         .unwrap_or_default();
     format!(
-        "not set up: no agit Skill or capture hooks for {names}, so nothing is captured{declined}. Ask the person before running `agit setup`"
+        "not set up: no agit Skill or capture hooks for {names}, so nothing is captured{declined}. `agit setup` sets it up; an agent asks the person before running it"
     )
 }
 
@@ -904,7 +904,7 @@ fn claude_hooks_check() -> Option<(String, Check)> {
         Check::Ok("SessionStart and Stop".into())
     } else {
         Check::Warn(format!(
-            "{} not installed, so Claude Code conversations are not captured. Ask the person before running `agit setup --runtime claude-code --hooks`",
+            "{} not installed, so Claude Code conversations are not captured. `agit setup --runtime claude-code --hooks` installs them; an agent asks the person before running it",
             missing.join(" and ")
         ))
     };
@@ -1985,7 +1985,8 @@ mod tests {
     /// format.
     /// A computer where setup never ran says so, names the runtimes left without agit, and names
     /// a decline with its date, since a person who declined gets no further notice anywhere else.
-    /// Like the notice an agent reads, it tells the reader to ask the person before running setup.
+    /// It names the command for whoever reads it, and that an agent asks the person first: the
+    /// reader is as often the person as an agent.
     #[test]
     fn a_computer_without_setup_names_its_runtimes_and_a_decline() {
         let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z")
@@ -2003,7 +2004,8 @@ mod tests {
             "{declined}"
         );
         assert!(
-            declined.contains("Ask the person before running `agit setup`"),
+            declined
+                .contains("`agit setup` sets it up; an agent asks the person before running it"),
             "{declined}"
         );
         assert!(!setup_warning(&["codex"], None).contains("declined"));

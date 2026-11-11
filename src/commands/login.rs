@@ -321,7 +321,7 @@ fn cancelled(hub: &str, credential: &HubCredential, withdrawal: Withdrawal) -> S
         ),
     };
     format!(
-        "the human approved the sign-in, but {why} before its credentials were saved, so nothing was signed in; {session}. {next}"
+        "the sign-in was approved, but {why} before its credentials were saved, so nothing was signed in; {session}. {next}"
     )
 }
 
@@ -330,7 +330,7 @@ fn cancelled(hub: &str, credential: &HubCredential, withdrawal: Withdrawal) -> S
 fn withdrawn(hub: &str, withdrawal: Withdrawal) -> anyhow::Error {
     anyhow::Error::new(InteractionRequired(match withdrawal {
         Withdrawal::Forgotten => format!(
-            "the sign-in request was cancelled before it was finished: `agit logout` forgot it, or another agit process found it no longer valid. Run `{}` again and ask the human to approve the new request.",
+            "the sign-in request was cancelled before it was finished: `agit logout` forgot it, or another agit process found it no longer valid. Run `{}` again, then approve the new request.",
             login_command(hub)
         ),
         Withdrawal::Replaced => format!(
@@ -388,7 +388,7 @@ fn refuse_unsaveable(error: &anyhow::Error) -> ExitCode {
     }
     if let Some(Unsaveable::Pending { hub, state }) = error.downcast_ref::<Unsaveable>() {
         ui::hint(&format!(
-            "once AGIT_HOME is writable, rerun `{}` to claim the approved sign-in; a new `agit login` would need the human to approve again",
+            "once AGIT_HOME is writable, rerun `{}` to claim the approved sign-in; a new `agit login` would need another approval",
             complete_command(hub, state.as_deref())
         ));
     }
@@ -418,22 +418,19 @@ fn still_pending(record: &PendingLogin) -> String {
     let (approve, what) = match (&record.approval, record.flow) {
         (Some(approval), _) => (
             format!(
-                "Ask the human to open {} and enter the code {} to approve the sign-in",
+                "Open {} and enter the code {} to approve the sign-in",
                 approval.url, approval.user_code
             ),
             "code",
         ),
-        (None, Flow::Device) => (
-            "Ask the human to finish approving the sign-in code".to_owned(),
-            "code",
-        ),
+        (None, Flow::Device) => ("Finish approving the sign-in code".to_owned(), "code"),
         (None, Flow::Browser) => (
-            "Ask the human to finish approving the login link".to_owned(),
+            "Open the login link and approve the sign-in".to_owned(),
             "link",
         ),
     };
     format!(
-        "{approve}, then retry the same `agit login --complete` command. If the {what} expired, run `{}` again to request a new {what}.",
+        "{approve}, then run the same `agit login --complete` command again. If the {what} expired, run `{}` to get a new {what}.",
         login_command(&record.hub)
     )
 }
@@ -441,7 +438,7 @@ fn still_pending(record: &PendingLogin) -> String {
 /// The failure for a request the Hub will never approve.
 fn no_longer_valid(hub: &str) -> anyhow::Error {
     anyhow::Error::new(InteractionRequired(format!(
-        "the sign-in request is no longer valid: it expired or was already used. Run `{}` again and ask the human to approve the new request.",
+        "the sign-in request is no longer valid: it expired or was already used. Run `{}` again, then approve the new request.",
         login_command(hub)
     )))
 }
@@ -450,7 +447,7 @@ fn no_longer_valid(hub: &str) -> anyhow::Error {
 /// waits for the human's approval.
 pub(crate) fn complete_hint(hub: &str) -> String {
     format!(
-        "a sign-in for this Hub is waiting for the human's approval; after they approve it, run `{}` to finish it instead of starting a new `agit login`",
+        "a sign-in for this Hub is waiting for approval; once it's approved, run `{}` to finish it instead of starting a new `agit login`",
         complete_command(hub, None)
     )
 }
@@ -653,7 +650,7 @@ fn complete(hub: &str, state: Option<&str>, wait: u64) -> crate::Result<Option<S
             .map(|approval| format!(" at {} with the code {}", approval.url, approval.user_code))
             .unwrap_or_default();
         format!(
-            "waiting up to {} seconds for the human to approve the sign-in{at}…",
+            "waiting up to {} seconds for the sign-in to be approved{at}…",
             until.saturating_duration_since(start).as_secs()
         )
     });
@@ -689,7 +686,7 @@ fn nothing_to_complete(hub: &str) -> crate::Result<Option<SignedIn>> {
         return Ok(Some(SignedIn::new(credential, Origin::AlreadySaved)));
     }
     Err(anyhow::Error::new(InteractionRequired(format!(
-        "no sign-in request is waiting for {label}. Run `{}` to request a new login link and ask the human to approve it.",
+        "no sign-in request is waiting for {label}. Run `{}` to request a new login link, then approve it.",
         login_command(hub)
     ))))
 }
@@ -939,7 +936,7 @@ fn approved_request(hub: &str) -> Option<SignedIn> {
         Recorded::Approved(signed_in) => {
             if signed_in.origin == Origin::Obtained {
                 ui::progress(
-                    "the human already approved the sign-in request that was waiting; finishing it instead of starting a new one",
+                    "the sign-in request that was waiting is already approved; finishing it instead of starting a new one",
                 );
             }
             Some(*signed_in)
@@ -973,7 +970,7 @@ pub(crate) fn claim_recorded(hub: &str) -> PendingSignIn {
             Err(error) => {
                 let revoked = revoke_unsaved(hub, credential);
                 ui::warning(&format!(
-                    "the human approved the sign-in, but its credentials cannot be saved{}: {error:#}",
+                    "the sign-in was approved, but its credentials cannot be saved{}: {error:#}",
                     if revoked {
                         "; the Hub session was signed out again"
                     } else {
@@ -1045,7 +1042,7 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
         Err(error) => return Err(error),
     };
     let url = session.url.clone();
-    let message = "Ask the human to open the login link, sign in, and approve CLI access.";
+    let message = "Open the login link, sign in, and approve CLI access.";
     let complete = ["agit", "login", "--hub", hub, "--complete", &session.state];
     if super::json::is_capturing() {
         println!(
@@ -1061,7 +1058,7 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
     } else {
         println!("{}", url);
         println!(
-            "After the human approves, run: {}",
+            "Once it's approved, run: {}",
             complete_command(hub, Some(&session.state))
         );
         println!("The login link expires in {} seconds.", session.expires_in);

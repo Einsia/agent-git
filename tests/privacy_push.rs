@@ -2158,7 +2158,7 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     assert!(!refused.status.success(), "{refused:?}");
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains(
-            "publishing to a public repository needs the person's confirmation: run it in a terminal, or pass --yes once they have confirmed it in this conversation"
+            "publishing to a public repository needs a yes from the person: run it in an interactive terminal to be asked, or add --yes once they have said yes in this conversation"
         ),
         "{refused:?}"
     );
@@ -2368,8 +2368,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     );
     assert!(text(&refused).contains(changed), "{refused:?}");
     assert!(
-        text(&refused)
-            .contains("publishing to a public repository needs the person's confirmation"),
+        text(&refused).contains("publishing to a public repository needs a yes from the person"),
         "{refused:?}"
     );
     assert!(hub.refuse_moved.lock().unwrap().is_empty());
@@ -2395,8 +2394,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     );
     assert!(text(&refused).contains(changed), "{refused:?}");
     assert!(
-        text(&refused)
-            .contains("publishing to a public repository needs the person's confirmation"),
+        text(&refused).contains("publishing to a public repository needs a yes from the person"),
         "{refused:?}"
     );
     assert_eq!(previews(), before + 1);
@@ -2510,7 +2508,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     assert!(text(&stopped).contains(changed), "{stopped:?}");
     assert!(
         text(&stopped).contains(
-            "1 of 2 parts are published; part 2 carries encrypted sessions, which need the person's confirmation"
+            "1 of 2 parts are published; part 2 carries encrypted sessions, which need a yes from the person"
         ),
         "{stopped:?}"
     );
@@ -2543,8 +2541,7 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     assert!(!refused.status.success(), "{refused:?}");
     assert!(text(&refused).contains(changed), "{refused:?}");
     assert!(
-        text(&refused)
-            .contains("publishing to a public repository needs the person's confirmation"),
+        text(&refused).contains("publishing to a public repository needs a yes from the person"),
         "{refused:?}"
     );
     assert_eq!(previews(), before + 1);
@@ -5750,7 +5747,7 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
     assert!(!unattended.status.success(), "{unattended:?}");
     assert!(
         String::from_utf8_lossy(&unattended.stderr).contains(
-            "1 of 3 parts are published; part 2 carries encrypted sessions, which need the person's confirmation"
+            "1 of 3 parts are published; part 2 carries encrypted sessions, which need a yes from the person"
         ),
         "{unattended:?}"
     );
