@@ -386,6 +386,12 @@ mod tests {
                 "--hub",
                 "https://private-canary",
             ],
+            vec![
+                "agit",
+                "login",
+                "--continue",
+                "https://private-canary/@private-canary/s/private-canary",
+            ],
             vec!["agit", "pr", "show", "123456789"],
             vec!["agit", "config", "hub.url", "https://private-canary"],
             vec![

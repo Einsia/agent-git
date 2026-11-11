@@ -847,6 +847,45 @@ fn noninteractive_login_returns_a_human_link_and_completion_claims_it() {
     }
 }
 
+/// A sign-in started from a Hub link sends that link's page with its request, so the browser's
+/// signed-in page can link back to it, and tells the agent which page it sent. A link with a `#`
+/// part, or on another Hub, sends none: the page behind a `#` part (an invitation's token, a
+/// share key) cannot open without it, so the agent gives the whole link back to the person. A
+/// rule that cut the `#` part and sent the rest, or sent another Hub's link, fails here.
+#[test]
+fn a_sign_in_continues_to_a_hub_link_only_when_it_has_no_fragment() {
+    for flags in modes() {
+        for (link, sent) in [
+            (
+                "/@acme/app/s/agit-1?ref=main",
+                Some("/@acme/app/s/agit-1?ref=main"),
+            ),
+            ("/workspaces/join/SYNTHETIC-id#token=SYNTHETIC", None),
+            ("https://elsewhere.example.test/@acme/app", None),
+        ] {
+            let url = "https://hub.example.test/auth/cli?state=SYNTHETIC-state";
+            let hub = Hub::new(vec![Reply::Json(
+                json!({"state":"SYNTHETIC-state", "url":url, "expires_in":600}),
+            )]);
+            let lab = Lab::new(&hub.base);
+            lab.seed(&hub.base);
+            let link = if link.starts_with('/') {
+                format!("{}{link}", hub.base)
+            } else {
+                link.to_string()
+            };
+            let output = lab.run(&hub.base, &flags, &["login", "--continue", &link], None);
+            if let Some(document) = assert_output(&output, &flags, 8) {
+                assert_eq!(document["result"]["value"]["continue"], json!(sent));
+            }
+            let requests = hub.finish();
+            assert_eq!(requests.len(), 1);
+            let body = sent.map_or_else(|| json!({}), |path| json!({"continue": path}));
+            assert_request(&requests[0], "/api/auth/cli/session", body);
+        }
+    }
+}
+
 #[test]
 fn browser_handoff_and_completion_preserve_remote_failure_categories() {
     for flags in modes() {

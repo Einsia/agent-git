@@ -78,6 +78,11 @@ pub struct Args {
     /// 0 checks once).
     #[arg(long, value_name = "seconds", requires = "complete")]
     pub wait: Option<u64>,
+    /// The Hub link this sign-in started from. Once the person approves, the browser's
+    /// signed-in page links back to that page. Only a link on this Hub without a `#` part is
+    /// sent, as its path and query; otherwise the sign-in goes on without it.
+    #[arg(long = "continue", value_name = "link", conflicts_with_all = ["with_token", "complete"])]
+    pub continue_to: Option<String>,
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -123,6 +128,41 @@ fn say_next(hub: &str, capturing: bool) {
     }
 }
 
+/// The Hub page a sign-in started from, as the sign-in request names it: the path and query of
+/// `link` when it is on `hub`. A link with a `#` part names none. That part never leaves the
+/// browser, and the pages that carry one (an invitation's token, a share key) cannot open
+/// without it, so the agent gives the whole link back to the person after the sign-in. A path
+/// of its own (`/@acme/app`) is on this Hub.
+pub(crate) fn continue_path(hub: &str, link: &str) -> Option<String> {
+    let link = link.trim();
+    if link.contains('#') || link.contains('\\') || link.chars().any(char::is_control) {
+        return None;
+    }
+    if link.starts_with('/') {
+        return (!link.starts_with("//")).then(|| link.to_string());
+    }
+    let (scheme, rest) = link.split_once("://")?;
+    let (authority, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let authority_matches = crate::infra::hub_authority::HubAuthority::parse(hub)
+        .is_ok_and(|hub| hub.matches(&format!("{scheme}://{authority}")));
+    if !authority_matches {
+        return None;
+    }
+    Some(match path {
+        "" => "/".to_string(),
+        path if path.starts_with('?') => format!("/{path}"),
+        path => path.to_string(),
+    })
+}
+
+/// What a new sign-in request sends: the page it continues to, when it names one.
+fn sign_in_body(continue_to: Option<&str>) -> serde_json::Value {
+    match continue_to {
+        Some(path) => serde_json::json!({ "continue": path }),
+        None => serde_json::json!({}),
+    }
+}
+
 /// The Hub as a person reads it in a sentence: its host, without the scheme.
 fn host_of(hub: &str) -> &str {
     hub.split("://").nth(1).unwrap_or(hub).trim_end_matches('/')
@@ -138,6 +178,16 @@ pub(crate) fn run_as_step(args: Args) -> CmdResult {
         return Ok(ExitCode::Usage);
     }
     let hub = hub.trim().trim_end_matches('/').to_string();
+    let continue_to = args
+        .continue_to
+        .as_deref()
+        .and_then(|link| continue_path(&hub, link));
+    if args.continue_to.is_some() && continue_to.is_none() {
+        ui::hint(
+            "the link is not sent with this sign-in (it has a `#` part or is on another Hub); open it once signed in",
+        );
+    }
+    let continue_to = continue_to.as_deref();
     let new_request = !args.with_token && args.complete.is_none();
     let approved = new_request.then(|| approved_request(&hub)).flatten();
     if approved.is_none()
@@ -145,7 +195,7 @@ pub(crate) fn run_as_step(args: Args) -> CmdResult {
         && !args.device
         && (super::json::is_capturing() || !ui::prompt::can_ask())
     {
-        return start_browser_handoff(&hub);
+        return start_browser_handoff(&hub, continue_to);
     }
     ui::info(format_args!("hub: {}", ui::accent(&hub)));
 
@@ -160,9 +210,9 @@ pub(crate) fn run_as_step(args: Args) -> CmdResult {
             args.wait.unwrap_or(DEFAULT_COMPLETE_WAIT),
         )
     } else if args.device {
-        login_device(&hub)
+        login_device(&hub, continue_to)
     } else {
-        login_interactive(&hub)
+        login_interactive(&hub, continue_to)
     };
 
     match result {
@@ -482,7 +532,7 @@ pub fn login() -> crate::Result<Option<String>> {
     let hub = config::hub_url();
     let mut signed_in = match approved_request(&hub) {
         Some(signed_in) => signed_in,
-        None => match login_interactive(&hub)? {
+        None => match login_interactive(&hub, None)? {
             Some(signed_in) => signed_in,
             None => return Ok(None),
         },
@@ -516,7 +566,7 @@ pub fn login() -> crate::Result<Option<String>> {
     Ok(Some(signed_in.who))
 }
 
-fn login_interactive(hub: &str) -> crate::Result<Option<SignedIn>> {
+fn login_interactive(hub: &str, continue_to: Option<&str>) -> crate::Result<Option<SignedIn>> {
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -537,8 +587,8 @@ fn login_interactive(hub: &str) -> crate::Result<Option<SignedIn>> {
             return Ok(None);
         };
         match choice.trim() {
-            "" | "1" => return login_browser(hub),
-            "2" => return login_device(hub),
+            "" | "1" => return login_browser(hub, continue_to),
+            "2" => return login_device(hub, continue_to),
             _ => ui::error("choose 1 for browser sign-in or 2 for a device code."),
         }
     }
@@ -1018,11 +1068,11 @@ pub(crate) struct SignInLink {
     state: String,
 }
 
-pub(crate) fn request_sign_in(hub: &str) -> crate::Result<SignInLink> {
+pub(crate) fn request_sign_in(hub: &str, continue_to: Option<&str>) -> crate::Result<SignInLink> {
     ensure_saveable(|| Unsaveable::BeforeRequest)?;
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
-        remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
+        remote_request(client.post_public("api/auth/cli/session", &sign_in_body(continue_to)))?;
     Request::record(PendingLogin::new(
         hub,
         Flow::Browser,
@@ -1038,8 +1088,8 @@ pub(crate) fn request_sign_in(hub: &str) -> crate::Result<SignInLink> {
     })
 }
 
-fn start_browser_handoff(hub: &str) -> CmdResult {
-    let session = match request_sign_in(hub) {
+fn start_browser_handoff(hub: &str, continue_to: Option<&str>) -> CmdResult {
+    let session = match request_sign_in(hub, continue_to) {
         Ok(link) => link,
         Err(error) if error.is::<Unsaveable>() => return Ok(refuse_unsaveable(&error)),
         Err(error) => return Err(error),
@@ -1056,6 +1106,7 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
                 "expires_in": session.expires_in,
                 "message": message,
                 "complete_command": complete,
+                "continue": continue_to,
             })
         );
     } else {
@@ -1070,11 +1121,11 @@ fn start_browser_handoff(hub: &str) -> CmdResult {
     Ok(ExitCode::Interactive)
 }
 
-fn login_browser(hub: &str) -> crate::Result<Option<SignedIn>> {
+fn login_browser(hub: &str, continue_to: Option<&str>) -> crate::Result<Option<SignedIn>> {
     ensure_saveable(|| Unsaveable::BeforeRequest)?;
     let client = crate::hub::Client::for_hub(hub);
     let session: CliSession =
-        remote_request(client.post_public("api/auth/cli/session", &serde_json::json!({})))?;
+        remote_request(client.post_public("api/auth/cli/session", &sign_in_body(continue_to)))?;
     let request = Request::record(PendingLogin::new(
         hub,
         Flow::Browser,
@@ -1104,11 +1155,11 @@ struct DeviceCode {
     expires_in: u64,
 }
 
-fn login_device(hub: &str) -> crate::Result<Option<SignedIn>> {
+fn login_device(hub: &str, continue_to: Option<&str>) -> crate::Result<Option<SignedIn>> {
     ensure_saveable(|| Unsaveable::BeforeRequest)?;
     let client = crate::hub::Client::for_hub(hub);
     let dev: DeviceCode =
-        remote_request(client.post_public("api/auth/device/code", &serde_json::json!({})))?;
+        remote_request(client.post_public("api/auth/device/code", &sign_in_body(continue_to)))?;
     let url = crate::telemetry::acquisition::authorization_url(&dev.verification_uri, hub);
     let request = Request::record(
         PendingLogin::new(
