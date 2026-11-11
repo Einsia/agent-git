@@ -81,7 +81,51 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> CmdResult {
-    super::setup::presence::after(run_as_step(args))
+    let hub = args
+        .hub
+        .clone()
+        .unwrap_or_else(config::hub_url)
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    // A JSON reader gets one value saying who signed in and what is next, so the routine lines
+    // go to the diagnostics instead of the result.
+    let capturing = super::json::is_capturing();
+    let result = ui::with_info_on_stderr(capturing, || run_as_step(args));
+    let result = super::setup::presence::after(result);
+    if matches!(result, Ok(ExitCode::Ok)) {
+        say_next(&hub, capturing);
+    }
+    result
+}
+
+/// Ends `agit login` on the step bare `agit` names next for this folder, or on its footer when
+/// nothing is next, so a sign-in never stops at "done". A command that signs in as one of its
+/// steps goes on with its own work instead and prints its own result.
+fn say_next(hub: &str, capturing: bool) {
+    let next = super::front::overview::next_after_sign_in();
+    if capturing {
+        let account = crate::infra::credentials::load(hub).map(|credential| credential.username);
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "signed_in",
+                "account": account,
+                "hub": hub,
+                "next": next.map(|(command, why)| serde_json::json!({"command": command, "why": why})),
+            })
+        );
+        return;
+    }
+    match next {
+        Some((command, why)) => ui::info(format_args!("Next: {} — {why}", ui::accent(command))),
+        None => ui::info(super::front::overview::footer()),
+    }
+}
+
+/// The Hub as a person reads it in a sentence: its host, without the scheme.
+fn host_of(hub: &str) -> &str {
+    hub.split("://").nth(1).unwrap_or(hub).trim_end_matches('/')
 }
 
 /// `agit login` as a step of another command, which shows its own notice once it is ready.
@@ -155,13 +199,14 @@ pub(crate) fn run_as_step(args: Args) -> CmdResult {
             crate::domain::privacy::sync::forget_refusal(&hub);
             crate::domain::privacy::service::schedule_sync(&hub);
             let who = ui::bold(&signed_in.who);
+            let host = host_of(&hub);
             ui::success(&match origin {
-                Origin::Obtained => format!("signed in as {who}"),
-                Origin::SavedElsewhere => {
-                    format!("signed in as {who}; another agit process finished this sign-in")
-                }
+                Origin::Obtained => format!("Signed in as {who} on {host}"),
+                Origin::SavedElsewhere => format!(
+                    "Signed in as {who} on {host}; another agit process finished this sign-in"
+                ),
                 Origin::AlreadySaved => {
-                    format!("no sign-in request is waiting; already signed in as {who}")
+                    format!("Already signed in as {who} on {host}; no sign-in request was waiting")
                 }
             });
             crate::telemetry::observe(crate::telemetry::Observation::Authentication(true));
@@ -463,6 +508,11 @@ pub fn login() -> crate::Result<Option<String>> {
         crate::telemetry::account_saved(&hub, credential.account_id.as_deref());
     }
     crate::telemetry::observe(crate::telemetry::Observation::Authentication(true));
+    ui::success(&format!(
+        "Signed in as {} on {}",
+        ui::bold(&signed_in.who),
+        host_of(&hub)
+    ));
     Ok(Some(signed_in.who))
 }
 
@@ -936,8 +986,9 @@ pub(crate) fn claim_recorded(hub: &str) -> PendingSignIn {
         crate::telemetry::account_saved(hub, credential.account_id.as_deref());
     }
     ui::progress(format_args!(
-        "finished the sign-in the human approved: signed in as {}",
-        ui::bold(&signed_in.who)
+        "Signed in as {} on {}, finishing the sign-in the person approved",
+        ui::bold(&signed_in.who),
+        host_of(hub)
     ));
     PendingSignIn::SignedIn
 }

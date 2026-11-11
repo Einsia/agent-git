@@ -50,7 +50,8 @@ agit on [DIR] [--repo OWNER/NAME [--public]]
 | `--json` | Emit the unified CLI JSON envelope |
 
 Exit code `8` with `result.value.sign_in_url` means the user has to approve a sign-in: give
-them the link, and run the same command again after they approve. Codex runs AgentGit's hooks
+them the link, and run the same command again after they approve. When that run succeeds, tell
+them which account they are signed in as and what is now on; don't stop at "signed in". Codex runs AgentGit's hooks
 only after the user trusts them once in Codex (`/hooks`); the result says so.
 
 ## Examples

@@ -29,7 +29,9 @@ agit save [SESSION] [--all | --today] [--repo OWNER/NAME [--public]]
 With `--json`, `result.value.sessions[]` has `title`, `status` (`uploaded`, `pending` or
 `failed`), `link` and `error`. `pending` means the conversation's first reply has not finished;
 it uploads by itself when the reply ends. Exit code `8` with `result.value.sign_in_url` means
-the user must approve a sign-in: send them the link, then run the same command again.
+the user must approve a sign-in: send them the link, then run the same command again. When
+that run succeeds, tell them which account they are signed in as and give them the session
+links it returned.
 
 `result.value.opencode_earlier` (`earlier`, `already_saved`), when not null, means this save looked
 once at the OpenCode conversations of a folder turned on before agit recorded them. The ones it

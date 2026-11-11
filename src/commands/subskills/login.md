@@ -77,6 +77,12 @@ also recorded under `AGIT_HOME`, so any later process on the same machine and
    when `--complete` says so, or when the human never received the link.
 5. Continue the original task only after completion succeeds. `agit whoami --check`
    can verify the saved identity.
+6. Tell the human who they are signed in as and what happens next, in one line;
+   never stop at "done". With `--json`, `result.value` is `{status: "signed_in",
+   account, hub, next}`: name `account`, then either go on with the task they asked
+   for (and give them its result, such as the session link) or, when there was no
+   other task, offer `next.command` with `next.why`. Without `--json`, the last line
+   names the account and the next step the same way.
 
 A login that is interrupted while it waits (`agit login --device`, or the browser
 flow at a terminal) leaves its request recorded; `agit login --complete` finishes
