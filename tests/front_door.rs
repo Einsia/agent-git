@@ -221,6 +221,23 @@ fn fake_hub(created: Arc<Mutex<Vec<serde_json::Value>>>) -> String {
                         "eeeeeeee-0000-4000-8000-000000000005",
                     ),
                 )
+            } else if path == "/api/agents/me/solo-sessions"
+                && created
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["name"] == "solo-sessions")
+            {
+                // The private repository `agit on` creates for the `solo` folder, once created.
+                (
+                    "200 OK",
+                    agent(
+                        "me",
+                        "solo-sessions",
+                        "private",
+                        "dddddddd-0000-4000-8000-000000000004",
+                    ),
+                )
             } else if path.ends_with(".git/info/refs?service=git-receive-pack") {
                 ("200 OK", serde_json::json!("0000"))
             } else {
@@ -662,6 +679,28 @@ fn an_inferred_destination_is_never_public() {
         lab.created(),
         [("acme".to_string(), "widget-agents".to_string())],
         "the team's private repository is joined, and its origin linked, instead of a new one"
+    );
+}
+
+/// The first folder turned on for a repository downloads the repository's whole history to this
+/// computer, which takes minutes for a long one. `agit on` says so before the download starts, so
+/// neither the person nor an agent waiting on the command takes the wait for a hang. An `agit on`
+/// that started the download without a word would leave both looking at nothing until it ends.
+#[test]
+fn turning_a_folder_on_says_it_downloads_the_repository_first() {
+    let lab = Lab::new();
+    let dir = lab.folder("solo", false);
+    let out = lab.agit(&dir, &["on"]);
+    assert_eq!(
+        lab.created(),
+        [("me".to_string(), "solo-sessions".to_string())],
+        "{out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "downloading me/solo-sessions from the Hub to this computer for the first time"
+        ),
+        "{out:?}"
     );
 }
 
