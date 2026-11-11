@@ -419,7 +419,7 @@ fn assert_failure(output: &Output, mode: &str, code: i32, lab: &Lab, base: &str,
             "private credential in output: stdout={stdout} stderr={stderr}"
         );
     }
-    assert!(!stdout.contains("share created") && !stdout.contains("revoked "));
+    assert!(!stdout.contains("read-only copy created") && !stdout.contains("revoked "));
     if let Some(version) = mode.strip_prefix("json") {
         assert!(stderr.is_empty(), "{output:?}");
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();

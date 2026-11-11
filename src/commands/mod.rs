@@ -1486,7 +1486,11 @@ pub enum Commands {
     Activity(Box<activity::Args>),
     /// Write your month in an organization with your own agent and put it on the Hub
     Month(month::Args),
-    /// Create a read-only link to a conversation
+    /// Create a read-only copy anyone with its link can read without an account, until it expires
+    ///
+    /// Create a read-only copy of a conversation: one version, readable without an account by
+    /// anyone with its link, until it expires (in 7 days unless --expire says otherwise) or you
+    /// revoke it
     Share(share::Args),
     /// Choose session publication modes, manage original access, and configure privacy policy
     Privacy(privacy::Args),

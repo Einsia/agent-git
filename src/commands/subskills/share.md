@@ -1,6 +1,6 @@
 ---
 name: agit-share
-description: Create one-shot read-only session links and manage links you created.
+description: Create a read-only copy of a conversation that anyone with its link can read without an account until it expires, and manage the copies you created.
 ---
 
 # agit share
@@ -12,6 +12,10 @@ agit share [ref-or-session] [options]
 agit share list
 agit share rm <slug>
 ```
+
+`agit share` makes a read-only copy: one version of a conversation, readable without an account
+by anyone with its link, until it expires (in 7 days unless `--expire` says otherwise) or you
+revoke it. Create a session link, invite link or read-only copy only when the person asks for one; never create one on your own to finish a task.
 
 A bare `agit share` in a human terminal opens a wizard: choose a saved session,
 then encrypted or public visibility and an expiry. The selection is temporary;

@@ -332,6 +332,23 @@ pub struct CreatedInvitation {
     pub token: String,
 }
 
+/// How many sessions a repository holds, by who started them (`GET .../sessions/authors`): what a
+/// session link opens is said with these counts before the link is made.
+#[derive(Debug, Deserialize)]
+pub struct SessionAuthors {
+    pub authors: Vec<SessionAuthor>,
+    /// Sessions nobody is recorded as starting; they count as someone else's.
+    pub unattributed: u64,
+    /// The listing stopped short, so the counts are a lower bound.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionAuthor {
+    pub username: String,
+    pub count: u64,
+}
+
 /// One session hit. The fields correspond to `SessionHit` in the hub's `search/scan.rs`.
 ///
 /// **One row per session**, not one per event: the same word can occur dozens of times inside one

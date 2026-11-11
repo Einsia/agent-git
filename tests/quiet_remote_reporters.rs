@@ -556,7 +556,7 @@ fn quiet_share_preserves_the_created_link_policy_data_and_revoke_hint() {
         ];
         let output = success(lab.command(&hub.base, &args, mode).output().unwrap());
         let text = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(text.contains("share created"), mode == "ordinary");
+        assert_eq!(text.contains("read-only copy created"), mode == "ordinary");
         for data in [
             "https://example.invalid/s/owned-share",
             "source",
@@ -656,7 +656,7 @@ fn quiet_share_json_keeps_the_complete_created_result() {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|v| v.as_str().unwrap().contains("share created"))
+                    .any(|v| v.as_str().unwrap().contains("read-only copy created"))
             );
             outputs.push(value);
         }
