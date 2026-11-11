@@ -79,6 +79,18 @@ automatic upload on. Turning it on, from there or from the folder's switch, asks
 question says the repository's automatic upload is off, how many conversations it releases, and
 who can read them, and Cancel is its default answer.
 
+A folder set to upload that agit says is held shows why in agit's words, with the one step that
+answers it where the app has one: Sign in when agit isn't signed in as the folder's account, and
+the folder's switch, which asks the public question, when a public repository waits to be switched
+on. Another account, or a repository that doesn't let the account write, is said without a button.
+A reason this app doesn't know is shown as agit wrote it and still needs attention. A repository
+the Hub last reported as public says so on the folder's row. A runtime installed here that doesn't
+save the folder's conversations yet shows agit's step on the row, and needs attention only when agit
+says the folder has that runtime's conversations (`used_here`; an agit without it is answered by the
+recent conversations listed); one agit couldn't ask in time shows nothing. Records agit
+couldn't read for the list are named under it. "Upload again now" says how many conversations
+uploaded, and names apart those still in their first turn or left out, which are not failures.
+
 Every branch whose newest automatic upload didn't go through, wherever its conversation ran,
 shows as `owner/repo@branch` with agit's words for what happened, which name the command that goes
 on from it; where they don't, the row adds `agit push owner/repo@branch`, which shows what to do.

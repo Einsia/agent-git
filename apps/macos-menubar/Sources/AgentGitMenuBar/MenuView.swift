@@ -101,6 +101,14 @@ struct MenuView: View {
             Text("Some of agit's records could not be read; this list may be missing a folder.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
+            ForEach(model.unreadableRecords) { record in
+                Text(record.path.map { "\(record.what): \(Words.tilde($0))" } ?? record.what)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(record.path ?? record.what)
+            }
         }
     }
 
@@ -259,9 +267,9 @@ private struct FolderRow: View {
                 Image(systemName: "folder").foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(folder.name).font(.system(size: 12, weight: .semibold))
-                    Text("\(folder.description) · \(folder.repository)")
+                    Text("\(folder.description) · \(folder.repository)\(folder.isPublic ? " · public" : "")")
                         .font(.system(size: 11))
-                        .foregroundStyle(folder.failing || folder.blocked ? Color.orange : Color.secondary)
+                        .foregroundStyle(folder.failing || folder.blocked || folder.held != nil ? Color.orange : Color.secondary)
                         .lineLimit(1)
                 }
                 .help(folder.detail)
@@ -329,6 +337,22 @@ private struct FolderRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.leading, 18)
+            }
+            if let held = folder.held, held.code != "push_auto_off", model.busy[folder.folder] == nil {
+                Text(Words.sentence(held.text))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18)
+            }
+            if folder.isOn {
+                ForEach(folder.notCapturing, id: \.runtime) { capture in
+                    Text("\(Words.runtime(capture.runtime)): \(Words.sentence(capture.fix ?? ""))")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 18)
+                }
             }
             if let running = model.busy[folder.folder] {
                 HStack(spacing: 6) {
