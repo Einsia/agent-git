@@ -481,6 +481,7 @@ fn hydrate_transfer(request: &Request) -> crate::Result<Outcome> {
         unprocessed: 0,
         omitted: 0,
         reason: None,
+        protocol: None,
     };
     HYDRATION_TRANSFER.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -639,6 +640,7 @@ fn hydrate_transfer(request: &Request) -> crate::Result<Outcome> {
                             unprocessed: 0,
                             omitted: 0,
                             reason: Some(super::projector::Reason::Oversize),
+                            protocol: None,
                         }
                     } else {
                         restored?
@@ -662,6 +664,7 @@ fn hydrate_transfer(request: &Request) -> crate::Result<Outcome> {
                 reply.replacements = output.report.replacements;
                 reply.unresolved = output.report.unresolved;
                 reply.reason = output.report.reason;
+                reply.protocol = output.report.protocol;
                 reply.consumed = Some(output.bytes);
                 transfer.read += reply.content.len();
             }
@@ -755,6 +758,7 @@ fn frozen_hydration(request: &Request) -> crate::Result<Outcome> {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         })
     })
 }
@@ -807,6 +811,7 @@ fn status() -> crate::Result<Outcome> {
         unprocessed: 0,
         omitted: 0,
         reason: None,
+        protocol: None,
     })
 }
 
@@ -860,6 +865,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         });
     }
     let stamp = stamp(request.repo.as_deref());
@@ -1052,6 +1058,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         });
     }
     let loaded = loaded
@@ -1085,6 +1092,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         });
     }
     Ok(loaded

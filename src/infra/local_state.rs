@@ -239,6 +239,13 @@ pub fn lock_patiently(
 pub struct HeldLock(std::fs::File);
 
 impl HeldLock {
+    /// Take an exclusive lock on `file`, waiting at most [`LOCK_WAIT`] for another holder (see
+    /// [`lock_exclusive`]).
+    pub fn exclusive(file: std::fs::File, path: &Path, what: &'static str) -> crate::Result<Self> {
+        lock_exclusive(&file, path, what)?;
+        Ok(Self(file))
+    }
+
     /// Take an exclusive lock on `file`; contention reads as `busy`.
     pub fn try_exclusive(
         file: std::fs::File,

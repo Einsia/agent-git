@@ -112,6 +112,7 @@ fn withheld_live(input: &str) -> Option<Withheld> {
         .filter(|(needle, _)| input.contains(needle))
         .map(|(_, reason)| Withheld {
             reason: Some(reason),
+            protocol: None,
         })
 }
 
@@ -121,6 +122,9 @@ pub(crate) struct Withheld {
     /// What the worker reported; none when it gave no reason.
     #[cfg(feature = "cli")]
     pub(crate) reason: Option<crate::domain::privacy::projector::Reason>,
+    /// With a protocol error, which way the check ended.
+    #[cfg(feature = "cli")]
+    pub(crate) protocol: Option<crate::domain::privacy::projector::ProtocolCause>,
 }
 
 impl Withheld {
@@ -128,6 +132,7 @@ impl Withheld {
     fn of(outcome: &crate::domain::privacy::projector::Outcome) -> Self {
         Self {
             reason: outcome.reason,
+            protocol: outcome.protocol,
         }
     }
 }
@@ -153,7 +158,20 @@ impl std::fmt::Display for Withheld {
                 }
                 Some(Reason::Backoff) => "the privacy worker is waiting after a failure",
                 Some(Reason::SpawnFailed) => "the privacy worker could not start",
-                Some(Reason::ProtocolError) => "the privacy worker returned an invalid response",
+                Some(Reason::ProtocolError) => {
+                    return match self.protocol {
+                        Some(cause) => write!(
+                            f,
+                            "privacy check failed ({}): {cause}",
+                            reason_name(self.reason)
+                        ),
+                        None => write!(
+                            f,
+                            "privacy check failed ({}): the privacy worker returned an invalid response",
+                            reason_name(self.reason)
+                        ),
+                    };
+                }
                 Some(Reason::FindingsCap) => "the privacy scan exceeded its findings limit",
                 Some(Reason::UnheldPlaceholders) => {
                     "it holds placeholders this computer never made, so they stay as they are"
@@ -677,8 +695,15 @@ impl Redactor {
         }
         #[cfg(feature = "cli")]
         let mut value: serde_json::Value =
-            serde_json::from_str(&protected.content).map_err(|_| Withheld {
-                reason: Some(crate::domain::privacy::projector::Reason::ProtocolError),
+            serde_json::from_str(&protected.content).map_err(|error| {
+                use crate::domain::privacy::projector::{ProtocolCause, Reason, ReplyShape};
+                Withheld {
+                    reason: Some(Reason::ProtocolError),
+                    protocol: Some(ProtocolCause::UnreadableReply {
+                        bytes: protected.content.len(),
+                        shape: ReplyShape::of(protected.content.as_bytes(), &error),
+                    }),
+                }
             })?;
         #[cfg(not(feature = "cli"))]
         let _ = durable;
