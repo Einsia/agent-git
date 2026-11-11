@@ -9,6 +9,7 @@ mod audit;
 mod audit_report;
 mod audit_workspace;
 mod audited_push;
+pub(crate) use audited_push::published_visibility;
 mod consent;
 pub(crate) use audited_push::{
     automatic_publication_consent, automatic_publication_consent_with_client, publication_consent,

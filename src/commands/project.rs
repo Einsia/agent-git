@@ -1208,6 +1208,24 @@ fn verify(project: &Project) -> Result<Repo> {
     Ok(repo)
 }
 
+/// Who can read a session that went up as the person's own push, once, while its repository's
+/// automatic upload is off here, in the words a conversation's start uses: the visibility is the
+/// one that push read for its destination, and only the owner's kind and the members' access
+/// come from what the folder recorded. "visibility not confirmed" when the push read none.
+fn published_once_to(project: &Project, visibility: Option<&str>) -> String {
+    let audience = recorded_audience(&project.root);
+    visibility
+        .and_then(|visibility| {
+            readers(
+                &project.repository,
+                Some(visibility),
+                audience.org,
+                audience.members_read,
+            )
+        })
+        .unwrap_or_else(|| "visibility not confirmed".to_owned())
+}
+
 fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json::Value> {
     let mut command = crate::infra::background::command(std::env::current_exe()?);
     command.args(["--quiet", "--json"]).args(arguments);
@@ -1322,6 +1340,10 @@ pub(crate) enum UploadFailure {
     RulesChanged,
     /// The folder the conversation ran in doesn't upload it by itself, or left it out.
     FolderOff,
+    /// Another agit process kept one of agit's state locks for the whole wait.
+    LocalBusy,
+    /// agit could not write its own state on this computer.
+    LocalUnwritable,
     Other,
 }
 
@@ -1355,15 +1377,20 @@ impl Reader {
 
 impl UploadFailure {
     fn of(error: &anyhow::Error, project: &Project, candidate: &Candidate) -> Self {
+        use crate::infra::local_state::LocalStateError;
         if error.is::<RulesChanged>() {
             return Self::RulesChanged;
         }
-        let reported = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<ChildFailed>())
-            .map_or(Self::Other, |failed| {
-                Self::reported(failed.exit_code, &failed.message)
-            });
+        let reported = match crate::infra::local_state::find(error) {
+            Some(LocalStateError::Contended { .. }) => Self::LocalBusy,
+            Some(LocalStateError::NotWritable { .. }) => Self::LocalUnwritable,
+            None => error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ChildFailed>())
+                .map_or(Self::Other, |failed| {
+                    Self::reported(failed.exit_code, &failed.message)
+                }),
+        };
         if reported == Self::Other && sign_in(project) == SignIn::Absent {
             return Self::SignedOut;
         }
@@ -1421,6 +1448,12 @@ impl UploadFailure {
         if message.contains(super::push::FOLDER_KEEPS_IT) {
             return Self::FolderOff;
         }
+        if message.contains(crate::infra::local_state::CONTENDED) {
+            return Self::LocalBusy;
+        }
+        if message.contains(crate::infra::local_state::NOT_WRITABLE) {
+            return Self::LocalUnwritable;
+        }
         // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
         // name to rename is refused before the Hub is asked.
         if super::push::refused_for_good(message) {
@@ -1448,7 +1481,7 @@ impl UploadFailure {
                 "the session builds on one withdrawn on the Hub, so later turns of it stay on this computer; once that session is restored, pushing it yourself publishes it"
             }
             Self::PublicNeedsConsent => {
-                "its repository is public, and automatic upload into a public repository waits until you switch it on"
+                "its repository is public, and automatic upload into a public repository waits until you switch it on with `agit on`"
             }
             Self::Refused => "it can't be uploaded as it is, and `agit` in this folder shows why",
             Self::Diverged => {
@@ -1464,6 +1497,12 @@ impl UploadFailure {
                 "the rules for publishing to this repository changed while it was uploading, so the upload didn't finish; the turn stays saved here, and the next turn or `agit save` uploads what's left"
             }
             Self::FolderOff => "the folder it ran in doesn't upload it by itself",
+            Self::LocalBusy => {
+                "another agit process kept one of agit's locks too long; the next turn tries again"
+            }
+            Self::LocalUnwritable => {
+                "agit couldn't write its own files on this computer; `agit doctor` says where"
+            }
             // Nothing is known of a refusal without a name of its own, so no retry is promised.
             Self::Other => "it could not be completed on this computer",
         }
@@ -1705,11 +1744,18 @@ fn import_capture(
 /// Imports and publishes one session; returns its branch and the head the push started from.
 /// An `automatic` upload leaves out, once it is imported, a branch the Hub refused for a reason
 /// the next turn does not change, and says so with [`LeftOut`].
-fn sync_one(
-    project: &Project,
-    candidate: &Candidate,
-    automatic: bool,
-) -> Result<(String, Option<String>)> {
+/// What [`sync_one`] uploaded.
+struct Synced {
+    branch: String,
+    /// The branch's head, read before the push.
+    head: Option<String>,
+    /// For the person's own push while the repository's automatic upload is off here, the
+    /// visibility that push read for its destination (`Some(None)` when it read none); `None`
+    /// for an automatic upload.
+    once: Option<Option<String>>,
+}
+
+fn sync_one(project: &Project, candidate: &Candidate, automatic: bool) -> Result<Synced> {
     verify(project)?;
     let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
@@ -1753,6 +1799,9 @@ fn sync_one(
         "--quiet",
         &format!("refs/heads/{branch}^{{commit}}"),
     ]);
+    // The person's own push while the repository's automatic upload is off here: the save that
+    // asked for it says where it went, from what the push read.
+    let one_off = project.auto_upload && !uploads_automatically;
     let pushed = if uploads_automatically {
         super::upload_outcome::recorded(
             super::upload_outcome::Place::of(&project.repository, &branch),
@@ -1774,7 +1823,11 @@ fn sync_one(
         let args = vec!["push".into(), target];
         retry_stale(|| child(&args, &candidate.cwd, false))
     };
-    pushed?;
+    let pushed = pushed?;
+    let once = one_off.then(|| {
+        let lines = pushed["result"]["lines"].as_array().into_iter().flatten();
+        super::push::published_visibility(lines.filter_map(serde_json::Value::as_str))
+    });
     // A publication does not move the local view of the Hub's branches; fetching does, so local
     // status and links can tell that this branch is on the Hub.
     let _ = child(
@@ -1782,7 +1835,7 @@ fn sync_one(
         &candidate.cwd,
         false,
     );
-    Ok((branch, head))
+    Ok(Synced { branch, head, once })
 }
 
 /// Runs an upload, and once more, from the start, when it was prepared under publication rules
@@ -1908,7 +1961,7 @@ fn sync(project: &mut Project) -> CmdResult {
             serde_json::json!({"status": "skipped", "reason": reason})
         } else {
             match sync_one(project, &candidate, false) {
-                Ok((branch, head)) => {
+                Ok(Synced { branch, head, .. }) => {
                     serde_json::json!({"branch": branch, "status": "pushed", "head": head})
                 }
                 Err(error) if error.is::<NothingSettled>() => {
@@ -3313,10 +3366,23 @@ fn drain(root: &Path) -> Result<()> {
 /// git worktrees from before the folder covered them; automatic capture never does. `automatic`
 /// says no person asked for this upload.
 fn capture_candidate(
+    project: Project,
+    candidate: Candidate,
+    let_in: bool,
+    automatic: bool,
+) -> Result<bool> {
+    capture_candidate_into(project, candidate, let_in, automatic, &mut None)
+}
+
+/// [`capture_candidate`], which also leaves in `once` what an upload the person asked for while
+/// the repository's automatic upload is off read of its destination ([`Synced::once`]), for the
+/// save to say of this session alone.
+fn capture_candidate_into(
     mut project: Project,
     candidate: Candidate,
     let_in: bool,
     automatic: bool,
+    once: &mut Option<Option<String>>,
 ) -> Result<bool> {
     // Automatic capture leaves foreign claims to their source repository's settlement.
     if !matches!(
@@ -3375,17 +3441,18 @@ fn capture_candidate(
         "at": chrono::Utc::now(), "session_id": candidate.session_id, "ok": result.is_ok(),
         "error": result.as_ref().err().map(|e| format!("{e:#}")),
         "reason": reason,
-        "head": result.as_ref().ok().and_then(|(_, head)| head.as_deref()),
+        "head": result.as_ref().ok().and_then(|synced| synced.head.as_deref()),
     }));
     save(&project)?;
-    result?;
+    *once = result?.once;
     Ok(true)
 }
 
 /// What an explicit save did with one session.
 pub(crate) enum Saved {
-    /// On the Hub, on this branch.
-    Uploaded(String),
+    /// On the Hub, on this branch; with who can read it there when it went up as the person's own
+    /// push, once, while the repository's automatic upload is off on this computer.
+    Uploaded(String, Option<String>),
     /// Claimed on this branch; its first turn has not finished, and the Stop that finishes it
     /// uploads it.
     Pending(String),
@@ -3513,7 +3580,7 @@ pub(crate) fn save_now(
         };
         // A conversation the person saved themselves no longer stays out of the folder's uploads
         // because it predates `agit rc start --here` (see `rc::folder_cutoff`).
-        if (earlier || named) && matches!(outcome, Saved::Uploaded(_) | Saved::Pending(_)) {
+        if (earlier || named) && matches!(outcome, Saved::Uploaded(..) | Saved::Pending(_)) {
             crate::rc::folder_cutoff::admit(cwd, runtime, session_id)?;
         }
         saved.push(outcome);
@@ -3600,7 +3667,8 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
             why: None,
         });
     }
-    if !capture_candidate(project.clone(), candidate.clone(), let_in, false)? {
+    let mut once = None;
+    if !capture_candidate_into(project.clone(), candidate.clone(), let_in, false, &mut once)? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
         return Ok(Saved::Elsewhere {
@@ -3628,7 +3696,8 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
     let branch = link::get(&store, &candidate.runtime, &candidate.session_id)
         .and_then(|link| link.branch)
         .context("the session was not saved")?;
-    Ok(Saved::Uploaded(branch))
+    let once = once.map(|visibility| published_once_to(&after, visibility.as_deref()));
+    Ok(Saved::Uploaded(branch, once))
 }
 
 /// The capture worker lock, waiting for a worker that holds it.
@@ -9362,6 +9431,51 @@ mod tests {
             Saved::upload_failed("the Hub did not answer".into()),
             Saved::Failed(_)
         ));
+    }
+
+    /// A failed upload that agit's own state stopped is named by what stopped it, from the error
+    /// its child reports: another agit holding a lock for the whole wait, or agit's own files
+    /// unwritable. Each says what comes next, and any other failure stays unnamed. A classifier
+    /// that kept these as one "could not be completed" would leave the person with no reason; one
+    /// that matched too loosely would name a Hub failure as a local one.
+    #[test]
+    fn a_local_state_failure_is_named_by_what_stopped_it() {
+        let precondition = Some(ExitCode::Precondition.as_i32());
+        let busy = crate::infra::local_state::LocalStateError::Contended {
+            what: "the folder's capture lock",
+            path: "/tmp/x.capture".into(),
+        };
+        assert_eq!(
+            UploadFailure::reported(precondition, &busy.to_string()),
+            UploadFailure::LocalBusy
+        );
+        let unwritable = crate::infra::local_state::LocalStateError::NotWritable {
+            home: Some("/home/a/.agit".into()),
+            path: "/home/a/.agit/x".into(),
+            source: std::io::Error::other("read-only file system"),
+        };
+        assert_eq!(
+            UploadFailure::reported(precondition, &unwritable.to_string()),
+            UploadFailure::LocalUnwritable
+        );
+        assert_eq!(
+            UploadFailure::reported(precondition, "something else"),
+            UploadFailure::Other
+        );
+        assert_ne!(
+            UploadFailure::reported(precondition, "the selected namespace is not writable"),
+            UploadFailure::LocalUnwritable
+        );
+        assert!(
+            UploadFailure::LocalBusy
+                .describe()
+                .ends_with("the next turn tries again")
+        );
+        assert!(
+            UploadFailure::LocalUnwritable
+                .describe()
+                .contains("`agit doctor`")
+        );
     }
 
     /// Whether the owner is an organization and whether its members read the repository come from

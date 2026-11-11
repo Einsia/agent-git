@@ -293,9 +293,17 @@ fn run_repo(args: &Args, slug: &str) -> CmdResult {
         );
     }
     if effective && matches!(operation, "set" | "unset") && !super::json::requested() {
-        ui::hint(&format!(
-            "run `agit push {owner}/{name}@<branch> --dry-run` to inspect the destination and registered session settings"
-        ));
+        // A repository this computer never published to has no destination yet, so nothing
+        // uploads by itself until one push creates it.
+        if crate::hub::identity::read(&repo)?.is_none() {
+            ui::hint(&format!(
+                "{owner}/{name} isn't on the Hub from this computer yet; the first `agit push {owner}/{name}@<branch>` creates it, and automatic upload follows from then on"
+            ));
+        } else {
+            ui::hint(&format!(
+                "run `agit push {owner}/{name}@<branch> --dry-run` to inspect the destination and registered session settings"
+            ));
+        }
     }
     Ok(ExitCode::Ok)
 }

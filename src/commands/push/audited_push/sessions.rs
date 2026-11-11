@@ -716,7 +716,7 @@ pub(super) fn run(
         let interactive_part =
             part == 1 || yes_stands.is_none() || args.audit || (args.show_preview && !automatic);
         if interactive_part {
-            println!("Publication destination: {}", intent.describe());
+            println!("{}{}", super::DESTINATION_LINE, intent.describe());
         }
         println!("Privacy preview: {}", preview.path.display());
         if !automatic && interactive_part {

@@ -55,7 +55,8 @@ pub enum PermissionMode {
     /// "Auto" — everything the sandbox permits proceeds unattended. Still
     /// bounded by the workspace allowlist, which lives on the machine.
     Auto,
-    /// Look but do not touch: no edits, no commands. For planning.
+    /// Look but change nothing: no edits. It can read whatever the person can read on that
+    /// computer, outside the project too. For planning.
     Plan,
     /// No permission checks at all. Owner-only, and the session is marked
     /// [`SessionInfo::dangerous`] for the rest of its life.
