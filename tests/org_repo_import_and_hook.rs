@@ -37,6 +37,7 @@ fn fake_hub(
     signed_out: std::path::PathBuf,
     clone_url: std::path::PathBuf,
     hub_requests: Arc<AtomicUsize>,
+    remote_heads: std::path::PathBuf,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -141,6 +142,14 @@ fn fake_hub(
                     r#"{"name":"acme","role":"member","created_at":"2026-01-01T00:00:00Z"}"#
                         .to_string(),
                 )
+            } else if path == "/einsia/qa.git/info/refs?service=git-upload-pack"
+                && remote_heads.exists()
+            {
+                // Read as git's plain ref list, which is all `git ls-remote` needs.
+                (
+                    "200 OK",
+                    fs::read_to_string(&remote_heads).unwrap_or_default(),
+                )
             } else if path == "/einsia/qa.git/info/refs?service=git-receive-pack"
                 && !gate_closed.exists()
             {
@@ -203,6 +212,8 @@ struct Lab {
     signed_out: std::path::PathBuf,
     clone_url: std::path::PathBuf,
     hub_requests: Arc<AtomicUsize>,
+    /// Writing branch lines (`<oid>\t<ref>`) here makes the fake hub advertise them for `einsia/qa`.
+    remote_heads: std::path::PathBuf,
     home: std::path::PathBuf,
     agit_home: std::path::PathBuf,
     work: std::path::PathBuf,
@@ -224,12 +235,14 @@ impl Lab {
         let signed_out = tmp.path().join("signed-out");
         let clone_url = tmp.path().join("clone-url");
         let hub_requests = Arc::new(AtomicUsize::new(0));
+        let remote_heads = tmp.path().join("remote-heads");
         fs::write(&clone_url, "x").unwrap();
         let hub = fake_hub(
             gate_closed.clone(),
             signed_out.clone(),
             clone_url.clone(),
             Arc::clone(&hub_requests),
+            remote_heads.clone(),
         );
         let cred = agit::infra::credentials::HubCredential {
             account_id: None,
@@ -254,6 +267,7 @@ impl Lab {
             signed_out,
             clone_url,
             hub_requests,
+            remote_heads,
             home,
             agit_home,
             work,
@@ -4546,6 +4560,110 @@ fn a_rewound_conversation_names_the_import_that_keeps_both_and_the_import_works(
         agit::domain::link::get(&store, "claude-code", id).and_then(|link| link.branch),
         Some(format!("{branch}-2"))
     );
+}
+
+/// `agit save --branch NAME` puts a conversation that has no branch yet on NAME, in place of the
+/// generated name, through the same capture a save without it takes; asked again for another name,
+/// it refuses and names the rename that gives the branch the conversation already saves to that
+/// name, changing nothing. A save that let --branch open a second branch beside the first would
+/// split the conversation's history in two, the fork a rename of a still-saving branch made. A
+/// name the Hub already has, though this computer hasn't fetched it, is refused before the
+/// conversation is claimed: judged by this computer's copy alone, the claim would stand and the
+/// upload be refused.
+#[test]
+fn a_save_names_a_new_conversations_branch_and_never_opens_a_second_one() {
+    use sha2::{Digest, Sha256};
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "start", "ok");
+    let out = lab
+        .agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let checkout = Repo::open(lab.repo("einsia", "qa")).unwrap();
+    agit::hub::identity::pin(
+        &checkout,
+        &agit::hub::identity::RemoteIdentity::new(&lab.hub, QA_AGENT_ID).unwrap(),
+    )
+    .unwrap();
+    checkout.set_auto_push(Some(false)).unwrap();
+    let state = lab
+        .agit_home
+        .join("projects")
+        .join(&hex::encode(Sha256::digest(lab.work.to_string_lossy().as_bytes()))[..24]);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(
+        state.with_extension("json"),
+        serde_json::to_vec(&serde_json::json!({
+            "root": lab.work, "repository": "einsia/qa",
+            "identity": {"hub": lab.hub, "agent_id": QA_AGENT_ID},
+            "account": "me", "account_id": null, "enabled": true, "auto_upload": true,
+            "history": "none", "excluded": [format!("claude-code:{SID}")], "last_result": null,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // A stand-in `claude`, so the runtime counts as installed and its conversations are found.
+    let bin = lab.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let id = "dddddddd-0000-4000-8000-000000000021";
+    lab.append_turn(id, 1, "plan the release", "done");
+    let save = |branch: &str| {
+        let out = lab
+            .agit(&["--json", "save", id, "--branch", branch])
+            .env("PATH", &path)
+            .env_remove("AGIT_YES")
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .unwrap_or_else(|_| panic!("{out:?}"))
+    };
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claimed =
+        || agit::domain::link::get(&store, "claude-code", id).and_then(|link| link.branch);
+
+    fs::write(&lab.clone_url, format!("{}/einsia/qa.git", lab.hub)).unwrap();
+    fs::write(
+        &lab.remote_heads,
+        "1111111111111111111111111111111111111111\trefs/heads/me-taken\n",
+    )
+    .unwrap();
+    let document = save("me-taken");
+    let session = &document["result"]["value"]["sessions"][0];
+    assert!(
+        session["error"].as_str().is_some_and(
+            |error| error.starts_with("einsia/qa already has a branch me-taken; name another")
+        ),
+        "{document}"
+    );
+    assert_eq!(claimed(), None, "{document}");
+
+    let document = save("me-plan");
+    assert_eq!(claimed().as_deref(), Some("me-plan"), "{document}");
+    assert!(checkout.has_ref("refs/heads/me-plan"), "{document}");
+
+    let document = save("me-other");
+    let session = &document["result"]["value"]["sessions"][0];
+    assert!(
+        session["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("it already saves to me-plan")
+                && error.contains("`agit branch rename me-plan me-other --repo einsia/qa`")),
+        "{document}"
+    );
+    assert_eq!(claimed().as_deref(), Some("me-plan"), "{document}");
+    assert!(!checkout.has_ref("refs/heads/me-other"), "{document}");
 }
 
 /// `agit save` doesn't offer a conversation whose folder no longer exists, a removed worktree say.

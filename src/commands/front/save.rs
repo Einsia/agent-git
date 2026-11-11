@@ -26,6 +26,10 @@ pub struct SaveArgs {
     /// Allow the repository named with --repo to be public.
     #[arg(long, requires = "repo")]
     pub public: bool,
+    /// The branch the conversation goes up on the first time, in place of a generated name; only
+    /// for a save of one conversation that has no branch yet.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["all", "today"])]
+    pub branch: Option<String>,
 }
 
 pub fn run(args: SaveArgs) -> CmdResult {
@@ -63,6 +67,9 @@ fn again(args: &SaveArgs) -> String {
     }
     if args.public {
         command.push_str(" --public");
+    }
+    if let Some(branch) = &args.branch {
+        command.push_str(&format!(" --branch {}", ui::quote_posix_argument(branch)));
     }
     command
 }
@@ -210,8 +217,48 @@ struct Row {
     was_dropped: bool,
 }
 
+/// Whether git takes `name` as a branch name. A git that can't be run takes nothing.
+fn git_accepts_branch(name: &str) -> bool {
+    crate::infra::git_runtime::command()
+        .args(["check-ref-format", "--branch", name])
+        .current_dir(std::env::temp_dir())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn save(args: SaveArgs) -> CmdResult {
+    // Checked before the folder is planned, signed in or turned on: a name that fails later, at
+    // the import, would leave a folder `--repo` turned on by a save that saved nothing.
+    if let Some(branch) = &args.branch
+        && let Some(why) = crate::domain::repo::valid_branch_name(branch)
+            .err()
+            .map(|error| format!("{error:#}"))
+            .or_else(|| (branch == "main").then(|| "main holds no conversation".to_owned()))
+            .or_else(|| {
+                (!git_accepts_branch(branch))
+                    .then(|| "git doesn't accept it as a branch name".to_owned())
+            })
+    {
+        return Err(Refusal::new(
+            format!("`{branch}` can't name a conversation's branch: {why}"),
+            "name another with --branch",
+            ExitCode::Usage,
+        )
+        .into());
+    }
     let plan = plan(&args)?;
+    // One name is one branch: a save of several conversations would put them all on it.
+    let count: usize = plan.folders.values().map(Vec::len).sum();
+    if args.branch.is_some() && count > 1 {
+        return Err(Refusal::new(
+            format!("--branch names one conversation's branch, and this save covers {count}"),
+            "name the one to save: `agit save SESSION-ID --branch NAME`",
+            ExitCode::Usage,
+        )
+        .into());
+    }
     if plan.folders.is_empty() {
         if crate::commands::json::is_capturing() {
             println!(
@@ -327,7 +374,13 @@ fn save(args: SaveArgs) -> CmdResult {
             .map(|s| named && crate::commands::project::is_dropped(&root, s.runtime, &s.id))
             .collect();
         let spinner = ui::spinner(&format!("uploading {} session(s)…", targets.len()));
-        let outcomes = crate::commands::project::save_now(&root, &targets, plan.earlier, named);
+        let outcomes = crate::commands::project::save_now(
+            &root,
+            &targets,
+            plan.earlier,
+            named,
+            args.branch.as_deref(),
+        );
         spinner.finish_and_clear();
         for ((session, outcome), was_dropped) in sessions.iter_mut().zip(outcomes?).zip(was_dropped)
         {

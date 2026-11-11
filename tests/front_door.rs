@@ -1713,6 +1713,33 @@ fn a_folder_covers_its_git_worktrees_from_now_on() {
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
 }
 
+/// A branch name git can't take is refused before anything is set up: `agit save --branch` with
+/// `--repo` in a folder that isn't on yet creates no repository, turns nothing on and claims no
+/// conversation. Checked only at the import, the same mistake would leave the folder uploading by
+/// itself after a save that saved nothing.
+#[test]
+fn a_branch_name_git_refuses_changes_nothing() {
+    let lab = Lab::new();
+    let dir = lab.folder("notes", false);
+    let id = "27272727-2727-4272-8272-272727272727";
+    lab.conversation(&dir, id, "Plan the move");
+    for bad in ["bad..name", "-topic"] {
+        let out = lab.agit(&dir, &["save", id, "--branch", bad, "--repo", "me/notes"]);
+        assert_eq!(out.status.code(), Some(2), "{bad}: {out:?}");
+    }
+    assert!(lab.created().is_empty(), "nothing is created on the Hub");
+    assert!(
+        !lab.agit_home.join("projects").exists()
+            || std::fs::read_dir(lab.agit_home.join("projects"))
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|e| e != "json")),
+        "the folder is not turned on"
+    );
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    assert!(agit::domain::link::get(&store, "claude-code", id).is_none());
+}
+
 /// A conversation already saved in another repository is said to be saved there, in a plain line,
 /// not reported as an upload that failed, and saving again isn't offered: it changes nothing. Shown
 /// as an error with a retry, it reads as agit broken, and the retry meets the same answer.

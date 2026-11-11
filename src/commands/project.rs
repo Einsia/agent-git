@@ -3613,12 +3613,14 @@ fn free_branch(repo: &Repo, branch: &str) -> String {
 /// Uploads these sessions of the project deciding for the folder at `root` now, after any
 /// automatic upload already running there. With `earlier`, sessions the binding left out are let
 /// in first. A session the person dropped is let in only when `named`: the person asked for that
-/// one session, and not for every earlier one.
+/// one session, and not for every earlier one. `branch` names the branch a session that has none
+/// yet goes up on, in place of the generated name (see [`save_one`]).
 pub(crate) fn save_now(
     root: &Path,
     sessions: &[(String, String, PathBuf)],
     earlier: bool,
     named: bool,
+    branch: Option<&str>,
 ) -> Result<Vec<Saved>> {
     let root = &policy_root(root);
     let worker = wait_for_worker(root)?;
@@ -3658,7 +3660,7 @@ pub(crate) fn save_now(
             )));
             continue;
         }
-        let outcome = match save_one(project.clone(), candidate.clone(), earlier || named) {
+        let outcome = match save_one(project.clone(), candidate.clone(), earlier || named, branch) {
             Ok(outcome) => outcome,
             Err(error) => Saved::upload_failed_for(&project, &candidate, format!("{error:#}")),
         };
@@ -3703,7 +3705,16 @@ fn bound_apart(project: &Project, candidate: &Candidate) -> Result<Option<String
 
 /// Uploads one session for a save. `let_in` says the save lets in sessions of the folder's git
 /// worktrees from before they were covered.
-fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Saved> {
+/// With `branch`, a session no branch claims yet goes up on that branch rather than on a generated
+/// name; one that already saves to another branch is refused with the rename that gives that
+/// branch this name, and nothing changes. A second line beside the branch it already has would
+/// split its history in two.
+fn save_one(
+    project: Project,
+    candidate: Candidate,
+    let_in: bool,
+    branch: Option<&str>,
+) -> Result<Saved> {
     if delegation_withheld(&project.repository, &candidate, Some(&project), false)? {
         return Ok(Saved::Refused(
             "the root conversation's capture policy keeps this delegated session out".into(),
@@ -3727,6 +3738,78 @@ fn save_one(project: Project, candidate: Candidate, let_in: bool) -> Result<Save
             saved_in: Some(source),
             why: None,
         });
+    }
+    if let Some(named) = branch {
+        let _guard = lock(&project.root)?;
+        let project = read(&project.root)?.context("folder is not set up")?;
+        match placement(&project, &candidate)? {
+            Placement::Claim(current) if current == named => {}
+            Placement::Claim(current) => {
+                return Ok(Saved::Refused(format!(
+                    "it already saves to {current}; to give that branch this name: `agit branch rename {current} {named} --repo {}`",
+                    project.repository
+                )));
+            }
+            Placement::New => {
+                let repo = verify(&project)?;
+                let taken = || {
+                    Saved::Refused(format!(
+                        "{} already has a branch {named}; name another",
+                        project.repository
+                    ))
+                };
+                if repo.has_ref(&format!("refs/heads/{named}"))
+                    || repo.has_ref(&format!("refs/remotes/origin/{named}"))
+                {
+                    return Ok(taken());
+                }
+                // This computer's copy of the Hub's branches is as old as its last fetch: another
+                // computer may have made the branch since. Claimed on a name the Hub already has,
+                // the conversation would be refused at its upload, and stay claimed there.
+                let wanted = format!("refs/heads/{named}");
+                // A checkout nothing has published from yet has no origin: the Hub says where.
+                let url = match repo.remote(crate::domain::repo::ORIGIN) {
+                    Some(url) => Ok(url),
+                    None => super::parse_slug(&project.repository).and_then(|(owner, name)| {
+                        crate::hub::Client::from_env()
+                            .get_agent(&owner, &name)
+                            .map(|agent| agent.clone_url)
+                    }),
+                };
+                let listed = url.and_then(|url| {
+                    crate::hub::git::capture_for_remote(
+                        &repo,
+                        &["ls-remote", "--heads", &url, &wanted],
+                        &project.identity,
+                        std::time::Duration::from_secs(20),
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+                });
+                match listed {
+                    Ok(listed)
+                        if listed
+                            .lines()
+                            .any(|line| line.ends_with(&format!("\t{wanted}"))) =>
+                    {
+                        return Ok(taken());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return Ok(Saved::Failed(format!(
+                            "couldn't ask the Hub whether {} already has a branch {named}, so nothing was saved: {error:#}",
+                            project.repository
+                        )));
+                    }
+                }
+                import_capture(&project, &candidate, named, true)?;
+            }
+            Placement::Foreign(source) => {
+                return Ok(Saved::Elsewhere {
+                    saved_in: Some(source),
+                    why: None,
+                });
+            }
+        }
     }
     if !finished {
         let _guard = lock(&project.root)?;
@@ -6797,12 +6880,12 @@ mod tests {
         assert!(capture("claude-code", AFTER, tree.to_str()).unwrap());
         assert!(markers(&tree).unwrap().is_empty());
         let session = |id: &str| ("claude-code".to_string(), id.to_string(), tree.clone());
-        let saved = save_now(&tree, &[session(AFTER)], true, false).unwrap();
+        let saved = save_now(&tree, &[session(AFTER)], true, false, None).unwrap();
         assert!(
             matches!(&saved[..], [Saved::Refused(why)] if why.contains("agit project drop")),
             "a dropped session was let in"
         );
-        let _ = save_now(&tree, &[session(AFTER)], false, true).unwrap();
+        let _ = save_now(&tree, &[session(AFTER)], false, true, None).unwrap();
         assert!(!is_dropped(&tree, "claude-code", AFTER));
         fs::remove_file(state_path(&tree).unwrap()).unwrap();
 
@@ -7044,12 +7127,12 @@ mod tests {
                 policy.root.clone(),
             )
         };
-        let saved = save_now(&policy.root, &[session()], true, false).unwrap();
+        let saved = save_now(&policy.root, &[session()], true, false, None).unwrap();
         assert!(
             matches!(&saved[..], [Saved::Refused(why)] if why.contains("agit project drop")),
             "a dropped session was let in after the move"
         );
-        let _ = save_now(&policy.root, &[session()], false, true).unwrap();
+        let _ = save_now(&policy.root, &[session()], false, true, None).unwrap();
         assert!(!is_dropped(&policy.root, "claude-code", dropped));
 
         // A record that cannot be read stops the binding instead of going ahead without the drops,
@@ -8589,6 +8672,7 @@ mod tests {
             &[("claude-code".into(), id.into(), nested.clone())],
             true,
             false,
+            None,
         )
         .unwrap();
         let [
@@ -8638,6 +8722,7 @@ mod tests {
             &[session(dropped), session(before)],
             true,
             false,
+            None,
         )
         .unwrap();
         let Saved::Refused(why) = &saved[0] else {
@@ -8675,7 +8760,7 @@ mod tests {
         assert!(legacy.earlier.is_empty() && legacy.leaves_out(&key("claude-code", before)));
 
         // Naming it lets it back in.
-        save_now(&policy.root, &[session(dropped)], false, true).unwrap();
+        save_now(&policy.root, &[session(dropped)], false, true, None).unwrap();
         assert!(
             !read(&policy.root)
                 .unwrap()
@@ -9320,6 +9405,7 @@ mod tests {
             &[("codex".into(), DROPPED.into(), root.clone())],
             true,
             false,
+            None,
         )
         .unwrap();
         let [Saved::Refused(why)] = saved.as_slice() else {
