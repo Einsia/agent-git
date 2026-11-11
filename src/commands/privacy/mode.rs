@@ -259,8 +259,8 @@ pub(super) fn run(target: &str, mode: Option<Mode>) -> CmdResult {
             "All unpublished snapshots and future commits in this session will publish without session encryption. Repository readers can read the published content. Local secret protection still applies."
         );
     }
-    if std::env::var_os("AGIT_YES").is_none() && !ui::prompt::confirm("Save this session publication mode?", false)?.ok_or_else(|| crate::commands::InteractionRequired("publication mode changes require confirmation; use --yes or an interactive terminal".into()))? {
-        return Ok(ExitCode::Ok);
+    if std::env::var_os("AGIT_YES").is_none() && !ui::prompt::answer("Save this session publication mode?", false)?.ok_or_else(|| crate::commands::InteractionRequired("publication mode changes require confirmation; use --yes or an interactive terminal".into()))? {
+        return Err(crate::commands::Cancelled.into());
     }
     let _lock = modes::lock(&selected.repo, &actor.hub, &selected.metadata.session)?;
     let current = Selection::resolve(target)?;

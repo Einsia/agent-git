@@ -147,7 +147,7 @@ pub(super) fn run(
             intent.visibility
         );
         let confirmed = yes.answers()
-            || ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
+            || ui::prompt::answer(&prompt, false)?.ok_or_else(|| {
                 crate::commands::InteractionRequired(format!(
                     "cross-Hub delivery requires confirmation: run `{retry_command}` at an interactive terminal"
                 ))
@@ -192,7 +192,7 @@ pub(super) fn run(
         let confirmed = if answered {
             true
         } else {
-            ui::prompt::confirm(&prompt, false)?.ok_or_else(|| {
+            ui::prompt::answer(&prompt, false)?.ok_or_else(|| {
                 // Named so the person answers it: a flag that answers it would be one an agent runs.
                 crate::commands::InteractionRequired(format!(
                     "first publication requires confirmation of repository creation: run `{retry_command}` at an interactive terminal"
@@ -830,7 +830,7 @@ pub(super) fn run(
                         intent.hub, intent.visibility
                     ),
                 };
-                let answer = ui::prompt::confirm(&question, false)?;
+                let answer = ui::prompt::answer(&question, false)?;
                 if answer.is_none() && !args.audit {
                     return Err(crate::commands::InteractionRequired("session publication requires confirmation of its preview; use --yes or an interactive terminal".into()).into());
                 }

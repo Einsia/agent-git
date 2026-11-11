@@ -120,10 +120,17 @@ pub(crate) fn answer_public_switch_on(
         yes,
     ) {
         Some(answer) => Ok(answer),
-        None => Err(crate::commands::InteractionRequired(format!(
-            "Turning on automatic upload into the public repository {repository} needs a yes: run `{command}` with --yes, or turn it on from the AgentGit menu bar."
-        ))
-        .into()),
+        None => {
+            let text = format!(
+                "Turning on automatic upload into the public repository {repository} needs a yes: run `{command}` with --yes, or turn it on from the AgentGit menu bar."
+            );
+            crate::commands::fix::refuse(
+                "public_consent_required",
+                &text,
+                serde_json::json!({"repository": repository}),
+            );
+            Err(crate::commands::InteractionRequired(text).into())
+        }
     }
 }
 

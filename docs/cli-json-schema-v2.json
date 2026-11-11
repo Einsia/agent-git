@@ -60,6 +60,23 @@
         "$ref": "#/$defs/fix_command"
       },
       "description": "Alternative complete next-step commands. Empty on success or when a complete, lossless command is unavailable; never automatically execute these actions."
+    },
+    "refusal": {
+      "type": "object",
+      "description": "Present only when a failed command refused for a reason its reader can answer. Codes are an open set: a reader that does not know a code shows text.",
+      "required": [
+        "code",
+        "text"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
     }
   },
   "$defs": {

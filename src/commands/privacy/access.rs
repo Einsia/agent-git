@@ -250,7 +250,7 @@ pub(super) fn run(command: Action) -> CmdResult {
     };
     saved.validate()?;
     if !saved.confirm()? {
-        return Ok(ExitCode::Ok);
+        return Err(crate::commands::Cancelled.into());
     }
     saved.verify_account(&selected.client)?;
     saved.verify_source(&selected.repo)?;
@@ -595,7 +595,7 @@ impl SavedRequest {
         if std::env::var_os("AGIT_YES").is_some() {
             return Ok(true);
         }
-        ui::prompt::confirm(&format!("{operation}?"), false)?.ok_or_else(|| {
+        ui::prompt::answer(&format!("{operation}?"), false)?.ok_or_else(|| {
             crate::commands::InteractionRequired("original access changes require confirmation; use --yes or an interactive terminal".into()).into()
         })
     }
@@ -691,11 +691,12 @@ fn retry(repository: &str, request_id: &str) -> CmdResult {
         ui::error(GRANT_RETIRED);
         return Ok(ExitCode::Precondition);
     }
-    if saved.confirm()? {
-        saved.verify_account(&client)?;
-        saved.verify_source(&repo)?;
-        saved.submit(&client, repository)?;
+    if !saved.confirm()? {
+        return Err(crate::commands::Cancelled.into());
     }
+    saved.verify_account(&client)?;
+    saved.verify_source(&repo)?;
+    saved.submit(&client, repository)?;
     Ok(ExitCode::Ok)
 }
 

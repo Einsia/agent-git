@@ -43,6 +43,9 @@ pub struct ApiError {
     remedies: Vec<Remediation>,
     /// Refs a `refs_withdrawn` refusal names; the Hub names only refs the request proposed.
     refused_refs: Vec<String>,
+    /// The repository (`owner/name`) a lookup asked for, so a "not found" names it in the
+    /// product's words rather than the server's.
+    subject: Option<String>,
     /// The new repository a 409 `repository_choice` answer suggests.
     suggested: Option<String>,
 }
@@ -72,6 +75,7 @@ impl ApiError {
             base: "http://hub.invalid".into(),
             remedies: Vec::new(),
             refused_refs: Vec::new(),
+            subject: None,
             suggested: None,
         }
     }
@@ -87,10 +91,36 @@ impl ApiError {
     pub(crate) fn refused_refs(&self) -> &[String] {
         &self.refused_refs
     }
+
+    /// The repository a lookup that met this error asked for.
+    pub(crate) fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
+    }
+
+    /// The Hub's name as a person reads it: its host, without the scheme or a path.
+    pub(crate) fn hub_name(&self) -> &str {
+        let rest = self
+            .base
+            .split_once("://")
+            .map_or(self.base.as_str(), |(_, rest)| rest);
+        rest.split('/').next().unwrap_or(rest)
+    }
 }
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A repository that isn't found is told in one sentence naming it and the Hub. It never
+        // says which of the two it is: a private repository must read exactly as a missing one
+        // to an account without access, or names could be enumerated.
+        if self.status == 404
+            && let Some(repository) = &self.subject
+        {
+            return write!(
+                f,
+                "Repository {repository} isn't on {}, or it's private and this account can't see it.",
+                self.hub_name()
+            );
+        }
         // Say what the server said first, then what you can do about it. The order is
         // deliberate: a status code means nothing to the user, the server's sentence does.
         let said = if self.detail.trim().is_empty() {
@@ -106,9 +136,9 @@ impl std::fmt::Display for ApiError {
             401 if self.remedies.contains(&Remediation::Authenticate {}) => {
                 Some(crate::ui::login_hint(&self.base))
             }
-            404 => {
-                Some("it may not exist, or it may be a private agent you cannot access".to_string())
-            }
+            404 => Some(
+                "it may not exist, or it may be a private repository you can't access".to_string(),
+            ),
             _ => None,
         };
         if let Some(h) = hint {
@@ -699,6 +729,7 @@ impl Client {
             base: self.base.clone(),
             remedies,
             refused_refs,
+            subject: None,
             suggested,
         })
     }
@@ -1538,7 +1569,15 @@ impl Client {
         {
             return Ok(agent.clone());
         }
-        let agent: RemoteAgent = self.get(&format!("api/agents/{owner}/{name}"))?;
+        let agent: RemoteAgent =
+            self.get(&format!("api/agents/{owner}/{name}"))
+                .map_err(|error| match error.downcast::<ApiError>() {
+                    Ok(mut api) => {
+                        api.subject = Some(format!("{owner}/{name}"));
+                        anyhow::Error::new(api)
+                    }
+                    Err(error) => error,
+                })?;
         self.probes
             .borrow_mut()
             .agents
@@ -2990,7 +3029,7 @@ mod tests {
         });
         let scope = crate::commands::fix::Scope::enter();
         let result = Client::for_credential(&base, &cred).logout();
-        assert!(scope.finish(7).is_empty());
+        assert!(scope.finish(7).fix.is_empty());
         sibling.join().unwrap();
         unsafe {
             match old_home {
@@ -3261,6 +3300,7 @@ mod tests {
             base: "http://h".into(),
             remedies: Vec::new(),
             refused_refs: Vec::new(),
+            subject: None,
             suggested: None,
         }
     }
@@ -3331,13 +3371,13 @@ mod tests {
         let passive = crate::commands::fix::Scope::enter();
         assert!(format!("{error:#}").contains("synthetic refused"));
         assert!(format!("{error}").contains("operation refused"));
-        assert!(passive.finish(7).is_empty());
+        assert!(passive.finish(7).fix.is_empty());
 
         unsafe { std::env::set_var("AGIT_HUB_URL", "https://different.invalid") };
         let scope = crate::commands::fix::Scope::enter();
         crate::commands::fix::register_terminal_api_error(&error);
         crate::commands::fix::register_terminal_api_error(&error);
-        let actions = serde_json::to_value(scope.finish(5)).unwrap();
+        let actions = serde_json::to_value(scope.finish(5).fix).unwrap();
         assert_eq!(actions.as_array().unwrap().len(), 1);
         assert_eq!(
             actions[0]["argv"],
@@ -3353,7 +3393,7 @@ mod tests {
             "sign in",
         )));
         crate::commands::fix::register_terminal_api_error(&anyhow::anyhow!("HTTP 401; agit login"));
-        assert!(ordinary.finish(5).is_empty());
+        assert!(ordinary.finish(5).fix.is_empty());
     }
 
     #[test]
@@ -3364,6 +3404,15 @@ mod tests {
         assert!(
             msg.contains("not exist") && msg.contains("private"),
             "the 404 wording must blur the two cases: {msg}"
+        );
+        // A repository lookup names the repository and the Hub in one sentence, in the product's
+        // words, still without telling missing from private.
+        let mut lookup = api_err(404, "not_found", "agent alice/app was not found on the Hub");
+        lookup.base = "https://hub.example/".into();
+        lookup.subject = Some("alice/app".into());
+        assert_eq!(
+            lookup.to_string(),
+            "Repository alice/app isn't on hub.example, or it's private and this account can't see it."
         );
     }
 

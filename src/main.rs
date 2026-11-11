@@ -611,9 +611,16 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
 
     match result {
         Ok(code) => code.as_i32(),
+        Err(e) if e.is::<commands::Cancelled>() => {
+            println!("{}", commands::Cancelled::MESSAGE);
+            agit::ExitCode::Ok.as_i32()
+        }
         Err(e) => {
             commands::fix::register_terminal_error(&e);
             agit::ui::error(&commands::terminal_error_message(&e));
+            if let Some(hinted) = e.downcast_ref::<commands::Hinted>() {
+                agit::ui::hint(&hinted.hint);
+            }
             // A repository a command inspects that another command left part-way names its step.
             if let Some(step) = commands::migration::interrupted_step(&e) {
                 agit::ui::hint(step);

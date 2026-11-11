@@ -2023,13 +2023,19 @@ fn confirm(message: &str) -> Result<()> {
     if std::env::var_os("AGIT_YES").is_some() {
         return Ok(());
     }
-    if !ui::prompt::may_prompt() || ui::prompt::confirm(message, false)? != Some(true) {
-        return Err(super::InteractionRequired(format!(
+    let answer = if ui::prompt::may_prompt() {
+        ui::prompt::answer(message, false)?
+    } else {
+        None
+    };
+    match answer {
+        Some(true) => Ok(()),
+        Some(false) => Err(super::Cancelled.into()),
+        None => Err(super::InteractionRequired(format!(
             "{message}; review with --dry-run, then repeat with --yes"
         ))
-        .into());
+        .into()),
     }
-    Ok(())
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -2133,13 +2139,49 @@ pub fn run(args: Args) -> CmdResult {
 /// A directory routes to one repository: its workspace binding and any existing project policy
 /// must already name the requested one, unless `rebind` replaces them. Returns the existing
 /// policy for that repository; a policy for another repository carries nothing over.
-fn assignable(root: &Path, repository: &str, rebind: bool) -> Result<Option<Project>> {
-    if let Some(binding) = workspace::read(root) {
-        ensure!(
-            rebind || binding.repo == repository,
-            "directory is bound to {}; add `--rebind` to this command to move it to {repository}",
-            binding.repo
+///
+/// A refusal names both repositories and is answerable: `--json` carries it as
+/// `folder_bound_elsewhere` (the directory's binding) or `project_assigned_elsewhere` (its
+/// policy), with `again` run with `--rebind` as the fix, so a caller asks "move it?" and moves it
+/// only on a yes.
+fn assignable(
+    root: &Path,
+    repository: &str,
+    rebind: bool,
+    again: &[String],
+) -> Result<Option<Project>> {
+    // A binding alone saves here; a project policy also uploads.
+    let refuse = |code: &'static str, field: &str, current: &str, does: &str| {
+        let text = format!("{} already {does} {current}.", ui::tilde(root));
+        super::fix::refuse(
+            code,
+            &text,
+            serde_json::json!({"folder": root, field: current, "repository": repository}),
         );
+        let mut args: Vec<&str> = again.iter().map(String::as_str).collect();
+        args.push("--rebind");
+        // The fix carries the request's own confirmation; without one, running it for real asks
+        // again, so it needs someone to answer.
+        if std::env::var_os("AGIT_YES").is_some() {
+            args.insert(0, "--yes");
+        }
+        let requires_interaction = !args.contains(&"--dry-run") && !args.contains(&"--yes");
+        super::fix::register(|| super::fix::FixCommand::current(&args, requires_interaction));
+        anyhow::Error::new(super::Hinted {
+            message: text,
+            hint: format!("to move it to {repository}, run this again with `--rebind`"),
+        })
+    };
+    if let Some(binding) = workspace::read(root)
+        && !rebind
+        && binding.repo != repository
+    {
+        return Err(refuse(
+            "folder_bound_elsewhere",
+            "bound_to",
+            &binding.repo,
+            "saves to",
+        ));
     }
     let Some(existing) = read(root)? else {
         return Ok(None);
@@ -2147,11 +2189,14 @@ fn assignable(root: &Path, repository: &str, rebind: bool) -> Result<Option<Proj
     if existing.repository == repository {
         return Ok(Some(existing));
     }
-    ensure!(
-        rebind,
-        "project is already assigned to {}; add `--rebind` to this command to move it to {repository}",
-        existing.repository
-    );
+    if !rebind {
+        return Err(refuse(
+            "project_assigned_elsewhere",
+            "assigned_to",
+            &existing.repository,
+            "uploads to",
+        ));
+    }
     Ok(None)
 }
 
@@ -2196,7 +2241,30 @@ fn bind(
     let rows = candidates(&project)?;
     let in_worktrees = rows.iter().filter(|s| !s.cwd.starts_with(&root)).count();
     // A dry run answers whether the bind would go through, so it refuses what the bind refuses.
-    assignable(&root, repository, rebind)?;
+    // The same bind, for the fix a refusal offers.
+    let mut again = vec![
+        "project".to_owned(),
+        "bind".to_owned(),
+        root.to_string_lossy().into_owned(),
+        "--repo".to_owned(),
+        repository.to_owned(),
+        "--history".to_owned(),
+        match history {
+            History::All => "all",
+            History::None => "none",
+        }
+        .to_owned(),
+    ];
+    if automatic {
+        again.push("--auto-upload".to_owned());
+    }
+    if let Some(consent) = public_consent {
+        again.extend(["--public-consent".to_owned(), consent.to_owned()]);
+    }
+    if dry_run {
+        again.push("--dry-run".to_owned());
+    }
+    assignable(&root, repository, rebind, &again)?;
     if dry_run {
         // Whoever asks the person first (agit's menu bar) learns here whether the destination is
         // public, so it can say so in its question. It is read, never changed; an unreadable
@@ -2224,7 +2292,7 @@ fn bind(
         "configure project capture in a device terminal outside the RC supervisor"
     );
     let _guard = lock(&root)?;
-    if let Some(existing) = assignable(&root, repository, rebind)? {
+    if let Some(existing) = assignable(&root, repository, rebind, &again)? {
         project.last_result = existing.last_result;
         // The override from before the first bind stays the one unbind restores; push.auto as
         // this bind finds it may be the value an earlier bind set.
@@ -2355,10 +2423,15 @@ fn bind(
     let mut repository_guard = None;
     if automatic {
         let runtimes = super::setup::project_hook_runtimes()?;
-        ensure!(
-            super::config::get("commit.auto").as_deref() != Some("false"),
-            "commit.auto is disabled; enable it explicitly before automatic project capture"
-        );
+        if super::config::get("commit.auto").as_deref() == Some("false") {
+            // Automatic upload uploads the turns agit saves, and saving turns is switched off.
+            let text = "saving turns by themselves (commit.auto) is off, so nothing here would upload; `agit config commit.auto true` turns it on";
+            super::fix::refuse("commit_auto_off", text, serde_json::json!({}));
+            super::fix::register(|| {
+                super::fix::FixCommand::current(&["config", "commit.auto", "true"], false)
+            });
+            anyhow::bail!("{text}");
+        }
         let consent = super::push::publication_consent(&repo, repository, &project.identity)?;
         println!(
             "Automatic publication destination: {}",
@@ -7339,7 +7412,9 @@ mod tests {
     /// A dry run refuses what the bind refuses: a directory its workspace binding or an existing
     /// project policy already routes to another repository, unless `--rebind` moves it. A dry run
     /// that lists candidates before these checks reports a bind that cannot happen, and a
-    /// `--rebind` that still honors either route leaves the directory with no way to move.
+    /// `--rebind` that still honors either route leaves the directory with no way to move. The
+    /// refusal is typed, naming both repositories, with the same bind and `--rebind` as its fix:
+    /// a caller that had to read the prose could only guess which question to ask.
     #[test]
     fn dry_run_refuses_a_directory_routed_to_another_repository() {
         if !isolated("dry_run_refuses_a_directory_routed_to_another_repository") {
@@ -7347,6 +7422,7 @@ mod tests {
         }
         let bound = tempfile::tempdir().unwrap();
         workspace::bind(bound.path(), "alice/other", false).unwrap();
+        let scope = super::super::fix::Scope::enter();
         let error = bind(
             bound.path(),
             "alice/app",
@@ -7357,10 +7433,59 @@ mod tests {
             None,
         )
         .unwrap_err();
+        let recovery = scope.finish(1);
         assert!(
-            format!("{error:#}").contains("add `--rebind` to this command to move it to alice/app"),
+            format!("{error:#}").ends_with("already saves to alice/other."),
             "{error:#}"
         );
+        assert_eq!(
+            error
+                .downcast_ref::<crate::commands::Hinted>()
+                .unwrap()
+                .hint,
+            "to move it to alice/app, run this again with `--rebind`"
+        );
+        let refusal = recovery.refusal.unwrap();
+        assert_eq!(refusal["code"], "folder_bound_elsewhere");
+        assert_eq!(refusal["bound_to"], "alice/other");
+        assert_eq!(refusal["repository"], "alice/app");
+        let fix = serde_json::to_value(&recovery.fix).unwrap();
+        let argv: Vec<&str> = fix[0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(&argv[1..3], ["project", "bind"], "{fix}");
+        assert_eq!(argv[argv.len() - 2..], ["--dry-run", "--rebind"], "{fix}");
+        assert_eq!(fix[0]["requires_interaction"], false);
+        // A real bind's fix carries the request's own --yes, and without one it needs someone to
+        // answer the confirmation it asks again.
+        let fix_of = |yes: bool| {
+            if yes {
+                unsafe { std::env::set_var("AGIT_YES", "1") };
+            } else {
+                unsafe { std::env::remove_var("AGIT_YES") };
+            }
+            let scope = super::super::fix::Scope::enter();
+            let _ = bind(
+                bound.path(),
+                "alice/app",
+                History::None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap_err();
+            serde_json::to_value(&scope.finish(1).fix).unwrap()[0].clone()
+        };
+        let asked = fix_of(false);
+        assert_eq!(asked["requires_interaction"], true, "{asked}");
+        let confirmed = fix_of(true);
+        assert_eq!(confirmed["argv"][1], "--yes", "{confirmed}");
+        assert_eq!(confirmed["requires_interaction"], false, "{confirmed}");
+        unsafe { std::env::remove_var("AGIT_YES") };
         assert!(
             bind(
                 bound.path(),
@@ -7387,7 +7512,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("already assigned to alice/app"),
+            format!("{error:#}").ends_with("already uploads to alice/app."),
             "{error:#}"
         );
         assert!(
