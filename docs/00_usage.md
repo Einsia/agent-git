@@ -650,6 +650,20 @@ Searches the corpus you can read for "has anyone done this before". Every hit ca
 The main entry point is MCP: after `agit setup` the agent calls `search` itself and looks for
 precedent whenever it is stuck.
 
+In its default permission mode, Claude Code asks you before each call to an MCP tool, agit's
+`search` included. `search` sends your agent's query to the AgentGit Hub (unless the agent asks
+for history saved on this computer only) and returns sessions you can read. If you would rather
+it not ask for that one tool, you can add a permissions allow rule for it yourself, in
+`~/.claude/settings.json` (or a project's `.claude/settings.json`), next to any rules already
+there:
+
+```json
+{ "permissions": { "allow": ["mcp__agit__search"] } }
+```
+
+Whether to add it is your choice. agit never writes this rule; remove the entry and Claude Code
+asks again.
+
 ### 4.3 Merge two sessions
 
 You forked off the main line to try something, the conclusion is worth bringing back, but the
