@@ -288,14 +288,15 @@ Each folder has:
   binding owns its directory.
 - `awaiting_upload`: how many of those are saved and not on the Hub at their saved head (status
   `not_uploaded` or `waiting`), counted over all of them, not only `recent`.
-- `capture`: one item per runtime installed here, as `runtime`, `ready` and `fix`. `ready` is
+- `capture`: one item per runtime installed here, as `runtime`, `ready`, `fix` and `used_here`. `ready` is
   whether that runtime's new conversations here are saved by themselves: for Claude Code, its
   settings carry AgentGit's capture hooks; for Codex, its hooks feature is on and AgentGit's hooks
   are trusted, which shows as a hook seen for the folder's newest Codex conversation. `fix` is what to do when it isn't, else null. Both are null when the
   runtime couldn't be asked in time. Codex is asked from the folder, and its answer is kept for at
   most an hour, and only until Codex, its system or personal configuration, or a project
   configuration above the folder changes. `agit project list` without `--json` uses a kept answer
-  and doesn't start Codex.
+  and doesn't start Codex. `used_here` is whether any of the folder's conversations, not only
+  those in `recent`, is one of that runtime's.
 - `recent`: the newest of those conversations, newest first. Each has `title` (the runtime's own
   name for it, else its opening request; null when neither is known), `runtime`, `session_id`,
   `last_active` (when its transcript last changed), `status`, `repository` (where it is saved,
