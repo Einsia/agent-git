@@ -1419,10 +1419,7 @@ fn birth_session_branch(
         || lk.agent.as_deref() != Some(agent)
         || recorded_owner(lk) != Some(owner);
     if rerouted && !(created && onto_commit.is_some()) {
-        lk.native_checkpoint = None;
-        lk.baseline_bytes = None;
-        lk.baseline_hash = None;
-        lk.materialized_from = None;
+        lk.clear_native_evidence();
     }
     if rerouted {
         // A superseded transcript can be recovered only onto another line. The new claim is
@@ -2228,6 +2225,7 @@ fn attach(
     let claim_json = |link: &Link| {
         let mut claim = link.clone();
         claim.native_checkpoint = None;
+        claim.settled_prefixes.clear();
         claim.to_json()
     };
     if current.as_ref().map(claim_json).transpose()?

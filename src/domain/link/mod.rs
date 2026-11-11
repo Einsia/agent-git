@@ -108,6 +108,11 @@ pub struct Link {
     pub baseline_hash: Option<String>,
     /// Optional native-prefix evidence, independent of materialization and claim identity.
     pub native_checkpoint: Option<NativeCheckpoint>,
+    /// Earlier settled prefixes, newest first, each bound to the tip it settled. A tip published
+    /// before the latest settlement can still be proven from its own evidence, so a reader that
+    /// asks for history after it gets only what follows instead of the whole transcript.
+    /// Bounded by [`SETTLED_PREFIXES`]; cleared wherever `native_checkpoint` is.
+    pub settled_prefixes: Vec<NativeCheckpoint>,
     /// The exact session-branch tip represented by this runtime instance's recorded baseline.
     ///
     /// A runtime-local id is not durable lineage. This commit id lets resume distinguish an
@@ -149,6 +154,10 @@ pub struct PendingMilestone {
     pub from_bytes: u64,
 }
 
+/// How many earlier settled prefixes a link keeps. A reader whose saved copy is older than all of
+/// them reads a whole page, as one with no evidence does.
+pub const SETTLED_PREFIXES: usize = 8;
+
 /// Local raw bytes are bound to an immutable settled tip; the digest never enters Git objects.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeCheckpoint {
@@ -178,6 +187,8 @@ struct Body {
     baseline_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_checkpoint: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    settled_prefixes: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     materialized_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,6 +225,7 @@ impl Link {
             baseline_bytes: None,
             baseline_hash: None,
             native_checkpoint: None,
+            settled_prefixes: Vec::new(),
             materialized_from: None,
             privacy_recovery: None,
             privacy_recovery_format: None,
@@ -223,6 +235,24 @@ impl Link {
             claimed_by: None,
             pending_milestone: None,
         }
+    }
+
+    /// Keeps `prefix` as settled evidence for its tip ahead of older ones. One entry per tip;
+    /// the oldest falls off past [`SETTLED_PREFIXES`].
+    pub fn retain_settled_prefix(&mut self, prefix: NativeCheckpoint) {
+        self.settled_prefixes.retain(|kept| kept.tip != prefix.tip);
+        self.settled_prefixes.insert(0, prefix);
+        self.settled_prefixes.truncate(SETTLED_PREFIXES);
+    }
+
+    /// Drops every piece of native-prefix evidence. A claim routed elsewhere can't prove anything
+    /// about the new destination's history with evidence about the old one.
+    pub fn clear_native_evidence(&mut self) {
+        self.native_checkpoint = None;
+        self.settled_prefixes.clear();
+        self.baseline_bytes = None;
+        self.baseline_hash = None;
+        self.materialized_from = None;
     }
 
     /// Explicit inspection retains known claim fields without treating malformed data as absence.
@@ -252,6 +282,11 @@ impl Link {
                 .native_checkpoint
                 .as_ref()
                 .and_then(|checkpoint| serde_json::to_value(checkpoint).ok()),
+            settled_prefixes: self
+                .settled_prefixes
+                .iter()
+                .filter_map(|prefix| serde_json::to_value(prefix).ok())
+                .collect(),
             materialized_from: self.materialized_from.clone(),
             privacy_recovery: self.privacy_recovery.clone(),
             privacy_recovery_format: self.privacy_recovery_format.clone(),
@@ -620,6 +655,12 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         native_checkpoint: body
             .native_checkpoint
             .and_then(|value| serde_json::from_value(value).ok()),
+        settled_prefixes: body
+            .settled_prefixes
+            .into_iter()
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .take(SETTLED_PREFIXES)
+            .collect(),
         materialized_from: body.materialized_from,
         privacy_recovery: body.privacy_recovery,
         privacy_recovery_format: body.privacy_recovery_format,

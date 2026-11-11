@@ -86,27 +86,34 @@ impl Anchor {
                 && claim.branch.as_deref() == Some(lineage.branch()),
             "Archive capture route changed"
         );
-        let (bytes, hash) = if let Some(checkpoint) = claim
+        // The newest evidence first: the current checkpoint, the materialized baseline, then the
+        // earlier settled prefixes. Only evidence recorded for the published tip itself counts.
+        let baseline = claim
+            .materialized_from
+            .as_deref()
+            .zip(claim.baseline_bytes)
+            .zip(claim.baseline_hash.as_deref())
+            .map(|((tip, bytes), sha256)| (tip, bytes, sha256));
+        let (bytes, hash) = claim
             .native_checkpoint
-            .as_ref()
-            .filter(|checkpoint| checkpoint.tip == publication.source)
-        {
-            (checkpoint.bytes, checkpoint.sha256.as_str())
-        } else {
-            ensure!(
-                claim.materialized_from.as_deref() == Some(&publication.source),
-                "Archive native boundary has advanced"
-            );
-            (
+            .iter()
+            .map(|checkpoint| {
+                (
+                    checkpoint.tip.as_str(),
+                    checkpoint.bytes,
+                    checkpoint.sha256.as_str(),
+                )
+            })
+            .chain(baseline)
+            .chain(
                 claim
-                    .baseline_bytes
-                    .context("Archive native boundary is missing")?,
-                claim
-                    .baseline_hash
-                    .as_deref()
-                    .context("Archive native digest is missing")?,
+                    .settled_prefixes
+                    .iter()
+                    .map(|prefix| (prefix.tip.as_str(), prefix.bytes, prefix.sha256.as_str())),
             )
-        };
+            .find(|(tip, ..)| *tip == publication.source)
+            .map(|(_, bytes, hash)| (bytes, hash))
+            .context("Archive native boundary has advanced")?;
         let (last, parents) = parts
             .split_last_mut()
             .context("Archive has no native file")?;
@@ -139,6 +146,10 @@ fn verify_prefix(
         delimiter == *b"\n",
         "Archive boundary splits a native record"
     );
+    let stamp = proofs::stamp(file);
+    if stamp.is_some_and(|stamp| proofs::holds(stamp, bytes, expected)) {
+        return Ok(());
+    }
     file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let copied = std::io::copy(&mut file.take(bytes), &mut hash)?;
@@ -146,7 +157,94 @@ fn verify_prefix(
         copied == bytes && format!("{:x}", hash.finalize()) == expected,
         "Archive native prefix changed"
     );
+    if let Some(stamp) = stamp {
+        proofs::remember(stamp, bytes, expected);
+    }
     Ok(())
+}
+
+/// Prefixes already proven in this process. A proof is reused only while its file has not been
+/// written since it was hashed: the same device and inode, with the length, modification time and
+/// change time read before hashing. Any write misses, an append included: an append can't be told
+/// from a rewrite of earlier bytes without reading them, and a proof that outlived a rewrite would
+/// keep serving the published copy for records that no longer match it. A file modified less than
+/// `QUIET` before the read is neither reused nor remembered, because a filesystem may give two
+/// writes that close together the same times.
+mod proofs {
+    use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::time::{Duration, SystemTime};
+
+    /// Proofs kept at once; the oldest is dropped first.
+    const KEPT: usize = 32;
+    /// How long a file must have gone unmodified for its times to tell a later write apart.
+    #[cfg(unix)]
+    const QUIET: Duration = Duration::from_secs(1);
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        device: u64,
+        inode: u64,
+        len: u64,
+        modified: (i64, i64),
+        changed: (i64, i64),
+    }
+
+    struct Proof {
+        stamp: Stamp,
+        bytes: u64,
+        digest: String,
+    }
+
+    static PROOFS: Mutex<Vec<Proof>> = Mutex::new(Vec::new());
+
+    #[cfg(unix)]
+    pub(super) fn stamp(file: &std::fs::File) -> Option<Stamp> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().ok()?;
+        let age = SystemTime::now()
+            .duration_since(metadata.modified().ok()?)
+            .ok()?;
+        (age >= QUIET).then(|| Stamp {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn stamp(_: &std::fs::File) -> Option<Stamp> {
+        None
+    }
+
+    pub(super) fn holds(stamp: Stamp, bytes: u64, digest: &str) -> bool {
+        PROOFS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|proof| proof.stamp == stamp && proof.bytes == bytes && proof.digest == digest)
+    }
+
+    pub(super) fn remember(stamp: Stamp, bytes: u64, digest: &str) {
+        let mut proofs = PROOFS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        proofs.retain(|proof| {
+            !(proof.stamp.device == stamp.device
+                && proof.stamp.inode == stamp.inode
+                && proof.bytes == bytes)
+        });
+        if proofs.len() >= KEPT {
+            proofs.remove(0);
+        }
+        proofs.push(Proof {
+            stamp,
+            bytes,
+            digest: digest.to_owned(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +391,15 @@ mod tests {
         let mut advanced = claim.clone();
         advanced.native_checkpoint.as_mut().unwrap().tip = "b".repeat(40);
         link::write(&store, &advanced).unwrap();
+        assert!(read(params.clone()).unwrap()["after_archive"].is_null());
+        // A later settlement keeps the published tip's own evidence, so a reader whose saved copy
+        // is that tip still reads only what follows it; evidence with another digest proves
+        // nothing, and the reader gets the whole page instead.
+        advanced.retain_settled_prefix(claim.native_checkpoint.clone().unwrap());
+        link::write(&store, &advanced).unwrap();
+        assert_eq!(read(params.clone()).unwrap()["after_archive"], anchor);
+        advanced.settled_prefixes[0].sha256 = format!("{:x}", Sha256::digest(b"other\n"));
+        link::write(&store, &advanced).unwrap();
         assert!(read(params).unwrap()["after_archive"].is_null());
     }
 
@@ -306,5 +413,29 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(b"other\n").unwrap();
         assert!(verify_prefix(&mut file, 13, 6, &hash).is_err());
+
+        // A prefix longer than the boundary window, proven while its file was quiet so the proof
+        // is kept, then rewritten in place outside that window and appended to: the boundary
+        // bytes, the length asked for and the digest all still match, and only rereading the
+        // prefix shows the change.
+        let mut file = tempfile::tempfile().unwrap();
+        let saved = format!(
+            "{}\nsaved\n",
+            "a".repeat(super::super::FENCE_BYTES as usize)
+        );
+        file.write_all(saved.as_bytes()).unwrap();
+        file.write_all(b"latest\n").unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let hash = format!("{:x}", Sha256::digest(saved.as_bytes()));
+        let bytes = saved.len() as u64;
+        let end = file.metadata().unwrap().len();
+        verify_prefix(&mut file, end, bytes, &hash).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"b").unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"more\n").unwrap();
+        let end = file.metadata().unwrap().len();
+        assert!(verify_prefix(&mut file, end, bytes, &hash).is_err());
     }
 }
