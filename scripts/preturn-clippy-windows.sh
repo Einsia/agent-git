@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# `preturn-check --only clippy-windows`: rust:test:windows's lint, run on Linux, so code that only
-# Windows compiles is linted before a merge request takes the Windows runner. Same target, features
-# and flags as that job. Build scripts compile C and assembly for the target, which needs an MSVC
-# toolchain Linux doesn't have; clippy links nothing and reads none of that code, so a stand-in
-# writes the files those tools would have written.
+# The Windows target's Clippy, run on Linux: rust:clippy:windows in merge request pipelines and
+# `preturn-check --only clippy-windows` before one, so code that only Windows compiles is linted
+# without taking the Windows runner. Same target, features and flags as rust:test:windows's build,
+# so the lint covers the code that job compiles. Build scripts compile C and assembly for the
+# target, which needs an MSVC toolchain Linux doesn't have; clippy links nothing and reads none of
+# that code, so a stand-in writes the files those tools would have written.
 set -euo pipefail
 
 target=x86_64-pc-windows-msvc
