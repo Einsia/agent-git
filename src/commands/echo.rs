@@ -12,6 +12,8 @@ pub(crate) enum Source {
     Mixed,
     Interactive,
     Transaction,
+    /// The repository the current folder saves to; only read-only listings choose by it.
+    Folder,
 }
 
 impl Source {
@@ -22,6 +24,7 @@ impl Source {
             Self::Mixed => "explicit arguments + AGIT_SESSION",
             Self::Interactive => "interactive selection",
             Self::Transaction => "merge transaction",
+            Self::Folder => "this folder",
         }
     }
 

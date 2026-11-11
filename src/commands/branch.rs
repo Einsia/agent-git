@@ -15,7 +15,7 @@ use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Agent repo; omitted values require AGIT_SESSION.
+    /// Agent repo; else AGIT_SESSION's, and for the listing only, this folder's.
     #[arg(long, global = true, value_name = "owner/repo")]
     pub repo: Option<String>,
     #[command(subcommand)]
@@ -80,14 +80,52 @@ fn ctx_repo(explicit: Option<&str>) -> Option<(Repo, String)> {
             let cwd = std::env::current_dir().ok()?;
             match super::context::repo_for(&cwd) {
                 Ok(repo) => repo,
-                Err(error) => {
-                    ui::error(&format!("{error:#}"));
+                Err(_) => {
+                    // The shared error names a session branch, which `agit branch` doesn't take.
+                    ui::error("no agent repo named");
                     ui::hint("use `agit branch --repo <owner>/<repo>` or set AGIT_SESSION");
                     return None;
                 }
             }
         }
     };
+    open_local(slug)
+}
+
+/// What a bare `agit branch` lists: the repo `--repo` names, else AGIT_SESSION's, else the one
+/// this folder saves to. Listing writes nothing, so the folder may choose here; every change still
+/// needs an explicit target. With none of them, the agent repos on this computer are named.
+fn listing_repo(explicit: Option<&str>) -> Option<(Repo, String, super::echo::Source)> {
+    use super::echo::Source;
+    if explicit.is_some() {
+        return ctx_repo(explicit).map(|(repo, slug)| (repo, slug, Source::Explicit));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    if let Ok(slug) = super::context::repo_for(&cwd) {
+        return open_local(slug).map(|(repo, slug)| (repo, slug, Source::Environment));
+    }
+    let here = super::front::folder(&cwd)
+        .ok()
+        .and_then(|root| super::front::bound(&root));
+    if let Some(slug) = here {
+        let slug = super::context::qualify(&slug);
+        return open_local(slug).map(|(repo, slug)| (repo, slug, Source::Folder));
+    }
+    ui::error("no agent repo named, and this folder doesn’t save to one");
+    let repos = super::clone::list_local().unwrap_or_default();
+    if !repos.is_empty() {
+        eprintln!("agent repos on this computer:");
+        for (owner, name, _) in &repos {
+            eprintln!("  {owner}/{name}");
+        }
+    }
+    ui::hint("use `agit branch --repo <owner>/<repo>` or set AGIT_SESSION");
+    None
+}
+
+/// The agent repo `slug` names, opened, or `None` once it has said the repo isn't on this
+/// computer.
+fn open_local(slug: String) -> Option<(Repo, String)> {
     let (owner, name) = super::parse_slug(&slug).ok()?;
     let dir = crate::infra::config::repo_dir(&owner, &name).ok()?;
     match Repo::open(&dir) {
@@ -275,7 +313,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         None => {
-            let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
+            let Some((repo, slug, source)) = listing_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
             super::echo::emit(
