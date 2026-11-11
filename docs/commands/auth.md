@@ -11,6 +11,7 @@ website; the CLI does not ask for a username or password.
 | `agit login` | Open an interactive menu. Press Enter for browser authorization, or select device code. |
 | `agit login --device` | Skip the menu and print a verification URL and code to approve in a browser on any device. |
 | `agit login --with-token < token.txt` | Read a PAT from stdin and exchange it for a Hub session. |
+| `agit login --continue <link>` | Start the sign-in from a Hub link: once approved, the browser's signed-in page links back to that page. Only a link on this Hub without a `#` part is sent, as its path and query. |
 
 Browser authorization opens the approval URL when possible and also prints it.
 Device code works when the CLI machine cannot open a browser, including SSH

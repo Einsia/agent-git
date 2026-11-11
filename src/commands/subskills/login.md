@@ -13,7 +13,7 @@ Public read-only cloning does not require login; `clone --mine` does.
 ## Synopsis
 
 ```bash
-agit login [--hub <url>] [--with-token | --device | --complete [<state>] [--wait <seconds>]]
+agit login [--hub <url>] [--with-token | --device | --complete [<state>] [--wait <seconds>]] [--continue <link>]
 ```
 
 ## Options
@@ -25,6 +25,7 @@ agit login [--hub <url>] [--with-token | --device | --complete [<state>] [--wait
 | `--device` | Use device-code flow directly |
 | `--complete [<state>]` | Finish a sign-in after human approval and save credentials; without a value it finishes the request `agit login` recorded for this Hub, including an interrupted `--device` login |
 | `--wait <seconds>` | With `--complete`: how long to wait for the approval (default `90`; `0` checks once) |
+| `--continue <link>` | The Hub link this sign-in started from; once approved, the browser's signed-in page links back to that page. Only a link on this Hub without a `#` part is sent, as its path and query |
 | `--json` | Emit the unified CLI JSON envelope |
 | `-y, --yes` | Skip confirmation |
 | `-q, --quiet` | Reduce output |
@@ -77,6 +78,13 @@ also recorded under `AGIT_HOME`, so any later process on the same machine and
    when `--complete` says so, or when the human never received the link.
 5. Continue the original task only after completion succeeds. `agit whoami --check`
    can verify the saved identity.
+   When the sign-in started from a Hub link the human gave you (a session, a
+   repository, an invitation), pass it as `agit login --json --continue <link>`.
+   `result.value.continue` names the page the browser's signed-in page will link
+   back to. When it is `null`, the link was not sent: it has a `#` part (an
+   invitation's token, a share key), which never leaves this machine, or it is on
+   another Hub. Then, once completion succeeds, give the original link to the human
+   again to open, before going on.
 6. Tell the human who they are signed in as and what happens next, in one line;
    never stop at "done". With `--json`, `result.value` is `{status: "signed_in",
    account, hub, next}`: name `account`, then either go on with the task they asked

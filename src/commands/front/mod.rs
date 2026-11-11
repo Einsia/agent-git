@@ -868,7 +868,7 @@ pub(crate) fn sign_in(again: &str) -> Result<crate::hub::Client> {
         )
         .into());
     }
-    let link = super::login::request_sign_in(&hub)?;
+    let link = super::login::request_sign_in(&hub, None)?;
     if super::json::is_capturing() {
         println!(
             "{}",

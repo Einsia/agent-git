@@ -78,7 +78,8 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
 ## Working from an agent or script
 
 - When login is needed, run `agit login --json`, show its `authorization_url` to
-  the human, and ask them to sign in and approve CLI access. It returns exit `8`
+  the human, and ask them to sign in and approve CLI access; add `--continue <link>`
+  when the sign-in started from a Hub link the human gave you. It returns exit `8`
   while human action is needed. After approval, run the returned `complete_command`
   argument array with the same `AGIT_HOME` and explicit Hub. Continue only after
   it succeeds; do not ask for passwords or tokens. Then tell the human which

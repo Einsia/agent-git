@@ -170,6 +170,7 @@ pub fn run(args: Args) -> CmdResult {
             device: false,
             complete: None,
             wait: None,
+            continue_to: None,
         })?;
         if result != ExitCode::Ok {
             ui::hint(&format!(
