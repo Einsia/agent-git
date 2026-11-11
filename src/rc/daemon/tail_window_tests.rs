@@ -24,10 +24,9 @@ fn replacement_between_window_selection_and_watch_start_invalidates_the_window()
 
 /// An **absurdly large** transcript does not let the scan grow without bound.
 ///
-/// Exact line numbers count from the head of the file, and this function runs synchronously
-/// inside `dispatch` holding the daemon's global lock: the cost grows linearly with the size of
-/// the transcript and has no bound of its own — one pathologically large transcript stalls every
-/// RPC on this machine, the event pump with them. Past the cap only the last stretch is scanned.
+/// Exact line numbers count from the head of the file, so the cost of numbering grows with the
+/// transcript and has no bound of its own; one pathologically large transcript would hold its
+/// watch scan for as long as it takes. Past the cap only the last stretch is counted.
 #[test]
 fn a_transcript_far_past_the_cap_is_only_scanned_from_the_cap_onwards() {
     let d = tempfile::tempdir().unwrap();
@@ -90,6 +89,53 @@ fn the_window_starts_at_the_last_n_lines_and_counts_them_absolutely() {
     assert_eq!(got[0].lineno, 600);
     assert_eq!(got[0].text, "{\"n\":600}");
     assert_eq!(got[399].lineno, 999);
+}
+
+/// The window is the last lines whatever their lengths, numbered from the head of the file, with
+/// a final line that has no newline counted as one. Lines here straddle the scan's reads, so a
+/// scan that miscounted at a read boundary, dropped the unterminated last line, or treated a
+/// file-ending newline as starting another line would pick another start or number.
+#[test]
+fn the_window_matches_the_file_s_own_line_starts_across_reads_and_without_a_final_newline() {
+    for terminated in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        let mut bytes = Vec::new();
+        for i in 0..400usize {
+            bytes.extend(std::iter::repeat_n(b'x', (i * 7919) % 3000));
+            bytes.push(b'\n');
+        }
+        if !terminated {
+            bytes.extend_from_slice(b"unfinished");
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let mut starts = vec![0u64];
+        starts.extend(
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(index, byte)| **byte == b'\n' && index + 1 < bytes.len())
+                .map(|(index, _)| index as u64 + 1),
+        );
+        for want in [1u64, 7, 255, 399, 400, 401, 1000] {
+            let (offset, from_line, total, absolute, _) = tail_window(&p, want);
+            let expected = starts.len().saturating_sub(want as usize);
+            assert!(absolute);
+            assert_eq!(
+                total,
+                starts.len() as u64,
+                "terminated={terminated} want={want}"
+            );
+            assert_eq!(
+                from_line, expected as u64,
+                "terminated={terminated} want={want}"
+            );
+            assert_eq!(
+                offset, starts[expected],
+                "terminated={terminated} want={want}"
+            );
+        }
+    }
 }
 
 /// A file shorter than the window is served from the start, never a negative or empty window.

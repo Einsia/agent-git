@@ -324,31 +324,68 @@ fn window_start_bounded(f: &mut std::fs::File, want: u64, len: u64) -> (u64, u64
             base_off = 0;
         }
     }
-    // The scan starts at `base_off` wherever an earlier reader left the shared cursor; a window
-    // read from that cursor instead would start mid-file and replay the wrong records.
-    let _ = f.seek(SeekFrom::Start(base_off));
-    let mut starts: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
-    let mut reader = BufReader::new(f.take(len - base_off));
-    let mut offset: u64 = base_off;
-    let mut lineno: u64 = 0;
-    let mut buf = Vec::with_capacity(8192);
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if starts.len() == want {
-                    starts.pop_front();
+    // The window is found reading backward from the end, so it costs what it holds; the lines
+    // before it are then counted in bulk to number it. Reading each line forward instead spends a
+    // copy and a branch on every byte of a transcript that can be most of the cap.
+    match last_lines(f, base_off, len, want as u64).and_then(|(start, lines)| {
+        let before = count_newlines(f, base_off, start)?;
+        Ok((start, before, before + lines))
+    }) {
+        Ok((start, before, total)) => (start, before, total, base_off == 0),
+        // An unreadable window starts at the aligned boundary with nothing counted, never at the
+        // head of a capped file.
+        Err(_) => (base_off, 0, 0, base_off == 0),
+    }
+}
+
+/// Bytes read at once by the window scans.
+const SCAN_CHUNK: u64 = 64 * 1024;
+
+/// Where the last `want` lines of `[base, len)` start, and how many lines that is. A line ends
+/// after its newline; a final line without one still counts.
+fn last_lines(
+    f: &mut std::fs::File,
+    base: u64,
+    len: u64,
+    want: u64,
+) -> std::io::Result<(u64, u64)> {
+    let mut found = 0;
+    let mut end = len;
+    let mut chunk = vec![0; SCAN_CHUNK as usize];
+    while end > base {
+        let start = end.saturating_sub(SCAN_CHUNK).max(base);
+        let bytes = &mut chunk[..(end - start) as usize];
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(bytes)?;
+        for index in memchr::memrchr_iter(b'\n', bytes) {
+            let position = start + index as u64;
+            // A newline that ends the file ends the last line; it starts none.
+            if position + 1 < len {
+                found += 1;
+                if found == want {
+                    return Ok((position + 1, want));
                 }
-                starts.push_back((offset, lineno));
-                offset += n as u64;
-                lineno += 1;
             }
         }
+        end = start;
     }
-    // An empty capped window must stay at the aligned boundary, never rewind to the head.
-    let (start_off, start_line) = starts.front().copied().unwrap_or((base_off, 0));
-    (start_off, start_line, lineno, base_off == 0)
+    Ok((base, if len > base { found + 1 } else { 0 }))
+}
+
+/// Newlines in `[from, to)`.
+fn count_newlines(f: &mut std::fs::File, from: u64, to: u64) -> std::io::Result<u64> {
+    f.seek(SeekFrom::Start(from))?;
+    let mut reader = BufReader::with_capacity(SCAN_CHUNK as usize, (&mut *f).take(to - from));
+    let mut lines = 0;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(lines);
+        }
+        lines += memchr::memchr_iter(b'\n', buffer).count() as u64;
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
 }
 
 /// Whether `next` ends the consumed range with the bytes `previous` held there.
@@ -382,7 +419,7 @@ fn count_to_end(file: &mut std::fs::File) -> std::io::Result<(u64, u64)> {
             return Ok((bytes, lines + u64::from(unterminated)));
         }
         bytes += buffer.len() as u64;
-        lines += buffer.iter().filter(|&&byte| byte == b'\n').count() as u64;
+        lines += memchr::memchr_iter(b'\n', buffer).count() as u64;
         unterminated = buffer.last() != Some(&b'\n');
         let consumed = buffer.len();
         reader.consume(consumed);

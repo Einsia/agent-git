@@ -75,6 +75,7 @@ dependencies = [
  "indicatif",
  "keyring",
  "libc",
+ "memchr",
  "owo-colors",
  "portable-pty",
  "rand 0.8.7",
