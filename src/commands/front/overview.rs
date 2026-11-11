@@ -37,10 +37,15 @@ pub fn run() -> CmdResult {
         None => (FolderState::NotSaved, None),
         Some(root) => folder_state(root),
     };
-    let mut sessions = match &root {
-        Some(root) => super::sessions_in(root).unwrap_or_default(),
-        None => Vec::new(),
+    let (mut sessions, unlisted) = match &root {
+        Some(root) => super::sessions_shown_in(root),
+        None => (Vec::new(), Vec::new()),
     };
+    // A runtime whose store can't be read is named, not taken for one with no conversations here.
+    let unlisted: Vec<(&str, String)> = unlisted
+        .into_iter()
+        .map(|unlisted| (unlisted.runtime, format!("{:#}", unlisted.error)))
+        .collect();
     let total = sessions.len();
     // A git worktree a main checkout covers says which folder's setting it follows, and both say
     // how many sessions from before that coverage wait for `agit save --all`.
@@ -111,6 +116,10 @@ pub fn run() -> CmdResult {
                 "last_upload_error": failure,
                 "held": held.as_ref().map(crate::commands::project::Held::json),
                 "codex_hooks_not_running": codex_untrusted,
+                "unlisted": unlisted.iter().map(|(runtime, error)| serde_json::json!({
+                    "runtime": runtime,
+                    "error": error,
+                })).collect::<Vec<_>>(),
                 "opencode_not_captured": opencode,
                 "legacy_agents_sections": legacy.iter().map(|section| serde_json::json!({
                     "file": section.file,
@@ -202,6 +211,15 @@ pub fn run() -> CmdResult {
                     ui::warn_text("Codex has not run AgentGit's save hook:")
                 );
             }
+            for (runtime, error) in &unlisted {
+                println!(
+                    "  {} {error}",
+                    ui::warn_text(&format!(
+                        "{}'s conversations here can't be listed:",
+                        super::runtime_name(runtime)
+                    ))
+                );
+            }
             if let Some(failure) = failure_said {
                 println!("  {} {failure}", ui::warn_text("the last upload failed:"));
             }
@@ -288,9 +306,9 @@ pub(crate) fn next_after_sign_in() -> Option<(&'static str, &'static str)> {
     let state = root
         .as_deref()
         .map_or(FolderState::NotSaved, |root| folder_state(root).0);
-    let sessions = root.as_deref().map_or(0, |root| {
-        super::sessions_in(root).map_or(0, |found| found.len())
-    });
+    let sessions = root
+        .as_deref()
+        .map_or(0, |root| super::sessions_shown_in(root).0.len());
     next_here(true, root.as_deref(), state, sessions)
 }
 

@@ -1609,6 +1609,110 @@ fn a_save_finds_an_opencode_conversation_and_keeps_earlier_history_out() {
     }
 }
 
+/// An OpenCode conversation in a folder that is on is one of the folder's conversations: the
+/// overview lists it, as OpenCode, with where its upload stands, and a plain `agit save` takes it
+/// rather than counting it among the conversations from before the folder was on. OpenCode tells
+/// agit nothing when a turn ends, so its conversation goes up later than the others'; an overview
+/// that listed only the runtimes that report turn ends would hide it, uploaded or not, from the
+/// person who has to name it to save it.
+#[test]
+fn an_opencode_conversation_is_listed_and_saved_with_its_folder() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    lab.turn_on(&dir, "me/parley");
+    // As `agit on` records it today: OpenCode's store was read when the folder was turned on.
+    let policy = std::fs::read_dir(lab.agit_home.join("projects"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .unwrap();
+    let mut recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&policy).unwrap()).unwrap();
+    recorded["earlier_opencode"] = serde_json::Value::Bool(true);
+    std::fs::write(&policy, serde_json::to_vec_pretty(&recorded).unwrap()).unwrap();
+    lab.opencode_conversation(&dir, "ses_after_on", "Read the parser");
+
+    let value = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        let document: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{args:?}: {out:?}"));
+        document["result"]["value"].clone()
+    };
+    let overview = value(&["--json"]);
+    let row = overview["recent"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["session_id"] == "ses_after_on")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(row["runtime"], "opencode", "{overview}");
+    assert_eq!(row["status"], "not_saved", "{overview}");
+    let text = String::from_utf8_lossy(&lab.agit(&dir, &[]).stdout).into_owned();
+    assert!(
+        text.lines()
+            .any(|line| line.contains("Read the parser") && line.contains("OpenCode")),
+        "{text}"
+    );
+
+    let saved = value(&["--json", "save"]);
+    let taken: Vec<&str> = saved["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|session| session["session_id"].as_str())
+        .collect();
+    assert_eq!(taken, ["ses_after_on"], "{saved}");
+}
+
+/// A runtime whose store can't be read takes only its own conversations out of the folder's
+/// list, and is named there: with OpenCode installed and its database unreadable, the overview
+/// still lists the folder's Claude Code conversation and says OpenCode's can't be listed, while
+/// `agit save` refuses rather than go on without knowing which OpenCode conversations exist. An
+/// overview that failed as a whole would show the folder as empty; one that dropped OpenCode
+/// silently would take an unreadable store for one with nothing in it.
+#[test]
+fn an_unreadable_runtime_store_hides_only_its_own_conversations() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    lab.turn_on(&dir, "me/parley");
+    lab.conversation(
+        &dir,
+        "29292929-2929-4292-8292-292929292929",
+        "Plan the move",
+    );
+    std::fs::write(lab.bin.join("opencode"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(lab.bin.join("opencode.cmd"), "@exit /b 0\r\n").unwrap();
+    let data = lab.home.join(".local/share/opencode");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("opencode.db"), b"not a database").unwrap();
+
+    let out = lab.agit(&dir, &["--json"]);
+    let document: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{out:?}"));
+    let value = &document["result"]["value"];
+    let listed: Vec<&str> = value["recent"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["session_id"].as_str())
+        .collect();
+    assert_eq!(
+        listed,
+        ["29292929-2929-4292-8292-292929292929"],
+        "{document}"
+    );
+    assert_eq!(value["unlisted"][0]["runtime"], "opencode", "{document}");
+    let text = String::from_utf8_lossy(&lab.agit(&dir, &[]).stdout).into_owned();
+    assert!(
+        text.contains("OpenCode's conversations here can't be listed:"),
+        "{text}"
+    );
+    let saved = lab.agit(&dir, &["save"]);
+    assert!(!saved.status.success(), "{saved:?}");
+}
+
 /// A folder bound before agit recorded OpenCode's earlier conversations counts every OpenCode
 /// conversation there as earlier until an explicit `agit save` or `agit on` looks at OpenCode's
 /// store once. The background capture leaves such a policy as it is. The save that looks keeps

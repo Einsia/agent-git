@@ -585,7 +585,7 @@ fn ran_in(link: &link::Link, folder: &std::path::Path) -> bool {
 fn worktree_left_out(cwd: &std::path::Path) -> Option<usize> {
     let folder = super::front::folder(cwd).ok()?;
     super::project::worktree_of(&folder)?;
-    let sessions = super::front::sessions_in(&folder).ok()?;
+    let (sessions, _) = super::front::sessions_shown_in(&folder);
     Some(super::front::left_out_in(&folder, &sessions))
 }
 
