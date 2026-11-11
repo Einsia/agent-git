@@ -35,19 +35,7 @@ pub fn run() -> CmdResult {
     let root = super::folder(&cwd).ok();
     let (state, repository) = match &root {
         None => (FolderState::NotSaved, None),
-        Some(root) => {
-            let repository = super::bound(root);
-            let state = match (
-                crate::commands::project::uploads_automatically(root),
-                &repository,
-            ) {
-                (Some(true), _) => FolderState::On,
-                (Some(false), _) => FolderState::Off,
-                (None, Some(_)) => FolderState::LocalOnly,
-                (None, None) => FolderState::NotSaved,
-            };
-            (state, repository)
-        }
+        Some(root) => folder_state(root),
     };
     let mut sessions = match &root {
         Some(root) => super::sessions_in(root).unwrap_or_default(),
@@ -95,11 +83,7 @@ pub fn run() -> CmdResult {
     // start; the person removes it, as the file may be committed.
     let legacy = crate::commands::setup::legacy_folder_sections();
     // After the person said no to turning this folder on, nothing suggests it again.
-    let declined = root
-        .as_deref()
-        .is_some_and(crate::commands::project::automatic_upload_declined);
-    let next = next_step(account.is_some(), root.is_some(), state, total)
-        .filter(|(command, _)| !(declined && *command == "agit on"));
+    let next = next_here(account.is_some(), root.as_deref(), state, total);
     // With nothing else next, the sessions from before: the person's to upload, so an agent is
     // told to ask rather than handed the command.
     let earlier_next = (next.is_none() && waiting > 0).then_some(waiting);
@@ -256,14 +240,58 @@ pub fn run() -> CmdResult {
                 super::earlier_note(count, "here", super::Reader::Agent)
             ),
         },
-        (None, None) => println!(
-            "{}",
-            FOOTER
-                .map(|(what, command)| format!("{what}: {}", ui::accent(command)))
-                .join(" · ")
-        ),
+        (None, None) => println!("{}", footer()),
     }
     Ok(ExitCode::Ok)
+}
+
+/// Whether a folder's sessions save and upload, and the repository it is bound to.
+fn folder_state(root: &std::path::Path) -> (FolderState, Option<String>) {
+    let repository = super::bound(root);
+    let state = match (
+        crate::commands::project::uploads_automatically(root),
+        &repository,
+    ) {
+        (Some(true), _) => FolderState::On,
+        (Some(false), _) => FolderState::Off,
+        (None, Some(_)) => FolderState::LocalOnly,
+        (None, None) => FolderState::NotSaved,
+    };
+    (state, repository)
+}
+
+/// The step the overview names next for a folder. After the person said no to turning this
+/// folder on, nothing suggests it again.
+fn next_here(
+    signed_in: bool,
+    root: Option<&std::path::Path>,
+    state: FolderState,
+    sessions: usize,
+) -> Option<(&'static str, &'static str)> {
+    let declined = root.is_some_and(crate::commands::project::automatic_upload_declined);
+    next_step(signed_in, root.is_some(), state, sessions)
+        .filter(|(command, _)| !(declined && *command == "agit on"))
+}
+
+/// The overview's next step for the current folder once the person is signed in, so a sign-in
+/// ends on the same step bare `agit` would show; `None` when nothing is next.
+pub(crate) fn next_after_sign_in() -> Option<(&'static str, &'static str)> {
+    let cwd = std::env::current_dir().ok()?;
+    let root = super::folder(&cwd).ok();
+    let state = root
+        .as_deref()
+        .map_or(FolderState::NotSaved, |root| folder_state(root).0);
+    let sessions = root.as_deref().map_or(0, |root| {
+        super::sessions_in(root).map_or(0, |found| found.len())
+    });
+    next_here(true, root.as_deref(), state, sessions)
+}
+
+/// The overview's last line when no step is next.
+pub(crate) fn footer() -> String {
+    FOOTER
+        .map(|(what, command)| format!("{what}: {}", ui::accent(command)))
+        .join(" · ")
 }
 
 /// Whether an idle Codex session here changed well after the last time Codex ran AgentGit's Stop

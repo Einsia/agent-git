@@ -81,8 +81,10 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   the human, and ask them to sign in and approve CLI access. It returns exit `8`
   while human action is needed. After approval, run the returned `complete_command`
   argument array with the same `AGIT_HOME` and explicit Hub. Continue only after
-  it succeeds; do not ask for passwords or tokens. Read `references/commands/login.md`
-  for pending and expired requests.
+  it succeeds; do not ask for passwords or tokens. Then tell the human which
+  account they are signed in as (`result.value.account`) and what comes next: the
+  task they asked for, carried on to its result, or `result.value.next`. Read
+  `references/commands/login.md` for pending and expired requests.
 - Once this workflow applies, use `agit status --json` when session or workspace
   state is needed for the requested operation. Existing
   sessions require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`.

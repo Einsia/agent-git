@@ -334,7 +334,7 @@ fn quiet_auth_keeps_token_exchange_revoke_and_local_assets() {
             mode,
         )));
         if mode == "ordinary" {
-            assert!(String::from_utf8_lossy(&output.stdout).contains("signed in as me"));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Signed in as me on"));
         } else {
             assert!(output.stdout.is_empty(), "{output:?}");
         }
@@ -442,13 +442,8 @@ fn quiet_auth_json_keeps_complete_login_and_logout_results() {
             );
             assert!(signed.stderr.is_empty() && out.stderr.is_empty());
             let signed: Value = serde_json::from_slice(&signed.stdout).unwrap();
-            assert!(
-                signed["result"]["lines"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|v| v.as_str().unwrap().contains("signed in as me"))
-            );
+            assert_eq!(signed["result"]["value"]["status"], "signed_in", "{signed}");
+            assert_eq!(signed["result"]["value"]["account"], "me", "{signed}");
             outputs.push((
                 signed,
                 serde_json::from_slice::<Value>(&out.stdout).unwrap(),
