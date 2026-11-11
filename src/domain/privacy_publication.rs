@@ -2705,14 +2705,16 @@ mod tests {
         storage::parse_envelopes(projection.log()).unwrap()
     }
 
-    /// Words absorbed into a running turn are the person's own and are projected as theirs; a
-    /// notice the runtime queued the same way keeps its place without its text.
+    /// Words absorbed into a running turn are the person's own and are projected as theirs, in
+    /// the shape Claude Code writes them, ids included, and without those ids; a notice the
+    /// runtime queued the same way keeps its place without its text.
     #[test]
     fn an_absorbed_follow_up_is_projected_as_the_persons_words() {
         let records = projected(
             "claude-code",
             &[
-                json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","sessionId":"s","content":"also update the README"}),
+                json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","sessionId":"s","content":"also update the README",
+                       "commandUuid":"QUEUE-COMMAND-ID","deliveryId":"QUEUE-DELIVERY-ID"}),
                 json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn","sessionId":"s","content":"<task-notification>\n<task-id>PRIVATE_TASK</task-id>\n</task-notification>"}),
                 json!({"type":"queue-operation","operation":"enqueue","sessionId":"s","content":"also update the README"}),
             ],
@@ -2723,6 +2725,7 @@ mod tests {
             "also update the README"
         );
         assert!(records[0].content.get("isMeta").is_none());
+        assert!(!records[0].content.to_string().contains("QUEUE-"));
         for record in &records[1..] {
             assert_eq!(record.content["isMeta"], true);
             assert!(!record.content.to_string().contains("PRIVATE_TASK"));

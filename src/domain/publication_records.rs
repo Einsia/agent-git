@@ -434,6 +434,9 @@ fn claude(content: &Value, record: &Map<String, Value>) -> Option<Value> {
 /// [`typed_text`], since the runtime's own notices pass through the same queue; enqueued copies,
 /// other removals, other modes and records with fields nobody knows are left out.
 fn absorbed_follow_up(record: &Map<String, Value>) -> Option<Value> {
+    // Claude Code names the queued command and its delivery by opaque ids. They are known
+    // fields, so a removal that carries them is still the person's words, but they say nothing
+    // a reader needs and are not published.
     const FIELDS: &[&str] = &[
         "type",
         "operation",
@@ -444,6 +447,8 @@ fn absorbed_follow_up(record: &Map<String, Value>) -> Option<Value> {
         "sessionId",
         "uuid",
         "parentUuid",
+        "commandUuid",
+        "deliveryId",
     ];
     // A queued shell command or notification says so in its mode; a field nobody knows could
     // carry anything.

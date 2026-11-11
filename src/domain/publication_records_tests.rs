@@ -866,11 +866,13 @@ fn a_recovered_quote_inherits_the_decision_on_the_record_it_quotes() {
 
 /// Words the person types while a tool runs are absorbed into the turn with no user record after
 /// them; that removal is published with its words only, and nothing else the queue records is.
+/// The records carry the ids Claude Code writes on a removal: a rule that treats them as unknown
+/// fields drops every absorbed follow-up, and one that copies them publishes ids.
 #[test]
 fn an_absorbed_follow_up_is_published_as_the_persons_words() {
     let queue = |operation: &str, reason: Option<&str>, content: &str| {
         let mut record = json!({"type":"queue-operation","operation":operation,"timestamp":"t",
-            "sessionId":"s","content":content});
+            "sessionId":"s","content":content,"commandUuid":"c","deliveryId":"d"});
         if let Some(reason) = reason {
             record["reason"] = json!(reason);
         }
@@ -889,7 +891,8 @@ fn an_absorbed_follow_up_is_published_as_the_persons_words() {
     assert_stable("claude-code", &absorbed);
     let mut prompt = absorbed.clone();
     prompt["mode"] = json!("prompt");
-    assert_eq!(class("claude-code", &prompt), RecordClass::Conversation);
+    assert_eq!(published("claude-code", &prompt).unwrap()["mode"], "prompt");
+    assert_stable("claude-code", &prompt);
     let mut shell = absorbed.clone();
     shell["mode"] = json!("bash");
     let mut unknown = absorbed.clone();
