@@ -136,6 +136,9 @@ pub(super) fn harness_test_session_with_channels(
         pending_turn_command: None,
         pending_steer_command: None,
         steer_queue: Default::default(),
+        absorbing_steers: Default::default(),
+        turns_started: 0,
+        started_prompts: Default::default(),
         pending_interrupt_command: None,
         resolved_initial_turn: None,
         announced_turn_ids: Default::default(),
@@ -3076,4 +3079,250 @@ async fn a_settlement_stopped_at_the_privacy_check_is_tried_again_while_idle() {
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
         assert_eq!(session.publication_retry.due(), retried, "{wait:?}");
     }
+}
+
+/// Headless Claude Code records a steer it took at a tool step as `queue-operation remove` with
+/// reason `absorbed_mid_turn` and no record id (observed with `claude -p --input-format
+/// stream-json`, 2.1.311). Its copy in the transcript is named by the steer's native id, so a
+/// viewer settles the message the steer announced as queued instead of showing the words twice
+/// beside a message still waiting. Two steers with the same words are named in the order they
+/// were written; a steer that started the next turn instead comes back as a user record with its
+/// own id and is not named again; another runtime's records are left alone.
+#[tokio::test]
+async fn a_steer_headless_claude_takes_at_a_tool_step_names_its_transcript_copy() {
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let mut session = harness_test_session(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Running,
+    );
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    let started = uuid::Uuid::new_v4().to_string();
+    session.absorbing(first.clone(), "same words".into());
+    session.absorbing(second.clone(), "same words".into());
+    session.absorbing(started.clone(), "starts a turn".into());
+    let line = |lineno: u64, value: serde_json::Value| crate::rc::tail::TailedLine {
+        source: None,
+        lineno,
+        text: value.to_string(),
+    };
+    let absorbed = |words: &str| {
+        serde_json::json!({"type":"queue-operation","operation":"remove","reason":"absorbed_mid_turn",
+            "content":words,"sessionId":"s","timestamp":"2026-11-10T12:00:00Z"})
+    };
+    let lines = [
+        line(
+            0,
+            serde_json::json!({"type":"queue-operation","operation":"enqueue","content":"same words"}),
+        ),
+        line(1, absorbed("same words")),
+        line(
+            2,
+            serde_json::json!({"type":"user","uuid":started,"sessionId":"s",
+            "message":{"role":"user","content":"starts a turn"}}),
+        ),
+        line(3, absorbed("same words")),
+        line(4, absorbed("starts a turn")),
+        line(5, absorbed("never steered")),
+    ];
+    let mut items = items_from_lines_with_mode(
+        "claude-code",
+        &lines,
+        crate::rc::codex_history::HistoryMode::Model,
+    );
+    session.name_absorbed_steers(&mut items);
+    let named: Vec<(u64, Option<&str>)> = items
+        .iter()
+        .filter(|item| item.event.kind == crate::adapter::EventKind::UserInterjection)
+        .map(|item| (item.line, item.native_prompt_id.as_deref()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            (1, Some(first.as_str())),
+            (3, Some(second.as_str())),
+            (4, None),
+            (5, None)
+        ]
+    );
+    assert!(session.absorbing_steers.is_empty());
+
+    session.info.runtime = "codex".into();
+    session.absorbing(first.clone(), "same words".into());
+    let mut items = items_from_lines_with_mode(
+        "claude-code",
+        &[line(6, absorbed("same words"))],
+        crate::rc::codex_history::HistoryMode::Model,
+    );
+    session.name_absorbed_steers(&mut items);
+    assert_eq!(items[0].native_prompt_id, None);
+}
+
+/// A long tool step can collect more steers than the device keeps track of. Past
+/// [`MAX_ABSORBING_STEERS`] the next one is refused unsent rather than written with an identity
+/// that is then forgotten: with identical words, each copy still goes to its own message in the
+/// order sent.
+#[tokio::test]
+async fn steers_past_the_limit_are_refused_and_every_admitted_one_keeps_its_name() {
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let mut session = harness_test_session(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Running,
+    );
+    let mut sent = Vec::new();
+    let mut refused = 0;
+    for _ in 0..MAX_ABSORBING_STEERS + 1 {
+        match session.admits_absorbing_steer() {
+            Ok(()) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                session.absorbing(id.clone(), "same words".into());
+                sent.push(id);
+            }
+            Err(error) => {
+                assert!(error.is::<crate::rc::harness::TooManySteers>());
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(refused, 1);
+    let lines: Vec<_> = (0..sent.len() as u64)
+        .map(|lineno| crate::rc::tail::TailedLine {
+            source: None,
+            lineno,
+            text: serde_json::json!({"type":"queue-operation","operation":"remove",
+                "reason":"absorbed_mid_turn","content":"same words","sessionId":"s"})
+            .to_string(),
+        })
+        .collect();
+    let mut items = items_from_lines_with_mode(
+        "claude-code",
+        &lines,
+        crate::rc::codex_history::HistoryMode::Model,
+    );
+    session.name_absorbed_steers(&mut items);
+    let named: Vec<_> = items
+        .iter()
+        .map(|item| item.native_prompt_id.clone().unwrap())
+        .collect();
+    assert_eq!(named, sent);
+    assert!(
+        session.admits_absorbing_steer().is_ok(),
+        "named copies make room"
+    );
+}
+
+/// A steer's copy can reach the file late, after turns have ended with nothing new read, and
+/// behind a backlog of older turns' prompts. It is still named when it is read: a steer is let go
+/// unnamed only once a prompt of a turn agit started after it is read, known by the id agit gave
+/// it. Prompts of its own turn or earlier ones, however late, never let it go; nor does a turn
+/// Claude Code started on its own. The session's end does.
+#[tokio::test]
+async fn a_steer_copy_read_late_is_still_named_until_a_later_turn_is_read() {
+    let driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver();
+    let mut session = harness_test_session(
+        AnyDriver::ClaudeCode(Box::new(driver)),
+        "claude-code",
+        SessionStatus::Running,
+    );
+    let read = |session: &mut Session, values: &[serde_json::Value]| {
+        let lines: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(lineno, value)| crate::rc::tail::TailedLine {
+                source: None,
+                lineno: lineno as u64,
+                text: value.to_string(),
+            })
+            .collect();
+        let mut items = items_from_lines_with_mode(
+            "claude-code",
+            &lines,
+            crate::rc::codex_history::HistoryMode::Model,
+        );
+        session.name_absorbed_steers(&mut items);
+        items
+    };
+    let absorbed = |words: &str| {
+        serde_json::json!({"type":"queue-operation","operation":"remove",
+            "reason":"absorbed_mid_turn","content":words,"sessionId":"s"})
+    };
+    let prompt = |id: &str| {
+        serde_json::json!({"type":"user","uuid":id,"sessionId":"s",
+            "message":{"role":"user","content":"a prompt"}})
+    };
+    let turns: Vec<String> = (0..4).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for turn in &turns[..3] {
+        session.started_prompt(turn.clone());
+    }
+
+    // Written during turn 3, then turns 1-3's prompts read late, in order, before the copy.
+    let late = uuid::Uuid::new_v4().to_string();
+    session.absorbing(late.clone(), "late words".into());
+    for _ in 0..2 {
+        read(&mut session, &[]);
+    }
+    read(
+        &mut session,
+        &[prompt(&turns[0]), prompt(&turns[1]), prompt(&turns[2])],
+    );
+    let own = uuid::Uuid::new_v4().to_string();
+    read(&mut session, &[prompt(&own)]);
+    let items = read(&mut session, &[absorbed("late words")]);
+    assert_eq!(
+        items[0].native_prompt_id.as_deref(),
+        Some(late.as_str()),
+        "earlier turns' prompts and a turn Claude Code started on its own don't let it go"
+    );
+
+    // A prompt of a turn agit started after it lets it go.
+    for _ in 0..MAX_ABSORBING_STEERS {
+        session.absorbing(uuid::Uuid::new_v4().to_string(), "never copied".into());
+    }
+    assert!(session.admits_absorbing_steer().is_err());
+    read(&mut session, &[prompt(&turns[2])]);
+    assert!(
+        session.admits_absorbing_steer().is_err(),
+        "its own turn's prompt is not later"
+    );
+    session.started_prompt(turns[3].clone());
+    read(&mut session, &[prompt(&turns[3])]);
+    assert!(session.admits_absorbing_steer().is_ok());
+    assert!(session.absorbing_steers.is_empty());
+
+    // More turns start during a read backlog than ids are kept: the steers written in turn 4
+    // still go once a later turn's prompt is read, so the limit admits steers again and a later
+    // steer's copy with the same words takes that steer's id, not an old one's.
+    for _ in 0..MAX_ABSORBING_STEERS - 1 {
+        session.absorbing(uuid::Uuid::new_v4().to_string(), "same words".into());
+    }
+    let old = uuid::Uuid::new_v4().to_string();
+    session.absorbing(old.clone(), "same words".into());
+    assert!(session.admits_absorbing_steer().is_err());
+    let backlog: Vec<String> = (0..70).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+    for turn in &backlog {
+        session.started_prompt(turn.clone());
+    }
+    let prompts: Vec<_> = std::iter::once(&turns[3])
+        .chain(&backlog)
+        .map(|turn| prompt(turn))
+        .collect();
+    read(&mut session, &prompts);
+    assert!(
+        session.absorbing_steers.is_empty(),
+        "a later turn's prompt lets them go, though their own turn's id is no longer kept"
+    );
+    assert!(session.admits_absorbing_steer().is_ok());
+    let new = uuid::Uuid::new_v4().to_string();
+    session.absorbing(new.clone(), "same words".into());
+    let items = read(&mut session, &[absorbed("same words")]);
+    assert_eq!(items[0].native_prompt_id.as_deref(), Some(new.as_str()));
+
+    // A transcript that never yields: the waiting steers go when the session ends.
+    for _ in 0..MAX_ABSORBING_STEERS {
+        session.absorbing(uuid::Uuid::new_v4().to_string(), "stuck".into());
+    }
+    session.set_status(SessionStatus::Ended).await;
+    assert!(session.absorbing_steers.is_empty());
 }

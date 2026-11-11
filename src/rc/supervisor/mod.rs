@@ -1022,6 +1022,15 @@ pub struct Session {
     /// currently awaiting its exact response.
     pending_turn_command: Option<PendingTurnCommand>,
     pending_steer_command: Option<PendingSteerCommand>,
+    /// Steers headless Claude Code took for the running turn's next tool step, oldest first, with
+    /// the native id their echo is named by: see [`Session::name_absorbed_steers`].
+    absorbing_steers: std::collections::VecDeque<AbsorbingSteer>,
+    /// How many turns agit has started on headless Claude Code: each one's number, which a
+    /// waiting steer keeps for the turn it was written in.
+    turns_started: u64,
+    /// The ids agit gave the prompts of the most recent turns it started, with each turn's number,
+    /// oldest first: a prompt read with a number past a steer's comes after that steer.
+    started_prompts: std::collections::VecDeque<(String, u64)>,
     /// Messages for a running native Claude Code turn, held for its next tool step or waiting for
     /// the next turn; see [`steer_queue`].
     steer_queue: steer_queue::SteerQueue,
@@ -1579,6 +1588,9 @@ impl Session {
             pending_turn_command: None,
             pending_steer_command: None,
             steer_queue: Default::default(),
+            absorbing_steers: std::collections::VecDeque::new(),
+            turns_started: 0,
+            started_prompts: std::collections::VecDeque::new(),
             pending_interrupt_command: None,
             resolved_initial_turn: None,
             announced_turn_ids: Default::default(),
@@ -2048,6 +2060,9 @@ impl Session {
             return;
         }
         pending.attribution.native_prompt_id = self.driver.reserve_prompt_identity();
+        if let Some(prompt) = &pending.attribution.native_prompt_id {
+            self.started_prompt(prompt.clone());
+        }
         let dispatch = self
             .driver
             .start_turn(
@@ -2277,6 +2292,9 @@ impl Session {
                 SessionStatus::Running | SessionStatus::AwaitingApproval
             );
             self.abandon_steers().await;
+            // No more of this process's records will be read: what still waits for its copy
+            // can't be named now.
+            self.absorbing_steers.clear();
         }
         self.info.status = status;
         self.info.updated_at = chrono::Utc::now().to_rfc3339();
@@ -2629,9 +2647,18 @@ impl Session {
                             let pending = PendingSteerCommand { message: report.text, attribution, reply };
                             if self.driver.steers_at_step() {
                                 self.steer_at_step(message, pending).await;
+                            } else if let Err(error) = self.admits_absorbing_steer() {
+                                pending.reply.finish(Err(error));
                             } else {
                                 match self.driver.steer(&message).await {
-                                    SteerDispatch::Resolved(result) => self.resolve_steer(pending, result).await,
+                                    SteerDispatch::Resolved(result) => {
+                                        if matches!(result, Ok(Delivery::AtToolBoundary))
+                                            && let Some(native_prompt_id) = pending.attribution.native_prompt_id.clone()
+                                        {
+                                            self.absorbing(native_prompt_id, message);
+                                        }
+                                        self.resolve_steer(pending, result).await
+                                    }
                                     SteerDispatch::Awaiting => self.pending_steer_command = Some(pending),
                                 }
                             }
@@ -4060,12 +4087,137 @@ impl Session {
         // so it must not be alive across an `.await` — keeping the parse in its
         // own scope (inside `items_from_lines`) is what lets this whole session
         // run as a spawned task.
-        let items = items_from_lines_with_mode(&self.info.runtime, &polled, mode);
+        let mut items = items_from_lines_with_mode(&self.info.runtime, &polled, mode);
+        self.name_absorbed_steers(&mut items);
         for item in items {
             self.emit(method::ITEM_COMPLETED, item).await;
         }
     }
+
+    /// Whether one more steer may go to headless Claude Code. Each one waiting is kept until its
+    /// copy in the transcript is named; one past [`MAX_ABSORBING_STEERS`] is refused before it is
+    /// written, rather than forgetting one that waits.
+    fn admits_absorbing_steer(&self) -> crate::Result<()> {
+        if self.info.runtime == "claude-code" && self.absorbing_steers.len() >= MAX_ABSORBING_STEERS
+        {
+            return Err(crate::rc::harness::TooManySteers.into());
+        }
+        Ok(())
+    }
+
+    /// Remembers a steer headless Claude Code took for the running turn's next tool step, until
+    /// its copy in the transcript is named. A steer past [`MAX_ABSORBING_STEERS`] is refused
+    /// before it is written, so none is ever forgotten here while it waits.
+    fn absorbing(&mut self, native_prompt_id: String, message: String) {
+        self.absorbing_steers.push_back(AbsorbingSteer {
+            native_prompt_id,
+            message,
+            written_in: self.turns_started,
+        });
+    }
+
+    /// agit started a turn on headless Claude Code with this prompt id: the turn takes the next
+    /// number. Only the most recent ids are kept. Forgetting the oldest loses only prompts that
+    /// come right after a steer's turn, never the steer's own number, and the newer prompts kept
+    /// are later still, so a waiting steer is let go by whichever of them is read.
+    fn started_prompt(&mut self, prompt: String) {
+        if self.info.runtime != "claude-code" {
+            return;
+        }
+        self.turns_started += 1;
+        if self.started_prompts.len() >= MAX_STARTED_PROMPTS {
+            self.started_prompts.pop_front();
+        }
+        self.started_prompts.push_back((prompt, self.turns_started));
+    }
+
+    /// Whether the prompt record `read` is of a turn agit started after `steer` was written:
+    /// such a turn's prompt comes after the steer's copy in the transcript, so the copy can no
+    /// longer come. A prompt of the steer's own turn or an earlier one, however late it is read,
+    /// says nothing; nor does one agit didn't write, or one too old to be kept.
+    fn starts_a_later_turn(&self, steer: &AbsorbingSteer, read: &str) -> bool {
+        self.started_prompts
+            .iter()
+            .find(|(prompt, _)| prompt == read)
+            .is_some_and(|(_, turn)| *turn > steer.written_in)
+    }
+
+    /// Names the transcript's copy of each steer headless Claude Code took into a running turn.
+    ///
+    /// A steer that reaches the turn at a tool step is recorded as `queue-operation remove`
+    /// with reason `absorbed_mid_turn`: the words, with no record id. Without a name the copy
+    /// can't be matched to the message the steer announced, so viewers show the words twice and
+    /// the announced one stays waiting for a tool step that already came. A steer that starts
+    /// the next turn instead comes back as a user record carrying its own id, and is forgotten
+    /// here. Steers are matched in the order they were written, by their exact words.
+    ///
+    /// Claude Code appends a turn's records in order, and a steer's copy belongs to the turn it
+    /// was written in, so it comes before the prompt record of any turn agit started after it.
+    /// A steer is forgotten unnamed only once such a prompt is read, known by the id agit gave
+    /// it; prompts of its own turn or earlier ones, however late they are read, don't count.
+    /// Nothing here depends on when a turn ended or how long a read took. If the transcript never
+    /// yields those records, the steers waiting here go when the session ends, and the limit
+    /// refuses new steers until then.
+    fn name_absorbed_steers(&mut self, items: &mut [ItemCompleted]) {
+        if self.info.runtime != "claude-code" {
+            return;
+        }
+        for item in items.iter_mut() {
+            if let Some(uuid) = item.raw["uuid"].as_str()
+                && item.raw["type"] == "user"
+            {
+                let prompt = item.event.kind == crate::adapter::EventKind::UserPrompt;
+                let later: Vec<bool> = self
+                    .absorbing_steers
+                    .iter()
+                    .map(|steer| prompt && self.starts_a_later_turn(steer, uuid))
+                    .collect();
+                let mut later = later.into_iter();
+                self.absorbing_steers.retain(|steer| {
+                    let later = later.next().unwrap_or(false);
+                    steer.native_prompt_id != uuid && !later
+                });
+                continue;
+            }
+            if item.native_prompt_id.is_some()
+                || item.event.kind != crate::adapter::EventKind::UserInterjection
+                || item.raw["type"] != "queue-operation"
+                || item.raw["operation"] != "remove"
+                || item.raw["reason"] != "absorbed_mid_turn"
+            {
+                continue;
+            }
+            let Some(words) = item.raw["content"].as_str() else {
+                continue;
+            };
+            if let Some(index) = self
+                .absorbing_steers
+                .iter()
+                .position(|steer| steer.message == words)
+            {
+                let steer = self.absorbing_steers.remove(index).expect("found above");
+                item.native_prompt_id = Some(steer.native_prompt_id);
+            }
+        }
+    }
 }
+
+/// A steer headless Claude Code took for the running turn's next tool step, by its words and the
+/// native id its transcript copy is to be named by.
+struct AbsorbingSteer {
+    native_prompt_id: String,
+    message: String,
+    /// The number of the turn agit had last started when it was written, which its copy belongs
+    /// to; 0 if it had started none.
+    written_in: u64,
+}
+
+/// How many started prompts' ids are remembered. A steer's own turn is kept as a number, so
+/// forgetting older ids never strands it.
+const MAX_STARTED_PROMPTS: usize = 64;
+
+/// How many such steers may wait at once; one more is refused unsent.
+const MAX_ABSORBING_STEERS: usize = 16;
 
 /// Transcript lines → `item.completed` payloads. Shared by the supervised session, the read-only
 /// watch path and history pages: each must produce the exact same items for the same lines, or

@@ -50,6 +50,21 @@ impl std::fmt::Display for TurnNotRunning {
 
 impl std::error::Error for TurnNotRunning {}
 
+/// More messages already wait for the running turn's next tool step than the device keeps track
+/// of. Nothing was sent.
+#[derive(Debug)]
+pub(crate) struct TooManySteers;
+
+impl std::fmt::Display for TooManySteers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "The message was not sent: too many messages already wait for the agent's current step.",
+        )
+    }
+}
+
+impl std::error::Error for TooManySteers {}
+
 /// A turn-fenced interrupt on a runtime that cannot confirm which turn is running. Nothing was
 /// sent.
 #[derive(Debug)]

@@ -1924,6 +1924,11 @@ fn map_receipt<T>(
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
             Err(error)
         }
+        Ok(Err(error)) if error.is::<crate::rc::harness::TooManySteers>() => {
+            let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
+            error.data = Some(serde_json::json!({"outcome":"not_sent"}));
+            Err(error)
+        }
         Ok(Err(error)) if error.is::<crate::rc::harness::FenceUnsupported>() => {
             let mut error = RpcError::new(ErrorCode::SessionBusy, error.to_string());
             error.data = Some(serde_json::json!({"outcome":"not_sent"}));
