@@ -975,6 +975,165 @@ fn a_save_leaves_a_running_commands_recovery_alone() {
     assert!(pending.exists());
 }
 
+/// `agit branch rename` takes the conversation saving to the branch along: its next turn, settled
+/// by the hook at the turn's end, lands on the new name right after the history it already has,
+/// and a commit by the conversation's id, the path a save takes, doesn't create the old name
+/// again. A rename that moved only the git branch leaves the conversation claiming a name that no
+/// longer exists: the hook then saves nothing, and the commit rebuilds the old branch from the
+/// conversation's first turn, apart from the history already uploaded. When a conversation can't
+/// be moved, the rename fails naming it and the same command, which run again moves it; a rename
+/// that put the branch back instead could leave a conversation it had moved on a name that exists
+/// nowhere, once the write that put it back failed too.
+#[test]
+fn a_renamed_branch_keeps_its_conversation_saving_to_it() {
+    let lab = Lab::new();
+    let dir = lab.folder("renamed", false);
+    let id = "25252525-2525-4252-8252-252525252525";
+    lab.conversation(&dir, id, "Draft the plan");
+    let imported = lab.agit(
+        &dir,
+        &[
+            "import",
+            "--from",
+            "claude-code",
+            "--into",
+            "me/renamed@first",
+            "--independent",
+            "-y",
+            "--",
+            id,
+        ],
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let checkout = lab.agit_home.join("repos/me/renamed");
+    let rev = |name: &str| {
+        let out = Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .current_dir(&checkout)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let before = rev("refs/heads/first").expect("the import made the branch");
+
+    let renamed = lab.agit(
+        &dir,
+        &[
+            "branch",
+            "rename",
+            "first",
+            "me-first",
+            "--repo",
+            "me/renamed",
+        ],
+    );
+    let said = String::from_utf8_lossy(&renamed.stdout);
+    assert!(
+        renamed.status.success() && said.contains("now saves to me-first"),
+        "{renamed:?}"
+    );
+    // Renaming a branch to its own name changes nothing and ends at once.
+    let same = lab.agit(
+        &dir,
+        &[
+            "branch",
+            "rename",
+            "me-first",
+            "me-first",
+            "--repo",
+            "me/renamed",
+        ],
+    );
+    assert_eq!(same.status.code(), Some(4), "{same:?}");
+
+    // The conversation goes on, and its turn ends with a reply the Stop hook reads as final, so
+    // it settles the turn itself rather than in a settlement that waits apart for the reply.
+    let transcript = lab
+        .home
+        .join(".claude")
+        .join("projects")
+        .join(agit::adapter::claude_code::slug_for(&dir))
+        .join(format!("{id}.jsonl"));
+    let next = [
+        serde_json::json!({"type":"user","uuid":format!("{id}-u2"),"parentUuid":format!("{id}-a"),
+            "sessionId":id,"cwd":dir,"timestamp":"2026-10-25T10:01:00Z",
+            "message":{"role":"user","content":"Now the tests"}}),
+        serde_json::json!({"type":"assistant","uuid":format!("{id}-a2"),"parentUuid":format!("{id}-u2"),
+            "sessionId":id,"cwd":dir,"timestamp":"2026-10-25T10:01:05Z",
+            "message":{"role":"assistant","stop_reason":"end_turn",
+                "content":[{"type":"text","text":"Added."}]}}),
+    ];
+    let mut text = std::fs::read_to_string(&transcript).unwrap();
+    text.extend(next.iter().map(|record| format!("{record}\n")));
+    std::fs::write(&transcript, text).unwrap();
+    lab.stop(&dir, id, "claude-code", &transcript);
+
+    let after = rev("refs/heads/me-first").expect("the renamed branch");
+    assert_ne!(after, before, "the hook saved nothing after the rename");
+    assert_eq!(
+        rev("refs/heads/me-first^").as_deref(),
+        Some(before.as_str())
+    );
+    assert_eq!(rev("refs/heads/first"), None);
+
+    let committed = lab.agit(&dir, &["commit", id]);
+    assert!(committed.status.success(), "{committed:?}");
+    assert_eq!(rev("refs/heads/first"), None, "{committed:?}");
+    assert_eq!(rev("refs/heads/me-first").as_deref(), Some(after.as_str()));
+
+    // A conversation whose claim can't be moved: the rename says so and how to finish it.
+    let other = "26262626-2626-4262-8262-262626262626";
+    lab.conversation(&dir, other, "Sketch the docs");
+    let imported = lab.agit(
+        &dir,
+        &[
+            "import",
+            "--from",
+            "claude-code",
+            "--into",
+            "me/renamed@second",
+            "--independent",
+            "-y",
+            "--",
+            other,
+        ],
+    );
+    assert!(imported.status.success(), "{imported:?}");
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claimed =
+        || agit::domain::link::get(&store, "claude-code", other).and_then(|link| link.branch);
+    let rename = [
+        "branch",
+        "rename",
+        "second",
+        "me-second",
+        "--repo",
+        "me/renamed",
+    ];
+    let stuck = lab
+        .command(&dir, &rename)
+        .env("AGIT_TEST_FAIL_CLAIM_MOVE", other)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&stuck.stderr);
+    assert!(
+        !stuck.status.success()
+            && said.contains(&format!("{other} still saves to second"))
+            && said.contains("`agit branch rename second me-second --repo me/renamed`"),
+        "{stuck:?}"
+    );
+    assert!(rev("refs/heads/me-second").is_some());
+    assert_eq!(claimed().as_deref(), Some("second"));
+    let finished = lab.agit(&dir, &rename);
+    assert!(finished.status.success(), "{finished:?}");
+    assert_eq!(claimed().as_deref(), Some("me-second"), "{finished:?}");
+    assert_eq!(rev("refs/heads/second"), None);
+}
+
 /// What a folder does with a conversation is said the same way by a conversation's start, the
 /// overview and `agit on`. A folder that is on while its repository's automatic upload is off on
 /// this computer saves turns here and uploads nothing, so its start says the conversation stays on
