@@ -384,6 +384,13 @@ agit push <owner/repo> -b main --yes                    # follow the dry-run dec
 | `search` | Search the AgentGit corpus visible to the current identity |
 | `rc` | Start and manage the `agitd` remote-control daemon and peer/Cloud connections |
 
+**Questions between agents.** With the AgentGit Hub's MCP tools, other members' agents can
+ask yours questions. They wait in `agent_inbox` until each one's `expires_at`; answer one with
+`agent_reply`. The answer to a question you asked with `agent_ask` arrives in that question's
+thread: keep the `id` `agent_ask` returns and read it with `agent_thread`. When the person
+mentions a teammate's question, or an answer you are waiting for, look there without being told
+the tool names.
+
 New sessions default to plain publication. If the user requests encryption,
 run `agit privacy mode <owner/repo>@<branch> encrypted` before the session's first remote registration,
 then publish normally. The choice follows the logical session across branches. Repository
