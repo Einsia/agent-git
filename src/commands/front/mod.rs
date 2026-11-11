@@ -960,6 +960,7 @@ pub(crate) fn runtime_name(runtime: &str) -> &str {
     match runtime {
         "claude-code" => "Claude Code",
         "codex" => "Codex",
+        "opencode" => "OpenCode",
         other => other,
     }
 }
@@ -968,33 +969,42 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// The runtimes a folder lists, counts and uploads by itself: each tells agit when a turn ends.
-const LISTED: &[&str] = &["claude-code", "codex"];
-
-/// The runtimes `agit save` finds: the listed ones, and OpenCode, which tells agit nothing when a
-/// turn ends, so a save, or its agent's `agit commit`, is the only thing that saves it.
+/// The runtimes whose conversations a folder lists, counts and saves. OpenCode tells agit nothing
+/// when a turn ends, so its conversations go up later than the others', but they are the folder's
+/// all the same: a list that left them out would hide an OpenCode conversation, uploaded or not,
+/// from the person who has to name it to save it.
 const SAVED: &[&str] = &["claude-code", "codex", "opencode"];
 
-/// Claude Code and Codex conversations that ran in `root` or below it, except in a directory
-/// below that is set up on its own (those are that directory's), and in the git worktrees its
-/// policy covers, newest first.
+/// The conversations that ran in `root` or below it, except in a directory below that is set up
+/// on its own (those are that directory's), and in the git worktrees its policy covers, newest
+/// first. `agit save` saves them, and the overview lists the same ones ([`sessions_shown_in`]).
+/// A runtime store that can't be read is an error here: a save that went on without it could take
+/// an earlier conversation for a new one.
 pub(crate) fn sessions_in(root: &Path) -> Result<Vec<FolderSession>> {
-    sessions_of_in(LISTED, root)
+    let (sessions, unlisted) = sessions_shown_in(root);
+    match unlisted.into_iter().next() {
+        Some(unlisted) => Err(unlisted.error),
+        None => Ok(sessions),
+    }
 }
 
-/// [`sessions_in`] for `agit save`, OpenCode's conversations included.
-pub(crate) fn sessions_to_save_in(root: &Path) -> Result<Vec<FolderSession>> {
-    sessions_of_in(SAVED, root)
-}
-
-fn sessions_of_in(runtimes: &[&'static str], root: &Path) -> Result<Vec<FolderSession>> {
+/// [`sessions_in`] for a list a person reads: a runtime whose store can't be read leaves out only
+/// its own conversations, and is named, so one unreadable store never empties the folder's list
+/// of the conversations every other runtime still shows.
+pub(crate) fn sessions_shown_in(root: &Path) -> (Vec<FolderSession>, Vec<Unlisted>) {
     let worktrees = super::project::covered_worktrees(root);
-    sessions_where(runtimes, |cwd, _| {
+    listed_where(SAVED, |cwd, _| {
         (cwd.starts_with(root)
             && super::project::bound_root(cwd).is_none_or(|bound| root.starts_with(bound)))
             || (worktrees.iter().any(|worktree| cwd.starts_with(worktree))
                 && super::project::worktree_of(cwd).as_deref() == Some(root))
     })
+}
+
+/// A runtime whose conversations a list couldn't read, and why.
+pub(crate) struct Unlisted {
+    pub runtime: &'static str,
+    pub error: anyhow::Error,
 }
 
 /// How many of `sessions`, in the git worktree `folder` or below it, are left out until the
@@ -1110,10 +1120,30 @@ fn sessions_where(
     runtimes: &[&'static str],
     keep: impl Fn(&Path, std::time::SystemTime) -> bool,
 ) -> Result<Vec<FolderSession>> {
+    let (sessions, unlisted) = listed_where(runtimes, keep);
+    match unlisted.into_iter().next() {
+        Some(unlisted) => Err(unlisted.error),
+        None => Ok(sessions),
+    }
+}
+
+/// The conversations of `runtimes` that `keep` keeps, newest first, and the runtimes whose store
+/// couldn't be read.
+fn listed_where(
+    runtimes: &[&'static str],
+    keep: impl Fn(&Path, std::time::SystemTime) -> bool,
+) -> (Vec<FolderSession>, Vec<Unlisted>) {
     let store = Store::open().ok().flatten();
     let mut sessions = Vec::new();
+    let mut unlisted = Vec::new();
     for &runtime in runtimes {
-        let adapter = adapter::get(runtime)?;
+        let adapter = match adapter::get(runtime) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                unlisted.push(Unlisted { runtime, error });
+                continue;
+            }
+        };
         // A runtime's conversations are in its own store, there whether or not its command is on
         // this shell's PATH: an app, an editor or a PATH set only in new shells may run it. A store
         // that can't be read is left out only for a runtime agit can't find either, which may be
@@ -1121,7 +1151,10 @@ fn sessions_where(
         let choices = match adapter.all_session_choices() {
             Ok(choices) => choices,
             Err(_) if !adapter.available() => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                unlisted.push(Unlisted { runtime, error });
+                continue;
+            }
         };
         for session in choices {
             let cwd = session
@@ -1155,7 +1188,7 @@ fn sessions_where(
         }
     }
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
-    Ok(sessions)
+    (sessions, unlisted)
 }
 
 /// The conversation whose ID starts with `query` that `agit save` doesn't offer because the

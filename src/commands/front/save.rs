@@ -153,7 +153,7 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
     } else {
         None
     };
-    let here = super::sessions_to_save_in(&root)?;
+    let here = super::sessions_in(&root)?;
     let mut left_out = 0;
     let mut dropped = 0;
     let chosen: Vec<FolderSession> = match &args.session {

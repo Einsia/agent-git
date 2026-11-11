@@ -562,7 +562,7 @@ fn report(root: &Path, enabled: &Enabled, stays_off: Option<&Path>) -> CmdResult
         None => crate::commands::project::covered_worktrees(root),
     };
     let sessions = if through.is_some() || !worktrees.is_empty() {
-        super::sessions_in(root).unwrap_or_default()
+        super::sessions_shown_in(root).0
     } else {
         Vec::new()
     };
