@@ -134,7 +134,7 @@ impl Resources {
                 }
             }
         }
-        for (id, entry) in super::super::roster::Roster::try_load()?.sessions {
+        for (id, entry) in super::super::roster::Roster::read_only()?.sessions {
             if entry.workspace_id != super::super::endpoint::WORKSPACE {
                 continue;
             }

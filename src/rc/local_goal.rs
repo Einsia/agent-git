@@ -80,7 +80,7 @@ fn target(params: Value) -> crate::Result<Target> {
     let session = params["session_id"]
         .as_str()
         .context("Session id is required")?;
-    let roster = super::roster::Roster::try_load()?;
+    let roster = super::roster::Roster::read_only()?;
     let entry = roster.get(session);
     if let Some(entry) = entry {
         ensure!(
