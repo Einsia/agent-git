@@ -850,7 +850,7 @@ fn cwd_resume_decision(
 
     if !ui::prompt::can_ask() {
         return Err(super::InteractionRequired(
-            "the resume cwd requires an explicit decision:\n  - continue anyway (--yes)\n  - continue and inject an environment notice (interactive terminal)\n  - cancel\nrerun from a terminal to choose, or pass --yes to continue without an environment notice"
+            "the resume cwd requires an explicit decision:\n  - continue anyway (--yes)\n  - continue and inject an environment notice (interactive terminal)\n  - open it in another folder (--cwd <folder>)\n  - cancel\nrerun from a terminal to choose, or pass --yes to continue without an environment notice"
                 .to_owned(),
         )
         .into());
@@ -888,6 +888,96 @@ fn cwd_resume_decision(
 enum Decided {
     Asked,
     NotAsked,
+}
+
+/// Where a session opens without `--cwd`: where it last ran, unless this command runs in another
+/// worktree of that same Git repository. Then a person at a terminal chooses, with here first, as
+/// work in progress usually sits in front of them; without one it stays where it ran, and the line
+/// says how to open it here. `None` when the person cancels the choice.
+fn where_it_opens(recorded: PathBuf) -> crate::Result<Option<PathBuf>> {
+    let Ok(here) = std::env::current_dir() else {
+        return Ok(Some(recorded));
+    };
+    let (Some(here_top), Some(recorded_top)) = (top_level(&here), top_level(&recorded)) else {
+        return Ok(Some(recorded));
+    };
+    if here_top == recorded_top
+        || common_dir(&here).is_none()
+        || common_dir(&here) != common_dir(&recorded)
+    {
+        return Ok(Some(recorded));
+    }
+    if std::env::var_os("AGIT_YES").is_none() && ui::prompt::can_ask() {
+        let options = [
+            format!("here, in {}", ui::tilde(&here)),
+            format!("where it last ran, in {}", ui::tilde(&recorded)),
+        ];
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
+        return Ok(
+            match ui::prompt::select("open this session in which worktree?", &options)? {
+                Some(0) => Some(here),
+                Some(_) => Some(recorded),
+                None => None,
+            },
+        );
+    }
+    ui::info(format_args!(
+        "opens in {}, where it last ran; `--cwd .` opens it in this worktree",
+        ui::tilde(&recorded)
+    ));
+    Ok(Some(recorded))
+}
+
+/// The top level of the Git worktree holding `dir`, if any.
+fn top_level(dir: &Path) -> Option<PathBuf> {
+    git_path(dir, "--show-toplevel")
+}
+
+/// The Git directory every worktree of `dir`'s repository shares, if any.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
+    git_path(dir, "--git-common-dir")
+}
+
+fn git_path(dir: &Path, query: &str) -> Option<PathBuf> {
+    let output = crate::infra::git_runtime::command()
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--path-format=absolute", query])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = PathBuf::from(path.trim());
+    Some(path.canonicalize().unwrap_or(path))
+}
+
+/// Why a session opens in the runtime it does.
+#[derive(Clone, Copy)]
+enum Opening {
+    /// `--as` named it.
+    Asked,
+    /// The runtime that recorded the session's latest turn.
+    Recorded,
+    /// The runtime session a previous run prepared and nothing has used since.
+    Prepared,
+}
+
+/// One line, before anything launches, naming the runtime the session opens in, why, and the flag
+/// that picks another. A session opened in an unexpected runtime is converted, so the person
+/// learns the choice before it is made.
+fn say_opening(runtime: &str, why: Opening) {
+    let label = adapter::runtime_label(runtime);
+    match why {
+        Opening::Asked => ui::info(format_args!("opens in {label}, as --as asked")),
+        Opening::Recorded => ui::info(format_args!(
+            "opens in {label}, the runtime its latest turn ran in; `--as <runtime>` opens it in another"
+        )),
+        Opening::Prepared => ui::info(format_args!(
+            "opens in {label}, where it was last opened; `--as <runtime>` opens it in another"
+        )),
+    }
 }
 
 fn report_environment_notice(runtime: &str, notice: Option<&str>) {
@@ -1228,14 +1318,20 @@ fn resume_branch_for(
     // Falling back to "the top level of the git repo containing the current directory" instead
     // installs a session resumed from ~/Code into ~ on a machine whose home directory is itself a
     // git repo.
+    let last_ran = match &args.cwd {
+        Some(_) => None,
+        None => match lk_for(repo, slug, branch).and_then(|l| l.cwd.clone()) {
+            Some(recorded) => match where_it_opens(PathBuf::from(recorded))? {
+                Some(cwd) => Some(cwd),
+                None => return Ok(None),
+            },
+            None => None,
+        },
+    };
     let cwd = args
         .cwd
         .clone()
-        .or_else(|| {
-            lk_for(repo, slug, branch)
-                .and_then(|l| l.cwd.clone())
-                .map(PathBuf::from)
-        })
+        .or(last_ran)
         .or_else(|| {
             recovered
                 .as_ref()
@@ -1263,15 +1359,9 @@ fn resume_branch_for(
         .as_deref()
         .map(|runtime| crate::input_argument(adapter::normalize(runtime)))
         .transpose()?;
-    let to_runtime = requested_runtime
-        .or_else(|| {
-            config::get_global("runtime.default")
-                .ok()
-                .flatten()
-                .as_deref()
-                .and_then(|runtime| adapter::normalize(runtime).ok())
-        })
-        .unwrap_or(from);
+    // A session reopens in the runtime that recorded it unless `--as` asks for another;
+    // `runtime.default` chooses only where new sessions start.
+    let to_runtime = requested_runtime.unwrap_or(from);
     let (decision, decided) = cwd_resume_decision(repo, &snap, &cwd, (from, to_runtime))?;
     let system_prompt = match decision {
         CwdResumeDecision::Continue => None,
@@ -1330,6 +1420,14 @@ fn resume_branch_for(
                 system_prompt.as_deref(),
             )
         {
+            say_opening(
+                &existing.source,
+                if requested_runtime.is_some() {
+                    Opening::Asked
+                } else {
+                    Opening::Prepared
+                },
+            );
             report_environment_notice(&existing.source, system_prompt.as_deref());
             if recovered.is_none() {
                 materialize_memory(repo, branch, slug, &existing.source, &cwd);
@@ -1382,6 +1480,14 @@ fn resume_branch_for(
                 system_prompt.as_deref(),
             )
         {
+            say_opening(
+                from,
+                if requested_runtime.is_some() {
+                    Opening::Asked
+                } else {
+                    Opening::Recorded
+                },
+            );
             report_environment_notice(from, system_prompt.as_deref());
             materialize_memory(repo, branch, slug, from, &cwd);
             println!(
@@ -1486,6 +1592,14 @@ fn resume_branch_for(
     }
 
     // ── Slow path: materialize from the head VIEW, mint a new id ──
+    say_opening(
+        to_runtime,
+        if requested_runtime.is_some() {
+            Opening::Asked
+        } else {
+            Opening::Recorded
+        },
+    );
     materialize_and_resume(
         repo,
         slug,

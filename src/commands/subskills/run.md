@@ -22,8 +22,8 @@ agit run <local-ref> [options]
 |---|---|
 | `<source>` | `owner/repo@ref` for explicit network access, or a local ref within the repo selected by `AGIT_SESSION` |
 | `--mine` | Copy into your namespace before forking |
-| `--as <runtime>` | Runtime to use |
-| `--cwd <dir>` | Working directory for the runtime |
+| `--as <runtime>` | Runtime to open it in; without it, the runtime that recorded its latest turn (`runtime.default` applies only to new sessions) |
+| `--cwd <dir>` | Working directory for the runtime; without it, the folder the session last ran in (from another worktree of that repository, a terminal asks, here first) |
 | `-b, --branch <branch>` | New branch name when a fork occurs; required non-interactively |
 | `--no-launch` | Fetch/fork/materialize without starting |
 | `--json` | Emit the unified CLI JSON envelope |

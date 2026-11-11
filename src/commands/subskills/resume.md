@@ -28,8 +28,8 @@ This grouping offers candidates; it does not select a session target.
 | Option | Meaning |
 |---|---|
 | `[branch|@]` | Explicit owner/repo@branch, or a branch in the repo supplied through `AGIT_SESSION`; `@` requires `AGIT_SESSION`. Omitted targets open an interactive picker |
-| `--as <runtime>` | Runtime to use |
-| `--cwd <dir>` | Runtime working directory |
+| `--as <runtime>` | Runtime to open it in; without it, the runtime that recorded its latest turn (`runtime.default` applies only to new sessions) |
+| `--cwd <dir>` | Runtime working directory; without it, the folder the session last ran in (from another worktree of that repository, a terminal asks, here first) |
 | `--no-launch` | Resolve/materialize without starting |
 | `--force` | Explicitly replace local active claims; known unintegrated tracking history still refuses |
 | `--tui` / `--no-tui` | Force or forbid the full-screen interface. `--tui` overrides the agent-session check but not `--json` / `-q` / `-y` |
