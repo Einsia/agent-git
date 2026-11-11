@@ -102,7 +102,7 @@ fn present(parent: Option<&Process>) -> bool {
 /// answers, and allowing it without them would run the question unanswered. The hook builds that
 /// input itself, as [`answered`] says; an allow with `updatedInput` it can't build, or for any
 /// other tool, decides nothing, and the terminal asks instead.
-fn permitted(decision: &Value, payload: &Value) -> Option<Value> {
+pub(super) fn permitted(decision: &Value, payload: &Value) -> Option<Value> {
     match decision["behavior"].as_str()? {
         "allow" if decision.get("updatedInput").is_none() => Some(json!({"behavior": "allow"})),
         "allow" if payload["tool_name"] == "AskUserQuestion" => {

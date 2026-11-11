@@ -164,6 +164,10 @@ struct PeerState {
     operations: HashMap<String, Operation>,
     next_operation: u64,
     decisions: HashMap<String, Value>,
+    /// Whether a settings PermissionRequest hook has taken each ask's decision, by id: `true` once
+    /// its check-in has returned the decision. The supervisor's reply waits on it; a sender
+    /// dropped with its decision ends that wait unconfirmed.
+    taken: HashMap<String, tokio::sync::watch::Sender<bool>>,
     /// The asks and permission mode the module last reported; `snapshot` adds what the
     /// session's settings hooks report, which a module cannot see where Claude Code passes
     /// user plugins over on its classic events.
@@ -206,6 +210,7 @@ impl PeerState {
             operations: HashMap::new(),
             next_operation: 0,
             decisions: HashMap::new(),
+            taken: HashMap::new(),
             module_approvals: Vec::new(),
             module_mode: None,
             offered: HashMap::new(),
@@ -614,6 +619,11 @@ impl Hub {
                     .get(id)
                     .map_or(Value::Null, |offer| offer.wire["turn"].clone());
                 let decision = state.decisions.get(id).cloned();
+                if decision.is_some()
+                    && let Some(taken) = state.taken.get(id)
+                {
+                    taken.send_replace(true);
+                }
                 drop(state);
                 if fresh {
                     peer.changed.notify_waiters();
@@ -709,6 +719,10 @@ impl Hub {
                 .iter()
                 .any(|approval| approval["id"].as_str() == Some(id))
         });
+        let PeerState {
+            decisions, taken, ..
+        } = &mut *state;
+        taken.retain(|id, _| decisions.contains_key(id));
         state.seen = Instant::now();
         let commands = pending_commands(&state.operations);
         let reply = json!({"generation":state.snapshot.generation, "ack_seq":acknowledged,
@@ -1215,7 +1229,13 @@ impl Client {
             })
     }
 
-    pub fn answer(&self, response: &crate::protocol::ApprovalResponse) -> crate::Result<()> {
+    /// Hands `response` to the native ask it answers. The receiver turns `true` once the ask's
+    /// settings hook has taken the decision, and closes, unconfirmed, if the decision is
+    /// withdrawn: the ask resolved some other way, or this control detached.
+    pub fn answer(
+        &self,
+        response: &crate::protocol::ApprovalResponse,
+    ) -> crate::Result<tokio::sync::watch::Receiver<bool>> {
         let id = &response.approval_id;
         ensure!(
             !self.hub.closed.load(Ordering::Acquire),
@@ -1251,9 +1271,26 @@ impl Client {
             }
             state.decisions.insert(id.clone(), decision);
         }
-        Ok(())
+        Ok(state
+            .taken
+            .entry(id.clone())
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe())
     }
 }
+
+/// A decision whose own content doesn't fit the ask it answers: answers on an ask that takes none,
+/// or answers that don't match its questions. Nothing was handed over.
+#[derive(Debug)]
+pub(crate) struct MalformedDecision(&'static str);
+
+impl std::fmt::Display for MalformedDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for MalformedDecision {}
 
 fn approval_decision(
     approval: &Value,
@@ -1279,7 +1316,7 @@ fn approval_decision(
         let answers = response
             .answers
             .as_ref()
-            .context("native questions require answers")?;
+            .ok_or(MalformedDecision("native questions require answers"))?;
         ensure!(
             !questions.is_empty()
                 && answers.len() == questions.len()
@@ -1292,7 +1329,7 @@ fn approval_decision(
                                 && (question["multiSelect"] == true || values.len() == 1)
                                 && values.iter().all(|value| !value.trim().is_empty())))
                     ),
-            "answers must match the pending native questions"
+            MalformedDecision("answers must match the pending native questions")
         );
         let mut input = approval["input"].clone();
         input["answers"] = json!(
@@ -1305,9 +1342,17 @@ fn approval_decision(
     } else {
         ensure!(
             response.answers.is_none(),
-            "this native approval does not accept answers"
+            MalformedDecision("this native approval does not accept answers")
         );
     }
+    // The ask's hook decides with this exact check, and refuses what it doesn't hold. A
+    // decision handed over would then count as taken without being applied: what the hook
+    // would refuse is refused here instead, before it is handed over.
+    let hook_payload = json!({"tool_name": approval["tool"], "tool_input": approval["input"]});
+    ensure!(
+        super::permission::permitted(&decision, &hook_payload).is_some(),
+        MalformedDecision("answers must match the pending native questions")
+    );
     Ok(decision)
 }
 
@@ -1318,6 +1363,7 @@ impl Drop for Client {
         // Undispatched commands do not survive detachment and acquire a different supervisor.
         state.operations.retain(|_, operation| operation.claimed);
         state.decisions.clear();
+        state.taken.clear();
         state.events.clear();
     }
 }
@@ -1639,17 +1685,36 @@ mod tests {
                         Some("acceptEdits"),
                         "the module reports no mode, so the hook's report stands"
                     );
-                    client
-                        .answer(&ApprovalResponse {
-                            approval_id: offered["id"].as_str().unwrap().into(),
-                            session_id: session.clone(),
-                            decision: ApprovalDecision::Allow,
-                            scope: ApprovalScope::Once,
-                            message: None,
-                            by: None,
-                            answers: None,
-                        })
-                        .unwrap();
+                    let allow = ApprovalResponse {
+                        approval_id: offered["id"].as_str().unwrap().into(),
+                        session_id: session.clone(),
+                        decision: ApprovalDecision::Allow,
+                        scope: ApprovalScope::Once,
+                        message: None,
+                        by: None,
+                        answers: None,
+                    };
+                    let mut taken = client.answer(&allow).unwrap();
+                    assert!(!*taken.borrow(), "handed over, not yet taken by the hook");
+                    // The same decision again is the same one; a different one is refused.
+                    let mut repeated = client.answer(&allow).unwrap();
+                    let deny = ApprovalResponse {
+                        decision: ApprovalDecision::Deny,
+                        ..allow.clone()
+                    };
+                    assert!(client.answer(&deny).is_err());
+                    let mut answers = allow.clone();
+                    answers.answers = Some(std::collections::BTreeMap::from([(
+                        "Q".to_string(),
+                        vec!["A".to_string()],
+                    )]));
+                    assert!(
+                        client
+                            .answer(&answers)
+                            .unwrap_err()
+                            .is::<MalformedDecision>(),
+                        "answers on an ask that takes none are a malformed decision"
+                    );
                     let decided = loop {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         if hook.is_finished() {
@@ -1657,6 +1722,12 @@ mod tests {
                         }
                     };
                     assert_eq!(decided, Some(json!({"behavior":"allow"})));
+                    // The hook's check-in that returned the decision is the take.
+                    tokio::time::timeout(Duration::from_secs(1), taken.wait_for(|taken| *taken))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(*repeated.borrow_and_update());
                     let reporter = {
                         let registration = registration.clone();
                         std::thread::spawn(move || {
@@ -1916,6 +1987,25 @@ mod tests {
             "One, Two"
         );
         assert!(approval_decision(&json!({"tool":"Bash"}), &response).is_err());
+        // Answers the server's own check passes but the hook would refuse are refused here,
+        // as malformed, before the decision is handed over: a blank choice once joined, too many
+        // choices, and an answer past a native message's bound.
+        for answer in [
+            vec!["A, ".to_owned()],
+            (0..65).map(|choice| format!("choice {choice}")).collect(),
+            vec!["x".repeat(crate::rc::native_inbox::MAX_MESSAGE + 1)],
+        ] {
+            let mut refused = response.clone();
+            refused.answers = Some(std::collections::BTreeMap::from([(
+                "Which labels?".into(),
+                answer,
+            )]));
+            assert!(
+                approval_decision(&approval, &refused)
+                    .unwrap_err()
+                    .is::<MalformedDecision>()
+            );
+        }
         response
             .answers
             .as_mut()
