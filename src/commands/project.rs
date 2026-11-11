@@ -363,6 +363,13 @@ fn members_read(client: &crate::hub::Client, owner: &str) -> Option<bool> {
     client.get_org(owner).ok().map(|org| org.members_read())
 }
 
+/// What a line says about readers when the Hub didn't say who reads `repository`: the command that
+/// shows its visibility. A command, not the Hub page, since some of these lines are hook output,
+/// which can land in a transcript that is published.
+pub(crate) fn visibility_pointer(repository: &str) -> String {
+    format!("`agit repo info {repository}` shows its visibility")
+}
+
 /// Who can read `repository`, as the Hub said; `None` when it has not said its visibility. An
 /// organization's repository can also be granted to people outside it, so they are named beside
 /// its members. A private repository whose owner the Hub didn't place, an organization or the
@@ -1211,7 +1218,7 @@ fn verify(project: &Project) -> Result<Repo> {
 /// Who can read a session that went up as the person's own push, once, while its repository's
 /// automatic upload is off here, in the words a conversation's start uses: the visibility is the
 /// one that push read for its destination, and only the owner's kind and the members' access
-/// come from what the folder recorded. "visibility not confirmed" when the push read none.
+/// come from what the folder recorded. When the push read none, the command that shows it.
 fn published_once_to(project: &Project, visibility: Option<&str>) -> String {
     let audience = recorded_audience(&project.root);
     visibility
@@ -1223,7 +1230,7 @@ fn published_once_to(project: &Project, visibility: Option<&str>) -> String {
                 audience.members_read,
             )
         })
-        .unwrap_or_else(|| "visibility not confirmed".to_owned())
+        .unwrap_or_else(|| visibility_pointer(&project.repository))
 }
 
 fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json::Value> {
