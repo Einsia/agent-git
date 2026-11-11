@@ -15,7 +15,7 @@ pub const KEYS: [(&str, &str); 9] = [
     ),
     (
         "runtime.default",
-        "default runtime: claude-code / codex / opencode",
+        "the runtime new sessions start in: claude-code / codex / opencode",
     ),
     (
         "push.visibility",

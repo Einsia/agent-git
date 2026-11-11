@@ -795,7 +795,10 @@ fn a_cross_runtime_resume_baselines_what_the_live_read_returns() {
     );
 }
 
-/// An existing runtime remains the resume target unless the caller explicitly requests another.
+/// A session reopens in the runtime that recorded it unless the caller asks for another, whether
+/// its runtime session is continued here or opened again from what was saved, and the line before
+/// launch says so. `runtime.default` chooses only where new sessions start: a resume that followed
+/// it would convert this Claude Code session to Codex.
 #[test]
 fn runtime_default_does_not_replace_an_existing_native_session() {
     let lab = Lab::new();
@@ -829,10 +832,109 @@ fn runtime_default_does_not_replace_an_existing_native_session() {
         "{output}"
     );
     assert!(output.contains(SID), "{output}");
+    assert!(
+        output.contains("opens in Claude Code, the runtime its latest turn ran in"),
+        "{output}"
+    );
     let active = active_links_on(&lab, "einsia", "qa", "work");
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].session_id, SID);
     assert_eq!(active[0].source, "claude-code");
+
+    fs::remove_file(
+        lab.agit_home
+            .join("store/claude-code")
+            .join(format!("{SID}.json")),
+    )
+    .unwrap();
+    let reopened = lab
+        .agit(&["resume", "einsia/qa@work", "--no-launch"])
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&reopened.stdout),
+        String::from_utf8_lossy(&reopened.stderr)
+    );
+    assert!(reopened.status.success(), "{output}");
+    assert!(
+        output.contains("opens in Claude Code, the runtime its latest turn ran in"),
+        "{output}"
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(active.len(), 1, "{output}");
+    assert_eq!(active[0].source, "claude-code", "{output}");
+}
+
+/// Run from another worktree of the repository a session last ran in, with no terminal to ask and
+/// no `--cwd`, the session stays where it ran and the line before it says `--cwd .` opens it here.
+/// Opening it in the main checkout without a word left a person committing work there first;
+/// opening it here unasked would move a conversation nobody chose to move.
+#[test]
+fn a_run_from_another_worktree_stays_where_it_ran_and_names_cwd() {
+    let lab = Lab::new();
+    lab.append_turn(SID, 1, "work in the main checkout", "ok");
+    assert!(
+        lab.agit(&["import", "--independent", SID, "--into", "einsia/qa@work"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.invalid",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &lab.home)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&lab.work, &["init", "--quiet"]);
+    git(
+        &lab.work,
+        &["commit", "--quiet", "--allow-empty", "-m", "seed"],
+    );
+    let other = lab.work.parent().unwrap().join("other-worktree");
+    git(
+        &lab.work,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "other",
+            other.to_str().unwrap(),
+        ],
+    );
+    let resumed = lab
+        .agit(&["resume", "einsia/qa@work", "--no-launch", "--yes"])
+        .current_dir(&other)
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(resumed.status.success(), "{output}");
+    assert!(
+        output.contains("where it last ran; `--cwd .` opens it in this worktree"),
+        "{output}"
+    );
+    let active = active_links_on(&lab, "einsia", "qa", "work");
+    assert_eq!(active.len(), 1, "{output}");
+    let cwd = std::path::Path::new(active[0].cwd.as_deref().unwrap());
+    assert_eq!(cwd.canonicalize().unwrap(), lab.work, "{output}");
 }
 
 /// Repeating the same prepare must return the existing runtime id instead of minting another
@@ -875,6 +977,10 @@ fn repeated_no_launch_reuses_the_prepared_session() {
     assert!(second.status.success(), "{output}");
     assert!(
         output.contains("reusing the prepared runtime session"),
+        "{output}"
+    );
+    assert!(
+        output.contains("opens in Codex, where it was last opened"),
         "{output}"
     );
     assert!(output.contains(&prepared), "{output}");
