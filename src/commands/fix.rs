@@ -217,6 +217,15 @@ fn powershell_literal(value: &str) -> String {
 struct State {
     closed: bool,
     actions: Vec<FixCommand>,
+    refusal: Option<serde_json::Value>,
+}
+
+/// What a failed command reports for its reader to act on: the fix commands it registered and,
+/// when it refused for a reason a caller can answer, that refusal.
+#[derive(Default)]
+pub(crate) struct Recovery {
+    pub(crate) fix: Vec<FixCommand>,
+    pub(crate) refusal: Option<serde_json::Value>,
 }
 
 /// An explicit handle for a worker contributing to its caller's recovery report.
@@ -265,6 +274,29 @@ pub fn current_reporter() -> Option<Reporter> {
     CURRENT.with(|slot| slot.borrow().clone())
 }
 
+/// Records why the command refuses, as `{code, text, ...details}`, for `--json`'s `refusal`.
+/// A command refuses once, so the first refusal stands. Codes are an open set: a reader that
+/// doesn't know one shows `text`. Prose and subprocess output never call this.
+pub fn refuse(code: &'static str, text: &str, details: serde_json::Value) {
+    let Some(reporter) = current_reporter() else {
+        return;
+    };
+    let mut refusal = serde_json::json!({"code": code, "text": text});
+    if let serde_json::Value::Object(details) = details {
+        refusal
+            .as_object_mut()
+            .expect("a refusal is an object")
+            .extend(details);
+    }
+    let mut state = reporter
+        .0
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !state.closed && state.refusal.is_none() {
+        state.refusal = Some(refusal);
+    }
+}
+
 /// Prose and subprocess output never call this typed registration path.
 pub fn register(make_action: impl FnOnce() -> Option<FixCommand>) {
     if let Some(reporter) = current_reporter()
@@ -287,6 +319,18 @@ pub fn register_terminal_error(error: &anyhow::Error) {
 
 /// Register only when this response determines the command's final failure, after recovery ends.
 pub fn register_terminal_api_error(error: &anyhow::Error) {
+    if let Some(api) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::hub::client::ApiError>())
+        && api.status == 404
+        && let Some(repository) = api.subject()
+    {
+        refuse(
+            "repository_not_found",
+            &api.to_string(),
+            serde_json::json!({"repository": repository, "hub": api.hub_name()}),
+        );
+    }
     register(|| {
         let api = error
             .chain()
@@ -314,16 +358,23 @@ impl Scope {
         }
     }
 
-    pub(crate) fn finish(self, code: i32) -> Vec<FixCommand> {
+    pub(crate) fn finish(self, code: i32) -> Recovery {
         let mut state = self
             .reporter
             .0
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         state.closed = true;
-        let actions = std::mem::take(&mut state.actions);
+        let recovery = Recovery {
+            fix: std::mem::take(&mut state.actions),
+            refusal: state.refusal.take(),
+        };
         drop(state);
-        if code == 0 { Vec::new() } else { actions }
+        if code == 0 {
+            Recovery::default()
+        } else {
+            recovery
+        }
     }
 }
 
@@ -337,6 +388,7 @@ impl Drop for Scope {
             .unwrap_or_else(|poison| poison.into_inner());
         state.closed = true;
         state.actions.clear();
+        state.refusal = None;
     }
 }
 
@@ -414,16 +466,49 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(first.finish(4), vec![action("first"), action("worker")]);
+        assert_eq!(first.finish(4).fix, vec![action("first"), action("worker")]);
         assert!(current_reporter().is_none());
         let second = Scope::enter();
         worker.run(|| register(|| Some(action("late"))));
         register(|| Some(action("second")));
-        assert_eq!(second.finish(4), vec![action("second")]);
+        assert_eq!(second.finish(4).fix, vec![action("second")]);
         let success = Scope::enter();
         register(|| Some(action("unneeded")));
-        assert!(success.finish(0).is_empty());
+        refuse(
+            "unneeded",
+            "a refusal of a command that succeeded",
+            serde_json::json!({}),
+        );
+        let succeeded = success.finish(0);
+        assert!(succeeded.fix.is_empty() && succeeded.refusal.is_none());
         assert!(current_reporter().is_none());
+    }
+
+    /// A command refuses once: the first refusal stands, with its details beside its code and
+    /// text, and nothing outside an invocation is kept. A later refusal that replaced the first
+    /// would ask the reader a question about something the command never got to.
+    #[test]
+    fn the_first_refusal_stands_with_its_details() {
+        refuse(
+            "outside",
+            "no invocation is listening",
+            serde_json::json!({}),
+        );
+        let scope = Scope::enter();
+        refuse(
+            "folder_bound_elsewhere",
+            "~/app already belongs to alice/other",
+            serde_json::json!({"bound_to": "alice/other"}),
+        );
+        refuse("later", "a later refusal", serde_json::json!({}));
+        assert_eq!(
+            scope.finish(1).refusal,
+            Some(serde_json::json!({
+                "code": "folder_bound_elsewhere",
+                "text": "~/app already belongs to alice/other",
+                "bound_to": "alice/other",
+            }))
+        );
     }
 
     #[test]

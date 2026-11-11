@@ -32,9 +32,27 @@ Every supported command uses the same top-level fields:
   Stdout is not duplicated: it belongs exactly once in `result`.
 - `fix`: alternative typed recovery commands. The CLI reports them without execution;
   see [recovery actions](cli-json-fixes.md).
+- `refusal`: present only when a failed command refused for a reason its reader can answer, as
+  `{code, text}` plus details. A command refuses once. Codes are an open set: a reader that
+  doesn't know one shows `text`. Today's codes:
+  - `folder_bound_elsewhere` (`folder`, `bound_to`, `repository`) and
+    `project_assigned_elsewhere` (`folder`, `assigned_to`, `repository`): the folder already
+    belongs to another repository. `text` is the reason alone ("<folder> already saves to
+    <repository>." or "… already uploads to …"); the terminal also shows the `--rebind` hint.
+    `fix` holds the same bind with `--rebind`.
+  - `commit_auto_off`: saving turns is off, so automatic upload would upload nothing. `fix` holds
+    `agit config commit.auto true`.
+  - `no_capture_runtime`: no installed agent can save its conversations by itself.
+  - `public_consent_required` (`repository`): switching on automatic upload into a public
+    repository needs a yes: at a terminal, from the AgentGit menu bar, or with `--yes`.
+  - `repository_not_found` (`repository`, `hub`): the repository isn't on that Hub, or it's
+    private and this account can't see it; which of the two is never said.
+
+A person's no at a confirmation is not a refusal: the command prints "Cancelled; nothing
+changed." and exits 0.
 
 Use `--json --json-version 1` to retain the legacy envelope and validate it with
-[`cli-json-schema.json`](cli-json-schema.json). That version has no `fix` field.
+[`cli-json-schema.json`](cli-json-schema.json). That version has no `fix` or `refusal` field.
 The original version 1 schema is preserved unchanged.
 
 `result.format=json` preserves an existing structured command value under

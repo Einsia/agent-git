@@ -139,12 +139,12 @@ pub fn run(args: Args) -> CmdResult {
         }
         Action::Remove { id_or_name, yes } => {
             if !yes {
-                match ui::prompt::confirm(
+                match ui::prompt::answer(
                     &format!("Disable registered rule `{id_or_name}`?"),
                     false,
                 )? {
                     Some(true) => {}
-                    Some(false) => return Ok(ExitCode::Ok),
+                    Some(false) => return Err(super::Cancelled.into()),
                     None => {
                         ui::error("non-interactive removal requires `--yes`");
                         return Ok(ExitCode::Interactive);

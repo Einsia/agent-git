@@ -223,6 +223,40 @@ impl std::fmt::Display for InteractionRequired {
 
 impl std::error::Error for InteractionRequired {}
 
+/// The person answered a confirmation with no: nothing changed, and nothing failed. The command
+/// ends with exit 0 and says so; the advice to pass `--yes` is only for a caller nobody could ask.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl Cancelled {
+    pub const MESSAGE: &'static str = "Cancelled; nothing changed.";
+}
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::MESSAGE)
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// A refusal whose next step is a command for someone at a terminal. The message is the reason
+/// alone, so a caller that acts on `--json`'s `refusal` shows a sentence that tells nobody to type
+/// anything; the terminal shows the hint under it.
+#[derive(Debug)]
+pub struct Hinted {
+    pub message: String,
+    pub hint: String,
+}
+
+impl std::fmt::Display for Hinted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Hinted {}
+
 /// Typed failures preserve their category through context; authentication takes precedence.
 pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCode {
     if error.chain().any(|cause| {
@@ -240,6 +274,8 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         ExitCode::Usage
     } else if error.is::<RemoteRequest>() {
         ExitCode::Network
+    } else if error.is::<Cancelled>() {
+        ExitCode::Ok
     } else if error.is::<InteractionRequired>() {
         ExitCode::Interactive
     } else if crate::domain::refs::is_not_found(error) || error.is::<target::MissingLocalRepo>() {

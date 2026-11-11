@@ -1052,10 +1052,11 @@ pub(super) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
             );
         }
     }
-    anyhow::ensure!(
-        !runtimes.is_empty(),
-        "install Claude Code, or Codex with its hooks feature enabled, before enabling automatic project capture; use manual project sync otherwise"
-    );
+    if runtimes.is_empty() {
+        let text = "no agent here can save its conversations by itself: install Claude Code, or turn on Codex's hooks feature; `agit project sync` uploads by hand meanwhile";
+        super::fix::refuse("no_capture_runtime", text, serde_json::json!({}));
+        anyhow::bail!("{text}");
+    }
     Ok(runtimes)
 }
 

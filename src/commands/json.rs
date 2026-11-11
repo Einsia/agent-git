@@ -71,6 +71,10 @@ struct V2Document {
     #[serde(flatten)]
     document: Document,
     fix: Vec<super::fix::FixCommand>,
+    /// Why a failed command refused, when it is a reason the reader can answer
+    /// (see [`super::fix::refuse`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,7 +422,7 @@ fn capture_unix(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32
     let err_thread = thread::spawn(move || read_fd(err_read));
     let scope = (version == Version::V2).then(super::fix::Scope::enter);
     let code = f();
-    let fixes = scope.map(|scope| scope.finish(code)).unwrap_or_default();
+    let recovery = scope.map(|scope| scope.finish(code)).unwrap_or_default();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     redirect(libc::STDOUT_FILENO, saved_out);
@@ -430,7 +434,13 @@ fn capture_unix(command: &str, version: Version, f: impl FnOnce() -> i32) -> i32
 
     let stdout = out_thread.join().unwrap_or_default();
     let stderr = err_thread.join().unwrap_or_default();
-    if emit_version_checked(document(command, code, stdout, stderr), version, fixes).is_err()
+    if emit_version_checked(
+        document(command, code, stdout, stderr),
+        version,
+        recovery.fix,
+        recovery.refusal,
+    )
+    .is_err()
         && code == 0
     {
         crate::ExitCode::Precondition.as_i32()
@@ -521,13 +531,14 @@ fn diagnostics(text: &str) -> Vec<Diagnostic> {
 }
 
 fn emit_version(document: Document, version: Version, fixes: Vec<super::fix::FixCommand>) {
-    let _ = emit_version_checked(document, version, fixes);
+    let _ = emit_version_checked(document, version, fixes, None);
 }
 
 fn emit_version_checked(
     mut document: Document,
     version: Version,
     fixes: Vec<super::fix::FixCommand>,
+    refusal: Option<Value>,
 ) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     // Serialization of these in-memory values cannot fail; if stdout itself
@@ -544,6 +555,7 @@ fn emit_version_checked(
                 &V2Document {
                     document,
                     fix: fixes,
+                    refusal,
                 },
             )?;
         }
@@ -634,7 +646,7 @@ mod tests {
         let scope = super::super::fix::Scope::enter();
         crate::ui::hint("agit login --hub https://example.invalid");
         let _ = diagnostics("  → agit push --force\nerror synthetic failure\n");
-        assert!(scope.finish(4).is_empty());
+        assert!(scope.finish(4).fix.is_empty());
     }
 
     #[test]

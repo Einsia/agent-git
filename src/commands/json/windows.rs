@@ -473,11 +473,11 @@ pub(super) fn capture(command: &str, version: Version, f: impl FnOnce() -> i32) 
     let scope = (version == Version::V2).then(crate::commands::fix::Scope::enter);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     let mut code = result.as_ref().copied().unwrap_or(101);
-    let fixes = if result.is_ok() {
+    let recovery = if result.is_ok() {
         scope.map(|scope| scope.finish(code)).unwrap_or_default()
     } else {
         drop(scope);
-        Vec::new()
+        crate::commands::fix::Recovery::default()
     };
     let (mut out, mut err) = capture.finish();
     if result.is_err() {
@@ -503,7 +503,8 @@ pub(super) fn capture(command: &str, version: Version, f: impl FnOnce() -> i32) 
     if emit_version_checked(
         document(command, code, out.bytes, err.bytes),
         version,
-        fixes,
+        recovery.fix,
+        recovery.refusal,
     )
     .is_err()
         && code == 0

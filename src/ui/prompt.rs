@@ -72,7 +72,9 @@ pub fn select_from(
 /// A yes/no confirmation.
 ///
 /// Non-interactive returns None and **not** the default — a dangerous operation with no one to
-/// ask must refuse to run rather than take the default.
+/// ask must refuse to run rather than take the default. A cancel also returns None, for a caller
+/// whose question has a third answer, "not now", that must leave things as they were; a caller
+/// that only acts on a yes uses [`answer`], so it never tells someone at a terminal to find one.
 ///
 /// The answer is taken on Enter, not on the `y`/`n` keystroke. If a single key answered, the
 /// Enter of a habitual `y⏎` would land on the next question and take its default unseen. Esc or
@@ -120,6 +122,16 @@ pub fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
     let _ = theme.format_confirm_prompt_selection(&mut line, prompt, answer);
     term.write_line(&line)?;
     Ok(answer)
+}
+
+/// [`confirm`] for a question whose only effect is on a yes: `Some(true)` on yes, `Some(false)` on
+/// no or a cancel, and `None` only when nobody could be asked. A person who cancels has answered,
+/// so the caller says nothing changed instead of asking for `--yes` or a terminal.
+pub fn answer(prompt: &str, default: bool) -> Result<Option<bool>> {
+    if !can_ask() || !Term::stderr().is_term() {
+        return Ok(None);
+    }
+    Ok(Some(confirm(prompt, default)? == Some(true)))
 }
 
 #[derive(Debug, PartialEq, Eq)]
