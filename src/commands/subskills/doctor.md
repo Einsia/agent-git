@@ -18,7 +18,7 @@ agit doctor --repair-worktrees <owner/repo>
 |---|---|
 | `--repo <owner/repo>` | Inspect only this local repository and its fully matching adopted-session claims |
 | `--check-backend` | Also check Hub/backend reachability and configuration |
-| `--deep` | Inspect committed session integrity throughout locally reachable history |
+| `--deep` | Also read every session branch's saved LOG and VIEW to check that the VIEW references only events the LOG has, and inspect committed session integrity throughout locally reachable history. Without it doctor reads each branch's metadata and the live transcripts on this computer, compares no VIEW with its LOG, walks no committed history, and says so |
 | `--repair-worktrees <owner/repo>` | Move this repository's worktrees that sit in another repository's place into its own, relinked |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 

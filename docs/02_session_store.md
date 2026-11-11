@@ -808,7 +808,9 @@ pushed must not leave an agent behind on the server.
 
 `agit doctor` runs three checks over every agent repo on this machine, plus one
 aggregated warning about legacy layouts (repos left from before the upgrade are
-gathered into one line instead of flooding the screen one by one):
+gathered into one line instead of flooding the screen one by one). The VIEW check
+(3) reads every branch's LOG and VIEW, so it runs only with `agit doctor --deep`,
+together with the walk over committed history; a plain run says it did not read them:
 
 ```
 === session metadata integrity ===
@@ -883,5 +885,5 @@ agit show <session>                       read a session (saved VIEW by default;
 agit resume <session>                     continue a session (materialize saved VIEW when installation is needed)
 agit clone <owner>/<agent>                fetch a read-only checkout; no runtime installation or launch
 agit clone <owner>/<agent> --mine         make a copy under your name (origin yours, upstream the source)
-agit doctor                               session metadata integrity, live transcript check, VIEW check, runtimes, backend
+agit doctor                               session metadata integrity, live transcript check, runtimes, backend (--deep: VIEW check, committed history)
 ```

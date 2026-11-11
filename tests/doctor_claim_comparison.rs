@@ -566,3 +566,26 @@ fn doctor_handles_later_secret_mappings_and_missing_reconstruction_evidence() {
     .unwrap();
     lab.assert_status("rewritten");
 }
+
+/// Plain `agit doctor` reads each session branch's metadata but not its saved LOG and VIEW: it says
+/// the VIEWs and committed history were not read and names `--deep`, which still compares every
+/// branch's VIEW with its LOG. A plain run that kept reading every LOG and VIEW grows with the
+/// saved conversations; one that dropped the check without saying so reads as "VIEWs verified".
+#[test]
+fn plain_doctor_skips_the_view_check_and_deep_still_checks_every_view() {
+    let lab = Lab::new(false);
+    let plain = lab.run(&["doctor"]);
+    assert!(
+        plain.contains(
+            "session VIEWs and committed history were not read; `agit doctor --deep` checks them"
+        ),
+        "{plain}"
+    );
+    assert!(!plain.contains("reference reachable events"), "{plain}");
+    let deep = lab.run(&["doctor", "--deep"]);
+    assert!(
+        deep.contains("session branches all reference reachable events"),
+        "{deep}"
+    );
+    assert!(!deep.contains("were not read"), "{deep}");
+}
