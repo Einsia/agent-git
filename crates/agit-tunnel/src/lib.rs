@@ -52,11 +52,40 @@ impl Drop for Owner {
     }
 }
 
+/// The WebSocket close code for a service restart: the far end is going away to be replaced, and
+/// nothing failed.
+pub const SERVICE_RESTART: u16 = 1012;
+
+/// The far end closed the connection with [`SERVICE_RESTART`].
+#[derive(Debug)]
+pub struct ServiceRestart;
+
+impl std::fmt::Display for ServiceRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the far end closed the connection to restart")
+    }
+}
+
+impl std::error::Error for ServiceRestart {}
+
+/// Whether `error` comes from a [`ServiceRestart`] close, directly or through the I/O error an
+/// endpoint wrapper reads it as.
+pub fn is_service_restart(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<ServiceRestart>()
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<ServiceRestart>())
+    })
+}
+
 pub struct Connection {
     pub worker_pid: u32,
     pub connect_timing: Option<ConnectTiming>,
     sink: PacketSink,
     source: PacketSource,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Connection {
@@ -67,7 +96,19 @@ impl Connection {
             connect_timing: None,
             sink,
             source,
+            progress: None,
         }
+    }
+
+    /// Counts the bytes an endpoint wrapper has received beneath its packets. A wrapper that
+    /// yields one packet per complete frame still shows a frame arriving slowly through it.
+    pub fn with_progress(mut self, progress: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn progress(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.progress.clone()
     }
 
     /// The controller chooses the executable; credentials travel only over IPC.
@@ -224,6 +265,7 @@ impl Connection {
             connect_timing,
             sink: Box::pin(sink),
             source: Box::pin(source),
+            progress: None,
         })
     }
 

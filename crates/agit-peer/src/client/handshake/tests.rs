@@ -13,7 +13,8 @@ fn connection(outgoing: mpsc::Sender<Packet>, incoming: mpsc::Receiver<Packet>) 
     Connection::from_parts(41, Box::pin(sink), Box::pin(source))
 }
 
-/// ClientHello must precede readiness without consuming the post-pairing TLS allowance.
+/// ClientHello must precede readiness without consuming the post-pairing TLS allowance, and the
+/// joined route reports its receive progress.
 #[tokio::test(start_paused = true)]
 async fn pipelined_tls_preserves_delayed_pairing_and_rejects_another_link() {
     let controller = Identity::generate().unwrap();
@@ -73,10 +74,19 @@ async fn pipelined_tls_preserves_delayed_pairing_and_rejects_another_link() {
         assert!(pairing >= Duration::from_secs(20));
         assert!(pairing < REQUEST_TIMEOUT);
         assert_eq!(left.worker_pid, 41);
-        let (mut sender, _receiver) = left.split();
-        let (_sender, mut receiver) = right.unwrap().split();
+        // The joined route counts what arrives beneath its frames, as an authenticated one does,
+        // so a long frame still arriving keeps the route alive.
+        let progress = left
+            .progress()
+            .expect("a joined route counts its ciphertext");
+        let before = progress.load(std::sync::atomic::Ordering::Relaxed);
+        let (mut sender, mut left_receiver) = left.split();
+        let (mut right_sender, mut receiver) = right.unwrap().split();
         let frame = Packet::Text(serde_json::json!({"private":"payload"}).to_string());
         sender.send(frame.clone()).await.unwrap();
         assert_eq!(receiver.next().await.unwrap().unwrap(), frame);
+        right_sender.send(frame.clone()).await.unwrap();
+        assert_eq!(left_receiver.next().await.unwrap().unwrap(), frame);
+        assert!(progress.load(std::sync::atomic::Ordering::Relaxed) > before);
     }
 }

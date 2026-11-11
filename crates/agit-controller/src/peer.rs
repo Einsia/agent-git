@@ -18,7 +18,67 @@ const HANDSHAKE: Duration = Duration::from_secs(20);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 const DISCOVERY_RETRY: Duration = Duration::from_secs(1);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+/// A route waiting on its health reply is dead once nothing at all has arrived for this long.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+/// A health reply may queue behind a large page on the same stream while bytes keep arriving,
+/// but a device that never answers it within this bound is replaced even while it streams.
+const HEALTH_REPLY_LIMIT: Duration = Duration::from_secs(60);
+
+/// When a route dials again after it ends. A failure backs off by doubling. A relay restart is
+/// expected and brief: routes return at a random moment within a short spread, so the routes the
+/// old relay carried do not all arrive at once, and while the replacement starts they keep trying
+/// on a steady short cadence, so a route is back within one step of the replacement being up
+/// instead of one doubled step. The cadence holds for one window per restart: only a route that
+/// came online again starts another, so a relay that keeps closing with the restart code without
+/// coming up falls back to doubling.
+struct Redial {
+    backoff: Duration,
+    /// When the restart this route is redialing after began; cleared only by a route that came
+    /// online.
+    restarted: Option<tokio::time::Instant>,
+}
+
+impl Redial {
+    const FIRST: Duration = Duration::from_millis(250);
+    const LONGEST: Duration = Duration::from_secs(30);
+    /// The spread the first dial after a relay restart falls in.
+    const RESTART_SPREAD: Duration = Duration::from_secs(5);
+    /// The steady cadence while the replacement starts, plus up to as much again at random.
+    const RESTART_STEP: Duration = Duration::from_secs(2);
+    /// How long after a restart the steady cadence holds before failures double again.
+    const RESTART_WINDOW: Duration = Duration::from_secs(120);
+
+    fn new() -> Self {
+        Self {
+            backoff: Self::FIRST,
+            restarted: None,
+        }
+    }
+
+    fn online(&mut self) {
+        *self = Self::new();
+    }
+
+    /// The wait before the next dial after `error`, given a uniformly random `random`.
+    fn after(&mut self, error: &anyhow::Error, now: tokio::time::Instant, random: u64) -> Duration {
+        let within = |span: Duration| Duration::from_millis(random % span.as_millis() as u64);
+        if agit_tunnel::is_service_restart(error) && self.restarted.is_none() {
+            self.restarted = Some(now);
+            return within(Self::RESTART_SPREAD);
+        }
+        if self
+            .restarted
+            .is_some_and(|at| now.duration_since(at) < Self::RESTART_WINDOW)
+        {
+            return Self::RESTART_STEP + within(Self::RESTART_STEP);
+        }
+        // Jitter spreads retries across daemons without giving transport workers
+        // responsibility for connection policy.
+        let wait = self.backoff + within(self.backoff / 4 + Duration::from_millis(1));
+        self.backoff = (self.backoff * 2).min(Self::LONGEST);
+        wait
+    }
+}
 
 struct Task(tokio::task::JoinHandle<()>);
 impl Drop for Task {
@@ -140,7 +200,7 @@ pub(super) async fn run(
     shared_budget: Option<Arc<tokio::sync::Semaphore>>,
     refusal: Arc<std::sync::OnceLock<Value>>,
 ) {
-    let mut backoff = Duration::from_millis(250);
+    let mut redial = Redial::new();
     loop {
         publish(&status, &events, |s| {
             s.state = State::Connecting;
@@ -162,6 +222,7 @@ pub(super) async fn run(
             Ok(connection) => {
                 let transport_ms = opening.elapsed().as_secs_f64() * 1000.0;
                 let pid = connection.worker_pid;
+                let progress = connection.progress();
                 let (mut sink, mut source) = connection.split();
                 let describing = std::time::Instant::now();
                 let description = {
@@ -217,10 +278,11 @@ pub(super) async fn run(
                             s.worker_pid = Some(pid);
                             s.error = None;
                         });
-                        backoff = Duration::from_millis(250);
+                        redial.online();
                         online(
                             sink,
                             source,
+                            progress,
                             &mut requests,
                             &status,
                             &events,
@@ -252,20 +314,27 @@ pub(super) async fn run(
             });
             return;
         }
+        let random = u64::from_be_bytes(
+            uuid::Uuid::new_v4().as_bytes()[..8]
+                .try_into()
+                .unwrap_or_default(),
+        );
+        let wait = match &result {
+            Err(error) => redial.after(error, tokio::time::Instant::now(), random),
+            Ok(()) => {
+                redial.online();
+                Redial::FIRST
+            }
+        };
         let pause = refused
             .and_then(|refused| refused.retry_after)
-            .map_or(backoff, |retry_after| retry_after.max(backoff));
+            .map_or(wait, |retry_after| retry_after.max(wait));
         publish(&status, &events, |s| {
             s.state = State::Backoff;
             s.worker_pid = None;
             s.error = result.err().map(|e| e.to_string());
         });
-        // Jitter spreads retries across daemons without giving transport workers
-        // responsibility for connection policy.
-        let jitter = u128::from(uuid::Uuid::new_v4().as_bytes()[0]);
-        let pause = tokio::time::sleep(
-            pause + Duration::from_millis((pause.as_millis() * jitter / 1024) as u64),
-        );
+        let pause = tokio::time::sleep(pause);
         tokio::pin!(pause);
         loop {
             tokio::select! {
@@ -276,7 +345,6 @@ pub(super) async fn run(
                 },
             }
         }
-        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -358,6 +426,9 @@ fn decode(packet: Packet) -> anyhow::Result<Option<Value>> {
             Ok(Some(frame))
         }
         Packet::Ping(_) | Packet::Pong(_) => Ok(None),
+        Packet::Close(Some(close)) if close.code == agit_tunnel::SERVICE_RESTART => {
+            Err(agit_tunnel::ServiceRestart.into())
+        }
         _ => anyhow::bail!("peer closed or sent a non-RPC packet"),
     }
 }
@@ -365,6 +436,7 @@ fn decode(packet: Packet) -> anyhow::Result<Option<Value>> {
 async fn online(
     mut sink: PacketSink,
     mut source: PacketSource,
+    progress: Option<Arc<std::sync::atomic::AtomicU64>>,
     requests: &mut mpsc::Receiver<Request>,
     status: &watch::Sender<Status>,
     events: &broadcast::Sender<Event>,
@@ -404,7 +476,14 @@ async fn online(
     let mut health = tokio::time::interval(HEALTH_INTERVAL);
     health.tick().await;
     let mut expiration = tokio::time::interval(Duration::from_millis(50));
+    // The health request's id and when it was queued.
     let mut health_request: Option<(String, tokio::time::Instant)> = None;
+    // Bytes arriving count as liveness even while a frame is incomplete: a wrapper that yields
+    // whole frames shows a large one only once it has all arrived.
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut received = progress
+        .as_ref()
+        .map(|progress| progress.load(Ordering::Relaxed));
     let result = async {
         loop {
             tokio::select! {
@@ -431,6 +510,7 @@ async fn online(
                 }
                 packet = source.next() => {
                     let packet = packet.context("peer disconnected")??;
+                    last_inbound = tokio::time::Instant::now();
                     let bytes = packet.len().max(1) as u32;
                     let Some(frame) = decode(packet)? else { continue };
                     if let Some(id) = frame.get("id") {
@@ -457,6 +537,13 @@ async fn online(
                 _ = &mut failure => anyhow::bail!("tunnel could not confirm a write"),
                 _ = expiration.tick() => {
                     let now = tokio::time::Instant::now();
+                    if let Some(progress) = &progress {
+                        let count = progress.load(Ordering::Relaxed);
+                        if received != Some(count) {
+                            received = Some(count);
+                            last_inbound = now;
+                        }
+                    }
                     let expired = pending.iter().filter(|(_, request)| request.deadline <= now).map(|(id, _)| id.clone()).collect::<Vec<_>>();
                     for id in expired {
                         if let Some(request) = pending.remove(&id) {
@@ -465,15 +552,18 @@ async fn online(
                             request.fail(outcome, "peer request timed out; inspect the operation before retrying");
                         }
                     }
-                    if health_request.as_ref().is_some_and(|(_, deadline)| *deadline <= now) {
+                    if health_request.as_ref().is_some_and(|(_, sent)| {
+                        now >= last_inbound.max(*sent) + HEALTH_TIMEOUT || now >= *sent + HEALTH_REPLY_LIMIT
+                    }) {
                         anyhow::bail!("peer health check timed out");
                     }
                 }
                 _ = health.tick(), if health_request.is_none() => {
                     let id = uuid::Uuid::new_v4().to_string();
                     let frame = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"machine.describe","params":{}});
-                    writes.try_send(Write { packet: Packet::Text(frame.to_string()), deadline: tokio::time::Instant::now() + HEALTH_TIMEOUT, delivery: Arc::new(AtomicU8::new(QUEUED)), _budget: None }).map_err(|_| anyhow::anyhow!("peer health queue is unavailable"))?;
-                    health_request = Some((id, tokio::time::Instant::now() + HEALTH_TIMEOUT));
+                    let sent = tokio::time::Instant::now();
+                    writes.try_send(Write { packet: Packet::Text(frame.to_string()), deadline: sent + HEALTH_REPLY_LIMIT, delivery: Arc::new(AtomicU8::new(QUEUED)), _budget: None }).map_err(|_| anyhow::anyhow!("peer health queue is unavailable"))?;
+                    health_request = Some((id, sent));
                 }
             }
         }
@@ -525,6 +615,7 @@ mod tests {
             let error = online(
                 Box::pin(sink),
                 Box::pin(source),
+                None,
                 &mut requests,
                 &status,
                 &events,
@@ -547,6 +638,143 @@ mod tests {
         drop(first);
         assert_eq!(budget.available_permits(), packet.len());
         assert!(matches!(send().await.0, Some(Event::Frame { .. })));
+    }
+
+    // Only a service-restart close reads as a relay restart. After one, a route comes back within
+    // the spread and then on the steady cadence while the replacement starts, and doubles again
+    // after the window; only a route that came online renews the window. Reading every close as a
+    // restart would hammer a Hub that is refusing the route, reading none would put every
+    // release's routes on the doubling backoff, and renewing the window on every restart close
+    // would keep a relay that never comes up on the short cadence forever.
+    #[test]
+    fn a_relay_restart_redials_within_the_spread_then_steadily_and_only_once_per_online_route() {
+        use agit_tunnel::protocol::Close;
+        let close = |code| {
+            Packet::Close(Some(Close {
+                code,
+                reason: String::new(),
+            }))
+        };
+        let restart = decode(close(agit_tunnel::SERVICE_RESTART)).unwrap_err();
+        assert!(agit_tunnel::is_service_restart(&restart));
+        for code in [1000, 1011] {
+            assert!(!agit_tunnel::is_service_restart(
+                &decode(close(code)).unwrap_err()
+            ));
+        }
+        let other = anyhow::anyhow!("relay refused the connection");
+        let start = tokio::time::Instant::now();
+        let mut redial = Redial::new();
+        for random in [0, 4_999, u64::MAX] {
+            let mut fresh = Redial::new();
+            assert!(fresh.after(&restart, start, random) < Redial::RESTART_SPREAD);
+        }
+        assert!(redial.after(&restart, start, u64::MAX) < Redial::RESTART_SPREAD);
+        let mut now = start;
+        for random in [0, u64::MAX, 7] {
+            now += Duration::from_secs(10);
+            let wait = redial.after(&other, now, random);
+            assert!(wait >= Redial::RESTART_STEP && wait < Redial::RESTART_STEP * 2);
+        }
+        let again = redial.after(&restart, now, 0);
+        assert!(
+            again >= Redial::RESTART_STEP,
+            "a second restart close renews nothing"
+        );
+        now = start + Redial::RESTART_WINDOW;
+        let doubled = [0, 0, 0].map(|random| redial.after(&other, now, random));
+        assert_eq!(
+            doubled,
+            [Redial::FIRST, Redial::FIRST * 2, Redial::FIRST * 4]
+        );
+        redial.online();
+        assert!(redial.after(&restart, now, 0) < Redial::RESTART_SPREAD);
+        let mut ordinary = Redial::new();
+        assert_eq!(ordinary.after(&other, start, 0), Redial::FIRST);
+        assert_eq!(ordinary.after(&other, start, 0), Redial::FIRST * 2);
+    }
+
+    // A route is alive while bytes arrive, including bytes of a frame still arriving: an encrypted
+    // route yields one packet per complete frame, so a large page arriving slowly shows only as
+    // progress beneath it, and the health reply queues behind it. Failing at the first late reply
+    // would replace a busy route mid-page, never failing while bytes arrive would keep a device
+    // that stopped answering RPCs, and failing only at the reply limit would keep a silent route
+    // long after its far side went away.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_route_outlives_a_late_health_reply_but_not_silence_or_the_reply_limit() {
+        let description = serde_json::json!({"machine":{"machine_fingerprint":"device"}});
+        let start = || {
+            let (written, health) = mpsc::unbounded_channel::<String>();
+            let sink = futures_util::sink::unfold(written, |written, packet: Packet| async move {
+                if let Packet::Text(text) = packet {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["method"] == "machine.describe" {
+                        let _ = written.send(frame["id"].as_str().unwrap().to_owned());
+                    }
+                }
+                Ok::<_, anyhow::Error>(written)
+            });
+            let (inbound, receiver) = mpsc::channel::<Packet>(16);
+            let source = futures_util::stream::unfold(receiver, |mut receiver| async move {
+                receiver.recv().await.map(|packet| (Ok(packet), receiver))
+            });
+            let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (status, _) = watch::channel(Status {
+                peer_id: "peer".into(),
+                route_id: "route".into(),
+                generation: 1,
+                state: State::Online,
+                description: Some(description.clone()),
+                worker_pid: None,
+                error: None,
+            });
+            let counted = progress.clone();
+            let route = tokio::spawn(async move {
+                let (_requests, mut queued) = mpsc::channel(1);
+                let (events, _) = broadcast::channel(16);
+                online(
+                    Box::pin(sink),
+                    Box::pin(source),
+                    Some(counted),
+                    &mut queued,
+                    &status,
+                    &events,
+                    None,
+                )
+                .await
+            });
+            (route, health, inbound, progress)
+        };
+        // One frame's bytes arriving a chunk a second, with no complete frame among them.
+        let arriving = |progress: Arc<std::sync::atomic::AtomicU64>, seconds: u64| async move {
+            for _ in 0..seconds {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                progress.fetch_add(64 * 1024, Ordering::Relaxed);
+            }
+        };
+        let timed_out = |result: anyhow::Result<()>| {
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("peer health check timed out")
+        };
+
+        let (route, mut health, inbound, progress) = start();
+        let late = health.recv().await.unwrap();
+        arriving(progress.clone(), HEALTH_TIMEOUT.as_secs() * 2).await;
+        assert!(!route.is_finished());
+        let reply = serde_json::json!({"jsonrpc":"2.0","id":late,"result":description});
+        inbound.send(Packet::Text(reply.to_string())).await.unwrap();
+        health.recv().await.unwrap();
+        arriving(progress.clone(), HEALTH_REPLY_LIMIT.as_secs() + 1).await;
+        assert!(route.is_finished());
+        assert!(timed_out(route.await.unwrap()));
+
+        let (route, mut health, _inbound, _progress) = start();
+        health.recv().await.unwrap();
+        tokio::time::sleep(HEALTH_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(route.is_finished());
+        assert!(timed_out(route.await.unwrap()));
     }
 
     #[tokio::test]
@@ -589,6 +817,7 @@ mod tests {
             online(
                 Box::pin(sink),
                 Box::pin(source),
+                None,
                 &mut queued,
                 &status,
                 &events,

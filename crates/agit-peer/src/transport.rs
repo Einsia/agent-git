@@ -22,6 +22,10 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ByteStream {
     stream: DuplexStream,
     failure: Arc<Mutex<Option<String>>>,
+    /// The far end closed with a service restart; the reader sees that instead of a clean end.
+    restarting: Arc<std::sync::atomic::AtomicBool>,
+    /// Ciphertext bytes received so far, which move while a large frame is still arriving.
+    received: Arc<std::sync::atomic::AtomicU64>,
     tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -41,6 +45,9 @@ impl ByteStream {
         let (controls, mut pending) = mpsc::channel(4);
         let failure = Arc::new(Mutex::new(None));
         let closed_with = failure.clone();
+        let restarting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (restart, counted) = (restarting.clone(), received.clone());
         let task = tokio::spawn(async move {
             let sending = async {
                 let mut bytes = vec![0; CHUNK_SIZE];
@@ -64,6 +71,10 @@ impl ByteStream {
                                 bytes.len() <= CHUNK_SIZE,
                                 "peer tunnel chunk exceeds its size limit"
                             );
+                            counted.fetch_add(
+                                bytes.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             tokio::time::timeout(IO_TIMEOUT, output.write_all(&bytes)).await??;
                         }
                         Packet::Ping(bytes) => {
@@ -72,6 +83,12 @@ impl ByteStream {
                                 .context("peer heartbeat queue is full")?;
                         }
                         Packet::Pong(_) => {}
+                        Packet::Close(Some(close))
+                            if close.code == agit_tunnel::SERVICE_RESTART =>
+                        {
+                            restart.store(true, std::sync::atomic::Ordering::Release);
+                            return Ok(());
+                        }
                         Packet::Close(_) => return Ok(()),
                         _ => anyhow::bail!("peer tunnel accepts encrypted binary data only"),
                     }
@@ -94,8 +111,15 @@ impl ByteStream {
         Self {
             stream,
             failure,
+            restarting,
+            received,
             tasks: vec![task],
         }
+    }
+
+    /// Ciphertext bytes received so far.
+    pub fn received(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.received.clone()
     }
 }
 
@@ -110,15 +134,21 @@ impl AsyncRead for ByteStream {
         }
         let filled = buffer.filled().len();
         let result = Pin::new(&mut self.stream).poll_read(context, buffer);
-        if matches!(result, Poll::Ready(Ok(())))
-            && buffer.filled().len() == filled
-            && let Some(message) = self
+        if matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == filled {
+            if self.restarting.load(std::sync::atomic::Ordering::Acquire) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    agit_tunnel::ServiceRestart,
+                )));
+            }
+            if let Some(message) = self
                 .failure
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-        {
-            return Poll::Ready(Err(std::io::Error::other(message.clone())));
+            {
+                return Poll::Ready(Err(std::io::Error::other(message.clone())));
+            }
         }
         result
     }
@@ -160,11 +190,12 @@ pub async fn authenticate(
 ) -> anyhow::Result<Connection> {
     let pid = connection.worker_pid;
     let stream = ByteStream::new(connection);
+    let received = stream.received();
     let stream = match role {
         Role::Controller => tokio_rustls::TlsStream::Client(identity.connect(peer, stream).await?),
         Role::Executor => tokio_rustls::TlsStream::Server(identity.accept(peer, stream).await?),
     };
-    Ok(framed(pid, stream))
+    Ok(framed(pid, stream).with_progress(received))
 }
 
 pub fn framed<S>(worker_pid: u32, stream: S) -> Connection
