@@ -595,6 +595,31 @@ fn order(links: &mut Vec<link::Link>, cwd: &std::path::Path) -> usize {
     leading
 }
 
+/// The one saved conversation that ran in `cwd`'s folder, as its repository and branch: what a
+/// command that needs a target can name when nothing selected one. `None` when none or several
+/// did, or when the inventory is incomplete (an unreadable record or an exhausted budget may hide a
+/// second one); it never selects a target itself.
+pub(crate) fn folder_saved_session(cwd: &std::path::Path) -> Option<(String, String)> {
+    let folder = super::front::folder(cwd).ok()?;
+    let ClaimInventory { links, issues, .. } = claim_inventory(config::store_root().ok()?);
+    if !issues.is_empty() {
+        return None;
+    }
+    let saved: BTreeSet<(String, String)> = links
+        .iter()
+        .filter(|link| link.is_active() && ran_in(link, &folder))
+        .filter_map(|link| {
+            Some((
+                format!("{}/{}", link.owner.as_deref()?, link.agent.as_deref()?),
+                link.branch.clone()?,
+            ))
+        })
+        .collect();
+    let mut saved = saved.into_iter();
+    let one = saved.next()?;
+    saved.next().is_none().then_some(one)
+}
+
 /// [`order`], then the claims `scope` covers ahead of the rest, each part in that order. Returns
 /// how many of the current folder's claims lead and how many claims the scope covers: the
 /// folder's covered claims come first, so an index below the first count is in the folder.
@@ -969,7 +994,7 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "worktree": super::project::worktree_notice(&cwd),
         // Uploading the sessions from before is the person's choice: the agent asks.
-        "earlier_sessions_not_uploaded": earlier.map(|count| serde_json::json!({
+        "earlier_sessions_not_uploaded": earlier.filter(|count| *count > 0).map(|count| serde_json::json!({
             "count": count,
             "ask_user": super::front::earlier_note(count, "here", super::front::Reader::Agent),
         })),

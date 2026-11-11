@@ -639,6 +639,15 @@ fn ctx_repo(
     } else {
         super::context::resolve(cwd).map(|c| (super::context::qualify(&c.repo), Some(c.branch)))
     };
+    // The repository-level views read the repository the folder's project saves into where no
+    // binding of the folder names one: a git worktree's is its main checkout's, as `agit status`
+    // says.
+    let resolved = match resolved {
+        Err(error) if explicit_target => super::project::covering_repository(cwd)
+            .map(|slug| (super::context::qualify(&slug), None))
+            .ok_or(error),
+        resolved => resolved,
+    };
     match resolved {
         Ok((slug, branch)) => {
             let (o, n) = super::parse_slug(&slug).ok()?;
@@ -647,6 +656,11 @@ fn ctx_repo(
         }
         Err(e) => {
             ui::error(&format!("{e:#}"));
+            if let Some((slug, branch)) = super::status::folder_saved_session(cwd) {
+                ui::hint(&format!(
+                    "the conversation saved from this folder: `agit log {slug}@{branch}`"
+                ));
+            }
             ui::hint("or name it: `agit log <owner/repo>` or `agit log <ref>`");
             None
         }
