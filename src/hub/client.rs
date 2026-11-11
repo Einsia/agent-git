@@ -1296,6 +1296,11 @@ impl Client {
         )
     }
 
+    /// How many sessions `owner/name` holds, by who started them.
+    pub fn session_authors(&self, owner: &str, name: &str) -> Result<super::SessionAuthors> {
+        self.get(&format!("api/agents/{owner}/{name}/sessions/authors"))
+    }
+
     /// Record that this process starts work from a session: `receipt` names the repository,
     /// the source session and commit, and whether the work continues that line or forks it.
     /// The Hub decides whether the caller reuses someone else's session.

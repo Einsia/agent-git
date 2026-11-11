@@ -54,6 +54,8 @@ the conversation, its folder's destination and the account by itself, so do not 
   Follow that step or report it to the user.
 - Uploads go to a private destination. A destination is public only when the user names it with
   `--repo OWNER/NAME --public`.
+- Create a session link, invite link or read-only copy only when the person asks for one; never
+  create one on your own to finish a task.
 - In a folder that is on, never run `agit commit` or `agit push` for its conversations.
 
 The rest of this guide covers explicit and advanced operations, and runtimes other than Claude

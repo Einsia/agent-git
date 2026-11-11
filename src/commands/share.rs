@@ -227,7 +227,7 @@ pub fn run(mut args: Args) -> CmdResult {
         resp.slug
     );
 
-    ui::success("share created");
+    ui::success("read-only copy created");
     crate::telemetry::activation::reached(
         crate::telemetry::activation::Milestone::FirstShare,
         client.base(),

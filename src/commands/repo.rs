@@ -96,8 +96,8 @@ impl InviteRole {
 
     fn grants(self) -> &'static str {
         match self {
-            Self::Read => "clone and pull",
-            Self::Write => "clone, pull and push",
+            Self::Read => "read and clone this repository and its sessions",
+            Self::Write => "read, clone and push changes to this repository",
             Self::Owner => "full control, including settings and invite links",
         }
     }
@@ -976,6 +976,59 @@ fn landing_session(
 
 /// An invite link is a governance write like adding a collaborator: it is fenced by the local
 /// pin, never by a live lookup of the name.
+/// The sessions a link opens, by count: every one in the repository, how many other members (or
+/// nobody on record) started, and whether the listing reached them all.
+struct Reach {
+    total: u64,
+    others: u64,
+    complete: bool,
+}
+
+impl Reach {
+    fn of(authors: &crate::hub::SessionAuthors, me: Option<&str>) -> Self {
+        let total = authors
+            .authors
+            .iter()
+            .map(|author| author.count)
+            .sum::<u64>()
+            + authors.unattributed;
+        let mine: u64 = authors
+            .authors
+            .iter()
+            .filter(|author| Some(author.username.as_str()) == me)
+            .map(|author| author.count)
+            .sum();
+        Self {
+            total,
+            others: total.saturating_sub(mine),
+            complete: !authors.truncated,
+        }
+    }
+}
+
+/// What a link opens, in the words the Hub's share dialog uses: every session in the repository,
+/// counted, with how many are other members', and any added later. Without counts it still says
+/// that other members' sessions are included, which is what a reader could not otherwise know.
+fn opens(slug: &str, reach: Option<&Reach>, session: bool) -> String {
+    let first = if session { "; this session first" } else { "" };
+    let Some(reach) = reach else {
+        return format!(
+            "every session in {slug}, including other members' sessions and any added later{first}"
+        );
+    };
+    let now = if reach.complete {
+        format!("{} now", reach.total)
+    } else {
+        format!("at least {} now", reach.total)
+    };
+    let others = match reach.others {
+        0 => String::new(),
+        1 => ", including 1 by another member".to_owned(),
+        others => format!(", including {others} by other members"),
+    };
+    format!("every session in {slug} ({now}{others}, and any added later){first}")
+}
+
 fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
     let raw = match (branch, raw.trim().contains('@')) {
         (Some(_), true) => {
@@ -1026,6 +1079,11 @@ fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
         },
     };
     let settings = format!("{hub}/@{slug}/settings");
+    // Read before anything is minted, so what the link opens is said as counted.
+    let reach = client
+        .session_authors(owner, name)
+        .ok()
+        .map(|authors| Reach::of(&authors, client.credential_username().as_deref()));
 
     let created = match client.create_invitation(
         owner,
@@ -1093,6 +1151,12 @@ fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
             "created_at": created.invitation.created_at,
             "expires_at": null,
             "settings_url": settings,
+            "kind": if session.is_some() { "session_link" } else { "invite_link" },
+            "scope": reach.as_ref().map(|reach| serde_json::json!({
+                "sessions": reach.total,
+                "others": reach.others,
+                "complete": reach.complete,
+            })),
         });
         if let (Some((branch, id)), Some(session_url)) = (&session, &session_url) {
             value["branch"] = serde_json::json!(branch);
@@ -1103,24 +1167,27 @@ fn invite(raw: &str, branch: Option<&str>, role: InviteRole) -> CmdResult {
         return Ok(ExitCode::Ok);
     }
 
+    let kind = if session.is_some() {
+        "session link"
+    } else {
+        "invite link"
+    };
     ui::success(&format!(
-        "invite link created for {}",
+        "{kind} created for {}",
         match &session {
             Some((branch, _)) => format!("{slug}@{branch}"),
             None => slug.clone(),
         }
     ));
-    let mut rows = vec![
-        ("invite link", ui::accent(&url)),
-        ("repository", slug.clone()),
-    ];
+    let mut rows = vec![(kind, ui::accent(&url)), ("repository", slug.clone())];
     if let Some(session_url) = &session_url {
         rows.push(("session", session_url.clone()));
     }
     rows.push(("role", format!("{} ({})", role.as_str(), role.grants())));
+    rows.push(("opens", opens(&slug, reach.as_ref(), session.is_some())));
     rows.push((
         "expires",
-        "never; anyone holding the link can accept it until it is revoked".into(),
+        "never; anyone holding the link can join until you revoke it, and people who joined keep access until you remove them".into(),
     ));
     print!("{}", ui::table::key_values(&rows));
     if role == InviteRole::Owner {
@@ -1387,6 +1454,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// A link says what it opens in the Hub share dialog's words: every session, counted, how many
+    /// are other members' (nobody on record counts as someone else), "and any added later", and,
+    /// without counts, that other members' sessions are included. A sentence that dropped any of
+    /// these would describe a narrower link than the one it hands out.
+    #[test]
+    fn a_link_says_what_it_opens_in_the_share_dialogs_words() {
+        let reach = |total, others, complete| Reach {
+            total,
+            others,
+            complete,
+        };
+        assert_eq!(
+            opens("o/r", Some(&reach(7, 0, true)), true),
+            "every session in o/r (7 now, and any added later); this session first"
+        );
+        assert_eq!(
+            opens("o/r", Some(&reach(7, 1, true)), false),
+            "every session in o/r (7 now, including 1 by another member, and any added later)"
+        );
+        assert_eq!(
+            opens("o/r", Some(&reach(7, 3, false)), true),
+            "every session in o/r (at least 7 now, including 3 by other members, and any added later); this session first"
+        );
+        assert_eq!(
+            opens("o/r", None, true),
+            "every session in o/r, including other members' sessions and any added later; this session first"
+        );
+        let authors = crate::hub::SessionAuthors {
+            authors: vec![
+                crate::hub::SessionAuthor {
+                    username: "me".into(),
+                    count: 4,
+                },
+                crate::hub::SessionAuthor {
+                    username: "bob".into(),
+                    count: 2,
+                },
+            ],
+            unattributed: 1,
+            truncated: false,
+        };
+        let counted = Reach::of(&authors, Some("me"));
+        assert_eq!(
+            (counted.total, counted.others, counted.complete),
+            (7, 3, true)
+        );
+    }
 
     /// The role defaults to read and accepts only the hub's roles; the target keeps a branch
     /// with slashes whole and refuses an empty one instead of widening it to the repository.

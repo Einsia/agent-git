@@ -26,7 +26,7 @@ agit repo <subcommand>
 | `collab add <repo> <user> [--role read|write]` | Add a collaborator | Default role `read` |
 | `collab rm <repo> <user>` | Remove a collaborator | — |
 | `collab list <repo>` | List collaborators | — |
-| `invite <repo>[@<branch>] [-b <branch>] [--role read|write|owner]` | Print an invite link; with `@<branch>` (or `-b <branch>`) the invitee lands on that branch's session after accepting | Default role `read`; owners only; `@` selects the session in `AGIT_SESSION` |
+| `invite <repo>[@<branch>] [-b <branch>] [--role read|write|owner]` | Print an invite link; with `@<branch>` (or `-b <branch>`) it is a session link, and the invitee lands on that branch's session after accepting. It says what the link opens first | Default role `read`; owners only; `@` selects the session in `AGIT_SESSION` |
 | `rename <repo> <new-name>` | Rename a remote repo, and move the local checkout and its worktrees to the new name | A worktree that can't move stops it before the Hub is asked |
 | `delete <repo>` | Delete a remote repo | `--local` deletes only the local copy |
 | `path [repo]` | Print the main checkout for a bare repo, or `<owner/repo>@<branch>` for that session branch's worktree (created on demand); `@` selects the branch supplied through `AGIT_SESSION` | An omitted repo requires `AGIT_SESSION` and returns its main checkout |
@@ -62,6 +62,8 @@ For encrypted sessions, original access also requires membership and an entitlem
 snapshot. Enable encryption before registration with `agit privacy mode OWNER/REPO@BRANCH encrypted`.
 
 ## Invite links
+
+Create a session link, invite link or read-only copy only when the person asks for one; never create one on your own to finish a task.
 
 `repo invite` needs the identity-pinned local checkout that `clone`, `repo create` or the first `push` leaves behind, and only an owner of the repository can create a link. The link does not expire and can be used more than once; whoever opens it and signs in joins with the chosen role. List and revoke links in the repository's settings page on the Hub (Invite by link). `--json` returns `url`, `role`, `repository`, `invitation_id` and `settings_url`.
 
