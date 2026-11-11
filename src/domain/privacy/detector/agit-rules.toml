@@ -30,7 +30,8 @@ keywords = ["agit_su_", "agit_wh_"]
 
 # A bearer credential wherever it is written: a configuration file's headers, a log line, a
 # pasted request. gitleaks recognises one only inside `curl -H`. The capture group frames the
-# credential, so the scheme name stays readable.
+# credential, so the scheme name stays readable. A sentence's period the value ends with counts
+# toward its length, and the scanner leaves that period outside the replacement.
 [[rules]]
 id = "agit-bearer-token"
 description = "bearer credential in an authorization value"

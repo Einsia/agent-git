@@ -323,6 +323,13 @@ pub(crate) fn raw_hits_capped_in(
                     if !rule.accepts(secret, whole.as_str(), line) {
                         continue;
                     }
+                    // A bearer credential is weighed with a sentence's period counted, as its
+                    // rule matches it, but the period itself stays outside the replacement.
+                    let e = if rule.id == "agit-bearer-token" {
+                        e - usize::from(secret.ends_with('.'))
+                    } else {
+                        e
+                    };
                     let e = token_run_end(view, e);
                     let secret = &view[s..e];
                     if !keep(secret, s) {

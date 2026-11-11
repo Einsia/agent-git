@@ -571,4 +571,39 @@ mod tests {
         assert_eq!(blocked.findings.len(), 1);
         assert_eq!(blocked.findings[0].source, Source::RepositoryUser);
     }
+
+    /// A bearer credential that ends a sentence is replaced up to its last character, and the
+    /// sentence keeps its period; one whose dots are inside it, as a JSON Web Token's are, is
+    /// replaced whole. Whether a value is a credential is still decided with the period counted:
+    /// 23 characters and a period make the 24 the rule asks for, so that value is replaced too.
+    /// A rule that let the value end in a period takes the sentence's period with it; one that
+    /// counted only up to the last character would leave the 23-character credential in the clear.
+    #[test]
+    fn a_bearer_credential_ending_a_sentence_leaves_its_period() {
+        let token = "u7JmQ3pV9cL2xR8hF4aN6wK1sD5bG0tY";
+        let jwt = "eW91LmNhbm5vdC5ndWVzcy50aGlzLjIwMjYtMTAtMjY.Zk9q3vR";
+        let shortest = "u7JmQ3pV9cL2xR8hF4aN6wK";
+        let policy = Snapshot::compile(&[], &[], false).unwrap();
+        for (credential, after) in [
+            (token, ". Please check the header."),
+            (jwt, "."),
+            (shortest, "."),
+        ] {
+            let text = format!("My request uses Authorization: Bearer {credential}{after}");
+            let batch = policy.scan(&text, 64);
+            let start = text.find(credential).unwrap();
+            assert!(
+                batch
+                    .findings
+                    .iter()
+                    .any(|hit| hit.start == start && hit.end == start + credential.len()),
+                "{text}: {:?}",
+                batch
+                    .findings
+                    .iter()
+                    .map(|hit| (hit.rule, hit.start, hit.end))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }
