@@ -87,6 +87,110 @@ pub enum Reason {
     UnheldPlaceholders,
 }
 
+/// Which way a check ended with [`Reason::ProtocolError`]. It holds sizes and kinds only, never
+/// any of the text being checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum ProtocolCause {
+    /// The worker's reply could not be read.
+    UnreadableReply { bytes: usize, shape: ReplyShape },
+    /// The check stopped unexpectedly inside this process.
+    CheckStopped,
+    /// Two field names in one object became the same once protected, so the object can't keep
+    /// both.
+    NamesCollided,
+}
+
+/// What a worker reply that could not be read looked like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyShape {
+    /// No reply arrived: the worker closed its output or stopped.
+    Missing,
+    /// The reply is not JSON; `column` is where reading it stopped.
+    NotJson { column: usize },
+    /// The reply is JSON of this kind, but not a reply the check understands.
+    Unexpected { kind: JsonKind, column: usize },
+    /// The reply is larger than a reply may be.
+    OverBudget,
+    /// The reply parsed, but disagrees with the request or an earlier part of the same reply.
+    Inconsistent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonKind {
+    Object,
+    Array,
+    String,
+    Number,
+    Bool,
+    Null,
+}
+
+impl ReplyShape {
+    /// The shape of `reply`, which failed to parse as a worker reply with `error`.
+    pub fn of(reply: &[u8], error: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        let column = error.column();
+        match error.classify() {
+            Category::Io => Self::Missing,
+            Category::Syntax | Category::Eof => Self::NotJson { column },
+            Category::Data => {
+                let kind = match serde_json::from_slice::<Value>(reply) {
+                    Ok(Value::Object(_)) => JsonKind::Object,
+                    Ok(Value::Array(_)) => JsonKind::Array,
+                    Ok(Value::String(_)) => JsonKind::String,
+                    Ok(Value::Number(_)) => JsonKind::Number,
+                    Ok(Value::Bool(_)) => JsonKind::Bool,
+                    Ok(Value::Null) | Err(_) => JsonKind::Null,
+                };
+                Self::Unexpected { kind, column }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnreadableReply { bytes, shape } => {
+                let shape = match shape {
+                    ReplyShape::Missing => "no reply arrived".to_owned(),
+                    ReplyShape::NotJson { column } => {
+                        format!("not JSON, unreadable from column {column}")
+                    }
+                    ReplyShape::Unexpected { kind, column } => format!(
+                        "a JSON {} that isn't a reply, unreadable from column {column}",
+                        match kind {
+                            JsonKind::Object => "object",
+                            JsonKind::Array => "array",
+                            JsonKind::String => "string",
+                            JsonKind::Number => "number",
+                            JsonKind::Bool => "true or false",
+                            JsonKind::Null => "null",
+                        }
+                    ),
+                    ReplyShape::OverBudget => "larger than a reply may be".to_owned(),
+                    ReplyShape::Inconsistent => {
+                        "readable, but not matching what was asked".to_owned()
+                    }
+                };
+                write!(
+                    f,
+                    "the privacy worker's reply couldn't be read ({bytes} bytes, {shape}); the next try starts a fresh worker"
+                )
+            }
+            Self::CheckStopped => f.write_str(
+                "the privacy check stopped unexpectedly; trying again with the same content is likely to stop the same way",
+            ),
+            Self::NamesCollided => f.write_str(
+                "two field names in one record became the same once protected, so the record can't be checked as it is; trying again gives the same result",
+            ),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Outcome {
     pub content: String,
@@ -108,6 +212,9 @@ pub struct Outcome {
     /// released nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
+    /// With [`Reason::ProtocolError`], which way the check ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProtocolCause>,
 }
 
 impl Outcome {
@@ -121,6 +228,7 @@ impl Outcome {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         }
     }
 }
@@ -361,6 +469,7 @@ fn with_spans(mut outcome: Outcome, carried: Option<Outcome>) -> Outcome {
         if carried.status != Status::Complete {
             outcome.status = Status::Partial;
             outcome.reason = outcome.reason.or(carried.reason);
+            outcome.protocol = outcome.protocol.or(carried.protocol);
         }
     }
     outcome
@@ -566,6 +675,7 @@ impl Projector {
                 unprocessed: 0,
                 omitted: 0,
                 reason: None,
+                protocol: None,
             };
             if matches!(mode, Mode::HydrateText) {
                 outcome = self.hydrate_text(text);
@@ -671,6 +781,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         for line in text.split_inclusive('\n') {
             let body = line.strip_suffix('\n').unwrap_or(line);
@@ -686,6 +797,7 @@ impl Projector {
                     unprocessed: 0,
                     omitted: 0,
                     reason: None,
+                    protocol: None,
                 };
                 self.record(&mut value, hydrate, &mut next, preserve_protocol_ids);
                 next.content = if next.replacements > 0 {
@@ -708,6 +820,7 @@ impl Projector {
             if next.status != Status::Complete {
                 outcome.status = Status::Partial;
                 outcome.reason = outcome.reason.or(next.reason);
+                outcome.protocol = outcome.protocol.or(next.protocol);
             }
         }
         outcome
@@ -729,6 +842,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         for (value, pointers) in batch.records.iter_mut().zip(batch.pointers) {
             let mut mask = crate::domain::secrets::identity::native_record_mask(
@@ -829,6 +943,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         self.record(
             &mut envelope.content,
@@ -888,6 +1003,7 @@ impl Projector {
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
                     outcome.reason = outcome.reason.or(next.reason);
+                    outcome.protocol = outcome.protocol.or(next.protocol);
                 }
                 if let Some(field) = value.pointer_mut(pointer) {
                     retained.push((pointer.as_str(), Value::String(next.content)));
@@ -913,6 +1029,7 @@ impl Projector {
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
                     outcome.reason = outcome.reason.or(next.reason);
+                    outcome.protocol = outcome.protocol.or(next.protocol);
                 }
                 text = next.content;
                 if let Some(field) = value.pointer_mut(pointer) {
@@ -952,6 +1069,7 @@ impl Projector {
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
                     outcome.reason = outcome.reason.or(next.reason);
+                    outcome.protocol = outcome.protocol.or(next.protocol);
                 }
                 if let Some(field) = value.pointer_mut(pointer) {
                     *field = Value::String(next.content);
@@ -1228,6 +1346,7 @@ impl Projector {
                     if !names.insert(next.content.clone()) {
                         outcome.status = Status::Partial;
                         outcome.reason = Some(Reason::ProtocolError);
+                        outcome.protocol = Some(ProtocolCause::NamesCollided);
                         outcome.unresolved += 1;
                         return;
                     }
@@ -1240,6 +1359,7 @@ impl Projector {
                     if next.status != Status::Complete {
                         outcome.status = Status::Partial;
                         outcome.reason = outcome.reason.or(next.reason);
+                        outcome.protocol = outcome.protocol.or(next.protocol);
                     }
                     if name != next.content {
                         renamed.push((next.content, values.remove(&name).unwrap()));
@@ -1380,6 +1500,7 @@ impl Projector {
                 if next.status != Status::Complete {
                     outcome.status = Status::Partial;
                     outcome.reason = outcome.reason.or(next.reason);
+                    outcome.protocol = outcome.protocol.or(next.protocol);
                 }
             }
             Value::Array(values) => {
@@ -1455,6 +1576,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         let mut cursor = 0;
         for (span, payload) in spans {
@@ -1488,6 +1610,7 @@ impl Projector {
             if next.status != Status::Complete {
                 outcome.status = Status::Partial;
                 outcome.reason = outcome.reason.or(next.reason);
+                outcome.protocol = outcome.protocol.or(next.protocol);
             }
         }
         outcome.content.push_str(&text[cursor..]);
@@ -1511,6 +1634,7 @@ impl Projector {
                     replacements: 0,
                     unresolved: next.unresolved + next.replacements,
                     reason: Some(Reason::Oversize),
+                    protocol: None,
                     ..next
                 };
             };
@@ -1733,6 +1857,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         let mut cursor = 0;
         for finding in findings {
@@ -1772,6 +1897,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         let mut seen = std::collections::HashSet::new();
         while whole_token(&outcome.content) {
@@ -1788,6 +1914,7 @@ impl Projector {
             if next.status != Status::Complete {
                 outcome.status = Status::Partial;
                 outcome.reason = outcome.reason.or(next.reason);
+                outcome.protocol = outcome.protocol.or(next.protocol);
             }
             if !progress {
                 break;
@@ -1806,6 +1933,7 @@ impl Projector {
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
         let mut cursor = 0;
         let mut held = 0;
@@ -2612,6 +2740,7 @@ mod tests {
             let output = projector.transform(&collision.to_string(), mode);
             assert!(output.status == Status::Partial);
             assert_eq!(output.reason, Some(Reason::ProtocolError));
+            assert_eq!(output.protocol, Some(ProtocolCause::NamesCollided));
             assert_eq!(
                 serde_json::from_str::<Value>(&output.content).unwrap(),
                 collision

@@ -115,12 +115,28 @@ fn captured_session_refs_read_and_fork_the_local_branch() {
 fn share_sends_only_the_selected_branch_to_the_requested_hub() {
     let tmp = tempfile::tempdir().unwrap();
     let home = fixture(tmp.path());
-    let payload = share_payload(&home, tmp.path());
+    let payload = share_payload(&home, tmp.path(), &[]);
     assert!(payload.contains("SELECTED-CONTENT"), "{payload}");
     assert!(!payload.contains("UNSELECTED-CONTENT"), "{payload}");
 }
 
-fn share_payload(home: &Path, work: &Path) -> String {
+/// The privacy worker holds the repository's path alias lock while it projects a share. One
+/// that runs past its caller's deadline is ended before share projects the session itself, which
+/// takes that lock too, so the share completes. Left running, the worker still holds the lock
+/// when share's own projection asks for it, and the share fails on its first try every time.
+#[test]
+fn share_completes_when_its_privacy_worker_runs_out_of_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fixture(tmp.path());
+    let payload = share_payload(
+        &home,
+        tmp.path(),
+        &[("AGIT_TEST_PRIVACY_PROJECTION_DELAY_MS", "8000")],
+    );
+    assert!(payload.contains("SELECTED-CONTENT"), "{payload}");
+}
+
+fn share_payload(home: &Path, work: &Path, environment: &[(&str, &str)]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let hub = format!("http://{}", listener.local_addr().unwrap());
     let credential = agit::infra::credentials::HubCredential {
@@ -212,6 +228,7 @@ fn share_payload(home: &Path, work: &Path) -> String {
     });
     let out = agit(home, work, &["share", "--public", "-y"])
         .env("AGIT_HUB_URL", &hub)
+        .envs(environment.iter().copied())
         .output()
         .unwrap();
     assert!(
@@ -300,7 +317,7 @@ fn share_renders_both_runtime_orders_and_each_runtime_on_its_own() {
         meta::write(repo.root(), &snapshot).unwrap();
         repo.add_all().unwrap();
         repo.commit("selected mixed history").unwrap();
-        let payload = share_payload(&home, tmp.path());
+        let payload = share_payload(&home, tmp.path(), &[]);
         let mut offset = 0;
         for text in expected {
             let position = payload[offset..]

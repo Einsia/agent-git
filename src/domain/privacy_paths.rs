@@ -85,10 +85,10 @@ impl PathAliasStore {
             .read(true)
             .write(true)
             .open(&lock_path)?;
-        let _lock = crate::infra::local_state::HeldLock::try_exclusive(
+        let _lock = crate::infra::local_state::HeldLock::exclusive(
             lock,
             &lock_path,
-            "cannot lock privacy path aliases",
+            "privacy path aliases",
         )?;
         let mut aliases = Self::load(repo)?;
         let result = operation(&mut aliases)?;

@@ -1,6 +1,6 @@
 //! Business callers receive content even when the isolated privacy worker is unavailable.
 
-use super::projector::{MAX_UNIT_BYTES, Mode, Outcome, Reason, Status};
+use super::projector::{MAX_UNIT_BYTES, Mode, Outcome, ProtocolCause, Reason, ReplyShape, Status};
 use super::worker::{self, Request};
 use anyhow::{Context, ensure};
 use std::path::Path;
@@ -65,6 +65,29 @@ enum Failure {
     /// The reply was missing or malformed; the worker cannot be trusted with another request.
     #[error("privacy worker failed: {0:#}")]
     Protocol(anyhow::Error),
+}
+
+/// A worker reply that could not be read, known by its size and shape alone.
+#[derive(Debug, thiserror::Error)]
+#[error("the privacy worker's reply could not be read")]
+struct Unreadable(ProtocolCause);
+
+impl Unreadable {
+    fn reply(bytes: usize, shape: ReplyShape) -> Self {
+        Self(ProtocolCause::UnreadableReply { bytes, shape })
+    }
+}
+
+/// Which way a [`Failure::Protocol`] ended: a reply that parsed but did not match is
+/// [`ReplyShape::Inconsistent`].
+fn protocol_cause(error: &anyhow::Error) -> ProtocolCause {
+    error
+        .downcast_ref::<Unreadable>()
+        .map(|unreadable| unreadable.0)
+        .unwrap_or(ProtocolCause::UnreadableReply {
+            bytes: 0,
+            shape: ReplyShape::Inconsistent,
+        })
 }
 
 struct Process {
@@ -144,12 +167,17 @@ impl Process {
                 while let Ok(bytes) = requests.recv() {
                     let result = (|| -> crate::Result<worker::Response> {
                         worker::write_frame(&mut input, &bytes)?;
-                        let response = worker::read_frame(&mut output)?;
-                        let response: worker::Response = serde_json::from_slice(&response)?;
-                        ensure!(
-                            response.outcome.content.len() <= MAX_UNIT_BYTES + 1024 * 1024,
-                            "privacy output exceeds its byte budget"
-                        );
+                        let reply = worker::read_frame(&mut output)
+                            .context(Unreadable::reply(0, ReplyShape::Missing))?;
+                        let response: worker::Response =
+                            serde_json::from_slice(&reply).map_err(|error| {
+                                Unreadable::reply(reply.len(), ReplyShape::of(&reply, &error))
+                            })?;
+                        if response.outcome.content.len() > MAX_UNIT_BYTES + 1024 * 1024 {
+                            return Err(
+                                Unreadable::reply(reply.len(), ReplyShape::OverBudget).into()
+                            );
+                        }
                         Ok(response)
                     })();
                     let failed = result.is_err();
@@ -211,7 +239,7 @@ impl Process {
         self.send.try_send(bytes).map_err(|error| match error {
             mpsc::TrySendError::Full(_) => Failure::Busy,
             mpsc::TrySendError::Disconnected(_) => {
-                Failure::Protocol(anyhow::anyhow!("privacy worker is gone"))
+                Failure::Protocol(Unreadable::reply(0, ReplyShape::Missing).into())
             }
         })?;
         let started = Instant::now();
@@ -225,7 +253,9 @@ impl Process {
                 Ok(Err(error)) => return Err(Failure::Protocol(error)),
                 Err(mpsc::RecvTimeoutError::Timeout) => return Err(Failure::Deadline),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Failure::Protocol(anyhow::anyhow!("privacy worker is gone")));
+                    return Err(Failure::Protocol(
+                        Unreadable::reply(0, ReplyShape::Missing).into(),
+                    ));
                 }
             }
         }
@@ -602,7 +632,11 @@ fn transform_with(
             .flatten()
             .unwrap_or_else(|| transform_inner(repo, context, text, mode, budget))
     }))
-    .unwrap_or_else(|_| skipped(text, Reason::ProtocolError));
+    .unwrap_or_else(|_| {
+        let mut outcome = skipped(text, Reason::ProtocolError);
+        outcome.protocol = Some(ProtocolCause::CheckStopped);
+        outcome
+    });
     if outcome.status != Status::Complete || outcome.unprocessed > 0 {
         crate::telemetry::observe(crate::telemetry::Observation::PrivacyPending {
             budget: match budget {
@@ -637,6 +671,7 @@ fn transform_inner(
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         };
     }
     let Some(mut state) = lock_within(budget.lock_wait()) else {
@@ -723,8 +758,10 @@ fn transform_inner(
         unprocessed: 0,
         omitted: 0,
         reason: None,
+        protocol: None,
     };
     let mut stopped = None;
+    let mut cause = None;
     let mut cursor = 0;
     while cursor < text.len() {
         if budget.saturating_sub(started.elapsed()).is_zero() {
@@ -825,6 +862,7 @@ fn transform_inner(
                 // A batch the worker answered without processing it ends the processed prefix.
                 if protects && batch.status == Status::Skipped {
                     stopped = batch.reason.or(Some(Reason::StoreBusy));
+                    cause = batch.protocol;
                     break;
                 }
                 if outcome.content.is_empty() {
@@ -841,6 +879,7 @@ fn transform_inner(
                         .reason
                         .or(batch.reason)
                         .or(Some(Reason::SourceIncomplete));
+                    outcome.protocol = outcome.protocol.or(batch.protocol);
                 }
                 cursor = end;
             }
@@ -856,10 +895,11 @@ fn transform_inner(
                 stopped = Some(Reason::Deadline);
                 break;
             }
-            Err(Failure::Protocol(_)) => {
+            Err(Failure::Protocol(error)) => {
                 state.process.as_mut().expect("worker started").terminate();
                 state.failed_until = Some(Instant::now() + RETRY_DELAY);
                 stopped = Some(Reason::ProtocolError);
+                cause = Some(protocol_cause(&error));
                 break;
             }
         }
@@ -895,8 +935,10 @@ fn transform_inner(
             outcome.status = Status::Partial;
         }
         outcome.reason = stopped.or(outcome.reason);
+        outcome.protocol = cause.or(outcome.protocol);
     } else if stopped.is_some() {
         outcome.reason = outcome.reason.or(stopped);
+        outcome.protocol = outcome.protocol.or(cause);
     }
     outcome
 }
@@ -926,6 +968,7 @@ fn hydrate_event(
             unprocessed: 0,
             omitted: 0,
             reason: None,
+            protocol: None,
         });
     }
     if text.len() > MAX_EVENT_BYTES || text.len() > output_limit {
@@ -1215,6 +1258,7 @@ fn protect_oversized_line(
         unprocessed: 0,
         omitted: usize::from(!omitted.is_empty()),
         reason: None,
+        protocol: None,
     })
 }
 
@@ -1424,6 +1468,7 @@ fn protect_windows(
         unprocessed: 0,
         omitted: 0,
         reason: None,
+        protocol: None,
     };
     let keys = crate::domain::redact::PrivateKeys::new(text);
     let mut start = 0;
@@ -1929,6 +1974,42 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A worker reply the check can't read is named by its size and shape, never by what it
+    /// holds: a message built from the parser's own error would quote the reply, which can hold a
+    /// value the check exists to keep back.
+    #[test]
+    fn an_unreadable_reply_is_named_by_its_size_and_shape_only() {
+        const VALUE: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+        for (reply, shape) in [
+            (format!("partial {VALUE}"), "not JSON"),
+            (
+                format!("{{\"leaked_field\":\"{VALUE}\"}}"),
+                "a JSON object that isn't a reply",
+            ),
+        ] {
+            let error = serde_json::from_slice::<worker::Response>(reply.as_bytes())
+                .err()
+                .expect("not a reply");
+            let message = crate::domain::redact::Withheld {
+                reason: Some(Reason::ProtocolError),
+                protocol: Some(protocol_cause(
+                    &Unreadable::reply(reply.len(), ReplyShape::of(reply.as_bytes(), &error))
+                        .into(),
+                )),
+            }
+            .to_string();
+            assert!(message.contains(shape), "{message}");
+            assert!(
+                message.contains(&format!("{} bytes", reply.len())),
+                "{message}"
+            );
+            assert!(
+                !message.contains(VALUE) && !message.contains("leaked_field"),
+                "{message}"
+            );
         }
     }
 }

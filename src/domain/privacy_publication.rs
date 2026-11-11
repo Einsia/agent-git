@@ -215,6 +215,7 @@ pub(crate) fn project_worker(
         unprocessed: 0,
         omitted: 0,
         reason: None,
+        protocol: None,
     })
 }
 
@@ -468,6 +469,11 @@ pub fn project_frozen_with_sources(
             &text,
             super::privacy::projector::Mode::ProjectPublication,
         );
+        // A worker that ran out of time is still projecting, holding the repository's path alias
+        // lock that the projection below takes too; nobody reads its result, so it ends first.
+        if outcome.reason == Some(super::privacy::projector::Reason::Deadline) {
+            super::privacy::service::invalidate();
+        }
         if outcome.status == super::privacy::projector::Status::Complete
             && let Ok(mut projection) = serde_json::from_str::<SessionProjection>(&outcome.content)
             && projection.source_log.as_str() == log
@@ -508,6 +514,16 @@ fn project_frozen_local(
         let redactor = redactor.with_repository(repo.root())?;
         let snapshot = PublicationSnapshot::capture(repo, log, view, metadata)?;
         PathAliasStore::transact(repo, |aliases| {
+            // A debug build lets a test make the privacy worker's projection outlast its caller's
+            // deadline while it holds the alias lock; a release build ignores the variable.
+            #[cfg(debug_assertions)]
+            if std::env::args().nth(1).as_deref() == Some(super::privacy::worker::WORKER)
+                && let Some(delay) = std::env::var("AGIT_TEST_PRIVACY_PROJECTION_DELAY_MS")
+                    .ok()
+                    .and_then(|ms| ms.parse().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
             snapshot.project(&policy, aliases, branch, &redactor)
         })
     } else {
