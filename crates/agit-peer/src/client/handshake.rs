@@ -64,6 +64,7 @@ pub async fn join_controller(
         },
     );
     let stream = ByteStream::new(Connection::from_parts(pid, sink, Box::pin(source)));
+    let progress = stream.received();
     let handshake = identity.connecting(peer, stream)?;
     let ready = tokio::time::timeout_at(deadline, received);
     tokio::pin!(handshake, ready);
@@ -83,7 +84,10 @@ pub async fn join_controller(
             (stream, paired_at)
         }
     };
-    Ok((framed(pid, stream), paired_at.duration_since(started)))
+    Ok((
+        framed(pid, stream).with_progress(progress),
+        paired_at.duration_since(started),
+    ))
 }
 
 #[cfg(test)]

@@ -115,3 +115,69 @@ async fn tunnel_failure_reaches_the_idle_reader_without_becoming_tls_eof() {
         "peer tunnel receive failed: relay heartbeat expired"
     );
 }
+
+// A Hub replacing its relay closes each tunnel with a service restart. An encrypted route reads
+// that through its TLS session and framing, and the route redials quickly only if the restart
+// survives both; a wrapper that turned it into an end of stream would put every release on the
+// failure backoff. Ciphertext progress is counted beneath the frames, so a frame still arriving
+// keeps its route alive.
+#[tokio::test]
+async fn a_restart_close_reaches_the_encrypted_route_and_progress_counts_ciphertext() {
+    for (code, restarting) in [(agit_tunnel::SERVICE_RESTART, true), (1000, false)] {
+        let (to_left, left_rx) = mpsc::channel(16);
+        let (to_right, right_rx) = mpsc::channel(16);
+        let connection = |outgoing: mpsc::Sender<Packet>, incoming: mpsc::Receiver<Packet>| {
+            let sink = futures_util::sink::unfold(outgoing, |sender, packet| async move {
+                sender.send(packet).await?;
+                Ok::<_, anyhow::Error>(sender)
+            });
+            let source = futures_util::stream::unfold(incoming, |mut incoming| async {
+                incoming.recv().await.map(|packet| (Ok(packet), incoming))
+            });
+            Connection::from_parts(41, Box::pin(sink), Box::pin(source))
+        };
+        let relay = to_left.clone();
+        let alice = Identity::generate().unwrap();
+        let bob = Identity::generate().unwrap();
+        let (left, right) = tokio::join!(
+            authenticate(
+                connection(to_right, left_rx),
+                &alice,
+                bob.certificate(),
+                Role::Controller
+            ),
+            authenticate(
+                connection(to_left, right_rx),
+                &bob,
+                alice.certificate(),
+                Role::Executor
+            ),
+        );
+        let (left, right) = (left.unwrap(), right.unwrap());
+        let progress = left
+            .progress()
+            .expect("an encrypted route counts its ciphertext");
+        let (_left_sink, mut left_source) = left.split();
+        let (mut right_sink, _right_source) = right.split();
+        right_sink
+            .send(Packet::Text(r#"{"jsonrpc":"2.0","method":"ping"}"#.into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            left_source.next().await,
+            Some(Ok(Packet::Text(_)))
+        ));
+        assert!(progress.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+        let close = agit_tunnel::protocol::Close {
+            code,
+            reason: String::new(),
+        };
+        relay.send(Packet::Close(Some(close))).await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), left_source.next())
+            .await
+            .expect("the close did not reach the route");
+        let restart = matches!(&ended, Some(Err(error)) if agit_tunnel::is_service_restart(error));
+        assert_eq!(restart, restarting, "close code {code}");
+    }
+}
