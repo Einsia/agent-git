@@ -414,19 +414,91 @@ fn replace_recorded_off(slug: &str) -> Result<bool> {
 /// its checks (account, write access, destination identity, hook capability) all apply.
 fn bind(root: &Path, repository: &str) -> Result<()> {
     let root_arg = root.to_string_lossy().into_owned();
-    run_child(
-        &[
-            "project",
-            "bind",
-            &root_arg,
-            "--repo",
-            repository,
-            "--history",
-            "none",
-            "--auto-upload",
-        ],
-        root,
-    )
+    let arguments = [
+        "project",
+        "bind",
+        &root_arg,
+        "--repo",
+        repository,
+        "--history",
+        "none",
+        "--auto-upload",
+    ];
+    // The first folder bound to a repository on this computer downloads the repository's whole
+    // history into agit's checkout of it.
+    let first = crate::commands::parse_slug(repository)
+        .ok()
+        .and_then(|(owner, name)| crate::infra::config::repo_dir(&owner, &name).ok())
+        .filter(|checkout| crate::domain::repo::Repo::open(checkout).is_none());
+    match first {
+        Some(checkout) => downloading(repository, &checkout, || run_child(&arguments, root)),
+        None => run_child(&arguments, root),
+    }
+}
+
+/// Runs `bind` while it downloads `repository` into `checkout`, saying so before it starts and
+/// how much it downloaded once it ends; at a terminal, and only there, a line in between counts
+/// what has arrived.
+/// A long history takes minutes to download, and a command that says nothing meanwhile reads as
+/// hung, to the person and to an agent waiting on it alike.
+fn downloading(repository: &str, checkout: &Path, bind: impl FnOnce() -> Result<()>) -> Result<()> {
+    ui::progress(format_args!(
+        "downloading {repository} from the Hub to this computer for the first time; a long history takes a few minutes"
+    ));
+    let started = std::time::Instant::now();
+    let spinner = ui::spinner(&format!("downloading {repository}…"));
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let result = std::thread::scope(|scope| {
+        let spinner = &spinner;
+        scope.spawn(move || {
+            // Off a terminal nobody sees the count, and reading the checkout's size competes with
+            // the download for the disk.
+            if spinner.is_hidden() {
+                return;
+            }
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(std::time::Duration::from_secs(1))
+            {
+                spinner.set_message(format!(
+                    "downloading {repository}: {} so far, {}",
+                    crate::commands::mib(size_of(checkout)),
+                    elapsed(started.elapsed())
+                ));
+            }
+        });
+        let result = bind();
+        drop(stop);
+        result
+    });
+    spinner.finish_and_clear();
+    if result.is_ok() {
+        ui::progress(format_args!(
+            "downloaded {repository}: {} in {}",
+            crate::commands::mib(size_of(checkout)),
+            elapsed(started.elapsed())
+        ));
+    }
+    result
+}
+
+/// The bytes of the files under `dir`, as far as they can be read now.
+fn size_of(dir: &Path) -> u64 {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn elapsed(time: std::time::Duration) -> String {
+    let seconds = time.as_secs();
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else {
+        format!("{} min {} s", seconds / 60, seconds % 60)
+    }
 }
 
 /// Runs an advanced command with every confirmation answered, and turns its failure into a
