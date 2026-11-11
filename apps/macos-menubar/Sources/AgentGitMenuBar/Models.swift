@@ -36,6 +36,18 @@ struct ProjectList: Decodable {
     /// Branches whose newest automatic upload didn't go through, as `agit status` lists them;
     /// absent from an agit that predates the upload records.
     let uploadsNotThrough: UploadsNotThrough?
+    /// The records agit couldn't read for this list, which is then `incomplete`; absent from an
+    /// agit that doesn't name them.
+    let unreadable: [UnreadableRecord]?
+
+    struct UnreadableRecord: Decodable, Equatable, Identifiable {
+        /// What the record is, in agit's words.
+        let what: String
+        /// Absent for a record that isn't one file, such as a runtime's whole conversation list.
+        let path: String?
+
+        var id: String { "\(what)\u{0}\(path ?? "")" }
+    }
 }
 
 /// `uploads_not_through`: what agit recorded of automatic uploads that didn't go through, and
@@ -70,7 +82,7 @@ struct UploadNotThrough: Decodable, Equatable {
     /// The repository part of `target`; a repository's name holds no `@`.
     var repository: String { String(target.prefix { $0 != "@" }) }
     /// The description as a sentence: agit writes it to follow a colon.
-    var sentence: String { description.prefix(1).uppercased() + description.dropFirst() + "." }
+    var sentence: String { Words.sentence(description) }
     /// What the row says: agit's words, which name the command that goes on from most classes,
     /// and that command where they don't. Said twice, the same command reads as two steps.
     var detail: String {
@@ -101,6 +113,12 @@ struct Folder: Decodable, Identifiable, Equatable {
     /// agit that predates the count.
     let awaitingUpload: Int?
     let recent: [Conversation]
+    /// Why a folder set to upload by itself isn't uploading; absent from an agit that doesn't say.
+    let held: Held?
+    /// The audience the Hub last reported for the repository: `public`, `private`, or unknown.
+    let visibility: String?
+    /// Whether each runtime installed here saves this folder's conversations by itself.
+    let capture: [Capture]?
 
     var id: String { folder }
     var isOn: Bool { state == "on" }
@@ -125,6 +143,32 @@ struct Folder: Decodable, Identifiable, Equatable {
         blocked ? "\(path)\n\(blockedReason) Turn it on with: \(autoPushCommand)" : path
     }
     var autoPushCommand: String { "agit config --repo \(repository) push.auto true" }
+    var isPublic: Bool { visibility == "public" }
+    /// The runtimes here that don't save this folder's conversations yet, with agit's step for
+    /// each. One agit couldn't ask in time says nothing either way and isn't listed.
+    var notCapturing: [Capture] { (capture ?? []).filter { $0.ready == false && $0.fix != nil } }
+}
+
+/// Why a folder set to upload by itself isn't uploading, judged by agit from this Mac's records.
+/// `code` is an open set: one this app doesn't know is shown by its `text`, and still needs the
+/// person's attention, so a reason agit adds later never reads as nothing to do.
+struct Held: Decodable, Equatable {
+    let code: String
+    let text: String
+    /// The Hub and account the folder was set up under, for `other_account`.
+    let hub: String?
+    let account: String?
+}
+
+/// Whether one runtime installed here saves a folder's conversations by itself, and agit's step
+/// when it doesn't. `ready` is null when agit couldn't tell.
+struct Capture: Decodable, Equatable {
+    let runtime: String
+    let ready: Bool?
+    let fix: String?
+    /// Whether the folder has conversations of this runtime at all, from agit's whole list rather
+    /// than the few recent ones shown; absent from an agit that doesn't say.
+    let usedHere: Bool?
 }
 
 struct LastUpload: Decodable, Equatable {
@@ -165,6 +209,12 @@ struct UploadEvent: Codable, Identifiable, Equatable {
 }
 
 enum Words {
+    /// One of agit's clauses, written to follow a colon, as a sentence of its own.
+    static func sentence(_ clause: String) -> String {
+        let text = clause.prefix(1).uppercased() + clause.dropFirst()
+        return text.hasSuffix(".") ? text : text + "."
+    }
+
     static func runtime(_ runtime: String) -> String {
         switch runtime {
         case "claude-code": return "Claude Code"

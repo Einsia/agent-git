@@ -114,6 +114,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var hookProblem: String?
     @Published private(set) var listUnsupported = false
     @Published private(set) var incomplete = false
+    /// The records agit named as unreadable for the latest list.
+    @Published private(set) var unreadableRecords: [ProjectList.UnreadableRecord] = []
     /// An installed agit that waits for the running one to hand over, with why.
     @Published private(set) var pendingUpgrade: LocalDaemonStatus.PendingUpgrade?
     @Published private(set) var refreshing = false
@@ -241,7 +243,30 @@ final class AppModel: ObservableObject {
             problems.append(Problem(
                 id: "list", title: "Could not read agit's folders", detail: reason + age, fix: .chooseCLI))
         }
-        for folder in folders where folder.failing {
+        for folder in folders {
+            guard let held = folder.held, held.code != "push_auto_off" else { continue }
+            problems.append(Problem(
+                id: "held:\(folder.folder)",
+                title: "\(folder.name) isn't uploading",
+                detail: Words.sentence(held.text),
+                fix: Self.fix(held, folder.folder)))
+        }
+        for folder in folders where folder.isOn {
+            // Only a runtime the person uses here: an installed Codex that never ran in this
+            // folder costs it nothing, and its step stays on the folder's row. agit's `used_here`
+            // looks at every conversation; the recent ones shown are a few, which can't tell
+            // "never used" from "not lately", so they are only the answer of an agit without it.
+            // Claude Code's hooks are the app's own check, said once above.
+            for capture in folder.notCapturing where capture.runtime != "claude-code"
+                && (capture.usedHere ?? folder.recent.contains { $0.runtime == capture.runtime }) {
+                problems.append(Problem(
+                    id: "capture:\(folder.folder):\(capture.runtime)",
+                    title: "\(Words.runtime(capture.runtime)) conversations in \(folder.name) aren't saved",
+                    detail: capture.fix.map(Words.sentence), fix: .none))
+            }
+        }
+        // A held folder's reason says why its uploads fail; it is not told twice.
+        for folder in folders where folder.failing && folder.held == nil {
             problems.append(Problem(
                 id: "upload:\(folder.folder)",
                 title: "Uploads from \(folder.name) are failing",
@@ -282,6 +307,17 @@ final class AppModel: ObservableObject {
                 detail: folder.blockedReason, fix: .allowAutoUpload(folder.folder)))
         }
         return problems
+    }
+
+    /// The one step that answers a hold. A code this app doesn't know, an account to change, or
+    /// access only the repository's owner can give is said and not offered as a button.
+    private static func fix(_ held: Held, _ folder: String) -> Problem.Fix {
+        switch held.code {
+        case "signed_out": return .signIn
+        // Turning the folder on again asks, with the public question for a public repository.
+        case "public_needs_consent": return .allowAutoUpload(folder)
+        default: return .none
+        }
     }
 
     var health: Health {
@@ -540,6 +576,7 @@ final class AppModel: ObservableObject {
             listProblem = nil
             listed = Date()
             incomplete = list.incomplete
+            unreadableRecords = list.unreadable ?? []
             folders = list.folders.sorted { ($0.isOn ? 0 : 1, $0.name) < ($1.isOn ? 0 : 1, $1.name) }
             announce(list.uploadsNotThrough)
             observe(list.folders)
@@ -658,7 +695,7 @@ final class AppModel: ObservableObject {
         let name = (path as NSString).lastPathComponent
         perform(path, "Retrying uploads in \(name)…", failure: "Uploads in \(name) stopped") { cli in
             try await cli.run(["--yes", "project", "sync", path], timeout: 1800)
-        } done: { _ in "Retry finished." }
+        } done: { Self.synced($0) }
     }
 
     /// Turning uploads on publishes this folder's new conversations, so it always asks first, in
@@ -742,6 +779,20 @@ final class AppModel: ObservableObject {
     }
 
     /// `repository_visibility` from a dry-run bind's answer, or "" when agit could not read it.
+    /// What a finished sync did, from its counts. A conversation still in its first turn, or
+    /// one left out, is not a failure, so it is named apart.
+    private static func synced(_ result: CLIResult) -> String {
+        guard let value = result.value,
+              let object = try? JSONSerialization.jsonObject(with: value) as? [String: Any],
+              let counts = object["result"] as? [String: Any]
+        else { return "Retry finished." }
+        let count = { (key: String) in counts[key] as? Int ?? 0 }
+        var said = [count("uploaded") == 1 ? "1 conversation uploaded" : "\(count("uploaded")) conversations uploaded"]
+        if count("pending") > 0 { said.append("\(count("pending")) still in their first turn") }
+        if count("skipped") > 0 { said.append("\(count("skipped")) left out") }
+        return said.joined(separator: "; ") + "."
+    }
+
     private static func audience(_ result: CLIResult) -> String {
         guard let value = result.value,
               let object = try? JSONSerialization.jsonObject(with: value) as? [String: Any]
