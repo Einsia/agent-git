@@ -113,10 +113,6 @@ pub fn run(args: Args) -> CmdResult {
             let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
                 return Ok(ExitCode::Precondition);
             };
-            if !repo.has_ref(&format!("refs/heads/{old}")) {
-                ui::error(&format!("{slug} has no branch `{old}`."));
-                return Ok(ExitCode::Ref);
-            }
             if let Err(e) = crate::domain::repo::valid_branch_name(&new) {
                 ui::error(&format!("{e:#}"));
                 return Ok(ExitCode::Usage);
@@ -125,13 +121,7 @@ pub fn run(args: Args) -> CmdResult {
                 "branch",
                 &[super::echo::Selection::new(format!("{slug}@{old}"), source)],
             );
-            repo.git(&["branch", "-m", &old, &new])?;
-            super::worktree::rename(&repo, &old, &new)?;
-            ui::success(&format!("{old} → {new}"));
-            ui::info(ui::dim(
-                "  branch names are mere aliases: session identity, history and tags don’t move",
-            ));
-            Ok(ExitCode::Ok)
+            rename(&repo, &slug, &old, &new)
         }
         Some(Cmd::Rm { name, force }) => {
             let Some((repo, slug)) = ctx_repo(args.repo.as_deref()) else {
@@ -415,6 +405,130 @@ fn list(repo: &Repo, slug: &str, verbose: bool, all: bool) -> CmdResult {
             }
         }
     }
+    Ok(ExitCode::Ok)
+}
+
+/// Renames `old` to `new` and moves every conversation still saving to `old` with it, so its next
+/// turn settles onto `new` after the history it already has. A conversation left claiming `old`
+/// finds no branch at its next turn: a hook's settlement saves nothing, and a save or a commit by
+/// its id creates `old` again from the conversation's first turn, apart from the history already
+/// uploaded. Refused, with nothing changed, while a merge transaction names `old` or `old` is held
+/// back from uploads: a hold is kept by the branch's name, so a renamed branch would upload.
+///
+/// The branch moves first, then each conversation, each on its own. One that can't be moved is
+/// named, with the same command, which run again finds `old` gone and `new` there and moves only
+/// the conversations still saving to `old`. Putting the branch back instead would need every
+/// moved conversation put back too, and a write that failed once can fail again, leaving a
+/// conversation on a name that exists under neither.
+fn rename(repo: &Repo, slug: &str, old: &str, new: &str) -> CmdResult {
+    use crate::domain::link;
+    // One name would be locked twice below, and the second lock would wait for the first forever.
+    if old == new {
+        ui::error(&format!("`{old}` already has that name; nothing to rename"));
+        return Ok(ExitCode::Precondition);
+    }
+    let (owner, agent) = super::parse_slug(slug)?;
+    let store = crate::domain::store::Store::open_or_init()?;
+    let claims_old = || -> Vec<link::Link> {
+        link::list(&store)
+            .into_iter()
+            .filter(|claim| link::claims_branch(claim, &owner, &agent, old))
+            .collect()
+    };
+    // Both names' branch locks, in name order so two renames the other way round can't wait on
+    // each other: no settlement, import or other rename of either branch writes while its claims
+    // move. Everything below is read under them, so what a rename decides holds until it is done:
+    // read before, another rename could take the new name away in between, and this one would
+    // move the conversations onto a name that no longer exists.
+    let (first, second) = if old < new { (old, new) } else { (new, old) };
+    let _first = link::lock_branch(&store, slug, first)?;
+    let _second = link::lock_branch(&store, slug, second)?;
+    let has = |name: &str| repo.has_ref(&format!("refs/heads/{name}"));
+    // A rename that stopped partway: the branch has its new name, and some conversations still
+    // name the old one.
+    let finishing = !has(old) && has(new) && !claims_old().is_empty();
+    if !has(old) && !finishing {
+        ui::error(&format!("{slug} has no branch `{old}`."));
+        return Ok(ExitCode::Ref);
+    }
+    if has(new) && !finishing {
+        ui::error(&format!("{slug} already has a branch `{new}`."));
+        return Ok(ExitCode::Precondition);
+    }
+    if crate::domain::mergetx::read(repo.root())?
+        .is_some_and(|tx| tx.target == old || tx.source_branch.as_deref() == Some(old))
+    {
+        ui::error(&format!(
+            "`{old}` is in an open merge transaction; `agit merge --abort` or `--continue` first"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
+    if let Some(hold) = link::launch::held(&store, slug, old) {
+        ui::error(&link::launch::explain(&hold));
+        ui::hint(&format!(
+            "nothing was renamed: `{old}` stays held back from uploads under its own name"
+        ));
+        return Ok(ExitCode::Precondition);
+    }
+    if !finishing {
+        repo.git(&["branch", "-m", old, new])?;
+        super::worktree::rename(repo, old, new)?;
+        // What the last automatic upload of `old` came to is about a branch that no longer
+        // exists.
+        let _ = super::upload_outcome::forget(slug, Some(old));
+    }
+    let mut moved = Vec::new();
+    let mut stuck = Vec::new();
+    for claim in claims_old() {
+        let step = (|| -> crate::Result<bool> {
+            #[cfg(debug_assertions)]
+            if std::env::var("AGIT_TEST_FAIL_CLAIM_MOVE").as_deref()
+                == Ok(claim.session_id.as_str())
+            {
+                anyhow::bail!("injected failure moving {}", claim.session_id);
+            }
+            let _guard = link::lock(&store, &claim.source, &claim.session_id)?;
+            let Some(mut current) = link::get_checked(&store, &claim.source, &claim.session_id)?
+            else {
+                return Ok(false);
+            };
+            if !link::claims_branch(&current, &owner, &agent, old) {
+                return Ok(false);
+            }
+            current.branch = Some(new.to_owned());
+            link::write(&store, &current)?;
+            Ok(true)
+        })();
+        match step {
+            Ok(true) => moved.push(claim),
+            Ok(false) => {}
+            Err(error) => stuck.push((claim, error)),
+        }
+    }
+    ui::success(&format!("{old} → {new}"));
+    for claim in &moved {
+        ui::info(format_args!(
+            "  {} conversation {} now saves to {new}",
+            super::front::runtime_name(&claim.source),
+            link::short(&claim.session_id)
+        ));
+    }
+    if !stuck.is_empty() {
+        for (claim, error) in &stuck {
+            ui::error(&format!(
+                "{} conversation {} still saves to {old}, which no longer exists: {error:#}",
+                super::front::runtime_name(&claim.source),
+                claim.session_id
+            ));
+        }
+        ui::hint(&format!(
+            "run the same command again to move them: `agit branch rename {old} {new} --repo {slug}`"
+        ));
+        return Ok(ExitCode::Failure);
+    }
+    ui::info(ui::dim(&format!(
+        "  history and tags stay as they are; anything already uploaded keeps the name {old} on the Hub"
+    )));
     Ok(ExitCode::Ok)
 }
 
