@@ -79,6 +79,9 @@ pub fn run() -> CmdResult {
         _ => None,
     };
     let codex_untrusted = state == FolderState::On && codex_hooks_silent(&sessions);
+    let opencode = root
+        .as_deref()
+        .and_then(crate::commands::project::opencode_not_captured);
     // An old agit section in a folder agit set up still tells agents to run agit at every session
     // start; the person removes it, as the file may be committed.
     let legacy = crate::commands::setup::legacy_folder_sections();
@@ -108,6 +111,7 @@ pub fn run() -> CmdResult {
                 "last_upload_error": failure,
                 "held": held.as_ref().map(crate::commands::project::Held::json),
                 "codex_hooks_not_running": codex_untrusted,
+                "opencode_not_captured": opencode,
                 "legacy_agents_sections": legacy.iter().map(|section| serde_json::json!({
                     "file": section.file,
                     "tracked": section.tracked,
@@ -188,6 +192,9 @@ pub fn run() -> CmdResult {
                 ),
                 (FolderState::Off, _) => println!("{folder} is off"),
                 (FolderState::NotSaved, _) => println!("{folder} is not saved"),
+            }
+            if let Some(said) = opencode {
+                println!("  {said}");
             }
             if codex_untrusted {
                 println!(

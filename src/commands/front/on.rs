@@ -510,7 +510,7 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
                 "teams_granted": enabled.granted,
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
-                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).collect::<Vec<_>>(),
+                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).chain(crate::commands::project::opencode_not_captured(root).map(|said| serde_json::json!({"runtime": "opencode", "state": "not_captured", "says": said}))).collect::<Vec<_>>(),
                 // Uploading the sessions from before is the person's choice: the agent asks.
                 "next": (waiting > 0).then(|| serde_json::json!({
                     "ask_user": super::earlier_note(waiting, "here", super::Reader::Agent),
@@ -604,6 +604,9 @@ fn report(root: &Path, enabled: &Enabled) -> CmdResult {
     }
     for (runtime, state) in &runtimes {
         println!("  {}: {}", super::runtime_name(runtime), state.describe());
+    }
+    if let Some(said) = crate::commands::project::opencode_not_captured(root) {
+        println!("  {said}");
     }
     let here =
         std::iter::once(("here".to_owned(), earlier)).chain(worktrees.iter().map(

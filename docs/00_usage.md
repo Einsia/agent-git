@@ -153,7 +153,11 @@ approval before first use or after the installed command changes, and saves noth
 `agit setup`, `agit doctor` and `agit project status` say which AgentGit hooks Codex will not run
 yet; approve them in Codex's startup review or in `/hooks`. OpenCode and Cursor have no
 equivalent "turn finished" callback; the skill above injects the settlement discipline into the
-agent, and the agent types `agit commit` itself at the right moment.
+agent, and the agent types `agit commit` itself at the right moment. So in a folder that uploads
+by itself, an OpenCode conversation goes up when its agent runs `agit commit` or you run
+`agit save`, not at the end of each turn; `agit on`, `agit`, `agit status` and `agit doctor` say
+so there when OpenCode is installed, and say nothing about it in a folder that is off, only set up
+for a repository, or on with its uploads held.
 
 `agit setup --agents-md` refreshes the managed section and normalizes nested AgentGit markers,
 preserving the text around that section. An unchanged repeat does not append another marker pair.

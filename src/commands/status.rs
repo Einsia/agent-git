@@ -239,6 +239,10 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(notice) = super::project::worktree_notice(&cwd) {
         println!("  {notice}");
     }
+    // A folder that uploads by itself says what it doesn't upload.
+    if let Some(said) = super::project::opencode_not_captured(&cwd) {
+        println!("  {said}");
+    }
     // Told once: branches already on the Hub that the folder they ran in keeps back.
     if let Ok(uploads) = super::project::kept_back_uploads_to_tell() {
         for upload in uploads {

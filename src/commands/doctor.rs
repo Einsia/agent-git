@@ -186,6 +186,12 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(row) = codex_hooks_row() {
         checks.push(("codex hooks".into(), row));
     }
+    if let Some(said) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| super::project::opencode_not_captured(&cwd))
+    {
+        checks.push(("opencode".into(), Check::Warn(said.into())));
+    }
 
     // ── git ──
     match crate::infra::git_runtime::command()
