@@ -861,8 +861,11 @@ pub(crate) fn kept_back_uploads() -> Result<Vec<KeptBackUpload>> {
     Ok(found.into_values().collect())
 }
 
-/// The kept-back uploads `agit status` has not shown yet, recorded as shown: each is told once.
-pub(crate) fn kept_back_uploads_to_tell() -> Result<Vec<KeptBackUpload>> {
+/// The kept-back uploads `agit status` has not shown yet, in the repositories `covers` names,
+/// recorded as shown: each is told once, and one status leaves out is told by a later one.
+pub(crate) fn kept_back_uploads_to_tell(
+    covers: impl Fn(&str) -> bool,
+) -> Result<Vec<KeptBackUpload>> {
     let path = config::agit_home()?.join("kept-back-uploads-told.json");
     let mut told: BTreeSet<String> = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
@@ -871,6 +874,7 @@ pub(crate) fn kept_back_uploads_to_tell() -> Result<Vec<KeptBackUpload>> {
     };
     let fresh: Vec<_> = kept_back_uploads()?
         .into_iter()
+        .filter(|upload| covers(&upload.repository))
         .filter(|upload| !told.contains(&format!("{}@{}", upload.repository, upload.branch)))
         .collect();
     if !fresh.is_empty() {

@@ -27,8 +27,8 @@ impl Lab {
         }
     }
 
-    fn output(&self, args: &[&str]) -> std::process::Output {
-        let output = Command::new(env!("CARGO_BIN_EXE_agit"))
+    fn raw(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_agit"))
             .args(args)
             .current_dir(&self.cwd)
             .env_clear_local()
@@ -40,7 +40,11 @@ impl Lab {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        let output = self.raw(args);
         assert!(
             output.status.success(),
             "{}",
@@ -89,6 +93,8 @@ fn explicit_discovery_works_before_first_adoption_and_distinguishes_runtimes() {
     let text = lab.output(&["status", "--check-missing"]);
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(text.contains("cccccccc-000"), "{text}");
+    let unsaved = String::from_utf8(lab.output(&["status", "--unsaved"]).stdout).unwrap();
+    assert!(unsaved.contains("cccccccc-000"), "{unsaved}");
     assert!(!lab.store.exists());
     let first = lab.run(&["status", "--check-missing", "--json"]);
     let items = first["result"]["value"]["unadopted"]["sessions"]
@@ -467,4 +473,187 @@ fn a_registered_conversation_says_whether_anything_saves_it() {
             && !said.contains(&format!("`agit import {}`", ids[0].1)),
         "{said}"
     );
+}
+
+/// A local checkout of `owner/name`, as `agit clone` leaves one: a Git repository in the store.
+fn checkout(lab: &Lab, repository: &str) {
+    let path = lab.store.join("repos").join(repository);
+    fs::create_dir_all(&path).unwrap();
+    let status = Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&path)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// A claim of `id` in this folder, saved to `owner/name@branch`.
+fn claim(lab: &Lab, repository: &str, id: &str) {
+    let (owner, name) = repository.split_once('/').unwrap();
+    let dir = lab.store.join("store/claude-code");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join(format!("{id}.json")),
+        serde_json::json!({"owner": owner, "agent": name, "branch": format!("b-{id}"),
+            "cwd": lab.cwd})
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// An upload of `target` waiting for the privacy check, as `agit push` records one.
+fn upload_wait(lab: &Lab, targets: &[&str]) {
+    fs::create_dir_all(&lab.store).unwrap();
+    let waits: serde_json::Map<String, serde_json::Value> = targets
+        .iter()
+        .map(|target| {
+            (
+                (*target).to_owned(),
+                serde_json::json!({"reason": "worker_unavailable", "since": 1_700_000_000}),
+            )
+        })
+        .collect();
+    fs::write(
+        lab.store.join("publication-pending.json"),
+        serde_json::Value::Object(waits).to_string(),
+    )
+    .unwrap();
+}
+
+/// `--repo` reports that repository alone: its sessions, its checkout and what waits in it, in
+/// text and JSON. The page counts the sessions it covers, not every claim. A report that took the
+/// claims in their own order, or listed every waiting upload, shows the other repository's.
+#[test]
+fn a_repository_scope_reports_that_repository_only() {
+    let lab = Lab::new();
+    checkout(&lab, "alice/notes");
+    checkout(&lab, "bob/wiki");
+    let ours = [
+        "aaaaaaaa-0000-4000-8000-000000000001",
+        "aaaaaaaa-0000-4000-8000-000000000002",
+    ];
+    let theirs = "bbbbbbbb-0000-4000-8000-000000000001";
+    claim(&lab, "bob/wiki", theirs);
+    for id in ours {
+        claim(&lab, "alice/notes", id);
+    }
+    upload_wait(&lab, &["alice/notes@b-one", "bob/wiki@b-two"]);
+
+    let status = lab.run(&["status", "--repo", "alice/notes", "--json"]);
+    let value = &status["result"]["value"];
+    assert_eq!(value["scope"]["kind"], "repository", "{status}");
+    assert_eq!(value["scope"]["repository"], "alice/notes");
+    assert_eq!(value["sessions"]["total"], 2, "{status}");
+    let mut ids: Vec<_> = value["sessions"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["session_id"].as_str().unwrap())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ours, "{status}");
+    let repositories: Vec<_> = value["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|repository| repository["repo"].as_str().unwrap())
+        .collect();
+    assert_eq!(repositories, ["alice/notes"], "{status}");
+    let waits: Vec<_> = value["upload_waits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|wait| wait["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(waits, ["alice/notes@b-one"], "{status}");
+    assert!(value["repository_summary"].is_null(), "{status}");
+
+    let every = lab.run(&["status", "--json"]);
+    assert_eq!(every["result"]["value"]["sessions"]["total"], 3, "{every}");
+    assert_eq!(every["result"]["value"]["scope"]["kind"], "machine");
+
+    let text = lab.output(&["status", "--repo", "alice/notes"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&text.stdout),
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert!(said.contains(ours[0]) && said.contains(ours[1]), "{said}");
+    assert!(said.contains("alice/notes@b-one"), "{said}");
+    assert!(
+        !said.contains("bob/wiki") && !said.contains(theirs),
+        "{said}"
+    );
+}
+
+/// A repository this computer has no checkout of is refused, with the command that fetches it,
+/// as `agit branch --repo` refuses it; a name that isn't `owner/name` is a usage error.
+#[test]
+fn a_repository_scope_needs_a_local_checkout() {
+    let lab = Lab::new();
+    let output = lab.raw(&["status", "--repo", "carol/none"]);
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("carol/none doesn’t exist locally."), "{said}");
+    assert!(said.contains("`agit clone carol/none`"), "{said}");
+    let output = lab.raw(&["status", "--repo", "a/b/c"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(!lab.store.join("store").exists());
+}
+
+/// `--all` puts one row per repository before the report: the current folder's first, then those
+/// with something waiting, the most first, then by conversations. Plain status leaves it out.
+#[test]
+fn every_repository_gets_a_summary_row_with_what_needs_attention() {
+    let lab = Lab::new();
+    lab.run(&["--json", "init", "here"]);
+    checkout(&lab, "local/big");
+    checkout(&lab, "bob/wiki");
+    for (repository, id) in [
+        ("local/big", "aaaaaaaa-0000-4000-8000-000000000001"),
+        ("local/big", "aaaaaaaa-0000-4000-8000-000000000002"),
+        ("local/big", "aaaaaaaa-0000-4000-8000-000000000003"),
+        ("bob/wiki", "bbbbbbbb-0000-4000-8000-000000000001"),
+    ] {
+        claim(&lab, repository, id);
+    }
+    upload_wait(&lab, &["bob/wiki@b-one", "bob/wiki@b-two"]);
+
+    let status = lab.run(&["status", "--all", "--json"]);
+    let rows: Vec<_> = status["result"]["value"]["repository_summary"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{status}"))
+        .iter()
+        .map(|row| {
+            (
+                row["repository"].as_str().unwrap().to_owned(),
+                row["here"].as_bool().unwrap(),
+                row["conversations"].as_u64().unwrap(),
+                row["attention"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("local/here".to_owned(), true, 0, 0),
+            ("bob/wiki".to_owned(), false, 1, 2),
+            ("local/big".to_owned(), false, 3, 0),
+        ],
+        "{status}"
+    );
+
+    let text = String::from_utf8(lab.output(&["status", "--all"]).stdout).unwrap();
+    assert!(
+        text.contains("repo\tfolder\tconversations\tneed attention"),
+        "{text}"
+    );
+    assert!(text.contains("local/here\there\t0\t0"), "{text}");
+    assert!(text.contains("bob/wiki\t\t1\t2"), "{text}");
+    assert!(text.contains("local/big\t\t3\t0"), "{text}");
+    let plain = String::from_utf8(lab.output(&["status"]).stdout).unwrap();
+    assert!(!plain.contains("need attention"), "{plain}");
+    assert!(lab.run(&["status", "--json"])["result"]["value"]["repository_summary"].is_null());
 }
