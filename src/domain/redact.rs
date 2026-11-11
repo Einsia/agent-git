@@ -455,62 +455,6 @@ impl Redactor {
         Ok(report)
     }
 
-    /// Whether `name` can be published as it is: neither the detector, nor persona masking, nor
-    /// a value the user registered would rewrite it. The detector and persona masking run in this
-    /// process. Registered values live only in the privacy worker's dictionary, so the worker is
-    /// asked too: a worker that does not answer gets one more try once its back-off is over, and
-    /// if it still cannot answer the check fails with a message that says retrying works.
-    #[cfg(feature = "cli")]
-    pub(crate) fn publishes_unchanged(&self, name: &str) -> crate::Result<bool> {
-        let scan = if crate::infra::config::privacy_entropy_replace() {
-            crate::domain::privacy::detector::scan(name, 1)
-        } else {
-            crate::domain::privacy::detector::scan_high_confidence(name, 1)
-        };
-        if !scan.findings.is_empty() || self.persona_only(name).text != name {
-            return Ok(false);
-        }
-        anyhow::ensure!(
-            scan.complete,
-            "the privacy check for `{name}` could not complete; retrying the push usually works"
-        );
-        let mut pending = None;
-        for attempt in 0..2 {
-            let protected = crate::domain::privacy::service::transform(
-                self.repo.as_deref(),
-                name,
-                crate::domain::privacy::projector::Mode::ProtectText,
-            );
-            if crate::domain::privacy::service::passed(&protected) {
-                return Ok(protected.content == name);
-            }
-            pending = Some(crate::domain::privacy::service::Pending::of(&protected));
-            if attempt == 0 {
-                crate::domain::privacy::service::wait_for_retry();
-            }
-        }
-        Err(
-            anyhow::Error::new(pending.expect("an attempt ran")).context(format!(
-                "the privacy check for `{name}` could not run, so nothing was published"
-            )),
-        )
-    }
-
-    /// The text a session branch is named from: the first prompt as it is published, with every
-    /// replaced value left out. `None` when the privacy check cannot run, so the caller names the
-    /// branch without the prompt's words.
-    #[cfg(feature = "cli")]
-    pub(crate) fn branch_name_source(&self, prompt: &str) -> Option<String> {
-        branch_text(prompt, |text| {
-            let protected = crate::domain::privacy::service::transform(
-                self.repo.as_deref(),
-                text,
-                crate::domain::privacy::projector::Mode::ProtectText,
-            );
-            crate::domain::privacy::service::passed(&protected).then_some(protected.content)
-        })
-    }
-
     #[cfg(feature = "cli")]
     pub(crate) fn scrub_persona(&self, text: &str) -> Report {
         self.persona_only(text)
@@ -927,37 +871,6 @@ fn empty_report() -> Report {
     }
 }
 
-/// A prompt with every high-confidence finding removed here, then protected by `protect` (the
-/// privacy worker, which also replaces the values the person registered), with its placeholders
-/// dropped. `None` when `protect` cannot run.
-#[cfg(feature = "cli")]
-fn branch_text(prompt: &str, protect: impl FnOnce(&str) -> Option<String>) -> Option<String> {
-    let scan = crate::domain::privacy::detector::scan_high_confidence(prompt, 64);
-    if !scan.complete {
-        return None;
-    }
-    let mut kept = String::new();
-    let mut at = 0;
-    for span in &scan.findings {
-        if span.start >= at {
-            kept.push_str(&prompt[at..span.start]);
-            kept.push(' ');
-            at = span.end;
-        }
-    }
-    kept.push_str(&prompt[at..]);
-    let protected = protect(&kept)?;
-    let mut words = String::new();
-    let mut at = 0;
-    for (start, end, _) in crate::domain::privacy::projector::tokens(&protected) {
-        words.push_str(&protected[at..start]);
-        words.push(' ');
-        at = end;
-    }
-    words.push_str(&protected[at..]);
-    Some(words)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1050,52 +963,6 @@ mod tests {
         let a = scrub(persona(), &text);
         let b = scrub(persona(), &text);
         assert_eq!(a.text, b.text);
-    }
-
-    const KEY_ID: &str = "AKIA2E7YQXK4NMZ5VJ3T";
-    const TOKEN: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
-    const REGISTERED: &str = "Larkspur-Overture";
-
-    fn placeholder() -> String {
-        format!(
-            "{{{{AGIT_SECRET_V2:{}:{}}}}}",
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4()
-        )
-    }
-
-    /// A new session's branch is named from its opening request as published: the request's
-    /// words stay, and nothing publication replaces reaches the name, in any spelling.
-    #[test]
-    fn a_new_branch_is_named_from_the_published_request() {
-        let request = format!("deploy with {KEY_ID} and {TOKEN} using {REGISTERED} please");
-        let text = branch_text(&request, |text| {
-            Some(text.replace(REGISTERED, &placeholder()))
-        })
-        .unwrap();
-        let name = crate::commands::front::slug(&text, 200);
-        assert!(name.starts_with("deploy-with"), "{name}");
-        assert!(name.ends_with("please"), "{name}");
-        for value in [KEY_ID, TOKEN, REGISTERED] {
-            let spelled = crate::commands::front::slug(value, 200);
-            assert!(!name.contains(&spelled), "{name}");
-        }
-        assert!(
-            branch_text(&request, |_| None).is_none(),
-            "a check that can't run"
-        );
-    }
-
-    /// A credential-shaped tag name is refused by the detector in this process, before the
-    /// privacy worker is asked: the answer cannot wait on a worker that is slow or absent.
-    #[test]
-    fn a_credential_shaped_tag_name_is_refused_without_the_worker() {
-        let redactor = Redactor::new(persona());
-        assert!(
-            !redactor
-                .publishes_unchanged("fix-ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr")
-                .unwrap()
-        );
     }
 
     /// The device-control redactor, the one remote control uses, passes text and JSON values as

@@ -4641,27 +4641,31 @@ fn a_milestone_and_tag_reach_the_hub_with_their_turn() {
         verified
     );
 
-    // Refused before anything lands: a key-shaped tag name, and a message on a session tag.
+    // A tag name the person typed is taken as it is, one the privacy check would change
+    // included; a message on a session tag is still refused before anything lands.
+    const KEY_SHAPED: &str = "fix-ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
     append(&source, &[prompt("One more check")]);
     append(&source, &reply);
-    let key_shaped = run(&[
-        "commit",
-        "alice/app@talk",
-        "--tag",
-        "fix-ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr",
-    ]);
-    assert!(!key_shaped.status.success(), "{key_shaped:?}");
-    assert!(
-        String::from_utf8_lossy(&key_shaped.stderr).contains("plain name"),
-        "{key_shaped:?}"
+    assert_success(&run(&["commit", "alice/app@talk", "--tag", KEY_SHAPED]));
+    let checked = tip();
+    assert_ne!(checked, verified);
+    assert_eq!(
+        git(
+            repo.root(),
+            &["rev-parse", &format!("{KEY_SHAPED}^{{commit}}")]
+        ),
+        checked
     );
-    assert_eq!(tip(), verified);
     let annotated = run(&["tag", "-m", "Reviewed", "ms-noted", "alice/app@talk"]);
     assert!(!annotated.status.success(), "{annotated:?}");
     assert!(!repo.has_tag("ms-noted"));
-    assert_success(&run(&["commit", "alice/app@talk"]));
 
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    // Published under the name as it was typed.
+    git(
+        &remote,
+        &["rev-parse", "--verify", &format!("refs/tags/{KEY_SHAPED}")],
+    );
     let published = git(&remote, &["rev-parse", "refs/tags/ms-verified"]);
     assert_ne!(
         published, verified,

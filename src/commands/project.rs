@@ -1615,10 +1615,7 @@ fn new_branch(project: &Project, candidate: &Candidate) -> String {
         let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
         adapter.parse_at(&path).ok()?.gist(200)
     });
-    let words = gist
-        .as_deref()
-        .and_then(|gist| branch_words(project, gist))
-        .unwrap_or_default();
+    let words = gist.as_deref().map(branch_words).unwrap_or_default();
     let runtime = match candidate.runtime.as_str() {
         "claude-code" => "claude",
         other => other,
@@ -1641,19 +1638,9 @@ fn new_branch(project: &Project, candidate: &Candidate) -> String {
     }
 }
 
-/// The words of a new branch's name: the opening request as it is published, with every value
-/// publication replaces left out, so nothing replaced in the conversation reaches the name.
-/// `None` when that can't be checked.
-fn branch_words(project: &Project, request: &str) -> Option<String> {
-    let redactor = match checkout(project) {
-        Ok(repo) => crate::domain::redact::Redactor::try_this_machine()
-            .ok()?
-            .with_repository(repo.root())
-            .ok()?,
-        Err(_) => crate::domain::redact::Redactor::try_this_machine().ok()?,
-    };
-    let published = redactor.branch_name_source(&without_markup(request))?;
-    Some(super::front::slug(&published, 40))
+/// The words of a new branch's name: the opening request's own words, as the person typed them.
+fn branch_words(request: &str) -> String {
+    super::front::slug(&without_markup(request), 40)
 }
 
 /// A request's text without the markup a runtime or a paste wraps around it, such as
@@ -9093,6 +9080,20 @@ mod tests {
             "fix-the-login"
         );
         assert_eq!(name("compare a < b and c > d"), "compare-a-b-and-c-d");
+    }
+
+    /// A new session's branch is named by the opening request's own words, as they were typed:
+    /// a value the privacy check would replace elsewhere is kept, like every other word.
+    #[test]
+    fn a_new_branch_keeps_the_requests_words_as_they_are() {
+        assert_eq!(
+            branch_words("ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr"),
+            "ghp-r7kq2mxv9lpz4tnc8wjf3bhy6svd1age5ukr"
+        );
+        assert_eq!(
+            branch_words("use AKIA2E7YQXK4NMZ5VJ3T please"),
+            "use-akia2e7yqxk4nmz5vj3t-please"
+        );
     }
 
     /// A capture named by its request is known by the conversation its line records as opening

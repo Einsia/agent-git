@@ -179,18 +179,13 @@ fn create(
     // nothing protects, so it could never be published as it is.
     let on_session_line = crate::domain::meta::read_at_ref_result(repo, &target.sha)?
         .is_some_and(|metadata| metadata.is_session_line());
-    if on_session_line {
-        if message.is_some() {
-            ui::error("a tag on session history can't carry a message (`-m`).");
-            ui::hint(&format!(
-                "leave out -m: `agit tag {tag} {}` is published on the turn's public commit",
-                ref_.unwrap_or(ctx_branch)
-            ));
-            return Ok(ExitCode::Usage);
-        }
-        if let Some(code) = refuse_unpublishable_name(repo, tag)? {
-            return Ok(code);
-        }
+    if on_session_line && message.is_some() {
+        ui::error("a tag on session history can't carry a message (`-m`).");
+        ui::hint(&format!(
+            "leave out -m: `agit tag {tag} {}` is published on the turn's public commit",
+            ref_.unwrap_or(ctx_branch)
+        ));
+        return Ok(ExitCode::Usage);
     }
     super::echo::emit(
         "tag",
@@ -257,7 +252,7 @@ fn delete(
 }
 
 /// Refuses a tag `agit commit --tag` would put on a session turn before anything lands: a name
-/// git or agit cannot take, one already in use, or one publication would have to change.
+/// git or agit cannot take, or one already in use.
 pub(super) fn refuse_session_tag(repo: &Repo, tag: &str) -> crate::Result<Option<ExitCode>> {
     if !domain_valid_name(tag)
         || repo
@@ -273,22 +268,7 @@ pub(super) fn refuse_session_tag(repo: &Repo, tag: &str) -> crate::Result<Option
         ui::error(&format!("`{tag}` already exists; pick another tag name."));
         return Ok(Some(ExitCode::Precondition));
     }
-    refuse_unpublishable_name(repo, tag)
-}
-
-/// A tag name is published as it is, so it is held to the check a session branch name meets:
-/// nothing the detector, persona masking or a value this device registered would replace.
-fn refuse_unpublishable_name(repo: &Repo, tag: &str) -> crate::Result<Option<ExitCode>> {
-    let redactor =
-        crate::domain::redact::Redactor::try_this_machine()?.with_repository(repo.root())?;
-    if redactor.publishes_unchanged(tag)? {
-        return Ok(None);
-    }
-    ui::error(
-        "this tag name holds text the privacy check would change, so it can't be published as it is.",
-    );
-    ui::hint("pick a plain name that says what the turn did, such as `ms-login-flow`");
-    Ok(Some(ExitCode::Usage))
+    Ok(None)
 }
 
 fn domain_valid_name(name: &str) -> bool {

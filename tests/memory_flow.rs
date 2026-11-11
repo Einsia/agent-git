@@ -755,3 +755,30 @@ fn distill_says_why_a_file_has_nothing_to_carry() {
             .is_none()
     );
 }
+
+/// Memory a session recorded reaches main through distill with a credential in it replaced, even
+/// a value a session branch name or a tag name keeps as it was typed: collecting memory is the
+/// step that still protects it.
+#[test]
+fn memory_distilled_into_main_has_its_credentials_replaced() {
+    const TOKEN: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo, claude, _mem) = fixture(tmp.path());
+    settle_team(
+        &repo,
+        "s1",
+        &format!(
+            "---\nname: team\ndescription: shared\n---\nuid, not user_id\ndeploy with {TOKEN}\n"
+        ),
+    );
+    ok(&agit(
+        &home,
+        &claude,
+        &["distill", "-y", "--into", &format!("{REPO}@s1")],
+    ));
+    let distilled = repo
+        .show("refs/heads/main", "memory/team.md")
+        .expect("the session's memory reaches main");
+    assert!(distilled.contains("deploy with "), "{distilled}");
+    assert!(!distilled.contains(TOKEN), "{distilled}");
+}
