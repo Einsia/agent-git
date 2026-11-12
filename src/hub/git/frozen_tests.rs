@@ -605,9 +605,10 @@ fn partial_branch_rejection_retains_accepted_refs_and_stops_before_tags() {
             recorded_status(&result.0, "refs/heads/main"),
             super::super::PublicationStatus::Updated
         );
+        // Git refuses the non-fast-forward update itself, so it is known not to have been sent.
         assert_eq!(
             recorded_status(&result.0, "refs/heads/selected"),
-            super::super::PublicationStatus::Unconfirmed
+            super::super::PublicationStatus::Rejected
         );
         let mut expected_remote = BTreeMap::from([
             ("refs/heads/main".into(), base.clone()),
@@ -660,7 +661,7 @@ fn tag_rejection_preserves_branch_success_and_quiet_keeps_machine_acknowledgment
     );
     assert_eq!(
         recorded_status(tags, "refs/tags/outer"),
-        super::super::PublicationStatus::Unconfirmed
+        super::super::PublicationStatus::Rejected
     );
     let mut remote = expected(&plan);
     remote.insert("refs/tags/outer".into(), base);
@@ -982,6 +983,37 @@ fn missing_duplicate_malformed_and_interrupted_records_cannot_complete_a_batch()
         duplicate.refs[0].status,
         super::super::PublicationStatus::Unconfirmed
     );
+    // A ref Git or the Hub refused did not change on the Hub. A missing report or a failed atomic
+    // push says nothing about this ref, so the update may have landed.
+    let refused = |detail: &str| {
+        let records: String = refs
+            .iter()
+            .map(|reference| format!("!\t{}\t{detail}\n", reference.refspec()))
+            .collect();
+        let result = parse(records.into_bytes(), true, 1);
+        assert!(result.complete && !result.ok());
+        result.refs[0].status
+    };
+    for detail in [
+        "[rejected] (non-fast-forward)",
+        "[remote rejected] (deny updating a hidden ref)",
+    ] {
+        assert_eq!(
+            refused(detail),
+            super::super::PublicationStatus::Rejected,
+            "{detail}"
+        );
+    }
+    for detail in [
+        "[rejected] (atomic push failed)",
+        "[remote failure] (remote failed to report status)",
+    ] {
+        assert_eq!(
+            refused(detail),
+            super::super::PublicationStatus::Unconfirmed,
+            "{detail}"
+        );
+    }
     let interrupted = parse(first.into_bytes(), false, 1);
     assert_eq!(
         interrupted.refs[0].status,

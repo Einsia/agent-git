@@ -394,6 +394,83 @@ fn publication_recovery_distinguishes_unattempted_acknowledged_and_unknown_ref_u
     assert!(recovery.contains("(lost acknowledgement)"), "{recovery}");
 }
 
+/// Only a ref the Hub acknowledged (updated, or already at the published object) clears its
+/// branch's pending upload, releases a ref set aside as withdrawn, or clears an oversized mark. A
+/// ref refused by Git or by the Hub (`[remote rejected]`, as for a ref withdrawn or hidden on the
+/// Hub) did not change there, and one with no acknowledgement may not have. A reading that let
+/// through everything but "unconfirmed" would record a refused branch as uploaded and let a
+/// withdrawn ref go.
+#[test]
+fn only_acknowledged_refs_count_as_published() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&temp.path().join("repo")).unwrap();
+    repo.git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        "Publication root",
+    ])
+    .unwrap();
+    let branch = repo.current_branch().unwrap();
+    let plan = crate::domain::repo::publication::PublicationPlan::freeze_selected(&repo, &[branch])
+        .unwrap();
+    let reference = plan.heads()[0].clone();
+    let phase =
+        |status: PublicationStatus, detail: Option<&str>| crate::hub::git::PublicationPhase {
+            attempts: vec![crate::hub::git::PublicationAttempt {
+                batch: 0,
+                outcome: crate::hub::git::Outcome {
+                    code: 0,
+                    stderr: String::new(),
+                },
+                refs: vec![crate::hub::git::PublishedRef {
+                    reference: reference.clone(),
+                    status,
+                    detail: detail.map(str::to_owned),
+                }],
+                complete: true,
+                error: None,
+            }],
+            ..Default::default()
+        };
+    let name = reference.name().to_owned();
+    for (status, detail) in [
+        (PublicationStatus::Updated, None),
+        (PublicationStatus::UpToDate, None),
+    ] {
+        assert_eq!(
+            sessions::acknowledged_refs(std::iter::once(&phase(status, detail)))
+                .collect::<Vec<_>>(),
+            [name.clone()],
+            "{status:?}"
+        );
+    }
+    for (status, detail) in [
+        (
+            PublicationStatus::Rejected,
+            Some("[remote rejected] (deny updating a hidden ref)"),
+        ),
+        (
+            PublicationStatus::Rejected,
+            Some("[rejected] (non-fast-forward)"),
+        ),
+        (
+            PublicationStatus::Unconfirmed,
+            Some("[remote failure] (remote failed to report status)"),
+        ),
+    ] {
+        assert!(
+            sessions::acknowledged_refs(std::iter::once(&phase(status, detail)))
+                .next()
+                .is_none(),
+            "{status:?} {detail:?}"
+        );
+    }
+}
+
 #[test]
 fn inherited_git_routing_is_refused_without_reporting_its_value() {
     for key in [

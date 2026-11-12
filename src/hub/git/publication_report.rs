@@ -134,10 +134,12 @@ impl PublicationAttempt {
         self.complete
             && self.error.is_none()
             && self.outcome.ok()
-            && self
-                .refs
-                .iter()
-                .all(|reference| reference.status != PublicationStatus::Unconfirmed)
+            && self.refs.iter().all(|reference| {
+                matches!(
+                    reference.status,
+                    PublicationStatus::Updated | PublicationStatus::UpToDate
+                )
+            })
     }
 
     /// Refs the destination advertised at their frozen object immediately before this batch,
@@ -216,7 +218,9 @@ impl PublicationAttempt {
             let status = match flag {
                 " " | "*" => PublicationStatus::Updated,
                 "=" => PublicationStatus::UpToDate,
-                // Failure can mean that the server's acknowledgment was lost after publication.
+                "!" if refused(detail) => PublicationStatus::Rejected,
+                // The remote failed to report this ref, or an atomic push failed as a whole: the
+                // update may have landed after the acknowledgment was lost.
                 "!" => PublicationStatus::Unconfirmed,
                 _ => {
                     result.complete = false;
@@ -234,6 +238,26 @@ impl PublicationAttempt {
     }
 }
 
+/// Whether a porcelain `!` record's detail says this ref was refused, so the remote ref did not
+/// change: Git refused the update before sending it, or the Hub answered `ng` for it (a hidden
+/// ref, a withdrawn or erased tombstone, a gate). Git's other `!` records, a remote that failed to
+/// report and an atomic push that failed as a whole, say nothing about this ref; a refusal read
+/// into one of them would drop an update the Hub may hold.
+fn refused(detail: &str) -> bool {
+    const LOCAL: [&str; 8] = [
+        "[rejected] (non-fast-forward)",
+        "[rejected] (already exists)",
+        "[rejected] (fetch first)",
+        "[rejected] (needs force)",
+        "[rejected] (stale info)",
+        "[rejected] (remote ref updated since checkout)",
+        "[rejected] (new shallow roots not allowed)",
+        "[rejected] (remote does not support deleting refs)",
+    ];
+    // The Hub writes its own reason after `[remote rejected]`.
+    detail.starts_with("[remote rejected]") || LOCAL.contains(&detail)
+}
+
 #[derive(Debug)]
 pub struct PublishedRef {
     pub reference: FrozenRef,
@@ -245,5 +269,7 @@ pub struct PublishedRef {
 pub enum PublicationStatus {
     Updated,
     UpToDate,
+    /// The ref was refused, by Git before sending or by the Hub, so the remote ref did not change.
+    Rejected,
     Unconfirmed,
 }
