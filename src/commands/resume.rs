@@ -1984,6 +1984,22 @@ fn committed_log(repo: &Repo, head: &str, snap: &meta::Meta) -> crate::Result<St
     })
 }
 
+/// Whether `link`'s transcript holds work that settlement would still land past `head`, judged
+/// the way a runtime switch judges it. A transcript that cannot be read is not called unsettled,
+/// since nothing shows that it holds anything past `head`.
+pub(crate) fn holds_unsettled_work(
+    repo: &Repo,
+    head: &str,
+    snap: &meta::Meta,
+    link: &Link,
+) -> crate::Result<bool> {
+    let log = committed_log(repo, head, snap)?;
+    let Ok(live) = link.read() else {
+        return Ok(false);
+    };
+    Ok(live_tail(&log, snap, link, &live)? != adapter::Tail::Settled)
+}
+
 /// Finds the store link serving this branch.
 fn lk_for(_repo: &Repo, slug: &str, branch: &str) -> Option<Link> {
     let store = Store::open_or_init().ok()?;

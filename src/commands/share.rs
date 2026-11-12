@@ -120,6 +120,24 @@ pub fn run(mut args: Args) -> CmdResult {
             return Err(error);
         }
     };
+    if !prepared.holds_conversation {
+        ui::error(&format!(
+            "{} holds no conversation yet, so its link would open empty; no share was created",
+            source.label
+        ));
+        match (&source.running, &source.repository, &source.branch) {
+            (Some(running), ..) => {
+                for line in including_running(&source, running) {
+                    ui::hint(&line);
+                }
+            }
+            (None, Some(repository), Some(branch)) => ui::hint(&format!(
+                "`agit log {repository}@{branch}` lists the turns this branch holds"
+            )),
+            _ => {}
+        }
+        return Ok(ExitCode::Precondition);
+    }
     let expire_secs = crate::input_argument(parse_expire(&args.expire))?;
 
     // Passphrase: hashed locally; the plaintext is never uploaded.
@@ -164,6 +182,17 @@ pub fn run(mut args: Args) -> CmdResult {
         writeln!(output, "Complete selected public records:")?;
         privacy_preview::write_session(&mut output, &prepared.protected)?;
         output.flush()?;
+    }
+    if let Some(running) = &source.running {
+        ui::warning(&match source.metadata.turn {
+            Some(turn) => format!(
+                "this link holds the conversation up to turn {turn}; the turn in progress is not in it"
+            ),
+            None => "this link holds the conversation up to its last saved turn; the turn in progress is not in it".to_owned(),
+        });
+        for line in including_running(&source, running) {
+            ui::hint(&line);
+        }
     }
 
     let visibility = if args.public {
@@ -308,6 +337,9 @@ struct ShareSource {
     branch: Option<String>,
     /// The repository a recorded point belongs to.
     repository: Option<String>,
+    /// The conversation still writing to the branch whose tip is the selected point, when its
+    /// transcript holds work that point does not have yet.
+    running: Option<link::Link>,
 }
 
 impl ShareSource {
@@ -329,6 +361,9 @@ struct PreparedShare {
     projection: crate::domain::privacy_publication::SessionProjection,
     report: crate::domain::privacy_publication::ProjectionReport,
     policy_digest: String,
+    /// Whether the copy holds anything a reader sees: records a runtime writes for itself are not
+    /// shown, so a copy of only those opens empty.
+    holds_conversation: bool,
 }
 
 /// Project native content before rendering so truncation cannot hide discovery context.
@@ -376,6 +411,10 @@ fn protected_readable(
         "privacy policy changed while preparing the share"
     );
     Ok(PreparedShare {
+        holds_conversation: parsed
+            .events
+            .iter()
+            .any(|event| crate::adapter::is_conversation(event.kind)),
         text: ui::transcript::render_transcript(&parsed, usize::MAX),
         report: {
             let mut report = projection.report().clone();
@@ -513,6 +552,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         metadata,
         branch: native.branch.clone(),
         repository: None,
+        running: None,
     })
 }
 
@@ -598,6 +638,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
     } else {
         storage::materialize_pair_local(point.repo.root(), &point.sha, limit, limit)?
     };
+    let running = running_conversation(&point, &snapshot);
     if !full_log && snapshot.layout == meta::LayoutVersion::V0 {
         let reachable: std::collections::HashSet<_> = log
             .split_inclusive('\n')
@@ -649,7 +690,68 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         metadata: snapshot,
         branch: point.branch,
         repository: Some(point.slug),
+        running,
     })
+}
+
+/// The one conversation writing to the branch whose tip `point` is, when it has written what
+/// that tip does not hold yet. An older point of the branch, or a branch several conversations
+/// write to, names none.
+fn running_conversation(point: &SharePoint, snapshot: &meta::Meta) -> Option<link::Link> {
+    let branch = point.branch.as_deref()?;
+    let tip = point
+        .repo
+        .git(&[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ])
+        .ok()?;
+    if tip.trim() != point.sha {
+        return None;
+    }
+    let (owner, name) = point.slug.split_once('/')?;
+    let [conversation] = <[link::Link; 1]>::try_from(link::active_for_branch(
+        &Store::open().ok()??,
+        owner,
+        name,
+        branch,
+    ))
+    .ok()?;
+    super::resume::holds_unsettled_work(&point.repo, &point.sha, snapshot, &conversation)
+        .unwrap_or(false)
+        .then_some(conversation)
+}
+
+/// The commands that give a link holding the turn `running` has not settled yet. Waiting for the
+/// turn's end is offered only where its folder saves that turn into the branch by itself and
+/// counts this conversation among the ones it saves; otherwise the wait would end with the branch
+/// where it is.
+fn including_running(source: &ShareSource, running: &link::Link) -> Vec<String> {
+    let mut lines = vec![format!(
+        "`agit share {}` makes a read-only copy of the conversation as it is now, the turn in progress included; it does not upload the conversation to the repository",
+        running.session_id
+    )];
+    let (Some(repository), Some(branch), Some(cwd)) =
+        (&source.repository, &source.branch, running.cwd.as_deref())
+    else {
+        return lines;
+    };
+    let share = format!("agit share {repository}@{branch}");
+    let folder = std::path::Path::new(cwd);
+    if !super::project::captured_by_project(&running.source, &running.session_id, folder) {
+        return lines;
+    }
+    match super::project::saving(folder) {
+        super::project::Saving::Uploads => lines.push(format!(
+            "or, once that turn has ended and uploaded by itself: `{share}`"
+        )),
+        super::project::Saving::Held { held, .. } if held.code == "push_auto_off" => lines.push(
+            format!("or, once that turn has ended and saved on this computer: `{share}`"),
+        ),
+        _ => {}
+    }
+    lines
 }
 
 /// Only writer-shaped synthetic content may be absent from a legacy VIEW's LOG.
@@ -870,6 +972,88 @@ mod tests {
     }
 
     /// The selected session's ref owns the shared transcript even when another ref is checked out.
+    /// The step "share the branch once the turn has ended" is offered only for a conversation the
+    /// folder saves by itself. In a folder that uploads by itself, a Claude Code conversation gets
+    /// it; an OpenCode one that agit's plugin never ran for does not, since its turn never reaches
+    /// the branch. Judging by the folder's state alone gives both the step.
+    #[test]
+    fn waiting_for_the_turn_is_offered_only_for_a_conversation_the_folder_saves() {
+        if crate::rc::in_isolated_test(
+            "commands::share::tests::waiting_for_the_turn_is_offered_only_for_a_conversation_the_folder_saves",
+        ) {
+            return;
+        }
+        const HUB: &str = "https://example.test";
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path());
+            std::env::set_var("AGIT_HUB_URL", HUB);
+        }
+        crate::infra::credentials::save_at(
+            &home
+                .path()
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(HUB).unwrap())),
+            &crate::infra::credentials::HubCredential {
+                account_id: Some("alice".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(HUB.into()),
+                access_token: "fixture-access".into(),
+                refresh_token: "fixture-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let folder = home.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let folder = folder.canonicalize().unwrap();
+        crate::commands::project::save_policy_for_test(
+            &folder,
+            "alice/app",
+            &crate::hub::identity::RemoteIdentity::new(HUB, "bbbbbbbb-0000-4000-8000-000000000002")
+                .unwrap(),
+            "alice",
+        );
+        assert_eq!(
+            crate::commands::project::saving(&folder),
+            crate::commands::project::Saving::Uploads
+        );
+        let source = ShareSource {
+            raw: String::new(),
+            envelope: None,
+            runtime: "claude-code".into(),
+            label: "VIEW of alice/app@talk".into(),
+            selection_source: crate::commands::echo::Source::Explicit,
+            protection_repo: None,
+            projection_log: None,
+            metadata: meta::Meta::new_file_line(),
+            branch: Some("talk".into()),
+            repository: Some("alice/app".into()),
+            running: None,
+        };
+        let lines = |runtime: &str| {
+            let conversation = link::Link::new(
+                runtime,
+                "46246246-0000-4000-8000-000000000001",
+                Some(&folder),
+            );
+            including_running(&source, &conversation)
+        };
+        let wait =
+            "or, once that turn has ended and uploaded by itself: `agit share alice/app@talk`";
+        assert!(lines("claude-code").iter().any(|line| line == wait));
+        let opencode = lines("opencode");
+        assert!(
+            !opencode
+                .iter()
+                .any(|line| line.contains("once that turn has ended")),
+            "{opencode:?}"
+        );
+        assert!(opencode[0].starts_with("`agit share 46246246-0000-4000-8000-000000000001`"));
+    }
+
     #[test]
     fn a_session_in_a_linked_worktree_is_read_from_its_branch() {
         let d = tempfile::tempdir().unwrap();

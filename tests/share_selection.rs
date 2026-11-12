@@ -312,11 +312,15 @@ impl Fixture {
     }
 
     fn run_command(&self, subcommand: &str, args: &[&str], session: Option<&str>) -> Output {
+        self.run_agit(&["-y", subcommand], args, session)
+    }
+
+    fn run_agit(&self, leading: &[&str], args: &[&str], session: Option<&str>) -> Output {
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command
-            .args(["-y", subcommand])
+            .args(leading)
             .args(args)
             .env_clear_local()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -342,7 +346,7 @@ impl Fixture {
             if Instant::now() > deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{subcommand} subprocess exceeded its deadline");
+                panic!("{leading:?} subprocess exceeded its deadline");
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -1059,6 +1063,132 @@ fn a_repaired_copy_of_a_merged_session_shares() {
     );
 
     f.success(&["me/paper@merged-repaired", "--public"], None);
+}
+
+/// A share of a conversation whose turn is still running never hands out a link that silently
+/// lacks it. A point with no conversation yet is refused before anything reaches the Hub, and the
+/// refusal names commands that work as printed: the session ID one shares the turn in progress.
+/// A point with earlier turns is shared, and the output says which turn the link stops at, at
+/// the confirmation, before any link exists. An
+/// implementation that uploads the empty copy, or shares the earlier turns without saying so,
+/// fails here.
+#[test]
+fn a_share_during_a_running_turn_is_refused_when_empty_and_says_where_it_stops() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let id = "46246246-2462-4462-8462-462462462462";
+    let record = |kind: &str, text: &str| {
+        let content = if kind == "user" {
+            json!(text)
+        } else {
+            json!([{"type": "text", "text": text}])
+        };
+        format!(
+            "{}\n",
+            json!({"type": kind, "sessionId": id, "message": {"role": kind, "content": content}})
+        )
+    };
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{id}.jsonl"));
+    std::fs::write(&transcript, record("user", "RUNNING-FIRST-TURN")).unwrap();
+    let mut conversation = link::Link::new("claude-code", id, Some(f.home()));
+    conversation.owner = Some("me".into());
+    conversation.agent = Some("paper".into());
+    conversation.branch = Some("talk".into());
+    link::write(&Store::at(f.home().join("store")), &conversation).unwrap();
+
+    f.repo.git(&["checkout", "-b", "talk", "main"]).unwrap();
+    storage::write_snapshot(f.repo.root(), "", "").unwrap();
+    let mut snapshot = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        f.home().to_string_lossy().into(),
+    );
+    meta::write(f.repo.root(), &snapshot).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo.commit("new session talk").unwrap();
+    f.repo.git(&["checkout", "main"]).unwrap();
+
+    let session_share = format!("agit share {id}");
+    for (args, session) in [
+        (vec![], Some("me/paper@talk")),
+        (vec!["me/paper@talk"], None),
+        (vec!["me/paper@talk", "--full-log"], None),
+    ] {
+        let before = f.hub.payloads().len();
+        let out = f.run(&args, session);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert_eq!(f.hub.payloads().len(), before, "{stderr}");
+        assert!(stderr.contains("its link would open empty"), "{stderr}");
+        assert!(stderr.contains(&format!("`{session_share}`")), "{stderr}");
+        assert!(!stderr.contains("once that turn has ended"), "{stderr}");
+    }
+    let live = f.success(&[id], None);
+    assert!(decrypted(&f, &live).contains("RUNNING-FIRST-TURN"));
+
+    let settled = record("user", "SETTLED-TURN") + &record("assistant", "SETTLED-REPLY");
+    std::fs::write(
+        &transcript,
+        settled.clone() + &record("user", "RUNNING-SECOND-TURN"),
+    )
+    .unwrap();
+    let log = transcript::wrap_lines(&settled, "claude-code", &snapshot.session);
+    f.repo.git(&["checkout", "talk"]).unwrap();
+    storage::write_snapshot(f.repo.root(), &log, &log).unwrap();
+    snapshot.turn = Some(1);
+    meta::write(f.repo.root(), &snapshot).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo.commit("turn 1").unwrap();
+    f.repo.git(&["checkout", "main"]).unwrap();
+    for (args, session) in [
+        (vec![], Some("me/paper@talk")),
+        (vec!["me/paper@talk"], None),
+        (vec!["me/paper@talk", "--full-log"], None),
+    ] {
+        let out = f.success(&args, session);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "this link holds the conversation up to turn 1; the turn in progress is not in it"
+            ),
+            "{stderr}"
+        );
+        assert!(stderr.contains(&format!("`{session_share}`")), "{stderr}");
+        let copy = decrypted(&f, &out);
+        assert!(copy.contains("SETTLED-REPLY") && !copy.contains("RUNNING-SECOND-TURN"));
+    }
+    let before = f.hub.payloads().len();
+    let unconfirmed = f.run_agit(&["share"], &[], Some("me/paper@talk"));
+    let stderr = String::from_utf8_lossy(&unconfirmed.stderr);
+    let stops = stderr.find("up to turn 1; the turn in progress is not in it");
+    let asks = stderr.find("requires confirmation");
+    assert!(stops.is_some() && stops < asks, "{stderr}");
+    assert_eq!(f.hub.payloads().len(), before);
+}
+
+/// The plaintext of the encrypted copy the last share sent, read with the key from its link.
+fn decrypted(f: &Fixture, output: &Output) -> String {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+    use base64::Engine;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let key = stdout
+        .split("#k=")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let request = f.hub.payloads().pop().unwrap();
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let blob = engine.decode(request["payload"].as_str().unwrap()).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&engine.decode(key).unwrap()).unwrap();
+    String::from_utf8(
+        cipher
+            .decrypt(Nonce::from_slice(&blob[..12]), &blob[12..])
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 fn head_of(repo: &Repo, branch: &str) -> String {
