@@ -580,8 +580,10 @@ pub fn run(args: Args) -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-/// Puts the sessions that ran in the folder of `cwd` first, then active claims ahead of recovery
-/// history within each part, without using filesystem timestamps, and returns how many lead.
+/// Puts the sessions that ran in the folder of `cwd` first, then, within each part, active claims
+/// ahead of recovery history and the most recently settled ahead of the rest, and returns how many
+/// lead. The time is the one each link records when a settlement lands turns, so ordering reads
+/// no commit and no filesystem timestamp; a link with none keeps the store's order after the rest.
 ///
 /// The folder follows the front door's rule; a home directory or filesystem root has none, so
 /// nothing leads there.
@@ -590,8 +592,9 @@ fn order(links: &mut Vec<link::Link>, cwd: &std::path::Path) -> usize {
     let (mut here, mut rest): (Vec<_>, Vec<_>) = std::mem::take(links)
         .into_iter()
         .partition(|link| folder.as_deref().is_some_and(|folder| ran_in(link, folder)));
-    here.sort_by_key(|link| !link.is_active());
-    rest.sort_by_key(|link| !link.is_active());
+    let newest_first = |link: &link::Link| (!link.is_active(), std::cmp::Reverse(link.settled_at));
+    here.sort_by_key(newest_first);
+    rest.sort_by_key(newest_first);
     let leading = here.len();
     here.append(&mut rest);
     *links = here;

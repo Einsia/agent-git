@@ -2222,10 +2222,13 @@ fn attach(
     };
     // Destination selection can wait on remote permissions. Its link snapshot cannot replace a
     // claim, supersession marker or watermark another writer publishes while that request waits.
+    // What a settlement records about itself (its checkpoint, prefixes and time) is not a change
+    // of claim, and the link written below starts from the current one, so it keeps them.
     let claim_json = |link: &Link| {
         let mut claim = link.clone();
         claim.native_checkpoint = None;
         claim.settled_prefixes.clear();
+        claim.settled_at = None;
         claim.to_json()
     };
     if current.as_ref().map(claim_json).transpose()?

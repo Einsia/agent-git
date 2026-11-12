@@ -1113,6 +1113,13 @@ fn a_renamed_branch_keeps_its_conversation_saving_to_it() {
 
     let after = rev("refs/heads/me-first").expect("the renamed branch");
     assert_ne!(after, before, "the hook saved nothing after the rename");
+    // The settlement that landed the turn records when, which `agit status` orders by.
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    assert!(
+        agit::domain::link::get(&store, "claude-code", id)
+            .is_some_and(|claim| claim.settled_at.is_some()),
+        "the settlement recorded no time"
+    );
     assert_eq!(
         rev("refs/heads/me-first^").as_deref(),
         Some(before.as_str())
@@ -2028,6 +2035,55 @@ fn a_conversation_saved_elsewhere_is_said_so_and_no_retry_is_offered() {
     );
     assert!(value["next"].is_null(), "{document}");
     assert!(lab.created().is_empty(), "nothing is created on the Hub");
+}
+
+/// `agit status` lists a folder's conversations newest first, by when a settlement last landed
+/// turns on each one's branch, so the newest is on the first page whatever its runtime. In the
+/// store's order, by runtime and then id, an OpenCode conversation follows every Claude Code one,
+/// and a folder with more conversations than a page hides its newest one past the first page. A
+/// claim with no settlement recorded sorts after the settled ones, and a later settlement of the
+/// older conversation brings it back to the front. `--offset` still reaches every claim.
+#[test]
+fn status_lists_a_folders_newest_conversation_first() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let claim = |runtime: &str, id: &str, branch: &str, settled_at: Option<i64>| {
+        let mut claim = agit::domain::link::Link::new(runtime, id, Some(&dir));
+        claim.owner = Some("me".into());
+        claim.agent = Some("parley".into());
+        claim.branch = Some(branch.into());
+        claim.settled_at = settled_at;
+        agit::domain::link::write(&store, &claim).unwrap();
+    };
+    const CLAUDE: &str = "28282828-2828-4282-8282-282828282828";
+    const OPENCODE: &str = "ses_newer_in_parley";
+    const NEVER: &str = "29292929-2929-4292-8292-292929292929";
+    claim("claude-code", CLAUDE, "claude-older", Some(1_793_000_000));
+    claim("opencode", OPENCODE, "opencode-newer", Some(1_793_000_600));
+    claim("claude-code", NEVER, "never-settled", None);
+    let page = |offset: &str| -> Vec<String> {
+        let out = lab.agit(
+            &dir,
+            &["--json", "status", "--limit", "1", "--offset", offset],
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{out:?}"));
+        let sessions = &document["result"]["value"]["sessions"];
+        assert_eq!(sessions["total"], 3, "{document}");
+        sessions["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| Some(item["session_id"].as_str()?.to_owned()))
+            .collect()
+    };
+    assert_eq!(page("0"), [OPENCODE]);
+    assert_eq!(page("1"), [CLAUDE]);
+    assert_eq!(page("2"), [NEVER]);
+
+    claim("claude-code", CLAUDE, "claude-older", Some(1_793_001_200));
+    assert_eq!(page("0"), [CLAUDE]);
 }
 
 /// `agit save` finds an OpenCode conversation in a folder that is on, though OpenCode tells agit
