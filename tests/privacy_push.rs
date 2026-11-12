@@ -2182,6 +2182,141 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     );
 }
 
+/// A push that meets another upload of the same repository preparing its snapshots waits for that
+/// upload's lock and publishes once it is released; one still blocked when the bound runs out says
+/// another upload is in progress and names the push to run again, not the operating system's lock
+/// error, and sends nothing. A push that only tries the lock fails at once while the other upload
+/// holds it, so it never reaches the second publication, and one that waits without a bound never
+/// gives the first answer.
+#[test]
+fn a_push_waits_a_bounded_time_for_another_upload_of_its_repository() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let command = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", home.join("codex"))
+            .env("CLAUDE_CONFIG_DIR", home.join("claude"))
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args);
+        command
+    };
+    let run = |args: &[&str]| command(args).output().unwrap();
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    for (key, value) in [
+        ("http.userAgent", TRANSPORT_USER_AGENT),
+        ("user.name", "Source Writer"),
+        ("user.email", "source@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ] {
+        repo.git(&["config", key, value]).unwrap();
+    }
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["new", "alice/app", "-b", "work", "--no-launch"]));
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    // Another upload of the repository is preparing: it holds the publication lock exclusively.
+    let lock_path = repo.root().join(".git/agit/privacy-publication/lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap()
+    };
+    let upload =
+        agit::infra::local_state::HeldLock::try_exclusive(open(), &lock_path, "held").unwrap();
+
+    let blocked = command(&["push", "alice/app@work"])
+        .env("AGIT_TEST_LOCK_WAIT_MS", "200")
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success(), "{blocked:?}");
+    let said = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        said.contains(
+            "another upload of this repository is in progress; run `agit push alice/app --branch=work` again once it finishes"
+        ),
+        "{blocked:?}"
+    );
+    assert!(!said.contains("os error"), "{blocked:?}");
+    assert!(git(&remote, &["for-each-ref", "refs/heads/work"]).is_empty());
+
+    let mut waiting = command(&["push", "alice/app@work"])
+        .env("AGIT_DIAGNOSE_LOCK_WAITS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(waiting.stderr.take().unwrap());
+    let mut said = String::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stderr.read_line(&mut line).unwrap(),
+            0,
+            "the push ended without waiting for the lock: {said}"
+        );
+        said.push_str(&line);
+        if line.starts_with("agit lock wait: this repository's publication lock (")
+            && line.trim_end().ends_with(" waiting")
+        {
+            break;
+        }
+    }
+    drop(upload);
+    stderr.read_to_string(&mut said).unwrap();
+    let waited = waiting.wait().unwrap();
+    assert!(waited.success(), "{said}");
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/work"]),
+        git(repo.root(), &["rev-parse", "refs/heads/work"])
+    );
+}
+
 /// A receipt the Hub refuses because the repository's refs moved after the preview (another
 /// member's push to any branch), or because it had expired when the upload arrived, is previewed
 /// again, once, from the start. The second attempt reads

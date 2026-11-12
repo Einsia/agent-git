@@ -635,6 +635,13 @@ pub(crate) fn accepted_session_identity(
         .map(|mapping| (mapping.public_session.clone(), mapping.public.clone())))
 }
 
+/// The repository's publication lock, by the name an error gives it when it stays held past the
+/// wait. An upload holds it exclusively while it prepares its snapshots, for as long as its
+/// sessions take, and readers of a publication store hold it shared. Every taker waits a bounded
+/// time ([`crate::infra::local_state::LOCK_WAIT`]): one that only tried it would fail whenever
+/// another upload of the repository was preparing, however soon that upload let go.
+pub(crate) const PUBLICATION_LOCK: &str = "this repository's publication lock";
+
 pub(crate) fn publication_envelope(
     source: &Repo,
     branch: Option<&str>,
@@ -648,10 +655,10 @@ pub(crate) fn publication_envelope(
         .read(true)
         .open(&lock_path);
     let _lock = match lock {
-        Ok(lock) => Some(crate::infra::local_state::HeldLock::try_shared(
+        Ok(lock) => Some(crate::infra::local_state::HeldLock::shared(
             lock,
             &lock_path,
-            "publication state is busy; retry",
+            PUBLICATION_LOCK,
         )?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
@@ -700,11 +707,7 @@ fn receipt_cache(
     let lock = crate::infra::config::state_file_options()
         .read(true)
         .open(&lock_path)?;
-    let lock = crate::infra::local_state::HeldLock::try_shared(
-        lock,
-        &lock_path,
-        "privacy publication cache is being updated; retry",
-    )?;
+    let lock = crate::infra::local_state::HeldLock::shared(lock, &lock_path, PUBLICATION_LOCK)?;
     let ledger = accepted::Ledger::open(source, &receipt.destination)?;
     let store = ledger
         .receipt_store(receipt)?
