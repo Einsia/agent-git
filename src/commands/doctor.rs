@@ -184,6 +184,7 @@ pub fn run(args: Args) -> CmdResult {
     checks.extend(skill_installation_checks());
     checks.extend(claude_mcp_check());
     checks.extend(claude_hooks_check());
+    checks.extend(opencode_plugin_check());
     checks.extend(unloadable_skill_checks());
     if let Some(row) = codex_hooks_row() {
         checks.push(("codex hooks".into(), row));
@@ -927,6 +928,33 @@ fn claude_hooks_check() -> Option<(String, Check)> {
         ))
     };
     Some(("hooks claude-code".into(), row))
+}
+
+/// OpenCode tells agit a turn ended only through agit's plugin, so without it OpenCode's turns
+/// upload when someone saves them, not as they end. No row where OpenCode is not installed.
+/// Installing the plugin is the person's decision, so the row says to ask first.
+fn opencode_plugin_check() -> Option<(String, Check)> {
+    use super::setup::native::{OpencodePlugin, opencode_plugin_path, opencode_plugin_state};
+    if !crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available()) {
+        return None;
+    }
+    let path = opencode_plugin_path()?;
+    let install = "`agit setup --runtime opencode --hooks` installs it; an agent asks the person before running it";
+    let row = match opencode_plugin_state(&path, &super::setup::exe_str()) {
+        OpencodePlugin::Current => Check::Ok(path.display().to_string()),
+        OpencodePlugin::Older => Check::Warn(format!(
+            "{} is from another agit, so OpenCode may not reach this one when a turn ends. {install}",
+            path.display()
+        )),
+        OpencodePlugin::Absent => Check::Warn(format!(
+            "not installed, so OpenCode's turns upload only when someone saves them. {install}"
+        )),
+        OpencodePlugin::Foreign => Check::Warn(format!(
+            "{} is a file agit did not write, so agit's plugin is not installed and that file was left as it is",
+            path.display()
+        )),
+    };
+    Some(("hooks opencode".into(), row))
 }
 
 /// Whether Codex runs AgentGit's hooks, as Codex itself reports them for this directory. No row

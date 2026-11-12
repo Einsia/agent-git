@@ -7,8 +7,9 @@
 //!   workspace as pending adoption. Discovery answers only "which ones exist". Claude Code,
 //!   hook-capable Codex and WorkBuddy receive `agit hooks` commands in their hook settings, one
 //!   entry per hook whatever path agit runs from; Hermes and OpenClaw receive their native
-//!   lifecycle integration. Other runtimes keep using the instruction-injected `agit commit`
-//!   discipline.
+//!   lifecycle integration; OpenCode receives one plugin file, `opencode/plugin/agit.js` under
+//!   `$XDG_CONFIG_HOME` or `~/.config`, that settles a conversation when it goes idle. Other
+//!   runtimes keep using the instruction-injected `agit commit` discipline.
 //! * `--skill`: install one entrypoint plus command references read on demand into each runtime's
 //!   native Skill directory:
 //!   - claude-code → `~/.claude/skills/agit/`
@@ -45,7 +46,7 @@ pub(crate) mod claude_mcp;
 mod codex_trust;
 mod json_text;
 mod legacy;
-mod native;
+pub(crate) mod native;
 pub mod presence;
 pub(crate) mod skill_off;
 
@@ -383,6 +384,16 @@ fn run_setup(mut args: Args) -> CmdResult {
     } else {
         ui::info(format_args!("Nothing to install."));
     }
+    // OpenCode loads the plugin from outside agit's own folders, so a caller reading JSON is told
+    // where it is, as a person reads it in the lines above.
+    if hooks
+        && super::json::requested()
+        && let Some(path) = native::opencode_plugin_path().filter(|path| {
+            native::opencode_plugin_state(path, &exe_str()) == native::OpencodePlugin::Current
+        })
+    {
+        println!("{}", serde_json::json!({"opencode_plugin": path}));
+    }
     // The installer that ran this setup says the next steps itself, last.
     if all
         && !args.installed_only
@@ -609,6 +620,12 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
                 native::openclaw(&exe)
             });
         }
+    }
+    if runtime.wants("opencode")
+        && (runtime.named("opencode")
+            || crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available()))
+    {
+        report.merge(native::opencode(&exe));
     }
 
     report
@@ -1037,8 +1054,10 @@ pub(super) fn codex_hooks_enabled_within(
 
 /// The runtimes whose hooks can capture project sessions automatically. Codex counts only when
 /// it reports an enabled hooks feature; a Codex that cannot does not take Claude Code capture
-/// down with it, and its sessions remain available to manual project sync.
-pub(super) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
+/// down with it, and its sessions remain available to manual project sync. OpenCode counts when
+/// it is installed: binding sets it up with `--hooks`, which writes its plugin, and its
+/// conversations then upload once the plugin ran for each of them.
+pub(crate) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
     let mut runtimes = Vec::new();
     if crate::adapter::get("claude-code")?.available() {
         runtimes.push("claude-code");
@@ -1052,8 +1071,11 @@ pub(super) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
             );
         }
     }
+    if crate::adapter::get("opencode")?.available() {
+        runtimes.push("opencode");
+    }
     if runtimes.is_empty() {
-        let text = "no agent here can save its conversations by itself: install Claude Code, or turn on Codex's hooks feature; `agit project sync` uploads by hand meanwhile";
+        let text = "no agent here can save its conversations by itself: install Claude Code or OpenCode, or turn on Codex's hooks feature; `agit project sync` uploads by hand meanwhile";
         super::fix::refuse("no_capture_runtime", text, serde_json::json!({}));
         anyhow::bail!("{text}");
     }
@@ -1505,6 +1527,17 @@ fn remove_skill(targets: Targets<'_>) -> CmdResult {
             ui::warning(&format!(
                 "cannot remove agit's Skill from {}: {error}",
                 dir.display()
+            ));
+            failed = true;
+            continue;
+        }
+        if name == "opencode"
+            && let Some(path) = native::opencode_plugin_path()
+            && let Err(error) = native::remove_opencode(&path)
+        {
+            ui::warning(&format!(
+                "cannot remove agit's OpenCode plugin {}: {error}",
+                path.display()
             ));
             failed = true;
             continue;
@@ -2350,7 +2383,7 @@ fn home() -> Option<PathBuf> {
 /// whenever an update moves the file, and an untrusted hook saves nothing. Without such a link the
 /// executable's own path is used, except one a cache cleanup or temporary directory removes, for
 /// which another `agit` on `PATH` is preferred; setup says which path it wrote either way.
-fn exe_str() -> String {
+pub(crate) fn exe_str() -> String {
     static CHOSEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     CHOSEN
         .get_or_init(|| {
