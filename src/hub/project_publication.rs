@@ -15,6 +15,25 @@ pub(crate) struct Target {
     pub repository_id: String,
     #[serde(default)]
     pub encryption_enabled: Option<bool>,
+    /// The account that made this folder binding on the web; absent for a binding made before
+    /// the Hub recorded it.
+    #[serde(default)]
+    pub bound_by: Option<String>,
+    /// Whether the device's account is the only account that can bind folders in the workspace.
+    #[serde(default)]
+    pub sole_binder: Option<bool>,
+}
+
+impl Target {
+    /// Whether this binding is the device's own account's choice, `account` as the device's
+    /// sign-in names it: made by that account, or, for a binding older than the Hub's record of
+    /// who made it, in a workspace where no other account can bind a folder.
+    pub(crate) fn bound_by_account(&self, account: &str) -> bool {
+        match &self.bound_by {
+            Some(bound_by) => bound_by == account,
+            None => self.sole_binder == Some(true),
+        }
+    }
 }
 
 impl Target {

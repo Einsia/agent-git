@@ -1174,12 +1174,21 @@ impl Daemon {
             let repository =
                 crate::rc::local_repository::ensure_repository(&p.project_id, &project)
                     .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
+            let branch = format!("desktop-{}", start_id.as_deref().unwrap_or_default());
+            // Its uploads are judged by this project's own destination.
+            (|| -> crate::Result<()> {
+                let repo =
+                    crate::rc::local_repository::require(&crate::rc::lineage::AgitSession::new(
+                        &repository.slug,
+                        &repository.agent_id,
+                        "main",
+                    )?)?;
+                crate::rc::local_repository::note_session_project(&repo, &branch, &p.project_id)
+            })()
+            .map_err(|e| RpcError::new(ErrorCode::Internal, e.to_string()))?;
             p.agent = Some(repository.slug);
             p.expected_agent_id = Some(repository.agent_id);
-            p.branch = Some(format!(
-                "desktop-{}",
-                start_id.as_deref().unwrap_or_default()
-            ));
+            p.branch = Some(branch);
         }
         let mode = p
             .permission_mode

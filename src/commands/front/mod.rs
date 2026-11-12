@@ -1466,3 +1466,35 @@ mod tests {
         assert_eq!(slug("修复登录跳转", 40), "");
     }
 }
+
+/// Asks once, at a terminal that can prompt, about a binding set on the web for `root` that this
+/// computer can't take by itself. Returns the repository when the person said yes; it is then the
+/// folder's destination. Nothing is asked from a hook, in the background or with `AGIT_YES`.
+pub(crate) fn ask_web_binding(root: &Path) -> Result<Option<String>> {
+    use crate::rc::folder_destination as folder;
+    if std::env::var_os("AGIT_YES").is_some() || !ui::prompt::may_prompt() {
+        return Ok(None);
+    }
+    let Some(key) = folder::Key::signed_in(root, &crate::infra::config::hub_url())? else {
+        return Ok(None);
+    };
+    let Some((project, binding)) = folder::unasked(&key)? else {
+        return Ok(None);
+    };
+    let yes = ui::prompt::confirm(&folder::question(&binding.repository), false)? == Some(true);
+    folder::answer(&key, &project, &binding, yes)?;
+    Ok(yes.then_some(binding.repository))
+}
+
+/// For `agit status`: a binding set on the web for `root` that this computer holds for the person
+/// to decide, and the command that asks about it.
+pub(crate) fn web_binding_waiting(root: &Path) -> Option<String> {
+    use crate::rc::folder_destination as folder;
+    let key = folder::Key::signed_in(root, &crate::infra::config::hub_url()).ok()??;
+    let binding = folder::waiting(&key).ok()??;
+    Some(format!(
+        "{} {} was set on the web for this folder; `agit on` here asks whether to use it",
+        folder::HELD,
+        binding.repository
+    ))
+}

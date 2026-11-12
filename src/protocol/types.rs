@@ -894,6 +894,9 @@ pub enum PublicationReason {
     BindingInvalid,
     PushDisabled,
     DestinationMissing,
+    /// A destination is saved, but it isn't the one chosen for this conversation's own project
+    /// under the account signed in on the device, so its turns stay there until it is.
+    DestinationUnconfirmed,
     ConsentRequired,
     EligibilityUnchecked,
     PublicationPending,

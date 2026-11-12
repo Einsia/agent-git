@@ -103,6 +103,8 @@ pub(super) struct Prepared {
     native_source: Option<crate::protocol::NativeSourceRef>,
     runtime: String,
     lineage: AgitSession,
+    /// The project the session runs in, when it was started in one.
+    project: Option<String>,
     credential_dir: PathBuf,
     after: Option<String>,
 }
@@ -150,6 +152,7 @@ impl Daemon {
             native_source: row.native_source.clone(),
             runtime: scope.runtime.clone(),
             lineage,
+            project: row.project_id.clone(),
             credential_dir: store::directory().map_err(|_| unavailable())?,
             after: request.after,
         })
@@ -236,15 +239,22 @@ impl Prepared {
     ) -> Result<Value, RpcError> {
         let grant = self.authority.publication_grant()?;
         let lineage = self.lineage.clone();
+        let project = self.project.clone();
         let (native, runtime, issuer) = (
             self.native.clone(),
             self.runtime.clone(),
             grant.target.owner.issuer.clone(),
         );
-        let (repo_path, destination, records) = blocking(move || {
+        let (repo_path, destination, records, held) = blocking(move || {
             let path = lineage.repo_dir()?;
             let repo = Repo::open(&path).context("publication repository is missing")?;
-            let destination = crate::rc::capture::destination(&repo, &lineage)?;
+            let confirmed =
+                crate::rc::capture::confirmed_destination(&repo, &lineage, project.as_deref())?;
+            let destination = match &confirmed {
+                crate::rc::capture::Confirmed::Missing => None,
+                crate::rc::capture::Confirmed::Held(destination)
+                | crate::rc::capture::Confirmed::Ready(destination) => Some(destination.clone()),
+            };
             // A grant speaks for the Hub that issued it, so it confirms publications on that Hub
             // alone; one Hub's grant never vouches for a capture another Hub receives.
             if let Some(destination) = &destination {
@@ -253,8 +263,16 @@ impl Prepared {
                     "publication Hub differs from the grant's"
                 );
             }
-            let records = Entry::records(&repo, lineage.branch(), &native, &runtime)?;
-            Ok((path, destination, records))
+            let mut records = Entry::records(&repo, lineage.branch(), &native, &runtime)?;
+            // What was prepared for a destination the folder no longer uploads to stays here.
+            if let Some(destination) = &destination {
+                records.retain(|entry| {
+                    entry.request().destination == destination.identity
+                        && entry.request().repository == destination.repository
+                });
+            }
+            let held = matches!(confirmed, crate::rc::capture::Confirmed::Held(_));
+            Ok((path, destination, records, held))
         })
         .await?;
         let Some(destination) = destination else {
@@ -266,6 +284,15 @@ impl Prepared {
                 crate::protocol::PublicationReason::DestinationMissing,
             ));
         };
+        if held {
+            self.authority.publication_grant()?;
+            self.check_lineage(&*daemon.lock().await)?;
+            return Ok(setup_response(
+                &self.logical,
+                &records,
+                crate::protocol::PublicationReason::DestinationUnconfirmed,
+            ));
+        }
         let path = repo_path.clone();
         let target = destination.clone();
         let (native, runtime) = (self.native.clone(), self.runtime.clone());
@@ -501,7 +528,10 @@ fn setup_response(
             Progress::LocalSaved
         },
         stage: Some(
-            if matches!(reason, Reason::PushDisabled | Reason::DestinationMissing) {
+            if matches!(
+                reason,
+                Reason::PushDisabled | Reason::DestinationMissing | Reason::DestinationUnconfirmed
+            ) {
                 Stage::Configuration
             } else {
                 Stage::Consent
@@ -682,6 +712,7 @@ mod status_tests {
             native_source: Some(source),
             runtime: "codex".into(),
             lineage,
+            project: None,
             credential_dir: PathBuf::new(),
             after: None,
         };

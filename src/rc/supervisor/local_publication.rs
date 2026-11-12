@@ -38,11 +38,19 @@ impl Session {
                 .agit_session
                 .as_ref()
                 .context("capture binding is missing")?;
-            let Some(destination) = crate::rc::capture::destination(&repo, lineage)? else {
-                status.readiness = Readiness::SetupRequired;
-                status.stage = Some(Stage::Configuration);
-                status.reason = Some(Reason::DestinationMissing);
-                return Ok(None);
+            let (destination, held) = match crate::rc::capture::confirmed_destination(
+                &repo,
+                lineage,
+                self.info.project_id.as_deref(),
+            )? {
+                crate::rc::capture::Confirmed::Missing => {
+                    status.readiness = Readiness::SetupRequired;
+                    status.stage = Some(Stage::Configuration);
+                    status.reason = Some(Reason::DestinationMissing);
+                    return Ok(None);
+                }
+                crate::rc::capture::Confirmed::Held(destination) => (destination, true),
+                crate::rc::capture::Confirmed::Ready(destination) => (destination, false),
             };
             status.target = Some(destination.target());
             ensure!(
@@ -55,6 +63,14 @@ impl Session {
                 .context("RC native session is unavailable")?;
             // Off means no attempt at all: nothing is sent, recorded or shown.
             if !crate::commands::auto_push::publication_allowed(&repo, &destination.repository)? {
+                return Ok(None);
+            }
+            // Kept here until this project's own destination is confirmed on this computer.
+            if held {
+                tracing_note(crate::rc::folder_destination::HELD);
+                status.readiness = Readiness::SetupRequired;
+                status.stage = Some(Stage::Configuration);
+                status.reason = Some(Reason::DestinationUnconfirmed);
                 return Ok(None);
             }
             if crate::rc::folder_cutoff::holds_back(&repo, &self.info.runtime, &native_session_id) {

@@ -12097,3 +12097,124 @@ fn a_file_lines_record_is_published_as_it_is() {
         );
     }
 }
+
+/// `agit on --repo` moves a folder that is on to another repository: its terminal sessions go
+/// there from then on, and so does the folder's destination record, which the conversations
+/// started for it on the web follow. A web binding by the device's own account moves a folder the
+/// same way, through this command.
+#[test]
+fn turning_a_folder_on_for_another_repository_moves_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let hub = Hub::start(&remote_root, [38; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    // A stand-in `claude`, so a folder turned on finds a runtime to capture.
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(bin.join("claude.cmd"), "@exit /b 0\r\n").unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // The destination exists on the Hub; this computer has no checkout of it.
+    let checkout = home.join("repos/alice/app");
+    let repo = Repo::init(&checkout).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    fs::remove_dir_all(&checkout).unwrap();
+    let folder = temp.path().join("folder");
+    fs::create_dir(&folder).unwrap();
+    let folder = folder.canonicalize().unwrap();
+    let folder_arg = folder.to_str().unwrap();
+    // The folder is on for another repository, as `agit on` records it.
+    {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(folder.to_string_lossy().as_bytes()));
+        fs::create_dir_all(home.join("projects")).unwrap();
+        fs::write(
+            home.join("projects")
+                .join(format!("{}.json", &digest[..24])),
+            serde_json::to_vec_pretty(&json!({
+                "root": folder, "repository": "alice/old",
+                "identity": {"hub": hub.base, "agent_id": "11111111-0000-4000-8000-000000000001"},
+                "account": "alice", "account_id": "account-1", "enabled": true,
+                "auto_upload": true, "history": "none", "excluded": [], "last_result": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    let moved = run(&["--yes", "on", "--repo", "alice/app", folder_arg]);
+    assert_success(&moved);
+    let status = run(&["project", "status", folder_arg]);
+    assert_success(&status);
+    let said = String::from_utf8_lossy(&status.stdout);
+    assert!(said.contains("alice/app"), "{said}");
+    let records: Vec<serde_json::Value> = fs::read_dir(home.join("folder-destinations"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "json"))
+        .map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(
+        records[0]["destination"]["repository"], "alice/app",
+        "{records:?}"
+    );
+    assert_eq!(
+        records[0]["destination"]["chosen_for"], "folder",
+        "{records:?}"
+    );
+}

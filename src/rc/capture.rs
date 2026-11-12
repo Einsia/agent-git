@@ -333,6 +333,43 @@ pub(crate) fn destination_by(
     Ok(Some(destination))
 }
 
+/// Whether `lineage`'s turns may upload from this computer now, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Confirmed {
+    /// No destination is saved for its capture repository.
+    Missing,
+    /// One is saved, but it isn't the one chosen for the conversation's own project under the
+    /// account signed in here, so the turns stay on this computer.
+    Held(PublicationDestination),
+    Ready(PublicationDestination),
+}
+
+/// [`destination`] for an upload: a device-local repository first takes the destination chosen
+/// for its folder (see [`super::local_repository::publication::follow_folder`]), then the
+/// conversation is judged by its own project's choice: `project`, when its capture repository
+/// doesn't record one.
+pub(crate) fn confirmed_destination(
+    repo: &Repo,
+    lineage: &AgitSession,
+    project: Option<&str>,
+) -> Result<Confirmed> {
+    use super::local_repository::publication;
+    if publication::is_device_local(repo)? {
+        let hub = publication::Destination::load(repo)?
+            .map(|saved| saved.identity.hub)
+            .unwrap_or_else(crate::infra::config::hub_url);
+        publication::follow_folder(repo, &hub)?;
+    }
+    let Some(destination) = destination(repo, lineage)? else {
+        return Ok(Confirmed::Missing);
+    };
+    if !publication::confirmed(repo, lineage.branch(), &destination.identity, project)? {
+        return Ok(Confirmed::Held(destination));
+    }
+    publication::keep_destination(repo, lineage.branch(), &destination.identity)?;
+    Ok(Confirmed::Ready(destination))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

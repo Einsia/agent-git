@@ -40,8 +40,16 @@ fn current_or(dir: Option<PathBuf>) -> Result<PathBuf> {
     })
 }
 
-fn turn_on(args: OnArgs) -> CmdResult {
-    let dir = current_or(args.dir)?;
+fn turn_on(mut args: OnArgs) -> CmdResult {
+    let dir = current_or(args.dir.take())?;
+    // A binding set on the web that this computer can't take by itself is asked about here once;
+    // yes moves the folder to it, as `--repo` would.
+    if args.repo.is_none()
+        && let Ok(root) = super::folder(&dir)
+        && let Some(repository) = super::ask_web_binding(&root)?
+    {
+        args.repo = Some(repository);
+    }
     if args.repo.is_none() {
         let lifted = turn_on_bound_folders(&dir, super::held_sessions)?;
         if !lifted.is_empty() {
@@ -803,7 +811,7 @@ fn codex_state(hooks: Option<crate::commands::setup::CodexHooks>) -> RuntimeStat
 /// person saves them (`rc::folder_cutoff`), as they did when it was first turned on: only those
 /// started from now on upload. `held` lists a folder's conversations (`runtime:session-id`).
 /// Returns each folder and the repository it uploads to.
-fn turn_on_bound_folders(
+pub(crate) fn turn_on_bound_folders(
     dir: &Path,
     held: impl Fn(&Path) -> Result<Vec<String>>,
 ) -> Result<Vec<(PathBuf, Option<String>)>> {
@@ -851,7 +859,7 @@ fn report_bound_on(lifted: &[(PathBuf, Option<String>)]) -> CmdResult {
 /// Turns off the folders holding `dir` that the website binds as projects of this computer: their
 /// new sessions no longer upload, whatever binds them again, until `agit on`. Returns the folders
 /// turned off by this call.
-fn turn_off_bound_folders(dir: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn turn_off_bound_folders(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut turned = Vec::new();
     for (folder, repo) in crate::rc::local_repository::covering(dir)? {
         if !repo.uploads_turned_off()? {

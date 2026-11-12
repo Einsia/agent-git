@@ -141,6 +141,16 @@ impl Request {
                     &repository.agent_id,
                     &format!("desktop-{}", logical.trim_start_matches("agit-")),
                 )?;
+                // Its uploads are judged by this project's own destination.
+                crate::rc::local_repository::note_session_project(
+                    &crate::rc::local_repository::require(&crate::rc::lineage::AgitSession::new(
+                        &repository.slug,
+                        &repository.agent_id,
+                        "main",
+                    )?)?,
+                    proposal.branch(),
+                    &project_id,
+                )?;
                 proposal.capture = Some(crate::rc::capture::RepositoryKind::DeviceLocal {
                     agent_id: repository.agent_id,
                 });

@@ -255,6 +255,9 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(notice) = super::project::worktree_notice(&cwd) {
         println!("  {notice}");
     }
+    if let Some(waiting) = super::front::web_binding_waiting(&cwd) {
+        println!("  {waiting}");
+    }
     // A folder that uploads by itself says what it doesn't upload.
     if let Some(said) = super::project::opencode_not_captured(&cwd) {
         println!("  {said}");
@@ -993,6 +996,7 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
         "runtime_session": runtime_session_json(&runtime_sessions),
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "worktree": super::project::worktree_notice(&cwd),
+        "web_binding_waiting": super::front::web_binding_waiting(&cwd),
         // Uploading the sessions from before is the person's choice: the agent asks.
         "earlier_sessions_not_uploaded": earlier.filter(|count| *count > 0).map(|count| serde_json::json!({
             "count": count,

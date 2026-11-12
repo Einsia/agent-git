@@ -83,6 +83,7 @@ pub(crate) mod diagnostics;
 mod endpoint;
 /// The conversations a folder held when `agit rc start --here` bound it.
 pub(crate) mod folder_cutoff;
+pub(crate) mod folder_destination;
 pub mod grants;
 pub mod harness;
 pub mod identity;
