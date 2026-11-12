@@ -86,6 +86,100 @@ pub(super) fn openclaw(exe: &str) -> SetupReport {
     report("OpenClaw lifecycle plugin", result)
 }
 
+/// The first line of agit's OpenCode plugin; a file that does not start with it is not agit's.
+const OPENCODE_MARKER: &str = "// agentgit-opencode-plugin ";
+
+/// Where agit's OpenCode plugin goes: one file in OpenCode's global plugin folder, which OpenCode
+/// loads in every folder. OpenCode reads its configuration from `$XDG_CONFIG_HOME/opencode` when
+/// that is an absolute path and from `~/.config/opencode` otherwise; a plugin written anywhere
+/// else is never loaded, and every turn end it should report goes unnoticed.
+pub(crate) fn opencode_plugin_path() -> Option<std::path::PathBuf> {
+    opencode_plugin_path_in(
+        std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from),
+        crate::infra::config::user_home(),
+    )
+}
+
+fn opencode_plugin_path_in(
+    xdg_config: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    xdg_config
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| home.join(".config")))
+        .map(|config| config.join("opencode/plugin/agit.js"))
+}
+
+/// agit's OpenCode plugin for the agit at `exe`.
+fn opencode_plugin(exe: &str) -> String {
+    include_str!("opencode.mjs")
+        .replace("__AGIT_PLUGIN_VERSION__", env!("CARGO_PKG_VERSION"))
+        .replace(
+            "__AGIT_EXE__",
+            &exe.replace('\\', "\\\\").replace('"', "\\\""),
+        )
+}
+
+/// What is at `path`, where agit's OpenCode plugin goes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OpencodePlugin {
+    Absent,
+    /// agit's plugin, the one this agit writes.
+    Current,
+    /// agit's plugin from another version or for an agit at another path.
+    Older,
+    /// A file there that agit did not write.
+    Foreign,
+}
+
+pub(crate) fn opencode_plugin_state(path: &Path, exe: &str) -> OpencodePlugin {
+    match std::fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OpencodePlugin::Absent,
+        Ok(text) if text == opencode_plugin(exe) => OpencodePlugin::Current,
+        Ok(text) if text.starts_with(OPENCODE_MARKER) => OpencodePlugin::Older,
+        _ => OpencodePlugin::Foreign,
+    }
+}
+
+/// Writes agit's OpenCode plugin, named in setup's output. A file there that agit did not write
+/// stays as it is and setup says so; nothing else in OpenCode's plugin folder is touched.
+pub(super) fn opencode(exe: &str) -> SetupReport {
+    let Some(path) = opencode_plugin_path() else {
+        ui::warning("cannot install the OpenCode plugin: HOME is not set");
+        return SetupReport::failure();
+    };
+    opencode_at(&path, exe)
+}
+
+fn opencode_at(path: &Path, exe: &str) -> SetupReport {
+    if opencode_plugin_state(path, exe) == OpencodePlugin::Foreign {
+        ui::warning(&format!(
+            "cannot install the OpenCode plugin: {} is a file agit did not write, so it was left as it is",
+            path.display()
+        ));
+        return SetupReport::failure();
+    }
+    let result = super::write_if_changed(path, &opencode_plugin(exe), "OpenCode plugin");
+    if result.succeeded() {
+        ui::info(format_args!(
+            "  {} OpenCode plugin: {}",
+            ui::ok(ui::theme::symbols().check),
+            path.display()
+        ));
+    }
+    result
+}
+
+/// Removes agit's OpenCode plugin, and only it: a file there that agit did not write stays.
+pub(crate) fn remove_opencode(path: &Path) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.starts_with(OPENCODE_MARKER) => std::fs::remove_file(path).map(|()| true),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn openclaw_at(root: &Path, exe: &str) -> crate::Result<()> {
     let path = root.join("openclaw.json");
     let mut config: Value = match std::fs::read_to_string(&path) {
@@ -193,5 +287,76 @@ mod tests {
         .unwrap();
         assert!(openclaw_at(root.path(), "/changed").is_err());
         assert_eq!(before, std::fs::read(&path).unwrap());
+    }
+
+    /// Setup owns one file in OpenCode's plugin folder, recognized by its first line. It writes
+    /// and replaces only that file, leaves a file of the same name that it did not write as it
+    /// is, and removal deletes only its own. The plugin it writes runs this agit, starts it
+    /// detached on `session.idle` alone, and hands it nothing but the conversation's id and
+    /// folder. The folder is the one OpenCode loads plugins from: under an absolute
+    /// `$XDG_CONFIG_HOME`, else `~/.config`. A setup that overwrote by name would destroy the
+    /// person's own plugin; one that passed more would hand agit the conversation through a path
+    /// no privacy check reads; one that wrote under the home folder while OpenCode reads another
+    /// would install a plugin that never runs.
+    #[test]
+    fn setup_owns_only_its_own_opencode_plugin_file() {
+        // Absolute on this platform: a Unix-style path is relative on Windows.
+        let paths = tempfile::tempdir().unwrap();
+        let home = paths.path().join("home");
+        let config = paths.path().join("config");
+        assert_eq!(
+            opencode_plugin_path_in(Some(config.clone()), Some(home.clone())),
+            Some(config.join("opencode/plugin/agit.js"))
+        );
+        assert_eq!(
+            opencode_plugin_path_in(Some("relative/config".into()), Some(home.clone())),
+            Some(home.join(".config/opencode/plugin/agit.js"))
+        );
+        assert_eq!(
+            opencode_plugin_path_in(None, Some(home.clone())),
+            Some(home.join(".config/opencode/plugin/agit.js"))
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("plugin").join("agit.js");
+        assert_eq!(
+            opencode_plugin_state(&path, "/a/agit"),
+            OpencodePlugin::Absent
+        );
+        assert!(opencode_at(&path, "/a/agit").succeeded());
+        assert_eq!(
+            opencode_plugin_state(&path, "/a/agit"),
+            OpencodePlugin::Current
+        );
+        assert_eq!(
+            opencode_plugin_state(&path, "/b/agit"),
+            OpencodePlugin::Older
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with(OPENCODE_MARKER));
+        assert!(written.contains("const AGIT = \"/a/agit\";"));
+        assert!(written.contains("event?.type !== \"session.idle\""));
+        assert!(written.contains("detached: true"));
+        assert!(written.contains("JSON.stringify({ session_id: session, cwd: directory })"));
+        assert!(!written.contains("__AGIT_"));
+        assert!(opencode_at(&path, "/b/agit").succeeded());
+        assert_eq!(
+            opencode_plugin_state(&path, "/b/agit"),
+            OpencodePlugin::Current
+        );
+        assert!(remove_opencode(&path).unwrap());
+        assert!(!path.exists());
+
+        let theirs = "export default async () => ({});\n";
+        std::fs::write(&path, theirs).unwrap();
+        let neighbour = path.with_file_name("theirs.js");
+        std::fs::write(&neighbour, theirs).unwrap();
+        assert_eq!(
+            opencode_plugin_state(&path, "/a/agit"),
+            OpencodePlugin::Foreign
+        );
+        assert!(!opencode_at(&path, "/a/agit").succeeded());
+        assert!(!remove_opencode(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        assert_eq!(std::fs::read_to_string(&neighbour).unwrap(), theirs);
     }
 }

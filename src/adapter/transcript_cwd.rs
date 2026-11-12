@@ -73,11 +73,20 @@ pub(crate) fn recorded_cwd(path: &std::path::Path) -> Option<String> {
 }
 
 /// When the conversation began: the time on the first complete record that carries one, read as
-/// [`recorded_cwd`] reads the directory. Claude Code and Codex both stamp records at top level.
+/// [`recorded_cwd`] reads the directory. Claude Code and Codex both stamp records at top level;
+/// OpenCode's materialized transcript names it once, as `time_created` in milliseconds in its
+/// `opencode.meta` record. Without it, a covered worktree would count every OpenCode
+/// conversation there as begun before it was covered, a new one included.
 /// Only project capture asks, which the Hub does not link.
 #[cfg(feature = "cli")]
 pub(crate) fn recorded_start(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Utc>> {
     first_recorded(path, |record| {
+        if record.get("kind").and_then(serde_json::Value::as_str) == Some("opencode.meta") {
+            return record
+                .get("time_created")?
+                .as_i64()
+                .and_then(chrono::DateTime::from_timestamp_millis);
+        }
         let stamp = record.get("timestamp")?.as_str()?;
         chrono::DateTime::parse_from_rfc3339(stamp)
             .ok()

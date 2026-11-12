@@ -147,17 +147,31 @@ With hooks installed, Claude Code and a hook-capable Codex **settle once every t
 completes**, and day to day you never type `agit commit`. Manual settlement stays useful — see the
 milestones in 3.2.
 
+OpenCode has no hook setting; `agit setup` writes one plugin file instead,
+`opencode/plugin/agit.js` in OpenCode's configuration folder (`$XDG_CONFIG_HOME` when that is an
+absolute path, `~/.config` otherwise), which OpenCode loads in every folder. `agit project bind
+--auto-upload` counts an installed OpenCode as an agent that saves by itself and sets it up. When an OpenCode
+conversation goes idle, the plugin starts agit in the background with that conversation's id and
+folder and nothing else; OpenCode does not wait for it, and when agit is not installed it does
+nothing. setup names the file it wrote (`opencode_plugin` with `--json`), replaces only a file it
+wrote itself, and `agit setup --remove-skill --runtime opencode` removes it. A conversation the
+plugin ran for uploads at the end of each turn in a folder that uploads by itself, under the same
+rules as Claude Code's: conversations from before the folder was turned on, ones you dropped, and
+conversations a sub-agent started stay until you save them. `agit doctor` says whether the plugin
+is installed and is this agit's.
+
 Codex hook installation is capability-gated by `codex features list`; unsupported installations
 are left untouched. Codex treats user hooks as untrusted until they are reviewed, so it asks for
 approval before first use or after the installed command changes, and saves nothing until then.
 `agit setup`, `agit doctor` and `agit project status` say which AgentGit hooks Codex will not run
-yet; approve them in Codex's startup review or in `/hooks`. OpenCode and Cursor have no
-equivalent "turn finished" callback; the skill above injects the settlement discipline into the
-agent, and the agent types `agit commit` itself at the right moment. So in a folder that uploads
-by itself, an OpenCode conversation goes up when its agent runs `agit commit` or you run
-`agit save`, not at the end of each turn; `agit on`, `agit`, `agit status` and `agit doctor` say
-so there when OpenCode is installed, and say nothing about it in a folder that is off, only set up
-for a repository, or on with its uploads held.
+yet; approve them in Codex's startup review or in `/hooks`. Cursor has no equivalent "turn
+finished" callback; the skill above injects the settlement discipline into the agent, and the
+agent types `agit commit` itself at the right moment. OpenCode without the plugin is the same: in
+a folder that uploads by itself, an OpenCode conversation goes up when its agent runs
+`agit commit` or you run `agit save`, not at the end of each turn; `agit on`, `agit`,
+`agit status` and `agit doctor` say so there when OpenCode is installed and the plugin has not run
+in that folder, and say nothing about it in a folder that is off, only set up for a repository, or
+on with its uploads held.
 
 `agit setup --agents-md` refreshes the managed section and normalizes nested AgentGit markers,
 preserving the text around that section. An unchanged repeat does not append another marker pair.

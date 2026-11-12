@@ -734,6 +734,57 @@ pub(crate) fn codex_capture_allowed(_root: &Path, session: &str) -> bool {
     codex_hooked_path(session).is_some_and(|path| path.exists())
 }
 
+/// Where AgentGit records that OpenCode ran agit's plugin for `session`, `None` for an id that is
+/// not a plain file name, so an id cannot name a path outside the record directory.
+fn opencode_hooked_path(session: &str) -> Option<PathBuf> {
+    let plain = !session.is_empty()
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    plain.then(|| config::agit_home().ok())?.map(|home| {
+        home.join("hooks-seen")
+            .join("opencode-sessions")
+            .join(session)
+    })
+}
+
+/// Records, as agit's OpenCode plugin settles `session` in a folder a project covers, that
+/// OpenCode runs the plugin for that conversation. Called only there: a plugin running in a
+/// folder no project covers leaves nothing behind.
+pub(crate) fn opencode_hooks_seen(session: &str) {
+    if let Some(path) = opencode_hooked_path(session)
+        && path
+            .parent()
+            .is_some_and(|dir| config::create_state_dir(dir).is_ok())
+    {
+        let _ = fs::write(path, b"");
+    }
+}
+
+/// Whether OpenCode's `session` uploads by itself at the end of a turn: agit's plugin ran for that
+/// very conversation, and no other conversation started it. Without the plugin OpenCode tells
+/// agit nothing when a turn ends, so a computer without it keeps uploading OpenCode conversations
+/// only when someone saves them. A sub-agent's conversation, or one whose start cannot be read,
+/// does not upload by itself.
+pub(crate) fn opencode_capture_allowed(session: &str) -> bool {
+    opencode_hooked_path(session).is_some_and(|path| path.exists())
+        && adapter::opencode::started_by_another(session) == Some(false)
+}
+
+/// Whether some OpenCode conversation in the folder at `root` ran agit's plugin, so its turns
+/// there upload as they end.
+fn opencode_plugin_ran_in(root: &Path) -> bool {
+    let (Ok(home), Ok(Some(project))) = (config::agit_home(), read(root)) else {
+        return false;
+    };
+    let seen = home.join("hooks-seen").join("opencode-sessions");
+    saved_only_candidates(&project).is_ok_and(|found| {
+        found
+            .iter()
+            .any(|candidate| seen.join(&candidate.session_id).exists())
+    })
+}
+
 /// Why the folder whose policy decides for `path` keeps `session` of `runtime` from being saved or
 /// uploaded without the person asking, if it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1067,9 +1118,9 @@ fn candidates(project: &Project) -> Result<Vec<Candidate>> {
 }
 
 /// The OpenCode conversations of the project, found the way [`candidates`] finds the others, from
-/// a complete reading of OpenCode's store. A project never uploads them by itself: OpenCode says
-/// nothing when a turn ends, so only `agit save` takes them, and bind records them only to keep
-/// its earlier ones out of a plain save.
+/// a complete reading of OpenCode's store. A project uploads one by itself only once agit's plugin
+/// ran for it ([`opencode_capture_allowed`]); the rest only `agit save` takes, and bind records
+/// them only to keep its earlier ones out of a plain save.
 fn saved_only_candidates(project: &Project) -> Result<Vec<Candidate>> {
     let worktrees = crate::domain::worktree::of(&project.root);
     let mut result = Vec::new();
@@ -2850,12 +2901,25 @@ pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Pat
         session_id: session_id.into(),
         cwd: cwd.to_path_buf(),
     };
-    if runtime == "opencode" {
-        return opencode_earlier(&project, session_id);
-    }
-    project.earlier.contains(&key(runtime, session_id))
-        || before_covered(&project, &candidate, false).unwrap_or(true)
-        || codex_unhooked(&project, &candidate)
+    earlier_history(&project, &candidate, false) || codex_unhooked(&project, &candidate)
+}
+
+/// Whether `candidate` is earlier history of the folder, which uploads only when the person names
+/// it or lets earlier history in: from before the folder was turned on without its history, or
+/// from a covered git worktree before the worktree was covered. OpenCode keeps its own record of
+/// that ([`opencode_earlier`]); every path that uploads by itself asks this one function, so none
+/// of them lets in a conversation another of them calls earlier. `adopt` as in [`before_covered`].
+fn earlier_history(project: &Project, candidate: &Candidate, adopt: bool) -> bool {
+    let recorded = if candidate.runtime == "opencode" {
+        opencode_earlier(project, &candidate.session_id)
+    } else {
+        project
+            .earlier
+            .contains(&key(&candidate.runtime, &candidate.session_id))
+    };
+    // A covered git worktree outside the folder keeps its own earlier history by when it was
+    // covered, whatever the runtime: a bind records only the folder's own earlier conversations.
+    recorded || before_covered(project, candidate, adopt).unwrap_or(true)
 }
 
 /// Whether the person stopped uploading this session from the folder at `root`, or from the main
@@ -3016,11 +3080,16 @@ pub(crate) fn earlier_count(root: &Path) -> usize {
         .count()
 }
 
-/// Whether a project captures this runtime's conversations by itself: only the runtimes whose
-/// hooks call [`capture`]. Any other runtime's conversation is saved only when someone imports it,
-/// so telling its agent the project saves it would leave it unsaved.
-fn captured_runtime(runtime: &str) -> bool {
-    matches!(runtime, "codex" | "claude-code")
+/// Whether a project captures this conversation by itself: Claude Code's and Codex's, whose hooks
+/// call [`capture`], and OpenCode's once agit's plugin ran for it ([`opencode_capture_allowed`]).
+/// Any other conversation is saved only when someone imports it, so telling its agent the project
+/// saves it would leave it unsaved.
+fn captured_runtime(runtime: &str, session: &str) -> bool {
+    match runtime {
+        "codex" | "claude-code" => true,
+        "opencode" => opencode_capture_allowed(session),
+        _ => false,
+    }
 }
 
 /// Exact hook identity remains authoritative; a project policy never overrides another claim.
@@ -3028,14 +3097,19 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
         return Ok(false);
     };
-    if !captured_runtime(runtime) {
+    if !matches!(runtime, "codex" | "claude-code" | "opencode") {
         return Ok(false);
     }
     let Some((project, _)) = governing(&cwd)? else {
         return Ok(false);
     };
-    if runtime == "codex" {
-        codex_hooks_seen(session);
+    match runtime {
+        "codex" => codex_hooks_seen(session),
+        "opencode" => opencode_hooks_seen(session),
+        _ => {}
+    }
+    if !captured_runtime(runtime, session) {
+        return Ok(false);
     }
     let candidate = Candidate {
         runtime: runtime.into(),
@@ -3204,14 +3278,14 @@ fn delegation_withheld(
 }
 
 /// Whether `project` keeps `candidate`'s turns from being uploaded: the project is paused, it
-/// uploads nothing, it leaves the session out (dropped, or from before the folder was on), or the
-/// session began in one of the folder's git worktrees before the folder covered it. `adopt`
-/// records a worktree seen for the first time as covered from now.
+/// uploads nothing, the person dropped the session, it is earlier history ([`earlier_history`]),
+/// or it is a delegate the project holds back. `adopt` records a worktree seen for the first time
+/// as covered from now.
 fn withholds(project: &Project, candidate: &Candidate, adopt: bool) -> bool {
     !project.enabled
         || !project.auto_upload
         || project.leaves_out(&key(&candidate.runtime, &candidate.session_id))
-        || before_covered(project, candidate, adopt).unwrap_or(true)
+        || earlier_history(project, candidate, adopt)
         || delegation_withheld(&project.repository, candidate, Some(project), adopt).unwrap_or(true)
 }
 
@@ -3556,7 +3630,7 @@ fn capture_candidate_into(
         !project.enabled
             || !project.auto_upload
             || project.leaves_out(&session_key)
-            || (!let_in && before_covered(project, &candidate, true).unwrap_or(true))
+            || (!let_in && earlier_history(project, &candidate, true))
             || delegation_withheld(&project.repository, &candidate, Some(project), true)
                 .unwrap_or(true)
     };
@@ -4698,7 +4772,7 @@ impl SignIn {
 /// automatically, the runtime is not one a project captures, the project withholds the
 /// conversation (see [`withholds`]), or it records into another repository.
 fn capturing(runtime: &str, session: &str, origin: &Path) -> Option<(Project, Via)> {
-    if !captured_runtime(runtime) {
+    if !captured_runtime(runtime, session) {
         return None;
     }
     let (project, via) = governing(origin).ok()??;
@@ -4761,7 +4835,7 @@ pub(crate) struct HeldEarlier {
 /// dropped it, it records into another repository, or no project there is on and uploads
 /// automatically. Judged from local state alone, the audience included, so a hook may ask.
 pub(crate) fn held_earlier(runtime: &str, session: &str, origin: &Path) -> Option<HeldEarlier> {
-    if !captured_runtime(runtime) {
+    if !captured_runtime(runtime, session) {
         return None;
     }
     let origin = origin
@@ -4777,9 +4851,9 @@ pub(crate) fn held_earlier(runtime: &str, session: &str, origin: &Path) -> Optio
         session_id: session.into(),
         cwd: origin,
     };
-    let earlier = project.earlier.contains(&session_key)
-        || before_covered(&project, &candidate, false).unwrap_or(true);
-    if !earlier || claimed_elsewhere(&project, runtime, session) {
+    if !earlier_history(&project, &candidate, false)
+        || claimed_elsewhere(&project, runtime, session)
+    {
         return None;
     }
     let recorded = recorded_audience(&project.root);
@@ -5724,17 +5798,29 @@ pub(crate) enum Saving {
 }
 
 /// How `folder`, a directory a conversation runs in or a folder's root, treats an OpenCode
-/// conversation when it uploads by itself: OpenCode tells agit nothing when a turn ends, so one of
-/// its conversations goes up when its agent runs `agit commit` or the person runs `agit save`,
-/// never at the end of each turn. `None` unless OpenCode is installed here and [`saving`] says
-/// [`Saving::Uploads`]: in a folder that is off, only bound, never set up, or on with its uploads
-/// held, an agent's `agit commit` uploads nothing, so the sentence would promise uploads that
-/// never happen. Every surface asks this one function, so none of them says it where another
-/// stays silent.
+/// conversation when it uploads by itself: without agit's plugin, OpenCode tells agit nothing when
+/// a turn ends, so one of its conversations goes up when its agent runs `agit commit` or the
+/// person runs `agit save`, never at the end of each turn. `None` unless OpenCode is installed
+/// here and [`saving`] says [`Saving::Uploads`]: in a folder that is off, only bound, never set
+/// up, or on with its uploads held, an agent's `agit commit` uploads nothing, so the sentence
+/// would promise uploads that never happen. Also `None` once the plugin is this agit's and an
+/// OpenCode conversation of the folder ran it: a plugin file alone may be one OpenCode never
+/// loaded. Every surface asks this one function, so none of them says it where another stays
+/// silent.
 pub(crate) fn opencode_not_captured(folder: &Path) -> Option<&'static str> {
     (crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available())
-        && saving(folder) == Saving::Uploads)
-        .then_some(OPENCODE_NOT_CAPTURED)
+        && saving(folder) == Saving::Uploads
+        && !opencode_plugin_runs(folder))
+    .then_some(OPENCODE_NOT_CAPTURED)
+}
+
+/// Whether OpenCode tells this agit when a turn ends in `folder`: the plugin is this agit's, and
+/// an OpenCode conversation of the folder ran it.
+fn opencode_plugin_runs(folder: &Path) -> bool {
+    use super::setup::native::{OpencodePlugin, opencode_plugin_path, opencode_plugin_state};
+    opencode_plugin_path().is_some_and(|path| {
+        opencode_plugin_state(&path, &super::setup::exe_str()) == OpencodePlugin::Current
+    }) && opencode_plugin_ran_in(&policy_root(folder))
 }
 
 /// The sentence every surface uses for [`opencode_not_captured`].
@@ -6993,6 +7079,153 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    /// An OpenCode conversation uploads by itself, at turn end and in every path that judges
+    /// automatic upload, only when agit's plugin ran for that very conversation, no other
+    /// conversation started it, and it is not earlier history of the folder by OpenCode's own
+    /// record. A gate that took the plugin running anywhere, that let a sub-agent's conversation
+    /// through, or that judged OpenCode's earlier history by the record Claude Code and Codex use
+    /// (which never holds OpenCode's) would upload a conversation the person kept out.
+    #[test]
+    fn an_opencode_conversation_uploads_by_itself_only_once_its_own_plugin_ran() {
+        if !isolated("an_opencode_conversation_uploads_by_itself_only_once_its_own_plugin_ran") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let folder = work.path().canonicalize().unwrap();
+        let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("opencode");
+        fs::create_dir_all(&data).unwrap();
+        let database = data.join("opencode.db");
+        opencode_database(
+            &database,
+            &folder,
+            &["ses_before", "ses_after", "ses_unhooked"],
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO session VALUES ('ses_subagent', 'global', 'ses_after', ?1, 100, 150, '1.18.13')",
+                [folder.to_str().unwrap()],
+            )
+            .unwrap();
+        // Turned on without its history; agit has not yet looked at OpenCode's store.
+        let mut policy = project(&folder);
+        policy.history = History::None;
+        save(&policy).unwrap();
+        let uploads = |session: &str| capturing("opencode", session, &folder).is_some();
+        // What the plugin's settle records before it judges the conversation; recorded directly,
+        // so no capture worker starts here.
+        let plugin_ran = opencode_hooks_seen;
+
+        for session in ["ses_before", "ses_after", "ses_subagent"] {
+            plugin_ran(session);
+        }
+        // Until agit looks, every OpenCode conversation in the folder counts as earlier, plugin
+        // or no plugin.
+        assert!(!uploads("ses_before"));
+        assert!(!uploads("ses_after"));
+        assert!(left_out(&folder, "opencode", "ses_before", &folder));
+
+        // The look records what was there; a conversation started after it is the folder's.
+        let mut policy = read(&folder).unwrap().unwrap();
+        policy.earlier.insert(key("opencode", "ses_before"));
+        policy.earlier_opencode = true;
+        save(&policy).unwrap();
+        assert!(!uploads("ses_before"), "earlier history uploaded by itself");
+        assert!(held_earlier("opencode", "ses_before", &folder).is_some());
+        assert!(uploads("ses_after"));
+        assert!(held_earlier("opencode", "ses_after", &folder).is_none());
+        assert!(
+            !uploads("ses_subagent"),
+            "a sub-agent's conversation uploaded"
+        );
+        assert!(
+            !uploads("ses_unhooked"),
+            "a conversation whose plugin never ran uploaded"
+        );
+        // A settle for it, the plugin's first, queues nothing: it is earlier history.
+        assert!(capture("opencode", "ses_before", folder.to_str()).unwrap());
+        assert!(markers(&policy.root).unwrap().is_empty());
+        // A second idle with nothing new, such as an abort, changes nothing.
+        plugin_ran("ses_after");
+        assert!(uploads("ses_after"));
+
+        // The plugin record is a plain file name: an id naming a path records nothing.
+        opencode_hooks_seen("../escape");
+        assert!(!opencode_capture_allowed("../escape"));
+        assert!(
+            !config::agit_home()
+                .unwrap()
+                .join("hooks-seen")
+                .join("escape")
+                .exists()
+        );
+
+        // A git worktree of the folder, outside it, keeps its earlier history out by when the
+        // folder covered it: a bind records only the folder's own earlier conversations, so the
+        // one that began there before is in no earlier record. One that began after is the
+        // folder's. Both live apart from the folder above, whose own policy would cover them.
+        let apart = tempfile::tempdir().unwrap();
+        let checkout = apart.path().canonicalize().unwrap().join("checkout");
+        git_checkout(&checkout);
+        let mut policy = read(&folder).unwrap().unwrap();
+        policy.root = checkout.canonicalize().unwrap();
+        policy.earlier.clear();
+        save(&policy).unwrap();
+        let tree = worktree(
+            &policy.root,
+            &apart.path().canonicalize().unwrap().join("tree"),
+        );
+        let at = |id: &str, created: i64| {
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "INSERT INTO session VALUES (?1, 'global', NULL, ?2, ?3, ?3, '1.18.13')",
+                    rusqlite::params![id, tree.to_str().unwrap(), created],
+                )
+                .unwrap();
+            plugin_ran(id);
+        };
+        at("ses_tree_before", 1_000);
+        adopt_worktree(&policy.root, &tree, None).unwrap();
+        at(
+            "ses_tree_after",
+            chrono::Utc::now().timestamp_millis() + 60_000,
+        );
+        let in_tree = |session: &str| capturing("opencode", session, &tree).is_some();
+        assert!(
+            !in_tree("ses_tree_before"),
+            "a worktree's earlier OpenCode conversation uploaded by itself"
+        );
+        assert!(left_out(&policy.root, "opencode", "ses_tree_before", &tree));
+        assert!(in_tree("ses_tree_after"));
+    }
+
+    /// A computer with OpenCode and neither Claude Code nor Codex can turn a folder on for
+    /// automatic upload: binding counts an installed OpenCode as an agent that saves by itself and
+    /// sets it up with `--hooks`, which writes its plugin. A binding that counted only the runtimes
+    /// with hook settings refuses such a computer, so the plugin is never installed by the way a
+    /// folder is turned on.
+    #[cfg(unix)]
+    #[test]
+    fn binding_counts_an_installed_opencode_as_saving_by_itself() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if !isolated("binding_counts_an_installed_opencode_as_saving_by_itself") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let bin = work.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let opencode = bin.join("opencode");
+        fs::write(&opencode, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: `isolated` runs this test alone in a process of its own.
+        unsafe { std::env::set_var("PATH", &bin) };
+        assert_eq!(
+            super::super::setup::project_hook_runtimes().unwrap(),
+            ["opencode"]
+        );
     }
 
     /// A captured OpenCode conversation is judged by the folder it started in, like the others:

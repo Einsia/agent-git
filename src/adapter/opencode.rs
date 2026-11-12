@@ -311,6 +311,22 @@ pub(crate) fn every_session_in_full() -> Result<Vec<SessionRef>> {
     Ok(listed.into_iter().map(|l| to_ref(l, &cache)).collect())
 }
 
+/// Whether OpenCode's `session` is a sub-agent's conversation, one another conversation started.
+/// `None` when the store is missing, cannot be read, or does not hold the session: a caller that
+/// uploads only top-level conversations treats that as not top-level.
+#[cfg(feature = "cli")]
+pub(crate) fn started_by_another(session: &str) -> Option<bool> {
+    let con = open(&db_path()?)?;
+    let sessions = Layout::detect(&con).ok()?.sessions();
+    con.query_row(
+        &format!("WITH selected AS ({sessions}) SELECT parent_id FROM selected WHERE id = ?1"),
+        [session],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .map(|parent| parent.is_some_and(|parent| !parent.is_empty()))
+}
+
 fn to_ref(l: Listed, cache_root: &Path) -> SessionRef {
     SessionRef {
         title: l.title,
