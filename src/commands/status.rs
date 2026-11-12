@@ -709,6 +709,11 @@ fn summary_rows(
             .keys()
             .map(|target| scope::repository_of_target(target).to_owned()),
     );
+    attention.extend(
+        crate::rc::settle_blocked::load()
+            .keys()
+            .map(|target| scope::repository_of_target(target).to_owned()),
+    );
     attention.extend(upload_off.iter().cloned());
     if let Some(store) = Store::open().ok().flatten() {
         attention.extend(
