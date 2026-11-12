@@ -522,9 +522,26 @@ fn upload_wait(lab: &Lab, targets: &[&str]) {
     .unwrap();
 }
 
+/// Finished turns of `target` waiting to be saved, as a daemon that couldn't start its saving
+/// step records them: one file per conversation under AGIT_HOME.
+fn save_wait(lab: &Lab, targets: &[&str]) {
+    let waits = lab.store.join("settle-blocked");
+    fs::create_dir_all(&waits).unwrap();
+    for target in targets {
+        fs::write(
+            waits.join(format!(
+                "{}.json",
+                &blake3::hash(target.as_bytes()).to_hex()[..32]
+            )),
+            serde_json::json!({"target": target, "since": 1_700_000_000u64}).to_string(),
+        )
+        .unwrap();
+    }
+}
+
 /// `--repo` reports that repository alone: its sessions, its checkout and what waits in it, in
 /// text and JSON. The page counts the sessions it covers, not every claim. A report that took the
-/// claims in their own order, or listed every waiting upload, shows the other repository's.
+/// claims in their own order, or listed every waiting upload or save, shows the other repository's.
 #[test]
 fn a_repository_scope_reports_that_repository_only() {
     let lab = Lab::new();
@@ -540,6 +557,7 @@ fn a_repository_scope_reports_that_repository_only() {
         claim(&lab, "alice/notes", id);
     }
     upload_wait(&lab, &["alice/notes@b-one", "bob/wiki@b-two"]);
+    save_wait(&lab, &["alice/notes@b-three", "bob/wiki@b-four"]);
 
     let status = lab.run(&["status", "--repo", "alice/notes", "--json"]);
     let value = &status["result"]["value"];
@@ -568,11 +586,25 @@ fn a_repository_scope_reports_that_repository_only() {
         .map(|wait| wait["target"].as_str().unwrap())
         .collect();
     assert_eq!(waits, ["alice/notes@b-one"], "{status}");
+    let saves: Vec<_> = value["save_waits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|wait| wait["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(saves, ["alice/notes@b-three"], "{status}");
     assert!(value["repository_summary"].is_null(), "{status}");
 
     let every = lab.run(&["status", "--json"]);
     assert_eq!(every["result"]["value"]["sessions"]["total"], 3, "{every}");
     assert_eq!(every["result"]["value"]["scope"]["kind"], "machine");
+    assert_eq!(
+        every["result"]["value"]["save_waits"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{every}"
+    );
 
     let text = lab.output(&["status", "--repo", "alice/notes"]);
     let said = format!(
@@ -582,6 +614,7 @@ fn a_repository_scope_reports_that_repository_only() {
     );
     assert!(said.contains(ours[0]) && said.contains(ours[1]), "{said}");
     assert!(said.contains("alice/notes@b-one"), "{said}");
+    assert!(said.contains("alice/notes@b-three"), "{said}");
     assert!(
         !said.contains("bob/wiki") && !said.contains(theirs),
         "{said}"
@@ -604,7 +637,9 @@ fn a_repository_scope_needs_a_local_checkout() {
 }
 
 /// `--all` puts one row per repository before the report: the current folder's first, then those
-/// with something waiting, the most first, then by conversations. Plain status leaves it out.
+/// with something waiting, the most first, then by conversations. Plain status leaves it out. A
+/// waiting upload and a waiting save each count, so a repository whose only trouble is turns not
+/// saved yet doesn't read as needing nothing while the report below warns about it.
 #[test]
 fn every_repository_gets_a_summary_row_with_what_needs_attention() {
     let lab = Lab::new();
@@ -620,6 +655,7 @@ fn every_repository_gets_a_summary_row_with_what_needs_attention() {
         claim(&lab, repository, id);
     }
     upload_wait(&lab, &["bob/wiki@b-one", "bob/wiki@b-two"]);
+    save_wait(&lab, &["local/big@b-three"]);
 
     let status = lab.run(&["status", "--all", "--json"]);
     let rows: Vec<_> = status["result"]["value"]["repository_summary"]
@@ -640,7 +676,7 @@ fn every_repository_gets_a_summary_row_with_what_needs_attention() {
         [
             ("local/here".to_owned(), true, 0, 0),
             ("bob/wiki".to_owned(), false, 1, 2),
-            ("local/big".to_owned(), false, 3, 0),
+            ("local/big".to_owned(), false, 3, 1),
         ],
         "{status}"
     );
@@ -652,7 +688,7 @@ fn every_repository_gets_a_summary_row_with_what_needs_attention() {
     );
     assert!(text.contains("local/here\there\t0\t0"), "{text}");
     assert!(text.contains("bob/wiki\t\t1\t2"), "{text}");
-    assert!(text.contains("local/big\t\t3\t0"), "{text}");
+    assert!(text.contains("local/big\t\t3\t1"), "{text}");
     let plain = String::from_utf8(lab.output(&["status"]).stdout).unwrap();
     assert!(!plain.contains("need attention"), "{plain}");
     assert!(lab.run(&["status", "--json"])["result"]["value"]["repository_summary"].is_null());
