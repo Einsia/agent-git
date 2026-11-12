@@ -1032,15 +1032,30 @@ fn show_publication(report: &PublicationReport) {
                         attempt.outcome.code,
                         attempt.outcome.http_status()
                     );
+                    if let Some(reason) = http_refusal_reason(attempt.outcome.http_status()) {
+                        println!("{name}: {reason}");
+                    }
                 }
                 for reference in &attempt.refs {
                     let status = match reference.status {
                         PublicationStatus::Updated => "updated",
                         PublicationStatus::UpToDate => "up to date",
+                        PublicationStatus::Rejected => "rejected, not changed",
                         PublicationStatus::Unconfirmed => "unconfirmed",
                     };
+                    // Git's record names why a ref failed and who refused it, e.g.
+                    // `[rejected] (non-fast-forward)` or `[remote rejected] (…)`.
+                    let detail = match (reference.status, &reference.detail) {
+                        (
+                            PublicationStatus::Rejected | PublicationStatus::Unconfirmed,
+                            Some(detail),
+                        ) => {
+                            format!(" {detail}")
+                        }
+                        _ => String::new(),
+                    };
                     println!(
-                        "{name} batch {}: {} {status}",
+                        "{name} batch {}: {} {status}{detail}",
                         attempt.batch,
                         reference.reference.name()
                     );
@@ -1070,6 +1085,20 @@ fn show_publication(report: &PublicationReport) {
             if lfs.ok() { "complete" } else { "incomplete" },
             lfs.unattempted.len()
         );
+    }
+}
+
+/// Git discards the body of an HTTP error, so a refusal that arrives only as a status needs its
+/// meaning stated here; a refusal the Hub frames inside the Git protocol reaches stderr instead.
+fn http_refusal_reason(status: Option<u16>) -> Option<&'static str> {
+    match status {
+        Some(428) => Some(
+            "the Hub requires a session publication receipt and the expected repository identity \
+             with every push, and this request lacked one, so none of its refs were published; \
+             update agit and run `agit push` again, and if it persists report `agit --version` \
+             with this output",
+        ),
+        _ => None,
     }
 }
 

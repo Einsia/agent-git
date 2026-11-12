@@ -961,14 +961,10 @@ pub(super) fn run(
         // A target whose branch the Hub now holds no longer waits for the privacy check, and an
         // automatic upload of it that didn't go through no longer stands for it. Only the Hub's
         // acknowledgement says so: a preview, a cancelled push or a refused one sends nothing.
-        for branch in report
-            .heads
-            .iter()
-            .flat_map(|phase| &phase.attempts)
-            .flat_map(|attempt| &attempt.refs)
-            .filter(|published| published.status != PublicationStatus::Unconfirmed)
-            .filter_map(|published| published.reference.name().strip_prefix("refs/heads/"))
-        {
+        for name in acknowledged_refs(report.heads.iter()) {
+            let Some(branch) = name.strip_prefix("refs/heads/") else {
+                continue;
+            };
             crate::domain::privacy::pending::upload::clear_uploaded(&[&repository, slug], branch);
             // An automatic upload is recorded by the checkout it ran from, which is not the Hub
             // repository when a device-local capture or `--to` publishes elsewhere.
@@ -976,13 +972,7 @@ pub(super) fn run(
                 crate::commands::upload_outcome::acknowledged(&repo, slug, branch, source);
             }
         }
-        let accepted: Vec<String> = [&report.heads, &report.tags]
-            .into_iter()
-            .flatten()
-            .flat_map(|phase| &phase.attempts)
-            .flat_map(|attempt| &attempt.refs)
-            .filter(|published| published.status != PublicationStatus::Unconfirmed)
-            .map(|published| published.reference.name().to_owned())
+        let accepted: Vec<String> = acknowledged_refs(report.heads.iter().chain(&report.tags))
             .filter(|name| selected.asking_again.contains(name))
             .collect();
         if !accepted.is_empty() {
@@ -993,13 +983,7 @@ pub(super) fn run(
                 )
             })?;
         }
-        let acknowledged_heads: Vec<String> = report
-            .heads
-            .iter()
-            .flat_map(|phase| &phase.attempts)
-            .flat_map(|attempt| &attempt.refs)
-            .filter(|published| published.status != PublicationStatus::Unconfirmed)
-            .map(|published| published.reference.name().to_owned())
+        let acknowledged_heads: Vec<String> = acknowledged_refs(report.heads.iter())
             .filter(|name| oversized.contains_key(name))
             .collect();
         if !acknowledged_heads.is_empty() {
@@ -1250,6 +1234,26 @@ pub(super) fn run(
     }
     report_left_out_tags(&left_out_tags);
     Ok(ExitCode::Ok)
+}
+
+/// The refs of `phases` the Hub acknowledged: updated, or already at the published object. Only
+/// these may clear a branch's pending upload, release a ref set aside as withdrawn, or clear an
+/// oversized mark. A ref Git or the Hub refused did not change on the Hub, and one with no
+/// acknowledgement may not have; either taken as acknowledged would record as uploaded, or let go,
+/// something the Hub never took.
+pub(super) fn acknowledged_refs<'a>(
+    phases: impl Iterator<Item = &'a crate::hub::git::PublicationPhase>,
+) -> impl Iterator<Item = String> {
+    phases
+        .flat_map(|phase| &phase.attempts)
+        .flat_map(|attempt| &attempt.refs)
+        .filter(|published| {
+            matches!(
+                published.status,
+                PublicationStatus::Updated | PublicationStatus::UpToDate
+            )
+        })
+        .map(|published| published.reference.name().to_owned())
 }
 
 /// Records the session tags the Hub holds on another commit than the local tag of the same name,
