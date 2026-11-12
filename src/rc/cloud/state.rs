@@ -1,7 +1,7 @@
 //! Each Hub's Cloud connection as this daemon sees it now, for `agit rc status` and
 //! `agit rc start --here`. Only fixed classes are kept, never an error's text.
 
-use crate::rc::control::{CloudLine, CloudPresence};
+use crate::rc::control::{CloudLine, CloudPresence, Refusing};
 use std::{collections::BTreeMap, sync::Mutex};
 
 /// A Hub's line, with the enrolled device the host serves it with and the device its presence
@@ -25,6 +25,7 @@ fn update(hub: &str, change: impl FnOnce(&mut State)) {
             pending: false,
             presence: CloudPresence::Connecting,
             error: None,
+            refusing: None,
         },
         enrolled_device: None,
         connected_device: None,
@@ -77,6 +78,33 @@ pub(crate) fn enrollment_failed(hub: &str, class: &'static str) {
     });
 }
 
+/// A connection the Hub offered was refused for `class`. Only a cause on this computer counts (a
+/// helper that cannot start, a full queue): the presence socket can stay open through those, so
+/// the line would read online while every turn sent from the Hub fails. The first refusal of a
+/// run gives `since_ms`; each one gives `last_ms`.
+pub(crate) fn offer_refused(hub: &str, class: &'static str, now_ms: i64) {
+    if !matches!(class, "local_io" | "ingress_full") {
+        return;
+    }
+    update(hub, |state| {
+        let since_ms = state
+            .line
+            .refusing
+            .as_ref()
+            .map_or(now_ms, |refusing| refusing.since_ms);
+        state.line.refusing = Some(Refusing {
+            class: class.to_owned(),
+            since_ms,
+            last_ms: now_ms,
+        });
+    });
+}
+
+/// A connection the Hub offered was taken: this computer takes them again.
+pub(crate) fn offer_taken(hub: &str) {
+    update(hub, |state| state.line.refusing = None);
+}
+
 /// Each Hub's line. A connection made as another device than the one enrolled now (an earlier
 /// account's, before the switch reached the presence socket) reads as connecting, not online.
 pub(crate) fn lines() -> Vec<CloudLine> {
@@ -125,19 +153,19 @@ pub(crate) fn failure_class(error: &anyhow::Error) -> &'static str {
     "connection_failed"
 }
 
+/// The state is one table per process and `observe` forgets every Hub it is not given, so the
+/// tests that drive it take turns.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The state is one table per process and `observe` forgets every Hub it is not given, so
-    /// the tests that drive it take turns.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     /// What the host saw is what `rc status` shows, per Hub, and a Hub no longer served drops
     /// out. A failure keeps its class until the next connection clears it.
@@ -184,6 +212,30 @@ mod tests {
         assert_eq!(line().presence, CloudPresence::Connecting);
         connected(hub, "account-b");
         assert_eq!(line().presence, CloudPresence::Connected);
+        observe(&[]);
+    }
+
+    /// Connections refused on this computer's side show on the line, from the first refusal,
+    /// while the presence stays online; one taken clears it. A refusal caused elsewhere does not.
+    #[test]
+    fn connections_refused_here_show_until_one_is_taken() {
+        let _serial = serial();
+        let hub = "https://state-refusing.invalid";
+        let line = || lines().into_iter().find(|line| line.hub == hub).unwrap();
+        observe(&[(hub.into(), false, Some("dev".into()))]);
+        connected(hub, "dev");
+        offer_refused(hub, "grant_expired", 1_000);
+        assert_eq!(line().refusing, None);
+        offer_refused(hub, "local_io", 2_000);
+        offer_refused(hub, "local_io", 17_000);
+        let refusing = line().refusing.unwrap();
+        assert_eq!(
+            (refusing.class.as_str(), refusing.since_ms, refusing.last_ms),
+            ("local_io", 2_000, 17_000)
+        );
+        assert_eq!(line().presence, CloudPresence::Connected);
+        offer_taken(hub);
+        assert_eq!(line().refusing, None);
         observe(&[]);
     }
 }

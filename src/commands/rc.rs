@@ -940,10 +940,17 @@ fn status() -> CmdResult {
             println!("  uptime     {}", human_secs(s.uptime_secs));
             println!("  version    {}", s.agit_version);
             for line in &s.cloud {
-                let state = match (line.presence, line.error.as_deref()) {
-                    (control::CloudPresence::Connected, _) => ui::ok("online").to_string(),
-                    (control::CloudPresence::Connecting, _) => "connecting".to_owned(),
-                    (control::CloudPresence::Failed, class) => ui::warn_text(&format!(
+                let state = match (line.presence, line.error.as_deref(), &line.refusing) {
+                    (control::CloudPresence::Connected, _, Some(refusing)) => {
+                        ui::warn_text(&format!(
+                            "online, but its connections fail on this computer ({})",
+                            refusing.class
+                        ))
+                        .to_string()
+                    }
+                    (control::CloudPresence::Connected, ..) => ui::ok("online").to_string(),
+                    (control::CloudPresence::Connecting, ..) => "connecting".to_owned(),
+                    (control::CloudPresence::Failed, class, _) => ui::warn_text(&format!(
                         "not online ({})",
                         class.unwrap_or("connection_failed")
                     ))

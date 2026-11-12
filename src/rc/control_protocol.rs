@@ -89,6 +89,21 @@ pub struct CloudLine {
     pub presence: CloudPresence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set while the Hub's connections to this computer fail on this computer's side, from the
+    /// first refused one until one is taken again. A daemon that predates the field sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusing: Option<Refusing>,
+}
+
+/// Why this computer refuses the Hub's connections (a fixed class, never a message), since when,
+/// and when it last did, in Unix milliseconds. `last_ms` tells a refusal still going on from one
+/// long past; a daemon that predates it sends none, which reads as no later refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusing {
+    pub class: String,
+    pub since_ms: i64,
+    #[serde(default)]
+    pub last_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

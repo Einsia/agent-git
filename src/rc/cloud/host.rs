@@ -312,6 +312,16 @@ impl std::fmt::Display for HostRefusal {
 }
 impl std::error::Error for HostRefusal {}
 
+/// Hands an authenticated connection to the executor. The Hub's line stops reading as refusing
+/// only once the connection is in the queue, so a full queue keeps the time of its first refusal.
+fn enqueue<T>(hub: &str, incoming: &mpsc::Sender<T>, connection: T) -> Result<(), HostRefusal> {
+    incoming
+        .try_send(connection)
+        .map_err(|_| HostRefusal::IngressFull)?;
+    super::state::offer_taken(hub);
+    Ok(())
+}
+
 /// The fixed class an offer's rejection is logged under. It names the check that failed, never
 /// an id, a token or a message from the Hub or the operating system.
 fn rejection_reason(error: &anyhow::Error) -> &'static str {
@@ -483,11 +493,10 @@ async fn run_executor(
                         record(&log, "cloud.endpoint_authenticated", serde_json::json!({"hub":hub,"link_id":link_id,"grant_id":grant.id,"source_id":source_id,"worker_pid":connection.worker_pid,"enrollment_ms":enrollment_ms,"verification_source":verification_source,"verification_ms":verification_ms,"transport_ms":transport_ms,"transport_timing":transport_timing,"transport_reopened":transport_reopened,"pairing_ms":pairing_ms,"tls_ms":authenticated.elapsed().as_secs_f64()*1000.0,"total_ms":started.elapsed().as_secs_f64()*1000.0}));
                         let renewal = Some(Renewal { api, credential: enrollment.credential, token: grant_token });
                         phase = "ingress";
-                        incoming.try_send(Authenticated { connection, grant, stopped, renewal })
-                            .map_err(|_| HostRefusal::IngressFull)?;
+                        enqueue(&hub, &incoming, Authenticated { connection, grant, stopped, renewal })?;
                         Ok::<_, anyhow::Error>(())
                     }.await;
-                    if let Err(error) = &accepted { record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"reason":rejection_reason(error),"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
+                    if let Err(error) = &accepted { super::state::offer_refused(&hub, rejection_reason(error), chrono::Utc::now().timestamp_millis()); record(&log, "cloud.endpoint_rejected", serde_json::json!({"hub":hub,"link_id":link_id,"source_id":source_id,"phase":phase,"reason":rejection_reason(error),"total_ms":started.elapsed().as_secs_f64()*1000.0})); }
                 });
             }
             #[allow(unreachable_code)]
@@ -591,6 +600,41 @@ mod presence_tests {
     use agit_tunnel::Packet;
     use futures_util::poll;
     use tokio::sync::oneshot;
+
+    /// A connection that does not reach the queue is not taken: two in a row keep the first
+    /// refusal's time, and one that is queued clears the refusal.
+    #[test]
+    fn a_connection_that_cannot_be_queued_keeps_the_first_refusal() {
+        let _serial = super::super::state::serial();
+        let hub = "https://host-enqueue.invalid";
+        let line = || {
+            super::super::state::lines()
+                .into_iter()
+                .find(|line| line.hub == hub)
+                .unwrap()
+        };
+        super::super::state::observe(&[(hub.into(), false, Some("dev".into()))]);
+        let (queue, mut accepted) = mpsc::channel(1);
+        queue.try_send(0u8).unwrap();
+        for now_ms in [1_000, 9_000] {
+            let refused = enqueue(hub, &queue, 1u8).unwrap_err();
+            assert_eq!(refused, HostRefusal::IngressFull);
+            super::super::state::offer_refused(
+                hub,
+                rejection_reason(&anyhow::Error::new(refused)),
+                now_ms,
+            );
+        }
+        let refusing = line().refusing.unwrap();
+        assert_eq!(
+            (refusing.class.as_str(), refusing.since_ms),
+            ("ingress_full", 1_000)
+        );
+        accepted.try_recv().unwrap();
+        enqueue(hub, &queue, 2u8).unwrap();
+        assert_eq!(line().refusing, None);
+        super::super::state::observe(&[]);
+    }
 
     /// #298: a rejected offer is logged under the check that refused it, and only that: a fixed
     /// class, the same through any context the error picked up on the way, and nothing from the

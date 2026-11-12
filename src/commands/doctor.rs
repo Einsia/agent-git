@@ -488,6 +488,12 @@ pub fn run(args: Args) -> CmdResult {
         },
     ));
 
+    // ── Local daemon ──
+    // The daemon's presence can stay online while every connection the Hub offers fails on this
+    // computer, so the row reports what the Hub can reach, from one query under one bound.
+    #[cfg(unix)]
+    checks.push(("local daemon".into(), local_daemon_row()));
+
     // ── Background service log ──
     // What the agit background service did, by ids, classes and timings, never content. The
     // first place to look when a session stopped answering.
@@ -791,6 +797,122 @@ impl CredentialExpiry {
             Self::Unknown => "unknown",
         }
     }
+}
+
+/// How long `doctor` waits for the local daemon's answer.
+#[cfg(unix)]
+const DAEMON_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(unix)]
+const DAEMON_RESTART: &str = "agit rc local restart --if-idle";
+
+#[cfg(unix)]
+fn local_daemon_row() -> Check {
+    let directory = match crate::rc::local_rc_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            return Check::Warn(format!(
+                "could not be checked: {}",
+                first_line(&error.to_string())
+            ));
+        }
+    };
+    daemon_row_in(&directory, DAEMON_ANSWER_BOUND)
+}
+
+/// The row for the daemon of `directory`, from one query under one `bound`: whether it runs and
+/// what it reports come from the same exchange, so the bound is the most `doctor` waits.
+#[cfg(unix)]
+fn daemon_row_in(directory: &std::path::Path, bound: std::time::Duration) -> Check {
+    use crate::rc::control;
+    let (presence, status) = control::presence_within(directory, bound);
+    let pid = match presence {
+        control::Presence::Running(pid) => pid,
+        control::Presence::Absent => return Check::Ok("not running".into()),
+        control::Presence::Unclear(_) => {
+            return Check::Warn(
+                "could not tell whether it runs; agit rc local status shows more".into(),
+            );
+        }
+    };
+    daemon_row(pid, status.map(control::Reply::Status), |ms| {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "a while".into())
+    })
+}
+
+/// The local daemon's row from its status answer, `None` when it gave none in time. A Hub it
+/// cannot take connections from, or whose presence failed on this computer, is a warning that
+/// names the restart; `since` writes a time.
+#[cfg(unix)]
+fn daemon_row(
+    pid: u32,
+    answer: Option<crate::rc::control::Reply>,
+    since: impl Fn(i64) -> String,
+) -> Check {
+    use crate::rc::control::{CloudPresence, Reply};
+    let Some(Reply::Status(status)) = answer else {
+        return Check::Warn(format!(
+            "running (pid {pid}) but did not answer within {} s; agit rc local status shows more",
+            DAEMON_ANSWER_BOUND.as_secs()
+        ));
+    };
+    let (mut fine, mut trouble, mut restart) = (Vec::new(), Vec::new(), false);
+    for line in &status.cloud {
+        let hub = &line.hub;
+        match (line.presence, line.error.as_deref(), &line.refusing) {
+            (CloudPresence::Connected, _, Some(refusing)) => {
+                // A full queue is load, not a fault: a restart ends the running turns and does
+                // not make room. Only a local I/O failure can be one a restart clears.
+                let busy = refusing.class == "ingress_full";
+                restart |= !busy;
+                let when = if refusing.last_ms > refusing.since_ms {
+                    format!(
+                        "since {}, last at {}",
+                        since(refusing.since_ms),
+                        since(refusing.last_ms)
+                    )
+                } else {
+                    format!("since {}", since(refusing.since_ms))
+                };
+                trouble.push(format!(
+                    "connected to {hub}, but the Hub's connections to this computer fail here {when} ({}){}",
+                    refusing.class,
+                    if busy { "; it is busy" } else { "" }
+                ));
+            }
+            (CloudPresence::Connected, ..) => fine.push(format!("connected to {hub}")),
+            (CloudPresence::Connecting, ..) => fine.push(format!("connecting to {hub}")),
+            (CloudPresence::Failed, class, _) => {
+                restart |= class == Some("local_io");
+                trouble.push(format!(
+                    "not connected to {hub} ({})",
+                    class.unwrap_or("connection_failed")
+                ));
+            }
+        }
+    }
+    if trouble.is_empty() {
+        return Check::Ok(if fine.is_empty() {
+            format!("running (pid {pid})")
+        } else {
+            format!("running (pid {pid}); {}", fine.join(", "))
+        });
+    }
+    let next = if restart {
+        format!("if it keeps failing, restart it once no turn is running: {DAEMON_RESTART}")
+    } else {
+        "agit rc local status shows more".to_owned()
+    };
+    Check::Warn(format!(
+        "running (pid {pid}); {}; turns sent from the Hub may not reach this computer — {next}",
+        trouble.join("; ")
+    ))
 }
 
 fn credential_row(
@@ -2117,6 +2239,172 @@ mod tests {
         match check {
             Check::Ok(t) | Check::Warn(t) | Check::Err(t) => t,
         }
+    }
+
+    /// The daemon row warns, with the restart, when the Hub's connections fail on this computer
+    /// though its presence is online; a quiet daemon or a Hub-side failure names no restart.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_row_says_when_the_hub_cannot_reach_this_computer() {
+        use crate::rc::control::{CloudLine, CloudPresence, Refusing, Reply, Status};
+        let line = |presence, error: Option<&str>, refusing: Option<Refusing>| CloudLine {
+            hub: "https://hub.invalid".into(),
+            enrolled: true,
+            pending: false,
+            presence,
+            error: error.map(Into::into),
+            refusing,
+        };
+        let answer = |line: CloudLine| {
+            Some(Reply::Status(Status {
+                cloud: vec![line],
+                ..Status::default()
+            }))
+        };
+        let since = |ms: i64| format!("t{ms}");
+        let online =
+            super::daemon_row(7, answer(line(CloudPresence::Connected, None, None)), since);
+        assert!(matches!(online, Check::Ok(_)), "{}", row_text(&online));
+        assert!(row_text(&online).contains("connected to https://hub.invalid"));
+        let refusing = Refusing {
+            class: "local_io".into(),
+            since_ms: 42,
+            last_ms: 90,
+        };
+        let failing = super::daemon_row(
+            7,
+            answer(line(CloudPresence::Connected, None, Some(refusing))),
+            since,
+        );
+        assert!(matches!(failing, Check::Warn(_)), "{}", row_text(&failing));
+        for part in [
+            "since t42, last at t90",
+            "local_io",
+            "if it keeps failing, restart it",
+            super::DAEMON_RESTART,
+        ] {
+            assert!(row_text(&failing).contains(part), "{}", row_text(&failing));
+        }
+        let elsewhere = super::daemon_row(
+            7,
+            answer(line(CloudPresence::Failed, Some("hub_unavailable"), None)),
+            since,
+        );
+        assert!(matches!(elsewhere, Check::Warn(_)));
+        assert!(!row_text(&elsewhere).contains(super::DAEMON_RESTART));
+        let quiet = super::daemon_row(7, None, since);
+        assert!(
+            row_text(&quiet).contains("did not answer"),
+            "{}",
+            row_text(&quiet)
+        );
+    }
+
+    /// The refusal note says when the last refusal was, so a person can tell one still going on
+    /// from one long past; a refusal seen once, or from a daemon that predates the time, names
+    /// only when it began.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_row_says_when_the_hub_was_last_refused() {
+        use crate::rc::control::{CloudLine, CloudPresence, Refusing, Reply, Status};
+        let row = |since_ms: i64, last_ms: i64| {
+            let refusing = Refusing {
+                class: "local_io".into(),
+                since_ms,
+                last_ms,
+            };
+            let reply = Some(Reply::Status(Status {
+                cloud: vec![CloudLine {
+                    hub: "https://hub.invalid".into(),
+                    enrolled: true,
+                    pending: false,
+                    presence: CloudPresence::Connected,
+                    error: None,
+                    refusing: Some(refusing),
+                }],
+                ..Status::default()
+            }));
+            row_text(&super::daemon_row(7, reply, |ms| format!("t{ms}"))).to_owned()
+        };
+        assert!(
+            row(10, 500).contains("since t10, last at t500"),
+            "{}",
+            row(10, 500)
+        );
+        for once in [row(10, 10), row(10, 0)] {
+            assert!(once.contains("since t10 (local_io)"), "{once}");
+            assert!(!once.contains("last at"), "{once}");
+        }
+    }
+
+    /// A full ingress queue is load, not a fault: the row says the daemon is busy and points to
+    /// its status, and does not advise a restart, which ends the running turns without making
+    /// room. A local I/O refusal still advises one, only if it keeps failing.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_daemon_is_not_told_to_restart() {
+        use crate::rc::control::{CloudLine, CloudPresence, Refusing, Reply, Status};
+        let row = |class: &str| {
+            let reply = Some(Reply::Status(Status {
+                cloud: vec![CloudLine {
+                    hub: "https://hub.invalid".into(),
+                    enrolled: true,
+                    pending: false,
+                    presence: CloudPresence::Connected,
+                    error: None,
+                    refusing: Some(Refusing {
+                        class: class.into(),
+                        since_ms: 1,
+                        last_ms: 2,
+                    }),
+                }],
+                ..Status::default()
+            }));
+            row_text(&super::daemon_row(7, reply, |ms| format!("t{ms}"))).to_owned()
+        };
+        let busy = row("ingress_full");
+        assert!(busy.contains("it is busy"), "{busy}");
+        assert!(busy.contains("agit rc local status"), "{busy}");
+        assert!(!busy.contains(super::DAEMON_RESTART), "{busy}");
+        assert!(!busy.contains("restart"), "{busy}");
+        let io = row("local_io");
+        assert!(io.contains(super::DAEMON_RESTART), "{io}");
+        assert!(io.contains("if it keeps failing"), "{io}");
+        assert!(!io.contains("it is busy"), "{io}");
+    }
+
+    /// The daemon row waits for its bound once, however the daemon fails to answer: a socket that
+    /// accepts and never replies reads as "could not tell", not as "not running", and within the
+    /// bound; nothing listening reads as "not running".
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_row_keeps_to_its_bound_for_a_daemon_that_never_replies() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = crate::rc::control::socket_path_for(directory.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let none = super::daemon_row_in(directory.path(), std::time::Duration::from_millis(300));
+        assert_eq!(row_text(&none), "not running");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let silent = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(2).flatten().collect();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            drop(held);
+        });
+        let bound = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let row = super::daemon_row_in(directory.path(), bound);
+        let waited = started.elapsed();
+        assert!(matches!(row, Check::Warn(_)), "{}", row_text(&row));
+        assert!(
+            row_text(&row).contains("could not tell"),
+            "{}",
+            row_text(&row)
+        );
+        assert!(
+            waited < bound * 3,
+            "waited {waited:?} for a bound of {bound:?}"
+        );
+        silent.join().unwrap();
     }
 
     /// Resumable while the CLI is not on PATH: a Warn whose row still states capability and
