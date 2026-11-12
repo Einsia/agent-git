@@ -400,6 +400,26 @@ fn bounded_description(mut description: serde_json::Value) -> serde_json::Value 
     description
 }
 
+/// What this daemon tells a controller about itself on `machine.describe`. `agit_version` is the
+/// release number the daemon was built from, the one a person quotes, so someone who has only the
+/// browser can say which release their machine runs; `build_id` identifies the exact build for
+/// negotiation and is not meant to be read.
+fn machine_description(
+    machine: super::identity::Identity,
+    instance: &str,
+    capabilities: std::collections::BTreeMap<String, crate::protocol::RuntimeCapability>,
+    build_id: &str,
+    rpc_features: &[String],
+    diagnostic_log: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let mut description = serde_json::json!({"protocol_version":1,"authority":"local-owner","machine":machine,"instance_id":instance,"epoch":1,"workspace_id":WORKSPACE,"capabilities":capabilities,"max_frame_bytes":MAX_FRAME,"history":{"version":2,"runtimes":["codex","claude-code","opencode"],"snapshot":true}});
+    description["build_id"] = serde_json::json!(build_id);
+    description["agit_version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    description["rpc_features"] = serde_json::json!(rpc_features);
+    description["diagnostic_log"] = serde_json::json!(diagnostic_log);
+    description
+}
+
 pub async fn serve(
     listener: Listener,
     outbound: super::outbound::OutboundRx,
@@ -431,12 +451,14 @@ pub async fn serve(
             .collect::<std::collections::BTreeMap<_, _>>()
     })
     .await?;
-    let description = serde_json::json!({"protocol_version":1,"authority":"local-owner","machine":identity,"instance_id":instance,"epoch":1,"workspace_id":WORKSPACE,"capabilities":capabilities,"max_frame_bytes":MAX_FRAME,"history":{"version":2,"runtimes":["codex","claude-code","opencode"],"snapshot":true}});
-    let mut description = description;
-    description["build_id"] = serde_json::json!(daemon.build_id);
-    description["rpc_features"] = serde_json::json!(daemon.rpc_features);
-    description["diagnostic_log"] = serde_json::json!(diagnostics.as_ref().map(|log| log.path()));
-    let description = bounded_description(description);
+    let description = bounded_description(machine_description(
+        identity,
+        &instance,
+        capabilities,
+        &daemon.build_id,
+        &daemon.rpc_features,
+        diagnostics.as_ref().map(|log| log.path()),
+    ));
     let cloud = cloud::Ingress::start(diagnostics.clone())?;
     serve_described(
         listener,

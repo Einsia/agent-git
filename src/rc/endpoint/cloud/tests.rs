@@ -58,7 +58,18 @@ async fn encrypted_cloud_ingress() {
         listener,
         outbound,
         events,
-        json!({"authority":"local-owner", "diagnostic_log":"private-path"}),
+        super::super::machine_description(
+            crate::rc::identity::Identity {
+                machine_fingerprint: "fingerprint".into(),
+                display_name: "machine".into(),
+                created_at: "2026-11-12T00:00:00Z".into(),
+            },
+            "instance",
+            Default::default(),
+            crate::rc::build_identity::BUILD_ID,
+            &[],
+            Some(std::path::Path::new("private-path")),
+        ),
         crate::rc::peers::controller().unwrap(),
         None,
         Some(ingress),
@@ -107,6 +118,8 @@ async fn encrypted_cloud_ingress() {
     sink.send(Packet::Text(describe.to_json())).await.unwrap();
     let description = receive(&mut source).await.result.unwrap();
     assert_eq!(description["authority"], "cloud-principal");
+    // A browser-only member reads the daemon's release from here; the local log path stays home.
+    assert_eq!(description["agit_version"], env!("CARGO_PKG_VERSION"));
     assert!(description.get("diagnostic_log").is_none());
 
     let list = Frame::request(
