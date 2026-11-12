@@ -13,11 +13,26 @@ use std::time::{Duration, Instant};
 /// to a process that is stuck or still waiting for input.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 
+/// [`LOCK_WAIT`], unless a debug build's `AGIT_TEST_LOCK_WAIT_MS` shortens it so a test can watch
+/// a command give up without waiting the whole bound. A release build ignores the variable.
+fn lock_wait() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("AGIT_TEST_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    LOCK_WAIT
+}
+
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Set, a wait for a state lock that lasts longer than [`DIAGNOSED_WAIT`] writes one line to
-/// stderr when it ends: which lock, its path, this process's id and how long it waited. No state
-/// content. It is for finding a hidden holder in a test run, and off otherwise.
+/// stderr when it ends: which lock, its path, this process's id and how long it waited. A bounded
+/// wait also writes one when it begins, so a hung command names its lock at once and a test knows
+/// the command is waiting. No state content. It is for finding a hidden holder in a test run, and
+/// off otherwise.
 pub const LOCK_DIAGNOSTICS_ENV: &str = "AGIT_DIAGNOSE_LOCK_WAITS";
 const DIAGNOSED_WAIT: Duration = Duration::from_secs(1);
 
@@ -72,7 +87,7 @@ impl std::fmt::Display for LocalStateError {
                 f,
                 "{CONTENDED} {what} ({}) and did not release it within {} seconds",
                 path.display(),
-                LOCK_WAIT.as_secs()
+                lock_wait().as_secs()
             ),
         }
     }
@@ -149,15 +164,39 @@ pub fn is_contended(error: &std::io::Error) -> bool {
 /// release it. A lock held past the wait is reported as [`LocalStateError::Contended`] instead of
 /// blocking the command without bound.
 pub fn lock_exclusive(file: &std::fs::File, path: &Path, what: &'static str) -> crate::Result<()> {
+    lock_within(file, path, what, fs2::FileExt::try_lock_exclusive)
+}
+
+/// [`lock_exclusive`] for a shared lock: it waits only while another process holds the lock
+/// exclusively.
+pub fn lock_shared(file: &std::fs::File, path: &Path, what: &'static str) -> crate::Result<()> {
+    lock_within(file, path, what, fs2::FileExt::try_lock_shared)
+}
+
+fn lock_within(
+    file: &std::fs::File,
+    path: &Path,
+    what: &'static str,
+    attempt: fn(&std::fs::File) -> std::io::Result<()>,
+) -> crate::Result<()> {
     let started = Instant::now();
-    let deadline = started + LOCK_WAIT;
+    let deadline = started + lock_wait();
+    let mut waiting = false;
     loop {
-        match fs2::FileExt::try_lock_exclusive(file) {
+        match attempt(file) {
             Ok(()) => {
                 diagnose_wait(what, path, started, "acquired");
                 return Ok(());
             }
             Err(error) if is_contended(&error) => {
+                if !waiting && std::env::var_os(LOCK_DIAGNOSTICS_ENV).is_some() {
+                    eprintln!(
+                        "agit lock wait: {what} ({}) process {} waiting",
+                        path.display(),
+                        std::process::id()
+                    );
+                }
+                waiting = true;
                 if Instant::now() >= deadline {
                     diagnose_wait(what, path, started, "gave up");
                     return Err(LocalStateError::Contended {
@@ -243,6 +282,13 @@ impl HeldLock {
     /// [`lock_exclusive`]).
     pub fn exclusive(file: std::fs::File, path: &Path, what: &'static str) -> crate::Result<Self> {
         lock_exclusive(&file, path, what)?;
+        Ok(Self(file))
+    }
+
+    /// Take a shared lock on `file`, waiting at most [`LOCK_WAIT`] while another process holds it
+    /// exclusively (see [`lock_shared`]).
+    pub fn shared(file: std::fs::File, path: &Path, what: &'static str) -> crate::Result<Self> {
+        lock_shared(&file, path, what)?;
         Ok(Self(file))
     }
 

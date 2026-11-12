@@ -951,10 +951,10 @@ impl ProjectedHistory {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        let lock = crate::infra::local_state::HeldLock::try_exclusive(
+        let lock = crate::infra::local_state::HeldLock::exclusive(
             lock,
             &lock_path,
-            "privacy publication cache is being updated; retry",
+            super::PUBLICATION_LOCK,
         )?;
         let scope = digest_json(
             &json!({"version": SESSION_ENVELOPE_VERSION, "kind":"session-owner", "identity":identity}),

@@ -578,6 +578,8 @@ pub(super) fn run(
                 #[cfg(not(windows))]
                 use crate::ui::session::shell_arg as quote_arg;
                 error.context(format!("fetch the accepted public history with `agit fetch {}` and retry `{retry_command}`; keep this checkout to preserve unpublished commits", quote_arg(&repository)))
+            } else if another_upload(&error) {
+                error.context(format!("{UPLOAD_IN_PROGRESS}; run `{retry_command}` again once it finishes"))
             } else {
                 unsent(error)
             }
@@ -1348,6 +1350,20 @@ impl Answer {
                 && (self.agit_yes || (!self.encrypted && !self.public && !self.can_ask))))
             .then_some(true)
     }
+}
+
+/// How a push that waited out another upload of the same repository begins its error. Nothing of
+/// this push was sent, and the other upload is still preparing, so the next step is to rerun it.
+const UPLOAD_IN_PROGRESS: &str = "another upload of this repository is in progress";
+
+/// Whether `error` is the publication lock held past the wait, which only an upload holds that
+/// long.
+fn another_upload(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::infra::local_state::find(error),
+        Some(crate::infra::local_state::LocalStateError::Contended { what, .. })
+            if *what == crate::domain::privacy_git::PUBLICATION_LOCK
+    )
 }
 
 /// Names what the push did and did not publish when the accepted ledger refuses it; that
