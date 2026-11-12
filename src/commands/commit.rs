@@ -3859,6 +3859,7 @@ fn settle_bytes(
         }
         (_, None) => unreachable!("new_chunks is non-empty, so settlement built a commit"),
     }
+    lk.settled_at = Some(chrono::Utc::now().timestamp());
     if unsettled > 0 {
         crate::domain::privacy::pending::record(
             &lk.session_id,

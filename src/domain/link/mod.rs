@@ -139,6 +139,11 @@ pub struct Link {
     /// A milestone or tag asked for while the turn it names had not been saved yet. The
     /// settlement that lands that turn records it and clears it.
     pub pending_milestone: Option<PendingMilestone>,
+    /// When a settlement last moved this claim's branch forward, in UTC seconds. `agit status`
+    /// lists a folder's conversations newest first by it without reading a commit; a link that
+    /// has none sorts after every one that has, in the store's order. Only a settlement that
+    /// lands turns sets it, so recording a hold, a dismissal or a supersede reorders nothing.
+    pub settled_at: Option<i64>,
 }
 
 /// A milestone request waiting for its turn. The summary is stored only as the privacy check
@@ -205,6 +210,8 @@ struct Body {
     pending_milestone: Option<PendingMilestone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claimed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_at: Option<i64>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -234,6 +241,7 @@ impl Link {
             naming_ignored: false,
             claimed_by: None,
             pending_milestone: None,
+            settled_at: None,
         }
     }
 
@@ -295,6 +303,7 @@ impl Link {
             naming_ignored: self.naming_ignored,
             claimed_by: self.claimed_by.clone(),
             pending_milestone: self.pending_milestone.clone(),
+            settled_at: self.settled_at,
         }
     }
 
@@ -669,6 +678,7 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         naming_ignored: body.naming_ignored,
         claimed_by: body.claimed_by,
         pending_milestone: body.pending_milestone,
+        settled_at: body.settled_at,
     }
 }
 
