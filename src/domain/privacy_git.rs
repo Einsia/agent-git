@@ -923,22 +923,29 @@ pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
 
 /// Compact the publication store at `root` once it holds many packs or loose objects, and say
 /// whether it did. Every publication imports into the store and nothing else packs it, so it would
-/// keep each import's pack and each snapshot's loose objects for good. Unreachable objects stay
-/// (`-k`): what pending candidates and outbox receipts name is not always reachable from the
-/// store's refs, and a publication running alongside may still write objects no ref names yet.
-/// Because nothing is pruned, a repack needs no publication lock: Git's own repack leaves every
-/// object either in a pack or loose. Only the store's own objects are packed (`-l`): were it ever
-/// to gain an alternate, packing everything would copy the source's private objects into the
-/// publication store.
+/// keep each import's pack and each snapshot's loose objects for good.
+///
+/// Packs are rolled up geometrically (`--geometric=2`): the small packs and the loose objects go
+/// into one new pack, and a pack holding at least twice the objects of everything smaller stays as
+/// it is. A full repack (`-a`) rewrites the whole store, its largest pack included, each time
+/// small packs pile up, and needs the store's size free again on its disk while it runs. A
+/// roll-up keeps every object of the packs it rolls up and every loose one, reachable or not:
+/// what pending candidates and outbox receipts name is not always reachable from the store's refs,
+/// and a publication running alongside may still write objects no ref names yet. Because nothing
+/// is pruned, it needs no publication lock: Git's own repack leaves every object either in a pack
+/// or loose. Only the store's own packs are rolled up (`-l`): were it ever to gain an alternate,
+/// packing everything would copy the source's private objects into the publication store.
 pub(crate) fn compact_store(root: &Path) -> Result<bool> {
     let repo = Repo::at(root);
     if !needs_compaction(&repo)? {
         return Ok(false);
     }
     let field = store_counts(&repo)?;
-    // The new pack is written before anything it replaces is removed, so compaction needs about
-    // the store's size free; starting without it would fill the disk and then fail.
-    let needed = (field("size:") + field("size-pack:")) * 1024;
+    // The new pack is written before the packs it replaces are removed, so everything the roll-up
+    // may rewrite must fit free beside it; starting without that room would fill the disk and then
+    // fail.
+    let needed = ((field("size:") + field("size-pack:")) * 1024)
+        .saturating_sub(kept_pack_bytes(&store_packs(root)));
     let available = fs2::available_space(root)?;
     ensure!(
         available >= needed,
@@ -946,8 +953,57 @@ pub(crate) fn compact_store(root: &Path) -> Result<bool> {
         needed >> 20,
         available >> 20
     );
-    repo.git(&["repack", "-a", "-d", "-k", "-l", "-q"])?;
+    repo.git(&["repack", "--geometric=2", "-d", "-l", "-q"])?;
     Ok(true)
+}
+
+/// The store's packs, each as its bytes on disk and the objects it holds. A pack whose index
+/// can't be read counts as holding none.
+fn store_packs(root: &Path) -> Vec<(u64, u64)> {
+    fs::read_dir(root.join(".git/objects/pack"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "pack")
+        })
+        .filter_map(|path| {
+            let bytes = fs::metadata(&path).ok()?.len();
+            Some((
+                bytes,
+                pack_objects(&path.with_extension("idx")).unwrap_or(0),
+            ))
+        })
+        .collect()
+}
+
+/// The objects a pack index lists: the last entry of its fan-out table, which follows the
+/// version 2 header or starts a version 1 index.
+fn pack_objects(index: &Path) -> Option<u64> {
+    use std::io::Read as _;
+    let mut head = [0u8; 8 + 256 * 4];
+    fs::File::open(index).ok()?.read_exact(&mut head).ok()?;
+    let fanout = if head[..4] == [0xff, b't', b'O', b'c'] {
+        &head[8..]
+    } else {
+        &head[..256 * 4]
+    };
+    Some(u32::from_be_bytes(fanout[255 * 4..].try_into().ok()?).into())
+}
+
+/// The bytes of the pack a geometric roll-up surely leaves alone: one holding at least twice the
+/// objects of every other pack together. Git keeps or rolls up packs by their objects, not their
+/// bytes, so a pack that is only the largest on disk may be rewritten, and when no pack dominates
+/// any of them may be; then nothing is left out of the room needed.
+fn kept_pack_bytes(packs: &[(u64, u64)]) -> u64 {
+    let total: u64 = packs.iter().map(|(_, objects)| objects).sum();
+    packs
+        .iter()
+        .max_by_key(|(_, objects)| *objects)
+        .filter(|(_, objects)| *objects >= 2 * (total - objects))
+        .map_or(0, |(bytes, _)| *bytes)
 }
 
 /// The publication stores kept for the repository whose common Git directory is `common`, each
@@ -1496,10 +1552,34 @@ mod store_tests {
         }
     }
 
-    /// A store past Git's own maintenance thresholds is compacted into one pack without losing an
-    /// object that no ref reaches any more, since pending candidates and receipts can name such
-    /// objects; below the thresholds it is left alone. A compaction that pruned (`gc`) or dropped
-    /// unreachable packed objects (`repack -a -d` without `-k`) loses the orphaned blob.
+    /// A store past Git's own maintenance thresholds rolls its small packs into one without
+    /// rewriting its large pack, and without losing an object that no ref reaches any more, since
+    /// pending candidates and receipts can name such objects; below the thresholds it is left
+    /// alone. A compaction that pruned (`gc`) or dropped unreachable packed objects (`repack -a -d`
+    /// without `-k`) loses the orphaned blob; a full repack rewrites the large pack, needing the
+    /// whole store's size free on its disk each time.
+    /// The room a roll-up needs leaves out only a pack Git surely keeps: the one with at least
+    /// twice the objects of all the others. A budget that left out the largest pack on disk lets a
+    /// roll-up start that rewrites it after all, filling the disk: a pack of a few large blobs is
+    /// rolled up into the small ones when it holds fewer objects than they do.
+    #[test]
+    fn a_roll_up_counts_room_for_every_pack_it_may_rewrite() {
+        // (bytes, objects)
+        assert_eq!(
+            kept_pack_bytes(&[(4 << 30, 400), (1 << 20, 100), (1 << 20, 100)]),
+            4 << 30
+        );
+        assert_eq!(
+            kept_pack_bytes(&[(4 << 30, 2), (1 << 20, 100), (1 << 20, 100)]),
+            0
+        );
+        assert_eq!(
+            kept_pack_bytes(&[(1 << 20, 100), (1 << 20, 100), (1 << 20, 100)]),
+            0
+        );
+        assert_eq!(kept_pack_bytes(&[]), 0);
+    }
+
     #[test]
     fn a_crowded_store_is_compacted_without_losing_unreachable_objects() {
         let directory = tempfile::tempdir().unwrap();
@@ -1522,6 +1602,28 @@ mod store_tests {
         git(root, &["repack", "-q"]);
         git(root, &["switch", "-q", "--orphan", "main"]);
         git(root, &["branch", "-q", "-D", "candidate"]);
+        // The store's history so far, in one pack that holds more objects than all the small packs
+        // after it put together, twice over.
+        for index in 0..400 {
+            fs::write(
+                root.join(format!("history-{index}.txt")),
+                format!("{index}\n"),
+            )
+            .unwrap();
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "history"]);
+        git(root, &["repack", "-q"]);
+        let large = fs::read_dir(root.join(".git/objects/pack"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .max_by_key(|path| fs::metadata(path).unwrap().len())
+            .unwrap();
+        let written = fs::metadata(&large).unwrap().modified().unwrap();
         for index in 0..=COMPACT_PACKS {
             fs::write(root.join("turn.txt"), format!("turn {index}\n")).unwrap();
             git(root, &["add", "turn.txt"]);
@@ -1531,7 +1633,8 @@ mod store_tests {
         assert!(packs(root) as u64 > COMPACT_PACKS);
 
         assert!(compact_store(root).unwrap());
-        assert_eq!(packs(root), 1);
+        assert_eq!(packs(root), 2);
+        assert_eq!(fs::metadata(&large).unwrap().modified().unwrap(), written);
         git(root, &["cat-file", "-e", &orphan]);
         assert!(!compact_store(root).unwrap());
     }
