@@ -16,7 +16,9 @@ use std::path::PathBuf;
 mod ownership;
 use ownership::Ownership;
 
-pub use super::control_protocol::{CloudLine, CloudPresence, Reply, Request, SessionLine, Status};
+pub use super::control_protocol::{
+    CloudLine, CloudPresence, Refusing, Reply, Request, SessionLine, Status,
+};
 
 /// Length cap for a unix socket path.
 ///
@@ -134,6 +136,31 @@ pub fn presence_in(rc_dir: &std::path::Path) -> Presence {
         Liveness::Stale => Presence::Absent,
         Liveness::Unknown(why) => Presence::Unclear(why),
     }
+}
+
+/// [`presence_in`] with one deadline over the whole query, and the status the daemon answered
+/// with when it did. One exchange tells whether a daemon runs and what it reports, so a caller
+/// with a time cap does not spend it twice. A daemon that accepts and never replies is
+/// [`Presence::Unclear`] at the deadline, never [`Presence::Absent`].
+pub fn presence_within(
+    rc_dir: &std::path::Path,
+    budget: std::time::Duration,
+) -> (Presence, Option<Status>) {
+    let mut status = None;
+    let deadline = std::time::Instant::now() + budget;
+    let liveness = probe_with_owner(
+        &socket_path_for(rc_dir),
+        rc_dir,
+        None,
+        deadline,
+        &mut status,
+    );
+    let presence = match liveness {
+        Liveness::Live(pid) => Presence::Running(pid),
+        Liveness::Stale => Presence::Absent,
+        Liveness::Unknown(why) => Presence::Unclear(why),
+    };
+    (presence, status)
 }
 
 /// Send one request and read one reply. Used by the CLI side.
@@ -414,20 +441,67 @@ fn connect_timed_out() -> std::io::Error {
 /// distinguishes a listener that exited during the exchange from an unresponsive live peer.
 /// Ownership always comes from `rc_dir`, even when the socket uses the short-path fallback.
 fn probe_socket(path: &std::path::Path, rc_dir: &std::path::Path) -> Liveness {
-    probe_with_owner(path, rc_dir, None)
+    probe_with_owner(path, rc_dir, None, probe_deadline(), &mut None)
+}
+
+/// The deadline an unhurried probe works under.
+fn probe_deadline() -> std::time::Instant {
+    std::time::Instant::now() + CONNECT_TIMEOUT
+}
+
+/// What is left of `deadline`, never zero: a zero socket timeout means no timeout.
+fn left_of(deadline: std::time::Instant) -> std::time::Duration {
+    deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_millis(1))
+}
+
+/// One line from `stream`, read within `deadline` in total. A socket timeout bounds a single read,
+/// and a reply that keeps arriving in pieces without a newline restarts it on every piece, so the
+/// time left is taken and the timeout set again before each read. An empty string is a peer that
+/// closed without sending anything.
+fn read_line_by(mut stream: &UnixStream, deadline: std::time::Instant) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut line = Vec::new();
+    let mut piece = [0u8; 4096];
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for the daemon's reply",
+            ));
+        }
+        stream.set_read_timeout(Some(left_of(deadline)))?;
+        match stream.read(&mut piece) {
+            Ok(0) => break,
+            Ok(count) => {
+                let newline = piece[..count].iter().position(|byte| *byte == b'\n');
+                line.extend_from_slice(&piece[..newline.map_or(count, |at| at + 1)]);
+                if newline.is_some() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn probe_with_owner(
     path: &std::path::Path,
     rc_dir: &std::path::Path,
     owner: Option<&Ownership>,
+    deadline: std::time::Instant,
+    status: &mut Option<Status>,
 ) -> Liveness {
-    match probe_once(path, rc_dir, owner) {
+    match probe_once(path, rc_dir, owner, deadline, status) {
         live @ Liveness::Live(_) => live,
         Liveness::Stale => Liveness::Stale,
         // Connect through the bounded path (see [`connect_within`]): against a full backlog a
         // blocking connect waits indefinitely on Linux, and probing twice would wedge twice.
-        Liveness::Unknown(why) => match connect_within(path, CONNECT_TIMEOUT) {
+        Liveness::Unknown(why) => match connect_within(path, left_of(deadline)) {
             Err(e) if no_listener(&e) => ownership_verdict(path, rc_dir, owner),
             // Everything else that fails to connect (a connect timeout included) falls back to
             // `Unknown` — only the two above are enough for a verdict.
@@ -509,14 +583,14 @@ fn probe_once(
     path: &std::path::Path,
     rc_dir: &std::path::Path,
     owner: Option<&Ownership>,
+    deadline: std::time::Instant,
+    status: &mut Option<Status>,
 ) -> Liveness {
-    use std::io::{BufRead, BufReader};
-
     // `connect` **itself** needs a cap, see [`CONNECT_TIMEOUT`]: the two read/write timeouts below
     // only govern what happens after the connection is established, while a blocking connect
     // against a full backlog waits indefinitely on Linux — the probe wedges on this line and none
     // of the budgets below ever apply.
-    let mut stream = match connect_within(path, CONNECT_TIMEOUT) {
+    let mut stream = match connect_within(path, left_of(deadline)) {
         Ok(s) => s,
         Err(e) if no_listener(&e) => return ownership_verdict(path, rc_dir, owner),
         // A timeout lands here too: not getting a connection does not say "nobody is there", only
@@ -527,7 +601,7 @@ fn probe_once(
 
     // The budget covers both queuing and the status handler. An error reply or timeout cannot
     // supply a daemon PID, but must still preserve the socket as unknown.
-    let t = CONNECT_TIMEOUT;
+    let t = left_of(deadline);
     if stream.set_read_timeout(Some(t)).is_err() || stream.set_write_timeout(Some(t)).is_err() {
         return Liveness::Unknown("cannot set socket timeouts".into());
     }
@@ -558,11 +632,16 @@ fn probe_once(
     // The cost is that "connects but does not answer" makes `agit rc start` refuse to start instead
     // of cleaning up on its own. That is a **loud** failure whose error says what to do; removing a
     // live daemon's socket by mistake is a quiet one.
-    let mut reply = String::new();
-    match BufReader::new(&stream).read_line(&mut reply) {
-        Ok(0) => Liveness::Unknown("connected but the peer closed without answering".into()),
-        Ok(_) => match serde_json::from_str::<Reply>(&reply) {
-            Ok(Reply::Status(status)) if status.pid > 0 => Liveness::Live(status.pid),
+    match read_line_by(&stream, deadline) {
+        Ok(reply) if reply.is_empty() => {
+            Liveness::Unknown("connected but the peer closed without answering".into())
+        }
+        Ok(reply) => match serde_json::from_str::<Reply>(&reply) {
+            Ok(Reply::Status(answer)) if answer.pid > 0 => {
+                let pid = answer.pid;
+                *status = Some(answer);
+                Liveness::Live(pid)
+            }
             Ok(_) => {
                 Liveness::Unknown("the control socket answered without a daemon status".into())
             }
@@ -602,7 +681,7 @@ fn listen_in(rc_dir: &std::path::Path) -> crate::Result<Listener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match probe_with_owner(&path, rc_dir, Some(&owner)) {
+    match probe_with_owner(&path, rc_dir, Some(&owner), probe_deadline(), &mut None) {
         Liveness::Stale => match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 if owner.remove_stale(&path)? == ownership::Proof::Relocated {
@@ -1001,6 +1080,46 @@ mod tests {
             "connecting without answering must not count as live — that is the shape inside the \
              race window"
         );
+    }
+
+    /// A reply that arrives in pieces and never ends its line keeps to the deadline of the whole
+    /// query: each read gets only the time left, so a daemon that sends a byte before every
+    /// timeout does not stretch the wait, and the answer is "cannot tell", never "nobody is
+    /// there".
+    #[test]
+    fn a_reply_that_dribbles_without_a_newline_keeps_to_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rc = tmp.path();
+        let p = socket_path_for(rc);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&p).unwrap();
+        let daemon = std::thread::spawn(move || {
+            // Two probes may connect (the second after an unclear first); each gets a byte every
+            // 40 ms for far longer than the budget, and never a newline.
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let started = std::time::Instant::now();
+                while started.elapsed() < std::time::Duration::from_millis(1500) {
+                    if stream.write_all(b" ").is_err() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+        });
+        let budget = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let (presence, status) = presence_within(rc, budget);
+        let waited = started.elapsed();
+        assert!(matches!(presence, Presence::Unclear(_)), "{presence:?}");
+        assert!(status.is_none());
+        assert!(
+            waited < budget * 3,
+            "waited {waited:?} on a budget of {budget:?}"
+        );
+        drop(daemon);
     }
 
     /// A disconnect **after the connection is established** must not be taken as "no listener".

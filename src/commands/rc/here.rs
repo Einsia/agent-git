@@ -359,6 +359,7 @@ mod tests {
             pending: false,
             presence,
             error: error.map(Into::into),
+            refusing: None,
         }
     }
 

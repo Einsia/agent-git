@@ -19,7 +19,9 @@ use windows_sys::Win32::System::Pipes::{
     PeekNamedPipe, SetNamedPipeHandleState,
 };
 
-pub use super::control_protocol::{CloudLine, CloudPresence, Reply, Request, SessionLine, Status};
+pub use super::control_protocol::{
+    CloudLine, CloudPresence, Refusing, Reply, Request, SessionLine, Status,
+};
 use super::windows_security::{self as security, Handle};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
