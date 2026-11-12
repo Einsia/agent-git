@@ -8,6 +8,94 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.50] - 2026-11-12
+
+### Added
+
+- `agit status --repo <owner/repo>` reports one repository, and `agit status --all` starts with a row per repository
+  saying how many conversations it holds and how many need attention; `--unsaved` is another name for
+  `--check-missing`.
+- `agit login --continue <link>` returns the browser to the Hub page the sign-in started from once approved; links
+  with a `#` part (invitations, share keys) are handed back to the person after sign-in instead.
+- `agit save --branch NAME` gives a conversation's first upload the branch name you choose.
+- `agit repo invite <owner/repo>@<branch>` prints a session link and says what it opens (every session in the
+  repository, how many now, and any added later), who can use it and until when.
+
+### Changed
+
+- When agit refuses for a reason you can answer (a folder that belongs to another repository, saving turns switched
+  off, a public repository, a repository it can't find), `--json` names it in `refusal` with any fix, a repository it
+  can't find is said in one sentence, and answering no to a confirmation says "Cancelled; nothing changed." instead of
+  failing.
+- `agit project list --json` says in each capture row whether that runtime has conversations in the folder
+  (`used_here`).
+- `agit login` ends by saying who signed in and what to do next, and `agit login --json` returns the account and the
+  next step.
+- Opening a remote-control conversation loads its newest messages from the computer faster, also right after a turn,
+  before the turn has finished uploading.
+- A session branch name agit makes from your first request now uses the request's words as you wrote them, and a tag
+  name you type is accepted and published as it is, whatever text it holds. Memory collected into main still has its
+  credentials replaced, as before.
+- `agit run` and `agit resume` reopen a session in the runtime its latest turn ran in unless `--as` names another
+  (`runtime.default` now applies only to new sessions), say which runtime and why before launching, and, run from
+  another worktree of the same repository, ask whether to open it here or where it last ran.
+- When the Hub hasn't said who can read a repository, agit points to `agit repo info <repo>` instead of saying
+  "(visibility not confirmed)", and `agit push --keep-both` names the branch it creates before publishing it.
+- agit's skill tells an agent where teammates' questions and the answers to its own questions arrive (`agent_inbox`,
+  `agent_thread`), so it notices them without being told the tool names.
+- Opening a long remote-control conversation that is running on the computer starts showing it sooner.
+- Sign-in steps, setup notices and the public-push refusal say what to do to whoever reads them (the person or their
+  agent) instead of "Ask the human", and a public push without a terminal says `--yes` passes on a yes the person gave
+  in the conversation.
+- `agit on` says when it downloads a repository to this computer for the first time, and at a terminal shows how much
+  has arrived.
+- Plain `agit doctor` no longer reads every saved session's LOG and VIEW, which took minutes on a computer with many
+  saved conversations; `agit doctor --deep` still checks that every session's VIEW references only events its LOG
+  has.
+- `agit share` is called a read-only copy: its help says anyone with the link can read it without an account until it
+  expires (in 7 days unless `--expire` says otherwise) or you revoke it.
+- A command that needs a conversation but is given none, such as `agit push <owner/repo>`, `agit commit` or
+  `agit log`, names the one conversation saved from this folder with the exact command, when there is exactly one; in
+  a git worktree, `agit log --branches` reads the repository its folder saves into.
+
+### Fixed
+
+- A save while automatic upload is off says it published once and where, and what switches automatic upload back on;
+  an automatic upload that agit's own files or locks stopped says so.
+- In a folder that uploads by itself, `agit on`, `agit`, `agit status` and `agit doctor` say that OpenCode
+  conversations go up when the agent runs `agit commit` or you run `agit save`, not at the end of each turn.
+- A remote-control connection that is busy sending a long conversation is no longer dropped and restarted as if the
+  device had stopped answering.
+- Remote control connections come back within seconds after the Hub replaces its relay, instead of waiting out a
+  growing retry delay.
+- Viewing a remote-control conversation can no longer undo, on disk, the record that a session ran without permission
+  checks.
+- `agit branch` with no `--repo` lists the branches of the agent repo the current folder saves to, and says so,
+  instead of failing; outside such a folder it names the agent repos on this computer and how to pick one.
+- `agit doctor` says in one short line when agit's Skill isn't installed for a runtime on this computer, says nothing
+  about runtimes that aren't installed, and counts missing or outdated Skill files instead of listing each one.
+- `agit doctor` checks each saved conversation against the digest its last save recorded instead of reading the whole
+  conversation, and it lists only the conversations that need attention.
+- A message typed while Claude Code was running a tool now appears in the saved conversation on the Hub.
+- A message typed into a conversation started from the Hub while the agent was running a tool shows once, as
+  delivered, when the agent takes it in, instead of staying queued beside a copy of it.
+- A conversation started from the Hub keeps saving its turns after an update replaces agit while it runs, instead of
+  waiting, unsaved, until the background service restarts; `agit status` says when finished turns are waiting to be
+  saved.
+- An approval answered from remote control for a Claude Code terminal session now reports that it was applied, and
+  answering one approval no longer holds up another in the same session.
+- `agit on` in a folder inside one you turned off turns on only that folder and says the outer one stays off, instead
+  of turning the outer folder back on.
+- `agit branch rename` moves the conversations saving to the branch to its new name, so their next turns go on the
+  renamed branch instead of recreating the old one.
+- A Codex tool call whose input held a value the privacy check protects keeps a readable input when it is saved or
+  published, so it still pairs with its result when the conversation is continued elsewhere.
+- `agit` lists a folder's OpenCode conversations with their upload state.
+- `agit share` on a long conversation no longer fails on its first try with a privacy protocol error or "cannot lock
+  privacy path aliases"; when the privacy check can't finish, the message now says why and whether trying again
+  helps.
+- A bearer credential at the end of a sentence no longer takes the sentence's period with it when it is replaced.
+
 ## [0.2.49] - 2026-11-11
 
 ### Fixed
