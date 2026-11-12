@@ -115,11 +115,13 @@ pub(crate) fn covering(dir: &Path) -> crate::Result<Vec<(std::path::PathBuf, Rep
     let dir = dir.canonicalize()?;
     let mut found: Vec<(std::path::PathBuf, Repo)> = Vec::new();
     for namespace in [super::LOCAL_NAMESPACE, "rc"] {
-        let repositories = registry(&super::namespace_dir(namespace)?.join("repositories.json"))?;
-        for repository in repositories
+        let directory = super::namespace_dir(namespace)?;
+        // A repository a project no longer starts conversations in still holds conversations that
+        // upload, so turning the folder off or on covers it too.
+        let repositories = registry(&directory.join("repositories.json"))?
             .into_values()
-            .filter(|repository| dir.starts_with(&repository.directory))
-        {
+            .chain(retired(&directory.join("retired-repositories.json"))?);
+        for repository in repositories.filter(|repository| dir.starts_with(&repository.directory)) {
             let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
             let repo = require_by(&lineage, Authority::Saved(namespace))?;
             if !found.iter().any(|(_, known)| known.root() == repo.root()) {
@@ -164,8 +166,13 @@ pub(crate) fn folders_of(repo: &Repo) -> crate::Result<Vec<std::path::PathBuf>> 
     let root = repo.root().canonicalize()?;
     let mut folders = Vec::new();
     for namespace in [super::LOCAL_NAMESPACE, "rc"] {
-        let repositories = registry(&super::namespace_dir(namespace)?.join("repositories.json"))?;
-        for repository in repositories.into_values() {
+        let directory = super::namespace_dir(namespace)?;
+        // A repository a project no longer starts conversations in still holds conversations of
+        // its folder, and the folder's records judge them too.
+        let repositories = registry(&directory.join("repositories.json"))?
+            .into_values()
+            .chain(retired(&directory.join("retired-repositories.json"))?);
+        for repository in repositories {
             let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
             let directory = std::path::PathBuf::from(&repository.directory);
             if lineage.repo_dir()?.canonicalize().ok().as_ref() == Some(&root)
@@ -178,6 +185,155 @@ pub(crate) fn folders_of(repo: &Repo) -> crate::Result<Vec<std::path::PathBuf>> 
     Ok(folders)
 }
 
+/// The projects whose conversations `repo` holds, each with its folder, when it is a device-local
+/// repository a daemon on this computer registered; another repository holds none.
+pub(crate) fn projects_of(repo: &Repo) -> crate::Result<Vec<(String, std::path::PathBuf)>> {
+    let root = repo.root().canonicalize()?;
+    let mut projects = Vec::new();
+    for namespace in [super::LOCAL_NAMESPACE, "rc"] {
+        let directory = super::namespace_dir(namespace)?;
+        let repositories = registry(&directory.join("repositories.json"))?
+            .into_iter()
+            .chain(
+                retired(&directory.join("retired-repositories.json"))?
+                    .into_iter()
+                    .map(|repository| (repository.project_id.clone(), repository)),
+            );
+        for (project, repository) in repositories {
+            let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
+            let entry = (project, std::path::PathBuf::from(&repository.directory));
+            if lineage.repo_dir()?.canonicalize().ok().as_ref() == Some(&root)
+                && !projects.contains(&entry)
+            {
+                projects.push(entry);
+            }
+        }
+    }
+    Ok(projects)
+}
+
+fn session_projects_path(repo: &Repo) -> crate::Result<std::path::PathBuf> {
+    Ok(repo.common_dir()?.join("agit/session-projects.json"))
+}
+
+/// What a repository records about one of its conversations: the project that started it, and
+/// the destination its first upload went to, which is the only one it uploads to after that.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    destination: Option<String>,
+}
+
+fn change_session(
+    repo: &Repo,
+    branch: &str,
+    change: impl FnOnce(&mut SessionRecord),
+) -> crate::Result<()> {
+    let path = session_projects_path(repo)?;
+    let directory = path
+        .parent()
+        .context("session project record has no folder")?;
+    std::fs::create_dir_all(directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut sessions = session_records(&path)?;
+    let before = sessions.get(branch).cloned();
+    let record = sessions.entry(branch.to_owned()).or_default();
+    change(record);
+    if before.as_ref() == Some(&*record) {
+        return Ok(());
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    std::io::Write::write_all(temporary.as_file_mut(), &serde_json::to_vec(&sessions)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    Ok(())
+}
+
+/// Records that the conversation on `branch` of device-local `repo` was started in `project`, so
+/// its uploads are judged by that project's destination.
+pub(crate) fn note_session_project(repo: &Repo, branch: &str, project: &str) -> crate::Result<()> {
+    change_session(repo, branch, |record| {
+        record.project.get_or_insert_with(|| project.to_owned());
+    })
+}
+
+/// The project that started the conversation on `branch` of device-local `repo`, when recorded.
+pub(crate) fn session_project(repo: &Repo, branch: &str) -> crate::Result<Option<String>> {
+    Ok(session_records(&session_projects_path(repo)?)?
+        .remove(branch)
+        .and_then(|record| record.project))
+}
+
+/// Records `destination` as where the conversation on `branch` uploads, once: a conversation keeps
+/// the destination its first upload went to.
+pub(crate) fn pin_session_destination(
+    repo: &Repo,
+    branch: &str,
+    destination: &str,
+) -> crate::Result<()> {
+    change_session(repo, branch, |record| {
+        record
+            .destination
+            .get_or_insert_with(|| destination.to_owned());
+    })
+}
+
+/// The destination the conversation on `branch` uploads to, when its first upload set one.
+pub(crate) fn session_destination(repo: &Repo, branch: &str) -> crate::Result<Option<String>> {
+    Ok(session_records(&session_projects_path(repo)?)?
+        .remove(branch)
+        .and_then(|record| record.destination))
+}
+
+fn session_records(path: &Path) -> crate::Result<BTreeMap<String, SessionRecord>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("session project record is invalid"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Device-local repositories a project no longer starts conversations in, because their
+/// destination isn't the one chosen for the folder any more. The conversations they hold keep the
+/// destination they started with, or hold, so they stay known.
+fn retired(path: &Path) -> crate::Result<Vec<Repository>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("retired repository record is invalid"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether `repository`'s saved destination is no longer the one chosen for `directory` under the
+/// account signed in to its Hub, so new conversations need a repository of their own.
+fn destination_moved(repository: &Repository, directory: &Path) -> crate::Result<bool> {
+    let lineage = AgitSession::new(&repository.slug, &repository.agent_id, "main")?;
+    let Some(repo) = Repo::open(lineage.repo_dir()?) else {
+        return Ok(false);
+    };
+    let Some(saved) = publication::Destination::load(&repo)? else {
+        return Ok(false);
+    };
+    let Some(key) = super::folder_destination::Key::signed_in(directory, &saved.identity.hub)?
+    else {
+        return Ok(false);
+    };
+    Ok(super::folder_destination::chosen(&key)?
+        .is_some_and(|chosen| chosen.repository_id != saved.identity.agent_id))
+}
+
+/// The device-local repository `project_id`'s new conversations in `directory` are recorded in.
+/// A project keeps its repository while that repository's destination is the one chosen for the
+/// folder; after the folder's destination changes, new conversations get a repository of their
+/// own, and the earlier one keeps its conversations and their destination.
 pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Repository> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -187,19 +343,38 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
         .open(super::rc_dir()?.join("repositories.lock"))?;
     fs2::FileExt::lock_exclusive(&lock)?;
     let mut repositories = registry(&super::rc_dir()?.join("repositories.json"))?;
-    let directory = directory.canonicalize()?.to_string_lossy().to_string();
+    let canonical = directory.canonicalize()?;
+    let directory = canonical.to_string_lossy().to_string();
     if let Some(repository) = repositories.get(project_id) {
         ensure!(
             repository.directory == directory,
             "project directory changed; select a new project identity"
         );
         // The launch boundary validates repository authority before spawning.
-        return Ok(repository.clone());
+        if !destination_moved(repository, &canonical)? {
+            return Ok(repository.clone());
+        }
+        let mut retired = retired(&super::rc_dir()?.join("retired-repositories.json"))?;
+        if !retired
+            .iter()
+            .any(|known| known.agent_id == repository.agent_id && known.project_id == project_id)
+        {
+            retired.push(repository.clone());
+            super::save_json("retired-repositories.json", &retired)?;
+        }
+        repositories.remove(project_id);
     }
     let machine = super::identity::identity()?;
-    let mut existing = repositories
+    let mut candidates = Vec::new();
+    for repository in repositories
         .values()
-        .filter(|repo| repo.directory == directory);
+        .filter(|repo| repo.directory == directory)
+    {
+        if !destination_moved(repository, &canonical)? {
+            candidates.push(repository);
+        }
+    }
+    let mut existing = candidates.into_iter();
     if let Some(candidate) = existing.next() {
         ensure!(
             existing.all(|repo| repo.agent_id == candidate.agent_id
@@ -209,7 +384,7 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
         );
         let lineage = AgitSession::new(&candidate.slug, &candidate.agent_id, "main")?;
         let repo =
-            Repo::open(&lineage.repo_dir()?).context("shared project repository is missing")?;
+            Repo::open(lineage.repo_dir()?).context("shared project repository is missing")?;
         require_identity(&repo, &candidate.agent_id, &machine.machine_fingerprint)?;
         let mut repository = candidate.clone();
         repository.project_id = project_id.into();
@@ -217,12 +392,26 @@ pub fn ensure_repository(project_id: &str, directory: &Path) -> crate::Result<Re
         super::save_json("repositories.json", &repositories)?;
         return Ok(repository);
     }
+    // A folder the person turned off stays off in the repository its new conversations get.
+    let mut turned_off = false;
+    for known in retired(&super::rc_dir()?.join("retired-repositories.json"))?
+        .iter()
+        .filter(|known| known.directory == directory)
+    {
+        let lineage = AgitSession::new(&known.slug, &known.agent_id, "main")?;
+        if let Some(repo) = Repo::open(lineage.repo_dir()?) {
+            turned_off |= repo.uploads_turned_off()?;
+        }
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let owner = format!("desktop-{}", machine.machine_fingerprint);
     let slug = format!("{owner}/project-{id}");
     let lineage = AgitSession::new(&slug, &id, "main")?;
     let repo = Repo::open_or_init(&lineage.repo_dir()?)?;
     repo.set_auto_push(Some(false))?;
+    if turned_off {
+        repo.turn_uploads_off(true)?;
+    }
     let authority = format!("local:{}", machine.machine_fingerprint);
     repo.git(&["config", "--local", "agit.desktopIdentity", &id])?;
     use_commit_identity(&repo)?;

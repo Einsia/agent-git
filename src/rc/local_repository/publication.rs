@@ -118,6 +118,11 @@ impl Selection {
         }))
     }
 
+    /// Whether this gives the repository its first destination.
+    pub(crate) fn is_first(&self) -> bool {
+        self.previous.is_none()
+    }
+
     pub(crate) fn checkout(
         &self,
         path: &std::path::Path,
@@ -159,4 +164,155 @@ impl Selection {
         repo.git(&["config", "--local", CONFIG, &serde_json::to_string(&saved)?])?;
         Ok(())
     }
+}
+
+/// The folders whose conversations device-local `repo` holds, and its projects.
+/// The destination chosen for `root` under the account signed in to `hub`, with its key. A folder
+/// without a record yet takes the person's own terminal choice for it, when that choice is this
+/// account's. `None` with nobody signed in, or nothing chosen.
+fn folder_record(
+    root: &std::path::Path,
+    hub: &str,
+) -> crate::Result<
+    Option<(
+        crate::rc::folder_destination::Key,
+        crate::rc::folder_destination::Chosen,
+    )>,
+> {
+    use crate::rc::folder_destination as folder;
+    let Some(key) = folder::Key::signed_in(root, hub)? else {
+        return Ok(None);
+    };
+    if folder::chosen(&key)?.is_none()
+        && let Some((repository, identity, account)) =
+            crate::commands::project::folder_choice(key.root())
+        && account == key.account()
+        && identity.hub == identity::normalize_hub(hub)?
+    {
+        folder::adopt(&key, &repository, &identity.agent_id)?;
+    }
+    Ok(folder::chosen(&key)?.map(|chosen| (key, chosen)))
+}
+
+fn folders_and_projects(repo: &Repo) -> crate::Result<(Vec<std::path::PathBuf>, Vec<String>)> {
+    let mut folders = Vec::new();
+    let mut projects = Vec::new();
+    for (project, folder) in super::projects_of(repo)? {
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+        projects.push(project);
+    }
+    Ok((folders, projects))
+}
+
+/// Gives device-local `repo` the destination chosen for its folder under the account signed in to
+/// `hub`, when it has none yet. A folder without a record yet takes the person's own terminal
+/// choice for it, when that choice is this account's. A repository that has a destination keeps
+/// it: its conversations keep the destination they started with, and a folder whose destination
+/// changed starts new conversations in a repository of their own
+/// ([`super::ensure_repository`]). Nothing changes for a repository no daemon here registered, or
+/// with nobody signed in.
+pub(crate) fn follow_folder(repo: &Repo, hub: &str) -> crate::Result<()> {
+    let Some(local_agent_id) = local_id(repo)? else {
+        return Ok(());
+    };
+    let (folders, _) = folders_and_projects(repo)?;
+    let [root] = folders.as_slice() else {
+        return Ok(());
+    };
+    let Some((_, chosen)) = folder_record(root, hub)? else {
+        return Ok(());
+    };
+    if Destination::load(repo)?.is_some() {
+        return Ok(());
+    }
+    let target = RemoteIdentity::new(hub, &chosen.repository_id)?;
+    slug(&chosen.repository)?;
+    identity::pin(repo, &target)?;
+    let saved = Destination {
+        version: 1,
+        local_agent_id,
+        repository: chosen.repository,
+        identity: target,
+    };
+    repo.git(&["config", "--local", CONFIG, &serde_json::to_string(&saved)?])?;
+    Ok(())
+}
+
+/// Whether the conversation on `branch` of device-local `repo` may upload to `saved`. One whose
+/// first upload went there keeps uploading there, under the account that sent it. Any other is
+/// judged at its start: `saved` must be the destination chosen for its folder under the account
+/// signed in there, for the project that started it (see
+/// [`crate::rc::folder_destination::allows`]). A conversation recorded outside a device-local
+/// repository was started at the terminal and keeps the terminal's destination. A repository no
+/// daemon here registered is judged as before; with nobody signed in, the sign-in check that
+/// follows decides.
+pub(crate) fn confirmed(
+    repo: &Repo,
+    branch: &str,
+    saved: &RemoteIdentity,
+    project: Option<&str>,
+) -> crate::Result<bool> {
+    use crate::rc::folder_destination as folder;
+    if local_id(repo)?.is_none() {
+        return Ok(true);
+    }
+    let (folders, projects) = folders_and_projects(repo)?;
+    if folders.is_empty() {
+        return Ok(true);
+    }
+    let account = crate::infra::credentials::account_key(&saved.hub);
+    if let Some(pinned) = super::session_destination(repo, branch)? {
+        return Ok(account.is_none() || pinned == pin_value(saved, account.as_deref()));
+    }
+    let project = super::session_project(repo, branch)?.or(project.map(str::to_owned));
+    for root in &folders {
+        let Some(key) = folder::Key::signed_in(root, &saved.hub)? else {
+            return Ok(true);
+        };
+        if !folder::allows(&key, project.as_deref(), &projects, &saved.agent_id)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn pin_value(destination: &RemoteIdentity, account: Option<&str>) -> String {
+    format!("{} {}", destination.agent_id, account.unwrap_or_default())
+}
+
+/// Records that the conversation on `branch` of device-local `repo` uploads to `destination`
+/// from now on, under the account signed in there, once its first upload is allowed.
+pub(crate) fn keep_destination(
+    repo: &Repo,
+    branch: &str,
+    destination: &RemoteIdentity,
+) -> crate::Result<()> {
+    if local_id(repo)?.is_none() {
+        return Ok(());
+    }
+    let Some(account) = crate::infra::credentials::account_key(&destination.hub) else {
+        return Ok(());
+    };
+    super::pin_session_destination(repo, branch, &pin_value(destination, Some(&account)))
+}
+
+/// For a one-off `agit push --to` that gave device-local `repo` its first destination: makes it
+/// the folder's too, when the folder has none yet, and returns the line that says so.
+pub(crate) fn first_choice(
+    repo: &Repo,
+    repository: &str,
+    identity: &RemoteIdentity,
+) -> crate::Result<Option<String>> {
+    use crate::rc::folder_destination as folder;
+    let (folders, _) = folders_and_projects(repo)?;
+    let [root] = folders.as_slice() else {
+        return Ok(None);
+    };
+    let Some(key) = folder::Key::signed_in(root, &identity.hub)? else {
+        return Ok(None);
+    };
+    Ok(folder::choose_first(&key, repository, &identity.agent_id)?
+        .then(|| format!("this folder now uploads to {repository}")))
 }

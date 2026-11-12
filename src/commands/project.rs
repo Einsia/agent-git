@@ -2460,6 +2460,17 @@ fn bind(
     }
     workspace::bind(&root, repository, rebind)?;
     save(&project)?;
+    // The person chose this for the folder: its workspace conversations follow it too.
+    crate::rc::folder_destination::choose(
+        &crate::rc::folder_destination::Key::new(
+            &root,
+            &project.identity.hub,
+            project.account_id.as_deref().unwrap_or(&project.account),
+        )?,
+        repository,
+        &project.identity.agent_id,
+        crate::rc::folder_destination::ChosenFor::Folder,
+    )?;
     // The new policy holds what a move released; the record of it has done its work.
     match fs::remove_file(state_path(&root)?.with_extension("moved-drops")) {
         Ok(()) => {}
@@ -2860,6 +2871,58 @@ pub(crate) fn is_dropped(root: &Path, runtime: &str, session_id: &str) -> bool {
 /// The repository of the project policy that covers `path`, paused or not.
 pub(crate) fn policy_repository(path: &Path) -> Option<String> {
     governing(path).ok()?.map(|(project, _)| project.repository)
+}
+
+/// Where the person chose, in a terminal, that `folder`'s conversations upload, for the account
+/// that chose it: the policy of `folder` or of a folder above it. A git worktree's main checkout
+/// doesn't choose for the worktree here. `(repository, identity, account)`, the account as
+/// [`credentials::account_key`] names it.
+pub(crate) fn folder_choice(folder: &Path) -> Option<(String, RemoteIdentity, String)> {
+    match governing(folder).ok()?? {
+        (project, Via::Folder) => Some((
+            project.repository,
+            project.identity,
+            project.account_id.unwrap_or(project.account),
+        )),
+        (_, Via::Worktree(_)) => None,
+    }
+}
+
+/// Gives `folder` a terminal policy uploading to `repository` for `account`, as `agit on` would.
+#[cfg(test)]
+pub(crate) fn save_policy_for_test(
+    folder: &Path,
+    repository: &str,
+    identity: &RemoteIdentity,
+    account: &str,
+) {
+    save(&Project {
+        root: folder.canonicalize().unwrap(),
+        repository: repository.into(),
+        identity: identity.clone(),
+        account: account.into(),
+        account_id: Some(account.into()),
+        enabled: true,
+        auto_upload: true,
+        history: History::None,
+        excluded: BTreeSet::new(),
+        earlier: BTreeSet::new(),
+        earlier_opencode: false,
+        last_result: None,
+        push_auto_before: None,
+    })
+    .unwrap();
+}
+
+/// The repository `folder`'s own policy uploads to and the account it is for (as
+/// [`credentials::account_key`] names it); `None` when the folder has no policy of its own.
+pub(crate) fn own_policy(folder: &Path) -> Option<(String, String)> {
+    read(&folder.canonicalize().ok()?).ok()?.map(|project| {
+        (
+            project.repository,
+            project.account_id.unwrap_or(project.account),
+        )
+    })
 }
 
 /// Whether the project policy covering `path` uploads automatically, without network access.

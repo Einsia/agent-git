@@ -150,6 +150,11 @@ pub(crate) enum Waiting {
     /// turned on, and stays here until the person saves it (see [`crate::rc::folder_cutoff`]).
     #[error("the conversation stays on this computer until it is saved")]
     HeldBack,
+    /// The turn is committed locally; the destination saved for its folder isn't the one chosen
+    /// for its own project under the account signed in here (see
+    /// [`crate::rc::folder_destination`]).
+    #[error("{}", crate::rc::folder_destination::HELD)]
+    Unconfirmed,
 }
 
 /// A recovery subprocess exited unsuccessfully; its exit code tells a refusal from a fault.
@@ -374,7 +379,16 @@ pub(crate) fn publication_target(
     runtime: &str,
     native: &str,
 ) -> crate::Result<crate::rc::capture::PublicationDestination> {
-    publication_target_by(repo, lineage, runtime, native, Authority::Process)
+    use crate::rc::local_repository::publication;
+    if publication::is_device_local(repo)? {
+        let hub = publication::Destination::load(repo)?
+            .map(|saved| saved.identity.hub)
+            .unwrap_or_else(crate::infra::config::hub_url);
+        publication::follow_folder(repo, &hub)?;
+    }
+    let destination = publication_target_by(repo, lineage, runtime, native, Authority::Process)?;
+    publication::keep_destination(repo, lineage.branch(), &destination.identity)?;
+    Ok(destination)
 }
 
 /// [`publication_target`], with a device-local capture repository verified against `authority`.
@@ -392,6 +406,14 @@ fn publication_target_by(
     }
     if crate::rc::folder_cutoff::holds_back(repo, runtime, native) {
         return Err(Waiting::HeldBack.into());
+    }
+    if !crate::rc::local_repository::publication::confirmed(
+        repo,
+        lineage.branch(),
+        &destination.identity,
+        None,
+    )? {
+        return Err(Waiting::Unconfirmed.into());
     }
     Ok(destination)
 }

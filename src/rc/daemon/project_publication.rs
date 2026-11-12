@@ -213,17 +213,11 @@ pub(in crate::rc) async fn reconcile_owned(
                 "main",
             )?;
             let repo = local_repository::require(&lineage).context(Stage::Repository)?;
-            if local_repository::publication::Destination::load(&repo)?.is_some_and(|saved| {
-                saved.identity == destination && saved.repository == request.repository
-            }) && repo.auto_push_enabled()?
-                && crate::commands::push::automatic_publication_consent_with_client(
-                    &repo,
-                    &request.repository,
-                    &destination,
-                    &client,
-                )
-                .context(Stage::Consent)?
-            {
+            let key = crate::rc::folder_destination::Key::signed_in(&directory, &hub)?
+                .ok_or(Failure::LoginOtherHub)
+                .context(Stage::Consent)?;
+            let decision = decide(&repo, &key, &target, &destination)?;
+            if decision == Decision::Hold {
                 return Ok(());
             }
             let current = || -> crate::Result<()> {
@@ -238,14 +232,41 @@ pub(in crate::rc) async fn reconcile_owned(
                 );
                 local_check()
             };
+            if decision == Decision::Own {
+                current()?;
+                prepare_project_publication_consent(
+                    &repo,
+                    &request.repository,
+                    &destination,
+                    &device.owner.account_id,
+                )
+                .context(Stage::Consent)?;
+                choose_own_binding(
+                    &key,
+                    &request.project_id,
+                    &request.repository,
+                    &destination,
+                    move_terminal,
+                )
+                .context(Stage::Destination)?;
+            }
+            // A folder whose destination changed starts new conversations in a repository of
+            // their own; it is that one this binding configures.
+            let repo = project_repository(&request.project_id, &directory)?.1;
+            if local_repository::publication::Destination::load(&repo)?.is_some_and(|saved| {
+                saved.identity == destination && saved.repository == request.repository
+            }) && repo.auto_push_enabled()?
+                && crate::commands::push::automatic_publication_consent_with_client(
+                    &repo,
+                    &request.repository,
+                    &destination,
+                    &client,
+                )
+                .context(Stage::Consent)?
+            {
+                return Ok(());
+            }
             current()?;
-            let selection = local_repository::publication::Selection::prepare(
-                &repo,
-                Some(&request.repository),
-                &hub,
-            )
-            .context(Stage::Destination)?
-            .context("project repository is not device-local")?;
             let consent = prepare_project_publication_consent(
                 &repo,
                 &request.repository,
@@ -253,6 +274,13 @@ pub(in crate::rc) async fn reconcile_owned(
                 &device.owner.account_id,
             )
             .context(Stage::Consent)?;
+            let selection = local_repository::publication::Selection::prepare(
+                &repo,
+                Some(&request.repository),
+                &hub,
+            )
+            .context(Stage::Destination)?
+            .context("project repository is not device-local")?;
             current()?;
             match confirm_repository(
                 &repo,
@@ -442,6 +470,31 @@ impl Prepared {
             crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
                 .context(Stage::Repository)?;
         let repo = local_repository::require(&lineage).context(Stage::Repository)?;
+        let consent = prepare_project_publication_consent(
+            &repo,
+            &self.request.repository,
+            &self.destination,
+            &grant.target.owner.account_id,
+        )
+        .context(Stage::Consent)?;
+        // The device owner confirms this binding from the web themselves, so it is this
+        // account's own choice for the folder.
+        let key =
+            crate::rc::folder_destination::Key::signed_in(&self.directory, &self.destination.hub)?
+                .ok_or(Failure::LoginOtherHub)
+                .context(Stage::Consent)?;
+        choose_own_binding(
+            &key,
+            &self.request.project_id,
+            &self.request.repository,
+            &self.destination,
+            move_terminal,
+        )
+        .context(Stage::Destination)?;
+        let (repository, repo) = project_repository(&self.request.project_id, &self.directory)?;
+        let lineage =
+            crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .context(Stage::Repository)?;
         let selection = local_repository::publication::Selection::prepare(
             &repo,
             Some(&self.request.repository),
@@ -450,13 +503,6 @@ impl Prepared {
         .context(Stage::Destination)?
         .context("project repository is not device-local")
         .context(Stage::Destination)?;
-        let consent = prepare_project_publication_consent(
-            &repo,
-            &self.request.repository,
-            &self.destination,
-            &grant.target.owner.account_id,
-        )
-        .context(Stage::Consent)?;
         self.current_device(canceled).context(Stage::OwnedBinding)?;
         selection.verify(&repo).context(Stage::Destination)?;
         Ok(Verified {
@@ -493,6 +539,128 @@ impl Prepared {
             consent_ready: verified.consent.matches(&repo)?,
         })
     }
+}
+
+/// What a reconcile does with a Hub binding for the folder's project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The device's own account made it: it becomes the folder's destination.
+    Own,
+    /// It is already the folder's destination: it is confirmed as it is.
+    Current,
+    /// Someone else made it: the project's conversations stay here, and the folder as it is.
+    Hold,
+}
+
+/// Judges `target`, the Hub's binding of a project over the folder of device-local `repo`, for the
+/// account `key` names. The binding is remembered, so the project's conversations upload only to
+/// it. A binding the device's own account made, or that is already the folder's destination, is
+/// confirmed; any other is held. A destination this computer already uploads the folder's only
+/// project to stays its destination, and nothing else is taken from an earlier choice. A held
+/// binding older than the Hub's record of who made it is asked about once, at a terminal.
+fn decide(
+    repo: &crate::domain::repo::Repo,
+    key: &crate::rc::folder_destination::Key,
+    target: &crate::hub::project_publication::Target,
+    destination: &RemoteIdentity,
+) -> crate::Result<Decision> {
+    use crate::rc::folder_destination as folder;
+    // A folder whose record predates this one takes the person's own terminal choice first.
+    local_repository::publication::follow_folder(repo, &destination.hub)?;
+    let request = target.request();
+    let binding = folder::Binding {
+        repository: request.repository.clone(),
+        repository_id: request.repository_id.clone(),
+    };
+    folder::note_binding(key, &request.project_id, &binding)?;
+    let chosen = folder::chosen(key)?;
+    // The device's own account's binding is taken once. One older than the Hub's record of who
+    // made it is taken only by a folder with no destination yet, in a workspace where no other
+    // account can bind.
+    if target.bound_by_account(key.account())
+        && (target.bound_by.is_some() || chosen.is_none())
+        && !folder::applied(key, &request.project_id, &request.repository_id)?
+    {
+        return Ok(Decision::Own);
+    }
+    if chosen
+        .as_ref()
+        .is_some_and(|chosen| chosen.repository_id == request.repository_id)
+    {
+        return Ok(Decision::Current);
+    }
+    if chosen.is_none()
+        && local_repository::publication::Destination::load(repo)?
+            .is_some_and(|saved| &saved.identity == destination)
+        && local_repository::projects_of(repo)?.len() == 1
+    {
+        folder::adopt(key, &request.repository, &request.repository_id)?;
+        return Ok(Decision::Current);
+    }
+    if target.bound_by.is_none() {
+        folder::ask_later(key, &request.project_id, &binding)?;
+    }
+    Ok(Decision::Hold)
+}
+
+/// Makes `repository`, which the device's own account bound `project` to, the folder's
+/// destination: new conversations of the folder go there, and so does the folder's own terminal
+/// policy of the same account, moved by `move_terminal` the way `agit on --repo` moves it. A
+/// folder with no policy of its own gets none, so terminal capture is never turned on from the
+/// web.
+fn choose_own_binding(
+    key: &crate::rc::folder_destination::Key,
+    project: &str,
+    repository: &str,
+    destination: &RemoteIdentity,
+    move_terminal: impl FnOnce(&std::path::Path, &str) -> crate::Result<()>,
+) -> crate::Result<()> {
+    crate::rc::folder_destination::choose(
+        key,
+        repository,
+        &destination.agent_id,
+        crate::rc::folder_destination::ChosenFor::Project(project.to_owned()),
+    )?;
+    if let Some((policy, account)) = crate::commands::project::own_policy(key.root())
+        && policy != repository
+        && account == key.account()
+    {
+        move_terminal(key.root(), repository)?;
+    }
+    Ok(())
+}
+
+/// The device-local repository `project`'s new conversations in `directory` are recorded in.
+fn project_repository(
+    project: &str,
+    directory: &std::path::Path,
+) -> crate::Result<(local_repository::Repository, crate::domain::repo::Repo)> {
+    let repository =
+        local_repository::ensure_repository(project, directory).context(Stage::Repository)?;
+    let lineage =
+        crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+            .context(Stage::Repository)?;
+    let repo = local_repository::require(&lineage).context(Stage::Repository)?;
+    Ok((repository, repo))
+}
+
+/// Moves `folder`'s terminal uploads to `repository` with `agit on --repo`.
+fn move_terminal(folder: &std::path::Path, repository: &str) -> crate::Result<()> {
+    let output = crate::infra::background::command(crate::infra::own_image::own_image()?)
+        .args(["on", "--repo", repository])
+        .arg(folder)
+        .env("AGIT_YES", "1")
+        .env_remove("AGIT_SESSION")
+        .env_remove("AGIT_MERGE_TX")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "the folder's terminal uploads could not be moved"
+    );
+    Ok(())
 }
 
 fn confirm_repository(
@@ -894,6 +1062,943 @@ mod tests {
                 .unwrap()
                 .identity,
             destination
+        );
+    }
+
+    const HUB: &str = "https://hub.example";
+    const OWN: &str = "00000000-0000-0000-0000-00000000000a";
+    const TEAM: &str = "00000000-0000-0000-0000-00000000000b";
+    const ORG: &str = "00000000-0000-0000-0000-00000000000c";
+
+    /// A device home signed in to the fixture Hub, with a folder bound as project `p`.
+    struct Folder {
+        _home: tempfile::TempDir,
+        directory: PathBuf,
+        /// Each conversation started here, by branch, with the repository that records it.
+        conversations:
+            std::cell::RefCell<std::collections::BTreeMap<String, local_repository::Repository>>,
+    }
+
+    fn sign_in(account: &str) {
+        crate::infra::credentials::save(
+            HUB,
+            &crate::infra::credentials::HubCredential {
+                account_id: Some(account.into()),
+                username: account.into(),
+                email: None,
+                hub: Some(HUB.into()),
+                access_token: "fixture".into(),
+                refresh_token: "fixture".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn fixture(account: &str) -> Folder {
+        let home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", home.path().join("agit"));
+            std::env::set_var("AGIT_HUB_URL", HUB);
+        }
+        crate::rc::select_local_authority();
+        sign_in(account);
+        let directory = home.path().join("burrow");
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        local_repository::ensure_repository("p", &directory).unwrap();
+        Folder {
+            _home: home,
+            directory,
+            conversations: Default::default(),
+        }
+    }
+
+    fn open(repository: &local_repository::Repository) -> crate::domain::repo::Repo {
+        local_repository::require(
+            &crate::rc::lineage::AgitSession::new(&repository.slug, &repository.agent_id, "main")
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    impl Folder {
+        fn key(&self, account: &str) -> crate::rc::folder_destination::Key {
+            crate::rc::folder_destination::Key::new(&self.directory, HUB, account).unwrap()
+        }
+
+        /// The repository `p`'s new conversations are recorded in now.
+        fn repository(&self) -> local_repository::Repository {
+            local_repository::ensure_repository("p", &self.directory).unwrap()
+        }
+
+        /// Starts a conversation of `p` on the web, on `branch`.
+        fn start(&self, branch: &str) {
+            let repository = self.repository();
+            local_repository::note_session_project(&open(&repository), branch, "p").unwrap();
+            self.conversations
+                .borrow_mut()
+                .insert(branch.to_owned(), repository);
+        }
+
+        /// Saves `repository` as the destination of `p`'s repository, as a first `agit push --to`
+        /// does, and returns the line it says.
+        fn push_to(&self, repository: &str, id: &str) -> Option<String> {
+            let repo = open(&self.repository());
+            let identity = RemoteIdentity::new(HUB, id).unwrap();
+            let selection =
+                local_repository::publication::Selection::prepare(&repo, Some(repository), HUB)
+                    .unwrap()
+                    .unwrap();
+            let first = selection.is_first();
+            selection.bind(&repo, &identity).unwrap();
+            first
+                .then(|| {
+                    local_repository::publication::first_choice(&repo, repository, &identity)
+                        .unwrap()
+                })
+                .flatten()
+        }
+
+        fn target(
+            &self,
+            repository: &str,
+            id: &str,
+            extra: serde_json::Value,
+        ) -> crate::hub::project_publication::Target {
+            let mut entry = serde_json::json!({
+                "web_workspace_id": "w", "web_project_id": "wp",
+                "workspace_id": crate::rc::endpoint::WORKSPACE, "project_id": "p",
+                "local_path": self.directory.to_str().unwrap(),
+                "repository": repository, "repository_id": id,
+            });
+            for (name, value) in extra.as_object().unwrap() {
+                entry[name] = value.clone();
+            }
+            serde_json::from_value(entry).unwrap()
+        }
+
+        /// The Hub's binding reaching the device, as reconcile takes it once the destination's
+        /// checks pass: judged, chosen when it is the device's own account's, and configured in
+        /// the repository the project's new conversations are recorded in. Returns the decision
+        /// and the folders whose terminal uploads moved.
+        fn reconcile(
+            &self,
+            target: &crate::hub::project_publication::Target,
+        ) -> (Decision, Vec<(PathBuf, String)>) {
+            let account = crate::infra::credentials::account_key(HUB).unwrap();
+            let key = self.key(&account);
+            let destination = RemoteIdentity::new(HUB, &target.repository_id).unwrap();
+            let decision = decide(&open(&self.repository()), &key, target, &destination).unwrap();
+            let mut moved = Vec::new();
+            if decision == Decision::Own {
+                choose_own_binding(
+                    &key,
+                    &target.project_id,
+                    &target.repository,
+                    &destination,
+                    |folder, repository| {
+                        moved.push((folder.to_owned(), repository.to_owned()));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            }
+            if decision != Decision::Hold {
+                let (_, repo) = project_repository("p", &self.directory).unwrap();
+                local_repository::publication::Selection::prepare(
+                    &repo,
+                    Some(&target.repository),
+                    HUB,
+                )
+                .unwrap()
+                .unwrap()
+                .bind(&repo, &destination)
+                .unwrap();
+            }
+            (decision, moved)
+        }
+
+        /// Where the conversation on `branch` uploads at its next settle, `None` when it holds.
+        fn uploads(&self, branch: &str) -> Option<String> {
+            let repository = self.conversations.borrow()[branch].clone();
+            let lineage = crate::rc::lineage::AgitSession::new(
+                &repository.slug,
+                &repository.agent_id,
+                branch,
+            )
+            .unwrap();
+            match crate::rc::capture::confirmed_destination(&open(&repository), &lineage, None)
+                .unwrap()
+            {
+                crate::rc::capture::Confirmed::Ready(destination) => Some(destination.repository),
+                _ => None,
+            }
+        }
+
+        /// Where archive recovery sends the conversation on `branch`, `None` when it waits.
+        fn recovers(&self, branch: &str) -> Option<String> {
+            let repository = self.conversations.borrow()[branch].clone();
+            let lineage = crate::rc::lineage::AgitSession::new(
+                &repository.slug,
+                &repository.agent_id,
+                branch,
+            )
+            .unwrap();
+            open(&repository).set_auto_push(Some(true)).unwrap();
+            crate::rc::supervisor::archive_recovery::publication_target(
+                &open(&repository),
+                &lineage,
+                "claude-code",
+                branch,
+            )
+            .ok()
+            .map(|destination| destination.repository)
+        }
+
+        /// Where archive recovery sends the conversation on `branch` as the folder's settings
+        /// stand, `None` when it waits.
+        fn recovers_as_set(&self, branch: &str) -> Option<String> {
+            let repository = self.conversations.borrow()[branch].clone();
+            let lineage = crate::rc::lineage::AgitSession::new(
+                &repository.slug,
+                &repository.agent_id,
+                branch,
+            )
+            .unwrap();
+            crate::rc::supervisor::archive_recovery::publication_target(
+                &open(&repository),
+                &lineage,
+                "claude-code",
+                branch,
+            )
+            .ok()
+            .map(|destination| destination.repository)
+        }
+
+        fn chosen(&self, account: &str) -> String {
+            crate::rc::folder_destination::chosen(&self.key(account))
+                .unwrap()
+                .unwrap()
+                .repository
+        }
+    }
+
+    /// Yuki's case: the folder first uploaded to her own repository by her own choice, and a
+    /// workspace project bound later over it to a team repository. Bound by another account (a
+    /// collaborator with full workspace access), the binding changes nothing: a new conversation
+    /// of the project holds, and the folder keeps her choice. Bound by her own account, it becomes
+    /// the folder's destination, its terminal uploads included, for conversations that start
+    /// after it. A one-off push never changes a destination the folder has.
+    #[test]
+    fn a_web_binding_retargets_a_folder_only_when_the_devices_own_account_made_it() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_web_binding_retargets_a_folder_only_when_the_devices_own_account_made_it",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        assert_eq!(
+            folder.push_to("yuki/burrow-rc", OWN).as_deref(),
+            Some("this folder now uploads to yuki/burrow-rc")
+        );
+        crate::commands::project::save_policy_for_test(
+            &folder.directory,
+            "yuki/burrow-rc",
+            &RemoteIdentity::new(HUB, OWN).unwrap(),
+            "account-yuki",
+        );
+
+        let by_hao = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(folder.reconcile(&by_hao), (Decision::Hold, vec![]));
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-b"),
+            None,
+            "held, not sent to the folder's destination"
+        );
+        assert_eq!(
+            folder.chosen("account-yuki"),
+            "yuki/burrow-rc",
+            "the folder keeps her choice"
+        );
+        assert_eq!(
+            crate::rc::folder_destination::unasked(&folder.key("account-yuki")).unwrap(),
+            None,
+            "a binding the Hub says someone else made is not asked about"
+        );
+
+        let by_yuki = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(
+            folder.reconcile(&by_yuki),
+            (
+                Decision::Own,
+                vec![(folder.directory.clone(), "simco/burrow-agents".to_owned())]
+            )
+        );
+        folder.start("desktop-c");
+        assert_eq!(
+            folder.uploads("desktop-c").as_deref(),
+            Some("simco/burrow-agents")
+        );
+        assert_eq!(
+            folder.uploads("desktop-b"),
+            None,
+            "a held conversation doesn't follow"
+        );
+        assert_eq!(folder.push_to("simco/burrow-agents", TEAM), None);
+        assert!(
+            local_repository::publication::Selection::prepare(
+                &open(&folder.repository()),
+                Some("yuki/elsewhere"),
+                HUB
+            )
+            .is_err(),
+            "a one-off push doesn't retarget the folder"
+        );
+        assert_eq!(folder.chosen("account-yuki"), "simco/burrow-agents");
+    }
+
+    /// A conversation keeps the destination it started with. After the project's destination
+    /// changes, its next settle and archive recovery still go to the earlier repository, a new
+    /// conversation goes to the new one, and nothing of the first goes to the new one. A
+    /// conversation whose start rule 1 forbade, like Yuki's workspace sessions to burrow-rc,
+    /// doesn't continue there and doesn't move: it holds.
+    #[test]
+    fn a_conversation_keeps_the_destination_it_started_with() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_conversation_keeps_the_destination_it_started_with",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        let first = folder.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&first).0, Decision::Own);
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a").as_deref(),
+            Some("yuki/burrow-rc")
+        );
+
+        let moved = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&moved).0, Decision::Own);
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-a").as_deref(),
+            Some("yuki/burrow-rc"),
+            "the next settle"
+        );
+        assert_eq!(
+            folder.recovers("desktop-a").as_deref(),
+            Some("yuki/burrow-rc"),
+            "archive recovery"
+        );
+        assert_eq!(
+            folder.uploads("desktop-b").as_deref(),
+            Some("simco/burrow-agents")
+        );
+        assert_eq!(
+            folder.recovers("desktop-b").as_deref(),
+            Some("simco/burrow-agents")
+        );
+        assert_ne!(
+            folder.conversations.borrow()["desktop-a"].agent_id,
+            folder.conversations.borrow()["desktop-b"].agent_id,
+            "the first conversation's turns aren't in the repository the new destination gets"
+        );
+
+        // Yuki's workspace sessions: going to her own repository, which the folder took from an
+        // earlier choice while the project is bound to the team's.
+        let forbidden = fixture("account-yuki");
+        forbidden.push_to("yuki/burrow-rc", OWN);
+        forbidden.start("desktop-hao");
+        let team = forbidden.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(forbidden.reconcile(&team).0, Decision::Hold);
+        assert_eq!(forbidden.uploads("desktop-hao"), None);
+        assert_eq!(forbidden.recovers("desktop-hao"), None);
+    }
+
+    /// Lin's case: a personal project bound over a folder whose device-local repository first
+    /// uploaded to an organization repository. Her own binding is used for new conversations;
+    /// the organization's destination, inherited from that earlier choice, is not.
+    #[test]
+    fn a_personal_project_over_a_folder_first_sent_to_an_org_uses_its_own_binding() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_personal_project_over_a_folder_first_sent_to_an_org_uses_its_own_binding",
+        ) {
+            return;
+        }
+        let folder = fixture("account-lin");
+        let repo = open(&folder.repository());
+        local_repository::publication::Selection::prepare(&repo, Some("simco/lumen-agents"), HUB)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &RemoteIdentity::new(HUB, ORG).unwrap())
+            .unwrap();
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a"),
+            None,
+            "an earlier destination with no record isn't used"
+        );
+        let personal = folder.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        assert_eq!(folder.reconcile(&personal), (Decision::Own, vec![]));
+        folder.start("desktop-b");
+        assert_eq!(folder.uploads("desktop-b").as_deref(), Some("lin/lumen"));
+        assert_eq!(folder.uploads("desktop-a"), None);
+    }
+
+    /// A binding from before the Hub recorded who made it is taken only when the folder has no
+    /// destination and the device's account is the only one that can bind in the workspace;
+    /// otherwise it holds and is asked about once. Under another sign-in nothing chosen for this
+    /// account is used.
+    #[test]
+    fn an_older_binding_is_taken_only_from_a_sole_binder_and_otherwise_asked_about() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::an_older_binding_is_taken_only_from_a_sole_binder_and_otherwise_asked_about",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        folder.start("desktop-a");
+        let shared = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"sole_binder": false}),
+        );
+        assert_eq!(folder.reconcile(&shared), (Decision::Hold, vec![]));
+        assert_eq!(folder.uploads("desktop-a"), None);
+        let key = folder.key("account-yuki");
+        let (project, binding) = crate::rc::folder_destination::unasked(&key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (project.as_str(), binding.repository.as_str()),
+            ("p", "simco/burrow-agents")
+        );
+        assert!(!crate::rc::folder_destination::answer(&key, &project, &binding, false).unwrap());
+        assert_eq!(folder.reconcile(&shared), (Decision::Hold, vec![]));
+        assert_eq!(
+            crate::rc::folder_destination::unasked(&key).unwrap(),
+            None,
+            "asked once"
+        );
+        let unrecorded = folder.target("simco/burrow-agents", TEAM, serde_json::json!({}));
+        assert_eq!(
+            folder.reconcile(&unrecorded),
+            (Decision::Hold, vec![]),
+            "a Hub without the field"
+        );
+
+        let sole = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"sole_binder": true}),
+        );
+        assert_eq!(folder.reconcile(&sole), (Decision::Own, vec![]));
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-b").as_deref(),
+            Some("simco/burrow-agents")
+        );
+
+        sign_in("account-other");
+        folder.start("desktop-c");
+        assert_eq!(
+            folder.uploads("desktop-c"),
+            None,
+            "another account's choice isn't used"
+        );
+        assert_eq!(
+            folder.uploads("desktop-b"),
+            None,
+            "nor its conversations, under another sign-in"
+        );
+        sign_in("account-yuki");
+        assert_eq!(
+            folder.uploads("desktop-b").as_deref(),
+            Some("simco/burrow-agents")
+        );
+    }
+
+    /// A reconcile that confirms nothing leaves the project's new conversations here, and they
+    /// upload once the device's own binding is confirmed. A destination this computer already
+    /// uploads the folder's only project to stays its destination at upgrade; with a second
+    /// project over the folder it is not taken.
+    #[test]
+    fn a_failed_reconcile_holds_and_an_upgrade_keeps_only_an_uninherited_destination() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_failed_reconcile_holds_and_an_upgrade_keeps_only_an_uninherited_destination",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        folder.push_to("yuki/burrow-rc", OWN);
+        // The binding reached the device, but its checks failed before it was confirmed.
+        let key = folder.key("account-yuki");
+        let by_yuki = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(
+            decide(
+                &open(&folder.repository()),
+                &key,
+                &by_yuki,
+                &RemoteIdentity::new(HUB, TEAM).unwrap()
+            )
+            .unwrap(),
+            Decision::Own
+        );
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a"),
+            None,
+            "nothing goes to the old destination"
+        );
+        assert_eq!(folder.reconcile(&by_yuki).0, Decision::Own);
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-b").as_deref(),
+            Some("simco/burrow-agents")
+        );
+
+        let only = fixture("account-yuki");
+        let repo = open(&only.repository());
+        local_repository::publication::Selection::prepare(&repo, Some("yuki/burrow-rc"), HUB)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &RemoteIdentity::new(HUB, OWN).unwrap())
+            .unwrap();
+        let same = only.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(
+            only.reconcile(&same).0,
+            Decision::Current,
+            "kept: this project's own"
+        );
+        only.start("desktop-a");
+        assert_eq!(only.uploads("desktop-a").as_deref(), Some("yuki/burrow-rc"));
+
+        let shared = fixture("account-yuki");
+        let repo = open(&shared.repository());
+        local_repository::publication::Selection::prepare(&repo, Some("yuki/burrow-rc"), HUB)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &RemoteIdentity::new(HUB, OWN).unwrap())
+            .unwrap();
+        local_repository::ensure_repository("q", &shared.directory).unwrap();
+        let same = shared.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(
+            shared.reconcile(&same).0,
+            Decision::Hold,
+            "two projects share the folder"
+        );
+        shared.start("desktop-a");
+        assert_eq!(shared.uploads("desktop-a"), None);
+    }
+
+    /// The person's terminal choice for a folder is where its workspace conversations upload
+    /// too, when their project's binding names it, and only then.
+    #[test]
+    fn terminal_and_workspace_conversations_of_a_folder_follow_one_destination() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::terminal_and_workspace_conversations_of_a_folder_follow_one_destination",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        crate::commands::project::save_policy_for_test(
+            &folder.directory,
+            "yuki/burrow-rc",
+            &RemoteIdentity::new(HUB, OWN).unwrap(),
+            "account-yuki",
+        );
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a").as_deref(),
+            Some("yuki/burrow-rc"),
+            "the folder's terminal choice"
+        );
+        let elsewhere = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(folder.reconcile(&elsewhere).0, Decision::Hold);
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-b"),
+            None,
+            "its project is bound elsewhere"
+        );
+    }
+
+    /// Lin's case, one destination per folder: a terminal policy for an organization repository
+    /// and a workspace project her own account binds to her personal one. Whichever of the two
+    /// she chose last is the folder's destination; a web-started conversation of the project
+    /// whose binding names the other holds, and none ever goes to the other project's
+    /// repository. A binding already applied isn't applied again, so a later terminal choice
+    /// stays.
+    #[test]
+    fn a_folder_has_one_destination_the_latest_own_choice_and_nothing_crosses() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_folder_has_one_destination_the_latest_own_choice_and_nothing_crosses",
+        ) {
+            return;
+        }
+        let org = RemoteIdentity::new(HUB, ORG).unwrap();
+        // The terminal choice first, then her web binding: the folder and its terminal uploads
+        // move to the personal repository.
+        let terminal_first = fixture("account-lin");
+        crate::commands::project::save_policy_for_test(
+            &terminal_first.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        let personal = terminal_first.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        assert_eq!(
+            terminal_first.reconcile(&personal),
+            (
+                Decision::Own,
+                vec![(terminal_first.directory.clone(), "lin/lumen".to_owned())]
+            )
+        );
+        terminal_first.start("desktop-a");
+        assert_eq!(
+            terminal_first.uploads("desktop-a").as_deref(),
+            Some("lin/lumen")
+        );
+        assert_eq!(terminal_first.chosen("account-lin"), "lin/lumen");
+
+        // Her web binding first, then `agit on --repo` for the organization: the folder is the
+        // organization's, and the personal project's new conversations hold, even after the next
+        // reconcile.
+        let web_first = fixture("account-lin");
+        let personal = web_first.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        assert_eq!(web_first.reconcile(&personal).0, Decision::Own);
+        web_first.start("desktop-a");
+        assert_eq!(web_first.uploads("desktop-a").as_deref(), Some("lin/lumen"));
+        crate::commands::project::save_policy_for_test(
+            &web_first.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        crate::rc::folder_destination::choose(
+            &web_first.key("account-lin"),
+            "simco/lumen-agents",
+            ORG,
+            crate::rc::folder_destination::ChosenFor::Folder,
+        )
+        .unwrap();
+        assert_eq!(web_first.reconcile(&personal), (Decision::Hold, vec![]));
+        web_first.start("desktop-b");
+        assert_eq!(
+            web_first.uploads("desktop-b"),
+            None,
+            "held, never sent to the organization"
+        );
+        assert_eq!(web_first.recovers("desktop-b"), None);
+        assert_eq!(
+            web_first.uploads("desktop-a").as_deref(),
+            Some("lin/lumen"),
+            "it keeps its start"
+        );
+        assert_eq!(web_first.chosen("account-lin"), "simco/lumen-agents");
+    }
+
+    /// Lin's folder at upgrade: her terminal policy names the organization repository, her
+    /// personal project's binding is older than the Hub's record of who made it, and its
+    /// device-local repository uploaded to the personal one. The folder keeps her terminal choice,
+    /// so her terminal sessions don't move; the personal project's conversations hold, never
+    /// going to the organization, and she is asked once. Yes moves the folder to the personal
+    /// repository for conversations that start after it.
+    #[test]
+    fn at_upgrade_a_folder_keeps_its_terminal_choice_and_asks_about_a_different_project_binding() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::at_upgrade_a_folder_keeps_its_terminal_choice_and_asks_about_a_different_project_binding",
+        ) {
+            return;
+        }
+        let folder = fixture("account-lin");
+        let repo = open(&folder.repository());
+        local_repository::publication::Selection::prepare(&repo, Some("lin/lumen"), HUB)
+            .unwrap()
+            .unwrap()
+            .bind(&repo, &RemoteIdentity::new(HUB, OWN).unwrap())
+            .unwrap();
+        folder.start("desktop-a");
+        crate::commands::project::save_policy_for_test(
+            &folder.directory,
+            "simco/lumen-agents",
+            &RemoteIdentity::new(HUB, ORG).unwrap(),
+            "account-lin",
+        );
+        let older = folder.target("lin/lumen", OWN, serde_json::json!({"sole_binder": true}));
+        assert_eq!(folder.reconcile(&older), (Decision::Hold, vec![]));
+        assert_eq!(
+            folder.uploads("desktop-a"),
+            None,
+            "never to the organization"
+        );
+        let key = folder.key("account-lin");
+        assert_eq!(
+            folder.chosen("account-lin"),
+            "simco/lumen-agents",
+            "her terminal sessions keep it"
+        );
+        let (project, binding) = crate::rc::folder_destination::unasked(&key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.repository, "lin/lumen");
+        assert!(crate::rc::folder_destination::answer(&key, &project, &binding, true).unwrap());
+        assert_eq!(folder.reconcile(&older).0, Decision::Current);
+        folder.start("desktop-b");
+        assert_eq!(folder.uploads("desktop-b").as_deref(), Some("lin/lumen"));
+    }
+
+    /// A conversation is judged by the project that started it. One the terminal side started
+    /// and captured, in the folder's terminal repository, keeps uploading there after the web
+    /// observes or resumes it, whatever the workspace project's binding says, at its settles and
+    /// in archive recovery alike.
+    #[test]
+    fn a_terminal_conversation_opened_on_the_web_keeps_its_terminal_destination() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_terminal_conversation_opened_on_the_web_keeps_its_terminal_destination",
+        ) {
+            return;
+        }
+        let folder = fixture("account-lin");
+        let org = RemoteIdentity::new(HUB, ORG).unwrap();
+        crate::commands::project::save_policy_for_test(
+            &folder.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        let checkout = crate::domain::repo::Repo::init(
+            &crate::infra::config::repo_dir("simco", "lumen-agents").unwrap(),
+        )
+        .unwrap();
+        crate::hub::identity::pin(&checkout, &org).unwrap();
+        checkout.set_auto_push(Some(true)).unwrap();
+        let claim =
+            crate::rc::lineage::AgitSession::new("simco/lumen-agents", ORG, "lumen-terminal")
+                .unwrap();
+        let personal = folder.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(folder.reconcile(&personal).0, Decision::Hold);
+        assert!(matches!(
+            crate::rc::capture::confirmed_destination(&checkout, &claim, Some("p")).unwrap(),
+            crate::rc::capture::Confirmed::Ready(destination) if destination.repository == "simco/lumen-agents"
+        ));
+        assert_eq!(
+            crate::rc::supervisor::archive_recovery::publication_target(
+                &checkout,
+                &claim,
+                "claude-code",
+                "native"
+            )
+            .unwrap()
+            .repository,
+            "simco/lumen-agents"
+        );
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a"),
+            None,
+            "a web-started one of the project holds"
+        );
+        assert_eq!(folder.recovers("desktop-a"), None);
+    }
+
+    /// The device's own account binds the project first, and another account rebinds it later:
+    /// a conversation started before keeps its destination, and one started after holds instead
+    /// of going where the project was first bound.
+    #[test]
+    fn a_rebinding_by_someone_else_holds_new_conversations() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_rebinding_by_someone_else_holds_new_conversations",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        let own = folder.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&own).0, Decision::Own);
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.uploads("desktop-a").as_deref(),
+            Some("yuki/burrow-rc")
+        );
+        let rebound = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-hao"}),
+        );
+        assert_eq!(folder.reconcile(&rebound).0, Decision::Hold);
+        folder.start("desktop-b");
+        assert_eq!(
+            folder.uploads("desktop-b"),
+            None,
+            "not to the project's first binding"
+        );
+        assert_eq!(folder.recovers("desktop-b"), None);
+        assert_eq!(
+            folder.uploads("desktop-a").as_deref(),
+            Some("yuki/burrow-rc")
+        );
+    }
+
+    /// `agit off` turns off every repository holding the folder's conversations, one a project no
+    /// longer starts conversations in included, and a folder turned off stays off in the repository
+    /// a later binding gives its new conversations, so a binding from the web never turns it back
+    /// on.
+    #[test]
+    fn a_folder_turned_off_stays_off_across_a_change_of_destination() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_folder_turned_off_stays_off_across_a_change_of_destination",
+        ) {
+            return;
+        }
+        // Off after the change: the earlier repository's conversation stops too.
+        let folder = fixture("account-yuki");
+        let first = folder.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&first).0, Decision::Own);
+        folder.start("desktop-a");
+        assert_eq!(
+            folder.recovers("desktop-a").as_deref(),
+            Some("yuki/burrow-rc")
+        );
+        let second = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&second).0, Decision::Own);
+        folder.start("desktop-b");
+        assert_eq!(
+            crate::commands::front::on::turn_off_bound_folders(&folder.directory)
+                .unwrap()
+                .len(),
+            2,
+            "both repositories holding the folder's conversations"
+        );
+        assert_eq!(
+            folder.recovers("desktop-a"),
+            None,
+            "the earlier repository is off too"
+        );
+        assert_eq!(folder.recovers("desktop-b"), None);
+
+        // Off before the change: the repository the new binding gives is off as well.
+        let folder = fixture("account-yuki");
+        assert_eq!(folder.reconcile(&first).0, Decision::Own);
+        folder.start("desktop-a");
+        crate::commands::front::on::turn_off_bound_folders(&folder.directory).unwrap();
+        assert_eq!(folder.reconcile(&second).0, Decision::Own);
+        let replaced = open(&folder.repository());
+        assert!(replaced.uploads_turned_off().unwrap());
+        assert!(
+            !crate::commands::auto_push::publication_allowed(&replaced, "simco/burrow-agents")
+                .unwrap()
+        );
+    }
+
+    /// A conversation in a repository the project no longer starts conversations in, after the
+    /// folder is turned off and on again: what it said meanwhile stays on this computer, as for
+    /// every conversation the folder held when it was turned on, until the person saves it.
+    #[test]
+    fn turning_a_folder_back_on_keeps_an_earlier_repositorys_conversation_here() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::turning_a_folder_back_on_keeps_an_earlier_repositorys_conversation_here",
+        ) {
+            return;
+        }
+        let folder = fixture("account-yuki");
+        let first = folder.target(
+            "yuki/burrow-rc",
+            OWN,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&first).0, Decision::Own);
+        folder.start("desktop-a");
+        open(&folder.conversations.borrow()["desktop-a"])
+            .set_auto_push(Some(true))
+            .unwrap();
+        assert_eq!(
+            folder.recovers_as_set("desktop-a").as_deref(),
+            Some("yuki/burrow-rc")
+        );
+        let second = folder.target(
+            "simco/burrow-agents",
+            TEAM,
+            serde_json::json!({"bound_by": "account-yuki"}),
+        );
+        assert_eq!(folder.reconcile(&second).0, Decision::Own);
+        crate::commands::front::on::turn_off_bound_folders(&folder.directory).unwrap();
+        assert_eq!(folder.recovers_as_set("desktop-a"), None, "off");
+        crate::commands::front::on::turn_on_bound_folders(&folder.directory, |_| {
+            Ok(vec!["claude-code:desktop-a".to_owned()])
+        })
+        .unwrap();
+        assert_eq!(
+            folder.recovers_as_set("desktop-a"),
+            None,
+            "it was there while the folder was off, so it stays here until it is saved"
         );
     }
 }

@@ -676,6 +676,18 @@ impl Schedule {
                     until: Until::PushEnabled { checked: now },
                 })
             }
+            // Rechecked like a wait for automatic publication: confirming the project's
+            // destination here ends it.
+            Class::Waits(Waiting::Unconfirmed) => {
+                eprintln!(
+                    "agitd: completed turn archive is committed locally and waits for its project's destination to be confirmed on this computer ({}, turn {})",
+                    job.logical, job.turn_id
+                );
+                Some(Park {
+                    claim: evidence.claim,
+                    until: Until::PushEnabled { checked: now },
+                })
+            }
             _ => None,
         };
         if let Some(park) = until {

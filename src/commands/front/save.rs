@@ -248,6 +248,19 @@ fn save(args: SaveArgs) -> CmdResult {
         )
         .into());
     }
+    // A binding set on the web that this computer can't take by itself is asked about here once;
+    // yes makes it the folder's destination, its terminal uploads included.
+    if !args.today
+        && let Ok(root) = std::env::current_dir().and_then(|dir| {
+            super::folder(&dir).map_err(|error| std::io::Error::other(error.to_string()))
+        })
+        && let Some(repository) = super::ask_web_binding(&root)?
+        && let Some((policy, _)) = crate::commands::project::own_policy(&root)
+        && policy != repository
+    {
+        let client = super::sign_in(&format!("agit on --repo {repository}"))?;
+        super::on::enable(&client, &root, Some(&repository), false, |_| Ok(true))?;
+    }
     let plan = plan(&args)?;
     // One name is one branch: a save of several conversations would put them all on it.
     let count: usize = plan.folders.values().map(Vec::len).sum();

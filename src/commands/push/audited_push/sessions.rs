@@ -894,7 +894,19 @@ pub(super) fn run(
         // dictionary. The sync runs detached, so it never holds up or fails the publication.
         crate::domain::privacy::service::schedule_sync(&intent.hub);
         if let Some(selection) = &local_target {
+            let first = selection.is_first();
             selection.bind(&repo, &destination.identity)?;
+            // A first destination named for this folder's conversations becomes the folder's
+            // own; one the folder has already is changed only by `agit on --repo`.
+            if first
+                && let Some(line) = crate::rc::local_repository::publication::first_choice(
+                    &repo,
+                    &selection.repository,
+                    &destination.identity,
+                )?
+            {
+                ui::info(&line);
+            }
         }
         projected.verify_source(&repo)?;
         let prepared = complete.bind_projected_destination_with_client(
