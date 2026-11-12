@@ -8,6 +8,36 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.51] - 2026-11-12
+
+### Added
+
+- Remote Control reports the agit release the computer runs, so the Hub can show it in the workspace.
+
+### Changed
+
+- OpenCode conversations in a folder that uploads by itself go up at the end of each turn once `agit setup` has
+  installed its OpenCode plugin.
+- A share made while a turn is running says, before you confirm, which turn the link holds up to.
+- `agit status` lists a folder's conversations by when each was last saved, newest first, so the newest is on the
+  first page whatever its runtime.
+
+### Fixed
+
+- `agit push` names why each branch or tag was not published (refused by Git, refused by the Hub, or unconfirmed)
+  and explains an HTTP 428, instead of listing every one as "unconfirmed".
+- A conversation now uploads only to the repository chosen for the project it started in: the folder's own choice for
+  one started in a terminal, or its web project's for one started from the web. That means a choice made on this
+  computer, or by your own account on the web. A repository chosen for another project, or under another account, is
+  never used, and until the right one is confirmed the conversation stays saved on this computer. A conversation
+  keeps the repository it started in, so changing a folder's or a project's repository applies to conversations
+  started after the change. A folder's terminal and web conversations now share one repository.
+- `agit share` refuses a link that would open empty and names the command that shares the conversation as it is now.
+- A push that starts while another upload of the same repository is preparing waits for it (up to 30 seconds) instead
+  of failing with "os error 11"; if it is still blocked it says so and names the command to rerun.
+- `agit status --all` counts a repository's finished turns waiting to be saved in its "need attention" column, so a
+  repository whose only trouble is a save wait no longer shows 0 there.
+
 ## [0.2.50] - 2026-11-12
 
 ### Added
