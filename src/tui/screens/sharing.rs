@@ -39,6 +39,7 @@ impl Draft {
             expire: EXPIRIES[self.expiry].into(),
             views: VIEW_LIMITS[self.views],
             password: self.password,
+            show_preview: false,
             cmd: None,
         }
     }

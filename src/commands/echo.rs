@@ -14,6 +14,8 @@ pub(crate) enum Source {
     Transaction,
     /// The repository the current folder saves to; only read-only listings choose by it.
     Folder,
+    /// The one agent conversation the runtime's own variables name, as `agit status` reads it.
+    ThisConversation,
 }
 
 impl Source {
@@ -25,6 +27,7 @@ impl Source {
             Self::Interactive => "interactive selection",
             Self::Transaction => "merge transaction",
             Self::Folder => "this folder",
+            Self::ThisConversation => "this conversation",
         }
     }
 

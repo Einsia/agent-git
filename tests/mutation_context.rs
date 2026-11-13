@@ -109,15 +109,18 @@ fn directory_pins_cannot_choose_daily_write_targets() {
     lab.pin();
     fs::write(lab.repo.root().join("README.md"), "unsaved user file\n").unwrap();
     let before = lab.repo.git(&["rev-parse", "main"]).unwrap();
-    for args in [
-        vec!["push", "--dry-run"],
-        vec!["commit", "-m", "must not commit"],
-        vec!["share", "--public"],
+    for (args, names) in [
+        (vec!["push", "--dry-run"], "AGIT_SESSION"),
+        (vec!["commit", "-m", "must not commit"], "AGIT_SESSION"),
+        (
+            vec!["share", "--public"],
+            "`agit share <owner>/<repo>@<branch>`",
+        ),
     ] {
         let output = lab.command(&args).output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{args:?}: {stderr}");
-        assert!(stderr.contains("AGIT_SESSION"), "{args:?}: {stderr}");
+        assert!(stderr.contains(names), "{args:?}: {stderr}");
         assert_eq!(lab.repo.git(&["rev-parse", "main"]).unwrap(), before);
     }
     let explicit = lab
@@ -164,7 +167,8 @@ fn adoption_cannot_replace_explicit_process_identity() {
         let output = command.output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{stderr}");
-        assert!(stderr.contains("requires a valid AGIT_SESSION"), "{stderr}");
+        assert!(stderr.contains("nothing to share was named"), "{stderr}");
+        assert!(!stderr.contains("me/fixture@"), "{stderr}");
     }
     let head = lab.repo.git(&["rev-parse", "work"]).unwrap();
     let mut selected = lab.command(&["share", "--public"]);

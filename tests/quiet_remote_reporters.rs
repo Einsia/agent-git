@@ -601,7 +601,11 @@ fn quiet_share_keeps_confirmation_refusal_without_a_request() {
     let head = lab.git(&repo, &["rev-parse", "HEAD"]);
     for mode in ["flag", "", "1"] {
         let output = lab
-            .command(&hub.base, &["share", "me/qa@chosen", "--public"], mode)
+            .command(
+                &hub.base,
+                &["share", "me/qa@chosen", "--public", "--show-preview"],
+                mode,
+            )
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(8), "{output:?}");

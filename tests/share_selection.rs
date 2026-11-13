@@ -316,6 +316,11 @@ impl Fixture {
     }
 
     fn run_agit(&self, leading: &[&str], args: &[&str], session: Option<&str>) -> Output {
+        let session = session.map(|session| ("AGIT_SESSION", session));
+        self.run_env(leading, args, session.as_slice())
+    }
+
+    fn run_env(&self, leading: &[&str], args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
@@ -334,9 +339,7 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
-        if let Some(session) = session {
-            command.env("AGIT_SESSION", session);
-        }
+        command.envs(envs.iter().copied());
         let mut child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
@@ -665,7 +668,7 @@ fn saved_and_live_shares_apply_the_same_scope_rewrites_and_aliases() {
         "me/paper@privacy-saved",
         "native-fixture",
     ] {
-        let output = f.success(&[target, "--public"], None);
+        let output = f.success(&[target, "--public", "--show-preview"], None);
         let request = f.hub.payloads().pop().unwrap();
         let text = request["payload"].as_str().unwrap();
         let public: Value = serde_json::from_str(text).unwrap();
@@ -1165,6 +1168,271 @@ fn a_share_during_a_running_turn_is_refused_when_empty_and_says_where_it_stops()
     let asks = stderr.find("requires confirmation");
     assert!(stops.is_some() && stops < asks, "{stderr}");
     assert_eq!(f.hub.payloads().len(), before);
+}
+
+/// A bare `agit share` in an agent's own turn, with the runtime's session variable and no
+/// `AGIT_SESSION`, shares that conversation's branch as `agit share <owner>/<repo>@<branch>` would,
+/// with the mid-turn note. A conversation with no branch yet, or several conversations, are refused
+/// before anything reaches the Hub with a command that works as printed, whether or not agit has a
+/// record of the conversation; no conversation at all gets copyable targets, not an environment
+/// variable. By default the confirmation follows the
+/// privacy summary, the record count and the note, and the records' text appears only with
+/// `--show-preview`, before the note. An implementation that still demands `AGIT_SESSION`, picks
+/// one of several conversations, or prints the records ahead of the question by default fails.
+#[test]
+fn a_bare_share_in_an_agents_turn_shares_its_own_conversation() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let id = "46846846-8468-4468-8468-468468468468";
+    let unsaved = "46846846-8468-4468-8468-000000000468";
+    let record = |id: &str, kind: &str, text: &str| {
+        let content = if kind == "user" {
+            json!(text)
+        } else {
+            json!([{"type": "text", "text": text}])
+        };
+        format!(
+            "{}\n",
+            json!({"type": kind, "sessionId": id, "message": {"role": kind, "content": content}})
+        )
+    };
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    let settled = record(id, "user", "SETTLED-TURN") + &record(id, "assistant", "SETTLED-REPLY");
+    std::fs::write(
+        project.join(format!("{id}.jsonl")),
+        settled.clone() + &record(id, "user", "RUNNING-TURN"),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(format!("{unsaved}.jsonl")),
+        record(unsaved, "user", "UNSAVED-TURN"),
+    )
+    .unwrap();
+    let store = Store::at(f.home().join("store"));
+    let mut conversation = link::Link::new("claude-code", id, Some(f.home()));
+    conversation.owner = Some("me".into());
+    conversation.agent = Some("paper".into());
+    conversation.branch = Some("talk".into());
+    link::write(&store, &conversation).unwrap();
+    link::write(
+        &store,
+        &link::Link::new("claude-code", unsaved, Some(f.home())),
+    )
+    .unwrap();
+
+    f.repo.git(&["checkout", "-b", "talk", "main"]).unwrap();
+    let mut snapshot = meta::Meta::new(
+        format!("agit-{}", "d".repeat(40)),
+        "claude-code".into(),
+        f.home().to_string_lossy().into(),
+    );
+    let log = transcript::wrap_lines(&settled, "claude-code", &snapshot.session);
+    storage::write_snapshot(f.repo.root(), &log, &log).unwrap();
+    snapshot.turn = Some(1);
+    meta::write(f.repo.root(), &snapshot).unwrap();
+    f.repo.add_all().unwrap();
+    f.repo.commit("turn 1").unwrap();
+    f.repo.git(&["checkout", "main"]).unwrap();
+
+    let this = [("CLAUDE_CODE_SESSION_ID", id)];
+    let note = "this link holds the conversation up to turn 1; the turn in progress is not in it";
+    let shared = f.run_env(&["-y", "share"], &[], &this);
+    let stderr = String::from_utf8_lossy(&shared.stderr);
+    assert!(shared.status.success(), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&shared.stdout).contains("(via this conversation)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(note), "{stderr}");
+    let copy = decrypted(&f, &shared);
+    assert!(copy.contains("SETTLED-REPLY") && !copy.contains("RUNNING-TURN"));
+
+    let before = f.hub.payloads().len();
+    let summary = f.run_env(&["share"], &[], &this);
+    let stderr = String::from_utf8_lossy(&summary.stderr);
+    let asks = stderr.find("requires confirmation").expect(&stderr);
+    for said in [
+        "Privacy preview:",
+        "2 public records selected; add --show-preview to print each one before you confirm",
+        note,
+    ] {
+        assert!(
+            stderr.find(said).is_some_and(|at| at < asks),
+            "{said}: {stderr}"
+        );
+    }
+    assert!(!stderr.contains("SETTLED-REPLY"), "{stderr}");
+    let full = f.run_env(&["share"], &["--show-preview"], &this);
+    let stderr = String::from_utf8_lossy(&full.stderr);
+    let shown = stderr.find("SETTLED-REPLY").expect(&stderr);
+    assert!(stderr.find(note).is_some_and(|at| shown < at), "{stderr}");
+    assert!(!stderr.contains("add --show-preview"), "{stderr}");
+    assert_eq!(f.hub.payloads().len(), before);
+
+    let refused = |envs: &[(&str, &str)]| {
+        let sent = f.hub.payloads().len();
+        let out = f.run_env(&["-y", "share"], &[], envs);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{stderr}");
+        assert_eq!(f.hub.payloads().len(), sent, "{stderr}");
+        assert!(!stderr.contains("AGIT_SESSION"), "{stderr}");
+        stderr
+    };
+    // One conversation the SessionStart hook recorded, and one it never saw: the pointer works
+    // as printed for both, and the copy treats the folder each ran in alike.
+    let unrecorded = "46946946-9469-4469-8469-469469469469";
+    let elsewhere = tempfile::tempdir().unwrap();
+    let workspace = elsewhere.path().to_string_lossy().into_owned();
+    std::fs::write(
+        project.join(format!("{unrecorded}.jsonl")),
+        format!(
+            "{}\n",
+            json!({"type": "user", "sessionId": unrecorded, "cwd": workspace, "message": {"role": "user", "content": format!("UNRECORDED-TURN in {workspace}/src")}})
+        ),
+    )
+    .unwrap();
+    for (session, text) in [(unsaved, "UNSAVED-TURN"), (unrecorded, "UNRECORDED-TURN")] {
+        let stderr = refused(&[("CLAUDE_CODE_SESSION_ID", session)]);
+        assert!(
+            stderr.contains("this conversation has no saved turns yet"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("`agit share {session}` makes a read-only copy")),
+            "{stderr}"
+        );
+        let live = f.success(&[session], None);
+        let copy = decrypted(&f, &live);
+        assert!(copy.contains(text), "{copy}");
+        assert!(!copy.contains(&workspace), "{copy}");
+        // The folder the conversation ran in is named in the copy by its alias, as a recorded
+        // conversation's is.
+        let public: Value = serde_json::from_str(&copy).unwrap();
+        assert!(public["metadata"]["workspace"].is_string(), "{copy}");
+    }
+    assert!(link::get(&store, "claude-code", unrecorded).is_none());
+    // A runtime that keeps conversations in a database, not in one file per conversation: the
+    // folder still comes from the conversation itself.
+    let database_id = "ses_468databasecarrier";
+    opencode_conversation(f.home(), elsewhere.path(), database_id, "DATABASE-TURN");
+    let live = f.success(&[database_id], None);
+    let copy = decrypted(&f, &live);
+    assert!(copy.contains("DATABASE-TURN"), "{copy}");
+    assert!(!copy.contains(&workspace), "{copy}");
+    let public: Value = serde_json::from_str(&copy).unwrap();
+    assert!(public["metadata"]["workspace"].is_string(), "{copy}");
+    assert!(link::get(&store, "opencode", database_id).is_none());
+    f.refuse_without_upload(&[&unrecorded[..30]], None);
+    let stderr = refused(&[
+        ("CLAUDE_CODE_SESSION_ID", id),
+        ("CLAUDE_SESSION_ID", unsaved),
+    ]);
+    assert!(
+        stderr.contains("more than one agent conversation"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("`agit share {id}`")), "{stderr}");
+    assert!(
+        stderr.contains(&format!("`agit share {unsaved}`")),
+        "{stderr}"
+    );
+    let stderr = refused(&[]);
+    assert!(
+        stderr.contains("`agit share <owner>/<repo>@<branch>` or `agit share <session-id>`"),
+        "{stderr}"
+    );
+}
+
+/// On a computer where agit has recorded nothing yet, so its session store does not exist, the
+/// pointer a bare share prints for the agent's conversation works as printed, and neither command
+/// creates the store. An implementation that looks the ID up only among stored records refuses it.
+#[test]
+fn a_share_by_session_id_works_before_agit_has_a_session_store() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let store = f.home().join("store");
+    assert!(!store.exists());
+    let id = "47047047-0470-4470-8470-470470470470";
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join(format!("{id}.jsonl")),
+        format!(
+            "{}\n",
+            json!({"type": "user", "sessionId": id, "cwd": f.home(), "message": {"role": "user", "content": "FIRST-USE-TURN"}})
+        ),
+    )
+    .unwrap();
+    let refused = f.run_env(&["-y", "share"], &[], &[("CLAUDE_CODE_SESSION_ID", id)]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(&format!("`agit share {id}` makes a read-only copy")),
+        "{stderr}"
+    );
+    let live = f.success(&[id], None);
+    assert!(decrypted(&f, &live).contains("FIRST-USE-TURN"));
+    assert!(!store.exists());
+}
+
+/// An OpenCode conversation of one finished turn that ran in `cwd`, in OpenCode's own database
+/// under `home`, the only place that runtime keeps it.
+fn opencode_conversation(home: &Path, cwd: &Path, id: &str, prompt: &str) {
+    let data = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&data).unwrap();
+    let database = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
+    database.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, version TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+    ).unwrap();
+    let cwd = cwd.to_str().unwrap();
+    database
+        .execute("INSERT OR IGNORE INTO project VALUES ('global', ?1)", [cwd])
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO session (id, project_id, parent_id, directory, title, time_created, time_updated, version) VALUES (?1, 'global', NULL, ?2, ?3, 100, 150, '1.18.13')",
+            [id, cwd, prompt],
+        )
+        .unwrap();
+    let (user, assistant) = (format!("{id}-u1"), format!("{id}-a1"));
+    for (message, created, body) in [
+        (
+            &user,
+            110,
+            json!({"role": "user", "time": {"created": 110}}),
+        ),
+        (
+            &assistant,
+            120,
+            json!({"role": "assistant", "parentID": user, "finish": "stop", "time": {"created": 120}}),
+        ),
+    ] {
+        database
+            .execute(
+                "INSERT INTO message VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![message, id, created, body.to_string()],
+            )
+            .unwrap();
+    }
+    for (part, message, created, text) in [
+        (format!("{user}text"), &user, 111, prompt),
+        (format!("{assistant}text"), &assistant, 121, "Done."),
+    ] {
+        database
+            .execute(
+                "INSERT INTO part VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    part,
+                    message,
+                    id,
+                    created,
+                    json!({"type": "text", "text": text}).to_string()
+                ],
+            )
+            .unwrap();
+    }
 }
 
 /// The plaintext of the encrypted copy the last share sent, read with the key from its link.

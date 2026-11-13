@@ -50,6 +50,11 @@ pub struct Args {
     #[arg(long)]
     pub password: bool,
 
+    /// Print each public record the link would hold before the confirmation, not only the
+    /// privacy summary.
+    #[arg(long)]
+    pub show_preview: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -98,6 +103,11 @@ pub fn run(mut args: Args) -> CmdResult {
         Ok(source) => source,
         Err(error) => {
             ui::error(&format!("{error:#}"));
+            if let Some(hinted) = error.downcast_ref::<super::Hinted>() {
+                for line in hinted.hint.lines() {
+                    ui::hint(line);
+                }
+            }
             return Ok(ExitCode::Precondition);
         }
     };
@@ -179,8 +189,10 @@ pub fn run(mut args: Args) -> CmdResult {
         privacy_preview::write_report(&mut output, &prepared.report)?;
         writeln!(output, "Public metadata:")?;
         privacy_preview::write_value(&mut output, &public["metadata"], 2)?;
-        writeln!(output, "Complete selected public records:")?;
-        privacy_preview::write_session(&mut output, &prepared.protected)?;
+        if args.show_preview {
+            writeln!(output, "Complete selected public records:")?;
+            privacy_preview::write_session(&mut output, &prepared.protected)?;
+        }
         output.flush()?;
     }
     if let Some(running) = &source.running {
@@ -194,11 +206,17 @@ pub fn run(mut args: Args) -> CmdResult {
             ui::hint(&line);
         }
     }
+    if !args.show_preview {
+        let records = storage::parse_envelopes(&prepared.protected)?.len();
+        ui::hint(&format!(
+            "{records} public records selected; add --show-preview to print each one before you confirm"
+        ));
+    }
 
     let visibility = if args.public {
-        "public and unencrypted"
+        "a public and unencrypted"
     } else {
-        "end-to-end encrypted"
+        "an end-to-end encrypted"
     };
     let expiry = if expire_secs == 0 {
         "never".to_owned()
@@ -212,7 +230,7 @@ pub fn run(mut args: Args) -> CmdResult {
     if std::env::var_os("AGIT_YES").is_none() {
         match ui::prompt::confirm(
             &format!(
-                "create a {visibility} share for {} (expires {expiry}, {views} views)?",
+                "create {visibility} share for {}? Anyone with the full link can read it until it expires or is withdrawn (expires {expiry}, {views} views)",
                 source.label
             ),
             false,
@@ -323,6 +341,7 @@ fn wants_tui(args: &Args) -> bool {
         && args.expire == "7d"
         && args.views.is_none()
         && !args.password
+        && !args.show_preview
 }
 
 struct ShareSource {
@@ -437,6 +456,9 @@ struct SharePoint {
 
 fn selected_source(target: Option<&str>, full_log: bool) -> crate::Result<ShareSource> {
     let Some(target) = target else {
+        if std::env::var_os("AGIT_SESSION").is_none_or(|value| value.is_empty()) {
+            return this_conversation_source(full_log);
+        }
         let point = resolve_point(refs::parse("@")?, false)?
             .ok_or_else(|| anyhow::anyhow!("the supplied session has no local repo"))?;
         return point_source(point, full_log);
@@ -471,6 +493,63 @@ fn selected_source(target: Option<&str>, full_log: bool) -> crate::Result<ShareS
     }
 }
 
+/// A bare share without `AGIT_SESSION` names the agent conversation the runtime's own variables
+/// name, read as `agit status` and `agit commit` read them. Several are never narrowed to one, and
+/// a conversation with no branch yet holds nothing a link could show.
+fn this_conversation_source(full_log: bool) -> crate::Result<ShareSource> {
+    let sessions = super::context::runtime_sessions();
+    let refusal = |message: &str, hint: String| -> anyhow::Error {
+        super::Hinted {
+            message: message.to_owned(),
+            hint,
+        }
+        .into()
+    };
+    match sessions.as_slice() {
+        [] => Err(refusal(
+            "nothing to share was named",
+            "name it: `agit share <owner>/<repo>@<branch>` or `agit share <session-id>`".into(),
+        )),
+        [session] => {
+            let Some(target) = &session.target else {
+                let mut hint = live_copy(&session.session_id);
+                match &session.project {
+                    Some(save) if save.upload_off => hint.push_str(
+                        "\nor, once this turn has ended and saved on this computer: `agit share`",
+                    ),
+                    Some(save) if save.sign_in == super::project::SignIn::Current => hint.push_str(
+                        "\nor, once this turn has ended and uploaded by itself: `agit share`",
+                    ),
+                    _ => {}
+                }
+                return Err(refusal(
+                    "this conversation has no saved turns yet, so its link would open empty; no share was created",
+                    hint,
+                ));
+            };
+            let mut point = resolve_point(parse_share_ref(target)?, false)?
+                .ok_or_else(|| anyhow::anyhow!("{target} has no local AgentGit repo"))?;
+            point.selection_source = super::echo::Source::ThisConversation;
+            point_source(point, full_log)
+        }
+        several => Err(refusal(
+            "this command runs inside more than one agent conversation; name the one to share",
+            several
+                .iter()
+                .map(|session| format!("`agit share {}`", session.session_id))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )),
+    }
+}
+
+/// The step that shares conversation `session` as it is now, the turn in progress included.
+fn live_copy(session: &str) -> String {
+    format!(
+        "`agit share {session}` makes a read-only copy of the conversation as it is now, the turn in progress included; it does not upload the conversation to the repository"
+    )
+}
+
 fn parse_share_ref(target: &str) -> crate::Result<refs::RefSpec> {
     if let Some((name, _)) = target.split_once('@')
         && !name.is_empty()
@@ -487,8 +566,9 @@ fn parse_share_ref(target: &str) -> crate::Result<refs::RefSpec> {
 }
 
 fn native_link(target: &str) -> crate::Result<Option<link::Link>> {
+    // Before agit's first record on this computer there is no store, and none is made to look.
     let Some(store) = Store::open()? else {
-        return Ok(None);
+        return discovered_native(target.trim());
     };
     let matches: Vec<_> = link::list(&store)
         .into_iter()
@@ -496,9 +576,50 @@ fn native_link(target: &str) -> crate::Result<Option<link::Link>> {
         .take(2)
         .collect();
     match matches.len() {
-        0 => Ok(None),
+        0 => discovered_native(target.trim()),
         1 => Ok(matches.into_iter().next()),
         _ => anyhow::bail!("`{target}` matches several native sessions; give a longer session ID"),
+    }
+}
+
+/// The folder a conversation ran in, as its own read-only snapshot records it, whatever carrier
+/// the runtime keeps it in; the copy's workspace alias rests on it.
+fn recorded_folder(adapter: &dyn crate::adapter::Adapter, raw: &str) -> Option<String> {
+    adapter
+        .parse(raw)
+        .ok()
+        .and_then(|session| session.cwd)
+        .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+        .or_else(|| {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|record| crate::adapter::transcript_cwd::record_cwd(&record))
+        })
+}
+
+/// A conversation agit has no record of yet, found read-only by its full native ID in the
+/// runtimes' own stores on this computer, as the runtime variables find the current one. A prefix
+/// finds nothing here, and an ID two runtimes both hold names neither.
+fn discovered_native(id: &str) -> crate::Result<Option<link::Link>> {
+    let limits = crate::adapter::native_snapshot::Limits::default();
+    let mut found: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    for &runtime in crate::adapter::RUNTIMES {
+        let Ok(adapter) = crate::adapter::get(runtime) else {
+            continue;
+        };
+        let Ok(source) = adapter.lookup_native_readonly(id, limits) else {
+            continue;
+        };
+        if !found.iter().any(|(_, path)| *path == source.path) {
+            found.push((runtime, source.path));
+        }
+    }
+    match found.as_slice() {
+        [] => Ok(None),
+        [(runtime, _)] => Ok(Some(link::Link::new(runtime, id, None))),
+        _ => anyhow::bail!(
+            "`{id}` names conversations of several runtimes on this computer; no share was created"
+        ),
     }
 }
 
@@ -531,7 +652,11 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         .snapshot_native_readonly(&source, limits)
         .context("cannot read native session within the privacy preparation input budget")?;
     let raw = String::from_utf8(snapshot.bytes).context("native session is not UTF-8")?;
-    let cwd = native.cwd.clone().unwrap_or_default();
+    let cwd = native
+        .cwd
+        .clone()
+        .or_else(|| recorded_folder(adapter.as_ref(), &raw))
+        .unwrap_or_default();
     let metadata = meta::Meta::new(
         meta::session_hash(&cwd, raw.as_bytes()),
         native.source.clone(),
@@ -728,10 +853,7 @@ fn running_conversation(point: &SharePoint, snapshot: &meta::Meta) -> Option<lin
 /// counts this conversation among the ones it saves; otherwise the wait would end with the branch
 /// where it is.
 fn including_running(source: &ShareSource, running: &link::Link) -> Vec<String> {
-    let mut lines = vec![format!(
-        "`agit share {}` makes a read-only copy of the conversation as it is now, the turn in progress included; it does not upload the conversation to the repository",
-        running.session_id
-    )];
+    let mut lines = vec![live_copy(&running.session_id)];
     let (Some(repository), Some(branch), Some(cwd)) =
         (&source.repository, &source.branch, running.cwd.as_deref())
     else {
