@@ -539,6 +539,7 @@ pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
         return Vec::new();
     };
     let references = std::cell::OnceCell::new();
+    let mut statements = syntax::Statements::new(text);
     pattern
         .captures_iter(text)
         .filter(|captures| {
@@ -554,7 +555,7 @@ pub(crate) fn credential_assignment_spans(text: &str) -> Vec<(usize, usize)> {
                         Shape::Quoted
                     } else {
                         Shape::Unquoted {
-                            in_code: code_context(text, name, value),
+                            in_code: code_context(text, &mut statements, name, value),
                         }
                     };
                     (value, shape, password_name(name.as_str()))
@@ -633,16 +634,18 @@ const DECLARATIONS: [&str; 7] = ["const", "let", "var", "val", "final", "mut", "
 /// `let mut secret = …`): a declaration keyword right before the name and an `=` with
 /// whitespace on both sides. Shell, `.env`, INI and YAML assignments, including shell
 /// `local NAME=…` and YAML flow mappings, are not, whatever follows the value.
-fn code_context(text: &str, name: regex::Match<'_>, value: regex::Match<'_>) -> bool {
-    let line = syntax::statement_prefix(&text[..name.start()])
-        .replace("\\\r\n", "")
-        .replace("\\\n", "");
-    if line.split_whitespace().any(|word| {
-        matches!(
-            word,
-            "export" | "local" | "readonly" | "declare" | "typeset" | "env"
-        )
-    }) {
+///
+/// The statement before the name is read from `statements`, which reads each statement of `text`
+/// once: walking back over the statement for every assignment costs time quadratic in the
+/// assignments of one long line.
+fn code_context(
+    text: &str,
+    statements: &mut syntax::Statements<'_>,
+    name: regex::Match<'_>,
+    value: regex::Match<'_>,
+) -> bool {
+    let (line, shell) = statements.before(name.start());
+    if shell {
         return false;
     }
     let declared = line.ends_with(char::is_whitespace)
@@ -1091,6 +1094,109 @@ pub(crate) fn scan_filtered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`code_context`] as it read each assignment's statement on its own, walking back from the
+    /// name: the reference the statement reader must agree with.
+    fn code_context_per_assignment(
+        text: &str,
+        name: regex::Match<'_>,
+        value: regex::Match<'_>,
+    ) -> bool {
+        let line = syntax::statement_prefix(&text[..name.start()])
+            .replace("\\\r\n", "")
+            .replace("\\\n", "");
+        if line.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "export" | "local" | "readonly" | "declare" | "typeset" | "env"
+            )
+        }) {
+            return false;
+        }
+        let declared = line.ends_with(char::is_whitespace)
+            && line
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .rfind(|word| !word.is_empty())
+                .is_some_and(|word| {
+                    line.trim_end().ends_with(word) && DECLARATIONS.contains(&word)
+                });
+        let between = &text[name.end()..value.start()];
+        let spaced = between.starts_with([' ', '\t'])
+            && between.trim_start().starts_with('=')
+            && !between.trim_start().starts_with("=>")
+            && between.trim_start()[1..].starts_with([' ', '\t']);
+        declared && spaced
+    }
+
+    /// Reading each statement once judges every unquoted assignment exactly as walking back from
+    /// each one did, over generated texts that mix declarations, shell words, separators, CRLF and
+    /// LF line ends, odd and even backslash runs before them, words continued across a line, and
+    /// assignments packed onto one line. A reader that mapped positions wrongly across a removed
+    /// continuation, or missed a shell word cut at the name, would disagree here.
+    #[test]
+    fn reading_each_statement_once_judges_assignments_as_walking_back_did() {
+        const PIECES: [&str; 30] = [
+            "password=",
+            "token = ",
+            "api_key=",
+            "secret: ",
+            "const ",
+            "let ",
+            "let mut ",
+            "static ",
+            "export ",
+            "local ",
+            "env ",
+            "exp\\\nort ",
+            "loc\\\r\nal ",
+            ";",
+            "{",
+            "}",
+            "\n",
+            "\r\n",
+            "\r",
+            "\\\n",
+            "\\\\\n",
+            "\\\r\n",
+            " ",
+            "\t",
+            "x",
+            "Sy6th3ticPassw0rd123456Val ",
+            "aB3dE6gH9jK2mN5pQ8sT ",
+            "=",
+            "=> ",
+            "\u{3000}",
+        ];
+        let Some(pattern) = CREDENTIAL_ASSIGNMENT.as_ref() else {
+            panic!("the assignment pattern compiles");
+        };
+        let mut state: u64 = 0x2895_1d1e_3a07_c0de;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize
+        };
+        let mut judged = 0;
+        for _ in 0..4000 {
+            let length = 1 + next() % 40;
+            let text: String = (0..length).map(|_| PIECES[next() % PIECES.len()]).collect();
+            let mut statements = syntax::Statements::new(&text);
+            for captures in pattern.captures_iter(&text) {
+                let (Some(name), Some(value)) = (captures.get(1), captures.get(5)) else {
+                    continue;
+                };
+                judged += 1;
+                assert_eq!(
+                    code_context(&text, &mut statements, name, value),
+                    code_context_per_assignment(&text, name, value),
+                    "{text:?} at {}",
+                    name.start()
+                );
+            }
+        }
+        assert!(judged > 1000, "{judged}");
+    }
 
     /// Credential-named source bindings and annotations retain their referenced code. The same
     /// spelling in configuration or a quoted initializer remains a credential candidate, and
