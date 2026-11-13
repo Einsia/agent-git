@@ -26,9 +26,10 @@ pub struct Current {
 ///
 /// Claude Code exports `CLAUDE_CODE_SESSION_ID`; `CLAUDE_SESSION_ID` is agit's own name for it,
 /// carried only by child processes agit starts itself. Both support unmanaged-session safety
-/// checks and stale AGIT_SESSION rejection; they select no ordinary command target. The front
-/// door's "this conversation" prefers [`FRONT_DOOR_SESSION`], and takes one of these only when it
-/// is the single session they name.
+/// checks and stale AGIT_SESSION rejection; they select no ordinary command target, except that a
+/// bare `agit share` without AGIT_SESSION shares the one conversation they name. The front door's
+/// "this conversation" prefers [`FRONT_DOOR_SESSION`], and takes one of these only when it is the
+/// single session they name.
 pub const ENV_SESSIONS: &[(&str, &str)] = &[
     ("CODEBUDDY_SESSION_ID", "workbuddy"),
     ("HERMES_SESSION_ID", "hermes"),
