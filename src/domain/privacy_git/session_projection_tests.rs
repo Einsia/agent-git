@@ -116,20 +116,51 @@ impl History {
 }
 
 /// Projects `commits` in order with one projector, as one publication run does, checks each
-/// against the whole-LOG projection, and returns the last one's public commit.
-fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) -> Option<String> {
+/// against the whole-LOG projection, ends the projector's chain of public trees (building its last
+/// one the full way), and returns the last one's public commit.
+///
+/// With `carrying` off, no public parent published anything. With it on, each snapshot's public
+/// parents are the public commits this run produced for its source parents, and what they
+/// published is read from them as a run reads it; the projector is told the commit it wrote a
+/// lone parent's LOG in, as a run tells it, so it carries the records that parent published
+/// instead of reading them.
+fn assert_equivalent(
+    history: &History,
+    commits: &[(String, Vec<String>)],
+    carrying: bool,
+) -> Option<String> {
     let source = history.source();
+    let objects = Objects::default();
     let mut projector = Projector::default();
     let mut rechecked = Rechecked::default();
+    // The public commit this run produced for each snapshot, which holds its public LOG.
+    let mut public_of = HashMap::<String, String>::new();
+    let mut written = HashMap::<String, String>::new();
     let mut last = None;
     for (oid, parents) in commits {
+        let (plain, publics) = if carrying {
+            let publics = parents
+                .iter()
+                .map(|parent| public_of[parent].clone())
+                .collect::<Vec<_>>();
+            (parents.clone(), publics)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let published =
+            || published_lines(&objects, &source, &source, &written, oid, &plain, &publics);
+        let written_parent = match publics.as_slice() {
+            [public] => written.get(public).map(String::as_str),
+            _ => None,
+        };
         let projected = projector
             .project(
-                &Objects::default(),
+                &objects,
                 &source,
                 oid,
                 parents,
-                &Published::default(),
+                written_parent,
+                &published,
                 &mut rechecked,
             )
             .unwrap();
@@ -137,14 +168,18 @@ fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) -> Op
             &source,
             oid,
             parents,
-            &Published::default(),
+            &published().unwrap(),
             Carried::default(),
             &mut Rechecked::default(),
         )
         .unwrap();
-        assert_eq!(projected, whole, "snapshot {oid}");
+        assert_eq!(projected, whole, "snapshot {oid}, carrying {carrying}");
+        let public = projected.commit.clone().unwrap_or_else(|| oid.clone());
+        written.insert(public.clone(), public.clone());
+        public_of.insert(oid.clone(), public);
         last = projected.commit;
     }
+    projector.finish(&source).unwrap();
     last
 }
 
@@ -165,12 +200,21 @@ fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) -> Op
 ///   and a commit that adds one;
 /// - a tool step's context this device's delivery records vouch for, published once as the typed
 ///   message it was, and an identical context after it, which the spent record no longer vouches
-///   for.
+///   for;
+/// - Codex records among the others;
+/// - a file outside the events that commits add, change and take away.
+///
+/// The run is projected twice: once with nothing published by the public parents, and once with
+/// each public parent the commit the run produced, so that what a lone parent published is carried
+/// from one commit to the next. Most commits rewrite a record, so their public trees are built on
+/// their parents'.
 ///
 /// A projector that started each commit's rule afresh, continued from a sibling or across a
 /// rewritten LOG, kept a duplicate's last occurrence, tracked the tree's event objects from the
 /// appended records alone, or spent delivery records afresh at each commit or not at all publishes
-/// something here that the whole-LOG projection does not.
+/// something here that the whole-LOG projection does not. So does one that carried a published
+/// record its parent did not publish, or built a public tree on its parent's without the child's
+/// own changes, inside the events or outside them.
 #[test]
 fn every_snapshot_is_projected_as_its_whole_transcript_is() {
     let home = tempfile::tempdir().unwrap();
@@ -259,6 +303,8 @@ fn every_snapshot_is_projected_as_its_whole_transcript_is_in() {
                 log.push(claude(json!({"type":"user","uuid":uuid("v"),"parentUuid":"a","message":{"role":"user","content":"rewind"}})));
                 view_back = 2;
             }
+            9 => log.push(line("codex", json!({"type":"response_item","payload":{"type":"message",
+                "role":"assistant","content":[{"type":"output_text","text":format!("codex answer {turn}")}]}}))),
             _ => log.push(claude(json!({"type":"user","uuid":uuid("n"),"parentUuid":"a",
                 "message":{"role":"user","content":format!("turn {turn}")}}))),
         }
@@ -277,6 +323,10 @@ fn every_snapshot_is_projected_as_its_whole_transcript_is_in() {
         if (130..140).contains(&turn) {
             extra.push(added.clone());
         }
+        // A file outside the events, added, changed at every turn, and then taken away.
+        if (150..160).contains(&turn) {
+            extra.push(("notes/turn.md".to_owned(), format!("turn {turn}\n")));
+        }
         if turn == 50 {
             // Two children of one commit, published in one run, then their merge.
             let mut left = log.clone();
@@ -293,8 +343,13 @@ fn every_snapshot_is_projected_as_its_whole_transcript_is_in() {
         tip = history.commit(&[&parent], &log, &view, &extra, &[]);
         order.push((tip.clone(), vec![parent]));
     }
-    let last =
-        assert_equivalent(&history, &order).expect("records are published other than as recorded");
+    let last = assert_equivalent(&history, &order, false)
+        .expect("records are published other than as recorded");
+    assert_eq!(
+        assert_equivalent(&history, &order, true),
+        Some(last.clone()),
+        "carrying what a public parent published changes what the last snapshot publishes"
+    );
     // The person's words go out once, as the typed message; the second context stays back.
     let carrying = git(
         history.root.path(),
@@ -342,7 +397,8 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
             &source,
             &base,
             &[],
-            &Published::default(),
+            None,
+            &|| Ok(Published::default()),
             &mut rechecked,
         )
         .unwrap();
@@ -353,7 +409,8 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
                 &source,
                 &broken,
                 &parents,
-                &Published::default(),
+                None,
+                &|| Ok(Published::default()),
                 &mut rechecked
             )
             .is_err()
@@ -365,7 +422,8 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
                 &source,
                 &broken,
                 &parents,
-                &Published::default(),
+                None,
+                &|| Ok(Published::default()),
                 &mut rechecked
             )
             .is_err()
@@ -402,7 +460,8 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
                 &source,
                 &base,
                 &[],
-                &Published::default(),
+                None,
+                &|| Ok(Published::default()),
                 &mut rechecked,
             )
             .unwrap();
@@ -411,7 +470,8 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
             &source,
             &child,
             &parents,
-            &Published::default(),
+            None,
+            &|| Ok(Published::default()),
             &mut rechecked,
         );
         assert!(
@@ -457,7 +517,11 @@ fn an_addition_at_the_cap_leaves_the_count_to_the_full_listing() {
     .collect();
     assert_eq!(held.len(), 2);
     let source = history.source();
-    assert_eq!(held_after(&source, held, &parent, &child, 2).unwrap(), None);
+    assert!(
+        held_after(&source, &held, &parent, &child, 2)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A projector continues only from the commit it projected last. A snapshot whose LOG extends
@@ -491,14 +555,14 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
     let source = history.source();
     let published_id = storage::event_id(&published_first).unwrap();
     let objects = Objects::default();
-    let published = Published {
+    let published = || Published {
         ids: [published_id.clone()].into_iter().collect(),
         prefix: Some(Prefix {
             source_lines: 1,
-            public: vec![published_id],
+            public: vec![published_id.clone()],
             holder: &source,
             objects: &objects,
-            commit: public,
+            commit: public.clone(),
         }),
     };
 
@@ -511,7 +575,8 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
                 &source,
                 oid,
                 &parents,
-                &Published::default(),
+                None,
+                &|| Ok(Published::default()),
                 &mut rechecked,
             )
             .unwrap();
@@ -523,7 +588,8 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
             &source,
             &sibling,
             &parents,
-            &published,
+            None,
+            &|| Ok(published()),
             &mut rechecked,
         )
         .unwrap();
@@ -531,7 +597,7 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
         &source,
         &sibling,
         &parents,
-        &published,
+        &published(),
         Carried::default(),
         &mut Rechecked::default(),
     )

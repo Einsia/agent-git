@@ -10,6 +10,9 @@
 //! to stderr by the time the answer starts. After a refused request the process is dropped and the
 //! next request starts another, since its place in the protocol is no longer known.
 //!
+//! Where only an object's ID is wanted, a `cat-file --batch-check` process answers without its
+//! body.
+//!
 //! The processes live as long as the [`Objects`] that started them: in memory, for one run.
 
 use super::*;
@@ -29,6 +32,7 @@ const MAX_TREE: usize = crate::domain::storage::MAX_MATERIALIZED_BYTES;
 #[derive(Default)]
 pub(super) struct Objects {
     readers: RefCell<HashMap<PathBuf, Process>>,
+    checks: RefCell<HashMap<PathBuf, Process>>,
     trees: RefCell<HashMap<PathBuf, Process>>,
     blobs: RefCell<HashMap<PathBuf, crate::commands::plumbing::BlobWriter>>,
 }
@@ -72,6 +76,33 @@ impl Objects {
         Ok(self
             .answer(repo, spec, Some((kind, limit)))?
             .map(|(_, body)| body))
+    }
+
+    /// The ID of the blob `spec` names, read without its body; `None` when `spec` names nothing
+    /// here or names another kind of object.
+    pub(super) fn blob_id(&self, repo: &Repo, spec: &str) -> Result<Option<String>> {
+        ensure!(!spec.contains('\n'), UNAVAILABLE);
+        let mut checks = self.checks.borrow_mut();
+        let root = repo.root().to_path_buf();
+        let process = match checks.entry(root.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Process::start(repo, &["cat-file", "--batch-check"])?)
+            }
+        };
+        let answered = process
+            .send(format!("{spec}\n").into_bytes())
+            .and_then(|()| {
+                let header = process.header();
+                process.quiet()?;
+                Ok(header?
+                    .filter(|(_, kind, _)| kind == "blob")
+                    .map(|(id, _, _)| id))
+            });
+        if answered.is_err() {
+            checks.remove(&root);
+        }
+        answered
     }
 
     /// Whether `spec` names an object here, of any kind.
