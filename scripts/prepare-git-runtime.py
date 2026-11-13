@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
+import re
 import stat
 import struct
 import sys
@@ -21,6 +22,27 @@ import zipfile
 
 
 MIRROR_PACKAGE = "git-runtime-archives"
+INPUTS_TAG_PREFIX = "runtime-inputs-"
+ALPINE_PACKAGE = re.compile(r"^https://dl-cdn\.alpinelinux\.org/alpine/[^/]+/[^/]+/([^/]+)/([^/]+\.apk)$")
+
+
+def inputs_tag(lock_bytes):
+    """Return the tag of the runtime-inputs Release that holds the pins of this lock.
+
+    The name carries a digest of the lock with every CR removed, so a checkout that converts line
+    endings names the same Release, and a Release can never hold the pins of another lock.
+    """
+    return INPUTS_TAG_PREFIX + hashlib.sha256(lock_bytes.replace(b"\r", b"")).hexdigest()[:16]
+
+
+def asset_name(pin):
+    """Return a pin's asset name in the runtime-inputs Release: its upstream file name.
+
+    Alpine keeps the architecture in the directory and not in the file name, so its x86_64 and
+    aarch64 packages share names; those carry the architecture in front.
+    """
+    match = ALPINE_PACKAGE.match(pin["url"])
+    return f"{match.group(1)}-{match.group(2)}" if match else pin["url"].rsplit("/", 1)[-1]
 
 
 def mirror_url(pin, api, project):
@@ -55,6 +77,32 @@ def fetch_mirror(pin):
     return body
 
 
+def fetch_inputs_release(pin):
+    """Return the pinned bytes from the runtime-inputs Release, or None to use upstream.
+
+    With AGIT_RUNTIME_INPUTS_BASE set to a repository's release download URL, every pinned archive
+    is first looked up as <base>/<inputs tag>/<asset name>. The Release is public and holds what
+    upstream served when the lock was written, so a build survives upstream removing a pinned
+    file. A missing, unreachable or wrong copy only falls back to the upstream URL, so the Release
+    can neither block nor change a runtime.
+    """
+    base = os.environ.get("AGIT_RUNTIME_INPUTS_BASE")
+    if not base:
+        return None
+    tag = inputs_tag(Path(__file__).with_name("git-runtime-lock.json").read_bytes())
+    name = asset_name(pin)
+    try:
+        with urllib.request.urlopen(f"{base.rstrip('/')}/{tag}/{name}", timeout=120) as response:
+            body = response.read()
+    except OSError as error:
+        print(f"No runtime-inputs copy of {name} ({error}); using {pin['url']}", file=sys.stderr, flush=True)
+        return None
+    if hashlib.sha256(body).hexdigest() != pin["sha256"]:
+        print(f"Runtime-inputs copy of {name} fails its checksum; using {pin['url']}", file=sys.stderr, flush=True)
+        return None
+    return body
+
+
 def download(pin, cache):
     if "path" in pin:
         body = Path(__file__).parent.joinpath(pin["path"]).read_bytes()
@@ -70,6 +118,8 @@ def download(pin, cache):
     path = cache / (pin["sha256"] + "-" + pin["url"].rsplit("/", 1)[-1])
     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != pin["sha256"]:
         body = fetch_mirror(pin)
+        if body is None:
+            body = fetch_inputs_release(pin)
         if body is None:
             for attempt in range(3):
                 print(f"Downloading {pin['url']} (attempt {attempt + 1})", file=sys.stderr, flush=True)

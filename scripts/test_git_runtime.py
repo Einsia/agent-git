@@ -22,6 +22,9 @@ spec.loader.exec_module(mirror)
 spec = importlib.util.spec_from_file_location("sources", Path(__file__).with_name("git-runtime-sources.py"))
 sources = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sources)
+spec = importlib.util.spec_from_file_location("stage", Path(__file__).with_name("stage-runtime-inputs.py"))
+stage = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(stage)
 spec = importlib.util.spec_from_file_location("pins", Path(__file__).with_name("check-git-runtime-pins.py"))
 pins = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pins)
@@ -33,7 +36,7 @@ class RuntimeArchiveTests(unittest.TestCase):
         environment = patch.dict(runtime.os.environ)
         environment.start()
         self.addCleanup(environment.stop)
-        for key in ("CI_API_V4_URL", "CI_PROJECT_ID", "CI_JOB_TOKEN"):
+        for key in ("CI_API_V4_URL", "CI_PROJECT_ID", "CI_JOB_TOKEN", "AGIT_RUNTIME_INPUTS_BASE"):
             runtime.os.environ.pop(key, None)
 
     def test_linux_certificate_store_is_pinned_and_available_without_network(self):
@@ -201,6 +204,75 @@ class RuntimeArchiveTests(unittest.TestCase):
             asset = f"git-lfs-{platform}-v{version}.{archive}"
             self.assertTrue((checksum, asset) in mirrored, f"{platform}: {asset} at {checksum} is not a mirrored pin")
 
+    def test_runtime_inputs_release_is_a_shortcut_that_cannot_change_the_pinned_bytes(self):
+        """Outside GitLab the runtime-inputs Release is tried before upstream, and used only if it has the pinned digest.
+
+        A build that trusted the Release's bytes, failed when the Release lacked a file instead of
+        falling back to upstream, or looked under a tag or name the stager does not use, would each
+        break one of the cases below.
+        """
+        body = b"verified runtime"
+        pin = {"url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/git-1-r0.apk", "sha256": hashlib.sha256(body).hexdigest()}
+        base = "https://releases.invalid/download"
+        tag = runtime.inputs_tag(Path(runtime.__file__).with_name("git-runtime-lock.json").read_bytes())
+        copy = f"{base}/{tag}/aarch64-git-1-r0.apk"
+        cases = {
+            "verified copy": (lambda: io.BytesIO(body), 0),
+            "tampered copy": (lambda: io.BytesIO(b"tampered"), 1),
+            "missing copy": (lambda: (_ for _ in ()).throw(urllib.error.HTTPError(copy, 404, "Not Found", {}, None)), 1),
+        }
+        for case, (copy_reply, upstream_requests) in cases.items():
+            requested = []
+
+            def urlopen(request, timeout):
+                url = getattr(request, "full_url", request)
+                requested.append(url)
+                return copy_reply() if url == copy else io.BytesIO(body)
+
+            with self.subTest(case), tempfile.TemporaryDirectory() as temporary, patch.dict(runtime.os.environ, {"AGIT_RUNTIME_INPUTS_BASE": base}):
+                with patch.object(runtime.urllib.request, "urlopen", side_effect=urlopen):
+                    self.assertEqual(runtime.download(pin, Path(temporary)), body)
+                self.assertEqual(requested[0], copy)
+                self.assertEqual(requested.count(pin["url"]), upstream_requests)
+
+    def test_runtime_inputs_release_names_every_pin_once_and_names_its_lock(self):
+        """Every upstream pin gets its own asset name, and the tag changes with the lock but not with line endings.
+
+        Alpine's x86_64 and aarch64 packages share file names; without the architecture in front, one
+        would overwrite the other in the Release and a build would fetch the wrong one. A tag that
+        ignored the lock would serve old pins after a lock bump; one that changed with CRs would make
+        a Windows checkout look for a Release that does not exist.
+        """
+        lock_bytes = Path(runtime.__file__).with_name("git-runtime-lock.json").read_bytes()
+        lock = json.loads(lock_bytes)
+        names = [runtime.asset_name(pin) for pin in stage.release_pins(lock)]
+        self.assertTrue(names)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(runtime.inputs_tag(lock_bytes), runtime.inputs_tag(lock_bytes.replace(b"\n", b"\r\n")))
+        self.assertNotEqual(runtime.inputs_tag(lock_bytes), runtime.inputs_tag(lock_bytes + b" "))
+
+    def test_staged_release_holds_only_verified_pins(self):
+        """The stager writes each upstream pin once under its asset name, and stops on bytes that miss their pin.
+
+        A stager that wrote unchecked bytes would publish them where release builds look first; one
+        that let two pins share a name would publish one of them under the other's name.
+        """
+        good = b"good"
+        lock = {"lfs": {"a": {"url": "https://example.invalid/a.zip", "sha256": hashlib.sha256(good).hexdigest()}},
+                "linux": {"x86_64": [{"url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/p-1-r0.apk", "sha256": hashlib.sha256(good).hexdigest()}],
+                          "aarch64": [{"url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/p-1-r0.apk", "sha256": hashlib.sha256(good).hexdigest()}]}}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "out"
+            output.mkdir()
+            names = stage.stage_pins(lock, output, Path(temporary), download=lambda pin, cache: good)
+            self.assertEqual(sorted(names), ["a.zip", "aarch64-p-1-r0.apk", "x86_64-p-1-r0.apk"])
+            self.assertEqual(sorted(path.name for path in output.iterdir()), sorted(names))
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "out"
+            output.mkdir()
+            with self.assertRaises(ValueError):
+                stage.stage_pins(lock, output, Path(temporary), download=lambda pin, cache: b"tampered")
+
     def test_pin_watch_fails_on_a_lost_pin_and_names_a_replaced_alpine_version(self):
         """The scheduled check fails when a pinned file is gone or changed, and names upstream's newer version.
 
@@ -282,6 +354,43 @@ class RuntimeSourceTests(unittest.TestCase):
                         sources.check_mingit_files(lock, inventory)
                 else:
                     sources.check_mingit_files(lock, inventory)
+
+    def test_withdrawn_upstream_pin_still_builds_and_checks_from_the_runtime_inputs_release(self):
+        """With upstream gone, both release steps that read a pin take the Release's verified copy.
+
+        The runtime build and the MinGit file check each read the pinned MinGit. If either went to
+        upstream only, a pin upstream removed would still fail the release although the Release holds
+        it; if either trusted the Release's bytes, a wrong copy would reach the build or the check.
+        """
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("cmd/git.exe", b"content")
+        body = buffer.getvalue()
+        pin = {"url": "https://upstream.invalid/MinGit.zip", "sha256": hashlib.sha256(body).hexdigest()}
+        base = "https://releases.invalid/download"
+        tag = runtime.inputs_tag(Path(runtime.__file__).with_name("git-runtime-lock.json").read_bytes())
+        copy = f"{base}/{tag}/MinGit.zip"
+        inventory = {"packages": [{"name": "git", "files": ["cmd/git.exe"]}]}
+        for case, copy_body, succeeds in (("verified copy", body, True), ("tampered copy", b"tampered", False)):
+            def urlopen(request, timeout):
+                url = getattr(request, "full_url", request)
+                if url == copy:
+                    return io.BytesIO(copy_body)
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+            with self.subTest(case), tempfile.TemporaryDirectory() as temporary, \
+                    patch.dict(runtime.os.environ, {"AGIT_RUNTIME_INPUTS_BASE": base}), \
+                    patch.object(runtime.urllib.request, "urlopen", side_effect=urlopen), \
+                    patch.object(sources.urllib.request, "urlopen", side_effect=urlopen):
+                sources.UNREACHABLE.clear()
+                if succeeds:
+                    self.assertEqual(runtime.download(pin, Path(temporary)), body)
+                    sources.check_mingit_files({"windows": pin}, inventory)
+                else:
+                    with self.assertRaises(RuntimeError):
+                        runtime.download(pin, Path(temporary))
+                    with self.assertRaises(ValueError):
+                        sources.check_mingit_files({"windows": pin}, inventory)
 
     def test_alpine_source_archive_holds_what_the_apkbuild_builds_from(self):
         """Every file the APKBUILD's sha512sums names is in the archive, with that checksum.

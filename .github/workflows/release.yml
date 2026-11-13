@@ -126,10 +126,14 @@ jobs:
           path: .cache/git-runtime
           key: git-runtime-v1-${{ matrix.target }}-${{ hashFiles('scripts/git-runtime-lock.json', 'scripts/prepare-git-runtime.py') }}
 
+      # Each pinned archive comes from this repository's runtime-inputs Release first, then upstream.
+      # That Release holds what upstream served when the lock was written, and every copy, from
+      # either place, must match its SHA-256 in the lock or the step fails.
       - name: Prepare bundled Git and Git LFS
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          AGIT_RUNTIME_INPUTS_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download
         run: |
           python scripts/prepare-git-runtime.py "$TARGET" .cache/git-runtime/payload.tar.gz
           python -c 'import os,pathlib; p=pathlib.Path(".cache/git-runtime/payload.tar.gz").resolve(); open(os.environ["GITHUB_ENV"], "a").write("AGIT_GIT_RUNTIME_ARCHIVE=" + str(p) + "\n")'
@@ -351,6 +355,8 @@ jobs:
       # for stops the job before anything is published.
       # The archives are uploaded nowhere but to this Release.
       - name: Source of the bundled Git runtime
+        env:
+          AGIT_RUNTIME_INPUTS_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download
         run: |
           set -euo pipefail
           python3 scripts/git-runtime-sources.py dist-sources --notes "$RUNNER_TEMP/SOURCES.md"

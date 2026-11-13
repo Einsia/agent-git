@@ -156,6 +156,29 @@ binaries by name picks one up.
 When a lock change replaces a copyleft pin, the same change updates its entry in
 `git-runtime-sources.json`; `scripts/test_git_runtime.py` fails until it does.
 
+## Runtime inputs Releases
+
+Upstream can stop serving a pinned runtime archive at any time, so the build, and
+the source step's check of the pinned MinGit, read each pin from a
+`runtime-inputs-<digest>` Release of this repository first, and
+from upstream only if that copy is missing or does not match its SHA-256. The
+digest is the first 16 hex digits of the SHA-256 of `scripts/git-runtime-lock.json`
+with every CR removed, so each lock version has its own Release.
+
+When the lock changes on the default branch, the sync pushes that tag on the
+mirrored commit while upstream still serves every pin, and
+`.github/workflows/runtime-inputs.yml` publishes the Release with
+`scripts/stage-runtime-inputs.py`. It holds, and nothing else:
+
+- every upstream pin of the lock, checked against its SHA-256 before upload, under
+  its upstream file name; Alpine packages, whose x86_64 and aarch64 files share
+  names, carry the architecture in front (`x86_64-git-2.54.0-r0.apk`);
+- the corresponding source archives and `SOURCES-SHA256SUMS`, built by
+  `scripts/git-runtime-sources.py` exactly as for a product Release.
+
+These Releases are never marked Latest and hold no `agit-` asset, so nothing that
+selects product releases or binaries picks one up.
+
 ## Download URLs
 
 ```
