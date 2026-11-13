@@ -165,9 +165,18 @@ pub fn run(args: Args) -> CmdResult {
         } => {
             let registration = match crate::rc::native_claude::register(&session, &generation) {
                 // Another process still writes the conversation: a definite answer, so the
-                // terminal keeps holding its input instead of taking agit for unreachable.
+                // terminal keeps holding its input instead of taking agit for unreachable. The
+                // plugin asks again every few seconds while it waits, so each refusal also tells
+                // the daemons this terminal loaded the conversation: the session start's
+                // announcement is made once, and a daemon that missed it would never release its
+                // own writer. The announcement is the session start's own; it grants nothing
+                // that one doesn't. The daemon's line says what the terminal waits for.
                 Err(error) if error.is::<crate::rc::native_claude::NotCurrentWriter>() => {
-                    println!("{}", serde_json::json!({ "refused": "not_current_writer" }));
+                    let lease = crate::rc::native_claude::announce_waiting_terminal(&session);
+                    println!(
+                        "{}",
+                        serde_json::json!({ "refused": "not_current_writer", "lease": lease.json() })
+                    );
                     return Ok(ExitCode::Ok);
                 }
                 registration => registration?,

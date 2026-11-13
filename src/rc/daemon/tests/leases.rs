@@ -161,7 +161,14 @@ fn an_idle_headless_writer_hands_over_at_once() {
 }
 
 /// A writer in the middle of a turn finishes it first; the terminal loaded the conversation
-/// before that turn's end, so it must resume again before continuing, and its typing waits.
+/// before that turn's end, so it must resume again before continuing, and its typing waits. Its
+/// line names the latest minute it takes over, when agit stops that turn, and once the turn has
+/// ended it starts with the command that resumes: Claude Code cuts the status line to the
+/// terminal's width, so a line leading with the explanation hid the one step that helps. A terminal the daemon
+/// hears of only through its refused registration announces itself again at every retry, which
+/// changes nothing: the turn still runs to its end, and the deadline stays where the first
+/// announcement set it. Repeats that released again would push the deadline on for as long as
+/// the terminal waits.
 #[test]
 fn a_running_headless_turn_finishes_before_the_terminal_takes_over() {
     run(
@@ -169,13 +176,75 @@ fn a_running_headless_turn_finishes_before_the_terminal_takes_over() {
             let crate::rc::control::Reply::TerminalOpened { notice, .. } = open(state) else {
                 panic!("a terminal announcement is answered with its lease");
             };
-            assert!(notice.is_some(), "the terminal is told why its input waits");
+            let notice = notice.expect("the terminal is told why its input waits");
+            assert!(
+                notice.contains("at the latest, when agit stops that turn"),
+                "{notice}"
+            );
+            let deadline = state.leases.get(THREAD).unwrap().deadline_ms;
+            assert!(deadline.is_some());
+            for _ in 0..3 {
+                open(state);
+            }
+            assert_eq!(state.leases.get(THREAD).unwrap().deadline_ms, deadline);
             assert!(!stopped(commands), "a running turn is not cut off");
             state.project_session_frame(event(method::ITEM_COMPLETED));
             assert!(!stopped(commands));
             state.project_session_frame(event(method::TURN_COMPLETED));
             assert!(stopped(commands), "the writer stops at its turn boundary");
             assert_eq!(ended(state).state, State::Stale);
+            let crate::rc::control::Reply::TerminalOpened { notice, .. } = open(state) else {
+                panic!("a terminal announcement is answered with its lease");
+            };
+            let notice = notice.expect("the terminal is told how to continue");
+            assert!(
+                notice.starts_with(&format!("Exit and run `claude --resume {THREAD}` now")),
+                "{notice}"
+            );
+        },
+        SessionStatus::Running,
+    );
+}
+
+/// A second terminal that opens while the web's writer hands over to a first one waits behind
+/// it: the first keeps the handover, and the deadline set when it opened, however often the
+/// second asks again, as its refused registration does at every retry. The second is told that
+/// another terminal goes first. Handing over in turns, the two would move the deadline on at
+/// every retry, and a turn stuck on an approval would never reach it.
+#[test]
+fn a_second_terminal_waits_behind_the_first_and_never_moves_the_deadline() {
+    run(
+        |state, commands| {
+            open(state);
+            let lease = state.leases.get(THREAD).unwrap();
+            let (first, deadline) = (lease.next, lease.deadline_ms);
+            let (mut child, second) = other_process();
+            for _ in 0..3 {
+                let crate::rc::control::Reply::TerminalOpened { notice, .. } =
+                    state.terminal_opened(THREAD, second.pid, true, None)
+                else {
+                    panic!("a terminal announcement is answered with its lease");
+                };
+                let notice = notice.expect("the second terminal is told why it waits");
+                assert!(
+                    notice.starts_with("Another terminal opened this conversation before this one"),
+                    "{notice}"
+                );
+                open(state);
+            }
+            let lease = state.leases.get(THREAD).unwrap();
+            assert_eq!((lease.next, lease.deadline_ms), (first, deadline));
+            assert!(!stopped(commands), "a running turn is not cut off");
+            state.project_session_frame(event(method::TURN_COMPLETED));
+            assert!(stopped(commands), "the writer stops at its turn boundary");
+            ended(state);
+            let lease = state.leases.get(THREAD).unwrap();
+            assert!(
+                matches!(lease.holder, crate::rc::lease::Holder::Tui(terminal) if terminal.pid == std::process::id()),
+                "the first terminal takes over: {lease:?}"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
         },
         SessionStatus::Running,
     );

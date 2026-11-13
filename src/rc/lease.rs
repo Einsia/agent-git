@@ -568,6 +568,18 @@ impl Leases {
                 }
                 return Opened::Unchanged(State::ReleaseFailed);
             }
+            // The writer already hands over to the terminal that opened first, by the deadline
+            // set then. Another terminal asks again at every retry of its refused registration;
+            // taking the handover in turns, the two would move the deadline on each time, and a
+            // turn stuck on an approval would never reach it.
+            if lease.state == State::Releasing
+                && lease.next.is_some()
+                && headless.as_ref().is_some_and(|headless| {
+                    matches!(&lease.holder, Holder::Headless { session_id } if session_id == headless.session_id)
+                })
+            {
+                return Opened::Unchanged(State::Releasing);
+            }
         }
         match headless {
             Some(headless) => {
@@ -931,6 +943,11 @@ impl Lease {
                     "A turn started from the web is still running for this conversation.",
                 )
             }
+            // Another terminal waits to take over first; this one writes only once that one is
+            // closed, as between any two terminals.
+            (Holder::Headless { .. }, State::Releasing, Some(_)) => {
+                return Some(self.behind_first_terminal(thread, opener));
+            }
             (Holder::Headless { .. }, State::ReleaseFailed, _) => (
                 *opener,
                 "agit could not confirm that the web's process for this conversation has stopped, \
@@ -938,8 +955,8 @@ impl Lease {
             ),
             (Holder::Tui(terminal), State::Stale, _) if terminal.same_process(opener) => (
                 *terminal,
-                "This terminal continues an older branch of this conversation, without the turn \
-                 sent from the web.",
+                "This terminal continues an older branch of this conversation without that turn, \
+                 and a message typed here would keep it there.",
             ),
             _ => return None,
         };
@@ -959,19 +976,78 @@ impl Lease {
                      `claude --resume {thread}` before typing here."
                 ),
             },
-            (State::Releasing, true) => {
-                "This terminal takes over when it ends; your message stays here until then."
-                    .to_owned()
-            }
-            (State::Releasing, false) => {
-                format!("When it ends, exit and run `claude --resume {thread}` before typing here.")
-            }
+            // The deadline is when the daemon stops that turn itself, so the wait has an end the
+            // person can read; without it the line reads as waiting for as long as the web runs.
+            (State::Releasing, true) => format!(
+                "This terminal takes over when it ends{latest}; your message stays here until then.",
+                latest = self.latest_takeover()
+            ),
+            (State::Releasing, false) => format!(
+                "When it ends{latest}, exit and run `claude --resume {thread}` before typing here.",
+                latest = self.latest_takeover()
+            ),
             _ => format!(
-                "Exit and run `claude --resume {thread}` now, before typing here: a message typed \
-                 in this terminal keeps it on an older branch of the conversation."
+                "Exit and run `claude --resume {thread}` now, before typing here, to continue with \
+                 the turn sent from the web."
             ),
         };
+        // An older branch is what a terminal opened during a web turn has once that turn ends:
+        // the step that takes over comes first, so a status line cut to the terminal's width
+        // still shows the command to copy.
+        if self.state == State::Stale {
+            return Some(format!("{remedy} {situation}"));
+        }
         Some(format!("{situation} {remedy}"))
+    }
+
+    /// The line of a terminal that opened a releasing conversation after another terminal did:
+    /// that one takes over from agit's own writer, and this one writes only once it is closed, as
+    /// between any two terminals. True whether that writer is in a turn or already stopping.
+    fn behind_first_terminal(&self, thread: &str, opener: &Terminal) -> String {
+        let by = self
+            .latest_takeover_minute()
+            .map(|minute| format!(", by {minute} at the latest"))
+            .unwrap_or_default();
+        let situation = format!(
+            "Another terminal opened this conversation before this one and takes it over from \
+             agit{by}."
+        );
+        if opener.plugin {
+            format!(
+                "{situation} This terminal can write once that one is closed and agit's own \
+                 process for it has stopped; your input waits here."
+            )
+        } else {
+            format!(
+                "{situation} Once that one is closed and agit's own process for it has \
+                 stopped, exit and run `claude --resume {thread}` before typing here."
+            )
+        }
+    }
+
+    /// When a releasing writer's turn is stopped if it has not ended by then, in the terminal's
+    /// local time, as a clause of the waiting line; empty when no deadline is set.
+    fn latest_takeover(&self) -> String {
+        self.latest_takeover_minute()
+            .map(|minute| format!(", at {minute} at the latest, when agit stops that turn"))
+            .unwrap_or_default()
+    }
+
+    /// The minute, in the terminal's local time, by which a releasing writer has been stopped:
+    /// the first one wholly after the deadline. The stop comes at the daemon's next tick after
+    /// the deadline, so a minute rounded down would name a time the terminal may still be
+    /// waiting at.
+    fn latest_takeover_minute(&self) -> Option<String> {
+        const MINUTE_MS: i64 = 60_000;
+        self.deadline_ms
+            .map(|deadline| deadline - deadline.rem_euclid(MINUTE_MS) + MINUTE_MS)
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|minute| {
+                minute
+                    .with_timezone(&chrono::Local)
+                    .format("%H:%M")
+                    .to_string()
+            })
     }
 }
 
