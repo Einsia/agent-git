@@ -520,7 +520,174 @@ fn import_list(tokens: &[Token], text: &str) -> bool {
 // Exemption discovery is optional; exceeding its budget leaves the carrier fully scannable.
 const MAX_SYNTAX_TOKENS: usize = 32_768;
 
-/// A continued physical line retains the declaration authority of its logical statement.
+/// Shell words that make an assignment after them a variable's value, never a program
+/// declaration.
+const SHELL_WORDS: [&str; 6] = ["export", "local", "readonly", "declare", "typeset", "env"];
+
+/// The statements of one text, each read once, for the assignments found in it in order.
+///
+/// A statement runs from just after the last statement separator before a position: `;`, `{`,
+/// `}`, or a line end that an odd run of backslashes doesn't continue (see [`statement_prefix`]).
+/// Before it is read, a statement's `\`-line-end continuations are removed, so a word continued
+/// across a line counts as one word.
+pub(super) struct Statements<'a> {
+    text: &'a str,
+    /// Where each separator is, in order.
+    separators: Vec<usize>,
+    /// The statement read last: assignments arrive in order, so each statement is read once.
+    current: Option<Statement>,
+}
+
+struct Statement {
+    /// Where the statement starts in the text.
+    start: usize,
+    /// The statement with its continuations removed.
+    joined: String,
+    /// Where each continuation removed from the statement begins in the text, and the bytes
+    /// removed by then, so a position in the text maps into `joined`.
+    removed: Vec<(usize, usize)>,
+    /// The end of the first word of `joined` that is a shell word, if any.
+    first_shell_word_end: Option<usize>,
+}
+
+impl<'a> Statements<'a> {
+    pub(super) fn new(text: &'a str) -> Self {
+        let bytes = text.as_bytes();
+        let separators = (0..bytes.len())
+            .filter(|&at| separates(bytes, at))
+            .collect();
+        Self {
+            text,
+            separators,
+            current: None,
+        }
+    }
+
+    /// The statement before `position`, with its continuations removed, and whether a shell
+    /// word stands in it: [`statement_prefix`] of the text before `position`, read for every
+    /// assignment of a statement at once.
+    pub(super) fn before(&mut self, position: usize) -> (&str, bool) {
+        let start = match self.separators.partition_point(|&at| at < position) {
+            0 => 0,
+            index => self.separators[index - 1] + 1,
+        };
+        if self
+            .current
+            .as_ref()
+            .is_none_or(|statement| statement.start != start)
+        {
+            let end = self
+                .separators
+                .get(self.separators.partition_point(|&at| at < position))
+                .copied()
+                .unwrap_or(self.text.len());
+            self.current = Some(Statement::read(self.text, start, end));
+        }
+        let statement = self.current.as_ref().expect("read above");
+        let at = statement.joined_position(position);
+        let line = &statement.joined[..at];
+        // Only whole words count. A shell word cut off at `position` leaves the statement before
+        // the name ending in something other than whitespace, which no declaration does, so the
+        // assignment is not code either way.
+        let shell = statement.first_shell_word_end.is_some_and(|end| end <= at);
+        (line, shell)
+    }
+}
+
+/// Whether the byte at `at` ends a statement: `;`, `{` or `}`, or a line end that isn't
+/// continued, that is not preceded (before a `\r\n`'s `\r`, for its `\n`) by an odd run of
+/// backslashes.
+fn separates(bytes: &[u8], at: usize) -> bool {
+    match bytes[at] {
+        b';' | b'{' | b'}' => true,
+        b'\n' | b'\r' => {
+            let start = at - usize::from(bytes[at] == b'\n' && at > 0 && bytes[at - 1] == b'\r');
+            let slashes = bytes[..start]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count();
+            slashes.is_multiple_of(2)
+        }
+        _ => false,
+    }
+}
+
+impl Statement {
+    fn read(text: &str, start: usize, end: usize) -> Self {
+        let region = &text[start..end];
+        let first = region.replace("\\\r\n", "");
+        let joined = first.replace("\\\n", "");
+        // Positions in `region` of what each pass removed, mapped back through the first pass.
+        let mut removed = Vec::new();
+        let mut taken = 0;
+        let mut first_removed = Vec::new();
+        for (at, _) in region.match_indices("\\\r\n") {
+            first_removed.push(at);
+        }
+        // Every first-pass removal before a point took three bytes out of `region`. The second
+        // pass meets its matches in increasing order, so the count of removals before them only
+        // moves forward; recounting from the start for each makes a statement that alternates
+        // both continuations quadratic.
+        let mut before = 0;
+        let mut to_region = |at_first: usize| {
+            while before < first_removed.len() && first_removed[before] - 3 * before <= at_first {
+                before += 1;
+            }
+            at_first + 3 * before
+        };
+        let mut all: Vec<(usize, usize)> = first_removed.iter().map(|&at| (at, 3)).collect();
+        for (at, _) in first.match_indices("\\\n") {
+            all.push((to_region(at), 2));
+        }
+        all.sort_unstable();
+        for (at, length) in all {
+            taken += length;
+            removed.push((start + at, taken));
+        }
+        let mut words = Vec::new();
+        let mut word_start = None;
+        for (at, character) in joined.char_indices() {
+            match (character.is_whitespace(), word_start) {
+                (true, Some(begin)) => {
+                    words.push((begin, at));
+                    word_start = None;
+                }
+                (false, None) => word_start = Some(at),
+                _ => {}
+            }
+        }
+        if let Some(begin) = word_start {
+            words.push((begin, joined.len()));
+        }
+        let first_shell_word_end = words
+            .iter()
+            .find(|&&(word, end)| SHELL_WORDS.contains(&&joined[word..end]))
+            .map(|&(_, end)| end);
+        Self {
+            start,
+            joined,
+            removed,
+            first_shell_word_end,
+        }
+    }
+
+    /// Where `position` of the text falls in [`Self::joined`]: no continuation straddles an
+    /// assignment's name, so every removal either ends before it or begins after it.
+    fn joined_position(&self, position: usize) -> usize {
+        let removed = self
+            .removed
+            .partition_point(|&(at, _)| at < position)
+            .checked_sub(1)
+            .map_or(0, |index| self.removed[index].1);
+        position - self.start - removed
+    }
+}
+
+/// A continued physical line retains the declaration authority of its logical statement. The
+/// detector reads statements through [`Statements`]; this per-position form is the reference its
+/// test compares against.
+#[cfg(test)]
 pub(super) fn statement_prefix(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut end = bytes.len();
