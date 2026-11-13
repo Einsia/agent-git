@@ -94,8 +94,22 @@ struct Hub {
     /// The next receive is applied, but its answer is lost: the client gets a 502, as when a
     /// proxy gives up on a push the Hub went on to take.
     lose_receive_answer: Arc<AtomicBool>,
+    /// How the next receives fail, one per receive, in order (see [`Cut`]).
+    cut_receives: Arc<Mutex<Vec<Cut>>>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+}
+
+/// How the Hub's edge answers a receive it cuts off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cut {
+    /// 504 after the Hub took the push: only the answer is lost.
+    AfterApplying,
+    /// 504 before the Hub took anything.
+    BeforeApplying,
+    /// 403, before anything is taken: a refusal, not a Hub that didn't answer. It stays in place,
+    /// refusing every receive, as the Hub refuses the same push again, until the test clears it.
+    Refused,
 }
 
 impl Hub {
@@ -166,6 +180,8 @@ impl Hub {
         let taking = Arc::clone(&taken_on_create);
         let lose_receive_answer = Arc::new(AtomicBool::new(false));
         let losing_answer = Arc::clone(&lose_receive_answer);
+        let cut_receives = Arc::new(Mutex::new(Vec::<Cut>::new()));
+        let cutting = Arc::clone(&cut_receives);
         let publicize_when = Arc::new(Mutex::new(None::<String>));
         let publicizing = Arc::clone(&publicize_when);
         let resolver_hub = base.clone();
@@ -632,6 +648,30 @@ impl Hub {
                         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
                         continue;
                     }
+                    let cut = (method == "POST" && target.ends_with("/git-receive-pack"))
+                        .then(|| {
+                            let mut queued = cutting.lock().unwrap();
+                            match queued.first() {
+                                Some(Cut::Refused) => Some(Cut::Refused),
+                                Some(_) => Some(queued.remove(0)),
+                                None => None,
+                            }
+                        })
+                        .flatten();
+                    if let Some(answer @ (Cut::BeforeApplying | Cut::Refused)) = cut {
+                        // The receipt is spent all the same, as the Hub spends a preview once.
+                        pending_receipt.take();
+                        let status = if answer == Cut::Refused {
+                            "403 Forbidden"
+                        } else {
+                            "504 Gateway Timeout"
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
                     if method == "POST" && target.ends_with("/git-receive-pack") {
                         assert_eq!(user_agent, TRANSPORT_USER_AGENT);
                         let receipt: serde_json::Value = pending_receipt
@@ -700,6 +740,13 @@ impl Hub {
                     let header = std::str::from_utf8(&response.stdout[..split]).unwrap();
                     assert!(!header.contains("Status:"), "{header}");
                     let body = &response.stdout[split + 4..];
+                    if cut == Some(Cut::AfterApplying) {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
                     if method == "POST"
                         && target.ends_with("/git-receive-pack")
                         && losing_answer.swap(false, Ordering::AcqRel)
@@ -750,6 +797,7 @@ impl Hub {
             refuse_with,
             taken_on_create,
             lose_receive_answer,
+            cut_receives,
             stop,
             worker: Some(worker),
         }
@@ -9898,6 +9946,380 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
     );
 }
 
+/// An automatic upload the Hub didn't answer is settled by what the Hub holds, and one that did
+/// not land is tried again by the folder's own worker at its time, by the same entry and gates as
+/// its first try, up to the tip it failed at:
+/// - a push the Hub took before its answer was lost is recorded as uploaded and not sent again;
+/// - one cut off before the Hub took anything is retried once its time comes, with no turn,
+///   command or daemon to start it, and a turn settled after the failure is not in the retry;
+/// - one that waited out another upload of the repository preparing is retried the same way;
+/// - one the Hub refused (403) is never retried, and one dropped after the failure goes with its
+///   record and is never tried again.
+///
+/// A worker that pushed a landed upload again would send it twice; one that waited for a trigger
+/// would leave the retry to the next turn; one that published the branch's tip would send a turn
+/// nobody's turn-end upload judged; one that retried a refusal or a dropped conversation would
+/// send what the Hub or the person turned down.
+#[test]
+fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
+    const LANDED: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+    const RETRIED: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+    const REFUSED: &str = "cccccccc-0000-4000-8000-00000000000c";
+    const DROPPED: &str = "dddddddd-0000-4000-8000-00000000000d";
+    const WAITED: &str = "eeeeeeee-0000-4000-8000-00000000000e";
+    const START: i64 = 1_900_000_000;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [33; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    // The clock every agit process here reads, the folder's detached worker included.
+    let clock = temp.path().join("clock");
+    fs::write(&clock, START.to_string()).unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let projects = temp
+        .path()
+        .join(".claude/projects")
+        .join(agit::domain::store::slug_for(&work));
+    fs::create_dir_all(&projects).unwrap();
+    let transcript = |session: &str| projects.join(format!("{session}.jsonl"));
+    let add_turn = |session: &str, prompt: &str| {
+        let cwd = work.to_string_lossy();
+        let records = format!(
+            "{}\n{}\n",
+            json!({"type":"user","sessionId":session,"cwd":cwd,"uuid":format!("{session}-u1"),
+                "timestamp":"2026-11-02T00:00:01.000Z",
+                "message":{"role":"user","content":prompt}}),
+            json!({"type":"assistant","sessionId":session,"cwd":cwd,"uuid":format!("{session}-a1"),
+                "timestamp":"2026-11-02T00:00:01.500Z",
+                "message":{"role":"assistant","stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"synthetic answer"}]}}),
+        );
+        fs::write(transcript(session), records).unwrap();
+    };
+    let agit = |args: &[&str], input: Option<String>, envs: &[(&str, &str)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        let mut child = command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("AGIT_TEST_CLOCK_FILE", &clock)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("AGIT_SECRETS_KEYSTORE", "file")
+            .envs(envs.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(args)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(input.unwrap_or_default().as_bytes())
+            .unwrap();
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        assert_success(&output);
+        output
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    repo.git(&["config", "agit.autoPush", "true"]).unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    agit(&["--yes", "push", "alice/app@main"], None, &[]);
+    agit(
+        &[
+            "--yes",
+            "project",
+            "bind",
+            work.to_str().unwrap(),
+            "--repo",
+            "alice/app",
+            "--history",
+            "none",
+        ],
+        None,
+        &[],
+    );
+    let policy = |change: &dyn Fn(&mut serde_json::Value)| {
+        for entry in fs::read_dir(home.join("projects")).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let mut policy: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                change(&mut policy);
+                fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+            }
+        }
+    };
+    policy(&|policy| policy["auto_upload"] = json!(true));
+
+    let digest = |value: &str| {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(value.as_bytes()))[..24].to_owned()
+    };
+    let record = |branch: &str| -> Option<serde_json::Value> {
+        let path = home
+            .join("projects/uploads")
+            .join(digest("alice/app"))
+            .join(format!("{}.json", digest(branch)));
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    };
+    let branches = || -> std::collections::BTreeSet<String> {
+        git(
+            repo.root(),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    };
+    let on_hub = |branch: &str| {
+        git(
+            &remote,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+    };
+    // The folder's worker runs detached from the Stop hook that starts it, so its outcome is
+    // waited for, within a bound.
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    // A conversation's first turn ends: its Stop hook hands it to the folder's worker, which
+    // captures it on a branch of its own and uploads it.
+    let upload = |session: &str, prompt: &str, envs: &[(&str, &str)]| -> String {
+        let before = branches();
+        add_turn(session, prompt);
+        agit(
+            &["hooks", "settle", "--runtime", "claude-code"],
+            Some(
+                json!({"session_id":session,"cwd":work,"transcript_path":transcript(session),
+                    "hook_event_name":"Stop"})
+                .to_string(),
+            ),
+            envs,
+        );
+        let found = std::cell::RefCell::new(None);
+        wait("the conversation's branch", &|| {
+            *found.borrow_mut() = branches().difference(&before).next().cloned();
+            found.borrow().is_some()
+        });
+        let branch = found.into_inner().unwrap();
+        wait("its upload's outcome", &|| {
+            record(&branch).is_some_and(|record| record["state"] != "started")
+        });
+        branch
+    };
+
+    // The Hub takes the push, and only its answer is lost: it is recorded as uploaded, once.
+    hub.cut_receives.lock().unwrap().push(Cut::AfterApplying);
+    let receives = hub.posts.load(Ordering::Acquire);
+    let landed = upload(LANDED, "alpha landed", &[]);
+    assert_eq!(record(&landed).unwrap()["state"], "uploaded");
+    assert_eq!(on_hub(&landed), git(repo.root(), &["rev-parse", &landed]));
+    assert_eq!(hub.posts.load(Ordering::Acquire), receives + 1);
+
+    // Cut off before the Hub took anything: it waits for the worker's next try.
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let retried = upload(RETRIED, "bravo retried", &[]);
+    let failed_at = git(repo.root(), &["rev-parse", &retried]);
+    let failed = record(&retried).unwrap();
+    assert_eq!(
+        (&failed["state"], &failed["reason"], &failed["retry_after"]),
+        (&json!("failed"), &json!("hub"), &json!(START + 60)),
+        "{failed}"
+    );
+    assert!(on_hub(&retried).is_empty());
+    let status = agit(&["status", "--json"], None, &[]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let items = &status["result"]["value"]["uploads_not_through"]["items"];
+    let item = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["target"] == format!("alice/app@{retried}"))
+        .unwrap_or_else(|| panic!("{status}"));
+    assert_eq!(item["state"], "retrying", "{item}");
+    assert!(
+        item["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("the Hub didn't answer; agit tries again by itself (next try about "),
+        "{item}"
+    );
+
+    // Refused by the Hub: it is not tried again.
+    hub.cut_receives.lock().unwrap().push(Cut::Refused);
+    let refused = upload(REFUSED, "charlie refused", &[]);
+    hub.cut_receives.lock().unwrap().clear();
+    let refusal = record(&refused).unwrap();
+    assert_eq!(refusal["state"], "failed", "{refusal}");
+    assert!(refusal.get("retry_after").is_none(), "{refusal}");
+
+    // Cut off too, and then dropped from the folder before its next try.
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let dropped = upload(DROPPED, "delta dropped", &[]);
+    assert_eq!(record(&dropped).unwrap()["retry_after"], json!(START + 60));
+    agit(
+        &["project", "drop", &format!("alice/app@{dropped}")],
+        None,
+        &[],
+    );
+    assert_eq!(record(&dropped), None);
+
+    // Another upload of the repository is preparing for the whole wait: tried again as well.
+    let lock = repo.root().join(".git/agit/privacy-publication/lock");
+    let preparing = agit::infra::local_state::HeldLock::try_exclusive(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .unwrap(),
+        &lock,
+        "held",
+    )
+    .unwrap();
+    let waited = upload(WAITED, "echo waited", &[("AGIT_TEST_LOCK_WAIT_MS", "300")]);
+    drop(preparing);
+    let busy = record(&waited).unwrap();
+    assert_eq!(
+        (&busy["reason"], &busy["retry_after"]),
+        (&json!("another_upload"), &json!(START + 60)),
+        "{busy}"
+    );
+
+    // A turn settled on the branch after its upload failed waits for its own upload.
+    let tree = git(
+        repo.root(),
+        &["rev-parse", &format!("{failed_at}^{{tree}}")],
+    );
+    let later = git(
+        repo.root(),
+        &[
+            "-c",
+            "user.name=Source Writer",
+            "-c",
+            "user.email=source@example.invalid",
+            "commit-tree",
+            &tree,
+            "-p",
+            &failed_at,
+            "-m",
+            "A later turn",
+        ],
+    );
+    git(
+        repo.root(),
+        &["update-ref", &format!("refs/heads/{retried}"), &later],
+    );
+
+    // Signed in as someone else, nothing is retried: a retry is the folder's own upload, made
+    // under the account the folder was bound to. The folder's worker runs here by itself, with a
+    // clock of its own past the retries' time, while the sleeping workers' clock stands still.
+    let account = home
+        .join("credentials")
+        .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap()));
+    let signed_in = fs::read(&account).unwrap();
+    save_at(
+        &account,
+        &HubCredential {
+            account_id: Some("account-2".into()),
+            username: "bob".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let later_clock = temp.path().join("later-clock");
+    fs::write(&later_clock, (START + 61).to_string()).unwrap();
+    let pending = record(&retried);
+    agit(
+        &["--quiet", "project", "capture", work.to_str().unwrap()],
+        None,
+        &[("AGIT_TEST_CLOCK_FILE", later_clock.to_str().unwrap())],
+    );
+    assert_eq!(record(&retried), pending);
+    assert!(on_hub(&retried).is_empty());
+    fs::write(&account, signed_in).unwrap();
+
+    // Nothing runs in the folder: only the worker's own clock brings the retry.
+    let previews = hub.previews.lock().unwrap().len();
+    fs::write(&clock, (START + 61).to_string()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while record(&retried).is_none_or(|record| record["state"] != "uploaded") {
+        assert!(
+            Instant::now() < deadline,
+            "the retry did not land: {:?}",
+            record(&retried)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(on_hub(&retried), failed_at);
+    wait("the waited upload's retry", &|| {
+        record(&waited).is_some_and(|record| record["state"] == "uploaded")
+    });
+    assert_eq!(on_hub(&waited), git(repo.root(), &["rev-parse", &waited]));
+    // The retry is an upload of its own, previewed and confirmed again.
+    assert!(hub.previews.lock().unwrap().len() > previews);
+    // The conversation dropped meanwhile was not tried again.
+    assert_eq!(record(&dropped), None);
+    assert!(on_hub(&dropped).is_empty());
+    assert!(on_hub(&refused).is_empty());
+    assert_eq!(record(&refused).unwrap(), refusal);
+}
+
 /// A file line that diverged from the Hub's, as when two people distill the same memory into
 /// main, is refused with `pull` as the way out: pull merges a file line's files and stops only
 /// where both sides changed the same lines. When the Hub's tip is here and holds exactly the
@@ -11459,12 +11881,13 @@ fn a_repository_that_appears_before_its_creation_is_asked_about_again() {
 }
 
 /// A push whose answer was lost, as when a proxy answers 502 for a push the Hub went on to take,
-/// leaves the person not knowing whether the Hub has it. Its retry finds nothing to send and says
-/// that the branch is on the Hub, also when a local tag it leaves out means there is still
-/// something the Hub lacks: "nothing new to upload" alone left open whether the failed push had
-/// reached it.
+/// asks the Hub what it holds, finds the branch there and succeeds, sending nothing a second time.
+/// A push after it finds nothing to send and says that the branch is on the Hub, also when a local
+/// tag it leaves out means there is still something the Hub lacks. A push that took the lost
+/// answer for a failure reports one the Hub doesn't have; one that pushed again sends the branch
+/// twice.
 #[test]
-fn a_retry_after_a_lost_answer_says_the_branch_is_on_the_hub() {
+fn a_push_whose_answer_was_lost_finds_the_branch_on_the_hub() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -11556,8 +11979,15 @@ fn a_retry_after_a_lost_answer_says_the_branch_is_on_the_hub() {
     repo.commit("Take main's decisions").unwrap();
     let merged = git(repo.root(), &["rev-parse", "refs/heads/main"]);
     hub.lose_receive_answer.store(true, Ordering::Release);
-    let failed = run(&["--yes", "push", "alice/app@main"]);
-    assert!(!failed.status.success(), "{failed:?}");
+    let receives = hub.posts.load(Ordering::Acquire);
+    let landed = run(&["--yes", "push", "alice/app@main"]);
+    assert_success(&landed);
+    assert!(
+        said(&landed)
+            .contains("the Hub's answer to this push was lost, and the Hub holds what it sent"),
+        "{landed:?}"
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire), receives + 1);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), merged);
 
     let refs = || {

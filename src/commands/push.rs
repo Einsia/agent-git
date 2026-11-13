@@ -107,6 +107,10 @@ pub struct Args {
     /// branch beside it (`<branch>-local`, or the next free name) and leave the Hub's as it is.
     #[arg(long, conflicts_with_all = ["all", "dry_run", "to", "to_hub", "audit"])]
     pub keep_both: bool,
+
+    /// (internal) An automatic retry publishes the named branch up to this commit and no further.
+    #[arg(long, hide = true, value_name = "commit")]
+    pub up_to: Option<String>,
 }
 
 /// `--keep-both` on a branch the Hub's copy hasn't moved away from: there is nothing to keep
@@ -241,6 +245,16 @@ pub fn check_audit_environment() -> crate::Result<()> {
 /// [`super::auto_push::automatic_push`]: the one place that marks a publication automatic.
 pub fn run_automatic(args: Args) -> CmdResult {
     super::auto_push::mark_automatic();
+    if args.up_to.is_some() {
+        ensure!(
+            args.agent
+                .as_deref()
+                .is_some_and(|target| target.contains('@'))
+                && args.branch.is_empty()
+                && !args.all,
+            "--up-to publishes one named branch"
+        );
+    }
     // Before sign-in or any request: with automatic upload off, this child asks the Hub nothing.
     if let Some((repository, _)) = args.agent.as_deref().and_then(|a| a.split_once('@')) {
         let (owner, name) = super::parse_slug(repository)?;
@@ -261,6 +275,11 @@ pub fn run_automatic(args: Args) -> CmdResult {
 /// upload's failure is classed as a privacy check that did not complete.
 pub fn run(args: Args) -> CmdResult {
     use crate::domain::privacy::{pending, service};
+    // Only an automatic retry stops short of the branch's tip; a person's push publishes it whole.
+    ensure!(
+        args.up_to.is_none() || super::auto_push::is_automatic(),
+        "--up-to is only for agit's own retries"
+    );
     let target = args.agent.clone().filter(|target| target.contains('@'));
     if args.keep_both && args.branch.len() > 1 {
         ui::error("--keep-both keeps one branch beside the Hub's; name one");
@@ -895,6 +914,11 @@ pub(crate) fn branch_list_unread(
     }
 }
 
+/// How a push that waited out another upload of the same repository begins its error. Nothing of
+/// this push was sent, and the other upload is still preparing, so the next step is to rerun it;
+/// an automatic upload's parent reads it to class the failure as one its worker tries again.
+pub(crate) const UPLOAD_IN_PROGRESS: &str = "another upload of this repository is in progress";
+
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
@@ -1027,24 +1051,34 @@ fn publish_in_groups(
                     ui::info(format_args!("{moved}; previewing it again"));
                     attempt(moved.retry())
                 }
-                Err(error) => match error.downcast::<audited_push::RepositoryExists>() {
-                    // Only a person answers for publishing into a repository they did not
-                    // create: neither a `--yes` given for the creation nor automatic upload does.
-                    Ok(exists)
-                        if !crate::commands::auto_push::is_automatic() && ui::prompt::can_ask() =>
-                    {
-                        ui::info(format_args!("{exists}; asking again"));
+                Err(error) => match error.downcast::<audited_push::NoAnswer>() {
+                    // A `--yes` given before the failure answered for a push the person did not
+                    // know had failed, so the retry asks again.
+                    Ok(lost) => {
+                        ui::info(format_args!("{lost}; trying once more"));
                         yes.withdraw();
-                        attempt(audited_push::Attempt::First)
+                        attempt(lost.retry())
                     }
-                    Ok(exists) => {
-                        stopped.set(true);
-                        Err(crate::commands::InteractionRequired(format!(
+                    Err(error) => match error.downcast::<audited_push::RepositoryExists>() {
+                        // Only a person answers for publishing into a repository they did not
+                        // create: neither a `--yes` given for the creation nor automatic upload does.
+                        Ok(exists)
+                            if !crate::commands::auto_push::is_automatic()
+                                && ui::prompt::can_ask() =>
+                        {
+                            ui::info(format_args!("{exists}; asking again"));
+                            yes.withdraw();
+                            attempt(audited_push::Attempt::First)
+                        }
+                        Ok(exists) => {
+                            stopped.set(true);
+                            Err(crate::commands::InteractionRequired(format!(
                             "{exists}; run `agit push` again at a terminal to decide whether to publish into it"
                         ))
                         .into())
-                    }
-                    Err(error) => Err(error),
+                        }
+                        Err(error) => Err(error),
+                    },
                 },
             },
             outcome => outcome,
@@ -1248,6 +1282,13 @@ pub(super) fn branch_failure_code(out: &crate::hub::git::Outcome) -> ExitCode {
         Some(404) => ExitCode::Ref,
         Some(500..=599) => ExitCode::Network,
         None if crate::hub::git::looks_like_auth_failure(&out.stderr) => ExitCode::Auth,
+        // The connection failed before the Hub answered, as a 5xx is a Hub that couldn't. Git
+        // also says the remote end hung up after the Hub's own refusal, which is an answer.
+        None if !out.stderr.contains("remote error:")
+            && crate::hub::git::looks_like_transport_failure(&out.stderr) =>
+        {
+            ExitCode::Network
+        }
         _ => ExitCode::Failure,
     }
 }
@@ -1931,6 +1972,7 @@ mod tests {
             dry_run: false,
             show_preview: false,
             keep_both: false,
+            up_to: None,
         };
         assert!(super::offers_keep_both(&push(), false));
         assert!(!super::offers_keep_both(&push(), true), "automatic");
@@ -1999,6 +2041,7 @@ mod tests {
             dry_run: false,
             show_preview: false,
             keep_both: false,
+            up_to: None,
         };
         let (_d, repo) = {
             let d = tempfile::tempdir().unwrap();
@@ -2206,8 +2249,12 @@ mod tests {
         assert!(!is_read_only("me", "alice", Some("http://h/bob/photo.git")));
     }
 
+    /// A refused push's category comes from evidence in Git's output: a status it printed, its
+    /// words for a failed sign-in, or its words for a connection that failed before the Hub
+    /// answered. Anything else, a ref rejection included, is a plain failure: read as the network,
+    /// it would have automatic uploads retry what the Hub turned down.
     #[test]
-    fn branch_failure_categories_require_known_status_or_existing_auth_evidence() {
+    fn branch_failure_categories_require_a_status_or_named_evidence() {
         for (status, expected) in [
             (401, ExitCode::Auth),
             (403, ExitCode::Policy),
@@ -2241,6 +2288,18 @@ mod tests {
                 ExitCode::Failure,
             ),
             ("unexpected protocol reply", ExitCode::Failure),
+            (
+                "error: RPC failed; curl 28 Operation timed out after 120000 milliseconds",
+                ExitCode::Network,
+            ),
+            (
+                "send-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly",
+                ExitCode::Network,
+            ),
+            (
+                "fatal: remote error: this repository is archived\nfatal: the remote end hung up unexpectedly",
+                ExitCode::Failure,
+            ),
         ] {
             assert_eq!(
                 branch_failure_code(&crate::hub::git::Outcome {

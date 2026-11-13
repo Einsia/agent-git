@@ -545,6 +545,15 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 fn dispatch(cmd: Commands, json: bool) -> i32 {
     agit::telemetry::observe(agit::telemetry::Observation::Stage("dispatch"));
     recheck_project_claims(&cmd);
+    // A folder's upload that is due to be tried again starts its worker from the front door's
+    // commands there, for a worker that was stopped or a computer that slept through the try.
+    if matches!(
+        cmd,
+        Commands::Status(_) | Commands::Overview | Commands::On(_) | Commands::Save(_)
+    ) && let Ok(cwd) = std::env::current_dir()
+    {
+        commands::project::start_due_retries_here(&cwd);
+    }
     let _echo = commands::echo::Invocation::enter(&cmd, json);
     let result = match cmd {
         Commands::On(a) => commands::front::on::on(a),

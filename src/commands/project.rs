@@ -1305,6 +1305,14 @@ fn automatic_push(target: &str, cwd: &Path) -> Result<serde_json::Value> {
     run_child(command, &["push".into(), target.into()], cwd)
 }
 
+/// The folder worker's own retry of `target`, up to `tip`.
+fn automatic_retry(target: &str, tip: &str, cwd: &Path) -> Result<serde_json::Value> {
+    let mut command = crate::infra::background::command(std::env::current_exe()?);
+    command.args(["--quiet", "--json"]);
+    super::auto_push::automatic_push_up_to(&mut command, target, tip);
+    run_child(command, &["push".into(), target.into()], cwd)
+}
+
 fn run_child(
     mut command: std::process::Command,
     arguments: &[String],
@@ -1404,6 +1412,8 @@ pub(crate) enum UploadFailure {
     FolderOff,
     /// Another agit process kept one of agit's state locks for the whole wait.
     LocalBusy,
+    /// Another upload of the same repository was still preparing for the whole wait.
+    AnotherUpload,
     /// agit could not write its own state on this computer.
     LocalUnwritable,
     Other,
@@ -1444,6 +1454,11 @@ impl UploadFailure {
             return Self::RulesChanged;
         }
         let reported = match crate::infra::local_state::find(error) {
+            Some(LocalStateError::Contended { what, .. })
+                if *what == crate::domain::privacy_git::PUBLICATION_LOCK =>
+            {
+                Self::AnotherUpload
+            }
             Some(LocalStateError::Contended { .. }) => Self::LocalBusy,
             Some(LocalStateError::NotWritable { .. }) => Self::LocalUnwritable,
             None => error
@@ -1510,6 +1525,10 @@ impl UploadFailure {
         if message.contains(super::push::FOLDER_KEEPS_IT) {
             return Self::FolderOff;
         }
+        // Before the lock in general: the lock it waited for is the one an upload prepares under.
+        if message.contains(super::push::UPLOAD_IN_PROGRESS) {
+            return Self::AnotherUpload;
+        }
         if message.contains(crate::infra::local_state::CONTENDED) {
             return Self::LocalBusy;
         }
@@ -1529,10 +1548,27 @@ impl UploadFailure {
         }
     }
 
+    /// Whether the folder's worker tries an upload that failed this way again by itself: the Hub
+    /// didn't answer, or another upload of the repository was still preparing, so the same upload
+    /// can go through once the Hub answers or the other upload is done. Every other class is
+    /// refused again until something changes on this computer or the Hub.
+    pub(crate) fn retried(self) -> bool {
+        matches!(self, Self::Hub | Self::AnotherUpload)
+    }
+
+    /// What happened, for a class [`Self::retried`] covers, without what comes next.
+    pub(crate) fn what_happened(self) -> &'static str {
+        match self {
+            Self::Hub => "the Hub didn't answer",
+            Self::AnotherUpload => "another upload of this repository was still preparing",
+            _ => self.describe(),
+        }
+    }
+
     pub(crate) fn describe(self) -> &'static str {
         match self {
             Self::SignedOut => "agit is signed out; run `agit login` and the next turn uploads it",
-            Self::Hub => "the Hub could not be reached or refused it",
+            Self::Hub => "the Hub didn't answer; the next turn tries again",
             Self::PrivacyIncomplete => {
                 "its privacy check did not complete, so nothing was sent; `agit status` says why and what ends the wait"
             }
@@ -1564,6 +1600,9 @@ impl UploadFailure {
             }
             Self::LocalUnwritable => {
                 "agit couldn't write its own files on this computer; `agit doctor` says where"
+            }
+            Self::AnotherUpload => {
+                "another upload of this repository was still preparing; the next turn tries again"
             }
             // Nothing is known of a refusal without a name of its own, so no retry is promised.
             Self::Other => "it could not be completed on this computer",
@@ -1853,7 +1892,8 @@ fn sync_one(project: &Project, candidate: &Candidate, automatic: bool) -> Result
     let one_off = project.auto_upload && !uploads_automatically;
     let pushed = if uploads_automatically {
         super::upload_outcome::recorded(
-            super::upload_outcome::Place::of(&project.repository, &branch),
+            super::upload_outcome::Place::of(&project.repository, &branch)
+                .map(|place| place.retried(0)),
             head.as_deref().unwrap_or_default(),
             || retry_stale(|| automatic_push(&target, &candidate.cwd)),
             |pushed| {
@@ -2179,7 +2219,7 @@ pub fn run(args: Args) -> CmdResult {
             sync(&mut project)
         }
         Action::Capture { path } => {
-            drain(&root(&path)?)?;
+            drain_and_retry(&root(&path)?)?;
             Ok(ExitCode::Ok)
         }
     }
@@ -3111,6 +3151,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     let Some((project, _)) = governing(&cwd)? else {
         return Ok(false);
     };
+    start_due_retries(&project);
     match runtime {
         "codex" => codex_hooks_seen(session),
         "opencode" => opencode_hooks_seen(session),
@@ -3565,9 +3606,26 @@ fn capture_worker(root: &Path) -> Result<Option<fs::File>> {
     }
 }
 
+/// How long a worker keeps waiting for its folder's retries, from its first wait on.
+const RETRY_WAIT: i64 = 2 * 60 * 60;
+
 /// Publishes queued sessions one at a time. After letting the worker lock go it looks once more,
 /// so a marker written while it was finishing is not left for the next turn.
 fn drain(root: &Path) -> Result<()> {
+    drain_then(root, false)
+}
+
+/// [`drain`] in the folder's detached worker, which then runs the folder's uploads that are due to
+/// be tried again. While a retry is still to come it waits for it without the lock, so a Stop
+/// meanwhile starts a worker of its own, and runs it once it takes the lock again; a worker that
+/// finds the lock taken leaves the due retries to its holder. A drain in the hook's own process
+/// never waits, so the turn ends at once.
+fn drain_and_retry(root: &Path) -> Result<()> {
+    drain_then(root, true)
+}
+
+fn drain_then(root: &Path, retrying: bool) -> Result<()> {
+    let mut waiting_since = None;
     loop {
         let Some(worker) = capture_worker(root)? else {
             return Ok(());
@@ -3597,10 +3655,143 @@ fn drain(root: &Path) -> Result<()> {
             let _ = capture_candidate(project, candidate, false, true);
             landed();
         }
+        let next = if retrying {
+            run_due_retries(root)
+        } else {
+            None
+        };
         drop(worker);
-        if markers(root)?.is_empty() && !catch_up_requested(root)? {
+        if !markers(root)?.is_empty() || catch_up_requested(root)? {
+            continue;
+        }
+        let Some(at) = next else {
+            return Ok(());
+        };
+        let since = *waiting_since.get_or_insert_with(super::upload_outcome::now);
+        if at > since + RETRY_WAIT {
             return Ok(());
         }
+        wait_until(at);
+    }
+}
+
+/// Starts the folder's worker when one of its uploads is due to be tried again and no worker holds
+/// the folder: a worker that was stopped, or a computer that slept through the try, leaves it due
+/// until something runs in the folder. It only starts the worker, and returns at once.
+fn start_due_retries(project: &Project) {
+    if !super::upload_outcome::has_records(&project.repository) {
+        return;
+    }
+    let Ok(repo) = checkout(project) else {
+        return;
+    };
+    let Some(branches) = local_branches(&repo) else {
+        return;
+    };
+    let now = super::upload_outcome::now();
+    let due = super::upload_outcome::retries(&project.repository, &branches)
+        .iter()
+        .any(|due| due.at <= now);
+    if due && capture_worker(&project.root).is_ok_and(|worker| worker.is_some()) {
+        let _ = spawn_capture(&project.root);
+    }
+}
+
+/// [`start_due_retries`] for the folder `cwd` is in, for the front door's commands run there.
+pub fn start_due_retries_here(cwd: &Path) {
+    if let Ok(cwd) = cwd.canonicalize()
+        && let Ok(Some((project, _))) = governing(&cwd)
+    {
+        start_due_retries(&project);
+    }
+}
+
+fn local_branches(repo: &Repo) -> Option<Vec<String>> {
+    Some(
+        repo.git(&["for-each-ref", "--format=%(refname)", "refs/heads/"])
+            .ok()?
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("refs/heads/"))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Runs the retries of `root`'s uploads that are due, and says when the next one not yet due is.
+/// None runs while the signed-in account, its Hub or the repository is not the one the folder was
+/// bound to, as no first upload would: they stay due until the folder is bound again, and the
+/// next worker that finds them so runs them.
+fn run_due_retries(root: &Path) -> Option<i64> {
+    let project = read(root).ok()??;
+    let repo = verify(&project).ok()?;
+    let branches = local_branches(&repo)?;
+    let now = super::upload_outcome::now();
+    for due in super::upload_outcome::retries(&project.repository, &branches) {
+        if due.at <= now {
+            retry_one(&project, &repo, &due);
+        }
+    }
+    super::upload_outcome::retries(&project.repository, &branches)
+        .into_iter()
+        .map(|due| due.at)
+        .filter(|at| *at > now)
+        .min()
+}
+
+/// Tries a failed upload of the folder again, up to the tip it was for. The retry runs the first
+/// upload's own entry, which reads every gate as it is now, the folder's included: a conversation
+/// the folder left out since is refused there and recorded as such, and nothing is sent. A retry
+/// whose repository no longer uploads by itself, or whose tip no longer continues the branch, is
+/// cancelled instead, and its failure stands: with upload off nothing is attempted, recorded or
+/// said, and past a rewrite the branch's next turn uploads it.
+fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) {
+    let target = format!("{}@{}", project.repository, due.branch);
+    let continues = super::auto_push::branch_tip(repo.root(), &due.branch).is_some_and(|head| {
+        head == due.tip
+            || repo
+                .git_opt(&["merge-base", "--is-ancestor", &due.tip, &head])
+                .is_some()
+    });
+    let uploads = project.enabled
+        && project.auto_upload
+        && super::auto_push::publication_allowed(repo, &project.repository).unwrap_or(false);
+    if !uploads || !continues {
+        due.cancel(&project.repository);
+        return;
+    }
+    if !due.claim(&project.repository) {
+        return;
+    }
+    let pushed = super::upload_outcome::recorded(
+        super::upload_outcome::Place::of(&project.repository, &due.branch)
+            .map(|place| place.retried(due.retry)),
+        &due.tip,
+        || retry_stale(|| automatic_retry(&target, &due.tip, &project.root)),
+        |pushed| pushed.as_ref().err().map(refusal),
+    );
+    if matches!(pushed, Ok(Ok(_))) {
+        let _ = child(
+            &["fetch".into(), project.repository.clone()],
+            &project.root,
+            false,
+        );
+    }
+}
+
+/// Waits until `at`, in Unix seconds, by the clock [`super::upload_outcome::now`] reads.
+fn wait_until(at: i64) {
+    loop {
+        let left = at - super::upload_outcome::now();
+        if left <= 0 {
+            return;
+        }
+        // A test's clock moves when the test moves it, so it is read often.
+        let step = if cfg!(debug_assertions) && std::env::var_os("AGIT_TEST_CLOCK_FILE").is_some() {
+            std::time::Duration::from_millis(50)
+        } else {
+            std::time::Duration::from_secs(left.clamp(1, 60) as u64)
+        };
+        std::thread::sleep(step);
     }
 }
 

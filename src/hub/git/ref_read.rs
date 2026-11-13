@@ -47,26 +47,7 @@ impl Failure {
         if lower.contains("repository") && lower.contains("not found") {
             return Self::new("Git repository was not found or is inaccessible", false);
         }
-        let transient = [
-            "timed out",
-            "timeout",
-            "connection reset",
-            "connection refused",
-            "failed to connect",
-            "couldn't connect",
-            "could not resolve host",
-            "could not resolve proxy",
-            "empty reply from server",
-            "remote end hung up",
-            "connection was closed",
-            "recv failure",
-            "send failure",
-            "early eof",
-            "http/2 stream",
-            "http2 stream",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
+        let transient = looks_like_transport_failure(stderr);
         Self::new(
             if transient {
                 "Git destination connection failed temporarily"

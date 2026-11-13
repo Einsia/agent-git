@@ -471,6 +471,77 @@ fn only_acknowledged_refs_count_as_published() {
     }
 }
 
+/// A ref the Hub refused by name was answered, so a push that also ended with a 5xx is not a Hub
+/// that didn't answer: an automatic upload never retries it, and asking the Hub afterwards leaves
+/// it refused. Only refs left without an answer are settled by what the Hub holds. A push read as
+/// unanswered whenever its request ended with a 5xx would retry a hidden or withdrawn ref.
+#[test]
+fn a_ref_the_hub_refused_is_never_a_hub_that_did_not_answer() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repo::init(&temp.path().join("repo")).unwrap();
+    repo.git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        "Publication root",
+    ])
+    .unwrap();
+    let branch = repo.current_branch().unwrap();
+    let plan = crate::domain::repo::publication::PublicationPlan::freeze_selected(&repo, &[branch])
+        .unwrap();
+    let reference = plan.heads()[0].clone();
+    let report = |status: PublicationStatus, detail: &str| {
+        PublicationReport {
+        lfs: None,
+        heads: Some(crate::hub::git::PublicationPhase {
+            attempts: vec![crate::hub::git::PublicationAttempt {
+                batch: 0,
+                outcome: crate::hub::git::Outcome {
+                    code: 1,
+                    stderr: "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\n".into(),
+                },
+                refs: vec![crate::hub::git::PublishedRef {
+                    reference: reference.clone(),
+                    status,
+                    detail: Some(detail.into()),
+                }],
+                complete: false,
+                error: None,
+            }],
+            ..Default::default()
+        }),
+        tags: None,
+        error: None,
+    }
+    };
+    let hidden = "[remote rejected] (deny updating a hidden ref)";
+    assert_eq!(
+        publication_failure_code(&report(PublicationStatus::Rejected, hidden)),
+        ExitCode::Failure
+    );
+    assert_eq!(
+        publication_failure_code(&report(
+            PublicationStatus::Unconfirmed,
+            "[remote failure] (remote failed to report status)"
+        )),
+        ExitCode::Network
+    );
+    // The Hub holding the pushed object changes nothing for a ref it refused.
+    let mut refused = report(PublicationStatus::Rejected, hidden);
+    let held = std::collections::BTreeMap::from([(
+        reference.name().to_owned(),
+        reference.oid().to_owned(),
+    )]);
+    assert_eq!(
+        refused.settle_unanswered(&std::collections::BTreeMap::new(), &held),
+        crate::hub::git::Unanswered::None
+    );
+    assert!(!refused.ok());
+}
+
 #[test]
 fn inherited_git_routing_is_refused_without_reporting_its_value() {
     for key in [

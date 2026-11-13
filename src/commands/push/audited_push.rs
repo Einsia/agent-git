@@ -161,6 +161,55 @@ impl std::fmt::Display for RefsMoved {
 
 impl std::error::Error for RefsMoved {}
 
+/// A first attempt of the person's own push that the Hub didn't answer, and that the Hub's refs
+/// show did not land whole. Its caller runs the publication once more from the start, asking every
+/// confirmation again: the person answered for a push they did not know had failed.
+#[derive(Debug)]
+pub(super) struct NoAnswer {
+    refused: Previewed,
+}
+
+impl NoAnswer {
+    pub(super) fn retry(self) -> Attempt {
+        Attempt::Retry(self.refused)
+    }
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the Hub didn't answer")
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
+/// What stopped a push the Hub didn't answer, and the one command that goes on, once the Hub's
+/// refs were read for it (`unanswered`, `None` when they couldn't be). `None` when the Hub
+/// answered for every ref, so [`publication_recovery`] says it.
+fn unanswered_recovery(
+    report: &PublicationReport,
+    unanswered: Option<&crate::hub::git::Unanswered>,
+    retry: &str,
+) -> Option<String> {
+    use crate::hub::git::Unanswered;
+    let stopped = publication_failure(report).map_or_else(
+        || "publication did not complete".to_owned(),
+        |reason| format!("publication did not complete ({reason})"),
+    );
+    match unanswered {
+        Some(Unanswered::None) => None,
+        None => Some(format!(
+            "{stopped}; the Hub didn't answer, and its branches couldn't be read to tell whether this push landed; `{retry}` checks and uploads what it doesn't hold"
+        )),
+        Some(Unanswered::Moved(name)) => Some(format!(
+            "{stopped}; {name} changed on the Hub while this push waited for its answer, so nothing more was sent; `{retry}` previews it again"
+        )),
+        Some(Unanswered::Landed | Unanswered::NotLanded) => Some(format!(
+            "{stopped}; the Hub didn't answer, and it doesn't hold all of this push yet; `{retry}` uploads the rest"
+        )),
+    }
+}
+
 /// Why the Hub refused an attempt of `report` in a way a new preview can pass, or `None`.
 fn previews_again(report: &PublicationReport) -> Option<&'static str> {
     let outcome = &[&report.heads, &report.tags]
@@ -1119,7 +1168,18 @@ fn publication_failure_code(report: &PublicationReport) -> ExitCode {
     }
     for phase in [&report.heads, &report.tags].into_iter().flatten() {
         if let Some(attempt) = phase.attempts.last().filter(|attempt| !attempt.ok()) {
-            return branch_failure_code(&attempt.outcome);
+            let code = branch_failure_code(&attempt.outcome);
+            // A ref the Hub or Git refused was answered, whatever status the request ended with:
+            // read as a Hub that didn't answer, an automatic upload would retry a refusal.
+            let refused = attempt
+                .refs
+                .iter()
+                .any(|reference| reference.status == PublicationStatus::Rejected);
+            return if code == ExitCode::Network && refused {
+                ExitCode::Failure
+            } else {
+                code
+            };
         }
     }
     ExitCode::Failure

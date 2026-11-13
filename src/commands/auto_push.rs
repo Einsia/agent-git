@@ -129,6 +129,13 @@ pub(crate) fn automatic_push(command: &mut std::process::Command, target: &str) 
     command.args([AUTOMATIC_ENTRY, target]);
 }
 
+/// [`automatic_push`] of `target`'s branch up to `tip` and no further, as a retry publishes the
+/// tip the failed upload was for: turns saved since go with their own turn's upload.
+pub(crate) fn automatic_push_up_to(command: &mut std::process::Command, target: &str, tip: &str) {
+    automatic_push(command, target);
+    command.args(["--up-to", tip]);
+}
+
 #[cfg(all(test, unix))]
 #[test]
 fn unattended_children_cannot_inherit_interactive_consent() {
