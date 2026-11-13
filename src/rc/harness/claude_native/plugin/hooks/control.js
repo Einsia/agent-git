@@ -85,11 +85,16 @@ const CHECKING = "Checking with agit whether another process still writes this c
 // 30 s (LEASE_UNKNOWN_MS).
 const NOT_WRITER = "Not sent yet: another Claude Code is still open on this conversation. Close "
   + "it and this terminal can write; your input waits here.";
+// agit is stopping its own process for this conversation, which ran no turn: this terminal writes
+// once that process is gone. Whoever started that process, on the web or elsewhere, it is agit's.
+const HANDING_OVER = "Not sent yet: agit is stopping its own process for this conversation; "
+  + "this terminal can write in a moment, and your input waits here.";
 const UNREACHABLE = "agit couldn't check whether another process writes this conversation, so "
   + "your input is sent as usual.";
-const STALE = (session) => "This terminal continues an older branch of this conversation, without "
-  + `the turn sent from the web. Exit and run \`claude --resume ${session}\` now, before typing `
-  + "here: a message typed in this terminal keeps it on an older branch of the conversation.";
+// The command comes first: Claude Code cuts the status line to the terminal's width.
+const STALE = (session) => `Exit and run \`claude --resume ${session}\` now, before typing here, `
+  + "to continue with the turn sent from the web. This terminal continues an older branch of this "
+  + "conversation without that turn, and a message typed here would keep it there.";
 // Once a prompt was held back here, resuming may land on this terminal's branch again: the only
 // way on from this terminal is to continue without the web's turn, knowingly.
 const CONTINUE = "Not sent: this terminal continues an older branch of this conversation, without "
@@ -202,7 +207,13 @@ async function registerTarget($, target) {
     return false;
   }
   if (registered.refused === "not_current_writer") {
-    learn(target, { known: true, notice: NOT_WRITER });
+    // The refusal also told the daemon this terminal waits, and its line says for what: a web
+    // turn to end, and when agit stops it at the latest; or agit's own idle process stopping now.
+    // Without one, another terminal or a Claude Code agit doesn't run holds the conversation.
+    const daemon = registered.lease?.known === true ? registered.lease : null;
+    const notice = typeof daemon?.notice === "string" && daemon.notice ? daemon.notice
+      : daemon?.state === "releasing" ? HANDING_OVER : NOT_WRITER;
+    learn(target, { known: true, notice });
     return false;
   }
   if (registered.registration?.session !== target.session

@@ -440,6 +440,17 @@ pub(crate) fn announce_terminal(
     }
 }
 
+/// Tell the daemons on this machine that the terminal running this hook loaded `session` while
+/// another process still writes it, as its session start does. Unknown when this hook's terminal
+/// isn't among the processes Claude Code lists for the conversation.
+#[cfg(unix)]
+pub(crate) fn announce_waiting_terminal(session: &str) -> Announced {
+    match terminal_of_hook(session) {
+        Some(pid) => announce_terminal(session, pid, true, None),
+        None => Announced::Unknown,
+    }
+}
+
 /// Tell the daemons on this machine that the headless writer of `session` finished a turn on
 /// record `leaf`. Only the daemon running that writer keeps it.
 pub(crate) fn report_writer_leaf(session: &str, leaf: &str) {

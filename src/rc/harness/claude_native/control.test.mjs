@@ -68,7 +68,8 @@ async function fixture() {
     if (argv[2] === "native-lease") {
       return leaseFails ? { exitCode: 1, stdout: "" } : { exitCode: 0, stdout: JSON.stringify({ lease }) };
     }
-    if (refused) return { exitCode: 0, stdout: JSON.stringify({ refused: "not_current_writer" }) };
+    if (refused) return { exitCode: 0, stdout: JSON.stringify(
+      { refused: "not_current_writer", ...(refused === true ? {} : { lease: refused }) }) };
     return { exitCode: 0, stdout: JSON.stringify({
     registration: { session: argv[4], generation: argv[6] }, descriptor: "/owned-descriptor",
     lease: leaseFails ? { known: false } : lease,
@@ -628,9 +629,9 @@ test("a cd in the terminal is not a new conversation", async () => {
   assert.ok(registrations() > before, "another conversation registers, whatever its folder");
 });
 
-const olderBranch = "This terminal continues an older branch of this conversation, without the "
-  + "turn sent from the web. Exit and run `claude --resume a` now, before typing here: a message "
-  + "typed in this terminal keeps it on an older branch of the conversation.";
+const olderBranch = "Exit and run `claude --resume a` now, before typing here, to continue with "
+  + "the turn sent from the web. This terminal continues an older branch of this conversation "
+  + "without that turn, and a message typed here would keep it there.";
 const continueAnyway = "Not sent: this terminal continues an older branch of this conversation, "
   + "without the turn sent from the web. Submit the same message again to send it anyway: this "
   + "continues without the turn sent from the web; that turn stays in the history.";
@@ -840,6 +841,32 @@ test("a terminal agit refuses as writer holds its input past the release window 
   assert.equal(statuses(f).at(-1), undefined);
   await later(3610001, () => f.fire("prompt.submit", typed, downstream));
   assert.deepEqual(sent, ["my question"]);
+});
+
+// A refused registration is also the daemon's word on what this terminal waits for, since the
+// refusal announces the terminal: the web turn still running, with when agit stops it at the
+// latest, or agit's own idle process stopping now. Only without such a word is another Claude Code
+// the reason. A plugin that kept its own line would tell a person waiting on the web's turn to
+// close a process they never opened.
+test("a refused terminal shows the daemon's reason for the wait", async () => {
+  const running = `${releasing} This terminal takes over when it ends, at 16:40 at the latest, `
+    + "when agit stops that turn; your message stays here until then.";
+  for (const [answer, shown] of [
+    [{ known: true, state: "releasing", notice: running }, running],
+    [{ known: true, state: "releasing", notice: null }, /agit is stopping its own process/],
+    [{ known: true, state: null, notice: null }, /another Claude Code is still open/],
+    [{ known: false }, /another Claude Code is still open/],
+  ]) {
+    const f = await fixture();
+    f.setRefused(answer);
+    await f.fire("session.start");
+    await f.poll();
+    const { sent, downstream } = typing();
+    const { drop } = await f.fire("prompt.submit", typed, downstream);
+    if (typeof shown === "string") assert.equal(drop, shown);
+    else assert.match(drop, shown);
+    assert.deepEqual(sent, [], "a refused terminal holds its input whatever the reason");
+  }
 });
 
 // The plugin also runs in the daemon's own headless writer, the `claude -p` it supervises, which
