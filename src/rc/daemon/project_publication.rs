@@ -241,14 +241,8 @@ pub(in crate::rc) async fn reconcile_owned(
                     &device.owner.account_id,
                 )
                 .context(Stage::Consent)?;
-                choose_own_binding(
-                    &key,
-                    &request.project_id,
-                    &request.repository,
-                    &destination,
-                    move_terminal,
-                )
-                .context(Stage::Destination)?;
+                choose_own_binding(&key, &request.project_id, &request.repository, &destination)
+                    .context(Stage::Destination)?;
             }
             // A folder whose destination changed starts new conversations in a repository of
             // their own; it is that one this binding configures.
@@ -477,18 +471,15 @@ impl Prepared {
             &grant.target.owner.account_id,
         )
         .context(Stage::Consent)?;
-        // The device owner confirms this binding from the web themselves, so it is this
-        // account's own choice for the folder.
         let key =
             crate::rc::folder_destination::Key::signed_in(&self.directory, &self.destination.hub)?
                 .ok_or(Failure::LoginOtherHub)
                 .context(Stage::Consent)?;
-        choose_own_binding(
+        adopt_page_binding(
             &key,
             &self.request.project_id,
             &self.request.repository,
             &self.destination,
-            move_terminal,
         )
         .context(Stage::Destination)?;
         let (repository, repo) = project_repository(&self.request.project_id, &self.directory)?;
@@ -604,16 +595,17 @@ fn decide(
 }
 
 /// Makes `repository`, which the device's own account bound `project` to, the folder's
-/// destination: new conversations of the folder go there, and so does the folder's own terminal
-/// policy of the same account, moved by `move_terminal` the way `agit on --repo` moves it. A
-/// folder with no policy of its own gets none, so terminal capture is never turned on from the
-/// web.
+/// destination: conversations started from the web in the folder go there from now on. The
+/// folder's terminal policy is never touched. A binding reaches the device each time the owner
+/// opens the workspace page and on every plan pass, not only when they choose it, so moving the
+/// policy from here would move their terminal conversations, into a repository more people may
+/// read, with nothing asked. Where the terminal's conversations go changes only with `agit on` at
+/// the terminal.
 fn choose_own_binding(
     key: &crate::rc::folder_destination::Key,
     project: &str,
     repository: &str,
     destination: &RemoteIdentity,
-    move_terminal: impl FnOnce(&std::path::Path, &str) -> crate::Result<()>,
 ) -> crate::Result<()> {
     crate::rc::folder_destination::choose(
         key,
@@ -621,16 +613,22 @@ fn choose_own_binding(
         &destination.agent_id,
         crate::rc::folder_destination::ChosenFor::Project(project.to_owned()),
     )?;
-    // A terminal policy turned off stays off and where it was: moving it runs `agit on`, which
-    // would turn uploads back on that the person turned off themselves.
-    if let Some((policy, account)) = crate::commands::project::own_policy(key.root())
-        && policy != repository
-        && account == key.account()
-        && crate::commands::project::uploads_automatically(key.root()) == Some(true)
-    {
-        move_terminal(key.root(), repository)?;
-    }
     Ok(())
+}
+
+/// A binding the workspace page sends: the device owner's own, taken as the folder's destination
+/// the first time it arrives. The page sends every binding again each time it connects, so one
+/// already applied changes nothing, and a later choice of the folder's destination stays.
+fn adopt_page_binding(
+    key: &crate::rc::folder_destination::Key,
+    project: &str,
+    repository: &str,
+    destination: &RemoteIdentity,
+) -> crate::Result<()> {
+    if crate::rc::folder_destination::applied(key, project, &destination.agent_id)? {
+        return Ok(());
+    }
+    choose_own_binding(key, project, repository, destination)
 }
 
 /// The device-local repository `project`'s new conversations in `directory` are recorded in.
@@ -645,25 +643,6 @@ fn project_repository(
             .context(Stage::Repository)?;
     let repo = local_repository::require(&lineage).context(Stage::Repository)?;
     Ok((repository, repo))
-}
-
-/// Moves `folder`'s terminal uploads to `repository` with `agit on --repo`.
-fn move_terminal(folder: &std::path::Path, repository: &str) -> crate::Result<()> {
-    let output = crate::infra::background::command(crate::infra::own_image::own_image()?)
-        .args(["on", "--repo", repository])
-        .arg(folder)
-        .env("AGIT_YES", "1")
-        .env_remove("AGIT_SESSION")
-        .env_remove("AGIT_MERGE_TX")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "the folder's terminal uploads could not be moved"
-    );
-    Ok(())
 }
 
 fn confirm_repository(
@@ -1182,10 +1161,21 @@ mod tests {
             serde_json::from_value(entry).unwrap()
         }
 
+        /// The folder's terminal policy as `agit on` left it: its repository and whether it
+        /// uploads.
+        fn terminal(&self) -> Option<(String, Option<bool>)> {
+            crate::commands::project::own_policy(&self.directory).map(|(repository, _)| {
+                (
+                    repository,
+                    crate::commands::project::uploads_automatically(&self.directory),
+                )
+            })
+        }
+
         /// The Hub's binding reaching the device, as reconcile takes it once the destination's
         /// checks pass: judged, chosen when it is the device's own account's, and configured in
         /// the repository the project's new conversations are recorded in. Returns the decision
-        /// and the folders whose terminal uploads moved.
+        /// and the terminal policies it changed, read from the policy itself.
         fn reconcile(
             &self,
             target: &crate::hub::project_publication::Target,
@@ -1193,21 +1183,18 @@ mod tests {
             let account = crate::infra::credentials::account_key(HUB).unwrap();
             let key = self.key(&account);
             let destination = RemoteIdentity::new(HUB, &target.repository_id).unwrap();
+            let before = self.terminal();
             let decision = decide(&open(&self.repository()), &key, target, &destination).unwrap();
-            let mut moved = Vec::new();
             if decision == Decision::Own {
-                choose_own_binding(
-                    &key,
-                    &target.project_id,
-                    &target.repository,
-                    &destination,
-                    |folder, repository| {
-                        moved.push((folder.to_owned(), repository.to_owned()));
-                        Ok(())
-                    },
-                )
-                .unwrap();
+                choose_own_binding(&key, &target.project_id, &target.repository, &destination)
+                    .unwrap();
             }
+            let moved = match self.terminal() {
+                after if after != before => after
+                    .map(|(repository, _)| vec![(self.directory.clone(), repository)])
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
             if decision != Decision::Hold {
                 let (_, repo) = project_repository("p", &self.directory).unwrap();
                 local_repository::publication::Selection::prepare(
@@ -1292,8 +1279,10 @@ mod tests {
     /// workspace project bound later over it to a team repository. Bound by another account (a
     /// collaborator with full workspace access), the binding changes nothing: a new conversation
     /// of the project holds, and the folder keeps her choice. Bound by her own account, it becomes
-    /// the folder's destination, its terminal uploads included, for conversations that start
-    /// after it. A one-off push never changes a destination the folder has.
+    /// the folder's destination for web-started conversations that start after it, and her
+    /// terminal policy stays on her own repository: a team repository more people read never
+    /// receives her terminal conversations because a binding arrived. A one-off push never changes
+    /// a destination the folder has.
     #[test]
     fn a_web_binding_retargets_a_folder_only_when_the_devices_own_account_made_it() {
         if crate::rc::in_isolated_test(
@@ -1341,12 +1330,11 @@ mod tests {
             TEAM,
             serde_json::json!({"bound_by": "account-yuki"}),
         );
+        assert_eq!(folder.reconcile(&by_yuki), (Decision::Own, vec![]));
         assert_eq!(
-            folder.reconcile(&by_yuki),
-            (
-                Decision::Own,
-                vec![(folder.directory.clone(), "simco/burrow-agents".to_owned())]
-            )
+            folder.terminal(),
+            Some(("yuki/burrow-rc".to_owned(), Some(true))),
+            "her terminal policy stays on her own repository"
         );
         folder.start("desktop-c");
         assert_eq!(
@@ -1672,10 +1660,12 @@ mod tests {
 
     /// Lin's case, one destination per folder: a terminal policy for an organization repository
     /// and a workspace project her own account binds to her personal one. Whichever of the two
-    /// she chose last is the folder's destination; a web-started conversation of the project
-    /// whose binding names the other holds, and none ever goes to the other project's
-    /// repository. A binding already applied isn't applied again, so a later terminal choice
-    /// stays.
+    /// she chose last is the folder's destination for conversations started from the web; a
+    /// web-started conversation of the project whose binding names the other holds, and none
+    /// ever goes to the other project's repository. A binding already applied isn't applied
+    /// again, so a later terminal choice stays. Her terminal policy is never moved by a binding,
+    /// on or off: a reconcile that ran `agit on` would carry her terminal conversations, unasked,
+    /// to wherever the binding points, an organization's repository included.
     #[test]
     fn a_folder_has_one_destination_the_latest_own_choice_and_nothing_crosses() {
         if crate::rc::in_isolated_test(
@@ -1684,8 +1674,9 @@ mod tests {
             return;
         }
         let org = RemoteIdentity::new(HUB, ORG).unwrap();
-        // The terminal choice first, then her web binding: the folder and its terminal uploads
-        // move to the personal repository.
+        // The terminal choice first, then her web binding: the folder's web-started
+        // conversations go to the personal repository, and her terminal policy stays on the
+        // organization's.
         let terminal_first = fixture("account-lin");
         crate::commands::project::save_policy_for_test(
             &terminal_first.directory,
@@ -1698,12 +1689,10 @@ mod tests {
             OWN,
             serde_json::json!({"bound_by": "account-lin"}),
         );
+        assert_eq!(terminal_first.reconcile(&personal), (Decision::Own, vec![]));
         assert_eq!(
-            terminal_first.reconcile(&personal),
-            (
-                Decision::Own,
-                vec![(terminal_first.directory.clone(), "lin/lumen".to_owned())]
-            )
+            terminal_first.terminal(),
+            Some(("simco/lumen-agents".to_owned(), Some(true)))
         );
         terminal_first.start("desktop-a");
         assert_eq!(
@@ -1713,8 +1702,7 @@ mod tests {
         assert_eq!(terminal_first.chosen("account-lin"), "lin/lumen");
 
         // Her terminal choice turned off with `agit off`: the web binding is the folder's, and the
-        // terminal policy stays off and where it was. Moving it runs `agit on`, which would turn
-        // her uploads back on.
+        // terminal policy stays off and where it was.
         let turned_off = fixture("account-lin");
         crate::commands::project::save_policy_for_test(
             &turned_off.directory,
@@ -1795,6 +1783,44 @@ mod tests {
             "it keeps its start"
         );
         assert_eq!(web_first.chosen("account-lin"), "simco/lumen-agents");
+        // The workspace page sends her personal binding again each time she opens it: applied
+        // once already, it changes nothing, and the organization stays the folder's destination.
+        adopt_page_binding(
+            &web_first.key("account-lin"),
+            &personal.project_id,
+            &personal.repository,
+            &RemoteIdentity::new(HUB, OWN).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(web_first.chosen("account-lin"), "simco/lumen-agents");
+
+        // The page delivering her personal binding the first time, over a folder whose terminal
+        // policy names the organization: the binding is the folder's for web-started
+        // conversations, and the terminal policy stays where she set it.
+        let page_first = fixture("account-lin");
+        crate::commands::project::save_policy_for_test(
+            &page_first.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        let personal = page_first.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        adopt_page_binding(
+            &page_first.key("account-lin"),
+            &personal.project_id,
+            &personal.repository,
+            &RemoteIdentity::new(HUB, OWN).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page_first.chosen("account-lin"), "lin/lumen");
+        assert_eq!(
+            page_first.terminal(),
+            Some(("simco/lumen-agents".to_owned(), Some(true)))
+        );
     }
 
     /// What a folder bind reports to the Hub: the account's own record for the folder, else its
