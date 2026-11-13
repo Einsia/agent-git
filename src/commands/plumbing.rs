@@ -309,6 +309,10 @@ pub fn tree_apply_content(
     )
 }
 
+/// The size from which [`tree_edit`] remembers a blob it wrote, to find the same bytes again in
+/// the same edit without hashing them twice.
+const REMEMBERED_FROM: usize = 64 * 1024;
+
 /// One change [`tree_edit`] makes at a path.
 enum Edit {
     /// A regular file with these bytes.
@@ -354,14 +358,29 @@ fn tree_edit(repo: &Repo, base_commitish: &str, edits: Vec<(String, Edit)>) -> R
     let base_id = gix::ObjectId::from_hex(base_tree.as_bytes())?;
     let tree = {
         let mut editor = objects.edit_tree(base_id)?;
+        let mut written: Vec<(Vec<u8>, gix::ObjectId)> = Vec::new();
         for (path, edit) in edits {
             match edit {
                 Edit::Bytes(bytes) => {
-                    let kind = gix::object::Kind::Blob;
-                    let id = gix::objs::compute_hash(objects.object_hash(), kind, &bytes)?;
-                    if !objects.has_object(id) {
-                        write_loose_object(&directory, &id, kind, &bytes)?;
-                    }
+                    // Edits of one tree often carry the same bytes, as a VIEW that is its whole
+                    // LOG does: those are hashed and written once. Only blobs of at least
+                    // `REMEMBERED_FROM` bytes are remembered: hashing twice costs on the few large
+                    // ones a tree holds, and every small file remembered makes each one after it
+                    // compare against all of them.
+                    let id = match written.iter().find(|(seen, _)| *seen == bytes) {
+                        Some((_, id)) => *id,
+                        None => {
+                            let kind = gix::object::Kind::Blob;
+                            let id = gix::objs::compute_hash(objects.object_hash(), kind, &bytes)?;
+                            if !objects.has_object(id) {
+                                write_loose_object(&directory, &id, kind, &bytes)?;
+                            }
+                            if bytes.len() >= REMEMBERED_FROM {
+                                written.push((bytes, id));
+                            }
+                            id
+                        }
+                    };
                     editor.upsert(path.as_str(), gix::object::tree::EntryKind::Blob, id)?;
                 }
                 Edit::Entry(kind, id) => {
