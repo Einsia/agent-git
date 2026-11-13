@@ -645,9 +645,18 @@ impl FrozenPublication {
             if let Some(tip) = remote.get(head.name())
                 && !line.is_empty()
             {
+                // A tip this repository doesn't hold can't be shown to be continued, and is named
+                // as such: one that went missing here reads the same as history the Hub took from
+                // elsewhere.
+                ensure!(
+                    present.contains(tip),
+                    "{branch}: the hub's branch is at {}, which this repository doesn't hold; \
+                     it cannot be published as a fast-forward of it",
+                    &tip[..tip.len().min(12)]
+                );
                 // Along a first-parent line every commit after a descendant of the tip is one too,
                 // so the cuts that fast-forward the branch are a suffix of the line.
-                let first = if present.contains(tip) {
+                let first = {
                     let (mut low, mut high) = (0, line.len());
                     while low < high {
                         let middle = low + (high - low) / 2;
@@ -658,8 +667,6 @@ impl FrozenPublication {
                         }
                     }
                     low
-                } else {
-                    line.len()
                 };
                 ensure!(
                     first < line.len(),

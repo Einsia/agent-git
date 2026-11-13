@@ -298,19 +298,19 @@ impl Selection {
             // Only the selected session's own earlier snapshots. An encrypted snapshot names its
             // session in its binding: as published, its metadata carries the public id instead, so
             // it is judged by the binding. Any other commit of another session, such as the one
-            // this session was forked from, ends the walk.
+            // this session was forked from, ends the walk. A snapshot whose envelope can't be read
+            // fails the access: walked past, it would hand out an older original, or none.
             for commit in line.lines().skip(1) {
                 let Some(session) = &session else {
                     break;
                 };
-                if let Ok(candidate @ (_, Some(_))) =
-                    crate::domain::privacy_git::publication_envelope(
-                        &repo,
-                        resolved.branch.as_deref(),
-                        commit,
-                        &identity,
-                    )
-                {
+                let candidate = crate::domain::privacy_git::publication_envelope(
+                    &repo,
+                    resolved.branch.as_deref(),
+                    commit,
+                    &identity,
+                )?;
+                if candidate.1.is_some() {
                     let bound = candidate.1.as_deref().and_then(|bytes| {
                         PrivacyEnvelope::parse(bytes)
                             .ok()?
