@@ -165,6 +165,11 @@ pub(super) struct NativeSnapshots {
     source: String,
     claim: String,
     consumed: usize,
+    /// The LOG text of `ids[..log_ids]`. Each snapshot's LOG is a longer prefix of the same ids,
+    /// and its VIEW a suffix of its LOG, so the text grows by the ids each turn adds, each checked
+    /// once as it joins, rather than being written out and checked again in full every turn.
+    log: String,
+    log_ids: usize,
 }
 
 impl NativeSnapshots {
@@ -246,6 +251,8 @@ impl NativeSnapshots {
             source: source.to_owned(),
             claim: claim.to_owned(),
             consumed: settled_count,
+            log: String::new(),
+            log_ids: 0,
         })
     }
 
@@ -316,13 +323,29 @@ impl NativeSnapshots {
                 files.insert(path, body);
             }
         }
+        // Each id joining the LOG meets the checks `storage::sequence_text` puts on a sequence, in
+        // its order. The VIEW is a part of the same LOG, so its ids passed them already.
+        for (index, id) in self.ids[..count].iter().enumerate().skip(self.log_ids) {
+            if index == storage::MAX_SEQUENCE_EVENTS {
+                anyhow::bail!(
+                    "event sequence exceeds {} entries",
+                    storage::MAX_SEQUENCE_EVENTS
+                );
+            }
+            meta::event_path(id).with_context(|| format!("invalid event id at index {index}"))?;
+            self.log.push_str(id);
+            self.log.push('\n');
+        }
+        self.log_ids = self.log_ids.max(count);
+        // Every id is one line of the same length.
+        let line = meta::EVENT_ID_HEX_LEN + 1;
         files.insert(
             meta::LOG_FILE.into(),
-            storage::sequence_text(&self.ids[..count])?.into_bytes(),
+            self.log.as_bytes()[..count * line].to_vec(),
         );
         files.insert(
             meta::VIEW_FILE.into(),
-            storage::sequence_text(&self.ids[view_start..count])?.into_bytes(),
+            self.log.as_bytes()[view_start * line..count * line].to_vec(),
         );
         self.consumed = count;
         Ok(files)
