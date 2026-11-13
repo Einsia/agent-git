@@ -82,7 +82,7 @@ impl Failure {
     }
 
     /// The class of `error`: one a check raised itself, else what the Hub's status says.
-    fn of(error: &anyhow::Error) -> Self {
+    pub(in crate::rc) fn of(error: &anyhow::Error) -> Self {
         if let Some(failure) = error.downcast_ref::<Failure>() {
             return *failure;
         }
