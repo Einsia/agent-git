@@ -2,18 +2,18 @@
   "schema": 1,
   "sources": [
     {
-      "asset": "source-alpine-git-2.54.0-r0.tar",
+      "asset": "source-alpine-git-2.54.1-r0.tar",
       "covers": [
-        "5a2c6782774d2e891fc2fc3fdc50c3c2743b8eb2dc7cda69b6b723af2eedcf78",
-        "ea41e2f837f1f6a8b66e72a5ece0fc75cca44f76f49cf5500d467fc5627d0ab7",
-        "e8094a47bfa6e66b7d550ae12a7a8bcab0bc4af502aacd5d2a6fc62d2c5e488d",
-        "bad163db30bfd90c99f86fac54e7ac082040024d214c0e1d0c7d98a4f5a7edb5"
+        "a8d6464152f823b28d80876142649bfddd8ac7959b5c24be9f8f7f2b5e2421dc",
+        "6a9dc5e00013a8daecedd1c2951ec16fc69f0e5ade6847db81e86a9e658323b7",
+        "d64eeddb867cdb678944535e1e56d0438a9ca5114344cbf624abae31519f2afd",
+        "9b32dbf05e14b1603b6a4206021dfc9c156382d73e3c3e1a27439e39eef3d116"
       ],
       "aports": {
-        "commit": "b3ed5f8f4ce6b2ef13adeaf7494557add6546bda",
+        "commit": "e1bb2d7fd69b2bbed321077da3085b8195abef69",
         "directory": "main/git",
         "files": {
-          "APKBUILD": "af43f6de15a7de1402a4ae17ea5fc8cde5383897f1c01dfd890ad24af3b3138e",
+          "APKBUILD": "834cfb851ab80ffc3b037afc8510db75144d02d30cef9f77080c461c55733969",
           "fix-t4219-with-sticky-bit.patch": "2ae5b4901a7ef98ffb35eaba1d201d97b556fca1bf4688f88f79ca24d51a8cd6",
           "git-daemon.confd": "4703ba2372c661fb674a29fea7f64983f8b1b3136d971663509249655bca6e21",
           "git-daemon.initd": "ff9b5beefbe55ba6340f1c4acced195515002d0ccb431a8fcd5b1078eacd2e59"
@@ -21,12 +21,12 @@
       },
       "downloads": [
         {
-          "name": "git-2.54.0.tar.xz",
+          "name": "git-2.54.1.tar.xz",
           "urls": [
-            "https://www.kernel.org/pub/software/scm/git/git-2.54.0.tar.xz",
-            "https://distfiles.alpinelinux.org/distfiles/v3.24/git-2.54.0.tar.xz"
+            "https://www.kernel.org/pub/software/scm/git/git-2.54.1.tar.xz",
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/git-2.54.1.tar.xz"
           ],
-          "sha256": "f689162364c10de79ef89aa8dbf48731eb057e34edbbd20aca510ce0154681a3"
+          "sha256": "ca988eb9af7d8770339df7cdc38106fec8244664ff886840767cb9be3ef0e16c"
         }
       ]
     },

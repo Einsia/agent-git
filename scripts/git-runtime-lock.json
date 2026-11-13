@@ -37,19 +37,19 @@
       },
       {
         "name": "git",
-        "version": "2.54.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/git-2.54.0-r0.apk",
-        "sha256": "5a2c6782774d2e891fc2fc3fdc50c3c2743b8eb2dc7cda69b6b723af2eedcf78",
+        "version": "2.54.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/git-2.54.1-r0.apk",
+        "sha256": "a8d6464152f823b28d80876142649bfddd8ac7959b5c24be9f8f7f2b5e2421dc",
         "license": "GPL-2.0-only",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda/main/git"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e1bb2d7fd69b2bbed321077da3085b8195abef69/main/git"
       },
       {
         "name": "git-init-template",
-        "version": "2.54.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/git-init-template-2.54.0-r0.apk",
-        "sha256": "e8094a47bfa6e66b7d550ae12a7a8bcab0bc4af502aacd5d2a6fc62d2c5e488d",
+        "version": "2.54.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/git-init-template-2.54.1-r0.apk",
+        "sha256": "d64eeddb867cdb678944535e1e56d0438a9ca5114344cbf624abae31519f2afd",
         "license": "GPL-2.0-only",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda/main/git"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e1bb2d7fd69b2bbed321077da3085b8195abef69/main/git"
       },
       {
         "name": "libcrypto3",
@@ -133,11 +133,11 @@
       },
       {
         "name": "zlib",
-        "version": "1.3.2-r1",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.3.2-r1.apk",
-        "sha256": "63aeea03c15a2f9018f81805cfc8aa926bdf5cd68921f22149c2fbb5d0ee9f47",
+        "version": "1.4-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zlib-1.4-r0.apk",
+        "sha256": "7b05bc778b8b25cd880835b40114182bd4d1581717504d0129c810c0a14291cb",
         "license": "Zlib",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0afa2da0e8c8051c6f8f64a7a388e5a259904245/main/zlib"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/bdf501c870a92a05c097857401f69c48c4810384/main/zlib"
       },
       {
         "name": "zstd-libs",
@@ -167,19 +167,19 @@
       },
       {
         "name": "git",
-        "version": "2.54.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/git-2.54.0-r0.apk",
-        "sha256": "ea41e2f837f1f6a8b66e72a5ece0fc75cca44f76f49cf5500d467fc5627d0ab7",
+        "version": "2.54.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/git-2.54.1-r0.apk",
+        "sha256": "6a9dc5e00013a8daecedd1c2951ec16fc69f0e5ade6847db81e86a9e658323b7",
         "license": "GPL-2.0-only",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda/main/git"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e1bb2d7fd69b2bbed321077da3085b8195abef69/main/git"
       },
       {
         "name": "git-init-template",
-        "version": "2.54.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/git-init-template-2.54.0-r0.apk",
-        "sha256": "bad163db30bfd90c99f86fac54e7ac082040024d214c0e1d0c7d98a4f5a7edb5",
+        "version": "2.54.1-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/git-init-template-2.54.1-r0.apk",
+        "sha256": "9b32dbf05e14b1603b6a4206021dfc9c156382d73e3c3e1a27439e39eef3d116",
         "license": "GPL-2.0-only",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/b3ed5f8f4ce6b2ef13adeaf7494557add6546bda/main/git"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e1bb2d7fd69b2bbed321077da3085b8195abef69/main/git"
       },
       {
         "name": "libcrypto3",
@@ -263,11 +263,11 @@
       },
       {
         "name": "zlib",
-        "version": "1.3.2-r1",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zlib-1.3.2-r1.apk",
-        "sha256": "1f77a542ac6634761b9fe38d8bdca19b154071dcfa25432e73f2bc8a0740a33f",
+        "version": "1.4-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zlib-1.4-r0.apk",
+        "sha256": "d3e30d012a3445222b0b4a28f1d4d97ce67387f8b48561921111696da174f0de",
         "license": "Zlib",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0afa2da0e8c8051c6f8f64a7a388e5a259904245/main/zlib"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/bdf501c870a92a05c097857401f69c48c4810384/main/zlib"
       },
       {
         "name": "zstd-libs",
