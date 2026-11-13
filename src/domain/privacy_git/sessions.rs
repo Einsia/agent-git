@@ -9,7 +9,10 @@ use crate::domain::session_privacy::{
 use crate::hub::{
     git::RemoteRefs, identity::RemoteIdentity, privacy::sessions::SessionPrivacyResponse,
 };
+use objects::Objects;
 
+#[path = "session_objects.rs"]
+mod objects;
 #[path = "session_projection.rs"]
 mod projection;
 #[path = "session_sources.rs"]
@@ -983,6 +986,7 @@ impl ProjectedHistory {
         ));
         initialize_with_format(&root, source_plan.heads()[0].oid().len())?;
         let repo = Repo::at(&root).local_objects_only();
+        let objects = Objects::default();
         let mut cache = match state::load(&root.join(".git/session-candidates"), &scope)? {
             Some(bytes) => candidate_cache(&bytes),
             None => Cache {
@@ -1238,14 +1242,13 @@ impl ProjectedHistory {
                         .filter(|_| metadata.source_ref.is_none())
                     {
                         Some(source_ref) => {
-                            let mut commit =
-                                read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+                            let mut commit = objects.commit(&source, oid)?;
                             neutral_fork_text(source_ref, &mut metadata, &mut commit)
                                 .then_some(commit)
                         }
                         None => None,
                     };
-                    let neutral = rechecked.message(&source, oid, neutral)?;
+                    let neutral = rechecked.message(&objects, &source, oid, neutral)?;
                     let config = if metadata.is_file_line() {
                         None
                     } else {
@@ -1326,6 +1329,7 @@ impl ProjectedHistory {
                                         .is_some_and(super::frozen::encrypted);
                                     if !encrypted_here
                                         && shown_plain(
+                                            &objects,
                                             &source,
                                             &repo,
                                             written
@@ -1338,6 +1342,7 @@ impl ProjectedHistory {
                                     }
                                 }
                                 let public_records = published_lines(
+                                    &objects,
                                     &source,
                                     &repo,
                                     &written,
@@ -1359,6 +1364,7 @@ impl ProjectedHistory {
                                     && carried.held_back.is_empty()
                                 {
                                     let conversation = projector.project(
+                                        &objects,
                                         &source,
                                         oid,
                                         &parents[oid],
@@ -1463,6 +1469,7 @@ impl ProjectedHistory {
                                 oid.clone()
                             } else {
                                 plain_commit(
+                                    &objects,
                                     &source,
                                     &repo,
                                     (conversation.as_deref().unwrap_or(oid), neutral.as_deref()),
@@ -1472,7 +1479,7 @@ impl ProjectedHistory {
                             }
                         } else if neutral.is_some() || public_parents != parents[oid] {
                             let commit = (oid.as_str(), neutral.as_deref());
-                            plain_commit(&source, &repo, commit, &public_parents, None)?
+                            plain_commit(&objects, &source, &repo, commit, &public_parents, None)?
                         } else {
                             oid.clone()
                         };
@@ -1529,7 +1536,7 @@ impl ProjectedHistory {
                     )?;
                     let original = match &neutral {
                         Some(commit) => commit.clone(),
-                        None => read(&source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+                        None => objects.commit(&source, oid)?,
                     };
                     let committer = SourceCommitter::from_commit(
                         &original,
@@ -2090,6 +2097,7 @@ struct Prefix<'a> {
     /// The public parent's LOG, in order.
     public: Vec<String>,
     holder: &'a Repo,
+    objects: &'a Objects,
     commit: String,
 }
 
@@ -2097,15 +2105,15 @@ impl Prefix<'_> {
     /// The line the public parent publishes as `id`.
     fn line(&self, id: &str) -> Result<String> {
         use crate::domain::storage;
-        let bytes = read(
-            self.holder,
-            &[
-                "cat-file",
-                "blob",
+        let bytes = self
+            .objects
+            .read(
+                self.holder,
                 &format!("{}:{}", self.commit, meta::event_path(id)?),
-            ],
-            storage::MAX_MATERIALIZED_BYTES,
-        )?;
+                "blob",
+                storage::MAX_MATERIALIZED_BYTES,
+            )?
+            .context("privacy source object is unavailable")?;
         let line = String::from_utf8(bytes).context("a published event is not UTF-8")?;
         ensure!(
             storage::event_id(&line)? == id,
@@ -2118,11 +2126,11 @@ impl Prefix<'_> {
 /// Whether the public commit `commit` shows by its own tree that it is plain: a tree this run can
 /// read, holding nothing under `privacy/`. An envelope of any format, a tree that can't be read or
 /// any answer Git can't give cleanly says no, so its lines pass protection again.
-fn shown_plain(source: &Repo, repo: &Repo, commit: &str) -> bool {
+fn shown_plain(objects: &Objects, source: &Repo, repo: &Repo, commit: &str) -> bool {
     [source, repo].into_iter().any(|holder| {
         matches!(
-            holder.git_status_local(&["ls-tree", "--name-only", commit, "--", "privacy"]),
-            Ok((Some(0), stdout, stderr)) if stdout.trim().is_empty() && stderr.is_empty()
+            objects.tree(holder, &format!("{commit}^{{tree}}")),
+            Ok(Some(entries)) if !entries.iter().any(|entry| entry.name == b"privacy")
         )
     })
 }
@@ -2131,6 +2139,7 @@ fn shown_plain(source: &Repo, repo: &Repo, commit: &str) -> bool {
 /// this run wrote is read through the source commit `written` names for it, which holds the same
 /// LOG: what the run writes reaches the publication repository only when the run ends.
 fn published_lines<'a>(
+    objects: &'a Objects,
     source: &'a Repo,
     repo: &'a Repo,
     written: &std::collections::HashMap<String, String>,
@@ -2141,11 +2150,9 @@ fn published_lines<'a>(
     use crate::domain::storage;
     let limit = storage::MAX_MATERIALIZED_BYTES;
     let blob = |holder: &Repo, commit: &str, path: &str| -> Result<Option<String>> {
-        let spec = format!("{commit}:{path}");
-        if holder.git_opt(&["cat-file", "-e", &spec]).is_none() {
+        let Some(bytes) = objects.read(holder, &format!("{commit}:{path}"), "blob", limit)? else {
             return Ok(None);
-        }
-        let bytes = read(holder, &["cat-file", "blob", &spec], limit)?;
+        };
         Ok(Some(
             String::from_utf8(bytes).context("a published LOG is not UTF-8")?,
         ))
@@ -2154,14 +2161,14 @@ fn published_lines<'a>(
     let mut orders = Vec::new();
     for parent in public_parents {
         let commit = written.get(parent).unwrap_or(parent);
-        let holder = [source, repo]
-            .into_iter()
-            .find(|holder| {
-                holder
-                    .git_opt(&["cat-file", "-e", &format!("{commit}^{{tree}}")])
-                    .is_some()
-            })
-            .context("a published parent is unavailable")?;
+        let mut holder = None;
+        for candidate in [source, repo] {
+            if objects.exists(candidate, &format!("{commit}^{{tree}}"))? {
+                holder = Some(candidate);
+                break;
+            }
+        }
+        let holder = holder.context("a published parent is unavailable")?;
         if let Some(log) = blob(holder, commit, meta::LOG_FILE)? {
             let ids = log.lines().map(str::to_owned).collect::<Vec<_>>();
             published.ids.extend(ids.iter().cloned());
@@ -2197,6 +2204,7 @@ fn published_lines<'a>(
                     source_lines: shared.len(),
                     public: public.clone(),
                     holder,
+                    objects,
                     commit: commit.clone(),
                 });
             }
@@ -2291,13 +2299,14 @@ impl Rechecked {
     /// leaves `oid`'s message as it is.
     fn message(
         &mut self,
+        objects: &Objects,
         repo: &Repo,
         oid: &str,
         commit: Option<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>> {
         let original = match &commit {
             Some(commit) => commit.clone(),
-            None => read(repo, &["cat-file", "commit", oid], MAX_COMMIT)?,
+            None => objects.commit(repo, oid)?,
         };
         let boundary = original
             .windows(2)
@@ -2351,11 +2360,13 @@ pub(super) fn plain_published(
     parent: &str,
     public_parent: &str,
 ) -> Result<Option<String>> {
-    if !shown_plain(source, source, public_parent) {
+    let objects = Objects::default();
+    if !shown_plain(&objects, source, source, public_parent) {
         return Ok(None);
     }
     let parents = [parent.to_owned()];
     let published = published_lines(
+        &objects,
         source,
         source,
         &std::collections::HashMap::new(),
@@ -2597,6 +2608,7 @@ fn conversation_commit(
 }
 
 fn plain_commit(
+    objects: &Objects,
     source: &Repo,
     destination: &Repo,
     (oid, commit): (&str, Option<&[u8]>),
@@ -2604,65 +2616,58 @@ fn plain_commit(
     metadata: Option<&Meta>,
 ) -> Result<String> {
     fn replace(
+        objects: &Objects,
         source: &Repo,
         destination: &Repo,
         tree: &str,
         parts: &[&str],
         blob: &str,
     ) -> Result<String> {
-        let entries = source.git_bytes_result(&["ls-tree", "-z", tree])?;
+        let entries = objects
+            .tree(source, tree)?
+            .context("privacy source object is unavailable")?;
         let mut output = Vec::new();
         let mut found = false;
-        for entry in entries
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            let separator = entry
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .context("invalid plain tree entry")?;
-            if &entry[separator + 1..] == parts[0].as_bytes() {
+        for mut entry in entries {
+            if entry.name == parts[0].as_bytes() {
                 found = true;
-                let header = std::str::from_utf8(&entry[..separator])?;
-                let fields: Vec<_> = header.split(' ').collect();
-                ensure!(fields.len() == 3, "invalid plain tree entry");
-                let replacement = if parts.len() == 1 {
+                entry.id = if parts.len() == 1 {
                     ensure!(
-                        fields[0] == "100644" && fields[1] == "blob",
+                        entry.mode == 0o100644,
                         "session metadata must be a regular file"
                     );
                     blob.to_owned()
                 } else {
                     ensure!(
-                        fields[0] == "040000" && fields[1] == "tree",
+                        entry.mode == 0o040000,
                         "session metadata parent must be a directory"
                     );
-                    replace(source, destination, fields[2], &parts[1..], blob)?
+                    replace(objects, source, destination, &entry.id, &parts[1..], blob)?
                 };
-                output.extend_from_slice(
-                    format!("{} {} {}\t", fields[0], fields[1], replacement).as_bytes(),
-                );
-                output.extend_from_slice(&entry[separator + 1..]);
-            } else {
-                output.extend_from_slice(entry);
             }
-            output.push(0);
+            output.extend(entry.listing());
         }
         ensure!(found, "plain publication metadata path is missing");
         // Source objects are imported in a batch before this publication becomes inspectable.
-        input(destination, &["mktree", "-z", "--missing"], &output)
+        objects.mktree(destination, output)
     }
+    let own = objects.commit(source, oid)?;
+    let tree = commit_tree(&own)?;
     let original = match commit {
         Some(commit) => commit.to_vec(),
-        None => read(source, &["cat-file", "commit", oid], MAX_COMMIT)?,
+        None => own,
     };
-    let tree = source.git(&["rev-parse", &format!("{oid}^{{tree}}")])?;
     let tree = if let Some(metadata) = metadata {
-        let mut value: serde_json::Value = serde_json::from_slice(&read(
-            source,
-            &["cat-file", "blob", &format!("{oid}:{}", meta::FILE)],
-            meta::MAX_BYTES,
-        )?)?;
+        let mut value: serde_json::Value = serde_json::from_slice(
+            &objects
+                .read(
+                    source,
+                    &format!("{oid}:{}", meta::FILE),
+                    "blob",
+                    meta::MAX_BYTES,
+                )?
+                .context("privacy source object is unavailable")?,
+        )?;
         value["session_privacy"] = serde_json::to_value(&metadata.session_privacy)?;
         value["session"] = json!(metadata.session);
         if metadata.milestone.is_some() {
@@ -2687,8 +2692,9 @@ fn plain_commit(
         }
         let text = serde_json::to_vec(&value)?;
         meta::ensure_within_limit(&text)?;
-        let blob = write_object(destination, "blob", &text)?;
+        let blob = objects.blob(destination, &text)?;
         replace(
+            objects,
             source,
             destination,
             &tree,
@@ -2703,6 +2709,20 @@ fn plain_commit(
         "commit",
         &commit_body(&tree, parents, &original)?,
     )
+}
+
+/// The tree a raw commit names on its first line, as `git rev-parse <commit>^{tree}` gives it.
+fn commit_tree(commit: &[u8]) -> Result<String> {
+    let line = commit
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let tree = line
+        .strip_prefix(b"tree ")
+        .and_then(|tree| std::str::from_utf8(tree).ok())
+        .filter(|tree| valid_oid(tree))
+        .context("publication source commit has no tree")?;
+    Ok(tree.to_owned())
 }
 
 const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -3796,12 +3816,14 @@ mod tests {
         let public = snapshot("public", &[], &[replied.clone()]);
         let reply = storage::canonical_event_id(&replied);
         let source = Repo::at(&root);
+        let objects = Objects::default();
         let published = Published {
             ids: [reply.clone()].into_iter().collect(),
             prefix: Some(Prefix {
                 source_lines: 2,
                 public: vec![reply],
                 holder: &source,
+                objects: &objects,
                 commit: public,
             }),
         };
