@@ -32,6 +32,38 @@ struct Delay {
 struct Recorded {
     digest: Option<String>,
     carrier: Carrier,
+    /// Where the next read of the carrier may start, when it is still the transcript read here.
+    progress: Option<Progress>,
+}
+
+/// How long a conversation's transcript may be read only past its last completed turn before it
+/// is read whole again, whether or not it changed since. A rewrite of what came before that turn
+/// that the shorter read can't see, one with an append in the same write, is refused by the
+/// archive job, and the whole read that follows takes it in; a transcript that went quiet right
+/// after it is read whole all the same.
+const WHOLE_READ_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Where a transcript's completed part ends, and the SHA-256 state over that part, so the next
+/// read starts there: what follows the last completed turn is the turn running and what was
+/// appended, and only it can move the boundary.
+#[derive(Clone)]
+struct Progress {
+    end: u64,
+    hasher: sha2::Sha256,
+    /// When the transcript was last read whole.
+    whole_at: tokio::time::Instant,
+    /// Whether it was read only past a completed turn since.
+    read_past: bool,
+}
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Progress")
+            .field("end", &self.end)
+            .field("whole_at", &self.whole_at)
+            .field("read_past", &self.read_past)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,10 +102,20 @@ impl Carrier {
         }
     }
 
+    /// Whether `other` was read from the same file as this carrier, which it can have grown since.
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        let same = self.file == other.file;
+        #[cfg(not(unix))]
+        let same = true;
+        same && self.path == other.path && other.len >= self.len
+    }
+
     /// A carrier that is still the conversation's current one and is unchanged holds no new
     /// turn, so the whole transcript need not be read and hashed again. Codex restores a
     /// compressed rollout before it appends, so a carrier that went cold since it was read is
-    /// unchanged too, and checking it never restores it.
+    /// unchanged too, and checking it never restores it. Whether a whole read is due all the same
+    /// is not asked here; [`Recorded::unchanged`] asks both.
     fn current_and_unchanged(&self, entry: &roster::Entry) -> bool {
         if current_carrier(entry).is_none_or(|current| normalized(&current) != self.path) {
             return false;
@@ -85,6 +127,19 @@ impl Carrier {
             }
             Err(_) => false,
         }
+    }
+}
+
+impl Recorded {
+    /// Whether the collector passes this conversation over: its carrier is still current and
+    /// unchanged, and it was not read only past a completed turn [`WHOLE_READ_EVERY`] or longer
+    /// after it was last read whole. Without the second part, a transcript that went quiet after
+    /// such a read is never read whole again until it changes, however long that takes.
+    fn unchanged(&self, entry: &roster::Entry, now: tokio::time::Instant) -> bool {
+        self.carrier.current_and_unchanged(entry)
+            && !self.progress.as_ref().is_some_and(|progress| {
+                progress.read_past && now >= progress.whole_at + WHOLE_READ_EVERY
+            })
     }
 }
 
@@ -155,12 +210,11 @@ impl Collector {
             }
             if let Some(recorded) = self.recorded.get(&logical).cloned() {
                 let entry = daemon.lock().await.roster.get(&logical).cloned();
+                let now = tokio::time::Instant::now();
                 if let Some(entry) = entry
-                    && tokio::task::spawn_blocking(move || {
-                        recorded.carrier.current_and_unchanged(&entry)
-                    })
-                    .await
-                    .unwrap_or(false)
+                    && tokio::task::spawn_blocking(move || recorded.unchanged(&entry, now))
+                        .await
+                        .unwrap_or(false)
                 {
                     continue;
                 }
@@ -189,17 +243,14 @@ impl Collector {
             // A stop lets the capture in flight finish within the grace archive recovery gives its
             // stages. A capture dropped at once ends the settlement subprocess it started wherever
             // that subprocess is, and a repository write it is in the middle of stays half done.
-            let digest = self
-                .recorded
-                .get(&logical)
-                .and_then(|recorded| recorded.digest.clone());
+            let previous = self.recorded.get(&logical).cloned();
             let capture = {
                 let daemon = daemon.clone();
                 async move {
                     Ok::<_, anyhow::Error>(
                         tokio::time::timeout(
                             std::time::Duration::from_secs(30),
-                            collect(&daemon, request, digest),
+                            collect(&daemon, request, previous),
                         )
                         .await,
                     )
@@ -243,6 +294,11 @@ impl Collector {
                     }
                 }
                 result => {
+                    // The next capture reads the whole transcript again: a failure may mean the
+                    // part before the last completed turn is not what was read.
+                    if let Some(recorded) = self.recorded.get_mut(&logical) {
+                        recorded.progress = None;
+                    }
                     // The same failure recurs every cycle until its cause changes; one line each.
                     let failure = format!("{result:?}");
                     if self.reported.get(&logical) != Some(&failure) {
@@ -304,7 +360,7 @@ impl Collector {
 async fn collect(
     daemon: &Arc<Mutex<Daemon>>,
     request: super::capture_binding::Request,
-    recorded: Option<String>,
+    previous: Option<Recorded>,
 ) -> crate::Result<Option<Recorded>> {
     let logical = request.logical.clone();
     let mut entry = request
@@ -360,8 +416,9 @@ async fn collect(
             state.roster = roster;
         }
     }
+    let now = tokio::time::Instant::now();
     tokio::task::spawn_blocking(move || {
-        capture_boundary(&logical, &entry, &lineage, recorded.as_deref())
+        capture_boundary(&logical, &entry, &lineage, previous.as_ref(), now)
     })
     .await?
 }
@@ -370,11 +427,10 @@ fn capture_boundary(
     logical: &str,
     entry: &roster::Entry,
     lineage: &crate::rc::lineage::AgitSession,
-    recorded: Option<&str>,
+    previous: Option<&Recorded>,
+    now: tokio::time::Instant,
 ) -> crate::Result<Option<Recorded>> {
     use crate::domain::{link, store::Store};
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
     let key = entry
         .native_source
         .as_ref()
@@ -396,7 +452,7 @@ fn capture_boundary(
     let path = claim
         .resolve()
         .context("Observed native transcript is missing")?;
-    let file = std::fs::File::open(&path)?;
+    let mut file = std::fs::File::open(&path)?;
     let metadata = file.metadata()?;
     let carrier = Carrier::of(entry, &path, &metadata);
     let size = metadata.len();
@@ -404,28 +460,31 @@ fn capture_boundary(
         size <= crate::adapter::native_snapshot::MAX_CAPTURE_BYTES as u64,
         "Observed native transcript exceeds its capture budget"
     );
-    let mut bytes = vec![];
-    file.take(size).read_to_end(&mut bytes)?;
-    let pending = || {
-        Ok(Some(Recorded {
-            digest: None,
-            carrier: carrier.clone(),
-        }))
+    let read = observe(
+        previous,
+        &carrier,
+        &mut file,
+        (&entry.runtime, &entry.thread_id, &path),
+        size,
+        now,
+    )?;
+    let progress = read.progress;
+    let Some(boundary) = read.boundary else {
+        return Ok(Some(Recorded {
+            digest: previous
+                .filter(|_| progress.is_some())
+                .and_then(|previous| previous.digest.clone()),
+            carrier,
+            progress,
+        }));
     };
-    let Some(end) = bytes.iter().rposition(|byte| *byte == b'\n') else {
-        return pending();
-    };
-    let text = std::str::from_utf8(&bytes[..=end])?;
-    let boundary =
-        crate::rc::archive_jobs::completed_end(&entry.runtime, &entry.thread_id, &path, text)?;
-    let Some(boundary) = boundary else {
-        return pending();
-    };
-    let digest = format!("{:x}", Sha256::digest(&bytes[..boundary as usize]));
+    let digest = read.digest.context("a completed boundary has its digest")?;
+    let recorded = previous.and_then(|previous| previous.digest.as_deref());
     if recorded == Some(digest.as_str()) {
         return Ok(Some(Recorded {
             digest: Some(digest),
             carrier,
+            progress,
         }));
     }
     let job = crate::rc::archive_jobs::Job::capture(
@@ -444,7 +503,162 @@ fn capture_boundary(
     Ok(Some(Recorded {
         digest: Some(digest),
         carrier,
+        progress,
     }))
+}
+
+/// Reads the transcript `carrier` describes, `size` bytes long, from where [`carried_progress`]
+/// says this read may start, as [`read_from`] does.
+fn observe(
+    previous: Option<&Recorded>,
+    carrier: &Carrier,
+    file: &mut std::fs::File,
+    (runtime, thread, path): (&str, &str, &std::path::Path),
+    size: u64,
+    now: tokio::time::Instant,
+) -> crate::Result<Reading> {
+    let carried = carried_progress(previous, carrier, file, now);
+    read_from(runtime, thread, path, file, size, carried, now)
+}
+
+/// Where this read of `carrier` may start: past the completed turn `previous` ended at, while
+/// `carrier` is the file that was read then, longer, or as long and not written since, the byte
+/// before that end still ends a record, and the transcript was read whole less than
+/// [`WHOLE_READ_EVERY`] ago. `None` reads it whole. A transcript only ever grows by appending, so
+/// one written without growing was rewritten in place.
+fn carried_progress(
+    previous: Option<&Recorded>,
+    carrier: &Carrier,
+    file: &mut std::fs::File,
+    now: tokio::time::Instant,
+) -> Option<Progress> {
+    let previous = previous?;
+    let progress = previous.progress.clone()?;
+    (previous.carrier.same_file(carrier)
+        && (carrier.len > previous.carrier.len || carrier.modified == previous.carrier.modified)
+        && now < progress.whole_at + WHOLE_READ_EVERY
+        && ends_record(file, progress.end))
+    .then_some(progress)
+}
+
+/// Whether the byte before `end` in `file` ends a record, as a completed boundary does.
+fn ends_record(file: &mut std::fs::File, end: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut last = [0u8];
+    end > 0
+        && file.seek(SeekFrom::Start(end - 1)).is_ok()
+        && file.read_exact(&mut last).is_ok()
+        && last == *b"\n"
+}
+
+/// What one read of a transcript found: the last completed boundary past where it started and
+/// that boundary's digest, if there is one, and where the next read may start.
+struct Reading {
+    /// How many bytes of the transcript were read.
+    #[cfg(test)]
+    bytes_read: u64,
+    boundary: Option<u64>,
+    digest: Option<String>,
+    progress: Option<Progress>,
+}
+
+/// Reads `file`, `size` bytes long, from the end of its last completed turn when `carried` says
+/// where that is, or whole, and finds the last completed boundary in what it read. A boundary is
+/// only ever found past the start: what came before ended a completed turn, so the turn running
+/// and what was appended alone can close another. Its digest covers the whole transcript up to
+/// it, the carried state extended over what was read.
+fn read_from(
+    runtime: &str,
+    thread: &str,
+    path: &std::path::Path,
+    file: &mut std::fs::File,
+    size: u64,
+    carried: Option<Progress>,
+    now: tokio::time::Instant,
+) -> crate::Result<Reading> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read as _, Seek, SeekFrom};
+    let (start, hasher, whole_at) = match carried {
+        Some(progress) => (progress.end, progress.hasher, progress.whole_at),
+        None => (0, Sha256::new(), now),
+    };
+    let read_past = start > 0;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![];
+    file.take(size - start).read_to_end(&mut bytes)?;
+    let unchanged = |hasher: Sha256| Progress {
+        end: start,
+        hasher,
+        whole_at,
+        read_past,
+    };
+    let Some(last) = bytes.iter().rposition(|byte| *byte == b'\n') else {
+        return Ok(Reading {
+            #[cfg(test)]
+            bytes_read: bytes.len() as u64,
+            boundary: None,
+            digest: None,
+            progress: (start > 0).then(|| unchanged(hasher)),
+        });
+    };
+    let text = std::str::from_utf8(&bytes[..=last])?;
+    let found = if start == 0 {
+        crate::rc::archive_jobs::completed_end(runtime, thread, path, text)?
+    } else {
+        completed_after(runtime, thread, path, start, &hasher, text)?.map(|end| start + end)
+    };
+    let Some(boundary) = found.filter(|boundary| *boundary > start) else {
+        return Ok(Reading {
+            #[cfg(test)]
+            bytes_read: bytes.len() as u64,
+            boundary: None,
+            digest: None,
+            progress: (start > 0).then(|| unchanged(hasher)),
+        });
+    };
+    let mut hasher = hasher;
+    hasher.update(&bytes[..(boundary - start) as usize]);
+    let digest = format!("{:x}", hasher.clone().finalize());
+    Ok(Reading {
+        #[cfg(test)]
+        bytes_read: bytes.len() as u64,
+        boundary: Some(boundary),
+        digest: Some(digest),
+        progress: Some(Progress {
+            end: boundary,
+            hasher,
+            whole_at,
+            read_past,
+        }),
+    })
+}
+
+/// [`crate::rc::archive_jobs::completed_end`] for `text`, the records that follow `start`, the
+/// end of a completed turn, given the SHA-256 state over the bytes before it: relative to `start`.
+fn completed_after(
+    runtime: &str,
+    thread: &str,
+    path: &std::path::Path,
+    start: u64,
+    hasher: &sha2::Sha256,
+    text: &str,
+) -> crate::Result<Option<u64>> {
+    let boundary = crate::commands::commit::completed_native_boundary(runtime, text)?;
+    #[cfg(unix)]
+    if runtime == "claude-code" {
+        let start = usize::try_from(start).context("a transcript offset is out of range")?;
+        let completed = crate::rc::native_claude::completion::boundaries_after(
+            thread,
+            path,
+            start,
+            hasher,
+            text.as_bytes(),
+        )?;
+        return Ok(boundary.max(completed.last().map(|end| (end - start) as u64)));
+    }
+    #[cfg(not(unix))]
+    let _ = (thread, path, start, hasher);
+    Ok(boundary)
 }
 
 /// Whether the conversation `native` of `runtime`, running in `root` inside the project folder
@@ -635,9 +849,211 @@ impl Daemon {
 mod tests {
     use super::*;
 
+    /// One turn of a transcript in `runtime`'s records: a request, a tool step, and the reply that
+    /// ends it.
+    fn turn(runtime: &str, n: usize) -> Vec<String> {
+        let lines = match runtime {
+            "codex" => vec![
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user",
+                    "content":[{"type":"input_text","text":format!("request {n}")}]}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call",
+                    "name":"shell","call_id":format!("call-{n}"),"arguments":"{}"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call_output",
+                    "call_id":format!("call-{n}"),"output":"done"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":format!("answer {n}")}]}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}),
+            ],
+            _ => vec![
+                serde_json::json!({"type":"user","uuid":format!("u{n}"),
+                    "message":{"role":"user","content":format!("request {n}")}}),
+                serde_json::json!({"type":"assistant","uuid":format!("a{n}"),
+                    "message":{"role":"assistant","stop_reason":"tool_use",
+                        "content":[{"type":"tool_use","id":format!("t{n}"),"name":"Bash","input":{}}]}}),
+                serde_json::json!({"type":"user","uuid":format!("r{n}"),
+                    "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":format!("t{n}"),"content":"done"}]}}),
+                serde_json::json!({"type":"assistant","uuid":format!("e{n}"),
+                    "message":{"role":"assistant","stop_reason":"end_turn",
+                        "content":[{"type":"text","text":format!("answer {n}")}]}}),
+            ],
+        };
+        lines.into_iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    /// The carrier a read of the transcript at `path` records, without a runtime's receipts.
+    fn carrier_of(path: &std::path::Path) -> Carrier {
+        let metadata = std::fs::metadata(path).unwrap();
+        Carrier {
+            path: normalized(path),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            file: {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino())
+            },
+            receipts: vec![],
+        }
+    }
+
+    /// The boundary and the digest over everything before it that a read leaves for the next.
+    fn state(reading: &Reading) -> Option<(u64, String)> {
+        use sha2::Digest as _;
+        reading.progress.as_ref().map(|progress| {
+            (
+                progress.end,
+                format!("{:x}", progress.hasher.clone().finalize()),
+            )
+        })
+    }
+
+    /// Read from the end of the last completed turn, a transcript that grows a line or a part of
+    /// one at a time, through several turns, leaves at every step the boundary and digest a whole
+    /// read of it leaves, and asks the file for no more than what follows that turn. A read that
+    /// started elsewhere or carried the wrong state leaves another boundary or digest; one that
+    /// read the whole file again asks for more. What it leaves says whether it read only past a
+    /// turn, which decides when the collector reads an unchanged transcript whole again.
+    #[test]
+    fn observed_capture_reads_only_what_follows_the_last_completed_turn() {
+        for runtime in ["codex", "claude-code"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("transcript.jsonl");
+            std::fs::write(&path, "").unwrap();
+            let thread = "71717171-7171-4171-8171-717171717171";
+            let now = tokio::time::Instant::now();
+            let mut written = String::new();
+            let mut previous: Option<Recorded> = None;
+            let mut shorter = 0;
+            for n in 0..6 {
+                for line in turn(runtime, n) {
+                    // Each record arrives in two writes, so some reads end inside a record.
+                    let (head, tail) = line.split_at(line.len() / 2);
+                    for part in [head, tail] {
+                        written.push_str(part);
+                        std::fs::write(&path, &written).unwrap();
+                        let size = written.len() as u64;
+                        let start = previous
+                            .as_ref()
+                            .and_then(|previous| previous.progress.as_ref())
+                            .map_or(0, |progress| progress.end);
+                        let carrier = carrier_of(&path);
+                        let mut file = std::fs::File::open(&path).unwrap();
+                        let read = observe(
+                            previous.as_ref(),
+                            &carrier,
+                            &mut file,
+                            (runtime, thread, &path),
+                            size,
+                            now,
+                        )
+                        .unwrap();
+                        let mut file = std::fs::File::open(&path).unwrap();
+                        let whole =
+                            read_from(runtime, thread, &path, &mut file, size, None, now).unwrap();
+                        assert_eq!(state(&read), state(&whole), "{runtime} at {size}");
+                        assert_eq!(read.bytes_read, size - start, "{runtime} at {size}");
+                        shorter += usize::from(read.bytes_read < whole.bytes_read);
+                        if let Some(progress) = &read.progress {
+                            assert_eq!(progress.read_past, start > 0, "{runtime} at {size}");
+                        }
+                        previous = Some(Recorded {
+                            digest: None,
+                            carrier,
+                            progress: read.progress,
+                        });
+                    }
+                }
+            }
+            assert!(
+                shorter > 0,
+                "{runtime}: no read started past a completed turn"
+            );
+            assert_eq!(
+                previous
+                    .and_then(|previous| previous.progress)
+                    .map(|progress| progress.end),
+                Some(written.len() as u64),
+                "{runtime}: the last turn completed"
+            );
+        }
+    }
+
+    /// The next read starts past the last completed turn only while the transcript is the file
+    /// that was read, grown or not written since, still ending a record there, and read whole
+    /// within [`WHOLE_READ_EVERY`]; otherwise it reads the whole file. A check that let a
+    /// replaced, truncated or rewritten file, or a stale state, through would read past a boundary
+    /// that isn't there, or hash bytes that changed.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_read_starts_past_the_last_turn_only_in_the_file_that_was_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transcript.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n").unwrap();
+        let carrier = carrier_of;
+        let previous = Recorded {
+            digest: Some("digest".into()),
+            carrier: carrier(&path),
+            progress: Some(Progress {
+                end: 8,
+                hasher: sha2::Sha256::default(),
+                whole_at: tokio::time::Instant::now(),
+                read_past: false,
+            }),
+        };
+        let carried = |previous: &Recorded| {
+            let mut file = std::fs::File::open(&path).unwrap();
+            carried_progress(
+                Some(previous),
+                &carrier(&path),
+                &mut file,
+                tokio::time::Instant::now(),
+            )
+            .map(|progress| progress.end)
+        };
+
+        // Rewritten in place, its length kept.
+        std::fs::write(&path, "{\"a\":9}\n{\"b\":2}\n").unwrap();
+        let written = previous.carrier.modified.unwrap() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+        assert_eq!(carried(&previous), None);
+        // The same file, grown.
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+        assert_eq!(carried(&previous), Some(8));
+        // No longer a record end at the boundary.
+        std::fs::write(&path, "{\"a\":10}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+        assert_eq!(carried(&previous), None);
+        // Shorter than when it was read.
+        std::fs::write(&path, "{\"a\":1}\n").unwrap();
+        assert_eq!(carried(&previous), None);
+        // Another file in its place.
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+        #[cfg(unix)]
+        {
+            let replacement = directory.path().join("replacement.jsonl");
+            std::fs::write(&replacement, "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+            assert_eq!(carried(&previous), None);
+        }
+        // The same file again, but read whole too long ago.
+        let previous = Recorded {
+            carrier: carrier(&path),
+            ..previous
+        };
+        assert_eq!(carried(&previous), Some(8));
+        tokio::time::advance(WHOLE_READ_EVERY).await;
+        assert_eq!(carried(&previous), None);
+    }
+
     /// The collector skips a conversation only while the carrier it read is still the thread's
-    /// current carrier and unchanged. Comparing only the old file would miss a Codex segment
-    /// rollover, and treating a missing file as changed would restore every cold rollout.
+    /// current carrier and unchanged, and not while a read only past its last turn has gone
+    /// [`WHOLE_READ_EVERY`] without a whole read. Comparing only the old file would miss a Codex
+    /// segment rollover, treating a missing file as changed would restore every cold rollout, and
+    /// skipping on the carrier alone leaves a transcript that went quiet after such a read
+    /// unchecked until it changes.
     #[test]
     fn unchanged_carrier_skips_reads_until_it_grows_rolls_over_or_is_restored() {
         let _environment = crate::infra::config::env_lock();
@@ -674,6 +1090,22 @@ mod tests {
 
         let carrier = read(&root);
         assert!(carrier.current_and_unchanged(&entry));
+        // Read only past its last turn, an unchanged transcript is still read whole once
+        // `WHOLE_READ_EVERY` has passed; read whole since, it is passed over again.
+        let at = tokio::time::Instant::now();
+        let recorded = |read_past| Recorded {
+            digest: None,
+            carrier: carrier.clone(),
+            progress: Some(Progress {
+                end: 3,
+                hasher: sha2::Sha256::default(),
+                whole_at: at,
+                read_past,
+            }),
+        };
+        assert!(recorded(true).unchanged(&entry, at));
+        assert!(!recorded(true).unchanged(&entry, at + WHOLE_READ_EVERY));
+        assert!(recorded(false).unchanged(&entry, at + WHOLE_READ_EVERY));
         std::fs::write(&root, "{}\n{}\n").unwrap();
         assert!(
             !carrier.current_and_unchanged(&entry),
