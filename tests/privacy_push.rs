@@ -42,8 +42,6 @@ struct Hub {
     manifests: Arc<Mutex<Vec<serde_json::Value>>>,
     registrations: Arc<AtomicUsize>,
     deny: Arc<AtomicBool>,
-    /// Refuses a receive that updates only tags, as a Hub that closed them would.
-    refuse_tags: Arc<AtomicBool>,
     unsupported_policy: Arc<AtomicBool>,
     /// Sessions a client from before encrypted publication was retired registers encrypted. Once
     /// one leaves the set, it continues as plain at its next revision when a writer registers it
@@ -124,8 +122,6 @@ impl Hub {
         let registered = Arc::clone(&registrations);
         let deny = Arc::new(AtomicBool::new(false));
         let denied = Arc::clone(&deny);
-        let refuse_tags = Arc::new(AtomicBool::new(false));
-        let refusing_tags = Arc::clone(&refuse_tags);
         let unsupported_policy = Arc::new(AtomicBool::new(false));
         let unsupported = Arc::clone(&unsupported_policy);
         let legacy_encrypted = Arc::new(Mutex::new(std::collections::BTreeSet::<String>::new()));
@@ -306,18 +302,6 @@ impl Hub {
                 }
                 let contains =
                     |needle: &[u8]| body.windows(needle.len()).any(|value| value == needle);
-                if target.ends_with("/git-receive-pack")
-                    && refusing_tags.load(Ordering::Acquire)
-                    && contains(b"refs/tags/")
-                    && !contains(b"refs/heads/")
-                {
-                    write!(
-                        stream,
-                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
-                    .unwrap();
-                    continue;
-                }
                 if method == "PUT" && target == "/api/agents/alice/app/privacy/strategy" {
                     let mut left = strategies_left.lock().unwrap();
                     if *left == Some(0) {
@@ -742,7 +726,6 @@ impl Hub {
             manifests,
             registrations,
             deny,
-            refuse_tags,
             unsupported_policy,
             legacy_encrypted,
             corrupt_receipt,
@@ -2781,10 +2764,14 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
 }
 
 /// The first upload counts as soon as the Hub acknowledged a branch it updated, before anything
-/// after that can fail. Here a push carries more tags than fit in one receive with its branch, so
-/// they follow the branch in receives of their own, and the Hub refuses them: the push fails, and
-/// its retry finds the branch up to date. Counting only at the end of a push that fully succeeded
-/// would miss this installation's first upload for good.
+/// after that can fail. Here the Hub refuses a tag the push carries as withdrawn, so the branch
+/// goes up alone and the tags, following in receives of their own, are refused again: the push
+/// fails, and its retry finds the branch up to date. Counting only at the end of a push that fully
+/// succeeded would miss this installation's first upload for good.
+///
+/// The tags are more than one command line takes, and the retry still sends every one of them in
+/// one receive: a receipted receive reads its refs from configuration. One that keeps them on the
+/// command line splits them into several receives, or refuses to send them.
 #[test]
 fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     let temp = tempfile::tempdir().unwrap();
@@ -2886,7 +2873,7 @@ fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
         });
         fs::write(telemetry.join("preferences.json"), preferences.to_string()).unwrap();
     }
-    hub.refuse_tags.store(true, Ordering::Release);
+    *hub.withdrawn.lock().unwrap() = Some("refs/tags/release-2".into());
     fs::write(repo.root().join("README.md"), "Shared file, revised").unwrap();
     repo.add_all().unwrap();
     repo.commit("Revise file").unwrap();
@@ -2918,9 +2905,18 @@ fn a_first_upload_counts_once_the_hub_acknowledged_a_branch() {
     assert!(git(&remote, &["for-each-ref", "refs/tags/release-2"]).is_empty());
     assert_eq!(uploads(), 1, "{refused:?}");
 
-    hub.refuse_tags.store(false, Ordering::Release);
+    *hub.withdrawn.lock().unwrap() = None;
+    let receives = hub.posts.load(Ordering::Acquire);
     assert_success(&run(&["--yes", "push", "alice/app@main"]));
     assert!(!git(&remote, &["for-each-ref", "refs/tags/release-2"]).is_empty());
+    assert_eq!(
+        git(&remote, &["for-each-ref", "refs/tags/"])
+            .lines()
+            .filter(|line| line.contains("refs/tags/release-2-"))
+            .count(),
+        256
+    );
+    assert_eq!(hub.posts.load(Ordering::Acquire) - receives, 1);
     assert_eq!(uploads(), 1);
 }
 

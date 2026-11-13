@@ -1449,3 +1449,73 @@ fn local_capture_inspects_without_a_hub_account_or_remote_identity() {
     );
     println!("{COMPLETE}");
 }
+
+/// A receipted receive takes its refs from the receive remote, however many; one without a
+/// receipt keeps them on the command line and refuses more than one line takes, since the Hub
+/// checks such a receive ref by ref. The remote is written from scratch over whatever an
+/// interrupted publication left, holds only the address and the refspecs, reads back as written,
+/// and is gone once the receive is done. A remote appended to an old one, or one that kept a
+/// fetch refspec or another address, fails here; so does one that goes ahead without reading back
+/// what it wrote after the removal failed, and a push that put a thousand tags on the command line
+/// without a receipt.
+#[test]
+fn a_receipted_receive_takes_its_refs_from_the_receive_remote() {
+    let url = "https://hub.example/alice/app.git";
+    let specs: Vec<String> = (0..1000)
+        .map(|n| format!("{:040x}:refs/tags/agit-{:040x}", n, n))
+        .collect();
+    let args = push_arguments(url, &specs, true).unwrap();
+    assert!(args.contains(&"--atomic"));
+    assert_eq!(args.last(), Some(&RECEIVE_REMOTE));
+    assert!(!args.iter().any(|arg| arg.contains("refs/tags/")));
+    assert!(push_arguments(url, &specs, false).is_err());
+    let few = &specs[..3];
+    let args = push_arguments(url, few, false).unwrap();
+    assert!(args.ends_with(&[url, &few[0], &few[1], &few[2]]));
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    std::fs::write(
+        &config,
+        format!(
+            "[core]\n\tbare = true\n[remote \"{RECEIVE_REMOTE}\"]\n\turl = https://elsewhere.example/x.git\n\tfetch = +refs/*:refs/*\n\tpush = refs/heads/main:refs/heads/main\n"
+        ),
+    )
+    .unwrap();
+    let read = |key: &str| -> Vec<String> {
+        let output = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&config)
+            .args(["--get-all", &format!("remote.{RECEIVE_REMOTE}.{key}")])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    {
+        let _remote = ReceiveRemote::write(directory.path(), url, &specs).unwrap();
+        assert_eq!(read("url"), [url]);
+        assert_eq!(read("push"), specs);
+        assert!(read("fetch").is_empty());
+    }
+    assert!(read("url").is_empty() && read("push").is_empty());
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("bare = true")
+    );
+    assert!(ReceiveRemote::write(directory.path(), url, &["a\nb".to_owned()]).is_err());
+
+    // A removal that fails, here behind a lock another writer holds, leaves the old remote in
+    // place, so what reads back differs from what was written.
+    std::fs::write(
+        &config,
+        format!("[remote \"{RECEIVE_REMOTE}\"]\n\turl = https://elsewhere.example/x.git\n"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("config.lock"), "").unwrap();
+    assert!(ReceiveRemote::write(directory.path(), url, &specs).is_err());
+}

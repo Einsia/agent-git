@@ -19,6 +19,10 @@ use std::process::{Command, Output};
 const CONFIG_LIMIT: usize = 64 * 1024;
 const REQUEST_UNITS: usize = 24 * 1024;
 const LFS_REMOTE: &str = "agit-publication";
+/// The remote a receipted receive pushes through: its refspecs come from this remote's
+/// configuration in the publication's own directory rather than the command line, so one receive
+/// takes any number of refs.
+const RECEIVE_REMOTE: &str = "agit-receive";
 /// Bounds one history listing used to plan staged requests.
 const STAGE_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -504,10 +508,11 @@ impl FrozenPublication {
             }
         };
         batches.extend(self.batches(&self.heads, policy));
-        // A session publication sends its tips and every tag in one receive when they fit one: its
-        // receipt makes the receive atomic, so a tag still never lands without its branch, and the
-        // publication costs one receipt and one receive fewer. Tags that do not fit follow their
-        // branch's acknowledged receive.
+        // A receipted publication sends its tips and every tag in one receive: the receive reads
+        // its refs from configuration, so any number of them fit, and its receipt makes it atomic,
+        // so a tag never lands without its branch. A tag's commit is one this publication sends or
+        // the destination holds, so the tags add no new commits and no pack bytes, the bounds the
+        // Hub publishes and the stages keep to.
         let mut tags = self.tags.clone();
         let mut alone = None;
         if let Some(last) = batches
@@ -565,15 +570,13 @@ impl FrozenPublication {
         (heads, tags)
     }
 
-    /// `heads` and every one of `tags` as one batch, when they fit one command line together.
+    /// `heads` and every one of `tags` as one batch, for a receipted receive, which reads its refs
+    /// from configuration and so takes any number of them.
     fn together(&self, heads: &[FrozenRef], tags: &[Vec<FrozenRef>]) -> Option<Vec<FrozenRef>> {
         if tags.is_empty() {
             return None;
         }
-        let refs: Vec<FrozenRef> = heads.iter().chain(tags.iter().flatten()).cloned().collect();
-        let oid_length = refs.first()?.oid().len();
-        let mut batches = batches(&refs, &self.url, oid_length).ok()?;
-        (batches.len() == 1).then(|| batches.remove(0))
+        Some(heads.iter().chain(tags.iter().flatten()).cloned().collect())
     }
 
     fn batches<'a>(
@@ -1202,18 +1205,30 @@ impl FrozenPublication {
                 current.len()
             ));
             let specs: Vec<_> = batch.iter().map(FrozenRef::refspec).collect();
-            let mut args = vec![
-                "push",
-                "--porcelain",
-                "--no-follow-tags",
-                "--recurse-submodules=no",
-                "--",
-                &self.url,
-            ];
-            args.extend(specs.iter().map(String::as_str));
-            if receipt.is_some() {
-                args.insert(1, "--atomic");
-            }
+            // A receipted receive pushes through a remote whose refspecs the directory's own
+            // configuration holds; any other keeps them on the command line, so it never carries
+            // more refs than one command line takes, and never a batch of tags the Hub would check
+            // one by one without a receipt.
+            let remote = match receipt
+                .is_some()
+                .then(|| ReceiveRemote::write(self.directory.path(), &self.url, &specs))
+                .transpose()
+            {
+                Ok(remote) => remote,
+                Err(error) => {
+                    phase.error = Some(format!("{error:#}"));
+                    phase.unattempted = owed(index);
+                    break;
+                }
+            };
+            let args = match push_arguments(&self.url, &specs, remote.is_some()) {
+                Ok(args) => args,
+                Err(error) => {
+                    phase.error = Some(format!("{error:#}"));
+                    phase.unattempted = owed(index);
+                    break;
+                }
+            };
             let run = super::execute_transport_receipt(
                 None,
                 &args,
@@ -1222,6 +1237,7 @@ impl FrozenPublication {
                 None,
                 receipt.as_ref(),
             );
+            drop(remote);
             let attempted = !run.attempts.is_empty();
             phase.attempts.extend(
                 run.attempts
@@ -1373,6 +1389,135 @@ fn batches(refs: &[FrozenRef], url: &str, oid_length: usize) -> Result<Vec<Vec<F
         batches.push(batch);
     }
     Ok(batches)
+}
+
+/// The `git push` arguments for one receive of `specs` to `url`: through [`RECEIVE_REMOTE`] when
+/// the receive is receipted and the remote holds its refspecs, otherwise on the command line,
+/// which refuses more refs than one command line takes. A receive without a receipt is checked by
+/// the Hub ref by ref, so it never carries a large batch of tags.
+fn push_arguments<'a>(
+    url: &'a str,
+    specs: &'a [String],
+    through_remote: bool,
+) -> Result<Vec<&'a str>> {
+    let mut args = vec![
+        "push",
+        "--porcelain",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+    ];
+    if through_remote {
+        args.insert(1, "--atomic");
+        args.push(RECEIVE_REMOTE);
+        return Ok(args);
+    }
+    ensure!(
+        fits_one_command_line(specs, url),
+        "a publication without a receipt sends no more refs than one command line takes"
+    );
+    args.extend(["--", url]);
+    args.extend(specs.iter().map(String::as_str));
+    Ok(args)
+}
+
+/// Whether `specs`, pushed to `url`, fit one command line, as [`batches`] cuts them.
+fn fits_one_command_line(specs: &[String], url: &str) -> bool {
+    let units = specs
+        .iter()
+        .map(|spec| argument_units(spec))
+        .try_fold(argument_units(url).saturating_add(256), usize::checked_add);
+    units.is_some_and(|units| units <= REQUEST_UNITS)
+}
+
+/// The remote [`RECEIVE_REMOTE`] in the publication's own temporary directory while one receipted
+/// receive pushes through it; removed when dropped. It holds the receive's address and refspecs
+/// and nothing else: no credential, no fetch refspec, no other key. Written from scratch each time
+/// and read back before the push, so a remote an earlier receive could not remove never decides
+/// where a push goes or what it sends.
+struct ReceiveRemote {
+    config: PathBuf,
+    /// Whether this receive wrote the remote, which it then removes.
+    written: bool,
+}
+
+impl ReceiveRemote {
+    fn write(directory: &Path, url: &str, specs: &[String]) -> Result<Self> {
+        let config = directory.join("config");
+        let mut remote = Self {
+            config,
+            written: false,
+        };
+        remote.remove();
+        let quoted = |value: &str| -> Result<String> {
+            ensure!(
+                !value.chars().any(char::is_control),
+                "a publication address or ref holds a control character"
+            );
+            Ok(format!(
+                "\"{}\"",
+                value.replace('\\', "\\\\").replace('"', "\\\"")
+            ))
+        };
+        let mut section = format!("[remote \"{RECEIVE_REMOTE}\"]\n\turl = {}\n", quoted(url)?);
+        for spec in specs {
+            section.push_str(&format!("\tpush = {}\n", quoted(spec)?));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&remote.config)?;
+        remote.written = true;
+        std::io::Write::write_all(&mut file, section.as_bytes())?;
+        drop(file);
+        let read = |key: &str| -> Result<Vec<String>> {
+            let output = remote
+                .git(&["--get-all", &format!("remote.{RECEIVE_REMOTE}.{key}")])
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "the receive remote was not written"
+            );
+            Ok(String::from_utf8(output.stdout)?
+                .lines()
+                .map(str::to_owned)
+                .collect())
+        };
+        ensure!(
+            read("url")? == [url] && read("push")? == specs,
+            "the receive remote reads back other than it was written, so nothing was sent"
+        );
+        Ok(remote)
+    }
+
+    fn git(&self, args: &[&str]) -> Command {
+        let mut command = crate::infra::git_runtime::command();
+        command
+            .args(["config", "--file"])
+            .arg(&self.config)
+            .args(args)
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn remove(&self) {
+        let _ = self
+            .git(&["--remove-section", &format!("remote.{RECEIVE_REMOTE}")])
+            .output();
+    }
+}
+
+impl Drop for ReceiveRemote {
+    fn drop(&mut self) {
+        if !self.written {
+            return;
+        }
+        let removed = self
+            .git(&["--remove-section", &format!("remote.{RECEIVE_REMOTE}")])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !removed {
+            eprintln!("agit: the publication's receive remote could not be removed");
+        }
+    }
 }
 
 fn argument_units(value: &str) -> usize {
