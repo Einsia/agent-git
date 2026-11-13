@@ -84,6 +84,7 @@ impl Projector {
     /// already published.
     pub(super) fn project(
         &mut self,
+        objects: &Objects,
         source: &Repo,
         oid: &str,
         parents: &[String],
@@ -404,7 +405,7 @@ impl Projector {
             )),
         ));
         let tree = crate::commands::plumbing::tree_apply_content(source, oid, edits)?;
-        let original = read(source, &["cat-file", "commit", oid], MAX_COMMIT)?;
+        let original = objects.commit(source, oid)?;
         Ok(Conversation {
             commit: Some(write_object(
                 source,

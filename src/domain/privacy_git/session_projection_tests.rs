@@ -124,7 +124,14 @@ fn assert_equivalent(history: &History, commits: &[(String, Vec<String>)]) -> Op
     let mut last = None;
     for (oid, parents) in commits {
         let projected = projector
-            .project(&source, oid, parents, &Published::default(), &mut rechecked)
+            .project(
+                &Objects::default(),
+                &source,
+                oid,
+                parents,
+                &Published::default(),
+                &mut rechecked,
+            )
             .unwrap();
         let whole = conversation_commit(
             &source,
@@ -330,11 +337,19 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
     );
     let mut continuing = Projector::default();
     continuing
-        .project(&source, &base, &[], &Published::default(), &mut rechecked)
+        .project(
+            &Objects::default(),
+            &source,
+            &base,
+            &[],
+            &Published::default(),
+            &mut rechecked,
+        )
         .unwrap();
     assert!(
         continuing
             .project(
+                &Objects::default(),
                 &source,
                 &broken,
                 &parents,
@@ -346,6 +361,7 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
     assert!(
         Projector::default()
             .project(
+                &Objects::default(),
                 &source,
                 &broken,
                 &parents,
@@ -381,9 +397,17 @@ fn a_missing_event_refuses_the_projection_as_it_refuses_the_whole_transcript() {
         );
         let mut continuing = Projector::default();
         continuing
-            .project(&source, &base, &[], &Published::default(), &mut rechecked)
+            .project(
+                &Objects::default(),
+                &source,
+                &base,
+                &[],
+                &Published::default(),
+                &mut rechecked,
+            )
             .unwrap();
         let continued = continuing.project(
+            &Objects::default(),
             &source,
             &child,
             &parents,
@@ -466,12 +490,14 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
     let public = history.commit(&[], &public_log, &public_log, &[], &[]);
     let source = history.source();
     let published_id = storage::event_id(&published_first).unwrap();
+    let objects = Objects::default();
     let published = Published {
         ids: [published_id.clone()].into_iter().collect(),
         prefix: Some(Prefix {
             source_lines: 1,
             public: vec![published_id],
             holder: &source,
+            objects: &objects,
             commit: public,
         }),
     };
@@ -481,6 +507,7 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
     for (oid, parents) in [(&base, vec![]), (&held, vec![base.clone()])] {
         projector
             .project(
+                &Objects::default(),
                 &source,
                 oid,
                 &parents,
@@ -491,7 +518,14 @@ fn a_projector_continues_only_from_the_commit_it_projected_last() {
     }
     let parents = vec![base.clone()];
     let projected = projector
-        .project(&source, &sibling, &parents, &published, &mut rechecked)
+        .project(
+            &Objects::default(),
+            &source,
+            &sibling,
+            &parents,
+            &published,
+            &mut rechecked,
+        )
         .unwrap();
     let whole = conversation_commit(
         &source,
