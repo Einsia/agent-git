@@ -65,6 +65,7 @@ mod publication_report;
 pub use publication_report::{
     LfsAttemptKind, LfsPublicationAttempt, LfsPublicationPhase, PublicationAttempt,
     PublicationPhase, PublicationReport, PublicationStatus, PublishedRef, SecretFindingsAcceptance,
+    Unanswered,
 };
 mod publication_output;
 
@@ -86,6 +87,37 @@ const AUTH_MARKERS: &[&str] = &[
 
 pub(crate) fn looks_like_auth_failure(stderr: &str) -> bool {
     AUTH_MARKERS.iter().any(|m| stderr.contains(m))
+}
+
+/// What Git, curl or the system print when a connection to the Hub failed on its way: nothing was
+/// answered, so the same request can go through once the network or the Hub is back. Matched in
+/// lowercase, and only where no HTTP status was printed: a status says the Hub answered.
+const TRANSPORT_MARKERS: &[&str] = &[
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "failed to connect",
+    "couldn't connect",
+    "could not resolve host",
+    "could not resolve proxy",
+    "empty reply from server",
+    "remote end hung up",
+    "unexpected disconnect",
+    "connection was closed",
+    "recv failure",
+    "send failure",
+    "early eof",
+    "http/2 stream",
+    "http2 stream",
+];
+
+/// Whether Git's diagnostics say the connection to the Hub failed with no answer from it.
+pub(crate) fn looks_like_transport_failure(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    TRANSPORT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 /// Authentication classification reads Git's diagnostics, so transport subprocesses use a

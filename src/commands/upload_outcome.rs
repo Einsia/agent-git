@@ -34,15 +34,19 @@ use std::sync::{Mutex, PoisonError};
 #[serde(tag = "state", rename_all = "snake_case")]
 enum Outcome {
     /// `attempt` tells this start from another upload of the same tip, which can overlap it.
+    /// `retry` counts the tries before this one that the folder's worker made by itself.
     Started {
         tip: String,
         attempt: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        retry: u32,
     },
     Uploaded {
         tip: String,
     },
     /// `attempt` is the start this failure finished, so the turn-end line tells it once. `said` is
-    /// the first line the push reported, for `agit status` alone.
+    /// the first line the push reported, for `agit status` alone. `retry_after` is when the
+    /// folder's worker tries again by itself, in Unix seconds; `None` when nothing will.
     Failed {
         tip: String,
         reason: UploadFailure,
@@ -50,6 +54,10 @@ enum Outcome {
         attempt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         said: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        retry: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after: Option<i64>,
     },
 }
 
@@ -59,6 +67,30 @@ impl Outcome {
             Self::Started { tip, .. } | Self::Uploaded { tip } | Self::Failed { tip, .. } => tip,
         }
     }
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// How long the folder's worker waits before each of its own tries of an upload that failed in a
+/// class it retries ([`UploadFailure::retried`]), in seconds. After the last, the upload stays
+/// failed and its line names the command that goes on.
+const RETRY_DELAYS: [i64; 4] = [60, 4 * 60, 15 * 60, 60 * 60];
+
+/// The time in Unix seconds. A debug build reads it from the file `AGIT_TEST_CLOCK_FILE` names
+/// when that is set, so a test moves a worker's clock past a retry without waiting for it; a
+/// release build ignores the variable.
+pub(crate) fn now() -> i64 {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("AGIT_TEST_CLOCK_FILE")
+        && let Some(seconds) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    {
+        return seconds;
+    }
+    chrono::Utc::now().timestamp()
 }
 
 fn digest(value: &str) -> String {
@@ -120,6 +152,9 @@ pub(crate) struct Place {
     skipped: PathBuf,
     /// `<owner/repo>@<branch>`, which a recorded privacy wait names.
     target: String,
+    /// For an upload the folder's worker retries by itself when it fails, how many tries came
+    /// before it; `None` for one nothing retries.
+    retry: Option<u32>,
 }
 
 impl Place {
@@ -130,7 +165,17 @@ impl Place {
                 .join(digest(branch))
                 .with_extension("json"),
             target: format!("{repository}@{branch}"),
+            retry: None,
         })
+    }
+
+    /// This place for an upload the folder's worker retries by itself when it fails, after
+    /// `retry` earlier tries.
+    pub(crate) fn retried(self, retry: u32) -> Self {
+        Self {
+            retry: Some(retry),
+            ..self
+        }
     }
 
     /// A place outside agit's home, for tests that must not write to it.
@@ -140,6 +185,7 @@ impl Place {
             paths: Paths::of(records.join("record.json")),
             skipped: skipped.join("skipped.json"),
             target: "test/repository@branch".to_owned(),
+            retry: None,
         }
     }
 
@@ -336,6 +382,7 @@ struct Upload {
     paths: Paths,
     tip: String,
     attempt: String,
+    retry: Option<u32>,
     running: std::fs::File,
 }
 
@@ -344,7 +391,7 @@ impl Place {
     /// not. A start that can't be recorded leaves the note instead; one that can removes it.
     fn start(self, tip: &str) -> crate::Result<Upload> {
         let lock = self.note_lock();
-        match self.paths.start(tip) {
+        match self.paths.start(tip, self.retry) {
             Ok(upload) => {
                 let remove = || std::fs::remove_file(&self.skipped);
                 let _ = under_write_lock(&lock, remove).unwrap_or_else(remove);
@@ -414,6 +461,18 @@ impl Place {
                 reason: UploadFailure::Other,
                 ..
             } if self.automatic_upload_off() => None,
+            Outcome::Failed {
+                reason,
+                attempt,
+                retry_after: Some(at),
+                ..
+            } => Some((Undone::Retrying(reason, at), attempt, told)),
+            Outcome::Failed {
+                reason,
+                attempt,
+                retry,
+                ..
+            } if retry > 0 && reason.retried() => Some((Undone::GaveUp(reason), attempt, told)),
             Outcome::Failed {
                 reason, attempt, ..
             } => Some((Undone::Failed(reason), attempt, told)),
@@ -491,7 +550,7 @@ impl Place {
 }
 
 impl Paths {
-    fn start(self, tip: &str) -> crate::Result<Upload> {
+    fn start(self, tip: &str, retry: Option<u32>) -> crate::Result<Upload> {
         let directory = self
             .record
             .parent()
@@ -510,6 +569,7 @@ impl Paths {
         let started = Outcome::Started {
             tip: tip.to_owned(),
             attempt: attempt.clone(),
+            retry: retry.unwrap_or(0),
         };
         under_write_lock(&self.writing, || write(&self.record, &started))
             .context("the upload record's lock can't be taken")?
@@ -518,6 +578,7 @@ impl Paths {
             paths: self,
             tip: tip.to_owned(),
             attempt,
+            retry,
             running,
         })
     }
@@ -532,11 +593,13 @@ impl Upload {
             paths,
             tip,
             attempt,
+            retry,
             running,
         } = self;
         let started = Outcome::Started {
             tip: tip.clone(),
             attempt: attempt.clone(),
+            retry: retry.unwrap_or(0),
         };
         under_write_lock(&paths.writing, || {
             if read(&paths.record).as_ref() == Some(&started) {
@@ -544,9 +607,14 @@ impl Upload {
                     Ok(()) => Outcome::Uploaded { tip },
                     Err((reason, said)) => Outcome::Failed {
                         tip,
+                        retry_after: retry
+                            .filter(|_| reason.retried())
+                            .and_then(|retry| RETRY_DELAYS.get(retry as usize))
+                            .map(|delay| now() + delay),
                         reason,
                         attempt,
                         said,
+                        retry: retry.unwrap_or(0),
                     },
                 };
                 let _ = write(&paths.record, &outcome);
@@ -562,6 +630,10 @@ impl Upload {
 pub(crate) enum Undone {
     /// It ran and failed.
     Failed(UploadFailure),
+    /// It failed, and the folder's worker tries it again by itself at this time, in Unix seconds.
+    Retrying(UploadFailure, i64),
+    /// It failed, and so did each of the tries the folder's worker made by itself.
+    GaveUp(UploadFailure),
     /// Its process ended before it recorded how it went.
     Ended,
     /// It didn't run, because its start couldn't be recorded.
@@ -571,7 +643,9 @@ pub(crate) enum Undone {
 impl Undone {
     pub(crate) fn describe(self) -> &'static str {
         match self {
-            Self::Failed(reason) => reason.describe(),
+            Self::Failed(reason) | Self::Retrying(reason, _) | Self::GaveUp(reason) => {
+                reason.describe()
+            }
             Self::Ended => "it stopped before it recorded how it went; the next turn tries again",
             Self::Unrecorded => {
                 "this computer couldn't record the upload's outcome, so it didn't run; the next turn tries again"
@@ -582,7 +656,8 @@ impl Undone {
     /// The name `agit status --json` gives the state.
     pub(crate) fn state(self) -> &'static str {
         match self {
-            Self::Failed(_) => "failed",
+            Self::Failed(_) | Self::GaveUp(_) => "failed",
+            Self::Retrying(..) => "retrying",
             Self::Ended => "ended",
             Self::Unrecorded => "unrecorded",
         }
@@ -590,7 +665,7 @@ impl Undone {
 
     pub(crate) fn reason(self) -> Option<UploadFailure> {
         match self {
-            Self::Failed(reason) => Some(reason),
+            Self::Failed(reason) | Self::Retrying(reason, _) | Self::GaveUp(reason) => Some(reason),
             Self::Ended | Self::Unrecorded => None,
         }
     }
@@ -602,11 +677,33 @@ impl Undone {
         reader: super::project::Reader,
         said: Option<&str>,
     ) -> String {
+        #[cfg(windows)]
+        use crate::ui::quote_powershell_argument as quote_arg;
+        #[cfg(not(windows))]
+        use crate::ui::session::shell_arg as quote_arg;
         match self {
             Self::Failed(reason) => reason.describe_for(target, reader, said),
+            Self::Retrying(reason, at) => format!(
+                "{}; agit tries again by itself (next try about {})",
+                reason.what_happened(),
+                clock_time(at)
+            ),
+            Self::GaveUp(reason) => format!(
+                "{} each time agit tried; the turn stays saved here, and `agit push {}` uploads it",
+                reason.what_happened(),
+                quote_arg(target)
+            ),
             Self::Ended | Self::Unrecorded => self.describe().to_owned(),
         }
     }
+}
+
+/// `at`, in Unix seconds, as this computer's wall clock shows it.
+fn clock_time(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0).map_or_else(
+        || "later".to_owned(),
+        |at| at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+    )
 }
 
 /// What the push said when the newest automatic upload of `repository@branch` failed: its first
@@ -651,6 +748,97 @@ pub(crate) fn undone_in(
         }
     }
     Ok(found)
+}
+
+/// Whether any upload of `repository` left a record here, without reading one.
+pub(crate) fn has_records(repository: &str) -> bool {
+    repository_dir(repository)
+        .ok()
+        .and_then(|directory| std::fs::read_dir(directory).ok())
+        .is_some_and(|mut entries| entries.next().is_some())
+}
+
+/// An upload the folder's worker tries again by itself, as its branch's record holds it.
+pub(crate) struct Due {
+    pub(crate) branch: String,
+    /// The tip the failed upload was for, which the retry publishes up to and no further.
+    pub(crate) tip: String,
+    /// How many tries came before the retry.
+    pub(crate) retry: u32,
+    /// When it is due, in Unix seconds.
+    pub(crate) at: i64,
+    /// The failed attempt it retries, so a retry another worker took is not run twice.
+    attempt: String,
+}
+
+/// The uploads of `repository`'s `branches` that the folder's worker tries again by itself, due
+/// now or later.
+pub(crate) fn retries(repository: &str, branches: &[String]) -> Vec<Due> {
+    branches
+        .iter()
+        .filter_map(|branch| {
+            let place = Place::of(repository, branch).ok()?;
+            match read(&place.paths.record)? {
+                Outcome::Failed {
+                    tip,
+                    attempt,
+                    retry,
+                    retry_after: Some(at),
+                    ..
+                } => Some(Due {
+                    branch: branch.clone(),
+                    tip,
+                    retry: retry + 1,
+                    at,
+                    attempt,
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+impl Due {
+    /// Takes the retry for this worker, or cancels it when `run` is false: either way the record
+    /// then names no next try. Only a record that still holds the failure this was read from is
+    /// changed, so of two workers that read it, one takes it. False when the record changed.
+    fn settle(&self, repository: &str, run: bool) -> bool {
+        let Ok(place) = Place::of(repository, &self.branch) else {
+            return false;
+        };
+        under_write_lock(&place.paths.writing, || match read(&place.paths.record) {
+            Some(Outcome::Failed {
+                tip,
+                reason,
+                attempt,
+                said,
+                retry,
+                retry_after: Some(_),
+            }) if attempt == self.attempt => {
+                let settled = Outcome::Failed {
+                    tip,
+                    reason,
+                    attempt,
+                    said,
+                    retry,
+                    retry_after: None,
+                };
+                write(&place.paths.record, &settled).is_ok() && run
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+    }
+
+    /// Takes the retry for this worker; false when another took it or the branch's record changed.
+    pub(crate) fn claim(&self, repository: &str) -> bool {
+        self.settle(repository, true)
+    }
+
+    /// Cancels the retry: what it was for no longer holds, so the failure stands as it is.
+    pub(crate) fn cancel(&self, repository: &str) {
+        self.settle(repository, false);
+    }
 }
 
 /// Removes what an agit that still attempted uploads with `push.auto` off left for this branch: the
@@ -1070,6 +1258,8 @@ mod tests {
                 reason,
                 attempt: "a".into(),
                 said: None,
+                retry: 0,
+                retry_after: None,
             };
             write(&place.paths.record, &failed).unwrap();
         };
@@ -1114,8 +1304,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let record = || read(&at(directory.path()).record);
 
-        let failing = at(directory.path()).start("tip-1").unwrap();
-        let succeeding = at(directory.path()).start("tip-1").unwrap();
+        let failing = at(directory.path()).start("tip-1", None).unwrap();
+        let succeeding = at(directory.path()).start("tip-1", None).unwrap();
         failing.finish(Err((UploadFailure::Hub, None)));
         succeeding.finish(Ok(()));
         assert_eq!(
@@ -1125,8 +1315,8 @@ mod tests {
             })
         );
 
-        let older = at(directory.path()).start("tip-2").unwrap();
-        let newer = at(directory.path()).start("tip-3").unwrap();
+        let older = at(directory.path()).start("tip-2", None).unwrap();
+        let newer = at(directory.path()).start("tip-3", None).unwrap();
         older.finish(Err((UploadFailure::Hub, None)));
         assert!(
             matches!(record(), Some(Outcome::Started { tip, .. }) if tip == "tip-3"),

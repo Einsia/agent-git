@@ -1072,10 +1072,10 @@ fn upload_line(
                 said.replacen("the folder it ran in", &folder, 1)
             )
         }
-        Undone::Failed(_) => {
+        Undone::Failed(_) | Undone::GaveUp(_) => {
             format!("agit: the last automatic upload to {repository} failed: {said}.")
         }
-        Undone::Ended | Undone::Unrecorded => {
+        Undone::Retrying(..) | Undone::Ended | Undone::Unrecorded => {
             format!("agit: the last automatic upload to {repository} didn't go through: {said}.")
         }
     }

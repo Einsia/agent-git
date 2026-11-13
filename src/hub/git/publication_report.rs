@@ -19,7 +19,92 @@ pub struct PublicationReport {
     pub error: Option<String>,
 }
 
+/// What the Hub's refs, read once after a push, say of the refs the push left without the Hub's
+/// answer ([`PublicationStatus::Unconfirmed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unanswered {
+    /// The push left no ref without an answer.
+    None,
+    /// The Hub holds every unanswered ref at the object the push sent: they landed.
+    Landed,
+    /// Some unanswered ref is where it was before the push, or still absent where the push was
+    /// creating it: it did not land. The ones that landed count as landed.
+    NotLanded,
+    /// This ref holds an object the push neither found nor sent, or is gone although it was
+    /// there: someone else changed it, or the Hub hides it from this account now.
+    Moved(String),
+}
+
 impl PublicationReport {
+    /// Whether some ref of the push was left without the Hub's answer.
+    pub fn unanswered(&self) -> bool {
+        [&self.heads, &self.tags]
+            .into_iter()
+            .flatten()
+            .flat_map(|phase| &phase.attempts)
+            .flat_map(|attempt| &attempt.refs)
+            .any(|reference| reference.status == PublicationStatus::Unconfirmed)
+    }
+
+    /// Judges every unanswered ref by `after`, the Hub's refs read once after the push, against
+    /// `before`, the refs the publication was frozen against. A ref the Hub holds at the object
+    /// the push sent is [`PublicationStatus::Updated`], and an attempt whose refs all landed
+    /// counts as complete: the Hub took it and only its answer was lost. A ref absent from
+    /// `after` landed nowhere only when it was absent from `before` too, as a ref the Hub hides
+    /// from this account is absent from its listing as well.
+    pub fn settle_unanswered(
+        &mut self,
+        before: &BTreeMap<String, String>,
+        after: &BTreeMap<String, String>,
+    ) -> Unanswered {
+        let (mut any, mut not_landed, mut moved) = (false, false, None);
+        for phase in [&mut self.heads, &mut self.tags].into_iter().flatten() {
+            let last = phase.attempts.len().checked_sub(1);
+            for (index, attempt) in phase.attempts.iter_mut().enumerate() {
+                let mut settled_here = false;
+                for reference in &mut attempt.refs {
+                    if reference.status != PublicationStatus::Unconfirmed {
+                        continue;
+                    }
+                    any = true;
+                    let name = reference.reference.name();
+                    match (before.get(name), after.get(name)) {
+                        (_, Some(now)) if now == reference.reference.oid() => {
+                            reference.status = PublicationStatus::Updated;
+                            settled_here = true;
+                        }
+                        (Some(was), Some(now)) if was == now => not_landed = true,
+                        (None, None) => not_landed = true,
+                        _ => {
+                            moved.get_or_insert_with(|| name.to_owned());
+                        }
+                    }
+                }
+                let all_landed = attempt.refs.iter().all(|reference| {
+                    matches!(
+                        reference.status,
+                        PublicationStatus::Updated | PublicationStatus::UpToDate
+                    )
+                });
+                if settled_here && all_landed {
+                    attempt.complete = true;
+                    attempt.error = None;
+                    attempt.outcome.code = 0;
+                    // A phase's error is its last run's, which this attempt was.
+                    if Some(index) == last {
+                        phase.error = None;
+                    }
+                }
+            }
+        }
+        match (any, moved, not_landed) {
+            (false, ..) => Unanswered::None,
+            (true, Some(name), _) => Unanswered::Moved(name),
+            (true, None, true) => Unanswered::NotLanded,
+            (true, None, false) => Unanswered::Landed,
+        }
+    }
+
     pub fn ok(&self) -> bool {
         self.error.is_none()
             && self.lfs.as_ref().is_some_and(LfsPublicationPhase::ok)

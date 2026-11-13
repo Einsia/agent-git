@@ -3,6 +3,7 @@
 use super::*;
 use crate::domain::privacy_git::sessions::SessionPublicationPlan;
 use crate::domain::repo::publication::{PublicationPlan, carries_main, is_raw_ancestor};
+use crate::hub::git::Unanswered;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
@@ -379,7 +380,7 @@ pub(super) fn run(
     let mut supervisor = SupervisorReply::from_env()?;
     // The reviewed heads bound the whole run: no part goes past them, so a turn saved after the
     // confirmation waits for the next push.
-    let reviewed_heads: std::collections::BTreeMap<String, String> = original
+    let mut reviewed_heads: std::collections::BTreeMap<String, String> = original
         .heads()
         .iter()
         .filter_map(|head| {
@@ -387,6 +388,24 @@ pub(super) fn run(
             Some((branch.to_owned(), head.oid().to_owned()))
         })
         .collect();
+    // An automatic retry publishes up to the tip its failed upload was for, and only while that
+    // tip still continues the branch: past a rewrite, it would move the Hub's branch back.
+    if let Some(tip) = &args.up_to {
+        let branch = args
+            .agent
+            .as_deref()
+            .and_then(|target| target.split_once('@'))
+            .map(|(_, branch)| branch)
+            .context("--up-to publishes one named branch")?;
+        let head = reviewed_heads
+            .get(branch)
+            .context("the branch to retry is not in this publication")?;
+        ensure!(
+            tip == head || is_raw_ancestor(&repo, tip, head)?,
+            "{repository}@{branch} no longer continues the commit this retry was for"
+        );
+        reviewed_heads.insert(branch.to_owned(), tip.clone());
+    }
     let push_limits = client
         .push_limits()
         .unwrap_or(crate::hub::PushLimits::UNPUBLISHED);
@@ -503,6 +522,11 @@ pub(super) fn run(
                 .iter()
                 .map(|branch| (branch.clone(), cuts[0].clone()))
                 .collect()
+        } else if args.up_to.is_some() {
+            part_branches
+                .iter()
+                .map(|branch| (branch.clone(), reviewed_heads[branch].clone()))
+                .collect()
         } else {
             std::collections::BTreeMap::new()
         };
@@ -579,7 +603,7 @@ pub(super) fn run(
                 use crate::ui::session::shell_arg as quote_arg;
                 error.context(format!("fetch the accepted public history with `agit fetch {}` and retry `{retry_command}`; keep this checkout to preserve unpublished commits", quote_arg(&repository)))
             } else if another_upload(&error) {
-                error.context(format!("{UPLOAD_IN_PROGRESS}; run `{retry_command}` again once it finishes"))
+                error.context(format!("{}; run `{retry_command}` again once it finishes", crate::commands::push::UPLOAD_IN_PROGRESS))
             } else {
                 unsent(error)
             }
@@ -923,7 +947,7 @@ pub(super) fn run(
             reply.prepare(&repo, candidate)?;
         }
         checking.finish();
-        let report = prepared.publish_with_session_receipts(
+        let mut report = prepared.publish_with_session_receipts(
         projected.policy_digest(),
         projected.session_manifest(),
         &intent.visibility,
@@ -938,6 +962,24 @@ pub(super) fn run(
                 format!("no branch or tag refs were published by this push; rerunning `{retry_command}` is safe after resolving the reported error")
             }
         })?;
+        // A push that went without the Hub's answer for some refs may have landed all the same.
+        // What the Hub holds is read once: a ref there at the object this push sent is published
+        // from here on, so its acceptance is recorded and its receipt saved, and nothing of it is
+        // sent again.
+        // Read before the Hub check: a batch the check settles hides a later phase that never ran.
+        let failure_code = publication_failure_code(&report);
+        // A refusal the Hub named is its answer, even one that leaves the outcome open, as a
+        // mutation awaiting reconciliation does: what it holds then says nothing yet.
+        let named = [&report.heads, &report.tags]
+            .into_iter()
+            .flatten()
+            .flat_map(|phase| &phase.attempts)
+            .any(|attempt| !attempt.ok() && attempt.outcome.refusal_kind().is_some());
+        let unanswered = if named {
+            Some(Unanswered::None)
+        } else {
+            settle_unanswered(&mut report, &repo, &intent.url, &identity, &selected.remote)
+        };
         // A branch the Hub acknowledged is uploaded whatever fails after it, in the tag phase or
         // while saving receipts, and a retry finds it up to date; so it counts now.
         let updated = report
@@ -1151,13 +1193,34 @@ pub(super) fn run(
                 }
                 .into());
             }
+            // The Hub didn't answer, and what this push sent is not all there: the person's push
+            // goes once more from the start. An automatic upload's next try is scheduled instead,
+            // unless all it sent landed: then only what it never sent remains, and going on now
+            // resends nothing.
+            let lost = matches!(unanswered, Some(Unanswered::Landed | Unanswered::NotLanded))
+                && failure_code == ExitCode::Network;
+            if lost
+                && matches!(attempt, super::Attempt::First)
+                && (unanswered == Some(Unanswered::Landed)
+                    || !crate::commands::auto_push::is_automatic())
+            {
+                return Err(super::NoAnswer { refused: previewed }.into());
+            }
             if in_parts {
                 ui::error(&format!(
                     "part {part} of {total} did not complete; {published} parts before it are published"
                 ));
             }
-            ui::error(&publication_recovery(&report, &retry_command, &repository));
-            return Ok(publication_failure_code(&report));
+            ui::error(
+                &super::unanswered_recovery(&report, unanswered.as_ref(), &retry_command)
+                    .unwrap_or_else(|| publication_recovery(&report, &retry_command, &repository)),
+            );
+            // Someone else changed a ref the push was waiting on: not a Hub that didn't answer.
+            return Ok(match unanswered {
+                Some(Unanswered::Moved(_)) => ExitCode::Failure,
+                _ if lost => failure_code,
+                _ => publication_failure_code(&report),
+            });
         }
         verify_receipt_acknowledgements(&report, &receipts)?;
         if intent.explicit_hub {
@@ -1352,9 +1415,35 @@ impl Answer {
     }
 }
 
-/// How a push that waited out another upload of the same repository begins its error. Nothing of
-/// this push was sent, and the other upload is still preparing, so the next step is to rerun it.
-const UPLOAD_IN_PROGRESS: &str = "another upload of this repository is in progress";
+/// [`crate::hub::git::PublicationReport::settle_unanswered`] by the Hub's refs as they are now,
+/// read once. `None` when they couldn't be read, so whether the unanswered refs landed is unknown.
+fn settle_unanswered(
+    report: &mut crate::hub::git::PublicationReport,
+    repo: &Repo,
+    url: &str,
+    identity: &RemoteIdentity,
+    before: &crate::hub::git::RemoteRefs,
+) -> Option<Unanswered> {
+    if !report.unanswered() {
+        return Some(Unanswered::None);
+    }
+    let checking = ui::publication::stage("Asking the Hub whether the push landed");
+    let after = crate::hub::git::FrozenPublication::read_advertised_refs(
+        repo,
+        url,
+        identity,
+        crate::hub::git::PUBLICATION_REF_READ,
+    )
+    .ok()?;
+    checking.finish();
+    let settled = report.settle_unanswered(&before.refs, &after.refs);
+    if settled == Unanswered::Landed {
+        ui::publication::notice(
+            "the Hub's answer to this push was lost, and the Hub holds what it sent",
+        );
+    }
+    Some(settled)
+}
 
 /// Whether `error` is the publication lock held past the wait, which only an upload holds that
 /// long.
