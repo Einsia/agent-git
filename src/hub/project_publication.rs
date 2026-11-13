@@ -62,6 +62,11 @@ pub(crate) struct Current {
     pub entry: Target,
 }
 
+/// Sent with every plan and current-entry request: this device never moves a folder's terminal
+/// policy for a binding it takes, so the Hub may tell it who made each one. A Hub that doesn't
+/// see it withholds `bound_by`, and the device then takes no binding as its own account's.
+const PLAN_HEADER: (&str, &str) = ("X-Agit-Publication-Plan", "2");
+
 impl super::Client {
     pub(crate) fn project_publication_plan(
         &self,
@@ -75,14 +80,17 @@ impl super::Client {
         if let Some(after) = after {
             path.push_str(&format!("?after={}", super::client::urlencode(after)));
         }
-        self.get(&path)
+        self.get_with(&path, None, &[PLAN_HEADER])
     }
 
+    /// The entry the plan gave for `target` as the Hub holds it now, with the binder fields the
+    /// plan carried, so the two compare equal while the binding is unchanged.
     pub(crate) fn current_project_publication(&self, target: &Target) -> crate::Result<Current> {
-        self.get(&format!(
+        let path = format!(
             "api/workspaces/{}/projects/{}/publication",
             super::client::urlencode(&target.web_workspace_id),
             super::client::urlencode(&target.web_project_id)
-        ))
+        );
+        self.get_with(&path, None, &[PLAN_HEADER])
     }
 }

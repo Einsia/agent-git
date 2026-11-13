@@ -493,7 +493,7 @@ impl Client {
     }
 
     /// [`Self::get_expected`] that also sends `headers`.
-    fn get_with<T: serde::de::DeserializeOwned>(
+    pub(super) fn get_with<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         expected_agent_id: Option<&str>,
@@ -2658,6 +2658,13 @@ mod tests {
         let (base, hub) = fake_hub(2, move |request| {
             assert!(request.contains("Bearer at-new"));
             assert!(!request.contains("foreign-account-token"));
+            // Without it the Hub withholds who made each binding, and none is taken as the
+            // device's own.
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-agit-publication-plan: 2")
+            );
             let body =
                 if request.starts_with("GET /api/peer/devices/device/project-publications ") {
                     serde_json::json!({"device":device,"entries":[target],"next_cursor":null})
