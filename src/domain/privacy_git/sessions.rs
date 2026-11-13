@@ -1106,7 +1106,7 @@ impl ProjectedHistory {
                 let mut mapped = BTreeMap::<String, accepted::Mapping>::new();
                 let mut plain_rewrites = BTreeSet::new();
                 let mut encrypted_below =
-                    super::frozen::Finder::new(&source, &parent, &ledger, &held, branch);
+                    super::frozen::Finder::new(&source, &parent, &ledger, &held, branch, &parents)?;
                 let mut file_line_bases = std::collections::HashMap::new();
                 for oid in order.iter().filter(|oid| reachable.contains(*oid)) {
                     // The plan leaves a boundary commit's ancestry out, so its public parents come
@@ -1341,15 +1341,29 @@ impl ProjectedHistory {
                                         plain_publics.push(public.clone());
                                     }
                                 }
-                                let public_records = published_lines(
-                                    &objects,
-                                    &source,
-                                    &repo,
-                                    &written,
-                                    oid,
-                                    &plain_sources,
-                                    &plain_publics,
-                                )?;
+                                let public_records = || {
+                                    published_lines(
+                                        &objects,
+                                        &source,
+                                        &repo,
+                                        &written,
+                                        oid,
+                                        &plain_sources,
+                                        &plain_publics,
+                                    )
+                                };
+                                // The commit holding the LOG of the snapshot's one public parent,
+                                // when this run wrote it and the parent shows itself plain.
+                                let written_parent = match (
+                                    parents[oid].as_slice(),
+                                    plain_sources.as_slice(),
+                                    plain_publics.as_slice(),
+                                ) {
+                                    ([parent], [plain], [public]) if parent == plain => {
+                                        written.get(public).map(String::as_str)
+                                    }
+                                    _ => None,
+                                };
                                 let carried = Carried {
                                     projected: published,
                                     others: &others,
@@ -1368,6 +1382,7 @@ impl ProjectedHistory {
                                         &source,
                                         oid,
                                         &parents[oid],
+                                        written_parent,
                                         &public_records,
                                         &mut rechecked,
                                     )?;
@@ -1380,7 +1395,7 @@ impl ProjectedHistory {
                                                 &source,
                                                 oid,
                                                 &parents[oid],
-                                                &public_records,
+                                                &public_records()?,
                                                 Carried::default(),
                                                 &mut rechecked,
                                             )?,
@@ -1388,12 +1403,13 @@ impl ProjectedHistory {
                                     );
                                     conversation
                                 } else {
+                                    projector.finish(&source)?;
                                     projector = projection::Projector::default();
                                     conversation_commit(
                                         &source,
                                         oid,
                                         &parents[oid],
-                                        &public_records,
+                                        &public_records()?,
                                         carried,
                                         &mut rechecked,
                                     )?
@@ -1667,6 +1683,7 @@ impl ProjectedHistory {
                     reports.push(projection.report().clone());
                     record_progress(oid, false);
                 }
+                projector.finish(&source)?;
                 let public_head = mapped[head.oid()].public.clone();
                 references.insert(head.name().to_owned(), public_head.clone());
                 for entry in mapped.values() {

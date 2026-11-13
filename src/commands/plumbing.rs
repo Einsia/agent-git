@@ -283,6 +283,9 @@ pub enum Content {
     Bytes(Vec<u8>),
     /// A blob already in the repository's store, such as one a [`BlobWriter`] wrote.
     Blob(gix::ObjectId),
+    /// An entry as another tree holds it: an object of the repository's store with its mode, or
+    /// a submodule's commit, which the store need not hold.
+    Entry(gix::object::tree::EntryKind, gix::ObjectId),
 }
 
 /// [`tree_apply_owned`] whose edits may also name blobs already stored, so a caller that wrote
@@ -302,6 +305,7 @@ pub fn tree_apply_content(
                     None => Edit::Remove,
                     Some(Content::Bytes(bytes)) => Edit::Bytes(bytes),
                     Some(Content::Blob(id)) => Edit::Entry(gix::object::tree::EntryKind::Blob, id),
+                    Some(Content::Entry(kind, id)) => Edit::Entry(kind, id),
                 };
                 (path, edit)
             })
@@ -385,7 +389,7 @@ fn tree_edit(repo: &Repo, base_commitish: &str, edits: Vec<(String, Edit)>) -> R
                 }
                 Edit::Entry(kind, id) => {
                     anyhow::ensure!(
-                        objects.has_object(id),
+                        kind == gix::object::tree::EntryKind::Commit || objects.has_object(id),
                         "a tree edit names an object the store lacks: {path:?}"
                     );
                     editor.upsert(path.as_str(), kind, id)?;
@@ -418,6 +422,15 @@ impl BlobWriter {
         let objects = open_objects(repo)?;
         let directory = objects.objects.store_ref().path().to_owned();
         Ok(Self { objects, directory })
+    }
+
+    /// The id `bytes` have as a blob in this store, without writing them.
+    pub fn id(&self, bytes: &[u8]) -> Result<gix::ObjectId> {
+        Ok(gix::objs::compute_hash(
+            self.objects.object_hash(),
+            gix::object::Kind::Blob,
+            bytes,
+        )?)
     }
 
     /// The id of `bytes` as a blob, written unless the store already holds it.

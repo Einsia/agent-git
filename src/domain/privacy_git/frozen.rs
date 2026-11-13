@@ -359,6 +359,72 @@ pub(super) struct Finder<'a> {
     held: &'a BTreeSet<String>,
     branch: &'a str,
     found: BTreeMap<String, Option<Rc<Nearest>>>,
+    merges: MergesBelow<'a>,
+}
+
+/// Whether a commit is a merge or has one below it, as `rev-list --merges -n 1 <commit>` says.
+/// A commit the run read answers by its own parent lines and its parents' answers, kept for the
+/// run, so a long line is walked once rather than once for every snapshot on it; any other commit
+/// is asked of Git once. Parent lines show every merge `rev-list` would, and a merge Git's commit
+/// graph left out as well, which only asks for the check that follows. A repository with a
+/// shallow file asks Git for every commit: Git's history stops at the commits it names, and their
+/// parent lines don't.
+pub(super) struct MergesBelow<'a> {
+    /// Each commit the run read, by its own parent lines.
+    parents: &'a BTreeMap<String, Vec<String>>,
+    shallow: bool,
+    known: HashMap<String, bool>,
+}
+
+impl<'a> MergesBelow<'a> {
+    pub(super) fn new(source: &Repo, parents: &'a BTreeMap<String, Vec<String>>) -> Result<Self> {
+        Ok(Self {
+            parents,
+            shallow: source.git_path_local("shallow")?.exists(),
+            known: HashMap::new(),
+        })
+    }
+
+    pub(super) fn of(&mut self, source: &Repo, oid: &str) -> Result<bool> {
+        let by_git = |commit: &str| -> Result<bool> {
+            Ok(!source
+                .git(&["rev-list", "--merges", "-n", "1", commit])?
+                .trim()
+                .is_empty())
+        };
+        if self.shallow {
+            return by_git(oid);
+        }
+        let mut stack = vec![oid.to_owned()];
+        while let Some(commit) = stack.last().cloned() {
+            if self.known.contains_key(&commit) {
+                stack.pop();
+                continue;
+            }
+            let answer = match self.parents.get(&commit) {
+                None => Some(by_git(&commit)?),
+                Some(parents) if parents.len() > 1 => Some(true),
+                Some(parents) => {
+                    let pending = parents
+                        .iter()
+                        .filter(|parent| !self.known.contains_key(*parent))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if pending.is_empty() {
+                        Some(parents.iter().any(|parent| self.known[parent]))
+                    } else {
+                        stack.extend(pending);
+                        None
+                    }
+                }
+            };
+            if let Some(answer) = answer {
+                self.known.insert(commit, answer);
+                stack.pop();
+            }
+        }
+        Ok(self.known[oid])
+    }
 }
 
 impl<'a> Finder<'a> {
@@ -368,15 +434,17 @@ impl<'a> Finder<'a> {
         ledger: &'a accepted::Ledger,
         held: &'a BTreeSet<String>,
         branch: &'a str,
-    ) -> Self {
-        Self {
+        parents: &'a BTreeMap<String, Vec<String>>,
+    ) -> Result<Self> {
+        Ok(Self {
             source,
             parent,
             ledger,
             held,
             branch,
             found: BTreeMap::new(),
-        }
+            merges: MergesBelow::new(source, parents)?,
+        })
     }
 
     /// The nearest encrypted snapshot below `oid`, a snapshot this publication adds, which is never
@@ -405,12 +473,7 @@ impl<'a> Finder<'a> {
         oid: &str,
         first: Option<&Nearest>,
     ) -> Result<Vec<Rc<Nearest>>> {
-        if self
-            .source
-            .git(&["rev-list", "--merges", "-n", "1", oid])?
-            .trim()
-            .is_empty()
-        {
+        if !self.merges.of(self.source, oid)? {
             return Ok(Vec::new());
         }
         let mut candidates = BTreeSet::new();
@@ -1354,5 +1417,89 @@ mod bound_tests {
         assert_eq!(envelope_history(&source, &tip, 3).unwrap().len(), 3);
         let refused = envelope_history(&source, &tip, 2).unwrap_err().to_string();
         assert!(refused.contains("nothing was sent"), "{refused}");
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A merge below a snapshot counts whether the run read the commits down to it or not: a
+    /// commit the run didn't read is asked of Git. In a repository with a shallow file Git's own
+    /// answer stands for every commit, since its history stops where that file says though the
+    /// parent lines go on. Taking a commit the run didn't read as having no merge below, or
+    /// following parent lines past a shallow boundary, answers otherwise here than `rev-list` does.
+    #[test]
+    fn a_merge_below_counts_whether_the_run_read_down_to_it_or_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        let tree = git(root, &["mktree"]);
+        let commit = |parents: &[&str], message: &str| {
+            let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
+            for parent in parents {
+                args.extend(["-p", parent]);
+            }
+            git(root, &args)
+        };
+        let base = commit(&[], "base");
+        let left = commit(&[&base], "left");
+        let right = commit(&[&base], "right");
+        let merge = commit(&[&left, &right], "merge");
+        let after = commit(&[&merge], "after");
+        let tip = commit(&[&after], "tip");
+        let source = Repo::at(root).local_objects_only();
+
+        // The run read the tip alone: the merge below it is asked of Git.
+        let read = super::super::commit_parent_map(&source, &[tip.clone()]).unwrap();
+        assert!(
+            MergesBelow::new(&source, &read)
+                .unwrap()
+                .of(&source, &tip)
+                .unwrap()
+        );
+
+        // The run read the whole line: parent lines answer, for the tip and for a line with none.
+        let line = [&base, &left, &right, &merge, &after, &tip].map(|oid| oid.to_string());
+        let read = super::super::commit_parent_map(&source, &line).unwrap();
+        let mut merges = MergesBelow::new(&source, &read).unwrap();
+        assert!(merges.of(&source, &tip).unwrap());
+        assert!(!merges.of(&source, &left).unwrap());
+
+        // Git's history stops at `after`, so it finds no merge below the tip.
+        std::fs::write(root.join(".git/shallow"), format!("{after}\n")).unwrap();
+        assert!(
+            !MergesBelow::new(&source, &read)
+                .unwrap()
+                .of(&source, &tip)
+                .unwrap()
+        );
     }
 }
