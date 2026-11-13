@@ -54,6 +54,10 @@ against those pins, so runtime assembly does not need a license-text service.
 Assembly verifies checksums, resolves archive links within the payload, checks
 binary architectures, and produces a deterministic compressed archive. The
 cache stores verified downloads and can be removed without affecting builds.
+Release builds read each pin from this repository's runtime-inputs Release before
+upstream (see
+[the release artifact contract](../.github/RELEASE_ARTIFACTS.md#runtime-inputs-releases)),
+so a pin upstream has removed still builds; any copy must match its SHA-256.
 
 Linux uses Alpine Git with its musl loader and dependency libraries, invoked
 through wrappers with a private library path. It uses the host `/bin/sh` and

@@ -1,0 +1,72 @@
+name: Runtime inputs
+
+# Pushing a `runtime-inputs-<lock digest>` tag publishes a Release that holds every archive
+# scripts/git-runtime-lock.json pins at that tag, each checked against its SHA-256, plus the
+# corresponding source of the copyleft components. The Release workflow reads the pinned archives
+# from here before upstream, so upstream removing a pinned file cannot fail a release.
+#
+# The GitLab sync pushes the tag when the lock changes, while upstream still serves every pin.
+# Nothing else is attached, and the job holds no credential but this run's own GITHUB_TOKEN.
+
+on:
+  push:
+    tags: ['runtime-inputs-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-inputs-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the Release, upload its assets
+    env:
+      INPUTS_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The tag name carries a digest of the lock it publishes; a tag pushed on another lock would
+      # put the wrong archives under a name release builds trust.
+      - name: Stage the pinned inputs and their sources
+        run: |
+          set -euo pipefail
+          python scripts/stage-runtime-inputs.py "$RUNNER_TEMP/inputs" | tee "$RUNNER_TEMP/stage.log"
+          test "$(tail -n 1 "$RUNNER_TEMP/stage.log")" = "$INPUTS_TAG" \
+            || { echo "::error::$INPUTS_TAG does not name the lock at this commit"; exit 1; }
+
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "Archives that scripts/git-runtime-lock.json pins at this tag, each checked against its SHA-256 there,"
+            echo "and the corresponding source of the bundled Git runtime's copyleft components (SOURCES-SHA256SUMS)."
+            echo "Release builds read the pinned archives from here before upstream."
+          } > "$notes"
+          if gh release view "$INPUTS_TAG" > /dev/null 2>&1; then
+            gh release upload "$INPUTS_TAG" "$RUNNER_TEMP"/inputs/* --clobber
+          else
+            gh release create "$INPUTS_TAG" "$RUNNER_TEMP"/inputs/* --verify-tag --latest=false \
+              --title "$INPUTS_TAG" --notes-file "$notes"
+          fi
+
+      # The Release must hold every staged file at the size it was staged, and nothing else.
+      - name: The Release holds exactly the staged files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$INPUTS_TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"' | sort > "$RUNNER_TEMP/attached.txt"
+          (cd "$RUNNER_TEMP/inputs" && for f in *; do echo "$f $(stat -c %s "$f")"; done) | sort > "$RUNNER_TEMP/staged.txt"
+          diff "$RUNNER_TEMP/staged.txt" "$RUNNER_TEMP/attached.txt"

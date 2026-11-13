@@ -26,6 +26,7 @@ section that lists them.
 import argparse
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -47,6 +48,24 @@ ALPINE_RECIPE_URLS = (
     "https://gitlab.alpinelinux.org/alpine/aports/-/raw/{commit}/{path}",
     "https://raw.githubusercontent.com/alpinelinux/aports/{commit}/{path}",
 )
+_runtime_spec = importlib.util.spec_from_file_location("runtime", Path(__file__).with_name("prepare-git-runtime.py"))
+runtime = importlib.util.module_from_spec(_runtime_spec)
+_runtime_spec.loader.exec_module(runtime)
+
+
+def pin_urls(pin):
+    """Return where a lock pin can be read, in order: the runtime-inputs Release, then upstream.
+
+    With AGIT_RUNTIME_INPUTS_BASE set, the Release copy comes first, under the same tag and asset
+    name the runtime build uses, so a pin upstream has removed still checks. fetch() takes the
+    first copy whose bytes match the pin, so the Release can never change what is checked.
+    """
+    urls = [pin["url"]]
+    base = os.environ.get("AGIT_RUNTIME_INPUTS_BASE")
+    if base:
+        tag = runtime.inputs_tag(Path(__file__).with_name("git-runtime-lock.json").read_bytes())
+        urls.insert(0, f"{base.rstrip('/')}/{tag}/{runtime.asset_name(pin)}")
+    return urls
 
 
 def copyleft_pins(lock):
@@ -109,7 +128,7 @@ def check_coverage(lock, sources, inventory):
 
 def check_mingit_files(lock, inventory):
     """Raise unless the pinned MinGit archive holds exactly the files the inventory assigns."""
-    with zipfile.ZipFile(io.BytesIO(fetch([lock["windows"]["url"]], lock["windows"]["sha256"]))) as archive:
+    with zipfile.ZipFile(io.BytesIO(fetch(pin_urls(lock["windows"]), lock["windows"]["sha256"]))) as archive:
         shipped = {entry.filename for entry in archive.infolist() if not entry.is_dir()}
     listed = {path for package in inventory["packages"] for path in package["files"]}
     problems = [f"MinGit ships {path}, which no inventoried package accounts for" for path in sorted(shipped - listed)]
