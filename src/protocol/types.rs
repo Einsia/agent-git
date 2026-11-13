@@ -287,6 +287,23 @@ pub struct ProjectBindResult {
     pub local_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_origin: Option<String>,
+    /// Where the folder's conversations upload for the account this device is signed in to on
+    /// the asking Hub. Absent from a device that cannot say, which a Hub then asks the person
+    /// about: taking it for "nothing chosen" would send a folder the person already pointed at a
+    /// repository somewhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<BoundFolder>,
+}
+
+/// A folder's upload destination as the device knows it for one account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundFolder {
+    /// The folder's own destination, or the person's terminal choice for it; `None` when the
+    /// account chose none.
+    pub destination: Option<PublicationTarget>,
+    /// The person turned this folder's uploads off here (`agit off`), so nothing it holds uploads
+    /// until they turn them on again.
+    pub uploads_off: bool,
 }
 
 /// An owned Cloud machine binds a confirmed project to an immutable private Hub repository.

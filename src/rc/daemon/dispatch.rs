@@ -94,6 +94,7 @@ impl Daemon {
                 Ok(serde_json::to_value(ProjectBindResult {
                     project_id: p.project_id,
                     git_origin: crate::rc::mirror::git_origin(&dir),
+                    folder: bound_folder(f, &dir),
                     local_path: dir.to_string_lossy().to_string(),
                 })
                 .unwrap())
@@ -680,6 +681,26 @@ impl Daemon {
             }
         }
     }
+}
+
+/// What `project.bind` says of `folder` to the Hub that asked: where it uploads for the account
+/// this device is signed in to there, and whether its uploads are off. Only a bind the device's
+/// owner made through their own grant names that Hub and account, and only when the device's
+/// sign-in is the same account; anything else says nothing, which the Hub takes for a device that
+/// cannot tell.
+fn bound_folder(frame: &Frame, folder: &std::path::Path) -> Option<crate::protocol::BoundFolder> {
+    let owner = frame.authority.folder_bind_owner()?;
+    if crate::infra::credentials::account_key(&owner.issuer).as_deref()
+        != Some(owner.account_id.as_str())
+    {
+        return None;
+    }
+    let destination =
+        crate::rc::local_repository::publication::folder_destination(folder, &owner.issuer).ok()?;
+    Some(crate::protocol::BoundFolder {
+        destination,
+        uploads_off: crate::commands::project::uploads_automatically(folder) == Some(false),
+    })
 }
 
 /// Install a new read-only follow: write it into the table, **and reopen its replay ring in the

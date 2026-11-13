@@ -15,6 +15,12 @@ pub(crate) trait Authority: Send + Sync {
         None
     }
 
+    /// The device's owner, when the device's owner made this folder bind on their own machine.
+    /// It names who asked and lends no publication authority.
+    fn folder_bind_owner(&self) -> Option<agit_peer::access::Principal> {
+        None
+    }
+
     fn watch_owner(&self) -> Option<String> {
         None
     }
@@ -42,6 +48,20 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
+    /// See [`Authority::folder_bind_owner`].
+    pub fn folder_bind_owner(&self) -> Option<agit_peer::access::Principal> {
+        let mut owner = None;
+        self.admit(|| {
+            owner = self
+                .authority
+                .as_ref()
+                .and_then(|authority| authority.folder_bind_owner());
+            owner.is_some()
+        })
+        .then_some(owner)
+        .flatten()
+    }
+
     pub fn owned_machine_grant(&self) -> Result<agit_peer::cloud::ConnectionGrant, RpcError> {
         let mut grant = None;
         if self.admit(|| {

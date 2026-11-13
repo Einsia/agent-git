@@ -194,6 +194,36 @@ fn folder_record(
     Ok(folder::chosen(&key)?.map(|chosen| (key, chosen)))
 }
 
+/// The destination [`folder_record`] would take for `root` under the account signed in to `hub`,
+/// read without writing anything: a folder is bound only once the Hub's binding of it is
+/// confirmed, and a person who adds it on the web and then cancels leaves no record behind.
+pub(crate) fn folder_destination(
+    root: &std::path::Path,
+    hub: &str,
+) -> crate::Result<Option<crate::protocol::PublicationTarget>> {
+    use crate::rc::folder_destination as folder;
+    let Some(key) = folder::Key::signed_in(root, hub)? else {
+        return Ok(None);
+    };
+    if let Some(chosen) = folder::chosen(&key)? {
+        return Ok(Some(crate::protocol::PublicationTarget {
+            repository: chosen.repository,
+            agent_id: chosen.repository_id,
+        }));
+    }
+    Ok(crate::commands::project::folder_choice(key.root())
+        .filter(|(_, identity, account)| {
+            account == key.account()
+                && identity::normalize_hub(hub).is_ok_and(|hub| identity.hub == hub)
+        })
+        .map(
+            |(repository, identity, _)| crate::protocol::PublicationTarget {
+                repository,
+                agent_id: identity.agent_id,
+            },
+        ))
+}
+
 fn folders_and_projects(repo: &Repo) -> crate::Result<(Vec<std::path::PathBuf>, Vec<String>)> {
     let mut folders = Vec::new();
     let mut projects = Vec::new();
