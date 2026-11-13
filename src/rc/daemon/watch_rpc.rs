@@ -2,6 +2,15 @@ use super::dispatch::install_watch;
 use super::*;
 use std::path::Path;
 
+/// Whether a watch enrolls its conversation in observed capture: only the device owner's own, in
+/// the conversation's own workspace. A member's watch, a controller watch on a delegated session
+/// scope, and a frame that names no caller view the conversation and record nothing. Each must
+/// show the owner; none is taken for the owner by default.
+pub(super) fn enrolls_observed_capture(frame: &Frame, workspace_id: &str) -> bool {
+    caller_scope(frame).is_ok_and(|caller| caller.is_owner() && caller.workspace_id == workspace_id)
+        && frame.authority.watch_owner().is_none()
+}
+
 /// How long a newly installed tail yields to the `session.watch` response before it starts
 /// sending replay frames.
 ///
@@ -730,9 +739,13 @@ impl Daemon {
         }
 
         let (archive_session, archive_error) =
-            match self.retain_observed_capture(&info, &current_cwd) {
-                Ok(session) => (session, None),
-                Err(error) => (None, Some(error.to_string())),
+            if enrolls_observed_capture(frame, &info.workspace_id) {
+                match self.retain_observed_capture(&info, &current_cwd) {
+                    Ok(session) => (session, None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else {
+                (None, None)
             };
         let result = serde_json::to_value(SessionWatchResult {
             native_selection: Some(crate::protocol::NativeSessionSelection {

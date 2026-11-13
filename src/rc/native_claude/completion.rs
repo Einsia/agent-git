@@ -204,6 +204,29 @@ pub(crate) fn boundaries(
     boundaries_in(&directory, session, &transcript, bytes)
 }
 
+/// [`boundaries`] for the bytes of `transcript` that follow `start`, given the SHA-256 state over
+/// the bytes before it: the receipts past `start` that `suffix` reaches, each checked against that
+/// state carried over `suffix`, as absolute ends. A receipt at or before `start` was checked when
+/// `start` was found, and cannot move a boundary past it.
+pub(crate) fn boundaries_after(
+    session: &str,
+    transcript: &Path,
+    start: usize,
+    prefix: &Sha256,
+    suffix: &[u8],
+) -> crate::Result<Vec<usize>> {
+    let transcript = transcript.canonicalize()?;
+    let directory = directory(session, &transcript)?;
+    boundaries_from(
+        &directory,
+        session,
+        &transcript,
+        start,
+        prefix.clone(),
+        suffix,
+    )
+}
+
 /// The receipts recorded for `transcript`, by name: a receipt can end a turn without the
 /// transcript changing, so a reader that skips an unchanged transcript compares these too.
 pub(crate) fn receipt_names(session: &str, transcript: &Path) -> Vec<std::ffi::OsString> {
@@ -234,6 +257,19 @@ fn boundaries_in(
     transcript: &Path,
     bytes: &[u8],
 ) -> crate::Result<Vec<usize>> {
+    boundaries_from(directory, session, transcript, 0, Sha256::new(), bytes)
+}
+
+/// The receipts past `start` within `suffix`, the transcript's bytes from `start` on, with
+/// `digest` the SHA-256 state over the bytes before `start`.
+fn boundaries_from(
+    directory: &Path,
+    session: &str,
+    transcript: &Path,
+    start: usize,
+    mut digest: Sha256,
+    suffix: &[u8],
+) -> crate::Result<Vec<usize>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -253,29 +289,31 @@ fn boundaries_in(
                 && receipt.reason == "aborted",
             "native completion receipt names another transcript"
         );
-        if receipt.bytes <= bytes.len() as u64 {
+        if (receipt.bytes > start as u64 || start == 0)
+            && receipt.bytes <= (start + suffix.len()) as u64
+        {
             receipts.push(receipt);
         }
     }
     receipts.sort_by_key(|receipt| receipt.bytes);
-    let mut digest = Sha256::new();
     let mut previous = 0;
     let mut boundaries = Vec::new();
     for receipt in receipts {
-        let end =
-            usize::try_from(receipt.bytes).context("native completion offset is out of range")?;
+        let end = usize::try_from(receipt.bytes)
+            .context("native completion offset is out of range")?
+            - start;
         ensure!(
-            end > 0 && bytes.get(end - 1) == Some(&b'\n'),
+            end > 0 && suffix.get(end - 1) == Some(&b'\n'),
             "native completion does not end at a record boundary"
         );
-        digest.update(&bytes[previous..end]);
+        digest.update(&suffix[previous..end]);
         previous = end;
         ensure!(
             hex::encode(digest.clone().finalize()) == receipt.sha256,
             "native completion prefix changed"
         );
-        if boundaries.last() != Some(&end) {
-            boundaries.push(end);
+        if boundaries.last() != Some(&(start + end)) {
+            boundaries.push(start + end);
         }
     }
     Ok(boundaries)
@@ -285,6 +323,10 @@ fn boundaries_in(
 mod tests {
     use super::*;
 
+    /// A completion receipt authorizes its boundary only while the transcript up to it hashes to
+    /// what the receipt saw, whether the transcript is read whole or past an earlier boundary with
+    /// the digest before it carried. A check that left the carried digest out accepts a receipt
+    /// for a prefix that changed.
     #[test]
     fn completion_authorizes_only_its_unchanged_native_prefix() {
         let directory = tempfile::tempdir().unwrap();
@@ -311,6 +353,46 @@ mod tests {
             boundaries_in(directory.path(), "session", &transcript, &grown).unwrap(),
             vec![stopped.len()]
         );
+        // Read past `stopped`, with the digest over it carried: a receipt at `stopped` was checked
+        // already, and one later is checked against the carried digest.
+        let mut carried = Sha256::new();
+        carried.update(stopped);
+        let later = Receipt {
+            bytes: grown.len() as u64,
+            sha256: hex::encode(Sha256::digest(&grown)),
+            ..receipt.clone()
+        };
+        std::fs::write(
+            directory.path().join("later.json"),
+            serde_json::to_vec(&later).unwrap(),
+        )
+        .unwrap();
+        let suffix = &grown[stopped.len()..];
+        assert_eq!(
+            boundaries_from(
+                directory.path(),
+                "session",
+                &transcript,
+                stopped.len(),
+                carried.clone(),
+                suffix
+            )
+            .unwrap(),
+            vec![grown.len()]
+        );
+        assert!(
+            boundaries_from(
+                directory.path(),
+                "session",
+                &transcript,
+                stopped.len(),
+                Sha256::new(),
+                suffix
+            )
+            .is_err(),
+            "a later receipt is checked against the carried digest"
+        );
+        std::fs::remove_file(directory.path().join("later.json")).unwrap();
         grown[2] = b'x';
         assert!(boundaries_in(directory.path(), "session", &transcript, &grown).is_err());
         assert!(boundaries_in(directory.path(), "another-session", &transcript, stopped).is_err());

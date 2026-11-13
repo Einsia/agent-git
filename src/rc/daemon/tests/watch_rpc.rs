@@ -897,3 +897,37 @@ async fn missing_parent_history_does_not_stop_live_watch() {
         .await
         .unwrap();
 }
+
+/// Only the device owner's own watch, in the conversation's workspace, enrolls the conversation
+/// in observed capture: a viewer's or operator's personal watch, the owner's role in another
+/// workspace, a frame without a caller, and a controller watch on a delegated session scope each
+/// leave it out. A check that took a missing caller or authority for the owner, or looked at the
+/// role alone, enrolls one of these.
+#[test]
+fn only_the_owners_watch_enrolls_a_conversation() {
+    let watch = |role: Option<&str>, workspace: &str| {
+        let mut frame = request(method::SESSION_WATCH, "ws", "native");
+        frame.caller = role.map(|role| crate::protocol::CallerClaim {
+            account_id: Some(role.into()),
+            username: Some(role.into()),
+            role: role.into(),
+            workspace_id: workspace.into(),
+        });
+        frame
+    };
+    assert!(enrolls_observed_capture(&watch(Some("owner"), "ws"), "ws"));
+    for frame in [
+        watch(Some("viewer"), "ws"),
+        watch(Some("operator"), "ws"),
+        watch(Some("owner"), "elsewhere"),
+        watch(None, "ws"),
+    ] {
+        assert!(!enrolls_observed_capture(&frame, "ws"));
+    }
+    let mut controller = watch(Some("owner"), "ws");
+    controller.authority = crate::rc::authority::Guard::new(WatchAuthority {
+        owner: "service".into(),
+        live: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    });
+    assert!(!enrolls_observed_capture(&controller, "ws"));
+}
