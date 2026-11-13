@@ -125,8 +125,16 @@ impl Daemon {
             native_mode,
         );
         // A shared native thread resumes in the mode it is set to, whoever resumes it; a private
-        // fallback launch takes the same mode from the spec.
+        // fallback launch takes the same mode from the spec. Choosing another here would change
+        // the thread's own settings, which the terminal shares, so it is switched once open.
         let mode = native_mode;
+        if p.permission_mode.is_some_and(|named| Some(named) != mode) {
+            return Err(RpcError::new(
+                ErrorCode::RuntimeUnavailable,
+                "this conversation resumes in the mode Codex keeps for it; nothing was launched",
+            )
+            .with_hint("resume it without choosing a mode, then switch once it is open"));
+        }
         let logical = if prior.is_some() {
             p.session_id.clone()
         } else {
@@ -310,6 +318,7 @@ mod tests {
                 expected_agent_id: None,
                 branch: None,
                 attach_only: false,
+                permission_mode: None,
             };
             // A conversation opens under the name the catalog shows for it, not unnamed.
             let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();

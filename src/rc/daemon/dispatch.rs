@@ -604,11 +604,29 @@ impl Daemon {
                 // session of another workspace counts as not running, so close tells an unknown
                 // id from someone else's live one no better than any other verb does.
                 let closed = f.method() == method::SESSION_CLOSE;
-                if closed
-                    && !self.sessions.get(&p.session_id).is_some_and(|live| {
-                        !live.ended && live.info.workspace_id == caller.workspace_id
-                    })
+                let running = self.sessions.get(&p.session_id).is_some_and(|live| {
+                    !live.ended && live.info.workspace_id == caller.workspace_id
+                });
+                // A conversation restarting to change its mode stays stopped once someone stops
+                // it, whether its old process is still ending or its new one is not up yet.
+                if !running
+                    && self
+                        .roster
+                        .get(&p.session_id)
+                        .is_some_and(|entry| entry.workspace_id == caller.workspace_id)
+                    && let Some(restart) = self.mode_restart_to_stop(&p.session_id)
                 {
+                    restart.stop();
+                    if closed && self.roster.observed.remove(&p.session_id) {
+                        self.save_close(&p.session_id)?;
+                    }
+                    return Ok(serde_json::json!({
+                        "session_id": p.session_id,
+                        "stopping": true,
+                        "closed": closed,
+                    }));
+                }
+                if closed && !running {
                     return Err(not_running_to_close());
                 }
                 let d = self.session_channel(&p.session_id, &caller, Need::Brake)?;
@@ -624,6 +642,9 @@ impl Daemon {
                 })?;
                 if closed && self.roster.observed.remove(&p.session_id) {
                     self.save_close(&p.session_id)?;
+                }
+                if let Some(restart) = self.mode_restart_to_stop(&p.session_id) {
+                    restart.stop();
                 }
                 stop.send(Command::Shutdown);
                 Ok(serde_json::json!({
@@ -756,6 +777,8 @@ mod tests {
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
             opening_sessions: HashMap::new(),
+            mode_restarts: HashMap::new(),
+            session_frames: None,
             exiting_launches: HashMap::new(),
             archive_recovering: HashMap::new(),
             watches: HashMap::new(),

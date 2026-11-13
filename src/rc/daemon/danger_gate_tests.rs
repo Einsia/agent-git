@@ -1,18 +1,6 @@
 use super::*;
 use crate::protocol::CallerClaim;
 
-/// A mode change from `from` to `mode`, judged as `session.setPermissionMode` judges it.
-pub(super) fn require_owner_to_loosen(
-    caller: Option<&CallerClaim>,
-    mode: crate::protocol::PermissionMode,
-    from: Option<crate::protocol::PermissionMode>,
-) -> Result<(), RpcError> {
-    require_owner_if_loosening(
-        caller,
-        from.map_or_else(|| mode.loosens_guard(), |from| mode.loosens_from(from)),
-    )
-}
-
 fn claim(role: &str) -> CallerClaim {
     CallerClaim {
         account_id: Some("acct".into()),
@@ -225,6 +213,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     info,
                     shared_executor: false,
                     started_process: true,
+                    bypass_needs_restart: false,
                     tx: cmd_tx,
                     runtime_thread_id: Some("native-1".into()),
                     task: tokio::spawn(async {}),
@@ -271,6 +260,8 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     sessions: [("session-1".to_string(), live)].into_iter().collect(),
                     latest_session_generations: HashMap::new(),
                     opening_sessions: HashMap::new(),
+                    mode_restarts: HashMap::new(),
+                    session_frames: None,
                     exiting_launches: HashMap::new(),
                     archive_recovering: HashMap::new(),
                     watches: HashMap::new(),
@@ -461,6 +452,7 @@ fn attach_only_joins_a_live_terminal() {
                         expected_agent_id: None,
                         branch: None,
                         attach_only: true,
+                        permission_mode: None,
                     },
                 )
             };
@@ -558,6 +550,7 @@ fn attach_only_launches_nothing_when_the_terminal_exits_before_the_driver_is_cho
                         expected_agent_id: None,
                         branch: None,
                         attach_only: true,
+                        permission_mode: None,
                     },
                     &caller_in("owner", "ws-a"),
                     &frames,

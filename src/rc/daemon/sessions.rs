@@ -479,6 +479,17 @@ impl Daemon {
             ));
         }
         if let Some(mut info) = self.supervised_in(&p.session_id, caller) {
+            // A conversation already running here keeps its mode; the reply says which. A mode
+            // named here is still judged, so a refusal says why rather than passing unnoticed.
+            if let Some(mode) = p.permission_mode {
+                require_owner_to_loosen(
+                    Some(caller),
+                    mode,
+                    self.sessions
+                        .get(&info.session_id)
+                        .map(|live| live.authorization_baseline()),
+                )?;
+            }
             if let Some(project) = p.project_id.as_deref()
                 && info.project_id.as_deref() != Some(project)
             {
@@ -576,6 +587,15 @@ impl Daemon {
                 ));
             }
             require_active_runtime(&entry.runtime, &entry.thread_id)?;
+            let permission_mode = resume_mode(
+                caller,
+                &entry.runtime,
+                p.permission_mode,
+                entry.restart_permission_mode(),
+            )?;
+            if p.permission_mode.is_some() && !entry.guard_attempts.is_empty() {
+                return Err(plan_restart_pending());
+            }
             let roots = self.roots_for(caller);
             let cwd = policy::require_within(std::path::Path::new(&entry.cwd), &roots)
                 .map_err(|e| {
@@ -647,8 +667,11 @@ impl Daemon {
                 labels_withheld: None,
                 // The monotonic bit is stamped by `prepare_spawn` from the slip above; it is
                 // not inferred back from the current permission mode and not copied again here.
-                dangerous: false,
-                permission_mode: entry.restart_permission_mode(),
+                // A resume that names Bypass starts unchecked, and that is recorded before launch.
+                dangerous: p
+                    .permission_mode
+                    .is_some_and(crate::protocol::PermissionMode::is_dangerous),
+                permission_mode,
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -659,13 +682,14 @@ impl Daemon {
                 // Native resume owns the current model; start receipts are immutable history.
                 model: None,
                 dangerous: false,
-                // Resume brings back the guard it ran under.
-                permission_mode: entry.restart_permission_mode(),
+                // Resume brings back the guard it ran under, unless it named another.
+                permission_mode,
                 attach_only: p.attach_only,
                 // A shared project resumes held to the repository, as it was started.
                 project_share: entry.project_share,
             };
-            let spawn = self.prepare_spawn(
+            let named_mode = p.permission_mode.is_some();
+            let mut spawn = self.prepare_spawn(
                 info,
                 spec,
                 danger,
@@ -673,6 +697,7 @@ impl Daemon {
                 p.prompt,
                 MessageAttribution::from_caller(caller, p.by, None),
             )?;
+            spawn.keep_recorded_mode = named_mode;
             return Ok(SessionOpening::launch(spawn, OpeningReply::Resume));
         }
 
@@ -896,6 +921,16 @@ impl Daemon {
             .as_ref()
             .and_then(roster::Entry::restart_permission_mode)
             .unwrap_or(crate::protocol::PermissionMode::Default);
+        let inherited_mode =
+            resume_mode(caller, &runtime, p.permission_mode, Some(inherited_mode))?
+                .unwrap_or(inherited_mode);
+        if p.permission_mode.is_some()
+            && prior
+                .as_ref()
+                .is_some_and(|entry| !entry.guard_attempts.is_empty())
+        {
+            return Err(plan_restart_pending());
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
@@ -918,8 +953,11 @@ impl Daemon {
             title,
             labels_withheld: None,
             // The judged bit is stamped by `prepare_spawn` — copying it here is one more place
-            // that has to be right.
-            dangerous: false,
+            // that has to be right. A takeover that names Bypass starts unchecked, and that is
+            // recorded before launch.
+            dangerous: p
+                .permission_mode
+                .is_some_and(crate::protocol::PermissionMode::is_dangerous),
             permission_mode: Some(inherited_mode),
             created_at: now.clone(),
             updated_at: now,
@@ -939,7 +977,8 @@ impl Daemon {
             // A conversation registered as a shared project stays one when taken over.
             project_share: prior.as_ref().is_some_and(|entry| entry.project_share),
         };
-        let spawn = self.prepare_spawn(
+        let named_mode = p.permission_mode.is_some();
+        let mut spawn = self.prepare_spawn(
             info,
             spec,
             danger,
@@ -947,6 +986,7 @@ impl Daemon {
             p.prompt,
             MessageAttribution::from_caller(caller, p.by, None),
         )?;
+        spawn.keep_recorded_mode = named_mode;
         Ok(SessionOpening::launch(spawn, OpeningReply::Resume))
     }
 
@@ -1193,6 +1233,14 @@ impl Daemon {
         let mode = p
             .permission_mode
             .unwrap_or(crate::protocol::PermissionMode::Default);
+        // Naming a mode is changing a setting, judged as a switch from the mode a start without one
+        // runs in: the machine's own default. Without one, a colleague's session starts in that
+        // default as the owner's does.
+        require_owner_to_loosen(
+            Some(caller),
+            mode,
+            Some(crate::protocol::PermissionMode::Default),
+        )?;
         let agit_session = lineage_from_params(
             self.settlement_feature(),
             p.agent.as_deref(),
@@ -1287,14 +1335,7 @@ impl Daemon {
         // Judge that this runtime can really express it too. Launching with a mode it cannot
         // express gives the user a session that believes it is in `plan` and writes whatever it
         // likes.
-        let supported = crate::rc::harness::capability_of(&p.runtime);
-        if !supported.permission_modes.contains(&mode) {
-            return Err(RpcError::new(
-                ErrorCode::RuntimeUnavailable,
-                format!("{} cannot express that permission mode", p.runtime),
-            )
-            .with_hint("the picker should only offer what `capabilities` reports"));
-        }
+        require_mode_supported(&p.runtime, mode)?;
         let now = chrono::Utc::now().to_rfc3339();
         let info = SessionInfo {
             interrupt_fenced: None,
@@ -1674,8 +1715,41 @@ impl Daemon {
             prompt,
             attribution,
             capture_degraded: false,
+            keep_recorded_mode: false,
         })
     }
+}
+
+/// The mode a resume launches in: the one it names, judged as a switch from `inherited`, the mode
+/// it would otherwise run in; otherwise `inherited`. A non-owner naming a looser mode is refused and
+/// nothing launches. Continuing in the mode the owner last chose changes nothing, so a colleague's
+/// resume of a conversation the owner left in Bypass continues in Bypass (#341).
+fn resume_mode(
+    caller: &crate::protocol::CallerClaim,
+    runtime: &str,
+    named: Option<crate::protocol::PermissionMode>,
+    inherited: Option<crate::protocol::PermissionMode>,
+) -> Result<Option<crate::protocol::PermissionMode>, RpcError> {
+    let Some(mode) = named else {
+        return Ok(inherited);
+    };
+    require_owner_to_loosen(
+        Some(caller),
+        mode,
+        Some(inherited.unwrap_or(crate::protocol::PermissionMode::Default)),
+    )?;
+    require_mode_supported(runtime, mode)?;
+    Ok(Some(mode))
+}
+
+/// A conversation whose last permission change is unconfirmed comes back in Plan until its new
+/// process confirms the mode (`Entry::restart_permission_mode`); it cannot launch in another.
+fn plan_restart_pending() -> RpcError {
+    RpcError::new(
+        ErrorCode::SessionBusy,
+        "this conversation comes back in Plan until its last permission change is confirmed; nothing was launched",
+    )
+    .with_hint("resume it without choosing a mode, then switch once it is running")
 }
 
 fn require_active_runtime(runtime: &str, session_id: &str) -> Result<(), RpcError> {

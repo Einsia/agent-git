@@ -180,6 +180,7 @@ fn attach_only_never_launches_a_conversation_nothing_runs() {
                     expected_agent_id: None,
                     branch: None,
                     attach_only,
+                    permission_mode: None,
                 };
                 for (runtime, thread) in [
                     ("claude-code", "aaaaaaaa-0000-4000-8000-000000000a01"),
@@ -264,6 +265,7 @@ fn attach_only_never_resumes_a_registered_session_nothing_runs() {
                     expected_agent_id: None,
                     branch: None,
                     attach_only,
+                    permission_mode: None,
                 };
                 let starts = state.roster.starts.len();
                 let error = state
@@ -343,6 +345,7 @@ fn attach_only_joins_a_supervised_codex_session() {
                                 expected_agent_id: None,
                                 branch: None,
                                 attach_only: true,
+                                permission_mode: None,
                             },
                             &claim("owner", "ws-a"),
                             &frames,
@@ -639,6 +642,7 @@ fn a_session_that_crashed_before_binding_cannot_be_resumed_by_logical_id() {
                             expected_agent_id: None,
                             branch: None,
                             attach_only: false,
+                            permission_mode: None,
                         },
                         &claim("owner", "ws-a"),
                         &frames,
@@ -1702,6 +1706,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         generation: 1,
         shared_executor: false,
         started_process: true,
+        bypass_needs_restart: false,
         info: SessionInfo {
             interrupt_fenced: None,
             interrupted: None,
@@ -2032,6 +2037,8 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         sessions: HashMap::new(),
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        mode_restarts: HashMap::new(),
+        session_frames: None,
         exiting_launches: HashMap::new(),
         archive_recovering: HashMap::new(),
         watches: HashMap::new(),
@@ -2127,6 +2134,7 @@ async fn stale_generation_is_dropped_before_every_session_projection_side_effect
             serde_json::to_value(crate::protocol::SessionStatusChanged {
                 session_id: "session-a".into(),
                 status: SessionStatus::Ended,
+                reason: None,
             })
             .unwrap(),
         ),
@@ -2298,6 +2306,7 @@ async fn current_generation_projects_every_session_fact_and_scrubs_its_tag() {
         serde_json::to_value(crate::protocol::SessionStatusChanged {
             session_id: "session-a".into(),
             status: SessionStatus::Ended,
+            reason: None,
         })
         .unwrap(),
     );
@@ -2932,7 +2941,7 @@ fn resumed_launch_does_not_replay_the_initial_model() {
             let opening = state.prepare_resume_session(SessionResume {
                 project_id: None,
                 workspace_id:"ws".into(), session_id:"logical".into(), prompt:None,
-                by:None, agent:None, expected_agent_id:None, branch:None, attach_only: false,
+                by:None, agent:None, expected_agent_id:None, branch:None, attach_only: false, permission_mode: None,
             }, &claim("owner", "ws"), &frames, &Default::default()).unwrap();
             let SessionOpening::Launch(spawn, _) = opening else { panic!("expected a native resume"); };
             assert_eq!(spawn.spec.resume_from.as_deref(), Some("native-model-changed"));
@@ -3259,10 +3268,13 @@ async fn owner_shares_a_local_conversation_that_members_then_list_without_runnin
     std::fs::write(root.join("completed"), b"").unwrap();
 }
 
-/// A colleague starts a session in the mode the start names, as the owner does, every mode the
-/// runtime can express included, and resumes one in the mode it last ran in.
+/// A colleague's session starts in the machine's own default, as the owner's does. Naming a mode
+/// is changing a setting, judged as a switch from that default: a colleague may name it or a
+/// stricter one, and a looser one is refused before anything is reserved, while the owner's start
+/// runs in any mode the runtime can express. A colleague resumes a conversation in the mode the
+/// owner last left it in.
 #[test]
-fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
+fn a_colleague_starts_in_the_default_and_resumes_in_the_owners_mode() {
     use crate::protocol::PermissionMode as M;
     let home = tempfile::tempdir().unwrap();
     let cwd = home.path().canonicalize().unwrap();
@@ -3289,10 +3301,14 @@ fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
                     Ok(SessionOpening::Ready(_)) => panic!("nothing to replay"),
                     Err(error) => panic!("{error:?}"),
                 };
-                let modes = crate::rc::harness::capability_of("claude-code").permission_modes;
-                assert!(modes.contains(&M::AcceptEdits) && modes.contains(&M::Auto));
-                for mode in modes.iter().copied() {
-                    let start = SessionStart {
+                with_claude_bypass_offered(|| {
+                    let modes = crate::rc::harness::capability_of("claude-code").permission_modes;
+                    assert!(
+                        [M::AcceptEdits, M::Auto, M::Bypass]
+                            .iter()
+                            .all(|mode| modes.contains(mode))
+                    );
+                    let start = |mode: Option<M>| SessionStart {
                         model: None,
                         start_id: None,
                         origin: None,
@@ -3304,16 +3320,39 @@ fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
                         branch: None,
                         prompt: None,
                         by: None,
-                        permission_mode: Some(mode),
+                        permission_mode: mode,
                     };
                     let opening = state.prepare_start_session(
-                        start,
+                        start(None),
                         &claim("operator", "ws-a"),
                         &frames,
                         &Default::default(),
                     );
-                    assert_eq!(launched(opening), Some(mode), "{mode:?}");
-                }
+                    assert_eq!(launched(opening), Some(M::Default));
+                    for mode in modes.iter().copied() {
+                        let reserved = state.opening_sessions.len();
+                        let opening = state.prepare_start_session(
+                            start(Some(mode)),
+                            &claim("operator", "ws-a"),
+                            &frames,
+                            &Default::default(),
+                        );
+                        if mode.loosens_from(M::Default) {
+                            let error = opening.err().expect("a looser mode was started");
+                            assert_eq!(error.code, ErrorCode::DangerousSessionLocked as i32);
+                            assert_eq!(state.opening_sessions.len(), reserved, "{mode:?}");
+                        } else {
+                            assert_eq!(launched(opening), Some(mode), "{mode:?}");
+                        }
+                        let opening = state.prepare_start_session(
+                            start(Some(mode)),
+                            &claim("owner", "ws-a"),
+                            &frames,
+                            &Default::default(),
+                        );
+                        assert_eq!(launched(opening), Some(mode), "owner {mode:?}");
+                    }
+                });
                 let resumed = state.prepare_resume_session(
                     SessionResume {
                         project_id: None,
@@ -3325,6 +3364,7 @@ fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
                         expected_agent_id: None,
                         branch: None,
                         attach_only: false,
+                        permission_mode: None,
                     },
                     &claim("operator", "ws-a"),
                     &frames,
@@ -3333,6 +3373,153 @@ fn a_colleague_starts_and_resumes_a_session_in_the_owners_mode() {
                 assert_eq!(launched(resumed), Some(M::AcceptEdits));
             });
     });
+}
+
+/// A resume may name the mode the conversation comes back in, judged as a switch from the mode it
+/// would otherwise run in, by the same check (295): a colleague naming a looser mode is refused
+/// with the reason before anything is reserved, and a stricter one is used. The owner's Bypass
+/// launches without permission checks, marked dangerous before launch, while the record keeps the
+/// old mode until the new process binds. Without a mode, a colleague's resume continues in the mode
+/// the owner left it in, Bypass included (#341). A conversation coming back in Plan to settle an
+/// unconfirmed permission change cannot be launched in another mode.
+#[test]
+fn a_resume_names_its_mode_as_a_switch_would() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::sessions::a_resume_names_its_mode_as_a_switch_would",
+    ) {
+        return;
+    }
+    use crate::protocol::PermissionMode as M;
+    const PLAIN: &str = "aaaaaaaa-0000-4000-8000-000000000295";
+    const BYPASSED: &str = "bbbbbbbb-0000-4000-8000-000000000295";
+    const GUARDED: &str = "cccccccc-0000-4000-8000-000000000295";
+    let home = tempfile::tempdir().unwrap();
+    // SAFETY: this test runs alone in its own process.
+    unsafe {
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
+        std::env::set_var("AGIT_HOME", home.path().join("agit"));
+    }
+    let cwd = home.path().canonicalize().unwrap();
+    // Transcripts that record the mode each ran in, so only what the resume names makes one
+    // dangerous.
+    let native = home
+        .path()
+        .join("claude/projects")
+        .join(crate::adapter::claude_code::slug_for(&cwd));
+    std::fs::create_dir_all(&native).unwrap();
+    for (id, mode) in [
+        (PLAIN, "default"),
+        (BYPASSED, "bypassPermissions"),
+        (GUARDED, "default"),
+    ] {
+        let record = serde_json::json!({"type":"user", "sessionId":id, "cwd":cwd,
+            "timestamp":"2026-11-13T00:00:00Z", "permissionMode":mode,
+            "message":{"role":"user", "content":"hello"}});
+        let path = native.join(format!("{id}.jsonl"));
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        // Quiet for an hour, as a paused conversation is: nothing else is writing it.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let roster: Roster = serde_json::from_value(serde_json::json!({"sessions":{
+                "plain":{"runtime":"claude-code", "thread_id":PLAIN, "cwd":cwd,
+                    "workspace_id":"ws-a", "permission_mode":"default"},
+                "bypassed":{"runtime":"claude-code", "thread_id":BYPASSED, "cwd":cwd,
+                    "workspace_id":"ws-a", "permission_mode":"bypass", "ever_dangerous":true},
+                "guarded":{"runtime":"claude-code", "thread_id":GUARDED, "cwd":cwd,
+                    "workspace_id":"ws-a", "permission_mode":"auto",
+                    "guard_attempts":{"guard-1":{"expected_mode":"plan"}}},
+            }}))
+            .unwrap();
+            let daemon = rpc_test_daemon(HashMap::new(), roster);
+            let mut state = daemon.lock().await;
+            state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
+            let (frames, _frames_rx) = mpsc::channel(1);
+            let resume = |state: &mut Daemon, session: &str, mode: Option<M>, role: &str| {
+                let opening = state.prepare_resume_session(
+                    SessionResume {
+                        project_id: None,
+                        workspace_id: "ws-a".into(),
+                        session_id: session.into(),
+                        prompt: None,
+                        by: None,
+                        agent: None,
+                        expected_agent_id: None,
+                        branch: None,
+                        attach_only: false,
+                        permission_mode: mode,
+                    },
+                    &claim(role, "ws-a"),
+                    &frames,
+                    &Default::default(),
+                );
+                state.opening_sessions.clear();
+                match opening {
+                    Ok(SessionOpening::Launch(spawn, _)) => {
+                        assert_eq!(spawn.info.permission_mode, spawn.spec.permission_mode);
+                        Ok(spawn)
+                    }
+                    Ok(SessionOpening::Ready(_)) => panic!("nothing runs to answer with"),
+                    Err(error) => Err(error),
+                }
+            };
+
+            for mode in [M::AcceptEdits, M::Auto, M::Bypass] {
+                let error = resume(&mut state, "plain", Some(mode), "operator")
+                    .err()
+                    .expect("the resume was prepared");
+                assert_eq!(
+                    error.code,
+                    ErrorCode::DangerousSessionLocked as i32,
+                    "{mode:?}"
+                );
+            }
+            assert!(!state.roster.sessions["plain"].ever_dangerous);
+
+            let plan = resume(&mut state, "plain", Some(M::Plan), "operator").unwrap();
+            assert_eq!(plan.spec.permission_mode, Some(M::Plan));
+            assert!(plan.keep_recorded_mode && !plan.info.dangerous);
+
+            let bypass = with_claude_bypass_offered(|| {
+                resume(&mut state, "plain", Some(M::Bypass), "owner")
+            })
+            .unwrap();
+            assert_eq!(bypass.spec.effective_mode(), M::Bypass);
+            assert!(bypass.info.dangerous && bypass.keep_recorded_mode);
+            assert!(
+                state.roster.sessions["plain"].ever_dangerous,
+                "recorded before launch"
+            );
+            assert_eq!(
+                state.roster.sessions["plain"].permission_mode,
+                Some(M::Default)
+            );
+            assert!(Roster::load().sessions["plain"].ever_dangerous);
+
+            let continued = resume(&mut state, "bypassed", None, "operator").unwrap();
+            assert_eq!(continued.spec.effective_mode(), M::Bypass);
+            assert!(!continued.keep_recorded_mode);
+
+            let error = resume(&mut state, "guarded", Some(M::Default), "owner")
+                .err()
+                .expect("the resume was prepared");
+            assert!(
+                error.message.contains("comes back in Plan"),
+                "{}",
+                error.message
+            );
+            let guarded = resume(&mut state, "guarded", None, "operator").unwrap();
+            assert_eq!(guarded.spec.permission_mode, Some(M::Plan));
+        });
 }
 
 /// A shared project's start (`origin = "project_share"`) launches only a group member's Claude Code
@@ -3452,6 +3639,7 @@ fn a_shared_project_stays_shared_when_resumed_or_taken_over() {
                         expected_agent_id: None,
                         branch: None,
                         attach_only: false,
+                        permission_mode: None,
                     };
                     let marked = |opening: Result<SessionOpening, RpcError>| match opening {
                         Ok(SessionOpening::Launch(spawn, _)) => spawn.spec.project_share,

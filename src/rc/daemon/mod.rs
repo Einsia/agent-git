@@ -68,6 +68,7 @@ mod danger;
 mod dispatch;
 mod guard;
 mod leases;
+mod mode_restart;
 mod observed_capture;
 #[cfg(unix)]
 mod open_turns;
@@ -539,6 +540,9 @@ struct Live {
     /// Whether opening this session started the runtime's process (`launched` on the resume
     /// reply), rather than attaching to a terminal or a shared server already running.
     started_process: bool,
+    /// Whether a switch to Bypass takes a new process: a Claude Code process launched with
+    /// permission checks refuses to switch live, so the daemon restarts it in Bypass instead.
+    bypass_needs_restart: bool,
     tx: mpsc::Sender<Command>,
     /// The harness's own session id. **It exists only in this table** and never goes on the
     /// wire — viewers address sessions by logical session id alone, which is why "continue on
@@ -731,6 +735,20 @@ enum SessionRpcOperation {
         tx: mpsc::Sender<Command>,
         command: Command,
         reply: SessionReceipt<()>,
+    },
+    /// A switch the running process cannot take live: it stops between turns and the conversation
+    /// comes back in `mode` through the resume path (`mode_restart`).
+    RestartInMode {
+        tx: mpsc::Sender<Command>,
+        mode: crate::protocol::PermissionMode,
+        resume: SessionResume,
+        caller: crate::protocol::CallerClaim,
+        authority: crate::rc::authority::Guard,
+        /// Set once the conversation runs again or the restart gives up; dropped unsent, it
+        /// releases the instructions waiting on it all the same.
+        done: tokio::sync::watch::Sender<bool>,
+        /// A person's stop meanwhile: the conversation stays stopped.
+        stopped: tokio::sync::watch::Receiver<bool>,
     },
     Approve {
         tx: mpsc::Sender<Command>,
@@ -1178,6 +1196,12 @@ pub struct Daemon {
     latest_session_generations: HashMap<String, u64>,
     /// Reserved logical and native identities remain exclusive while a harness opens.
     opening_sessions: HashMap<String, LaunchReservation>,
+    /// Conversations stopping to come back in another mode (`mode_restart`). Instructions for one
+    /// wait until its new process runs; the sender closes if the restart is dropped unrun.
+    mode_restarts: HashMap<String, mode_restart::ModeRestart>,
+    /// The pump's sender for session frames, for a launch the daemon makes on its own (a
+    /// `mode_restart`). Set when the pump starts.
+    session_frames: Option<mpsc::Sender<Frame>>,
     /// Reservations held only until a failed launch's process tree is gone, by logical id.
     /// `true` once that tree outlived forced termination.
     exiting_launches: HashMap<String, bool>,
@@ -1637,6 +1661,47 @@ fn require_owner_if_loosening(
     .with_hint(
         "in these modes the agent stops asking before it edits or runs things — that stays with the workspace owner",
     ))
+}
+
+/// Whether running in `mode`, where a session would otherwise run in `from`, loosens its guard.
+///
+/// One ruler for every way a mode is chosen: `session.setPermissionMode` switching from the mode
+/// in effect, and the mode `session.start` or `session.resume` names instead of the one it would
+/// otherwise run in. Naming a mode is changing a setting, so it is judged as a switch. Only an
+/// unknown starting point judges the mode alone.
+fn loosens(
+    mode: crate::protocol::PermissionMode,
+    from: Option<crate::protocol::PermissionMode>,
+) -> bool {
+    from.map_or_else(|| mode.loosens_guard(), |from| mode.loosens_from(from))
+}
+
+/// [`require_owner_if_loosening`] for running in `mode` instead of `from` (see [`loosens`]).
+pub(super) fn require_owner_to_loosen(
+    caller: Option<&crate::protocol::CallerClaim>,
+    mode: crate::protocol::PermissionMode,
+    from: Option<crate::protocol::PermissionMode>,
+) -> Result<(), RpcError> {
+    require_owner_if_loosening(caller, loosens(mode, from))
+}
+
+/// Whether `runtime` can run in `mode`. Launching in a mode it cannot express gives the user a
+/// session that believes it is in `plan` and writes whatever it likes.
+fn require_mode_supported(
+    runtime: &str,
+    mode: crate::protocol::PermissionMode,
+) -> Result<(), RpcError> {
+    if crate::rc::harness::capability_of(runtime)
+        .permission_modes
+        .contains(&mode)
+    {
+        return Ok(());
+    }
+    Err(RpcError::new(
+        ErrorCode::RuntimeUnavailable,
+        format!("{runtime} cannot express that permission mode"),
+    )
+    .with_hint("the picker should only offer what `capabilities` reports"))
 }
 
 /// Tell clients whether an error clears without anyone acting, under a stable `reason`.
