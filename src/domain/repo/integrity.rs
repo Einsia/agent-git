@@ -32,6 +32,11 @@ pub struct Damage {
 }
 
 /// Loose object files with no content, sorted by object id.
+///
+/// Git's own maintenance may run meanwhile: a repack moves loose objects into a pack and removes
+/// the files, and the fan-out directories they leave empty. A directory or file gone between
+/// listing and reading held no empty object, so it is passed over. Taken as an error, it fails
+/// every commit, a turn's included, while a background `gc` runs.
 pub fn empty_loose_objects(repo: &Repo) -> Result<Vec<String>> {
     let directory = repo.git_path("objects")?;
     let mut found = Vec::new();
@@ -49,8 +54,13 @@ pub fn empty_loose_objects(repo: &Repo) -> Result<Vec<String>> {
             continue;
         }
         let path = entry.path();
-        let objects =
-            std::fs::read_dir(&path).with_context(|| format!("cannot list {}", path.display()))?;
+        let objects = match std::fs::read_dir(&path) {
+            Ok(objects) => objects,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot list {}", path.display()));
+            }
+        };
         for object in objects {
             let object = object.with_context(|| format!("cannot list {}", path.display()))?;
             let rest = object.file_name().to_string_lossy().into_owned();
@@ -58,9 +68,14 @@ pub fn empty_loose_objects(repo: &Repo) -> Result<Vec<String>> {
             if !matches!(rest.len(), 38 | 62) || !is_hex(&rest) {
                 continue;
             }
-            let metadata = object
-                .metadata()
-                .with_context(|| format!("cannot inspect {}", object.path().display()))?;
+            let metadata = match object.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot inspect {}", object.path().display()));
+                }
+            };
             if metadata.is_file() && metadata.len() == 0 {
                 found.push(format!("{prefix}{rest}"));
             }
@@ -373,5 +388,33 @@ mod tests {
         std::fs::write(&loose, content).unwrap();
         refuse_damaged_parents(&repo, &[&tip]).unwrap();
         assert!(recorded(&repo).unwrap().is_empty());
+    }
+
+    /// A fan-out directory listed and then gone, as a repack leaves it, holds no damage, and the
+    /// guard before every commit lets the commit through; an empty object beside it is still
+    /// found. The directory is a
+    /// link to nothing here, so it is listed and then can't be read, every time.
+    #[cfg(unix)]
+    #[test]
+    fn a_fan_out_directory_gone_while_listing_holds_no_damage() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(directory.path()).unwrap();
+        std::fs::write(directory.path().join("page.md"), "content\n").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Page").unwrap();
+        let tip = repo.git(&["rev-parse", "HEAD"]).unwrap();
+        let objects = repo.git_path("objects").unwrap();
+        let gone = (0..=255)
+            .map(|byte| format!("{byte:02x}"))
+            .find(|prefix| prefix != "ee" && !objects.join(prefix).exists())
+            .unwrap();
+        std::os::unix::fs::symlink(directory.path().join("repacked"), objects.join(&gone)).unwrap();
+        assert!(empty_loose_objects(&repo).unwrap().is_empty());
+        refuse_damaged_parents(&repo, &[&tip]).unwrap();
+
+        let empty = format!("{}{}", "e".repeat(2), "0".repeat(38));
+        std::fs::create_dir_all(objects.join(&empty[..2])).unwrap();
+        std::fs::write(objects.join(&empty[..2]).join(&empty[2..]), b"").unwrap();
+        assert_eq!(empty_loose_objects(&repo).unwrap(), [empty]);
     }
 }
