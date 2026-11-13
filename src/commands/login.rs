@@ -335,6 +335,7 @@ fn save_obtained(hub: &str, signed_in: &mut SignedIn) -> crate::Result<Option<Wi
         .is_some_and(|previous| credential.account_id.as_deref() != Some(previous.as_str()))
     {
         crate::rc::step_delivery::forget_all();
+        crate::rc::waiting_messages::forget_all();
         crate::commands::memory::forget_codex_mirrors();
     }
     let mut withdrawal = None;

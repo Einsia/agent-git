@@ -47,6 +47,17 @@ impl Daemon {
         crate::rc::step_delivery::sweep(|session| {
             crate::adapter::claude_code::locate_transcript(session, None).is_some()
         });
+        // Messages left waiting go with a conversation this device no longer runs, and after a
+        // day.
+        crate::rc::waiting_messages::sweep(
+            |conversation| {
+                roster
+                    .sessions
+                    .values()
+                    .any(|entry| entry.thread_id == conversation)
+            },
+            chrono::Utc::now().timestamp_millis(),
+        );
         // Privacy dependencies are opened only by the isolated worker after daemon startup.
         let d = Arc::new(Mutex::new(Daemon {
             identity: identity.clone(),
@@ -1214,6 +1225,10 @@ impl Daemon {
         let _ = tokio::time::timeout(FLEET_EXIT_GRACE, async {
             let mut tasks = vec![];
             for (_, l) in self.sessions.drain() {
+                // Whatever the stop, the conversation outlives this daemon: what waits for its next
+                // turn stays for the session that continues it. Without room for this, the
+                // dropped sender says the same.
+                let _ = l.tx.try_send(Command::DaemonExiting);
                 let _ = l.tx.try_send(match self.stop_cause {
                     StopCause::Person => Command::Shutdown,
                     StopCause::Unattended | StopCause::Upgrade => Command::ShutdownUnattended,

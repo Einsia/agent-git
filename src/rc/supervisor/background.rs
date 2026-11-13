@@ -17,6 +17,7 @@ fn instruction(command: &Command) -> bool {
             _ => true,
         },
         Command::Keep { .. }
+        | Command::DaemonExiting
         | Command::Shutdown
         | Command::ShutdownUnattended
         | Command::ClaudeRestartGuardReady => false,
@@ -96,6 +97,7 @@ impl Session {
             }
             Command::InitialTurn { .. }
             | Command::Keep { .. }
+            | Command::DaemonExiting
             | Command::Shutdown
             | Command::ShutdownUnattended
             | Command::ClaudeRestartGuardReady => Ok(()),
@@ -195,6 +197,7 @@ impl Session {
                 .await;
             }
             Command::Keep { .. }
+            | Command::DaemonExiting
             | Command::Shutdown
             | Command::ShutdownUnattended
             | Command::ClaudeRestartGuardReady => {}
