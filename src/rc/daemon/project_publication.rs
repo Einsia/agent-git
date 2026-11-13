@@ -621,9 +621,12 @@ fn choose_own_binding(
         &destination.agent_id,
         crate::rc::folder_destination::ChosenFor::Project(project.to_owned()),
     )?;
+    // A terminal policy turned off stays off and where it was: moving it runs `agit on`, which
+    // would turn uploads back on that the person turned off themselves.
     if let Some((policy, account)) = crate::commands::project::own_policy(key.root())
         && policy != repository
         && account == key.account()
+        && crate::commands::project::uploads_automatically(key.root()) == Some(true)
     {
         move_terminal(key.root(), repository)?;
     }
@@ -1709,6 +1712,50 @@ mod tests {
         );
         assert_eq!(terminal_first.chosen("account-lin"), "lin/lumen");
 
+        // Her terminal choice turned off with `agit off`: the web binding is the folder's, and the
+        // terminal policy stays off and where it was. Moving it runs `agit on`, which would turn
+        // her uploads back on.
+        let turned_off = fixture("account-lin");
+        crate::commands::project::save_policy_for_test(
+            &turned_off.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        crate::commands::project::turn_policy_off_for_test(&turned_off.directory);
+        let personal = turned_off.target(
+            "lin/lumen",
+            OWN,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        assert_eq!(turned_off.reconcile(&personal), (Decision::Own, vec![]));
+        assert_eq!(
+            crate::commands::project::uploads_automatically(&turned_off.directory),
+            Some(false)
+        );
+
+        // The Hub binding the folder to the repository her turned-off terminal policy names, as
+        // it does for a folder whose origin that repository is linked to: nothing moves, and the
+        // policy stays off. This is the path a device that reports nothing takes too.
+        let same = fixture("account-lin");
+        crate::commands::project::save_policy_for_test(
+            &same.directory,
+            "simco/lumen-agents",
+            &org,
+            "account-lin",
+        );
+        crate::commands::project::turn_policy_off_for_test(&same.directory);
+        let terminal_repository = same.target(
+            "simco/lumen-agents",
+            ORG,
+            serde_json::json!({"bound_by": "account-lin"}),
+        );
+        assert_eq!(same.reconcile(&terminal_repository).1, vec![]);
+        assert_eq!(
+            crate::commands::project::uploads_automatically(&same.directory),
+            Some(false)
+        );
+
         // Her web binding first, then `agit on --repo` for the organization: the folder is the
         // organization's, and the personal project's new conversations hold, even after the next
         // reconcile.
@@ -1748,6 +1795,50 @@ mod tests {
             "it keeps its start"
         );
         assert_eq!(web_first.chosen("account-lin"), "simco/lumen-agents");
+    }
+
+    /// What a folder bind reports to the Hub: the account's own record for the folder, else its
+    /// terminal choice, and whether its uploads are off; read without writing, so a bind the
+    /// person cancels, or one the Hub answers with a choice, leaves no record of a destination
+    /// they never confirmed. A report that wrote the record would make the next binding read as
+    /// "already the folder's destination".
+    #[test]
+    fn a_folder_bind_reports_where_the_folder_uploads_without_recording_it() {
+        if crate::rc::in_isolated_test(
+            "rc::daemon::project_publication::tests::a_folder_bind_reports_where_the_folder_uploads_without_recording_it",
+        ) {
+            return;
+        }
+        let folder = fixture("account-lin");
+        let report =
+            || local_repository::publication::folder_destination(&folder.directory, HUB).unwrap();
+        assert_eq!(report(), None, "nothing chosen");
+        crate::commands::project::save_policy_for_test(
+            &folder.directory,
+            "simco/lumen-agents",
+            &RemoteIdentity::new(HUB, ORG).unwrap(),
+            "account-lin",
+        );
+        assert_eq!(
+            report(),
+            Some(crate::protocol::PublicationTarget {
+                repository: "simco/lumen-agents".into(),
+                agent_id: ORG.into(),
+            }),
+            "the terminal choice"
+        );
+        assert!(
+            crate::rc::folder_destination::chosen(&folder.key("account-lin"))
+                .unwrap()
+                .is_none(),
+            "reporting it records nothing"
+        );
+        crate::commands::project::turn_policy_off_for_test(&folder.directory);
+        assert_eq!(
+            crate::commands::project::uploads_automatically(&folder.directory),
+            Some(false),
+            "a folder turned off reports so"
+        );
     }
 
     /// Lin's folder at upgrade: her terminal policy names the organization repository, her

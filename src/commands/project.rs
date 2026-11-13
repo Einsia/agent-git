@@ -2978,6 +2978,14 @@ pub(crate) fn save_policy_for_test(
     .unwrap();
 }
 
+/// Turns `folder`'s own policy off as `agit off` does, keeping where it uploads.
+#[cfg(test)]
+pub(crate) fn turn_policy_off_for_test(folder: &Path) {
+    let mut project = read(&folder.canonicalize().unwrap()).unwrap().unwrap();
+    project.enabled = false;
+    save(&project).unwrap();
+}
+
 /// The repository `folder`'s own policy uploads to and the account it is for (as
 /// [`credentials::account_key`] names it); `None` when the folder has no policy of its own.
 pub(crate) fn own_policy(folder: &Path) -> Option<(String, String)> {

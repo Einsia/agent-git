@@ -305,6 +305,18 @@ impl crate::rc::authority::Authority for ExecutionAuthority {
         Some(grant)
     }
 
+    fn folder_bind_owner(&self) -> Option<agit_peer::access::Principal> {
+        if self.permit.method != crate::protocol::method::PROJECT_BIND {
+            return None;
+        }
+        let grant = self.grant.as_ref()?;
+        (grant.session_controller.is_none()
+            && grant.project_controller.is_none()
+            && grant.caller == grant.target.owner
+            && grant.source.owner == grant.target.owner)
+            .then(|| grant.target.owner.clone())
+    }
+
     fn publication_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
         if self.permit.method != crate::protocol::method::SESSION_PUBLICATION_DELIVER {
             return None;
@@ -810,13 +822,20 @@ mod tests {
             "owner-grant"
         );
         assert!(frame.authority.publication_grant().is_err());
+        let bind = client
+            .authorize(Frame::request("project.bind", json!({})))
+            .unwrap();
+        assert!(bind.authority.owned_machine_grant().is_err());
+        // A folder bind names its owner, for the folder's destination, and lends nothing else.
+        assert_eq!(bind.authority.folder_bind_owner(), Some(owner.clone()));
+        assert!(frame.authority.folder_bind_owner().is_none());
         assert!(
-            client
+            unbound
                 .authorize(Frame::request("project.bind", json!({})))
                 .unwrap()
                 .authority
-                .owned_machine_grant()
-                .is_err()
+                .folder_bind_owner()
+                .is_none()
         );
         registry.state.write().unwrap().policy = Policy::default();
         assert!(frame.authority.owned_machine_grant().is_err());
@@ -831,6 +850,14 @@ mod tests {
                 .authority
                 .owned_machine_grant()
                 .is_err()
+        );
+        assert!(
+            foreign
+                .authorize(Frame::request("project.bind", json!({})))
+                .unwrap()
+                .authority
+                .folder_bind_owner()
+                .is_none()
         );
         drop(client);
         assert!(frame.authority.owned_machine_grant().is_err());
