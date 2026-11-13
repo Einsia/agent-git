@@ -882,6 +882,7 @@ impl Daemon {
                 writer_released: false,
                 writer_process: None,
                 status_since: std::time::Instant::now(),
+                last_named: std::time::Instant::now(),
                 info: info.clone(),
                 shared_executor,
                 started_process,

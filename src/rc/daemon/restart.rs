@@ -31,10 +31,16 @@ impl Live {
     /// message. One whose saving step couldn't start need not wait that long: only the restart
     /// saves its turns, so it may go as soon as its turn is over.
     pub(super) fn idle_detachable(&self) -> bool {
+        self.idle_detachable_at(std::time::Instant::now())
+    }
+
+    /// [`Live::idle_detachable`] as of `now`.
+    pub(super) fn idle_detachable_at(&self, now: std::time::Instant) -> bool {
         !self.shared_executor
             && self.started_process
             && self.info.status == SessionStatus::Idle
-            && (self.settlement_unstartable || self.status_since.elapsed() >= IDLE_DETACH)
+            && (self.settlement_unstartable
+                || now.saturating_duration_since(self.status_since) >= IDLE_DETACH)
             && self.tx.capacity() == COMMAND_QUEUE_CAPACITY
             && !self.rpc_guard_sensitive
             && self.pending_mode.is_none()
@@ -46,6 +52,75 @@ impl Live {
 }
 
 impl Daemon {
+    /// The request in `frame` names a session: it is followed for another [`IDLE_DETACH`].
+    pub(super) fn note_named(&mut self, frame: &Frame, now: std::time::Instant) {
+        if let Some(live) = frame
+            .params
+            .as_ref()
+            .and_then(|params| params["session_id"].as_str())
+            .and_then(|id| self.sessions.get_mut(id))
+        {
+            live.last_named = now;
+        }
+    }
+
+    /// End the writers nobody follows, as an upgrade ends them: idle past [`IDLE_DETACH`] with
+    /// nothing queued, pending or awaiting an approval ([`Live::idle_detachable`]), and named by
+    /// no request for as long. Each is recorded as paused, so the page says it was paused, not
+    /// lost, and the next message resumes it. The daemon keeps no record of who reads a writer's
+    /// events, so a request naming the session stands for a reader: a page left open with no
+    /// request for that long sees the conversation paused and its next message resumes it.
+    /// Without this, every conversation opened from the Hub keeps its runtime resident until the
+    /// daemon exits.
+    pub(super) fn reap_idle_writers(&mut self, now: std::time::Instant) {
+        let idle: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(id, live)| {
+                live.idle_detachable_at(now)
+                    && now.saturating_duration_since(live.last_named) >= IDLE_DETACH
+                    && live.rpc_lanes_idle_except(None)
+                    // A turn recorded open has not been seen to end; stopping its writer would
+                    // leave it to be closed later as interrupted.
+                    && !self.roster.open_turns.contains_key(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if idle.is_empty() {
+            return;
+        }
+        let at = chrono::Utc::now().to_rfc3339();
+        let mut recorded = false;
+        for id in idle {
+            let Some(live) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            if live.tx.try_send(Command::ShutdownUnattended).is_err() {
+                continue;
+            }
+            // The writer stays listed until its stop completes; a later pass must not stop it
+            // again or record a second pause.
+            live.last_named = now;
+            crate::rc::diagnostics::event(
+                "session.ended",
+                serde_json::json!({
+                    "session_id": crate::rc::diagnostics::id(&id),
+                    "generation": live.generation,
+                    "reason": "idle",
+                }),
+            );
+            if self.roster.get(&id).is_some() {
+                self.roster
+                    .paused
+                    .insert(id, crate::protocol::Pause { at: at.clone() });
+                recorded = true;
+            }
+        }
+        if recorded && let Err(error) = self.roster.save() {
+            eprintln!("agitd: the paused conversations could not be recorded: {error:#}");
+        }
+    }
+
     pub(super) fn prepare_safe_stop(
         &self,
         request: &SafeStopRequest,
@@ -293,6 +368,138 @@ mod tests {
             state.prepare_safe_stop(&request, &admission, false, || false),
             Err(RestartRefusal::Busy(_))
         ));
+    }
+
+    /// A writer nobody follows ends on its own, as an upgrade ends it: idle past [`IDLE_DETACH`]
+    /// and named by no request for as long, it is told to stop once and recorded as paused, with
+    /// its roster entry kept, so the next subscriber reads it as paused and its next message
+    /// resumes it. One a request named within that time, one waiting for an approval, one with
+    /// work queued, one whose RPC is in flight and one with a turn recorded open keep running.
+    /// A daemon that never ended idle writers keeps every conversation opened from the Hub
+    /// resident; one that went by status alone ends a conversation someone is still reading; one
+    /// that skipped any of the other checks cuts off an approval, a queued message, a reply on
+    /// its way or a turn; one that stopped a writer again on the next pass, after the supervisor
+    /// took the first stop, records a second pause.
+    #[test]
+    fn an_idle_writer_nobody_names_is_paused_and_a_followed_or_busy_one_keeps_running() {
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use crate::protocol::PermissionMode;
+                    let now = std::time::Instant::now();
+                    let long_ago = now
+                        .checked_sub(IDLE_DETACH + std::time::Duration::from_secs(1))
+                        .unwrap();
+                    let mut roster = Roster::default();
+                    let mut sessions = HashMap::new();
+                    let mut commands = HashMap::new();
+                    for (id, status) in [
+                        ("agit-left", SessionStatus::Idle),
+                        ("agit-named", SessionStatus::Idle),
+                        ("agit-asking", SessionStatus::AwaitingApproval),
+                        ("agit-queued", SessionStatus::Idle),
+                        ("agit-replying", SessionStatus::Idle),
+                        ("agit-turning", SessionStatus::Idle),
+                    ] {
+                        roster.sessions.insert(
+                            id.into(),
+                            super::super::tests::rpc_test_roster_entry(id, PermissionMode::Default),
+                        );
+                        let (tx, rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+                        commands.insert(id, rx);
+                        let mut live =
+                            super::super::tests::rpc_test_live(id, 1, tx, PermissionMode::Default);
+                        live.info.status = status;
+                        live.status_since = long_ago;
+                        live.last_named = long_ago;
+                        sessions.insert(id.to_string(), live);
+                    }
+                    roster.open_turns.insert(
+                        "agit-turning".into(),
+                        crate::rc::roster::OpenTurn {
+                            turn_id: "turn-1".into(),
+                            runtime: "codex".into(),
+                            thread_id: "thread-agit-turning".into(),
+                            cwd: "/w".into(),
+                            writer: None,
+                            stopped_by_person: false,
+                        },
+                    );
+                    sessions["agit-queued"]
+                        .tx
+                        .try_send(Command::Shutdown)
+                        .unwrap();
+                    let _held = sessions["agit-replying"]
+                        .rpc_gate
+                        .clone()
+                        .lock_owned()
+                        .await;
+                    let daemon = super::super::tests::rpc_test_daemon(sessions, roster);
+                    let mut state = daemon.lock().await;
+                    let named = Frame::request(
+                        method::SESSION_SUBSCRIBE,
+                        serde_json::json!({"session_id": "agit-named"}),
+                    );
+                    state.note_named(&named, now);
+
+                    state.reap_idle_writers(now);
+                    // The supervisor takes the stop at once; the writer stays listed until it ends.
+                    assert!(matches!(
+                        commands.get_mut("agit-left").unwrap().try_recv(),
+                        Ok(Command::ShutdownUnattended)
+                    ));
+                    state.reap_idle_writers(now + std::time::Duration::from_secs(1));
+                    assert!(
+                        commands.get_mut("agit-left").unwrap().try_recv().is_err(),
+                        "a writer already told to stop is not told again"
+                    );
+                    for id in ["agit-named", "agit-asking", "agit-replying", "agit-turning"] {
+                        assert!(
+                            commands.get_mut(id).unwrap().try_recv().is_err(),
+                            "{id} keeps running"
+                        );
+                    }
+                    assert!(matches!(
+                        commands.get_mut("agit-queued").unwrap().try_recv(),
+                        Ok(Command::Shutdown)
+                    ));
+                    assert!(
+                        commands.get_mut("agit-queued").unwrap().try_recv().is_err(),
+                        "a writer with work queued keeps running"
+                    );
+                    let saved = Roster::load();
+                    assert_eq!(saved.paused.keys().collect::<Vec<_>>(), ["agit-left"]);
+                    assert!(
+                        saved.sessions.contains_key("agit-left"),
+                        "its next message resumes it from the roster"
+                    );
+                    assert_eq!(
+                        saved.open_turns.keys().collect::<Vec<_>>(),
+                        ["agit-turning"],
+                        "an open turn is neither closed nor added by the reaper"
+                    );
+
+                    // Its stop completed: the next subscriber hears it was paused.
+                    state.sessions.remove("agit-left");
+                    let (frames, _) = mpsc::channel(1);
+                    let mut subscribe = Frame::request(
+                        method::SESSION_SUBSCRIBE,
+                        serde_json::json!({"session_id": "agit-left"}),
+                    );
+                    subscribe.caller = Some(super::super::tests::claim("viewer", "ws-a"));
+                    let data = state
+                        .dispatch(&subscribe, &frames)
+                        .await
+                        .unwrap_err()
+                        .data
+                        .unwrap();
+                    assert!(data["paused"]["at"].is_string(), "{data}");
+                })
+        });
     }
 
     /// An upgrade ends a conversation on a runtime only the daemon runs once it has sat idle past

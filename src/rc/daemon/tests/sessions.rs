@@ -1746,6 +1746,7 @@ async fn next_turn_mode_stays_pending_until_the_immediate_fact_arrives() {
         writer_released: false,
         writer_process: None,
         status_since: std::time::Instant::now(),
+        last_named: std::time::Instant::now(),
     };
     let event = |applied| {
         Frame::notification(
