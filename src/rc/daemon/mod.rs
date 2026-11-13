@@ -2541,10 +2541,14 @@ fn read_preview(path: &std::path::Path, offset: u64) -> Result<FsReadFileResult,
         )
     })?;
     if meta.is_dir() {
-        return Err(
-            RpcError::new(ErrorCode::MalformedFrame, "that path is a directory")
-                .with_hint("use fs.readDirectory for folders"),
-        );
+        // `kind` lets a page tell a folder from a failed read without parsing the message; the
+        // code stays the one older pages already handle.
+        let mut error = RpcError::new(ErrorCode::MalformedFrame, "that path is a directory")
+            .with_hint("use fs.readDirectory for folders");
+        if let Some(data) = error.data.as_mut() {
+            data["kind"] = serde_json::json!("directory");
+        }
+        return Err(error);
     }
     let size = meta.len();
     let mut f = std::fs::File::open(path).map_err(|e| {
@@ -2574,11 +2578,22 @@ fn read_preview(path: &std::path::Path, offset: u64) -> Result<FsReadFileResult,
         )
     })?;
     let nominal = &buf[..nominal_len.min(buf.len())];
+    let window = utf8_preview_window(&buf, nominal_len);
+    let has_nul = nominal.contains(&0);
 
-    let mime = mime_of(path);
+    // The table decides the types it knows. For a name it does not know, the bytes decide:
+    // without that, a `.env`, a `.csv` or code in a language the table lacks is sent as binary
+    // and the page offers no preview of plain text.
+    let mut mime = mime_of(path);
+    // The window skips the tail of a character the previous page holds; the file's own first
+    // page has no previous page, so a continuation byte there is not text.
+    let sniffed = if offset == 0 { nominal } else { window };
+    if mime == UNKNOWN_MIME && !has_nul && starts_as_utf8(sniffed) {
+        mime = "text/plain".to_string();
+    }
     // The test is "does it contain a NUL byte", not the extension: an extension lies, and no
     // text format should contain a NUL.
-    let is_binary = nominal.contains(&0) || !mime.starts_with("text/") && !is_texty(&mime);
+    let is_binary = has_nul || !mime.starts_with("text/") && !is_texty(&mime);
     // Pagination advances by the nominal byte window, not by the UTF-8
     // look-ahead included in this response.
     let truncated = offset + (nominal_len as u64) < size;
@@ -2599,7 +2614,7 @@ fn read_preview(path: &std::path::Path, offset: u64) -> Result<FsReadFileResult,
             path: path.to_string_lossy().to_string(),
             size,
             mime,
-            text: Some(String::from_utf8_lossy(utf8_preview_window(&buf, nominal_len)).to_string()),
+            text: Some(String::from_utf8_lossy(window).to_string()),
             base64: None,
             is_binary: false,
             truncated,
@@ -2607,8 +2622,22 @@ fn read_preview(path: &std::path::Path, offset: u64) -> Result<FsReadFileResult,
     })
 }
 
+const UNKNOWN_MIME: &str = "application/octet-stream";
+
+/// How much of a file of unknown type is read to decide that it is text.
+const TEXT_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Whether the start of `bytes` is UTF-8. A character cut by the end of the sniffed prefix
+/// still counts: the prefix ends at an arbitrary byte.
+fn starts_as_utf8(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(&bytes[..bytes.len().min(TEXT_SNIFF_BYTES)]) {
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none(),
+    }
+}
+
 /// Extension → MIME. Covers only what the previewer actually renders; everything else is
-/// octet-stream.
+/// octet-stream, which `read_preview` turns into plain text when the content is text.
 fn mime_of(path: &std::path::Path) -> String {
     let ext = path
         .extension()
@@ -2629,12 +2658,14 @@ fn mime_of(path: &std::path::Path) -> String {
         "mp4" => "video/mp4",
         "json" => "application/json",
         "md" => "text/markdown",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
         "html" | "htm" => "text/html",
         "css" => "text/css",
         "js" | "mjs" | "ts" | "tsx" | "jsx" => "text/javascript",
         "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "sh" | "toml" | "yaml" | "yml"
         | "sql" | "txt" | "log" | "ini" | "cfg" | "lock" | "" => "text/plain",
-        _ => "application/octet-stream",
+        _ => UNKNOWN_MIME,
     }
     .to_string()
 }

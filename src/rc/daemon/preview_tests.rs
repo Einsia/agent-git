@@ -1,8 +1,11 @@
 use super::*;
 
-/// Deciding "binary or not" uses NUL bytes, not the extension — extensions lie (a PNG stuffed
-/// into a `.txt`, a `.log` that is gzip), and no text format may contain a NUL. Getting it wrong
-/// pushes a screenful of garbage into the previewer, or renders an image as text.
+/// Deciding "binary or not" uses the content, not the extension — extensions lie (a PNG stuffed
+/// into a `.txt`, a `.log` that is gzip), no text format may contain a NUL, and a name the type
+/// table does not know (`.env`, a language it lacks) says nothing either way. Getting it wrong
+/// pushes a screenful of garbage into the previewer, renders an image as text, or offers no
+/// preview of plain text. A sniff that demands the whole prefix decode cleanly calls text binary
+/// when the prefix ends inside a character.
 #[test]
 fn binary_detection_does_not_trust_the_extension() {
     let dir = tempfile::tempdir().unwrap();
@@ -20,6 +23,38 @@ fn binary_detection_does_not_trust_the_extension() {
     let r = read_preview(&liar, 0).unwrap();
     assert!(r.is_binary, "content with a NUL must be treated as binary");
     assert!(r.base64.is_some() && r.text.is_none());
+
+    // The table does not know the name; the content is text.
+    let env = dir.path().join("robotwin2-261113b.env");
+    std::fs::write(&env, "API_URL=http://localhost\n").unwrap();
+    let r = read_preview(&env, 0).unwrap();
+    assert!(!r.is_binary);
+    assert_eq!(r.mime, "text/plain");
+    assert_eq!(r.text.as_deref(), Some("API_URL=http://localhost\n"));
+
+    // CJK fixture (multi-byte boundary): the sniffed prefix ends inside `预`.
+    let cut = dir.path().join("cut.unknown");
+    let mut body = "a".repeat(TEXT_SNIFF_BYTES - 1);
+    body.push('预');
+    std::fs::write(&cut, &body).unwrap();
+    let r = read_preview(&cut, 0).unwrap();
+    assert!(
+        !r.is_binary,
+        "a character cut by the sniffed prefix is still text"
+    );
+
+    // Neither the name nor the content says text; a file that opens with the tail of a
+    // character is not text either, though a later page may start there.
+    for (name, bytes) in [
+        ("blob.dat", &[0xff, 0xfe, b'A', b'B'][..]),
+        ("tail.dat", &[0x80, 0x80, b'A', b'B'][..]),
+    ] {
+        let blob = dir.path().join(name);
+        std::fs::write(&blob, bytes).unwrap();
+        let r = read_preview(&blob, 0).unwrap();
+        assert!(r.is_binary, "{name}");
+        assert_eq!(r.mime, "application/octet-stream", "{name}");
+    }
 }
 
 /// A single `read()` handing back less than asked for is legal (interrupted by a signal, NFS,
@@ -118,16 +153,17 @@ fn a_huge_file_is_truncated_rather_than_refused() {
     assert!(r.text.unwrap().len() as u64 <= FILE_PREVIEW_CAP);
 }
 
+/// A folder is said to be a folder, in a field a page can test, under the code pages that
+/// predate the field already handle. A page that can only read the message treats a link to a
+/// folder as a failed read.
 #[test]
 fn a_directory_is_rejected_with_a_next_step() {
     let dir = tempfile::tempdir().unwrap();
     let e = read_preview(dir.path(), 0).unwrap_err();
-    assert!(
-        e.data.unwrap()["hint"]
-            .as_str()
-            .unwrap()
-            .contains("readDirectory")
-    );
+    assert!(e.is(ErrorCode::MalformedFrame));
+    let data = e.data.unwrap();
+    assert_eq!(data["kind"], "directory");
+    assert!(data["hint"].as_str().unwrap().contains("readDirectory"));
 }
 
 #[test]
@@ -143,4 +179,5 @@ fn previewable_kinds_get_the_mime_the_browser_needs() {
     // binary.
     assert!(is_texty(&mime_of(std::path::Path::new("/x/i.svg"))));
     assert_eq!(mime_of(std::path::Path::new("/x/Makefile")), "text/plain");
+    assert_eq!(mime_of(std::path::Path::new("/x/prices.csv")), "text/csv");
 }
