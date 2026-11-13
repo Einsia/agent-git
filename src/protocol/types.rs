@@ -396,7 +396,8 @@ pub struct FsReadFile {
 pub struct FsReadFileResult {
     pub path: String,
     pub size: u64,
-    /// Guessed MIME; the frontend picks the preview pane from it.
+    /// Guessed MIME, from the extension, or `text/plain` for an extension the device does not
+    /// know whose content is text; the frontend picks the preview pane from it.
     pub mime: String,
     /// Text content (present when `is_binary == false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
