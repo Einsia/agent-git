@@ -1988,6 +1988,36 @@ fn readable_fork_sources(
         .collect()
 }
 
+/// The most paths one listing in [`listed_paths`] names, so its command line stays well within
+/// what every platform takes.
+const LISTED_PATHS: usize = 64;
+
+/// Which of `paths` the tree of `commit` lists. Fails when a tree on the way to any of them can't
+/// be read, so a path missing from the answer is one the tree doesn't hold, never one this
+/// repository lost. Whether a listed path's own object is here is not asked.
+fn listed_paths(repo: &Repo, commit: &str, paths: &[&str]) -> Result<Vec<String>> {
+    let mut listed = Vec::new();
+    for paths in paths.chunks(LISTED_PATHS) {
+        let mut args = vec!["ls-tree", "-z", "--full-tree", "--name-only", commit, "--"];
+        args.extend(paths);
+        let output = repo.git_with_policy(&args, crate::domain::repo::ReadPolicy::LocalOnly)?;
+        listed.extend(
+            output
+                .split('\0')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    Ok(listed)
+}
+
+/// Whether the snapshot `commit` holds a publication envelope, that is, is published encrypted.
+/// It is plain only when its tree reads and lists no envelope: a tree on the way that can't be
+/// read is an error, so a receipt never calls what may be encrypted plain.
+fn published_encrypted(repo: &Repo, commit: &str) -> Result<bool> {
+    Ok(!listed_paths(repo, commit, &["privacy/envelope.json"])?.is_empty())
+}
+
 /// The records with parts left out that one publication has met, each counted once.
 #[derive(Default)]
 struct LeftOut {
@@ -2001,6 +2031,11 @@ struct LeftOut {
 /// publication adds and those a public parent of it already holds. A record met before in this
 /// publication is not looked up again, and the rest are looked up in one batch, so a long
 /// history of snapshots that each carry the same records costs no Git process per record.
+///
+/// A record no parent holds is added only when every parent's tree reads and lists no such path.
+/// One a parent lists without holding its object, or that lies below a tree the parent can't
+/// read, is an error: counted as added, a record the person saw left out before is announced as
+/// new.
 fn count_left_out(
     repo: &Repo,
     public_parents: &[String],
@@ -2032,6 +2067,18 @@ fn count_left_out(
             Ok(())
         },
     )?;
+    let missing: Vec<&str> = unknown
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !held.contains(index))
+        .map(|(_, path)| path.as_str())
+        .collect();
+    for parent in public_parents {
+        ensure!(
+            listed_paths(repo, parent, &missing)?.is_empty(),
+            "a published snapshot lists a record whose object this repository doesn't hold"
+        );
+    }
     for (index, path) in unknown.into_iter().enumerate() {
         if held.contains(&index) {
             seen.published.insert(path);
@@ -3434,7 +3481,7 @@ impl ProjectedHistory {
                 receipt.mode = PublicationMode::SessionPlain;
             }
             let object = format!("{}:privacy/envelope.json", candidate.public_head);
-            if self.repo.git(&["cat-file", "-e", &object]).is_ok() {
+            if published_encrypted(&self.repo, &candidate.public_head)? {
                 let bytes = read(
                     &self.repo,
                     &["cat-file", "blob", &object],
@@ -3695,6 +3742,77 @@ impl ProjectedHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Sorting records with parts left out into added and published reads each public parent's
+    /// tree: one a parent holds is published, one no parent's tree lists is added, and one below a
+    /// tree this repository lost, or listed without its object, fails the count. A batch check
+    /// reads those last two as missing too, so a count built on it alone announces a record the
+    /// person saw left out before as new.
+    ///
+    /// The same listing decides whether a receipt is encrypted: a snapshot holding an envelope is,
+    /// one whose `privacy/` holds none is plain, and one whose `privacy/` tree is lost fails. Asked
+    /// with `cat-file -e`, the lost tree reads as plain, and an encrypted snapshot gets a plain
+    /// receipt.
+    #[test]
+    fn a_record_below_a_lost_tree_is_neither_added_nor_published() {
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        for path in [
+            "events/a/1",
+            "events/a/2",
+            "events/b/3",
+            "privacy/other.json",
+        ] {
+            let file = temp.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, path).unwrap();
+        }
+        git(temp.path(), &["add", "-A"]);
+        git(temp.path(), &["commit", "-q", "-m", "snapshot"]);
+        let head = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        let repo = Repo::at(temp.path());
+        let count = |paths: &[&str]| {
+            let mut seen = LeftOut::default();
+            count_left_out(
+                &repo,
+                std::slice::from_ref(&head),
+                paths.iter().map(|path| (*path).to_owned()).collect(),
+                &mut seen,
+            )
+            .map(|()| (seen.added, seen.published))
+        };
+        let (added, published) = count(&["events/a/1", "events/a/9", "events/c/4"]).unwrap();
+        assert_eq!(
+            added,
+            BTreeSet::from(["events/a/9".into(), "events/c/4".into()])
+        );
+        assert_eq!(published, BTreeSet::from(["events/a/1".into()]));
+        assert!(!published_encrypted(&repo, &head).unwrap());
+        std::fs::write(temp.path().join("privacy/envelope.json"), "{}").unwrap();
+        git(temp.path(), &["add", "-A"]);
+        git(temp.path(), &["commit", "-q", "-m", "encrypted snapshot"]);
+        let encrypted = git(temp.path(), &["rev-parse", "HEAD"]).trim().to_owned();
+        assert!(published_encrypted(&repo, &encrypted).unwrap());
+
+        let lose = |spec: &str| {
+            let oid = git(temp.path(), &["rev-parse", spec]).trim().to_owned();
+            let object = temp
+                .path()
+                .join(".git/objects")
+                .join(&oid[..2])
+                .join(&oid[2..]);
+            // Renamed rather than removed: Git writes loose objects read-only.
+            std::fs::rename(object, temp.path().join(oid)).unwrap();
+        };
+        lose("HEAD:events/b");
+        lose("HEAD:events/a/2");
+        lose("HEAD:privacy");
+        assert!(count(&["events/b/3"]).is_err());
+        assert!(count(&["events/b/9"]).is_err());
+        assert!(count(&["events/a/2"]).is_err());
+        assert!(published_encrypted(&repo, &encrypted).is_err());
+        assert_eq!(count(&["events/a/1"]).unwrap().1.len(), 1);
+    }
 
     /// A v0 snapshot keeps its session in the three root files, and an `events/` directory beside
     /// them is the repository's own content: a snapshot whose records are all published needs no
