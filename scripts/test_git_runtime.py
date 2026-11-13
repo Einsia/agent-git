@@ -22,6 +22,9 @@ spec.loader.exec_module(mirror)
 spec = importlib.util.spec_from_file_location("sources", Path(__file__).with_name("git-runtime-sources.py"))
 sources = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sources)
+spec = importlib.util.spec_from_file_location("pins", Path(__file__).with_name("check-git-runtime-pins.py"))
+pins = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pins)
 
 
 class RuntimeArchiveTests(unittest.TestCase):
@@ -197,6 +200,32 @@ class RuntimeArchiveTests(unittest.TestCase):
         for platform, archive, checksum in pins:
             asset = f"git-lfs-{platform}-v{version}.{archive}"
             self.assertTrue((checksum, asset) in mirrored, f"{platform}: {asset} at {checksum} is not a mirrored pin")
+
+    def test_pin_watch_fails_on_a_lost_pin_and_names_a_replaced_alpine_version(self):
+        """The scheduled check fails when a pinned file is gone or changed, and names upstream's newer version.
+
+        A watch that treated a 404 or a changed body as success, or that read a newer Alpine version
+        as nothing to report, would let a release build be the first to find out.
+        """
+        directory = "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64"
+        bodies = {"kept": b"kept", "replaced": b"replaced", "changed": b"changed"}
+        lock = {"linux": {"x86_64": [
+            {"name": name, "version": "1-r0", "url": f"{directory}/{name}-1-r0.apk", "sha256": hashlib.sha256(body).hexdigest()}
+            for name, body in bodies.items()
+        ] + [{"name": "gone", "version": "1-r0", "url": f"{directory}/gone-1-r0.apk", "sha256": "0" * 64}]}}
+
+        def fetch(url):
+            name = url.rsplit("/", 1)[-1].split("-1-r0")[0]
+            if name == "gone":
+                raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+            return b"tampered" if name == "changed" else bodies[name]
+
+        index = {"kept": "1-r0", "replaced": "2-r0", "changed": "1-r0"}
+        failures, moved = pins.check(lock, fetch_bytes=fetch, read_index=lambda found: index)
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(any("gone-1-r0.apk cannot be downloaded" in failure for failure in failures))
+        self.assertTrue(any("changed-1-r0.apk no longer matches" in failure for failure in failures))
+        self.assertEqual(moved, [f"replaced 1-r0 -> 2-r0 ({directory})"])
 
 
 class RuntimeSourceTests(unittest.TestCase):
