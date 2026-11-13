@@ -122,6 +122,7 @@ pub mod tail;
 pub mod terminal;
 pub mod ticket;
 pub mod tunnel;
+pub mod waiting_messages;
 #[cfg(windows)]
 pub(crate) mod windows_job;
 pub(crate) mod writer_release;

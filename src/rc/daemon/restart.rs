@@ -507,7 +507,9 @@ mod tests {
     /// with nothing else. One idle for less, or waiting for an approval, still holds the upgrade.
     /// An upgrade that waits on every idle conversation is held for ever by one forgotten
     /// conversation; one that ends a young or busy one cuts someone off; one that ends it silently
-    /// leaves the person thinking it was lost.
+    /// leaves the person thinking it was lost. Its session hears that the daemon is going before
+    /// the stop itself: a stop alone reads as the conversation's own end, which drops the messages
+    /// waiting for its next turn instead of keeping them for the session that continues it.
     #[test]
     fn an_upgrade_ends_only_long_idle_conversations_and_says_they_were_paused() {
         let home = tempfile::tempdir().unwrap();
@@ -577,6 +579,15 @@ mod tests {
                     drop(frozen);
                     state.stop_cause = StopCause::Upgrade;
                     state.shutdown().await;
+                    let told: Vec<_> =
+                        std::iter::from_fn(|| receivers[0].try_recv().ok()).collect();
+                    assert!(
+                        matches!(
+                            told.as_slice(),
+                            [Command::DaemonExiting, Command::ShutdownUnattended]
+                        ),
+                        "the session hears the daemon is going, then the stop"
+                    );
                     let saved = Roster::load();
                     assert_eq!(saved.paused.keys().collect::<Vec<_>>(), ["agit-left"]);
                     assert!(saved.interrupted.is_empty(), "nothing was cut");

@@ -7,9 +7,18 @@
 //! authority, Default or Plan only for a non-owner, and the owner's home folder. A message
 //! admitted when it arrived is not admitted when it goes on that strength alone: the mode or the
 //! sender's access can change while a turn runs.
+//!
+//! What waits for the next turn is also kept on the device (`rc::waiting_messages`), so a daemon
+//! restart doesn't lose it. A message read back after a restart has no authority: a file can't
+//! hold one. It goes once its own sender's next turn or steer to the conversation is admitted,
+//! under that request's authority, ahead of it and of anything that came after it. A request from
+//! anyone else, the owner included, never sends it: that would send one account's words on
+//! another's authority. One its sender doesn't come back for within a day is dropped, and they
+//! are told.
 
 use super::*;
 use crate::rc::step_delivery;
+use crate::rc::waiting_messages;
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
@@ -22,6 +31,33 @@ pub(super) struct QueuedTurn {
     owner: bool,
     /// When it was queued.
     arrived: tokio::time::Instant,
+    /// When it arrived, in wall-clock milliseconds: what the device keeps across a restart.
+    arrived_ms: i64,
+    /// Its place among the messages a restart left waiting, when it is one of them.
+    restored: Option<u64>,
+}
+
+impl QueuedTurn {
+    fn stored(&self) -> waiting_messages::Stored {
+        waiting_messages::Stored {
+            message: self.message.clone(),
+            client_msg_id: self.attribution.client_msg_id.clone(),
+            sender: self.attribution.sender.clone(),
+            by: self.attribution.by.clone(),
+            arrived_ms: self.arrived_ms,
+        }
+    }
+}
+
+/// A message a restart left waiting: its words and sender as the device kept them, and its place
+/// among them. It carries no authority until its sender's next request gives it one.
+struct Restored {
+    stored: waiting_messages::Stored,
+    order: u64,
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// An owner's message the plugin holds for the running turn's next tool step: the conversation
@@ -72,6 +108,12 @@ pub(super) struct SteerQueue {
     waiting: VecDeque<QueuedTurn>,
     /// When this session last admitted a request from each account.
     confirmed: HashMap<String, tokio::time::Instant>,
+    /// What a restart left waiting, until each one's sender comes back.
+    restored: VecDeque<Restored>,
+    /// The daemon told this session it is going away, or let go of it without a word.
+    pub(super) daemon_leaving: bool,
+    /// The daemon is stopping with this session: what waits stays on the device, unsaid.
+    pub(super) keep_on_end: bool,
     /// Turn starts of queued messages as their receipts come back, by client message id.
     pub(super) outcomes: (
         mpsc::UnboundedSender<Started>,
@@ -118,6 +160,9 @@ impl Default for SteerQueue {
             next_order: 0,
             waiting: VecDeque::new(),
             confirmed: HashMap::new(),
+            restored: VecDeque::new(),
+            daemon_leaving: false,
+            keep_on_end: false,
             outcomes: mpsc::unbounded_channel(),
         }
     }
@@ -133,6 +178,8 @@ impl Session {
             authority: pending.reply.authority(),
             owner: pending.reply.owner_control(),
             arrived: tokio::time::Instant::now(),
+            arrived_ms: now_ms(),
+            restored: None,
         };
         let framed = step_delivery::framed(&queued.message);
         // The record comes first, so it exists before the plugin can hand the text over. Without
@@ -159,6 +206,7 @@ impl Session {
                 return;
             }
             self.steer_queue.waiting.push_back(queued);
+            self.persist_waiting();
             self.resolve_steer(pending, Ok(Delivery::WhenIdle)).await;
             return;
         };
@@ -227,6 +275,7 @@ impl Session {
                 .await;
         } else {
             self.steer_queue.waiting.push_back(steer.queued);
+            self.persist_waiting();
         }
     }
 
@@ -263,32 +312,221 @@ impl Session {
     /// unreported. Its record stays, so a hand-over still counts as the owner's words, and its
     /// sender is told nothing the device can't confirm. A record whose message never goes vouches
     /// only for that exact text, which nothing else writes.
+    ///
+    /// When the daemon stops with the session, nothing waiting is reported: the device keeps it
+    /// for the session that continues the conversation.
     pub(super) async fn abandon_steers(&mut self) {
         self.steer_queue.receipt = None;
         self.steer_queue.receipt_turn_over = None;
         self.steer_queue.held.clear();
         let waiting: Vec<QueuedTurn> = self.steer_queue.waiting.drain(..).collect();
-        for queued in waiting {
-            self.report_steer_dropped(&queued.attribution, "session_ended")
-                .await;
+        let restored: Vec<Restored> = self.steer_queue.restored.drain(..).collect();
+        if self.steer_queue.keep_on_end {
+            return;
         }
+        for queued in waiting {
+            let reason = if queued.restored.is_some() {
+                "device_restarted"
+            } else {
+                "session_ended"
+            };
+            self.report_steer_dropped(&queued.attribution, reason).await;
+        }
+        for restored in restored {
+            self.report_restored_dropped(&restored.stored).await;
+        }
+        self.persist_waiting();
+    }
+
+    /// Keeps on the device what waits for the next turn, in the order it arrived, so a restart
+    /// doesn't lose it. A conversation without an id yet keeps nothing.
+    fn persist_waiting(&self) {
+        let Some(conversation) = self.driver.runtime_thread_id() else {
+            return;
+        };
+        let mut waiting: Vec<waiting_messages::Stored> = self
+            .steer_queue
+            .restored
+            .iter()
+            .map(|restored| restored.stored.clone())
+            .chain(self.steer_queue.waiting.iter().map(QueuedTurn::stored))
+            .collect();
+        waiting.sort_by_key(|stored| stored.arrived_ms);
+        if waiting_messages::save(&conversation, &waiting).is_err() {
+            tracing_note("the messages waiting for the next turn couldn't be kept on this device");
+        }
+    }
+
+    /// Reads back what a restart left waiting for this conversation's next turn. One past its
+    /// age is dropped now, and its sender told.
+    pub(super) async fn restore_waiting(&mut self) {
+        let Some(conversation) = self.driver.runtime_thread_id() else {
+            return;
+        };
+        let now = now_ms();
+        let mut expired = false;
+        for (order, stored) in (0u64..).zip(waiting_messages::load(&conversation)) {
+            if stored.expired(now) {
+                self.report_restored_dropped(&stored).await;
+                expired = true;
+            } else {
+                self.steer_queue
+                    .restored
+                    .push_back(Restored { stored, order });
+            }
+        }
+        if expired {
+            self.persist_waiting();
+        }
+    }
+
+    /// Drops what a restart left waiting once it is past its age, and tells its senders.
+    async fn expire_restored(&mut self) {
+        let now = now_ms();
+        let expired: VecDeque<Restored> = {
+            let restored = std::mem::take(&mut self.steer_queue.restored);
+            let (expired, kept): (VecDeque<Restored>, VecDeque<Restored>) = restored
+                .into_iter()
+                .partition(|restored| restored.stored.expired(now));
+            self.steer_queue.restored = kept;
+            expired
+        };
+        if expired.is_empty() {
+            return;
+        }
+        for restored in &expired {
+            self.report_restored_dropped(&restored.stored).await;
+        }
+        self.persist_waiting();
+    }
+
+    /// `command` was admitted for its sender's account: the messages a restart left waiting from
+    /// that account, and only those, go under its authority, ahead of everything that came after
+    /// them. A turn it asks for while the session is idle then waits behind them, answered as
+    /// queued, as a steer that can't reach a turn is; anything else goes on as it came.
+    pub(super) async fn release_restored(&mut self, command: Command) -> Option<Command> {
+        if self.steer_queue.restored.is_empty() {
+            return Some(command);
+        }
+        let (authority, owner) = match &command {
+            Command::Turn { reply, .. } => (reply.authority(), reply.owner_control()),
+            Command::Steer { reply, .. } => (reply.authority(), reply.owner_control()),
+            _ => return Some(command),
+        };
+        let Some(account) = command.sender_account().map(str::to_owned) else {
+            return Some(command);
+        };
+        let (released, kept): (VecDeque<Restored>, VecDeque<Restored>) =
+            std::mem::take(&mut self.steer_queue.restored)
+                .into_iter()
+                .partition(|restored| {
+                    restored
+                        .stored
+                        .sender
+                        .as_ref()
+                        .is_some_and(|sender| sender.account_id == account)
+                });
+        self.steer_queue.restored = kept;
+        if released.is_empty() {
+            return Some(command);
+        }
+        // Released ones go ahead of everything queued since the restart, in the order they
+        // arrived, among any released earlier for another account.
+        let mut front: Vec<QueuedTurn> = Vec::new();
+        while self
+            .steer_queue
+            .waiting
+            .front()
+            .is_some_and(|queued| queued.restored.is_some())
+        {
+            front.extend(self.steer_queue.waiting.pop_front());
+        }
+        front.extend(released.into_iter().map(|restored| QueuedTurn {
+            attribution: MessageAttribution {
+                by: restored.stored.by.clone(),
+                sender: restored.stored.sender.clone(),
+                client_msg_id: restored.stored.client_msg_id.clone(),
+                native_prompt_id: None,
+                owner,
+            },
+            message: restored.stored.message,
+            authority: authority.clone(),
+            owner,
+            arrived: tokio::time::Instant::now(),
+            arrived_ms: restored.stored.arrived_ms,
+            restored: Some(restored.order),
+        }));
+        front.sort_by_key(|queued| queued.restored);
+        for queued in front.into_iter().rev() {
+            self.steer_queue.waiting.push_front(queued);
+        }
+        let command = match command {
+            Command::Turn {
+                message,
+                attribution,
+                guard_attempt: None,
+                reply,
+            } if self.may_start_queued() => {
+                let queued_words = self.redactor.scrub(&message).text;
+                self.emit(
+                    method::TURN_STEERED,
+                    crate::protocol::TurnSteered {
+                        message: queued_words,
+                        delivery: Delivery::WhenIdle,
+                        by: attribution.by.clone(),
+                        sender: attribution.sender.clone(),
+                        client_msg_id: attribution.client_msg_id.clone(),
+                        native_prompt_id: None,
+                    },
+                )
+                .await;
+                let operation_id = attribution
+                    .client_msg_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                self.steer_queue.waiting.push_back(QueuedTurn {
+                    message,
+                    attribution,
+                    authority,
+                    owner,
+                    arrived: tokio::time::Instant::now(),
+                    arrived_ms: now_ms(),
+                    restored: None,
+                });
+                reply.finish(Ok(TurnStartOutcome::NativeSubmission {
+                    operation_id,
+                    delivery: Delivery::WhenIdle,
+                }));
+                None
+            }
+            command => Some(command),
+        };
+        self.persist_waiting();
+        command
+    }
+
+    /// Whether a waiting message may start a turn now: none runs or waits to start.
+    fn may_start_queued(&self) -> bool {
+        !(self.turn_running()
+            || self.driver.has_active_turn()
+            || self.info.status == SessionStatus::Ended
+            || self.stopping_turn.is_some()
+            || self.pending_turn_command.is_some()
+            || self.pending_steer_command.is_some())
     }
 
     /// The next waiting message as a Turn command, once no turn runs or waits to start; the ones
     /// the session's gates refuse now are dropped and their senders told.
     pub(super) async fn next_queued_turn(&mut self) -> Option<Command> {
+        if !self.steer_queue.restored.is_empty() {
+            self.expire_restored().await;
+        }
         loop {
-            if self.steer_queue.waiting.is_empty()
-                || self.turn_running()
-                || self.driver.has_active_turn()
-                || self.info.status == SessionStatus::Ended
-                || self.stopping_turn.is_some()
-                || self.pending_turn_command.is_some()
-                || self.pending_steer_command.is_some()
-            {
+            if self.steer_queue.waiting.is_empty() || !self.may_start_queued() {
                 return None;
             }
             let queued = self.steer_queue.waiting.pop_front()?;
+            self.persist_waiting();
             if let Some(reason) = self.refused_at_delivery(&queued) {
                 self.report_steer_dropped(&queued.attribution, reason).await;
                 continue;
@@ -334,6 +572,18 @@ impl Session {
             Err(_) => "access_ended",
         };
         self.report_steer_dropped(attribution, reason).await;
+    }
+
+    /// Tells the sender that a message a restart left waiting won't go: they send it again.
+    async fn report_restored_dropped(&self, stored: &waiting_messages::Stored) {
+        let attribution = MessageAttribution {
+            by: stored.by.clone(),
+            sender: stored.sender.clone(),
+            client_msg_id: stored.client_msg_id.clone(),
+            ..Default::default()
+        };
+        self.report_steer_dropped(&attribution, "device_restarted")
+            .await;
     }
 
     /// Tells the sender a message the device took won't reach a turn: ids, who sent it, and a
@@ -385,6 +635,8 @@ mod tests {
             authority,
             owner,
             arrived: tokio::time::Instant::now(),
+            arrived_ms: now_ms(),
+            restored: None,
         }
     }
 
@@ -446,6 +698,239 @@ mod tests {
             Some(Command::Turn { message, .. }) => message,
             _ => panic!("expected a Turn command"),
         }
+    }
+
+    const OWNER: &str = r#"["https://cloud.example","owner"]"#;
+
+    /// A message waiting for the next turn, sent by `account`.
+    fn waiting_from(account: &str, message: &str) -> QueuedTurn {
+        let mut queued = queued(message, account == OWNER, Default::default());
+        queued.attribution.sender = sent_by(Some(account)).sender;
+        queued
+    }
+
+    /// A turn `account` asks for, and the receipt its answer comes back on.
+    fn turn_from(
+        account: &str,
+        message: &str,
+    ) -> (Command, crate::rc::ticket::Receipt<TurnStartOutcome>) {
+        let (reply, receipt) = crate::rc::ticket::ticket();
+        let mut attribution = sent_by(Some(account));
+        attribution.client_msg_id = Some(message.into());
+        let turn = Command::Turn {
+            message: message.into(),
+            attribution,
+            guard_attempt: None,
+            reply,
+        };
+        (turn, receipt)
+    }
+
+    fn waiting_on_device(conversation: &str) -> Vec<String> {
+        waiting_messages::load(conversation)
+            .into_iter()
+            .map(|stored| stored.message)
+            .collect()
+    }
+
+    /// Runs `test` on a current-thread runtime with its own AGIT_HOME: the waiting-message files
+    /// live there, and the home override is visible only to this thread.
+    fn with_home<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(test())
+        });
+    }
+
+    /// What waits for the next turn when the daemon stops is still there for the session that
+    /// continues the conversation, and no sender is told otherwise. Read back, nothing of it goes
+    /// by itself: a file holds no authority. A request from an account sends that account's
+    /// messages only, in the order they arrived and ahead of the turn it asks for, which is
+    /// answered as queued; the owner's request leaves a colleague's waiting, and a keep, which
+    /// asks for nothing, sends nothing. A queue that went by itself after the restart would run
+    /// words under no one's authority, and one any request released would send a colleague's
+    /// words on the owner's.
+    #[test]
+    fn a_restart_keeps_what_waits_and_only_its_senders_next_request_sends_it() {
+        with_home(|| async {
+            let (mut before, mut out) = idle_session();
+            let conversation = before
+                .driver
+                .runtime_thread_id()
+                .expect("a conversation id");
+            for (account, message) in [(OWNER, "owner-1"), (MEMBER, "member-1"), (OWNER, "owner-2")]
+            {
+                before
+                    .steer_queue
+                    .waiting
+                    .push_back(waiting_from(account, message));
+                before.persist_waiting();
+            }
+            before.steer_queue.keep_on_end = true;
+            before.abandon_steers().await;
+            assert!(dropped(&mut out).is_empty(), "a daemon stop tells nobody");
+            assert_eq!(
+                waiting_on_device(&conversation),
+                ["owner-1", "member-1", "owner-2"]
+            );
+            before.driver.shutdown().await.unwrap();
+
+            let (mut after, mut out) = idle_session();
+            after.restore_waiting().await;
+            assert!(
+                after.next_queued_turn().await.is_none(),
+                "nothing goes by itself"
+            );
+            assert!(after.release_restored(keep(Some(OWNER))).await.is_some());
+            assert!(
+                after.next_queued_turn().await.is_none(),
+                "a keep sends nothing"
+            );
+
+            let (turn, mut receipt) = turn_from(OWNER, "owner-3");
+            assert!(
+                after.release_restored(turn).await.is_none(),
+                "the owner's turn waits behind the owner's earlier messages"
+            );
+            assert!(matches!(
+                receipt.wait_until_closed().await,
+                Ok(Ok(TurnStartOutcome::NativeSubmission {
+                    delivery: Delivery::WhenIdle,
+                    ..
+                }))
+            ));
+            let queued: Vec<_> = std::iter::from_fn(|| out.try_recv().ok())
+                .filter(|frame| frame.method() == method::TURN_STEERED)
+                .map(|frame| frame.params_as::<crate::protocol::TurnSteered>().unwrap())
+                .map(|steered| (steered.client_msg_id, steered.delivery))
+                .collect();
+            assert_eq!(queued, [(Some("owner-3".into()), Delivery::WhenIdle)]);
+            for message in ["owner-1", "owner-2", "owner-3"] {
+                assert_eq!(turn_message(after.next_queued_turn().await), message);
+            }
+            assert!(
+                after.next_queued_turn().await.is_none(),
+                "the owner's request leaves a colleague's message waiting"
+            );
+            assert_eq!(waiting_on_device(&conversation), ["member-1"]);
+
+            assert!(after.release_restored(steer(Some(MEMBER))).await.is_some());
+            assert_eq!(turn_message(after.next_queued_turn().await), "member-1");
+            assert!(waiting_on_device(&conversation).is_empty());
+            assert!(dropped(&mut out).is_empty());
+            after.driver.shutdown().await.unwrap();
+        });
+    }
+
+    /// A message a restart left waiting is dropped, its sender told why, once it can't go: a day
+    /// after it arrived, or when the session ends for any reason but the daemon's stop. Then the
+    /// device keeps nothing of it. A message from before the restart that just stayed would wait
+    /// on the page as queued for good.
+    #[test]
+    fn a_message_a_restart_left_waiting_is_dropped_with_its_reason_once_it_cannot_go() {
+        with_home(|| async {
+            let (mut session, mut out) = idle_session();
+            let conversation = session
+                .driver
+                .runtime_thread_id()
+                .expect("a conversation id");
+            let mut old = waiting_from(MEMBER, "old").stored();
+            old.arrived_ms = now_ms() - waiting_messages::MAX_AGE_MS;
+            let fresh = waiting_from(MEMBER, "fresh").stored();
+            waiting_messages::save(&conversation, &[old, fresh]).unwrap();
+            session.restore_waiting().await;
+            assert_eq!(
+                dropped(&mut out),
+                [("old".to_owned(), "device_restarted".to_owned())]
+            );
+            assert_eq!(waiting_on_device(&conversation), ["fresh"]);
+
+            session
+                .steer_queue
+                .waiting
+                .push_back(waiting_from(OWNER, "since"));
+            session.abandon_steers().await;
+            assert_eq!(
+                dropped(&mut out),
+                [
+                    ("since".to_owned(), "session_ended".to_owned()),
+                    ("fresh".to_owned(), "device_restarted".to_owned()),
+                ]
+            );
+            assert!(waiting_on_device(&conversation).is_empty());
+            session.driver.shutdown().await.unwrap();
+        });
+    }
+
+    /// A runtime that exits on its own ends the session as any end but the daemon's stop does:
+    /// what a restart left waiting is dropped, its sender told, and the device keeps nothing of
+    /// it. A session that cleaned up only when its status changed would keep it past a runtime's
+    /// own exit, and its sender's next message to the resumed conversation would send it.
+    #[test]
+    fn a_runtime_that_exits_drops_what_a_restart_left_waiting() {
+        with_home(|| async {
+            let (mut session, mut out) = idle_session();
+            let conversation = session
+                .driver
+                .runtime_thread_id()
+                .expect("a conversation id");
+            waiting_messages::save(&conversation, &[waiting_from(MEMBER, "pending").stored()])
+                .unwrap();
+            session.driver.shutdown().await.unwrap();
+            let (_daemon, commands) = mpsc::channel(1);
+            tokio::time::timeout(std::time::Duration::from_secs(30), session.run(commands))
+                .await
+                .expect("the session ends with its runtime");
+            assert_eq!(
+                dropped(&mut out),
+                [("pending".to_owned(), "device_restarted".to_owned())]
+            );
+            assert!(waiting_on_device(&conversation).is_empty());
+        });
+    }
+
+    /// Through the session's own loop, a stop keeps what a restart left waiting only when the
+    /// daemon said first that it is going away; then nobody is told and the device keeps it. A
+    /// stop alone, a person's or one that restarts the process to change its mode, ends the
+    /// conversation here: it is dropped and its sender told. A session that kept it on any stop
+    /// would send it again with the sender's next message to a conversation they stopped, or to
+    /// one that only changed mode; one that ignored the daemon's word would lose it at an upgrade.
+    #[test]
+    fn only_the_daemons_word_ahead_of_a_stop_keeps_what_a_restart_left_waiting() {
+        with_home(|| async {
+            for announced in [true, false] {
+                let (session, mut out) = idle_session();
+                let conversation = session
+                    .driver
+                    .runtime_thread_id()
+                    .expect("a conversation id");
+                waiting_messages::save(&conversation, &[waiting_from(MEMBER, "pending").stored()])
+                    .unwrap();
+                // The sender stays open: the stop, not a daemon letting go, ends the session.
+                let (daemon, commands) = mpsc::channel(4);
+                if announced {
+                    daemon.try_send(Command::DaemonExiting).unwrap();
+                }
+                daemon.try_send(Command::Shutdown).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(30), session.run(commands))
+                    .await
+                    .expect("the session ends with the stop");
+                if announced {
+                    assert!(dropped(&mut out).is_empty(), "a daemon stop tells nobody");
+                    assert_eq!(waiting_on_device(&conversation), ["pending"]);
+                } else {
+                    assert_eq!(
+                        dropped(&mut out),
+                        [("pending".to_owned(), "device_restarted".to_owned())]
+                    );
+                    assert!(waiting_on_device(&conversation).is_empty());
+                }
+            }
+        });
     }
 
     /// When the session ends, a message the plugin holds keeps its delivery record and its sender

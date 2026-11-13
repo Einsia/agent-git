@@ -1333,6 +1333,10 @@ pub enum Command {
     },
     /// The sender of a message waiting for the next turn is still allowed to send it.
     Keep { attribution: MessageAttribution },
+    /// The daemon is stopping, and this session with it: the messages waiting for its next turn
+    /// stay on this device for the session that continues the conversation, and their senders
+    /// are told nothing. Sent ahead of the stop itself.
+    DaemonExiting,
     /// Stop at a person's request: a turn it cuts is held like their own interrupt.
     Shutdown,
     /// Stop that nobody chose for the running turn: it ends where agit stops it.
@@ -1352,7 +1356,7 @@ pub enum Command {
 fn accept(c: &Command) -> bool {
     match c {
         Command::ClaudeRestartGuardReady => true,
-        Command::InitialTurn { .. } | Command::Keep { .. } => true,
+        Command::InitialTurn { .. } | Command::Keep { .. } | Command::DaemonExiting => true,
         Command::Model { reply, .. }
         | Command::Runtime { reply, .. }
         | Command::Enqueue { reply, .. } => reply.accept(),
@@ -2404,6 +2408,9 @@ impl Session {
         let generation = self.generation;
         let notes = self.notes.clone();
         self.run_inner(&mut commands).await;
+        // However the session ended, a runtime's own exit included, what waits for its next turn
+        // is dropped and its senders told, unless the daemon is stopping with it.
+        self.abandon_steers().await;
         let exiting = std::time::Instant::now();
         let log = |event: &str, extra: serde_json::Value| {
             let mut metadata = serde_json::json!({
@@ -2524,6 +2531,7 @@ impl Session {
     async fn run_inner(&mut self, commands: &mut mpsc::Receiver<Command>) {
         // Native ownership is announced before commands run; repository preparation is independent.
         self.bind_if_known().await;
+        self.restore_waiting().await;
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(TAIL_POLL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -2592,6 +2600,24 @@ impl Session {
                     if let Some(command) = &cmd {
                         self.steer_queue.admitted(command, from_queue);
                     }
+                    // It also lets that account's messages a restart left waiting go, under its
+                    // authority; a turn it asks for then waits behind them.
+                    let cmd = match cmd {
+                        Some(Command::DaemonExiting) => {
+                            self.steer_queue.daemon_leaving = true;
+                            continue;
+                        }
+                        Some(command) if !from_queue => match self.release_restored(command).await {
+                            Some(command) => Some(command),
+                            None => continue,
+                        },
+                        // The daemon let go of this session without a word: it is going away.
+                        None => {
+                            self.steer_queue.daemon_leaving = true;
+                            None
+                        }
+                        other => other,
+                    };
                     if let Some(command) = &cmd
                         && let Err(error) = self.prepare_fallback_instruction(command).await {
                             self.reject_fallback_instruction(cmd.expect("command was checked"), error).await;
@@ -2599,6 +2625,13 @@ impl Session {
                         }
                     match cmd {
                         None | Some(Command::Shutdown | Command::ShutdownUnattended) => {
+                            // What waits for the next turn stays only when the daemon itself is
+                            // going away with this session. A stop that arrives on its own — a
+                            // person's, or one that restarts the process to change its mode —
+                            // ends the conversation here, so its senders are told.
+                            if self.steer_queue.daemon_leaving {
+                                self.steer_queue.keep_on_end = true;
+                            }
                             // Recorded before the wait: a runtime that exits during it without
                             // ending the turn must still leave a turn this stop cut, not one that
                             // ended on its own. A person's interrupt already on its way wins.
@@ -2735,7 +2768,7 @@ impl Session {
                             }
                             if self.info.status == SessionStatus::Ended { return; }
                         }
-                        Some(Command::Keep { .. }) => {}
+                        Some(Command::Keep { .. } | Command::DaemonExiting) => {}
                         Some(Command::Interrupt { expected_turn_id, reply }) => {
                             if self.pending_interrupt_command.is_some() {
                                 reply.finish(Err(anyhow::anyhow!("a native stop is awaiting its receipt")));

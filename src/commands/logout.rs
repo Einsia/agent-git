@@ -65,6 +65,7 @@ pub fn run(args: Args) -> CmdResult {
     if removed.records > 0 {
         // Records of messages delivered under this account leave the device with it.
         crate::rc::step_delivery::forget_all();
+        crate::rc::waiting_messages::forget_all();
         // Codex's copies of memory made under this account leave the device with it.
         crate::commands::memory::forget_codex_mirrors();
         ui::success(&format!("logged out of {hub}"));
@@ -94,6 +95,7 @@ fn run_all() -> CmdResult {
     let forgot = credentials::forget_pending()?;
     // Records of messages delivered under these accounts leave the device with them.
     crate::rc::step_delivery::forget_all();
+    crate::rc::waiting_messages::forget_all();
     // Codex's copies of memory made under these accounts leave the device with them.
     crate::commands::memory::forget_codex_mirrors();
     let all = credentials::all_checked()?;
