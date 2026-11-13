@@ -319,6 +319,10 @@ pub struct ClaudeCodeDriver {
     /// Current permission mode, kept so viewers joining late render the right
     /// control without asking the harness.
     mode: PermissionMode,
+    /// Whether this process was launched with `--dangerously-skip-permissions`. Only such a
+    /// process takes a live switch into `bypassPermissions`; any other answers
+    /// `bypass_not_launched`, so a switch into Bypass there takes a new process.
+    launched_unchecked: bool,
     model: Option<String>,
     effort: Option<String>,
     effort_known: bool,
@@ -566,6 +570,7 @@ impl ClaudeCodeDriver {
             stream_items: Default::default(),
             pending_approvals: Default::default(),
             mode,
+            launched_unchecked: mode.is_dangerous(),
             model: spec.model,
             effort: None,
             effort_known: false,
@@ -827,6 +832,12 @@ impl ClaudeCodeDriver {
         &mut self,
         mode: PermissionMode,
     ) -> PermissionModeChangeResult {
+        // The daemon restarts such a session instead; nothing reaches Claude that it would refuse.
+        if self.needs_restart_for(mode) {
+            return Err(PermissionModeChangeError::refused(
+                "this Claude Code process was started with permission checks, so it cannot switch to Bypass without restarting",
+            ));
+        }
         let request_id = uuid::Uuid::new_v4().to_string();
         self.proc
             .write_line(&json!({
@@ -1035,6 +1046,12 @@ impl ClaudeCodeDriver {
 
     pub fn permission_mode(&self) -> PermissionMode {
         self.mode
+    }
+
+    /// Whether switching to `mode` takes a new process: Bypass on a process launched with
+    /// permission checks, which Claude refuses to switch live.
+    pub fn needs_restart_for(&self, mode: PermissionMode) -> bool {
+        mode.is_dangerous() && !self.launched_unchecked
     }
 
     pub async fn next_event(&mut self) -> Option<HarnessEvent> {
@@ -1484,6 +1501,7 @@ impl ClaudeCodeDriver {
     #[cfg(all(test, unix))]
     pub(crate) fn set_test_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
+        self.launched_unchecked |= mode.is_dangerous();
     }
 
     #[cfg(test)]
@@ -1503,6 +1521,7 @@ impl ClaudeCodeDriver {
             model_catalog: vec![],
             pending_model_request: None,
             mode: PermissionMode::Default,
+            launched_unchecked: false,
             ready_sent: true,
             commands: vec![],
             pushback: Default::default(),
@@ -1792,6 +1811,79 @@ mod tests {
         assert!(argv(&allowed, "sid", false).contains(&"--dangerously-skip-permissions".into()));
     }
 
+    /// Only a launch in Bypass carries Claude's flag for skipping permission checks, and no launch
+    /// carries `--allow-dangerously-skip-permissions`: with that one, any later switch into Bypass
+    /// passes Claude, and only the daemon's owner check would stand in its way.
+    #[test]
+    fn only_a_bypass_launch_skips_permission_checks() {
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+            PermissionMode::Bypass,
+        ] {
+            for resume_from in [None, Some("sid")] {
+                let spec = LaunchSpec {
+                    cwd: PathBuf::from("/tmp"),
+                    resume_from: resume_from.map(Into::into),
+                    agit_session: None,
+                    model: None,
+                    dangerous: false,
+                    permission_mode: Some(mode),
+                    attach_only: false,
+                    project_share: false,
+                };
+                let args = argv(&spec, "sid", resume_from.is_some());
+                assert!(
+                    !args.contains(&"--allow-dangerously-skip-permissions".to_string()),
+                    "{mode:?} {resume_from:?}"
+                );
+                assert_eq!(
+                    args.contains(&"--dangerously-skip-permissions".to_string()),
+                    mode.is_dangerous(),
+                    "{mode:?} {resume_from:?}"
+                );
+            }
+        }
+    }
+
+    /// Claude refuses to switch a process launched with permission checks into Bypass
+    /// (`bypass_not_launched`), so such a process is never sent that switch: the daemon restarts
+    /// it in Bypass instead. One launched in Bypass leaves it and comes back live.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_checked_process_is_restarted_for_bypass_never_sent_the_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let written = directory.path().join("stdin.jsonl");
+        let mut checked = ClaudeCodeDriver::test_driver_recording(&written);
+        assert!(checked.needs_restart_for(PermissionMode::Bypass));
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::Plan,
+        ] {
+            assert!(!checked.needs_restart_for(mode), "{mode:?}");
+        }
+        let refused = checked
+            .set_permission_mode(PermissionMode::Bypass)
+            .await
+            .unwrap_err();
+        assert!(refused.is_explicit_refusal());
+        assert_eq!(checked.permission_mode(), PermissionMode::Default);
+        checked.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap_or_default(),
+            "",
+            "nothing reached Claude"
+        );
+
+        let mut unchecked = ClaudeCodeDriver::test_driver();
+        unchecked.set_test_mode(PermissionMode::Bypass);
+        assert!(!unchecked.needs_restart_for(PermissionMode::Bypass));
+    }
+
     /// A reopened conversation whose transcript Claude deleted, or never wrote, cannot use
     /// `--resume`: Claude exits at once, and every retry of the same launch fails the same way.
     /// It continues under its own id when nothing was settled, and is refused before the spawn
@@ -1941,6 +2033,7 @@ mod tests {
             model_catalog: vec![],
             pending_model_request: None,
             mode: PermissionMode::Default,
+            launched_unchecked: false,
             ready_sent: true,
             commands: vec![],
             pushback: Default::default(),

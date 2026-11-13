@@ -1456,6 +1456,10 @@ impl Session {
     pub(crate) fn shared_executor(&self) -> bool {
         self.driver.shared_executor()
     }
+    /// Whether a switch to Bypass needs a new process (see [`AnyDriver::needs_restart_for`]).
+    pub(crate) fn bypass_needs_restart(&self) -> bool {
+        self.driver.needs_restart_for(PermissionMode::Bypass)
+    }
     pub(crate) fn started_process(&self) -> bool {
         self.driver.started_process()
     }

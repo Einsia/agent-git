@@ -1007,6 +1007,14 @@ impl AnyDriver {
         }
     }
 
+    /// Whether switching this process to `mode` takes a new process rather than a live switch.
+    pub fn needs_restart_for(&self, mode: PermissionMode) -> bool {
+        match self {
+            Self::ClaudeCode(driver) => driver.needs_restart_for(mode),
+            _ => false,
+        }
+    }
+
     pub fn shared_executor(&self) -> bool {
         match self {
             Self::Codex(driver) => driver.shared_executor(),

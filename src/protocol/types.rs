@@ -58,8 +58,9 @@ pub enum PermissionMode {
     /// Look but change nothing: no edits. It can read whatever the person can read on that
     /// computer, outside the project too. For planning.
     Plan,
-    /// No permission checks at all. Owner-only, and the session is marked
-    /// [`SessionInfo::dangerous`] for the rest of its life.
+    /// No permission checks at all. Only the owner chooses it, starting, resuming or switching a
+    /// session into it; a colleague continues a conversation the owner left in it. The session is
+    /// marked [`SessionInfo::dangerous`] for the rest of its life.
     Bypass,
 }
 
@@ -605,6 +606,13 @@ pub struct SessionResume {
     /// starts it on the owner's machine. Advertised as `session-resume-attach-only-v1`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attach_only: bool,
+    /// The mode a conversation this resume launches runs in, instead of the mode it last ran in.
+    /// Judged as `session.setPermissionMode` judges a switch from that mode: only the owner may
+    /// name a looser one, and anyone may name a stricter one. A conversation already running here
+    /// keeps its mode; the reply says which, and `session.setPermissionMode` changes it.
+    /// Advertised as `resume-permission-mode-v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1363,6 +1371,11 @@ pub struct TurnCompleted {
 pub struct SessionStatusChanged {
     pub session_id: String,
     pub status: SessionStatus,
+    /// `restarting` on the `ended` of a process the device stopped to bring the conversation back
+    /// in another mode (a switch to Bypass): a new process follows, so it is restarting rather
+    /// than ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// A device-local registered secret was removed before an event left the machine.

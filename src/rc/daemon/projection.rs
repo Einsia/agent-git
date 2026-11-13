@@ -32,6 +32,20 @@ impl Daemon {
             "only a new session event needs projection and numbering"
         );
         let stream = frame.stream.clone().unwrap_or_default();
+        // The process a mode restart stopped: viewers learn that a new one follows.
+        if frame.method() == method::SESSION_STATUS
+            && self
+                .mode_restarts
+                .get(&stream)
+                .is_some_and(mode_restart::ModeRestart::under_way)
+            && let Some(params) = frame
+                .params
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            && params.get("status") == Some(&serde_json::json!(SessionStatus::Ended))
+        {
+            params.insert("reason".into(), serde_json::json!("restarting"));
+        }
         if let Some(watch) = self.watches.get_mut(&stream) {
             match frame.method() {
                 method::TURN_STARTED => watch.info.status = SessionStatus::Running,
@@ -975,6 +989,7 @@ mod bound_lineage_tests {
                         info,
                         shared_executor: false,
                         started_process: true,
+                        bypass_needs_restart: false,
                         tx: cmd_tx,
                         runtime_thread_id: Some("native-1".into()),
                         task: tokio::spawn(async {}),
@@ -1017,6 +1032,8 @@ mod bound_lineage_tests {
                         sessions: [("agit-S".to_string(), live)].into_iter().collect(),
                         latest_session_generations: HashMap::new(),
                         opening_sessions: HashMap::new(),
+                        mode_restarts: HashMap::new(),
+                        session_frames: None,
                         exiting_launches: HashMap::new(),
                         archive_recovering: HashMap::new(),
                         watches: HashMap::new(),

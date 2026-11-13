@@ -43,6 +43,10 @@ pub const RPC_FEATURES: &[&str] = &[
     // keeps sending this session admitted requests, or `session.enqueue.keep`; one left longer
     // than the limit without either is dropped as access_ended.
     "queued-keep-v1",
+    // session.resume takes `permission_mode`, the mode a conversation it launches runs in; only
+    // the owner may name one looser than the mode it would otherwise run in, judged as
+    // `session.setPermissionMode` judges a switch.
+    "resume-permission-mode-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

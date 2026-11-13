@@ -1258,7 +1258,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_loosening_it_does() {
         crate::protocol::PermissionMode::Bypass,
     ] {
         assert!(
-            super::super::danger_gate_tests::require_owner_to_loosen(
+            super::super::require_owner_to_loosen(
                 Some(&operator),
                 loosening,
                 Some(crate::protocol::PermissionMode::Default)
@@ -1267,7 +1267,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_loosening_it_does() {
             "{loosening:?} loosens; only the owner can switch to it"
         );
         assert!(
-            super::super::danger_gate_tests::require_owner_to_loosen(
+            super::super::require_owner_to_loosen(
                 Some(&owner),
                 loosening,
                 Some(crate::protocol::PermissionMode::Default)
@@ -1281,7 +1281,7 @@ fn braking_a_dangerous_session_does_not_need_the_owner_but_loosening_it_does() {
         crate::protocol::PermissionMode::Default,
     ] {
         assert!(
-            super::super::danger_gate_tests::require_owner_to_loosen(
+            super::super::require_owner_to_loosen(
                 Some(&operator),
                 tightening,
                 Some(crate::protocol::PermissionMode::Bypass)

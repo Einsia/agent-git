@@ -52,6 +52,9 @@ pub(super) struct PreparedSpawn {
     pub(super) attribution: MessageAttribution,
     /// The native capture binding could not be resolved, so this launch runs without lineage.
     pub(super) capture_degraded: bool,
+    /// This launch runs in a mode its request named instead of the one recorded: the record keeps
+    /// the old mode until the new process binds, so a launch that fails changes nothing.
+    pub(super) keep_recorded_mode: bool,
 }
 
 pub(super) struct Spawned {
@@ -94,9 +97,23 @@ impl SessionOpening {
         daemon: Arc<Mutex<Daemon>>,
         outbound: crate::rc::outbound::OutboundTx,
         id: crate::protocol::RequestId,
-        mut stop: watch::Receiver<bool>,
+        stop: watch::Receiver<bool>,
     ) {
-        let result = match self {
+        let frame = match self.run(daemon, stop).await {
+            Ok(value) => Frame::response(id, value),
+            Err(error) => Frame::error_response(id, error),
+        };
+        let _ = outbound.send(frame);
+    }
+
+    /// Opens the conversation and gives the reply: [`Self::serve`] without sending it, for a
+    /// launch the daemon makes on its own.
+    pub(super) async fn run(
+        self,
+        daemon: Arc<Mutex<Daemon>>,
+        mut stop: watch::Receiver<bool>,
+    ) -> Result<serde_json::Value, RpcError> {
+        match self {
             Self::Ready(value) => Ok(value),
             Self::Launch(mut spawn, reply) => {
                 let result = spawn.open(&daemon, &mut stop).await;
@@ -121,12 +138,7 @@ impl SessionOpening {
                 }
                 result
             }
-        };
-        let frame = match result {
-            Ok(value) => Frame::response(id, value),
-            Err(error) => Frame::error_response(id, error),
-        };
-        let _ = outbound.send(frame);
+        }
     }
 }
 
@@ -597,7 +609,10 @@ impl Daemon {
             project_id: spawn.info.project_id.clone(),
             agit_session,
             expected_agent_id,
-            permission_mode: spawn.info.permission_mode,
+            permission_mode: match prior {
+                Some(entry) if spawn.keep_recorded_mode => entry.permission_mode,
+                _ => spawn.info.permission_mode,
+            },
             guard_attempts: prior
                 .map(|entry| entry.guard_attempts.clone())
                 .unwrap_or_default(),
@@ -850,6 +865,7 @@ impl Daemon {
         }
         let shared_executor = session.shared_executor();
         let started_process = session.started_process();
+        let bypass_needs_restart = session.bypass_needs_restart();
         let runtime_thread_id = session.runtime_thread_id().or(spec.resume_from);
         let task = tokio::spawn(session.run(cmd_rx));
         // Running again, the conversation is no longer the one a stop interrupted.
@@ -886,6 +902,7 @@ impl Daemon {
                 info: info.clone(),
                 shared_executor,
                 started_process,
+                bypass_needs_restart,
                 tx: cmd_tx,
                 runtime_thread_id,
             },
@@ -1045,6 +1062,50 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}", error.error.message));
         drop(state);
         (dir, daemon, spawn)
+    }
+
+    /// A launch in a mode its request named keeps the recorded mode until its new process binds:
+    /// the record is the mode a conversation comes back in, so a launch that fails leaves it as it
+    /// was. Any other launch records the mode it runs in, as before.
+    #[test]
+    fn a_named_mode_is_recorded_only_once_its_process_binds() {
+        use crate::protocol::PermissionMode as M;
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (_dir, daemon, mut spawn) = fixture().await;
+                    let mut state = daemon.lock().await;
+                    let prior: roster::Entry = serde_json::from_value(serde_json::json!({
+                        "runtime":"unsupported-test-runtime", "thread_id":"",
+                        "cwd":spawn.spec.cwd, "workspace_id":"ws", "project_id":"project",
+                        "permission_mode":"default"
+                    }))
+                    .unwrap();
+                    state
+                        .roster
+                        .sessions
+                        .insert("agit-opening".into(), prior.clone());
+                    spawn.prior_entry = Some(prior);
+                    spawn.local_owner = true;
+                    spawn.info.permission_mode = Some(M::Bypass);
+                    spawn.keep_recorded_mode = true;
+                    state.persist_capture(&spawn).unwrap();
+                    assert_eq!(
+                        state.roster.sessions["agit-opening"].permission_mode,
+                        Some(M::Default)
+                    );
+                    spawn.keep_recorded_mode = false;
+                    state.persist_capture(&spawn).unwrap();
+                    assert_eq!(
+                        state.roster.sessions["agit-opening"].permission_mode,
+                        Some(M::Bypass)
+                    );
+                })
+        });
     }
 
     /// An unbound roster can acquire exact local capture only after its durable save succeeds.

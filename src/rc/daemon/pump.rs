@@ -61,6 +61,8 @@ impl Daemon {
             sessions: HashMap::new(),
             latest_session_generations: HashMap::new(),
             opening_sessions: HashMap::new(),
+            mode_restarts: HashMap::new(),
+            session_frames: None,
             exiting_launches: HashMap::new(),
             archive_recovering: HashMap::new(),
             watches: HashMap::new(),
@@ -235,6 +237,7 @@ impl Daemon {
 
         // Frames from sessions → journal → link.
         let (frames_tx, mut frames_rx) = mpsc::channel::<Frame>(4096);
+        d.lock().await.session_frames = Some(frames_tx.clone());
         // Outbound splits in two: one lane for replies, one for replayable stream events.
         // The test is "can it be recovered once lost", and on the taking side replies come
         // first — see `rc::outbound`.
@@ -539,7 +542,26 @@ impl Daemon {
                             let prepared = {
                                 let mut g = frame_lock(&d).await;
                                 if !connection_epoch_is_current(&g.settlement, epoch) { continue; }
-                                g.prepare_opening(&frame, &frames_tx)
+                                // A conversation restarting to change its mode is resumed once it
+                                // runs again, not launched a second time beside it.
+                                let restart = (frame.method() == method::SESSION_RESUME)
+                                    .then(|| frame.params_as::<SessionResume>().ok())
+                                    .flatten()
+                                    .and_then(|p| g.mode_restart_of(&p.session_id));
+                                match restart {
+                                    Some(restart) => Err(restart),
+                                    None => Ok(g.prepare_opening(&frame, &frames_tx)),
+                                }
+                            };
+                            let prepared = match prepared {
+                                Ok(prepared) => prepared,
+                                Err(restart) => {
+                                    session_rpc_tasks.spawn(super::mode_restart::open_after_restart(
+                                        d.clone(), out_tx.clone(), frames_tx.clone(), id, *frame, epoch,
+                                        restart, session_rpc_stop_tx.subscribe(),
+                                    ));
+                                    continue;
+                                }
                             };
                             match prepared {
                                 Ok(opening) => { session_rpc_tasks.spawn(opening.serve(
@@ -789,7 +811,30 @@ impl Daemon {
                                 if !connection_epoch_is_current(&g.settlement, epoch) {
                                     continue;
                                 }
-                                g.prepare_session_rpc_or_wait(&frame)
+                                // A conversation restarting to change its mode takes this once
+                                // its new process runs, rather than answering busy.
+                                match queued_session_id(&frame)
+                                    .ok()
+                                    .and_then(|session_id| g.mode_restart_of(&session_id))
+                                {
+                                    Some(restart) => Err(restart),
+                                    None => Ok(g.prepare_session_rpc_or_wait(&frame)),
+                                }
+                            };
+                            let prepared = match prepared {
+                                Ok(prepared) => prepared,
+                                Err(restart) => {
+                                    session_rpc_tasks.spawn(super::mode_restart::serve_after_restart(
+                                        d.clone(),
+                                        out_tx.clone(),
+                                        id,
+                                        frame,
+                                        epoch,
+                                        restart,
+                                        session_rpc_stop_tx.subscribe(),
+                                    ));
+                                    continue;
+                                }
                             };
                             match prepared {
                                 Ok(SessionRpcPreparation::Ready(prepared)) => {

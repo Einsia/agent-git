@@ -65,7 +65,8 @@ impl TranscriptDanger {
     /// `resume_from == None`).
     ///
     /// Only here is there no history to judge — a freshly started conversation context is empty
-    /// (the gate on the starting mode is `require_owner_to_loosen`, in `prepare_start_session`). Using
+    /// (the gate on a mode the start names is `require_owner_to_loosen`, in `prepare_start_session`,
+    /// judged from the machine's own default). Using
     /// this slip together with `--resume` is refused on the spot by `prepare_spawn`.
     pub(super) fn fresh_transcript() -> Self {
         Self {

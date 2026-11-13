@@ -323,21 +323,15 @@ impl Daemon {
                 // Authorization and durable arming happen after acquiring this
                 // session's serial guard, so two mode changes cannot both
                 // prepare against the same stale baseline.
-                let loosening = self
-                    .sessions
-                    .get(&p.session_id)
-                    .map(|l| p.mode.loosens_from(l.authorization_baseline()))
-                    .unwrap_or_else(|| p.mode.loosens_guard());
+                let loosening = loosens(
+                    p.mode,
+                    self.sessions
+                        .get(&p.session_id)
+                        .map(|l| l.authorization_baseline()),
+                );
                 let need = if loosening { Need::Drive } else { Need::Brake };
                 let d = self.session_channel(&p.session_id, &caller, need)?;
-                let supported = crate::rc::harness::capability_of(&d.runtime);
-                if !supported.permission_modes.contains(&p.mode) {
-                    return Err(RpcError::new(
-                        ErrorCode::RuntimeUnavailable,
-                        format!("{} cannot express that permission mode", d.runtime),
-                    )
-                    .with_hint("the picker should only offer what `capabilities` reports"));
-                }
+                require_mode_supported(&d.runtime, p.mode)?;
                 require_owner_if_loosening(Some(&caller), loosening)?;
                 if !self.durable_guard_row_complete(&p.session_id) {
                     return Ok(SessionRpcPreparation::AwaitingDurableGuardRow(
@@ -349,34 +343,56 @@ impl Daemon {
                     ));
                 }
                 self.require_durable_guard_row(&p.session_id)?;
-                let armed = if p.mode.is_dangerous() {
-                    self.arm_danger_before_loosening(&p.session_id)?
-                } else {
-                    None
-                };
-                let recovery_token = fresh_shutdown_guard_token(
-                    self.roster
-                        .sessions
-                        .get(&p.session_id)
-                        .map(|entry| &entry.guard_attempts),
-                );
-                let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
-                (
-                    SessionRpcOperation::SetPermissionMode {
-                        tx: d.tx,
-                        command: Command::SetPermissionMode {
+                // A process that cannot take this mode live is restarted in it between turns. Its
+                // launch records the danger bit before it runs unchecked, as a resume in Bypass does.
+                if self
+                    .sessions
+                    .get(&p.session_id)
+                    .is_some_and(|live| p.mode.is_dangerous() && live.bypass_needs_restart)
+                {
+                    let (resume, done, stopped) = self.prepare_mode_restart(&p, serial.lane)?;
+                    (
+                        SessionRpcOperation::RestartInMode {
+                            tx: d.tx,
                             mode: p.mode,
-                            by: p.by,
-                            armed,
-                            reply: ticket.with_control_ceiling(caller_is_owner),
+                            resume,
+                            caller: caller.clone(),
+                            authority: f.authority.clone(),
+                            done,
+                            stopped,
                         },
-                        reply: SessionReceipt(reply),
-                        mode: p.mode,
-                        armed,
-                        recovery_token,
-                    },
-                    true,
-                )
+                        false,
+                    )
+                } else {
+                    let armed = if p.mode.is_dangerous() {
+                        self.arm_danger_before_loosening(&p.session_id)?
+                    } else {
+                        None
+                    };
+                    let recovery_token = fresh_shutdown_guard_token(
+                        self.roster
+                            .sessions
+                            .get(&p.session_id)
+                            .map(|entry| &entry.guard_attempts),
+                    );
+                    let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
+                    (
+                        SessionRpcOperation::SetPermissionMode {
+                            tx: d.tx,
+                            command: Command::SetPermissionMode {
+                                mode: p.mode,
+                                by: p.by,
+                                armed,
+                                reply: ticket.with_control_ceiling(caller_is_owner),
+                            },
+                            reply: SessionReceipt(reply),
+                            mode: p.mode,
+                            armed,
+                            recovery_token,
+                        },
+                        true,
+                    )
+                }
             }
             method::TURN_INTERRUPT => {
                 let p: TurnInterrupt = f.params_as()?;
@@ -1626,6 +1642,62 @@ impl PreparedSessionRpc {
                     daemon, session_id, generation, serial, completion, response,
                 )
                 .await
+            }
+            SessionRpcOperation::RestartInMode {
+                tx,
+                mode,
+                resume,
+                caller,
+                authority,
+                done,
+                stopped,
+            } => {
+                // The old generation's gate goes before its process does, so its row can go when
+                // the process ends; instructions meanwhile wait on `done` (`mode_restart`). Nothing
+                // is stopped once the switch's admission is gone.
+                let stopping = authority.check().and_then(|()| {
+                    tx.try_send(Command::Shutdown)
+                        .map_err(|_| Daemon::session_rpc_busy())
+                });
+                if let Err(error) = stopping {
+                    daemon.lock().await.mode_restarts.remove(&session_id);
+                    let _ = done.send(true);
+                    return finish_prepared_session_rpc(
+                        daemon,
+                        session_id,
+                        generation,
+                        serial,
+                        SessionRpcCompletion::None,
+                        Err(error),
+                    )
+                    .await;
+                }
+                complete_prepared_session_rpc(
+                    daemon.clone(),
+                    session_id.clone(),
+                    generation,
+                    serial,
+                    SessionRpcCompletion::None,
+                )
+                .await;
+                let response = super::mode_restart::restart_in_mode(
+                    daemon.clone(),
+                    &session_id,
+                    generation,
+                    mode,
+                    resume,
+                    caller,
+                    authority,
+                    stopped,
+                    stop,
+                )
+                .await;
+                daemon.lock().await.mode_restarts.remove(&session_id);
+                let _ = done.send(true);
+                ExecutedSessionRpc {
+                    response,
+                    pending: None,
+                }
             }
             SessionRpcOperation::Interrupt {
                 tx,

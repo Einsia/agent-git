@@ -2,6 +2,7 @@ mod guards;
 #[cfg(unix)]
 mod leases;
 mod metadata;
+mod mode_restart;
 #[cfg(unix)]
 mod publication;
 mod sessions;
@@ -44,6 +45,7 @@ pub(super) fn rpc_test_live(
         },
         shared_executor: false,
         started_process: true,
+        bypass_needs_restart: false,
         tx,
         runtime_thread_id: None,
         task: tokio::spawn(async {}),
@@ -90,6 +92,8 @@ pub(super) fn rpc_test_daemon(
         sessions,
         latest_session_generations: HashMap::new(),
         opening_sessions: HashMap::new(),
+        mode_restarts: HashMap::new(),
+        session_frames: None,
         exiting_launches: HashMap::new(),
         archive_recovering: HashMap::new(),
         watches: HashMap::new(),
@@ -199,6 +203,34 @@ pub(super) fn rpc_turn_frame(session_id: &str) -> Frame {
 }
 
 use super::*;
+
+/// Runs `f` where Claude Code offers Bypass. Claude refuses to skip permission checks as root
+/// outside a sandbox it recognizes, and a runner may be one; `IS_SANDBOX=1` is the sandbox it
+/// recognizes, so a test of the Bypass paths runs them on every runner instead of passing on none.
+pub(super) fn with_claude_bypass_offered<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: the caller holds the process-wide environment lock.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("IS_SANDBOX", value),
+                    None => std::env::remove_var("IS_SANDBOX"),
+                }
+            }
+        }
+    }
+    let _environment = crate::infra::config::env_lock();
+    let _restore = Restore(std::env::var_os("IS_SANDBOX"));
+    // SAFETY: this holds the process-wide environment lock.
+    unsafe { std::env::set_var("IS_SANDBOX", "1") };
+    assert!(
+        crate::rc::harness::capability_of("claude-code")
+            .permission_modes
+            .contains(&crate::protocol::PermissionMode::Bypass)
+    );
+    f()
+}
 
 pub(super) fn claim(role: &str, ws: &str) -> crate::protocol::CallerClaim {
     crate::protocol::CallerClaim {
