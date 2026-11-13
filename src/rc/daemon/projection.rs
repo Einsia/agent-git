@@ -995,6 +995,7 @@ mod bound_lineage_tests {
                         writer_released: false,
                         writer_process: None,
                         status_since: std::time::Instant::now(),
+                        last_named: std::time::Instant::now(),
                     };
                     let (notes, _notes_rx) = mpsc::channel(1);
                     let (settlement, _) = tokio::sync::watch::channel(SettlementState::default());

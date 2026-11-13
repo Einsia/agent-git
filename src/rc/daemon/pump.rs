@@ -518,6 +518,13 @@ impl Daemon {
                         && frame.is_request() && connection_epoch_is_current(&settlement_tx, *epoch) {
                         crate::telemetry::rc_request(frame.method());
                     }
+                    if !stopping
+                        && let link::LinkEvent::Frame { epoch, frame } = &ev
+                        && frame.is_request()
+                        && connection_epoch_is_current(&settlement_tx, *epoch)
+                    {
+                        frame_lock(&d).await.note_named(frame, std::time::Instant::now());
+                    }
                     if !stopping { match ev {
                         link::LinkEvent::Frame { epoch, frame }
                             if matches!(frame.method(), method::SESSION_START | method::SESSION_RESUME) =>
@@ -863,6 +870,9 @@ impl Daemon {
                     // tick is already firing, and the test must run under the same lock as
                     // "add a viewer" — see `reap_idle_watches`.
                     g.reap_idle_watches();
+                    if !stopping {
+                        g.reap_idle_writers(std::time::Instant::now());
+                    }
                     g.reconcile_finished_sessions(&frames_tx);
                     g.enforce_lease_deadlines();
                     g.journal.flush();

@@ -620,6 +620,10 @@ struct Live {
     /// When the session last changed status: an upgrade may end a private conversation only once
     /// it has been idle for [`IDLE_DETACH`].
     status_since: std::time::Instant,
+    /// When a request last named this session. The daemon keeps no record of who reads a
+    /// writer's events, so a conversation nobody has asked about within [`IDLE_DETACH`] counts as
+    /// one nobody follows; see [`Daemon::reap_idle_writers`].
+    last_named: std::time::Instant,
 }
 
 impl Live {

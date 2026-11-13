@@ -64,6 +64,7 @@ pub(super) fn rpc_test_live(
         writer_released: false,
         writer_process: None,
         status_since: std::time::Instant::now(),
+        last_named: std::time::Instant::now(),
     }
 }
 
