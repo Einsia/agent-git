@@ -12,8 +12,8 @@ mod audited_push;
 pub(crate) use audited_push::published_visibility;
 mod consent;
 pub(crate) use audited_push::{
-    automatic_publication_consent, automatic_publication_consent_with_client, publication_consent,
-    publication_consent_with_client,
+    PublicationCheck, automatic_publication_consent, automatic_publication_consent_with_client,
+    publication_consent, publication_consent_with_client,
 };
 pub(crate) use consent::{
     ASKED_ENV, AutoConsent, PublicAnswer, answer_public_switch_on, confirms_public,

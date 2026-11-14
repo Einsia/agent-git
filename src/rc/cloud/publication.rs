@@ -115,6 +115,9 @@ pub(super) async fn run(hub: String, directory: PathBuf, log: Option<crate::rc::
                             "failure": class,
                             "http_status": error.downcast_ref::<crate::hub::client::ApiError>()
                                 .map(|response| response.status),
+                            // Which publication check refused it, by its fixed name.
+                            "check": crate::commands::push::PublicationCheck::of(&error)
+                                .map(crate::commands::push::PublicationCheck::name),
                         }));
                     }
                 }
