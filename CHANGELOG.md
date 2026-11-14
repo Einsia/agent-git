@@ -8,6 +8,55 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.52] - 2026-11-14
+
+### Changed
+
+- `agit share` asks for confirmation after a privacy summary; `--show-preview` prints each record first.
+- The first upload of a long conversation sends all its turn tags with the branch in one request, so it finishes
+  sooner, and the Hub counts it as one push.
+- An approval request says how many approvals this turn has already had denied, so the Hub can tell a repeated
+  request from a new one.
+- A conversation opened from the Hub that nobody has used for 30 minutes ends and is kept as paused; the next message
+  resumes it.
+- The device's diagnostics name which publication check refused an automatic upload.
+
+### Fixed
+
+- An upload is no longer refused because someone else uploaded their own branch to the same repository while it was
+  being prepared, and an automatic upload that meets someone else writing the same repository tries again by itself.
+  If your uploads were held up this way, upgrade to 0.2.52.
+- An upload the Hub didn't answer is checked on the Hub and, when it didn't land, tried again: once by `agit push`,
+  and on a schedule by the folder's automatic upload.
+- Remote Control can turn on Bypass for a Claude Code conversation (it restarts between turns) and resume a paused one
+  in a chosen mode; only the owner can loosen a mode when starting, resuming or switching.
+- A terminal opened on a conversation started from the web takes it over even when agit missed its start, and while it
+  waits it says what for and until when.
+- A Remote Control message waiting for the next turn is no longer lost when agit's background service restarts; it
+  goes with its sender's next message, and its sender is told if it can't.
+- A folder binding made on the web no longer moves where that folder's terminal conversations upload, and no longer
+  turns a folder's uploads back on after `agit off`.
+- A folder binding that can't be applied no longer retries every 30 seconds.
+- A file of an unknown type previews as text in the Hub when its content is text, and a link to a folder says it is a
+  folder.
+- Inside an agent's turn, `agit share` shares that conversation, or says exactly which command to run instead.
+- `agit doctor` says when the local daemon is running but the Hub can't reach this computer through it, and how to
+  restart it.
+- `agit memory` and `agit distill` without a target name `--into <owner>/<repo>@<branch>` and `AGIT_SESSION`, the two
+  ways they take one, instead of a form they refuse.
+- When part of a publication's own history is missing on this computer, uploads stop with an error that says so.
+- Saving a turn no longer fails with "cannot list .git/objects/…" when Git packs objects in the background at the same
+  time.
+- agit's fetches no longer let Git rewrite a whole checkout at once; agit rolls up its small packs itself and removes
+  the temporary packs an interrupted repack left behind.
+- Compacting a repository's upload store no longer rewrites its largest pack, so it no longer needs the store's whole
+  size free on disk every few dozen uploads.
+- The first upload, and the import, of a long conversation is much faster: it no longer redoes work over the whole
+  conversation for each turn or starts Git several times per turn.
+- The privacy check no longer slows down sharply on a long line packed with credential-like assignments.
+- While an agent works, a device watching a long conversation no longer rereads the whole transcript every few
+  seconds.
+- The Linux build of agit bundles Git 2.54.1 and zlib 1.4, Alpine's security updates of Git 2.54.0 and zlib 1.3.2.
 ## [0.2.51] - 2026-11-12
 
 ### Added
