@@ -734,10 +734,16 @@ fn publish(mut args: Args) -> CmdResult {
         &branches,
         asked_explicitly,
     )?;
-    // A push the person made is where their agent may learn the folder could upload by itself.
+    // A push the person made is where their agent may learn the folder could upload by itself. A
+    // push of file lines alone (a wiki page, shared files on main) published no conversation, so it
+    // says nothing about where this folder's conversations belong: a yes would send them to that
+    // repository, and a no would turn the folder off as a side effect of a file edit.
     if code == ExitCode::Ok
         && !args.dry_run
         && args.to_hub.is_none()
+        && branches
+            .iter()
+            .any(|branch| !meta::is_file_line_at(&repo, branch))
         && !crate::rc::local_repository::publication::is_device_local(&repo).unwrap_or(true)
         && let Ok(cwd) = std::env::current_dir()
     {
