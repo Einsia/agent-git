@@ -308,6 +308,10 @@ async fn encrypted_cloud_ingress() {
 
     for (method, params) in [
         ("session.history", json!({"session_id":"hidden"})),
+        (
+            "fs.readSessionImage",
+            json!({"session_id":"hidden","path":"shot.png"}),
+        ),
         ("peer.list", json!({})),
     ] {
         sink.send(Packet::Text(Frame::request(method, params).to_json()))

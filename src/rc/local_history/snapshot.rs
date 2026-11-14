@@ -382,6 +382,59 @@ pub(super) fn read(
     Ok(result)
 }
 
+/// Offers the text of each agent reply in the conversation's native history to `accept`, newest
+/// first, and reports whether it accepted one. The replies are the ones history pages show,
+/// parents of a Codex lineage included; the walk refuses as over the limit rather than read past
+/// the snapshot byte budget, so one transcript cannot hold a history worker without bound.
+///
+/// The capture is not filed among the cached snapshots: a walk that took a slot there would expire
+/// a page chain someone is reading.
+pub(super) fn find_reply(
+    target: &Target<'_>,
+    mut accept: impl FnMut(&str) -> bool,
+) -> crate::Result<bool> {
+    use crate::adapter::EventKind;
+    let mut snapshot = capture(target, SNAPSHOTS.get_or_init(Default::default))?;
+    if let Some(items) = &snapshot.native_items {
+        let reply = serde_json::to_value(EventKind::AssistantReply)?;
+        return Ok(items.iter().rev().any(|item| {
+            item["event"]["kind"] == reply
+                && item["event"]["text"].as_str().is_some_and(&mut accept)
+        }));
+    }
+    let adapter = crate::adapter::get(target.runtime)?;
+    let mut before = snapshot.parts.iter().try_fold(0u64, |n, part| {
+        n.checked_add(part.end)
+            .context("Native history is too large")
+    })?;
+    let mut read = 0;
+    while before > 0 {
+        let (lines, next, mode) = page_segments(&mut snapshot.parts, Some(before))?;
+        ensure!(next < before, Failure::InvalidCursor);
+        read += before - next;
+        ensure!(read <= MAX_BYTES, Failure::Limit);
+        validate_records(target.runtime, &lines)?;
+        for line in lines.iter().rev() {
+            let events = super::super::supervisor::line_events(
+                target.runtime,
+                adapter.as_ref(),
+                &line.text,
+                mode,
+            )
+            .map(|(_, events)| events)
+            .unwrap_or_default();
+            if events.iter().rev().any(|event| {
+                event.kind == EventKind::AssistantReply
+                    && event.text.as_deref().is_some_and(&mut accept)
+            }) {
+                return Ok(true);
+            }
+        }
+        before = next;
+    }
+    Ok(false)
+}
+
 fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
     let Target {
         runtime,

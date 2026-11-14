@@ -555,6 +555,7 @@ fn is_read(method: &str) -> bool {
             | "session.catalog.list"
             | "session.catalog.settings"
             | "session.history"
+            | "fs.readSessionImage"
             | "session.goal.read"
             | "session.commands"
             | "session.model"

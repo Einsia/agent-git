@@ -1,5 +1,6 @@
 //! Read-only pages addressed by native transcript byte boundaries.
 mod archive;
+pub(crate) mod session_image;
 mod snapshot;
 mod transfer;
 
@@ -59,6 +60,19 @@ fn read_with_roster(
     roster: &super::roster::Roster,
     timings: &mut Timings,
 ) -> crate::Result<Value> {
+    with_target(&params, roster, |target| {
+        snapshot::read(target, &params, timings)
+    })
+}
+
+/// Runs `read` on the conversation `params` names, as this device knows it: the runtime, native
+/// id and directory come from its own records whenever it has them, and only otherwise from the
+/// request, whose `cwd` and `runtime` the cloud layer replaces with the executor's own.
+fn with_target<T>(
+    params: &Value,
+    roster: &super::roster::Roster,
+    read: impl FnOnce(&Target<'_>) -> crate::Result<T>,
+) -> crate::Result<T> {
     let session = params["session_id"].as_str().context(Failure::Request)?;
     let entry = roster.get(session);
     let catalog_row = if entry.is_none() && session.starts_with("local-") {
@@ -142,7 +156,7 @@ fn read_with_roster(
     if target.context.is_some() {
         target.source_path(native)?;
     }
-    let result = snapshot::read(&target, &params, timings)?;
+    let result = read(&target)?;
     if let Some(context) = &target.context {
         context.validate()?;
     }

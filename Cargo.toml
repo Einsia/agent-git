@@ -118,6 +118,7 @@ rc = [
     "dep:tokio-tungstenite",
     "dep:futures-util",
     "dep:portable-pty",
+    "dep:pulldown-cmark",
 ]
 
 # The device-local vault for low-entropy secrets. A backend reusing domain with
@@ -275,6 +276,10 @@ portable-pty = { version = "0.9", optional = true }
 
 shlex = { version = "2", optional = true }
 url = { version = "2", optional = true }
+# `fs.readSessionImage` reads only an image an agent reply shows, so the device has to find the
+# images of a reply as the Workspace page's CommonMark renderer does: a hand-written pattern
+# would count an image inside a code span, or miss an escaped or reference-style destination.
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7", optional = true }
