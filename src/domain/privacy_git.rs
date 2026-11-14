@@ -859,7 +859,8 @@ fn needs_compaction(repo: &Repo) -> Result<bool> {
 /// every caller for that long. The publication never depends on the result, so a store that cannot
 /// be compacted, or a process that cannot start, still publishes and is compacted at a later push.
 pub(crate) fn schedule_compaction(root: &Path) {
-    if !needs_compaction(&Repo::at(root)).unwrap_or(false) {
+    if !needs_compaction(&Repo::at(root)).unwrap_or(false) && stale_temporary_packs(root).is_empty()
+    {
         return;
     }
     let Ok(mut command) = crate::infra::own_image::command() else {
@@ -879,6 +880,63 @@ pub(crate) fn schedule_compaction(root: &Path) {
     let _ = command.spawn();
 }
 
+/// Whether `root` is a repository [`COMPACT`] may compact: a publication store, or a checkout in
+/// agit's own repositories directory, each judged by its real path. The argument comes from this
+/// binary, but the entry must not become a way to repack, or to delete leftovers in, an arbitrary
+/// repository, a symbolic link to one included, whether the link is the repository or its `.git`.
+fn compactable(root: &Path) -> bool {
+    let Ok(real) = root.canonicalize() else {
+        return false;
+    };
+    if !root.is_absolute()
+        || !real
+            .join(".git")
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_dir())
+    {
+        return false;
+    }
+    let store = real
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "privacy-publication");
+    let checkout = crate::infra::config::repos_dir()
+        .and_then(|repos| Ok(repos.canonicalize()?))
+        .is_ok_and(|repos| real.starts_with(&repos) && real != repos);
+    store || checkout
+}
+
+/// How old a temporary pack must be before it counts as left over: Git writes one as it packs and
+/// renames it once done, so a younger one may still be written.
+const STALE_TEMPORARY_PACK: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The temporary packs in `root`'s pack directory that an interrupted repack left: named
+/// `tmp_pack_*` and older than [`STALE_TEMPORARY_PACK`]. Git deletes such files itself only when
+/// it prunes, after two weeks, and a repack that ran out of room leaves one the size of the store.
+pub(crate) fn stale_temporary_packs(root: &Path) -> Vec<PathBuf> {
+    let now = std::time::SystemTime::now();
+    fs::read_dir(root.join(".git/objects/pack"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("tmp_pack_"))
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > STALE_TEMPORARY_PACK)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 /// Run [`COMPACT`]: `None` when `args` name another command.
 pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
     if args.get(1)?.to_str()? != COMPACT {
@@ -888,15 +946,7 @@ pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
         return Some(4);
     };
     let root = Path::new(root);
-    // Only a store under a publication directory: the argument comes from this binary, but the
-    // entry must not become a way to repack an arbitrary repository.
-    let is_store = root.is_absolute()
-        && root.join(".git").is_dir()
-        && root
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "privacy-publication");
-    if !is_store || crate::infra::git_runtime::initialize().is_err() {
+    if !compactable(root) || crate::infra::git_runtime::initialize().is_err() {
         return Some(4);
     }
     let compacted = (|| -> Result<()> {
@@ -915,15 +965,20 @@ pub fn compaction_entry(args: &[std::ffi::OsString]) -> Option<i32> {
         ) else {
             return Ok(());
         };
+        // Before this repack writes a temporary pack of its own, so none of its own is taken.
+        for leftover in stale_temporary_packs(root) {
+            let _ = fs::remove_file(leftover);
+        }
         compact_store(root)?;
         Ok(())
     })();
     Some(if compacted.is_ok() { 0 } else { 4 })
 }
 
-/// Compact the publication store at `root` once it holds many packs or loose objects, and say
-/// whether it did. Every publication imports into the store and nothing else packs it, so it would
-/// keep each import's pack and each snapshot's loose objects for good.
+/// Compact the publication store or agit checkout at `root` once it holds many packs or loose
+/// objects, and say whether it did. Every publication imports into a store and nothing else packs
+/// it, and Git's own maintenance stays off for the fetches agit runs into a checkout, so each
+/// would keep every pack and loose object it is given for good.
 ///
 /// Packs are rolled up geometrically (`--geometric=2`): the small packs and the loose objects go
 /// into one new pack, and a pack holding at least twice the objects of everything smaller stays as
@@ -1558,6 +1613,74 @@ mod store_tests {
     /// alone. A compaction that pruned (`gc`) or dropped unreachable packed objects (`repack -a -d`
     /// without `-k`) loses the orphaned blob; a full repack rewrites the large pack, needing the
     /// whole store's size free on its disk each time.
+    /// The compaction entry takes only a publication store or a checkout in agit's own
+    /// repositories directory, judged by its real path, and in one it deletes the temporary packs
+    /// an interrupted repack left more than a day ago, never a younger one, which a repack may still
+    /// be writing. An entry that followed a symbolic link out of agit's directory, at the
+    /// repository or at its `.git`, would repack, and delete files in, a repository that isn't
+    /// agit's.
+    #[cfg(unix)]
+    #[test]
+    fn compaction_clears_old_leftovers_only_in_agits_own_repositories() {
+        const CHILD: &str = "AGIT_COMPACTION_ENTRY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "domain::privacy_git::store_tests::compaction_clears_old_leftovers_only_in_agits_own_repositories",
+                ])
+                .env(CHILD, "1")
+                .env("AGIT_HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let home = crate::infra::config::agit_home().unwrap();
+        let repos = crate::infra::config::repos_dir().unwrap();
+        let repository = |root: &Path| -> (PathBuf, PathBuf) {
+            fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-q", "-b", "main"]);
+            let pack = root.join(".git/objects/pack");
+            fs::create_dir_all(&pack).unwrap();
+            let old = pack.join("tmp_pack_left");
+            let young = pack.join("tmp_pack_writing");
+            fs::write(&old, "left over").unwrap();
+            fs::write(&young, "being written").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&old)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - 2 * STALE_TEMPORARY_PACK)
+                .unwrap();
+            (old, young)
+        };
+        let entry = |root: &Path| {
+            compaction_entry(&["agit".into(), COMPACT.into(), root.as_os_str().to_owned()])
+        };
+
+        let checkout = repos.join("alice/app");
+        let (old, young) = repository(&checkout);
+        assert_eq!(entry(&checkout), Some(0));
+        assert!(!old.exists() && young.exists());
+
+        let elsewhere = home.join("elsewhere");
+        let (old, young) = repository(&elsewhere);
+        let linked = repos.join("alice/linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        assert_eq!(entry(&linked), Some(4));
+        assert!(old.exists() && young.exists());
+
+        let outside = home.join("outside");
+        let (old, young) = repository(&outside);
+        let gitlinked = repos.join("alice/gitlinked");
+        fs::create_dir_all(&gitlinked).unwrap();
+        std::os::unix::fs::symlink(outside.join(".git"), gitlinked.join(".git")).unwrap();
+        assert_eq!(entry(&gitlinked), Some(4));
+        assert!(old.exists() && young.exists());
+    }
+
     /// The room a roll-up needs leaves out only a pack Git surely keeps: the one with at least
     /// twice the objects of all the others. A budget that left out the largest pack on disk lets a
     /// roll-up start that rewrites it after all, filling the disk: a pack of a few large blobs is

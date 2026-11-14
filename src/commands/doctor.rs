@@ -375,11 +375,11 @@ pub fn run(args: Args) -> CmdResult {
         let common = crate::domain::repo::Repo::at(root)
             .local_objects_only()
             .common_dir();
-        for (store, bytes) in common
+        let stores = common
             .map(|common| crate::domain::privacy_git::publication_stores(&common))
-            .unwrap_or_default()
-        {
-            if bytes >= LARGE_PUBLICATION_STORE {
+            .unwrap_or_default();
+        for (store, bytes) in &stores {
+            if *bytes >= LARGE_PUBLICATION_STORE {
                 #[cfg(windows)]
                 use crate::ui::quote_powershell_argument as quote_arg;
                 #[cfg(not(windows))]
@@ -388,13 +388,46 @@ pub fn run(args: Args) -> CmdResult {
                     slug.clone(),
                     Check::Warn(format!(
                         "its privacy publication store takes {:.1} GiB; the next `agit push` \
-                         compacts it when about that much is free on its disk, or with no agit \
-                         process running: git -C {} repack -a -d -k -l -q",
-                        bytes as f64 / (1u64 << 30) as f64,
+                         rolls up its small packs when there is room on its disk, or with no agit \
+                         process running: git -C {} repack --geometric=2 -d -l -q",
+                        *bytes as f64 / (1u64 << 30) as f64,
                         quote_arg(&store.to_string_lossy())
                     )),
                 ));
             }
+        }
+        // What interrupted repacks left in the checkout and its stores: each compaction deletes
+        // them while it holds its lock, so a count here is what is still waiting for one. The two
+        // are named apart because different commands compact them: a fetch the checkout, a push
+        // its stores; a hint naming the other one leaves the space taken.
+        let in_checkout = crate::domain::privacy_git::stale_temporary_packs(root);
+        let in_stores: Vec<_> = stores
+            .into_iter()
+            .flat_map(|(store, _)| crate::domain::privacy_git::stale_temporary_packs(&store))
+            .collect();
+        for (leftovers, place, command) in [
+            (in_checkout, "this checkout", "`agit fetch`"),
+            (in_stores, "its privacy publication stores", "`agit push`"),
+        ] {
+            if leftovers.is_empty() {
+                continue;
+            }
+            let bytes: u64 = leftovers
+                .iter()
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .sum();
+            checks.push((
+                slug.clone(),
+                Check::Warn(format!(
+                    "{} temporary pack file{} ({:.1} GiB) in {place} left by an interrupted \
+                     repack; the next {command} removes them, and with no Git process running \
+                     here they can be deleted by hand",
+                    leftovers.len(),
+                    if leftovers.len() == 1 { "" } else { "s" },
+                    bytes as f64 / (1u64 << 30) as f64,
+                )),
+            ));
         }
         match crate::domain::repo::integrity::assess(&crate::domain::repo::Repo::at(root)) {
             Ok(None) => {}

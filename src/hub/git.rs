@@ -867,13 +867,19 @@ impl Outcome {
 pub fn run(repo: &Repo, args: &[&str]) -> Result<Outcome> {
     let hub = crate::infra::config::hub_url();
     let expected = super::identity::expected_for_transport(repo, &hub)?;
+    let fetches = fetches(args);
+    let args = without_maintenance(args);
     let transport = TransportIdentity::for_hub(
         Some(repo.root()),
-        args,
+        &args,
         &hub,
         expected.as_ref().map(|identity| identity.agent_id.as_str()),
     )?;
-    run_transport(Some(repo.root()), args, &transport)
+    let outcome = run_transport(Some(repo.root()), &args, &transport)?;
+    if fetches && outcome.ok() {
+        crate::domain::privacy_git::schedule_compaction(repo.root());
+    }
+    Ok(outcome)
 }
 
 /// Keep the target selected for this operation fixed across branch and tag requests.
@@ -897,9 +903,15 @@ pub fn capture_for_remote(
 ) -> std::result::Result<String, AdvertisementUnread> {
     let setup = |_| AdvertisementUnread::refused("the Git transport could not be prepared");
     super::identity::verify_transport_target(repo, identity).map_err(setup)?;
-    let transport = TransportIdentity::new(Some(repo.root()), args, identity).map_err(setup)?;
-    ref_read::capture_within(repo.root(), args, Some(&transport), timeout)
-        .map_err(|failure| AdvertisementUnread::from_read(failure, timeout))
+    let fetches = fetches(args);
+    let args = without_maintenance(args);
+    let transport = TransportIdentity::new(Some(repo.root()), &args, identity).map_err(setup)?;
+    let read = ref_read::capture_within(repo.root(), &args, Some(&transport), timeout)
+        .map_err(|failure| AdvertisementUnread::from_read(failure, timeout))?;
+    if fetches {
+        crate::domain::privacy_git::schedule_compaction(repo.root());
+    }
+    Ok(read)
 }
 
 /// Explicit acceptance belongs only to this push and its validated immutable destination.
@@ -924,8 +936,43 @@ fn run_for_identity(
     args: &[&str],
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
-    let transport = TransportIdentity::new(dir, args, identity)?;
-    run_transport(dir, args, &transport)
+    let fetches = fetches(args);
+    let args = without_maintenance(args);
+    let transport = TransportIdentity::new(dir, &args, identity)?;
+    let outcome = run_transport(dir, &args, &transport)?;
+    if fetches
+        && outcome.ok()
+        && let Some(dir) = dir
+    {
+        crate::domain::privacy_git::schedule_compaction(dir);
+    }
+    Ok(outcome)
+}
+
+/// Whether `args` fetch into a repository: after a fetch or a pull Git runs its own maintenance,
+/// which past its thresholds rewrites the whole store at once, needs its size free again on the
+/// disk, and leaves a temporary pack that large when the disk fills. For every fetch agit runs,
+/// through [`run`], [`run_for_identity`] or [`capture_for_remote`], it stays off for that one
+/// invocation only ([`without_maintenance`]), and after a fetch that went through agit rolls up
+/// the checkout's small packs itself ([`crate::domain::privacy_git::schedule_compaction`]). A
+/// fetch path that skips this gets Git's whole-store repack back.
+fn fetches(args: &[&str]) -> bool {
+    args.iter()
+        .find(|arg| matches!(**arg, "clone" | "fetch" | "push" | "pull" | "ls-remote"))
+        .is_some_and(|command| matches!(*command, "fetch" | "pull"))
+}
+
+/// `args`, with Git's own maintenance turned off for this invocation when they fetch.
+fn without_maintenance<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    if fetches(args) {
+        [
+            &["-c", "gc.auto=0", "-c", "maintenance.auto=false"][..],
+            args,
+        ]
+        .concat()
+    } else {
+        args.to_vec()
+    }
 }
 
 fn run_transport(
