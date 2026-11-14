@@ -120,6 +120,7 @@ pub(crate) mod settle_blocked;
 pub mod step_delivery;
 pub mod supervisor;
 pub mod tail;
+pub(crate) mod team_memory;
 pub mod terminal;
 pub mod ticket;
 pub mod tunnel;
