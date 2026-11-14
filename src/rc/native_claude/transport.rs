@@ -1302,11 +1302,13 @@ fn approval_decision(
         "native approval requires a one-shot decision"
     );
     if response.decision == ApprovalDecision::Deny {
-        let mut decision = json!({"behavior":"deny"});
-        if let Some(message) = &response.message {
-            decision["message"] = json!(message);
+        // The hook passes on no message past this bound, so a longer one would reach Claude Code
+        // without the person's reason and without saying a person denied the call.
+        let message = crate::rc::harness::denial_for_agent(response.message.as_deref());
+        if message.len() > crate::rc::native_inbox::MAX_MESSAGE {
+            return Err(MalformedDecision("the reason is too long for this conversation").into());
         }
-        return Ok(decision);
+        return Ok(json!({"behavior":"deny","message":message}));
     }
     let mut decision = json!({"behavior":"allow"});
     if approval["tool"] == "AskUserQuestion" {
@@ -2018,8 +2020,46 @@ mod tests {
         response.message = Some("Ask about the selected project".into());
         assert_eq!(
             approval_decision(&approval, &response).unwrap(),
-            json!({
-            "behavior":"deny","message":"Ask about the selected project"})
+            json!({"behavior":"deny","message":
+                "The person reviewing this in AgentGit denied this tool call. Their reason: Ask about the selected project"})
+        );
+    }
+
+    /// A denial reaches the terminal's Claude Code as a person's: the frame, then their reason, or
+    /// the frame alone when they gave none. One whose framed text is past what the hook passes on
+    /// is refused here, where the page hears of it; handed over, the hook would drop the message
+    /// and Claude Code would hear neither that a person denied the call nor why.
+    #[test]
+    fn a_denial_reaches_the_terminal_as_the_persons() {
+        use crate::protocol::{ApprovalDecision, ApprovalResponse, ApprovalScope};
+        let approval = json!({"tool":"Bash","input":{"command":"git push --force"}});
+        let mut response = ApprovalResponse {
+            approval_id: "bash".into(),
+            session_id: "session".into(),
+            decision: ApprovalDecision::Deny,
+            scope: ApprovalScope::Once,
+            message: Some("  push to a new branch instead \n".into()),
+            by: Some("Sam Rivera".into()),
+            answers: None,
+        };
+        assert_eq!(
+            approval_decision(&approval, &response).unwrap(),
+            json!({"behavior":"deny","message":
+                "The person reviewing this in AgentGit denied this tool call. Their reason: push to a new branch instead"})
+        );
+        for blank in [None, Some(" ".to_string())] {
+            response.message = blank;
+            assert_eq!(
+                approval_decision(&approval, &response).unwrap(),
+                json!({"behavior":"deny","message":
+                    "The person reviewing this in AgentGit denied this tool call."})
+            );
+        }
+        response.message = Some("x".repeat(crate::rc::native_inbox::MAX_MESSAGE));
+        assert!(
+            approval_decision(&approval, &response)
+                .unwrap_err()
+                .is::<MalformedDecision>()
         );
     }
 

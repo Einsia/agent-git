@@ -1400,6 +1400,10 @@ pub enum Command {
         /// Whether the hub's stamp says owner. **Not read from `response`** — that whole
         /// structure comes from the browser.
         caller_is_owner: bool,
+        /// Whose message a denial's reason becomes on a runtime that takes none with the denial:
+        /// set from the hub's stamp, and only when the caller may also send this conversation
+        /// messages, since denying alone is open to more than sending is.
+        reason_sender: Option<MessageAttribution>,
         /// Whether a mode-changing session approval has crossed the durable
         /// danger boundary, and which newly-created arm this command owns.
         danger: DangerAuthorization,
@@ -2876,6 +2880,7 @@ impl Session {
                         Some(Command::Approve {
                             mut response,
                             caller_is_owner,
+                            reason_sender,
                             danger,
                             reply,
                         }) => {
@@ -2982,10 +2987,38 @@ impl Session {
                                     self.terminate_after_unknown_native_write(message).await;
                                 }
                             }
+                            let reason = response
+                                .message
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|reason| !reason.is_empty());
+                            let reason_to_send = match (&outcome, reason, reason_sender) {
+                                (
+                                    ApprovalOutcome::Applied { .. } | ApprovalOutcome::Resolved,
+                                    Some(reason),
+                                    Some(sender),
+                                ) if response.decision == crate::protocol::ApprovalDecision::Deny
+                                    && !self.driver.denial_carries_reason() =>
+                                {
+                                    Some((
+                                        crate::rc::harness::denial_for_agent(Some(reason)),
+                                        sender,
+                                        reply.authority(),
+                                        reply.owner_control(),
+                                    ))
+                                }
+                                _ => None,
+                            };
                             let ended = self.info.status == SessionStatus::Ended;
                             reply.finish(Ok(outcome));
                             if ended {
                                 return;
+                            }
+                            if let Some((message, sender, authority, owner)) = reason_to_send {
+                                self.send_denial_reason(message, sender, authority, owner).await;
+                                if self.info.status == SessionStatus::Ended {
+                                    return;
+                                }
                             }
                         }
                         Some(Command::Runtime { name, arguments, reply }) => {

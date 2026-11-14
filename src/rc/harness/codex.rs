@@ -2135,6 +2135,20 @@ impl CodexDriver {
         self.current_turn = Some(turn_id.to_string());
     }
 
+    /// A command approval Codex is waiting on, as if it had asked for it.
+    #[cfg(test)]
+    pub(crate) fn add_test_approval(&mut self, approval_id: &str) {
+        self.pending_approvals.insert(
+            approval_id.to_string(),
+            PendingApproval {
+                response_sent: false,
+                req_id: json!(format!("native-{approval_id}")),
+                method: "item/commandExecution/requestApproval".into(),
+                requested_permissions: None,
+            },
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_test_shutdowns(
         &mut self,

@@ -58,6 +58,12 @@ pub const RPC_FEATURES: &[&str] = &[
     // `session.publication.deliver` for that session on the connection, sends it no events, and
     // takes no ownership of the session from the controller that holds it.
     "publication-delivery-only-v1",
+    // A reason given with `approval.decide` deny reaches the agent marked as the person's, with
+    // no name, on every runtime: with the denial on Claude Code; on Codex and OpenCode as the
+    // denier's message, into the running Codex turn or else for the next turn, where the
+    // conversation shows it as theirs. It goes as a message only from a caller who may send this
+    // conversation one, and like any message it can be refused when it goes.
+    "denial-reason-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

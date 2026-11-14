@@ -323,6 +323,7 @@ mod tests {
                     by: Some("fixture-owner".into()),
                 },
                 caller_is_owner: true,
+                reason_sender: None,
                 danger: DangerAuthorization::NotRequired,
                 reply: ticket,
             })

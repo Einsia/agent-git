@@ -1444,6 +1444,7 @@ async fn run_ambiguous_claude_approval(
                 by: Some("owner".into()),
             },
             caller_is_owner: true,
+            reason_sender: None,
             danger: DangerAuthorization::NotRequired,
             reply: ticket,
         })
@@ -2060,8 +2061,10 @@ fn a_partial_record_moves_the_watermark_even_though_no_line_comes_out() {
 }
 
 /// Pins the deny note end to end, through `run_inner`'s `Command::Approve` arm into a Claude Code
-/// driver, in every mode: a colleague's denial note reaches Claude Code as written, as the owner's
-/// does. A device that replaced it dropped what the colleague told the agent.
+/// driver, in every mode: a colleague's denial note reaches Claude Code as the owner's does, as
+/// the person's reason after a frame saying a person denied the call, and naming no one though the
+/// answer names its sender. A device that replaced the note dropped what the colleague told the
+/// agent; one that handed it over bare made it read as the denied call's output.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
@@ -2108,6 +2111,7 @@ async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
                         by: Some("reviewer".into()),
                     },
                     caller_is_owner: owner,
+                    reason_sender: None,
                     danger: DangerAuthorization::NotRequired,
                     reply: ticket.with_control_ceiling(owner),
                 })
@@ -2143,7 +2147,13 @@ async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
             };
             let body = &line["response"]["response"];
             assert_eq!(body["behavior"], "deny", "{mode:?} owner={owner}");
-            assert_eq!(body["message"], note, "{mode:?} owner={owner}");
+            assert_eq!(
+                body["message"],
+                format!(
+                    "The person reviewing this in AgentGit denied this tool call. Their reason: {note}"
+                ),
+                "{mode:?} owner={owner}"
+            );
             session.driver.shutdown().await.unwrap();
         }
     }
@@ -2165,7 +2175,7 @@ fn oversized_raw_lines_are_replaced_not_streamed() {
 
 /// An approval reaches viewers as the harness raised it, its command and summary included, and a
 /// colleague answers it as the owner does: the card says `requires_owner: false`, and an
-/// operator's denial reaches Claude Code with the note as written. The privacy check is made to
+/// operator's denial reaches Claude Code with the note as their reason. The privacy check is made to
 /// come back incomplete for the credential, so an implementation that still checked the card
 /// would hold it back or send it without its command. One that kept the answer for the owner
 /// would refuse the operator's denial and write nothing.
@@ -2241,6 +2251,7 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
                     by: Some(if owner { "owner" } else { "operator" }.into()),
                 },
                 caller_is_owner: owner,
+                reason_sender: None,
                 danger: DangerAuthorization::NotRequired,
                 reply: ticket.with_control_ceiling(owner),
             })
@@ -2279,7 +2290,13 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
     };
     let answer = &first["response"]["response"];
     assert_eq!(answer["behavior"], "deny", "{first}");
-    assert_eq!(answer["message"], note, "{first}");
+    assert_eq!(
+        answer["message"],
+        format!(
+            "The person reviewing this in AgentGit denied this tool call. Their reason: {note}"
+        ),
+        "{first}"
+    );
     session.driver.shutdown().await.unwrap();
 }
 
@@ -2343,6 +2360,7 @@ async fn an_approval_request_says_how_often_this_turn_was_denied() {
                     by: Some("owner".into()),
                 },
                 caller_is_owner: true,
+                reason_sender: None,
                 danger: DangerAuthorization::NotRequired,
                 reply: ticket.with_control_ceiling(true),
             })
@@ -3205,6 +3223,7 @@ async fn a_colleague_answers_an_approval_that_reaches_past_the_workspace() {
                     by: Some("colleague".into()),
                 },
                 caller_is_owner: false,
+                reason_sender: None,
                 danger: DangerAuthorization::NotRequired,
                 reply: ticket.with_control_ceiling(false),
             })

@@ -237,6 +237,61 @@ impl Session {
         }
     }
 
+    /// A denial's reason, for a runtime that takes none with the denial, sent as the message of
+    /// the person who denied: into the running turn when there is one to steer, or else it waits
+    /// for the next turn, in the order it came, and goes through the gates any message passes.
+    /// A steer that may have reached the runtime is never sent again as a turn.
+    pub(super) async fn send_denial_reason(
+        &mut self,
+        message: String,
+        mut attribution: MessageAttribution,
+        authority: crate::rc::authority::Guard,
+        owner: bool,
+    ) {
+        if self.driver.has_active_turn() && self.pending_steer_command.is_none() {
+            let report = self.redactor.scrub(&message);
+            self.alert_registered(report.registered_ids, "turn_steer")
+                .await;
+            attribution.native_prompt_id = self.driver.reserve_prompt_identity();
+            let (ticket, _receipt) = crate::rc::ticket::ticket_authorized(authority.clone());
+            let pending = PendingSteerCommand {
+                message: report.text,
+                attribution,
+                reply: ticket.with_control_ceiling(owner),
+            };
+            match self.driver.steer(&message).await {
+                SteerDispatch::Resolved(Err(error))
+                    if error.is::<crate::rc::harness::TurnNotRunning>() =>
+                {
+                    attribution = pending.attribution;
+                    attribution.native_prompt_id = None;
+                }
+                SteerDispatch::Resolved(result) => {
+                    return self.resolve_steer(pending, result).await;
+                }
+                SteerDispatch::Awaiting => {
+                    self.pending_steer_command = Some(pending);
+                    return;
+                }
+            }
+        }
+        let queued = QueuedTurn {
+            message,
+            attribution,
+            authority,
+            owner,
+            arrived: tokio::time::Instant::now(),
+            arrived_ms: now_ms(),
+            restored: None,
+        };
+        if self.steer_queue.waiting.len() >= MAX_WAITING {
+            tracing_note("a denial's reason was not sent: too many messages already wait");
+            return;
+        }
+        self.steer_queue.waiting.push_back(queued);
+        self.persist_waiting();
+    }
+
     /// The plugin's receipt for a held message came back: one it didn't take isn't held, and one
     /// it took for a turn this session already saw end went undelivered, as that turn ended.
     /// Whether the turn is still running isn't judged from the terminal's latest state: the
@@ -743,6 +798,138 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(test())
+        });
+    }
+
+    /// A session waiting on one approval, `approval`, from `driver`'s runtime.
+    fn approving(driver: AnyDriver, runtime: &str) -> (Session, mpsc::Receiver<Frame>) {
+        let (mut session, out, _notes) = super::super::tests::harness_test_session_with_channels(
+            driver,
+            runtime,
+            SessionStatus::AwaitingApproval,
+        );
+        session.pending.insert(
+            "approval".into(),
+            PendingApproval {
+                suggested_permission_mode: None,
+                target: ("tool".into(), None),
+                handed_denial: None,
+            },
+        );
+        (session, out)
+    }
+
+    /// Runs `session` until a colleague's denial of its approval, with `reason`, is answered.
+    /// `may_send` is whether the daemon found that colleague may also send this conversation
+    /// messages. The daemon then lets go of the session, so what waits stays on the device.
+    async fn deny(mut session: Session, reason: Option<&str>, may_send: bool) -> Session {
+        let (ticket, mut receipt) = crate::rc::ticket::ticket();
+        let (commands, mut command_rx) = mpsc::channel(1);
+        commands
+            .send(Command::Approve {
+                response: crate::protocol::ApprovalResponse {
+                    approval_id: "approval".into(),
+                    session_id: session.info.session_id.clone(),
+                    decision: crate::protocol::ApprovalDecision::Deny,
+                    scope: crate::protocol::ApprovalScope::Once,
+                    message: reason.map(Into::into),
+                    by: Some("from the browser".into()),
+                    answers: None,
+                },
+                caller_is_owner: false,
+                reason_sender: may_send.then(|| sent_by(Some(MEMBER))),
+                danger: DangerAuthorization::NotRequired,
+                reply: ticket.with_control_ceiling(false),
+            })
+            .await
+            .unwrap();
+        drop(commands);
+        session.run_inner(&mut command_rx).await;
+        let outcome = receipt.wait_until_closed().await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, ApprovalOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+        session
+    }
+
+    const FRAMED: &str = "The person reviewing this in AgentGit denied this tool call. Their reason: use the staging database";
+
+    /// A reason given with a denial reaches a runtime that takes none with the denial (Codex
+    /// here; OpenCode, which can't be steered, goes the way of a Codex conversation with no turn
+    /// running) as the denier's message, framed as a person's reason: steered into the running
+    /// turn, or else waiting for the next one, under the denier's own account. Nothing goes for
+    /// a blank reason, from a denier the daemon found may not send this conversation messages,
+    /// or on Claude Code, whose denial already carries it. A device that dropped the reason left
+    /// the agent with a bare "declined"; one that sent it for anyone who may deny would let a
+    /// caller who may only stop a conversation start a turn in it; one that also sent it on
+    /// Claude Code would tell the agent twice.
+    #[test]
+    fn a_denials_reason_goes_to_codex_as_the_deniers_message() {
+        with_home(|| async {
+            let idle_codex = || {
+                let mut driver =
+                    crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
+                driver.add_test_approval("approval");
+                approving(AnyDriver::Codex(Box::new(driver)), "codex").0
+            };
+            let session = deny(idle_codex(), Some("  use the staging database\n"), true).await;
+            let waiting = waiting_messages::load("thread");
+            assert_eq!(
+                waiting
+                    .iter()
+                    .map(|w| w.message.as_str())
+                    .collect::<Vec<_>>(),
+                [FRAMED]
+            );
+            assert_eq!(
+                waiting[0].sender.as_ref().map(|s| s.account_id.as_str()),
+                Some(MEMBER)
+            );
+            drop(session);
+            waiting_messages::save("thread", &[]).unwrap();
+            for (reason, may_send) in [(Some(" "), true), (None, true), (Some("no"), false)] {
+                let session = deny(idle_codex(), reason, may_send).await;
+                assert!(
+                    waiting_on_device("thread").is_empty(),
+                    "{reason:?} may_send={may_send}"
+                );
+                drop(session);
+            }
+
+            let mut driver = crate::rc::harness::codex::CodexDriver::test_responder(
+                Some("thread"),
+                &[serde_json::json!({"id": 1, "result": {}})],
+            );
+            driver.add_test_approval("approval");
+            driver.set_test_current_turn("turn");
+            let (session, mut out) = approving(AnyDriver::Codex(Box::new(driver)), "codex");
+            let session = deny(session, Some("use the staging database"), true).await;
+            let steered = std::iter::from_fn(|| out.try_recv().ok())
+                .find(|frame| frame.method() == method::TURN_STEERED)
+                .expect("the reason is steered into the running turn")
+                .params
+                .unwrap();
+            assert_eq!(steered["message"], FRAMED);
+            assert_eq!(steered["sender"]["account_id"], MEMBER);
+            assert!(waiting_on_device("thread").is_empty());
+            drop(session);
+
+            // Claude Code's recording test driver runs only where its stand-in process does.
+            #[cfg(unix)]
+            {
+                let written = tempfile::NamedTempFile::new().unwrap();
+                let mut driver =
+                    crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_recording(
+                        written.path(),
+                    );
+                driver.add_test_approval("approval", None);
+                let (session, _out) =
+                    approving(AnyDriver::ClaudeCode(Box::new(driver)), "claude-code");
+                let mut session = deny(session, Some("use the staging database"), true).await;
+                assert!(waiting_on_device("test-session").is_empty());
+                session.driver.shutdown().await.unwrap();
+            }
         });
     }
 

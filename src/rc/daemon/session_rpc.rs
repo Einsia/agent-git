@@ -429,6 +429,13 @@ impl Daemon {
                     crate::protocol::ApprovalDecision::Deny => Need::Brake,
                 };
                 let d = self.session_channel(&p.session_id, &caller, need)?;
+                // A denial's reason goes on as the caller's message where the runtime takes none
+                // with the denial: only if this caller may send this conversation one.
+                let reason_sender = (p.decision == crate::protocol::ApprovalDecision::Deny
+                    && self
+                        .session_channel(&p.session_id, &caller, Need::Drive)
+                        .is_ok())
+                .then(|| MessageAttribution::from_caller(&caller, p.by.clone(), None));
                 let changes_session_policy = matches!(
                     (p.decision, p.scope),
                     (
@@ -480,6 +487,7 @@ impl Daemon {
                             // The caller seal belongs to the relayed frame, not to
                             // any browser-controlled params field.
                             caller_is_owner: f.caller.as_ref().is_some_and(|c| c.is_owner()),
+                            reason_sender,
                             danger,
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },

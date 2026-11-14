@@ -793,7 +793,7 @@ impl ClaudeCodeDriver {
             }
             ApprovalDecision::Deny => json!({
                 "behavior":"deny",
-                "message": r.message.clone().unwrap_or_else(|| "denied by a reviewer in the shared workspace".into())
+                "message": super::denial_for_agent(r.message.as_deref())
             }),
         };
         let write = self
