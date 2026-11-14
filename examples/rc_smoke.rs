@@ -167,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
                 ctx2.send(Command::Approve {
                     // The smoke script plays owner: it runs as this machine's owner.
                     caller_is_owner: true,
+                    reason_sender: None,
                     // This smoke path always answers one call, never a
                     // session-wide permission-mode suggestion.
                     danger: agit::rc::supervisor::DangerAuthorization::NotRequired,

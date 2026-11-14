@@ -506,6 +506,22 @@ pub enum SteerDispatch {
     Awaiting,
 }
 
+/// What Claude Code is told when a tool call is denied from AgentGit: that a person denied it,
+/// and their reason, if they gave one, as theirs. A reason handed over bare reads as the denied
+/// call's output, and an agent rightly distrusts output it didn't expect, so the person's guidance
+/// goes unfollowed. It names no one: the text lands in the transcript, which publishes to the
+/// repository's readers, and who denied stays on the page.
+///
+/// The Hub's conversation page reads this wording back from the denied call's result to show the
+/// reason alone, so a change to it shows the whole sentence there as the reason.
+pub(crate) fn denial_for_agent(reason: Option<&str>) -> String {
+    const DENIED: &str = "The person reviewing this in AgentGit denied this tool call.";
+    match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("{DENIED} Their reason: {reason}"),
+        None => DENIED.into(),
+    }
+}
+
 /// Authorization-relevant result of answering a native approval request.
 ///
 /// A session-scoped Claude answer carries a sticky mode change in the same
@@ -764,6 +780,17 @@ impl AnyDriver {
             #[cfg(unix)]
             Self::ClaudeNative(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether a denial's reason reaches the agent with the denial itself: Claude Code takes a
+    /// message with it; Codex and OpenCode take none, so their reason goes as a message.
+    pub(crate) fn denial_carries_reason(&self) -> bool {
+        match self {
+            Self::ClaudeCode(_) => true,
+            #[cfg(unix)]
+            Self::ClaudeNative(_) => true,
+            Self::Codex(_) | Self::OpenCode(_) => false,
         }
     }
 
