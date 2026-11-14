@@ -611,6 +611,8 @@ impl ClaudeNativeDriver {
                     can_allow_for_session: false,
                     suggested_permission_mode: None,
                     requested_at: chrono::Utc::now().to_rfc3339(),
+                    denied_this_turn: 0,
+                    denied_same_target: 0,
                 }));
         }
         self.approvals = pending;

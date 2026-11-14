@@ -12,6 +12,8 @@ async fn shared_approval_resolution_preserves_other_pending_requests() {
             id.into(),
             PendingApproval {
                 suggested_permission_mode: None,
+                target: ("tool".into(), None),
+                handed_denial: None,
             },
         );
     }
@@ -107,6 +109,7 @@ pub(super) fn harness_test_session_with_channels(
         redactor: redact::Redactor::this_machine(),
         out,
         pending: Default::default(),
+        denials: super::Denials::default(),
         consumed_bytes: 0,
         resuming: false,
         agit_session: None,
@@ -1423,6 +1426,8 @@ async fn run_ambiguous_claude_approval(
         "approval-1".into(),
         PendingApproval {
             suggested_permission_mode: suggested_mode,
+            target: ("tool".into(), None),
+            handed_denial: None,
         },
     );
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
@@ -1741,6 +1746,8 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
         "current-approval".into(),
         PendingApproval {
             suggested_permission_mode: None,
+            target: ("tool".into(), None),
+            handed_denial: None,
         },
     );
     let (commands, mut command_rx) = mpsc::channel(1);
@@ -1795,6 +1802,8 @@ async fn a_fenced_interrupt_leaves_a_claude_turn_running() {
         "current-approval".into(),
         PendingApproval {
             suggested_permission_mode: None,
+            target: ("tool".into(), None),
+            handed_denial: None,
         },
     );
     let (commands, mut command_rx) = mpsc::channel(1);
@@ -2081,6 +2090,8 @@ async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
                 "approval-deny".into(),
                 PendingApproval {
                     suggested_permission_mode: None,
+                    target: ("tool".into(), None),
+                    handed_denial: None,
                 },
             );
             let (ticket, mut receipt) = crate::rc::ticket::ticket();
@@ -2199,6 +2210,8 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
             can_allow_for_session: false,
             suggested_permission_mode: None,
             requested_at: "now".into(),
+            denied_this_turn: 0,
+            denied_same_target: 0,
         }))
         .await;
     let card = std::iter::from_fn(|| out.try_recv().ok())
@@ -2268,6 +2281,226 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
     assert_eq!(answer["behavior"], "deny", "{first}");
     assert_eq!(answer["message"], note, "{first}");
     session.driver.shutdown().await.unwrap();
+}
+
+/// Each approval request says how many approvals this turn already had denied, overall and for
+/// the same tool on the same path. The runtime asks one call at a time, so a page cannot count the
+/// requests still to come; it can tell a repeated request from a new one. Only a denial the
+/// runtime took counts: one it applied, or one handed to a native ask whose hook took it, once.
+/// A turn's end clears both. A count kept across turns, one that counted allows, refused or
+/// withdrawn answers, a shared request's close, or a handed denial twice, one that let a malformed
+/// retry erase a denial handed before it, or one that ignored the path would each mislabel a
+/// request below.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_approval_request_says_how_often_this_turn_was_denied() {
+    use crate::protocol::{ApprovalDecision, ApprovalScope};
+    let directory = tempfile::tempdir().unwrap();
+    let request = |id: &str, path: &str, turn: &str| {
+        HarnessEvent::Approval(crate::protocol::ApprovalRequest {
+            approval_id: id.into(),
+            session_id: String::new(),
+            turn_id: turn.into(),
+            kind: crate::protocol::ApprovalKind::FileChange,
+            tool: "Edit".into(),
+            input: serde_json::json!({ "file_path": path }),
+            summary: format!("edit {path}"),
+            paths: vec![path.into()],
+            timeout_secs: 0,
+            requires_owner: false,
+            owner_reason: None,
+            can_allow_for_session: false,
+            suggested_permission_mode: None,
+            requested_at: "now".into(),
+            denied_this_turn: 0,
+            denied_same_target: 0,
+        })
+    };
+    // The counts a card was raised with, read as the page reads them: absent means zero.
+    let counts = |out: &mut mpsc::Receiver<Frame>| {
+        let card = std::iter::from_fn(|| out.try_recv().ok())
+            .find(|frame| frame.method() == method::APPROVAL_REQUEST)
+            .expect("the card reaches viewers")
+            .params
+            .unwrap();
+        (
+            card["denied_this_turn"].as_u64().unwrap_or(0),
+            card["denied_same_target"].as_u64().unwrap_or(0),
+        )
+    };
+    let decide = async |session: Session, id: &str, decision, known: bool| {
+        let (ticket, mut receipt) = crate::rc::ticket::ticket();
+        let (commands, mut command_rx) = mpsc::channel(1);
+        commands
+            .send(Command::Approve {
+                response: ApprovalResponse {
+                    approval_id: id.into(),
+                    session_id: "session-turn-test".into(),
+                    decision,
+                    scope: ApprovalScope::Once,
+                    message: None,
+                    answers: None,
+                    by: Some("owner".into()),
+                },
+                caller_is_owner: true,
+                danger: DangerAuthorization::NotRequired,
+                reply: ticket.with_control_ceiling(true),
+            })
+            .await
+            .unwrap();
+        let worker = tokio::spawn(async move {
+            let mut session = session;
+            session.run_inner(&mut command_rx).await;
+            session
+        });
+        let outcome = receipt
+            .wait(std::time::Duration::from_secs(5))
+            .await
+            .expect("settled")
+            .expect("ticket stays open")
+            .expect("typed outcome");
+        assert_eq!(
+            matches!(outcome, ApprovalOutcome::Applied { .. }),
+            known,
+            "{id}: {outcome:?}"
+        );
+        drop(commands);
+        worker.await.unwrap()
+    };
+    // Each answer runs on a driver of its own: the test driver ends its loop once its commands are
+    // spent, and that end abandons what was pending, so the ledger is carried across by hand.
+    let drivers = std::cell::Cell::new(0);
+    let session_with = |ids: &[&str]| {
+        drivers.set(drivers.get() + 1);
+        let written = directory
+            .path()
+            .join(format!("written-{}.jsonl", drivers.get()));
+        let mut driver =
+            crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_recording(&written);
+        for id in ids {
+            driver.add_test_approval(id, None);
+        }
+        driver.set_test_mode(PermissionMode::Default);
+        harness_test_session_with_channels(
+            AnyDriver::ClaudeCode(Box::new(driver)),
+            "claude-code",
+            SessionStatus::Running,
+        )
+    };
+
+    let (mut session, mut out, _) = session_with(&["edit-1"]);
+    session
+        .on_harness_event(request("edit-1", "docs/a.md", "turn-1"))
+        .await;
+    assert_eq!(counts(&mut out), (0, 0));
+    let mut session = decide(session, "edit-1", ApprovalDecision::Deny, true).await;
+    let mut ledger = std::mem::take(&mut session.denials);
+
+    for (id, path, decision, known, expected) in [
+        ("edit-2", "docs/a.md", ApprovalDecision::Deny, true, (1, 1)),
+        (
+            "other-1",
+            "docs/b.md",
+            ApprovalDecision::Allow,
+            true,
+            (2, 0),
+        ),
+        ("edit-3", "docs/a.md", ApprovalDecision::Deny, true, (2, 2)),
+        // An answer the runtime refuses (the request is no longer pending there) is not counted.
+        (
+            "stale-1",
+            "docs/a.md",
+            ApprovalDecision::Deny,
+            false,
+            (3, 3),
+        ),
+        ("edit-4", "docs/a.md", ApprovalDecision::Deny, true, (3, 3)),
+    ] {
+        let known_ids: Vec<&str> = if known { vec![id] } else { vec![] };
+        let (next, mut out, _) = session_with(&known_ids);
+        session = next;
+        session.denials = std::mem::take(&mut ledger);
+        session.on_harness_event(request(id, path, "turn-1")).await;
+        assert_eq!(counts(&mut out), expected, "{id}");
+        session = decide(session, id, decision, known).await;
+        ledger = std::mem::take(&mut session.denials);
+    }
+
+    let (mut session, mut out, _) = session_with(&["edit-5"]);
+    session.denials = ledger;
+    session
+        .on_harness_event(HarnessEvent::TurnCompleted {
+            turn_id: "turn-1".into(),
+            outcome: TurnOutcome::Ok,
+            error: None,
+            cost_usd: None,
+            duration_ms: None,
+        })
+        .await;
+    while out.try_recv().is_ok() {}
+    session
+        .on_harness_event(request("edit-5", "docs/a.md", "turn-2"))
+        .await;
+    assert_eq!(
+        counts(&mut out),
+        (0, 0),
+        "a new turn starts with no denials"
+    );
+
+    // A denial handed to a native Claude Code ask counts once its hook has taken it, already at
+    // the next request if the ask's close is still on its way, and only once; one withdrawn
+    // before its hook took it never counts. A shared request that closed does not say whose
+    // answer it took, so a denial sent into it is not counted at all.
+    let (mut session, mut out, _) = session_with(&[]);
+    let (took, taken) = tokio::sync::watch::channel(false);
+    let (withdrew, withdrawn) = tokio::sync::watch::channel(false);
+    for (id, outcome) in [
+        ("handed-1", ApprovalOutcome::Handed { taken }),
+        ("handed-2", ApprovalOutcome::Handed { taken: withdrawn }),
+        ("shared-1", ApprovalOutcome::Resolved),
+    ] {
+        let mut pending = PendingApproval {
+            suggested_permission_mode: None,
+            target: ("Edit".into(), Some("docs/c.md".into())),
+            handed_denial: None,
+        };
+        pending.note_answer(ApprovalDecision::Deny, &outcome, &mut session.denials);
+        // A retry the ask can't take hands nothing over; the denial handed first still counts
+        // once the hook takes it.
+        pending.note_answer(
+            ApprovalDecision::Deny,
+            &ApprovalOutcome::MalformedDecision {
+                message: "answers don't match the ask".into(),
+            },
+            &mut session.denials,
+        );
+        // A handed answer keeps its card until the ask closes; a resolved one is gone.
+        if matches!(outcome, ApprovalOutcome::Handed { .. }) {
+            session.pending.insert(id.into(), pending);
+        }
+    }
+    // The hook takes the first denial whether or not a receiver is still kept for it.
+    took.send_replace(true);
+    drop(withdrew);
+    session
+        .on_harness_event(request("handed-3", "docs/c.md", "turn-3"))
+        .await;
+    assert_eq!(counts(&mut out), (1, 1), "the taken denial counts");
+    for id in ["handed-1", "handed-2"] {
+        session
+            .on_harness_event(HarnessEvent::ApprovalResolved {
+                approval_id: id.into(),
+            })
+            .await;
+    }
+    session
+        .on_harness_event(request("handed-4", "docs/c.md", "turn-3"))
+        .await;
+    assert_eq!(
+        counts(&mut out),
+        (1, 1),
+        "counted once, and the withdrawn one never"
+    );
 }
 
 /// The live `item.completed` carries the *same* object hash the committed envelope will carry:
@@ -2940,6 +3173,8 @@ async fn a_colleague_answers_an_approval_that_reaches_past_the_workspace() {
                 can_allow_for_session: false,
                 suggested_permission_mode: None,
                 requested_at: "now".into(),
+                denied_this_turn: 0,
+                denied_same_target: 0,
             }))
             .await;
         let mut card = None;

@@ -842,6 +842,96 @@ struct PendingApproval {
     /// the execution side can require a durable danger permit before echoing a
     /// bypass suggestion.
     suggested_permission_mode: Option<PermissionMode>,
+    /// The tool and first path it asks about, so a denial is counted against both.
+    target: Target,
+    /// A denial handed to a native Claude Code ask and not yet counted: it counts once its hook
+    /// has taken it (`true`), never if it was withdrawn first.
+    handed_denial: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+impl PendingApproval {
+    /// Notes what answering this approval with `decision` came to: a denial the runtime took
+    /// counts in `denials` now, and one handed to a native ask once its hook takes it.
+    fn note_answer(
+        &mut self,
+        decision: crate::protocol::ApprovalDecision,
+        outcome: &ApprovalOutcome,
+        denials: &mut Denials,
+    ) {
+        let denied = decision == crate::protocol::ApprovalDecision::Deny;
+        match DenialProof::of(outcome) {
+            DenialProof::Taken => {
+                self.handed_denial = None;
+                if denied {
+                    denials.record(self.target.clone());
+                }
+            }
+            // A new hand-over replaces the earlier one, which the runtime then never takes.
+            DenialProof::OnceTaken(taken) => self.handed_denial = denied.then_some(taken),
+            // Nothing was handed over or applied, so an earlier hand-over still stands: a
+            // malformed retry must not erase a denial the hook takes afterwards.
+            DenialProof::Unproven => {}
+        }
+    }
+
+    /// Counts this approval's handed denial in `denials` if the runtime has taken it, once.
+    fn count_taken_denial(&mut self, denials: &mut Denials) {
+        if self
+            .handed_denial
+            .as_ref()
+            .is_some_and(|taken| *taken.borrow())
+        {
+            self.handed_denial = None;
+            denials.record(self.target.clone());
+        }
+    }
+}
+
+/// A tool and the first path it touches, if any.
+type Target = (String, Option<String>);
+
+/// What an answer's outcome proves about whether the runtime took a denial.
+enum DenialProof {
+    /// The runtime applied this answer.
+    Taken,
+    /// Handed to a native ask; taken once the receiver turns true.
+    OnceTaken(tokio::sync::watch::Receiver<bool>),
+    /// Nothing says this answer was the one taken: a shared request that closed does not report
+    /// which client answered it, and a refused or unknown answer took no denial.
+    Unproven,
+}
+
+impl DenialProof {
+    fn of(outcome: &ApprovalOutcome) -> Self {
+        match outcome {
+            ApprovalOutcome::Applied { .. } => Self::Taken,
+            ApprovalOutcome::Handed { taken } => Self::OnceTaken(taken.clone()),
+            _ => Self::Unproven,
+        }
+    }
+}
+
+/// The approvals denied in the running turn, overall and per target. A new request carries both
+/// counts so a reader can tell it repeats one already refused; the runtime asks one call at a time,
+/// so nothing here can say how many are still to come. Cleared when the turn ends.
+#[derive(Default)]
+struct Denials {
+    total: u32,
+    by_target: std::collections::HashMap<Target, u32>,
+}
+
+impl Denials {
+    /// An approval for `target` was denied.
+    fn record(&mut self, target: Target) {
+        self.total = self.total.saturating_add(1);
+        let count = self.by_target.entry(target).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// The denials so far in this turn, and those for `target`.
+    fn of(&self, target: &Target) -> (u32, u32) {
+        (self.total, self.by_target.get(target).copied().unwrap_or(0))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -961,6 +1051,8 @@ pub struct Session {
     out: mpsc::Sender<Frame>,
     /// An approval already sent and not yet answered, with what answering it needs.
     pending: std::collections::HashMap<String, PendingApproval>,
+    /// The approvals denied so far in the running turn.
+    denials: Denials,
     /// The **byte** position consumed from the transcript. Used only to decide whether the file
     /// is still growing.
     ///
@@ -1629,6 +1721,7 @@ impl Session {
             redactor,
             out,
             pending: Default::default(),
+            denials: Denials::default(),
             consumed_bytes: 0,
             landed_thread: None,
             landing: None,
@@ -2842,6 +2935,7 @@ impl Session {
                             let expected_mode = changes_session_mode
                                 .then_some(pending.suggested_permission_mode)
                                 .flatten();
+                            let mut pending = pending;
                             let mut outcome = self.driver.answer_approval(&response).await;
                             match &mut outcome {
                                 ApprovalOutcome::Applied { effective_mode }
@@ -2860,6 +2954,7 @@ impl Session {
                                 }
                                 _ => {}
                             }
+                            pending.note_answer(response.decision, &outcome, &mut self.denials);
                             match &outcome {
                                 ApprovalOutcome::Applied { .. } | ApprovalOutcome::Resolved => {
                                     self.emit(method::APPROVAL_RESOLVED, crate::protocol::ApprovalResolved {
@@ -3324,6 +3419,7 @@ impl Session {
                 // do this). A turn boundary is authoritative: no approval from
                 // that turn can still be answered.
                 self.abandon_pending_approvals().await;
+                self.denials = Denials::default();
                 // Nor can a message held for one of its tool steps still reach it.
                 self.held_turn_over(
                     steer_queue::TurnOver::Ended(&turn_id),
@@ -3412,7 +3508,13 @@ impl Session {
                 self.flush_initial_turn_if_ready().await;
             }
             HarnessEvent::ApprovalResolved { approval_id } => {
-                let shown = self.pending.remove(&approval_id).is_some();
+                let shown = match self.pending.remove(&approval_id) {
+                    Some(mut pending) => {
+                        pending.count_taken_denial(&mut self.denials);
+                        true
+                    }
+                    None => false,
+                };
                 if shown {
                     self.emit(
                         method::APPROVAL_RESOLVED,
@@ -3460,8 +3562,25 @@ impl Session {
                 // reaches, for whoever reads the card.
                 req.requires_owner = false;
                 req.owner_reason = reason;
+                let target: Target = (req.tool.clone(), req.paths.first().cloned());
+                // A handed denial taken by now counts even if its ask's close is still on its way.
+                for pending in self.pending.values_mut() {
+                    pending.count_taken_denial(&mut self.denials);
+                }
+                (req.denied_this_turn, req.denied_same_target) = self.denials.of(&target);
+                crate::rc::diagnostics::event(
+                    "approval.requested",
+                    serde_json::json!({
+                        "session_id": crate::rc::diagnostics::id(&self.info.session_id),
+                        "tool": crate::rc::diagnostics::id(&req.tool),
+                        "denied_this_turn": req.denied_this_turn,
+                        "denied_same_target": req.denied_same_target,
+                    }),
+                );
                 let authority = PendingApproval {
                     suggested_permission_mode: req.suggested_permission_mode,
+                    target,
+                    handed_denial: None,
                 };
                 self.set_status(SessionStatus::AwaitingApproval).await;
                 // The card is the request as the harness raised it, and it is answerable from the
