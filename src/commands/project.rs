@@ -1414,6 +1414,11 @@ pub(crate) enum UploadFailure {
     LocalBusy,
     /// Another upload of the same repository was still preparing for the whole wait.
     AnotherUpload,
+    /// Someone else wrote to the repository while this upload ran: the Hub was still busy with
+    /// another write, the repository's refs moved or the receipt no longer held, or the history
+    /// the upload relied on left the Hub. Nothing of it moved a ref, and the same upload goes
+    /// through once the other write is done.
+    AnotherWriter,
     /// agit could not write its own state on this computer.
     LocalUnwritable,
     Other,
@@ -1535,6 +1540,16 @@ impl UploadFailure {
         if message.contains(crate::infra::local_state::NOT_WRITABLE) {
             return Self::LocalUnwritable;
         }
+        // Lost to someone else writing the repository: before any refusal for good, which none
+        // of these is, and before the exit status, which reads the Hub's busy 503 as a Hub that
+        // didn't answer. A bare 503 names no kind, is told no other way, and stays one.
+        if message.contains(crate::hub::git::HISTORY_CHANGED)
+            || message.contains(super::push::ANOTHER_WRITER)
+            || message.contains(super::push::RECEIPT_EXPIRED)
+            || message.contains(super::push::RECEIPT_SETTINGS_CHANGED)
+        {
+            return Self::AnotherWriter;
+        }
         // A refusal by the Hub is a policy exit too, but no privacy check is missing; a branch
         // name to rename is refused before the Hub is asked.
         if super::push::refused_for_good(message) {
@@ -1549,11 +1564,12 @@ impl UploadFailure {
     }
 
     /// Whether the folder's worker tries an upload that failed this way again by itself: the Hub
-    /// didn't answer, or another upload of the repository was still preparing, so the same upload
-    /// can go through once the Hub answers or the other upload is done. Every other class is
-    /// refused again until something changes on this computer or the Hub.
+    /// didn't answer, another upload of the repository was still preparing, or someone else was
+    /// writing the repository, so the same upload can go through once the Hub answers or the
+    /// other upload or write is done. Every other class is refused again until something changes
+    /// on this computer or the Hub.
     pub(crate) fn retried(self) -> bool {
-        matches!(self, Self::Hub | Self::AnotherUpload)
+        matches!(self, Self::Hub | Self::AnotherUpload | Self::AnotherWriter)
     }
 
     /// What happened, for a class [`Self::retried`] covers, without what comes next.
@@ -1561,6 +1577,7 @@ impl UploadFailure {
         match self {
             Self::Hub => "the Hub didn't answer",
             Self::AnotherUpload => "another upload of this repository was still preparing",
+            Self::AnotherWriter => "someone else was writing to this repository at the same time",
             _ => self.describe(),
         }
     }
@@ -1603,6 +1620,9 @@ impl UploadFailure {
             }
             Self::AnotherUpload => {
                 "another upload of this repository was still preparing; the next turn tries again"
+            }
+            Self::AnotherWriter => {
+                "someone else was writing to this repository at the same time; agit tries again by itself"
             }
             // Nothing is known of a refusal without a name of its own, so no retry is promised.
             Self::Other => "it could not be completed on this computer",
@@ -1930,23 +1950,29 @@ fn sync_one(project: &Project, candidate: &Candidate, automatic: bool) -> Result
 /// Runs an upload, and once more, from the start, when it was prepared under publication rules
 /// that changed before it was sent: the Hub refuses a preview or a receive whose rules no longer
 /// hold, and the upload refuses a receive when this computer's privacy settings changed under it.
-/// The second run decides everything again, consent and visibility included, so it never sends
-/// under rules the first one was not judged by. A second such refusal is [`RulesChanged`]; any
-/// other failure is passed on as it is.
+/// So it does when the history the upload relied on left the destination while it prepared, as
+/// when the branch it continues was moved there meanwhile. The second run decides everything
+/// again, consent and visibility included, so it never sends under rules the first one was not
+/// judged by. A second refusal for changed rules is [`RulesChanged`]; any other failure, a second
+/// moved history included, is passed on as it is.
 fn retry_stale<T>(mut upload: impl FnMut() -> Result<T>) -> Result<T> {
-    let stale = |error: &anyhow::Error| {
+    let rules_changed = |error: &anyhow::Error| {
         let said = format!("{error:#}");
         said.contains("create a new preview")
             || said.contains(crate::domain::privacy_git::POLICY_CHANGED)
     };
+    let history_changed =
+        |error: &anyhow::Error| format!("{error:#}").contains(crate::hub::git::HISTORY_CHANGED);
     match upload() {
-        Err(error) if stale(&error) => upload().map_err(|again| {
-            if stale(&again) {
-                RulesChanged.into()
-            } else {
-                again
-            }
-        }),
+        Err(error) if rules_changed(&error) || history_changed(&error) => {
+            upload().map_err(|again| {
+                if rules_changed(&again) {
+                    RulesChanged.into()
+                } else {
+                    again
+                }
+            })
+        }
         result => result,
     }
 }
@@ -10284,6 +10310,61 @@ mod tests {
             UploadFailure::LocalUnwritable
                 .describe()
                 .contains("`agit doctor`")
+        );
+    }
+
+    /// An upload lost to someone else writing the repository is told so and tried again by the
+    /// folder's worker, whatever said it: the push telling a refusal the Hub sent while someone
+    /// else wrote it, a receipt that no longer held, or this computer finding the history it
+    /// relied on gone from the Hub. A bare 503 from a Hub that names no kind stays a Hub that
+    /// didn't answer. Read by its status alone, the Hub's busy 503 is told as a Hub that didn't
+    /// answer; read as any 503, a Hub that couldn't answer is told as someone else writing.
+    #[test]
+    fn an_upload_lost_to_another_writer_is_told_so_and_tried_again() {
+        let network = Some(ExitCode::Network.as_i32());
+        let failure = Some(ExitCode::Failure.as_i32());
+        let policy = Some(ExitCode::Policy.as_i32());
+        let lost = [
+            (
+                network,
+                format!(
+                    "publication did not complete: {}; rerunning `agit push alice/app@work` sends it",
+                    super::super::push::ANOTHER_WRITER
+                ),
+            ),
+            (
+                failure,
+                format!("{}; publish again", crate::hub::git::HISTORY_CHANGED),
+            ),
+            (
+                policy,
+                format!(
+                    "publication did not complete ({})",
+                    super::super::push::RECEIPT_EXPIRED
+                ),
+            ),
+            (
+                policy,
+                format!(
+                    "publication did not complete ({})",
+                    super::super::push::RECEIPT_SETTINGS_CHANGED
+                ),
+            ),
+        ];
+        for (code, said) in lost {
+            assert_eq!(
+                UploadFailure::reported(code, &said),
+                UploadFailure::AnotherWriter,
+                "{said}"
+            );
+        }
+        assert!(UploadFailure::AnotherWriter.retried());
+        assert_eq!(
+            UploadFailure::reported(
+                network,
+                "publication did not complete (The requested URL returned error: 503); the Hub didn't answer, and it doesn't hold all of this push yet"
+            ),
+            UploadFailure::Hub
         );
     }
 

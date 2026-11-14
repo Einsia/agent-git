@@ -53,6 +53,13 @@ pub mod inspection_summary;
 mod ref_read;
 mod tag_fetch;
 pub use crate::domain::secrets::publication::InspectionFailure;
+pub(crate) use frozen::HISTORY_CHANGED;
+
+/// The kind of the Hub's refusal of a push that met another write to the same repository: its
+/// lock or write lease stayed held for the whole wait. The Hub sends it before any ref moves, so
+/// the same push can go through once the other write is done. A bare 503 without it is a Hub that
+/// couldn't answer.
+pub(crate) const REPOSITORY_BUSY: &str = "repository_busy";
 pub use frozen::{
     AdvertisementUnread, BlockedContentInspection, BlockedInspection, CapturedPublication,
     CompleteContentInspection, CompleteInspection, ContentInspection, FrozenPublication,
@@ -787,7 +794,7 @@ impl Outcome {
         self.refused_before_refs_moved()
             && !matches!(
                 self.refusal_kind(),
-                Some("publication_refs_moved" | "publication_receipt_invalid")
+                Some("publication_refs_moved" | "publication_receipt_invalid" | REPOSITORY_BUSY)
             )
     }
 
@@ -824,6 +831,7 @@ impl Outcome {
                     | "agentgit_upgrade_required"
                     | "publication_refs_moved"
                     | "publication_receipt_invalid"
+                    | REPOSITORY_BUSY
             )
         )
     }
@@ -1876,6 +1884,15 @@ mod tests {
         }
         assert_eq!(refused.receipt_refusal(), None);
         assert!(!refused.previews_again());
+        // Another write held the repository for the whole wait: turned down before any ref
+        // moved, and the same push goes through once that write is done.
+        let busy = outcome(
+            "fatal: remote error: HTTP 503 repository_busy: another write to this repository is still in progress; nothing was changed. Retry the push.\nfatal: the remote end hung up unexpectedly\n",
+        );
+        assert_eq!(busy.refusal_kind(), Some(REPOSITORY_BUSY));
+        assert!(busy.refused_before_refs_moved());
+        assert!(!busy.refused_for_good());
+        assert!(!busy.previews_again());
         // A result after the ref transaction may have moved refs; it is not a refusal to rerun.
         assert!(
             !outcome("fatal: remote error: HTTP 503 service_unavailable: try later")

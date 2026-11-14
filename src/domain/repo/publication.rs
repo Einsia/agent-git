@@ -243,6 +243,27 @@ impl PublicationPlan {
         &self.boundary
     }
 
+    /// Whether every commit this plan stopped its walk at is still reachable from one of `covers`
+    /// in `repo`, by raw parents under the same overlay-free walk the plan was frozen with. The
+    /// history the plan left undeclared lies below those commits, so the destination still holds
+    /// it while its heads include the covers. A cover whose commit is not in `repo` reaches
+    /// nothing here, so it can only fail the check.
+    pub(crate) fn boundary_covered(&self, repo: &Repo, covers: &[String]) -> Result<bool> {
+        if self.boundary.is_empty() {
+            return Ok(true);
+        }
+        let mut reader = Reader::new(repo);
+        let roots = reader.advertised_commits(covers)?;
+        if roots.is_empty() {
+            return Ok(false);
+        }
+        let reachable = reader.reachable_among(&roots, None)?;
+        Ok(self
+            .boundary
+            .iter()
+            .all(|commit| reachable.contains(commit)))
+    }
+
     /// Every annotated tag object in the selected chains, including unreferenced inner tags.
     pub fn tag_objects(&self) -> &[String] {
         &self.tag_objects
@@ -1375,6 +1396,67 @@ mod tests {
         let base = initialize(directory.path());
         let repo = Repo::at(directory.path());
         (directory, repo, base)
+    }
+
+    /// The history a plan left undeclared is covered only by a head that reaches its boundary by
+    /// raw parents: the branch it continues does, an unrelated branch does not, and neither does
+    /// one a replace ref makes look like it does. A check that followed replace refs would let a
+    /// receipt through after the only branch holding that history left the destination.
+    #[test]
+    fn a_boundary_is_covered_only_by_a_head_that_really_reaches_it() {
+        let (directory, repo, base) = repository();
+        let root = directory.path();
+        git(root, &["switch", "-qc", "work"]);
+        git(root, &["commit", "--allow-empty", "-qm", "published turn"]);
+        let published = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["commit", "--allow-empty", "-qm", "new turn"]);
+        let held = BTreeSet::from([base.clone(), published.clone()]);
+        let plan =
+            PublicationPlan::freeze_selected_after(&repo, &["work".to_owned()], &held).unwrap();
+        assert_eq!(plan.boundary(), std::slice::from_ref(&published));
+
+        git(root, &["switch", "-qc", "other", &base]);
+        git(
+            root,
+            &["commit", "--allow-empty", "-qm", "another conversation"],
+        );
+        let other = git(root, &["rev-parse", "HEAD"]);
+        assert!(
+            plan.boundary_covered(&repo, std::slice::from_ref(&published))
+                .unwrap()
+        );
+        assert!(
+            !plan
+                .boundary_covered(&repo, std::slice::from_ref(&other))
+                .unwrap()
+        );
+
+        let posing = git(
+            root,
+            &[
+                "commit-tree",
+                &format!("{other}^{{tree}}"),
+                "-p",
+                &published,
+                "-m",
+                "another conversation",
+            ],
+        );
+        git(root, &["replace", &other, &posing]);
+        assert_eq!(
+            git(
+                root,
+                &["rev-list", "--count", &format!("{published}..{other}")]
+            ),
+            "1"
+        );
+        assert!(
+            !plan
+                .boundary_covered(&repo, std::slice::from_ref(&other))
+                .unwrap()
+        );
+        // A cover this repository doesn't hold reaches nothing.
+        assert!(!plan.boundary_covered(&repo, &["0".repeat(40)]).unwrap());
     }
 
     fn git_with_input(root: &std::path::Path, args: &[&str], input: &str) {

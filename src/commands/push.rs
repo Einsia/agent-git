@@ -919,6 +919,23 @@ pub(crate) fn branch_list_unread(
 /// an automatic upload's parent reads it to class the failure as one its worker tries again.
 pub(crate) const UPLOAD_IN_PROGRESS: &str = "another upload of this repository is in progress";
 
+/// How a push tells a refusal the Hub sent because someone else was writing the repository, before
+/// any ref moved: it was busy with another write, or the repository's refs moved meanwhile. The
+/// same push goes through once that write is done; an automatic upload's parent reads it to class
+/// the failure as one its worker tries again.
+pub(crate) const ANOTHER_WRITER: &str =
+    "someone else was writing to this repository, so nothing was changed";
+
+/// How a push tells the Hub's refusal of a receipt that ran out before the upload reached it. A new
+/// preview of the same publication passes; an automatic upload's parent reads it to class the
+/// failure as one its worker tries again.
+pub(crate) const RECEIPT_EXPIRED: &str =
+    "this publication's receipt ran out before the upload reached the Hub";
+
+/// How a push tells the Hub's refusal of a receipt whose repository visibility or publication
+/// settings changed after the preview; read like [`RECEIPT_EXPIRED`].
+pub(crate) const RECEIPT_SETTINGS_CHANGED: &str = "the repository's visibility or publication settings changed on the Hub after this was previewed";
+
 /// Whether a failed push's message says that the same push meets the same refusal.
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
