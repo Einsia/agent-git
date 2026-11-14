@@ -277,6 +277,7 @@ pub(crate) mod tests {
                 runtime: "claude-code".into(),
                 generation: 7,
                 access: Access::Admin,
+                delivery_only: false,
             }),
             project_controller: None,
         };

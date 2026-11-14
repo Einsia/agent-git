@@ -200,6 +200,7 @@ async fn exercise(home: &std::path::Path, session_encrypted: bool) {
             runtime: "codex".into(),
             generation: 1,
             access: Access::Control,
+            delivery_only: false,
         }),
     };
     let (arrived_tx, mut arrived) = mpsc::channel(1);
