@@ -37,6 +37,7 @@ mod codex_titles;
 pub mod cursor;
 pub mod detail;
 pub mod enrich;
+pub mod gemini_cli;
 pub mod hermes;
 mod native_message;
 pub mod native_snapshot;
@@ -1164,6 +1165,14 @@ pub fn infer_runtime(text: &str) -> Option<&'static str> {
         ) {
             return Some("hermes");
         }
+        // A Gemini CLI session opens with {sessionId, projectHash, ...}; its messages are
+        // {id, type: "gemini" | "user", content}. Checked before Claude Code, whose records also
+        // carry a sessionId.
+        if (v.get("sessionId").is_some() && v.get("projectHash").is_some())
+            || (v.get("id").is_some() && v["type"] == "gemini")
+        {
+            return Some("gemini-cli");
+        }
         if v["type"] == "session" && v.get("version").is_some() && v.get("cwd").is_some() {
             return Some("openclaw");
         }
@@ -1325,6 +1334,7 @@ mod tests {
             ("hermes", Capability::Resumable, "hermes"),
             ("openclaw", Capability::Resumable, "openclaw"),
             ("workbuddy", Capability::Resumable, "workbuddy"),
+            ("gemini-cli", Capability::Resumable, "gemini-cli"),
         ];
         let got: Vec<_> = all()
             .iter()
@@ -1353,6 +1363,7 @@ mod tests {
             [
                 "claude-code",
                 "codex",
+                "gemini-cli",
                 "hermes",
                 "openclaw",
                 "opencode",
@@ -1430,6 +1441,12 @@ mod tests {
         assert_eq!(
             infer_runtime(r#"{"role":"user","message":{"content":[]}}"#),
             Some("cursor")
+        );
+        assert_eq!(
+            infer_runtime(
+                "{\"sessionId\":\"0b4c7f7e-3f43-4d8e-9a59-1f0c2b8f4a10\",\"projectHash\":\"p\",\"startTime\":\"t\"}\n{\"id\":\"m\",\"type\":\"user\",\"content\":[{\"text\":\"hi\"}]}"
+            ),
+            Some("gemini-cli")
         );
         assert_eq!(infer_runtime("not json"), None);
         assert_eq!(infer_runtime(""), None);

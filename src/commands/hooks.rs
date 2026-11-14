@@ -385,6 +385,19 @@ fn event_from(runtime: Option<&str>, buf: &str) -> Option<Event> {
                 event.source = Source::Startup;
             }
         }
+        // Gemini names its transcript in the payload; one outside a project's `chats` folder
+        // under Gemini's home is not a session of it, and nothing is read from it.
+        Some("gemini-cli") => {
+            let home = crate::adapter::gemini_cli::home().ok()?;
+            if !event.transcript_path.as_deref().is_some_and(|path| {
+                crate::adapter::gemini_cli::is_session_file(&home, std::path::Path::new(path))
+            }) {
+                eprintln!(
+                    "agit: the hook names no Gemini CLI session transcript; nothing captured"
+                );
+                return None;
+            }
+        }
         _ => {}
     }
     Some(event)
@@ -403,6 +416,7 @@ fn runtime_of(explicit: Option<&str>, transcript_path: Option<&str>) -> &'static
     }
     match transcript_path {
         Some(p) if p.contains("/.codex/") => "codex",
+        Some(p) if p.contains("/.gemini/") => "gemini-cli",
         Some(p) if p.contains("/.claude/") => "claude-code",
         _ => "claude-code",
     }

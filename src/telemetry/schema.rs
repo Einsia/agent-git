@@ -140,6 +140,7 @@ pub fn properties(argv: &[OsString]) -> Map<String, Value> {
                 "openclaw",
                 "hermes",
                 "workbuddy",
+                "gemini-cli",
             ],
             _ => &[],
         };

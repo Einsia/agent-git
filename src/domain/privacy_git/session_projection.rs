@@ -141,6 +141,7 @@ impl Projector {
         published: &dyn Fn() -> Result<Published<'a>>,
         rechecked: &mut Rechecked,
     ) -> Result<Conversation> {
+        let read_published = published;
         let Some((log, view)) = storage::local_v1_sequences(source.root(), oid)? else {
             // A v0 snapshot is rebuilt in the v1 layout as a whole.
             self.finish(source)?;
@@ -305,8 +306,18 @@ impl Projector {
             }
             Ok(())
         };
+        // A snapshot holding a Gemini CLI record is projected whole: publishing each part of a
+        // message once needs the lines around it, which `conversation_commit` reads.
+        let mut gemini = false;
         storage::for_each_local_event(source.root(), oid, &appended, &sizes, |id, line| {
+            if gemini {
+                return Ok(());
+            }
             let envelope = storage::parse_legacy_envelope_line(line)?;
+            if super::gemini_delta::applies(std::iter::once(&envelope)) {
+                gemini = true;
+                return Ok(());
+            }
             let first = !entries.contains_key(id);
             if first {
                 entries.insert(
@@ -398,6 +409,25 @@ impl Projector {
             &mut waiting,
             &mut contents,
         )?;
+        if gemini {
+            *self = Self::default();
+            let read;
+            let published = match published {
+                Some(published) => published,
+                None => {
+                    read = read_published()?;
+                    &read
+                }
+            };
+            return conversation_commit(
+                source,
+                oid,
+                parents,
+                published,
+                Carried::default(),
+                rechecked,
+            );
+        }
         // The whole-LOG projection uses a public parent's lines only while every record it keeps
         // in the shared part has one; otherwise none of them, so neither does this.
         if prefix.is_some_and(|prefix| !prefix_holds || shared != prefix.public.len()) {

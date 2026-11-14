@@ -900,6 +900,8 @@ impl HookInput {
                         let path = path.replace('\\', "/");
                         if path.contains("/.codex/") {
                             Some("codex")
+                        } else if path.contains("/.gemini/") {
+                            Some("gemini-cli")
                         } else if path.contains("/.claude/") {
                             Some("claude-code")
                         } else {

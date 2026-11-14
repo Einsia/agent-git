@@ -12926,3 +12926,318 @@ fn turning_a_folder_on_for_another_repository_moves_it() {
         "{records:?}"
     );
 }
+
+/// A Gemini CLI session publishes the conversation once and the person's words only. Gemini writes
+/// a reply again, whole, at each tool step: the push publishes its text, reasoning and each call
+/// once, and a later turn's copy adds only the result that is new. A prompt goes out as the person
+/// typed it (`displayContent`), never the `content` it was expanded into with the referenced files'
+/// bodies; an older prompt with no `displayContent` has its block of referenced files cut out and
+/// marked, and one whose block can't be cut cleanly is replaced whole. Context Gemini records as a
+/// prompt (the session's environment) never goes out, a hook's output appended after a prompt is
+/// cut and marked, and a `displayContent` holding context, or a context tag left unclosed among
+/// the words, replaces the prompt with a notice. Bookkeeping (metadata, `$set`, a legacy
+/// `$set.messages`, `$rewindTo`, a `$patch` that drops or reorders messages), notices, usage,
+/// display fields and inline data never go out. A token whose first copy of a reply held only its
+/// beginning is judged on the last copy, whole, and replaced; publishing each copy would send that
+/// beginning. Every published record is one the Hub's own judgement keeps unchanged. A third turn
+/// writes the reply again, once exactly as published and once with a new call: each part still
+/// goes out once, and every earlier turn's published LOG stays the start of the next; a push that
+/// judged a published line by its text, not its place, sends a part again. Exporting with
+/// `--redact`, which judges each record alone, refuses the session.
+#[test]
+fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
+    const FILE_BODY: &str = "CANARY-GEMINI-EXPANDED-FILE-BODY-41c7";
+    const OLD_BODY: &str = "CANARY-GEMINI-OLDER-EXPANDED-BODY-9d02";
+    const UNCLEAN: &str = "CANARY-GEMINI-UNCLEAN-PROMPT-e6b3";
+    const RESULT_DISPLAY: &str = "CANARY-GEMINI-RESULT-DISPLAY-07fa";
+    const DISPLAY_NAME: &str = "CANARY-GEMINI-DISPLAY-NAME-3b81";
+    const INFO: &str = "CANARY-GEMINI-INFO-NOTICE-c52e";
+    const SCRATCH: &str = "CANARY-GEMINI-SCRATCHPAD-PATH-8a6d";
+    const LEGACY: &str = "CANARY-GEMINI-LEGACY-SET-MESSAGES-2f19";
+    const MODEL: &str = "CANARY-GEMINI-MODEL-NAME-77d0";
+    const INLINE: &str = "Q0FOQVJZLUdFTUlOSS1JTkxJTkUtREFUQQ";
+    const TOKEN: &str = "ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr";
+    const TOKEN_START: &str = "ghp_R7kQ2mXv9LpZ4tNc8";
+    const SESSION_CONTEXT: &str = "CANARY-GEMINI-SESSION-CONTEXT-MEMORY-5a90";
+    const HOOK_CONTEXT: &str = "CANARY-GEMINI-HOOK-CONTEXT-e13d";
+    const DISPLAYED_CONTEXT: &str = "CANARY-GEMINI-DISPLAYED-CONTEXT-4c7b";
+    const UNCLOSED_CONTEXT: &str = "CANARY-GEMINI-UNCLOSED-CONTEXT-91fe";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "gemini-cli".into(),
+        String::new(),
+    );
+    repo.git(&["checkout", "-b", "gemini"]).unwrap();
+    let mut records: Vec<serde_json::Value> = Vec::new();
+    let mut turn = |added: Vec<serde_json::Value>| {
+        records.extend(added);
+        let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+        let log = transcript::wrap_lines(&text, "gemini-cli", &session.session);
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("turn {}", records.len())).unwrap();
+        assert_success(&run(&["--yes", "push", "alice/app@gemini"]));
+        // The Hub holds each turn's published form, not the local snapshot.
+        let public = git(&remote, &["rev-parse", "refs/heads/gemini"]);
+        assert_ne!(public, git(repo.root(), &["rev-parse", "HEAD"]));
+        let (log, _) = storage::materialize_pair_at(&remote, &public).unwrap();
+        (public, log)
+    };
+    let call = |id: &str, status: &str, result: serde_json::Value| {
+        json!({"id":id,"name":"read_file","args":{"file_path":format!("{id}.md")},"status":status,"result":result,
+            "displayName":DISPLAY_NAME,"description":"Reading","resultDisplay":RESULT_DISPLAY,"renderOutputAsMarkdown":true})
+    };
+    let output =
+        |text: &str| json!([{"functionResponse":{"name":"read_file","response":{"output":text}}}]);
+    let reply = |content: &str, calls: serde_json::Value, tokens: serde_json::Value| {
+        json!({"id":"m2","timestamp":"2026-11-14T01:00:01Z","type":"gemini","content":[{"text":content}],
+            "thoughts":[{"subject":"Plan","description":"read the notes first","timestamp":"t"}],
+            "toolCalls":calls,"tokens":tokens,"model":MODEL})
+    };
+    let token = |text: &str| json!({"id":"m4","timestamp":"2026-11-14T01:00:03Z","type":"gemini","content":[{"text":text}]});
+    let answered = reply(
+        "Reading the notes",
+        json!([call("c1", "success", output("OUT-C1"))]),
+        json!({"input":1,"output":2,"cached":0,"total":3}),
+    );
+    let (first, first_log) = turn(vec![
+        json!({"sessionId":"0b4c7f7e-3f43-4d8e-9a59-1f0c2b8f4a10","projectHash":"p","startTime":"t","lastUpdated":"t","kind":"main"}),
+        // The session's environment, which Gemini records as a prompt of its own.
+        json!({"id":"m0","timestamp":"t","type":"user",
+            "displayContent":format!("<session_context>\nMy memory: {SESSION_CONTEXT}\n</session_context>"),
+            "content":[{"text":format!("<session_context>\nThis is the Gemini CLI.\nMy memory: {SESSION_CONTEXT}\n</session_context>")}]}),
+        json!({"id":"m1","timestamp":"2026-11-14T01:00:00Z","type":"user",
+            "displayContent":[{"text":"Summarize @notes.md"}],
+            "content":[{"text":"Summarize @notes.md"},{"text":"\n--- Content from referenced files ---"},{"text":"\nContent from @notes.md:\n"},{"text":FILE_BODY},{"text":"\n--- End of content ---"}]}),
+        json!({"$set":{"lastUpdated":"t"}}),
+        reply(
+            "Reading the notes",
+            json!([call("c1", "scheduled", serde_json::Value::Null)]),
+            serde_json::Value::Null,
+        ),
+        answered.clone(),
+        json!({"id":"m3","timestamp":"t","type":"info","content":INFO}),
+        token(&format!("the key starts {TOKEN_START}")),
+        token(&format!("the key is {TOKEN}")),
+        json!({"$set":{"memoryScratchpad":{"version":1,"touchedPaths":[SCRATCH],"toolSequence":["read_file"]}}}),
+        json!({"$set":{"messages":[{"id":"x","type":"user","content":LEGACY}]}}),
+    ]);
+    let (second, second_log) = turn(vec![
+        reply(
+            "Reading the notes, edited",
+            json!([
+                call("c1", "success", output("OUT-C1")),
+                call("c2", "executing", serde_json::Value::Null)
+            ]),
+            serde_json::Value::Null,
+        ),
+        json!({"$patch":{"updates":[{"id":"m2","toolCalls":[{"id":"c2","result":output("OUT-C2")}]}]}}),
+        json!({"id":"m5","timestamp":"t","type":"user",
+            "content":[{"text":"Explain @old.md"},{"text":"\n--- Content from referenced files ---"},{"text":"\nContent from @old.md:\n"},{"text":OLD_BODY},{"text":"\n--- End of content ---"}]}),
+        json!({"id":"m6","timestamp":"t","type":"user","content":format!("look --- Content from referenced files --- {UNCLEAN}")}),
+        json!({"id":"m7","timestamp":"t","type":"user","content":[{"text":"what is in this picture"},{"inlineData":{"mimeType":"image/png","data":INLINE}}]}),
+        // A hook's output Gemini appended after the person's words.
+        json!({"id":"m8","timestamp":"t","type":"user",
+            "content":[{"text":"Run the tests"},{"text":format!("<hook_context>{HOOK_CONTEXT}</hook_context>")}]}),
+        json!({"id":"m9","timestamp":"t","type":"user",
+            "displayContent":format!("go <hook_context>{DISPLAYED_CONTEXT}</hook_context>"),
+            "content":[{"text":"go"}]}),
+        json!({"id":"m10","timestamp":"t","type":"user",
+            "content":[{"text":format!("see <hook_context>{UNCLOSED_CONTEXT}")}]}),
+        json!({"$rewindTo":"m7"}),
+        json!({"$patch":{"removeIds":["m6"],"orderIds":["m1","m2","m5"]}}),
+    ]);
+    // A later turn writes the reply again: once exactly as an earlier turn published it, once with
+    // a third call. Only the third call is new.
+    let (third, public_log) = turn(vec![
+        answered.clone(),
+        reply(
+            "Reading the notes",
+            json!([
+                call("c1", "success", output("OUT-C1")),
+                call("c2", "success", output("OUT-C2")),
+                call("c3", "success", output("OUT-C3"))
+            ]),
+            serde_json::Value::Null,
+        ),
+    ]);
+    // Each turn's published commit stays as it was: the next one's LOG extends it.
+    assert!(second_log.starts_with(&first_log) && public_log.starts_with(&second_log));
+    for (earlier, later) in [(&first, &second), (&second, &third)] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&remote)
+                .args(["merge-base", "--is-ancestor", earlier, later])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    for canary in [
+        FILE_BODY,
+        OLD_BODY,
+        UNCLEAN,
+        RESULT_DISPLAY,
+        DISPLAY_NAME,
+        INFO,
+        SCRATCH,
+        LEGACY,
+        MODEL,
+        INLINE,
+        TOKEN,
+        TOKEN_START,
+        SESSION_CONTEXT,
+        HOOK_CONTEXT,
+        DISPLAYED_CONTEXT,
+        UNCLOSED_CONTEXT,
+        "context>",
+        "\"tokens\"",
+        "displayContent",
+        "renderOutputAsMarkdown",
+        "$rewindTo",
+        "removeIds",
+        "orderIds",
+        "projectHash",
+    ] {
+        assert!(
+            !public_log.contains(canary),
+            "{canary} went out: {public_log}"
+        );
+    }
+    // Every part goes out exactly once, whichever copy and turn carried it.
+    for part in [
+        "Summarize @notes.md",
+        "Reading the notes",
+        "read the notes first",
+        "c1.md",
+        "c2.md",
+        "c3.md",
+        "OUT-C1",
+        "OUT-C2",
+        "OUT-C3",
+        "the key",
+    ] {
+        assert_eq!(public_log.matches(part).count(), 1, "{part}: {public_log}");
+    }
+    let published: Vec<serde_json::Value> = storage::parse_envelopes(&public_log)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            assert_eq!(record.source, "gemini-cli");
+            assert_eq!(
+                agit::domain::publication_records::published("gemini-cli", &record.content),
+                Some(record.content.clone()),
+                "the Hub's judgement changes a published record"
+            );
+            record.content
+        })
+        .collect();
+    let content_of = |id: &str| -> Vec<&serde_json::Value> {
+        published
+            .iter()
+            .filter(|record| record["id"] == id)
+            .filter_map(|record| record.get("content"))
+            .collect()
+    };
+    assert_eq!(content_of("m1"), [&json!([{"text":"Summarize @notes.md"}])]);
+    assert!(
+        content_of("m4")[0][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("the key is ")
+    );
+    assert_eq!(
+        content_of("m5"),
+        [&json!([{"text":"Explain @old.md"},{"text":"[File content excluded by policy]"}])]
+    );
+    assert_eq!(
+        content_of("m6"),
+        [&json!([{"text":"[Content unavailable: unsupported message format]"}])]
+    );
+    assert!(published.iter().all(|record| record["id"] != "m0"));
+    assert_eq!(
+        content_of("m8"),
+        [
+            &json!([{"text":"Run the tests"},{"text":"[Content unavailable: unsupported content block]"}])
+        ]
+    );
+    for unclean in ["m9", "m10"] {
+        assert_eq!(
+            content_of(unclean),
+            [&json!([{"text":"[Content unavailable: unsupported message format]"}])]
+        );
+    }
+    assert_eq!(
+        content_of("m7"),
+        [&json!([{"text":"what is in this picture"},{"text":"[Attachment omitted by policy]"}])]
+    );
+
+    // Redacting and sharing judge each record alone, so they refuse this session for now.
+    let refused = run(&["export", "alice/app@gemini", "--redact"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("isn't supported yet"),
+        "{refused:?}"
+    );
+}

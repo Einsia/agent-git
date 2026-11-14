@@ -78,6 +78,19 @@ pub(super) fn workbuddy_mcp(exe: &str) -> SetupReport {
     )
 }
 
+/// Gemini CLI reads MCP servers from the same user settings its hooks live in.
+pub(super) fn gemini_mcp(exe: &str) -> SetupReport {
+    let Ok(root) = crate::adapter::gemini_cli::home() else {
+        return SetupReport::failure();
+    };
+    super::upsert_json_mcp(
+        &root.join("settings.json"),
+        "mcpServers",
+        "agit",
+        json!({"command":exe,"args":["mcp"]}),
+    )
+}
+
 pub(super) fn openclaw(exe: &str) -> SetupReport {
     let result = (|| {
         let root = crate::adapter::openclaw::home()?;

@@ -36,6 +36,7 @@ runtimes! {
     ("hermes", "Hermes", ["hermes-agent"], super::hermes::Hermes, Some(|| Ok(super::hermes::home()?.join("skills/agit")))),
     ("openclaw", "OpenClaw", [], super::openclaw::OpenClaw, Some(|| Ok(super::openclaw::home()?.join("skills/agit")))),
     ("workbuddy", "WorkBuddy", ["workbuddy-ai"], super::workbuddy::WorkBuddy, Some(|| Ok(super::workbuddy::home()?.join("skills/agit")))),
+    ("gemini-cli", "Gemini CLI", ["gemini"], super::gemini_cli::GeminiCli, Some(|| Ok(super::gemini_cli::home()?.join("skills/agit")))),
 }
 
 pub fn registration(runtime: &str) -> Option<&'static RuntimeRegistration> {

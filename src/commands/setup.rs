@@ -437,6 +437,14 @@ const HOOKS: &[(&str, &[&str])] = &[
     ("Stop", &["hooks", "settle"]),
 ];
 
+/// The hooks installed into Gemini CLI's settings.json, under Gemini's own event names: its agent
+/// loop ends with `AfterAgent`, and a session that ends between loops ends with `SessionEnd`.
+const GEMINI_HOOKS: &[(&str, &[&str])] = &[
+    ("SessionStart", &["hooks", "ingest"]),
+    ("AfterAgent", &["hooks", "settle"]),
+    ("SessionEnd", &["hooks", "settle"]),
+];
+
 /// Hooks installed for Claude Code alone, each with its timeout in seconds. A PermissionRequest
 /// hook waits for an answer a person gives in shared control while the terminal's dialog stays
 /// up beside it. Claude Code goes on when the terminal answers but leaves the hook running, so
@@ -609,6 +617,20 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
             Err(_) => report.merge(SetupReport::failure()),
         }
     }
+    // The user's own settings: Gemini does not run AfterAgent from a project's settings.
+    if runtime.wants("gemini-cli") {
+        match crate::adapter::gemini_cli::home() {
+            Ok(root) => report.merge(install_hook_events(
+                &root.join("settings.json"),
+                "Gemini CLI",
+                &exe,
+                Some("gemini-cli"),
+                GEMINI_HOOKS,
+                &[],
+            )),
+            Err(_) => report.merge(SetupReport::failure()),
+        }
+    }
     for id in ["hermes", "openclaw"] {
         if runtime.wants(id)
             && (runtime.named(id)
@@ -727,7 +749,7 @@ type HookFile = (
     Option<&'static str>,
 );
 
-fn hook_files() -> [HookFile; 3] {
+fn hook_files() -> [HookFile; 4] {
     [
         ("claude-code", "Claude Code", claude_settings(), None),
         (
@@ -743,6 +765,14 @@ fn hook_files() -> [HookFile; 3] {
                 .ok()
                 .map(|root| root.join("settings.json")),
             Some("workbuddy"),
+        ),
+        (
+            "gemini-cli",
+            "Gemini CLI",
+            crate::adapter::gemini_cli::home()
+                .ok()
+                .map(|root| root.join("settings.json")),
+            Some("gemini-cli"),
         ),
     ]
 }
@@ -1107,6 +1137,19 @@ fn install_hook_file(
     runtime_flag: Option<&str>,
     extra: &[(&str, &[&str], u64)],
 ) -> SetupReport {
+    install_hook_events(path, label, exe, runtime_flag, HOOKS, extra)
+}
+
+/// [`install_hook_file`] with the runtime's own `events` in place of [`HOOKS`]. Every other key of
+/// the file is kept as it is, and the file keeps its permissions.
+fn install_hook_events(
+    path: &Path,
+    label: &str,
+    exe: &str,
+    runtime_flag: Option<&str>,
+    events: &[(&str, &[&str])],
+    extra: &[(&str, &[&str], u64)],
+) -> SetupReport {
     let original = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -1148,7 +1191,7 @@ fn install_hook_file(
         return SetupReport::failure();
     }
 
-    for event in HOOKS
+    for event in events
         .iter()
         .map(|(event, _)| *event)
         .chain(RETIRED_HOOKS.iter().map(|(event, _)| *event))
@@ -1166,13 +1209,13 @@ fn install_hook_file(
         }
     }
 
-    let added = add_hooks(&mut doc, exe, runtime_flag, extra);
+    let added = add_hooks(&mut doc, exe, runtime_flag, events, extra);
     if added > 0 {
         let text = match &original {
             None => serde_json::to_string_pretty(&doc).unwrap(),
             Some(text) => {
                 let Some(edited) = json_text::edit(text, &doc, |copy| {
-                    add_hooks(copy, exe, runtime_flag, extra);
+                    add_hooks(copy, exe, runtime_flag, events, extra);
                 }) else {
                     ui::warning(&format!(
                         "cannot install {label} hooks: {} cannot take them without rewriting the rest of it",
@@ -1216,6 +1259,7 @@ fn add_hooks(
     doc: &mut serde_json::Value,
     exe: &str,
     runtime_flag: Option<&str>,
+    events: &[(&str, &[&str])],
     extra: &[(&str, &[&str], u64)],
 ) -> usize {
     let hooks = doc
@@ -1228,7 +1272,7 @@ fn add_hooks(
         added += retire_hook(hooks, event, argv);
     }
     let on_path = agit_on_path();
-    for (event, argv) in HOOKS {
+    for (event, argv) in events {
         added += upsert_hook(
             hooks,
             event,
@@ -1960,6 +2004,9 @@ fn register_mcp(runtime: Targets<'_>) -> SetupReport {
 
     if runtime.wants("workbuddy") {
         report.merge(native::workbuddy_mcp(&exe));
+    }
+    if runtime.wants("gemini-cli") {
+        report.merge(native::gemini_mcp(&exe));
     }
     if runtime.wants("hermes")
         && (runtime.named("hermes")
@@ -3298,7 +3345,12 @@ mod tests {
     fn every_installed_hook_command_parses_as_a_real_agit_invocation() {
         use clap::Parser as _;
         let claude = CLAUDE_HOOKS.iter().map(|(event, argv, _)| (*event, *argv));
-        for (event, argv) in HOOKS.iter().copied().chain(claude) {
+        for (event, argv) in HOOKS
+            .iter()
+            .copied()
+            .chain(claude)
+            .chain(GEMINI_HOOKS.iter().copied())
+        {
             let mut cli: Vec<&str> = vec!["agit"];
             cli.extend_from_slice(argv);
             crate::commands::Cli::try_parse_from(&cli).unwrap_or_else(|e| {
@@ -3318,6 +3370,59 @@ mod tests {
             hook_command("/usr/bin/agit", HOOKS[0].1, Some("codex")),
             "/usr/bin/agit hooks ingest --runtime codex"
         );
+    }
+
+    /// Gemini CLI's hooks go under its own event names, each naming the runtime, into the user's
+    /// settings file without disturbing anything else in it: every other key keeps its value and
+    /// the file keeps its permissions, since it can hold an API key. Claude's `Stop` is not a
+    /// Gemini event, and a file that got it would capture nothing at a turn's end.
+    #[test]
+    fn gemini_hooks_take_its_event_names_and_leave_the_rest_of_its_settings_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = "{\n  \"security\": {\"auth\": {\"selectedType\": \"gemini-api-key\"}},\n  \"general\": {\"vimMode\": true}\n}\n";
+        std::fs::write(&path, original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let exe = "/usr/local/bin/agit";
+        let first = install_hook_events(
+            &path,
+            "Gemini CLI",
+            exe,
+            Some("gemini-cli"),
+            GEMINI_HOOKS,
+            &[],
+        );
+        assert!(first.succeeded() && first.changed > 0);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["security"]["auth"]["selectedType"], "gemini-api-key");
+        assert_eq!(doc["general"]["vimMode"], true);
+        assert!(doc["hooks"].get("Stop").is_none());
+        for (event, argv) in GEMINI_HOOKS {
+            assert!(
+                carries_hook(&doc, event, &hook_arguments(argv, Some("gemini-cli"))),
+                "{event} lacks agit's hook: {doc}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let again = install_hook_events(
+            &path,
+            "Gemini CLI",
+            exe,
+            Some("gemini-cli"),
+            GEMINI_HOOKS,
+            &[],
+        );
+        assert!(again.succeeded() && again.changed == 0);
     }
 
     /// What lands in settings.json is the same data as [`HOOKS`] — otherwise the test above only

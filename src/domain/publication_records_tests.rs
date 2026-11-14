@@ -443,6 +443,37 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
     use RecordClass::*;
     let cases = [
         (
+            "gemini-cli",
+            json!({"id":"m1","type":"user","content":[{"text":"fix"}]}),
+            Conversation,
+        ),
+        (
+            // Published, it loses the expanded `content`, so as written it is not the conversation.
+            "gemini-cli",
+            json!({"id":"m1","type":"user","displayContent":"fix","content":[{"text":"fix"}]}),
+            RuntimeContext,
+        ),
+        (
+            "gemini-cli",
+            json!({"id":"m2","type":"gemini","content":[{"text":"sure"}],"toolCalls":[{"id":"c1","name":"read_file","args":{}}]}),
+            Conversation,
+        ),
+        (
+            "gemini-cli",
+            json!({"id":"m3","type":"info","content":"Request cancelled."}),
+            RuntimeContext,
+        ),
+        (
+            "gemini-cli",
+            json!({"$set":{"memoryScratchpad":{"version":1,"touchedPaths":["/work/a"]}}}),
+            RuntimeContext,
+        ),
+        (
+            "gemini-cli",
+            json!({"sessionId":"s","projectHash":"p","startTime":"t","lastUpdated":"t","kind":"main"}),
+            RuntimeContext,
+        ),
+        (
             "cursor",
             json!({"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nfix\n</user_query>"}]}}),
             Conversation,

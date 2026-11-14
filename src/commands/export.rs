@@ -139,6 +139,16 @@ pub fn run(args: Args) -> CmdResult {
             return Ok(ExitCode::Precondition);
         }
     };
+    // Redaction and the privacy projection judge each record alone, and Gemini CLI writes a
+    // message again whole at each change: an earlier copy holding only part of a value would go
+    // out unrecognised. Until they publish each part of a message once, they refuse such a session.
+    if (args.redact || args.privacy)
+        && crate::domain::storage::parse_envelopes(&env_text)
+            .is_ok_and(|records| records.iter().any(|record| record.source == "gemini-cli"))
+    {
+        ui::error(crate::domain::privacy_publication::GEMINI_NOT_PROJECTED);
+        return Ok(ExitCode::Precondition);
+    }
     let selected = if let Some((a, b)) = spec_turn_range(&spec) {
         crop_to_turns(&env_text, a, b)?
     } else {
