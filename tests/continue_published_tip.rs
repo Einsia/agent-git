@@ -28,6 +28,9 @@ struct Lab {
     hub: Option<Hub>,
 }
 
+/// The Hub's identity for `alice/qa`.
+const AGENT_ID: &str = "aaaaaaaa-0000-4000-8000-000000000183";
+
 /// A Hub that answers only for `alice/qa`, whose clone address is a local repository.
 struct Hub {
     url: String,
@@ -41,7 +44,7 @@ impl Hub {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let agent = json!({
-            "agent_id": "aaaaaaaa-0000-4000-8000-000000000183",
+            "agent_id": AGENT_ID,
             "owner": "alice", "name": "qa", "visibility": "private", "clone_url": clone_url,
         })
         .to_string();
@@ -219,6 +222,48 @@ impl Lab {
         self.repo.add_all().unwrap();
         self.repo.commit(&format!("Turn {turn}")).unwrap();
         self.head()
+    }
+
+    /// Leaves the checkout holding more than one pack, with Git's own maintenance due on its next
+    /// fetch and run in the foreground, so a repack would be done by the time that fetch returns.
+    /// Returns how many packs it holds.
+    fn packs_due_for_maintenance(&self) -> usize {
+        for (key, value) in [("gc.autoPackLimit", "1"), ("gc.autoDetach", "false")] {
+            self.repo.git(&["config", key, value]).unwrap();
+        }
+        self.repo.git(&["repack", "-q"]).unwrap();
+        // A repack without `-a` packs only reachable loose objects, so the second pack holds one a
+        // ref reaches while it is written.
+        let loose = self.temporary.path().join("loose-object");
+        std::fs::write(&loose, "a loose object\n").unwrap();
+        let blob = self
+            .repo
+            .git(&["hash-object", "-w", loose.to_str().unwrap()])
+            .unwrap();
+        self.repo
+            .git(&["update-ref", "refs/test-packs/loose", blob.trim()])
+            .unwrap();
+        self.repo.git(&["repack", "-q"]).unwrap();
+        self.repo
+            .git(&["update-ref", "-d", "refs/test-packs/loose"])
+            .unwrap();
+        let packs = self.packs();
+        assert!(packs > 1);
+        packs
+    }
+
+    fn packs(&self) -> usize {
+        std::fs::read_dir(self.repo.root().join(".git/objects/pack"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .count()
     }
 
     fn head(&self) -> String {
@@ -451,10 +496,16 @@ fn a_native_session_of_the_stale_head_is_not_reused_after_the_fast_forward() {
 /// the branch only on the Hub, resume fetches it, says so, and continues from the published tip
 /// with that turn in the session. A resume judged against the last fetch continues the first
 /// turn alone in the first case and finds no branch in the second.
+///
+/// That fetch, like every fetch agit runs, leaves the checkout's packs to agit: one that let Git's
+/// own maintenance run would rewrite the checkout's packs into one before it returns. `agit run`'s
+/// fetch of a checkout it already has goes through the other transport entry, the one `agit pr
+/// fetch` shares, and is held to the same.
 #[test]
 fn resume_continues_a_collaborators_turn_it_fetches_from_the_hub() {
     for only_on_hub in [false, true] {
         let lab = Lab::published_by_a_collaborator(only_on_hub);
+        let packs = lab.packs_due_for_maintenance();
         let output = lab.agit(&["resume", "alice/qa@work", "--no-launch"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -472,6 +523,24 @@ fn resume_continues_a_collaborators_turn_it_fetches_from_the_hub() {
         assert!(
             lab.materialized().contains("Published turn 2."),
             "{only_on_hub}: the session handed to the runtime lacks the collaborator's turn"
+        );
+        assert!(
+            lab.packs() >= packs,
+            "{only_on_hub}: Git repacked the checkout after resume's fetch"
+        );
+        // `agit run` fetches a checkout it has only under the identity it was cloned with.
+        let hub = &lab.hub.as_ref().unwrap().url;
+        agit::hub::identity::pin(
+            &lab.repo,
+            &agit::hub::identity::RemoteIdentity::new(hub, AGENT_ID).unwrap(),
+        )
+        .unwrap();
+        let packs = lab.packs_due_for_maintenance();
+        let output = lab.agit(&["run", "alice/qa@work", "--no-launch"]);
+        assert!(
+            lab.packs() >= packs,
+            "{only_on_hub}: Git repacked the checkout after run's fetch: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

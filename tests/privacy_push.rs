@@ -12478,7 +12478,46 @@ fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
     turn("pub1", 'e', &[PUBLISHED], None);
     repo.git(&["checkout", "main"]).unwrap();
     assert_success(&run(&["--yes", "push", "alice/app@pub1"]));
+    // Past Git's own maintenance threshold, run in the foreground so a repack would be done by the
+    // time the fetch returns: a fetch agit runs leaves the checkout's packs to agit, which rolls up
+    // only small ones, instead of letting Git rewrite the whole store.
+    for config in [["gc.autoPackLimit", "1"], ["gc.autoDetach", "false"]] {
+        repo.git(&["config", config[0], config[1]]).unwrap();
+    }
+    let packs = || {
+        fs::read_dir(repo.root().join(".git/objects/pack"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "pack")
+            })
+            .count()
+    };
+    repo.git(&["repack", "-q"]).unwrap();
+    // A repack without `-a` packs only reachable loose objects, so the second pack holds one a
+    // ref reaches while it is written.
+    let loose = repo.root().join(".git/agit-test-loose-object");
+    fs::write(&loose, "a loose object\n").unwrap();
+    let blob = repo
+        .git(&["hash-object", "-w", loose.to_str().unwrap()])
+        .unwrap();
+    fs::remove_file(&loose).unwrap();
+    repo.git(&["update-ref", "refs/test-packs/loose", blob.trim()])
+        .unwrap();
+    repo.git(&["repack", "-q"]).unwrap();
+    repo.git(&["update-ref", "-d", "refs/test-packs/loose"])
+        .unwrap();
+    let before = packs();
+    assert!(before > 1);
     assert_success(&run(&["fetch", "alice/app"]));
+    assert!(
+        packs() >= before,
+        "Git repacked the checkout after agit's fetch"
+    );
     git(repo.root(), &["rev-parse", "refs/remotes/origin/pub1"]);
     // A later turn on it, never pushed.
     repo.git(&["checkout", "pub1"]).unwrap();
