@@ -980,11 +980,66 @@ fn lookup(client: &Client, owner: &str, name: &str) -> Result<Option<RemoteAgent
 /// The Hub finds a repository whatever the case of its name and answers with the spelling it
 /// stores. Which repository that is, where it matters, is settled by the agent id the caller
 /// compares next, never by the name.
+/// Which check before a publication refused it, by a fixed name a device's diagnostics may carry:
+/// never a path, repository, account or Hub address. Its message is the one the check has always
+/// shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationCheck {
+    HubChanged,
+    OtherDestination,
+    RepositoryIdentityChanged,
+    UrlOutsideHub,
+    UrlNotCanonical,
+    AccountUnavailable,
+    AccountChanged,
+}
+
+impl PublicationCheck {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::HubChanged => "hub_changed",
+            Self::OtherDestination => "other_destination",
+            Self::RepositoryIdentityChanged => "repository_identity_changed",
+            Self::UrlOutsideHub => "url_outside_hub",
+            Self::UrlNotCanonical => "url_not_canonical",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::AccountChanged => "account_changed",
+        }
+    }
+
+    /// The check `error` failed on, wherever in its chain it was raised.
+    pub(crate) fn of(error: &anyhow::Error) -> Option<Self> {
+        error.downcast_ref::<Self>().copied().or_else(|| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<Self>().copied())
+        })
+    }
+
+    fn require(self, holds: bool) -> Result<()> {
+        if holds { Ok(()) } else { Err(self.into()) }
+    }
+}
+
+impl std::fmt::Display for PublicationCheck {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HubChanged => "publication Hub changed",
+            Self::OtherDestination => "the Hub returned another publication destination",
+            Self::RepositoryIdentityChanged => "publication repository identity changed",
+            Self::UrlOutsideHub => "the publication URL is outside the selected Hub",
+            Self::UrlNotCanonical => "the publication URL is not canonical",
+            Self::AccountUnavailable => "publication account is unavailable",
+            Self::AccountChanged => "publication account changed",
+        })
+    }
+}
+
+impl std::error::Error for PublicationCheck {}
+
 fn verify_agent_location(hub: &str, owner: &str, name: &str, remote: &RemoteAgent) -> Result<()> {
-    ensure!(
-        remote.owner == owner && remote.name.eq_ignore_ascii_case(name),
-        "the Hub returned another publication destination"
-    );
+    PublicationCheck::OtherDestination
+        .require(remote.owner == owner && remote.name.eq_ignore_ascii_case(name))?;
     RemoteIdentity::new(hub, &remote.agent_id)?;
     verify_url(hub, &remote.clone_url)
 }
@@ -1031,29 +1086,23 @@ pub(crate) fn publication_consent_with_client(
     expected: &RemoteIdentity,
     client: &Client,
 ) -> Result<AutoConsent> {
-    ensure!(
-        identity::normalize_hub(client.base())? == expected.hub,
-        "publication Hub changed"
-    );
+    PublicationCheck::HubChanged
+        .require(identity::normalize_hub(client.base())? == expected.hub)?;
     let (owner, name) = super::super::parse_slug(repository)?;
     let remote = client.get_agent(&owner, &name)?;
     verify_agent_location(&expected.hub, &owner, &name, &remote)?;
-    ensure!(
-        remote.agent_id == expected.agent_id,
-        "publication repository identity changed"
-    );
+    PublicationCheck::RepositoryIdentityChanged.require(remote.agent_id == expected.agent_id)?;
     client.require_push_access(&owner, &name, &expected.agent_id)?;
     let credential =
-        credentials::load_checked(&expected.hub)?.context("publication account is unavailable")?;
+        credentials::load_checked(&expected.hub)?.ok_or(PublicationCheck::AccountUnavailable)?;
     let account = client.session_account()?;
-    ensure!(
+    PublicationCheck::AccountChanged.require(
         client.credential_username().as_deref() == Some(credential.username.as_str())
             && credential
                 .account_id
                 .as_ref()
                 .is_none_or(|id| id == &account.account_id),
-        "publication account changed"
-    );
+    )?;
     Ok(AutoConsent {
         version: 3,
         hub: expected.hub.clone(),
@@ -1066,19 +1115,16 @@ pub(crate) fn publication_consent_with_client(
 }
 
 fn verify_url(hub: &str, url: &str) -> Result<()> {
-    ensure!(
+    PublicationCheck::UrlOutsideHub.require(
         identity::normalize_hub(url)? == url
             && url.starts_with(&format!("{hub}/"))
             && crate::infra::hub_authority::HubAuthority::parse(hub)?.matches(url),
-        "the publication URL is outside the selected Hub"
-    );
-    ensure!(
+    )?;
+    PublicationCheck::UrlNotCanonical.require(
         !url.chars()
             .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | '%'))
             && !url.split('/').any(|part| matches!(part, "." | "..")),
-        "the publication URL is not canonical"
-    );
-    Ok(())
+    )
 }
 
 fn show_publication(report: &PublicationReport) {

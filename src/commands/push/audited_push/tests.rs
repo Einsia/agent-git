@@ -247,6 +247,60 @@ fn noncanonical_or_credentialed_git_destinations_are_refused() {
     }
 }
 
+/// A publication check that refuses names itself by its fixed code, through the context a caller
+/// adds, and still says what it always said: a device's diagnostics record that code, so a check
+/// that went back to a bare message would read as an unclassified failure again.
+#[test]
+fn a_refused_publication_check_names_itself() {
+    let named = |result: Result<()>| {
+        let error = result
+            .unwrap_err()
+            .context("the caller's own context on top");
+        let check = PublicationCheck::of(&error).expect("the check names itself");
+        assert_eq!(
+            format!("{:#}", error).split(": ").last(),
+            Some(check.to_string().as_str())
+        );
+        check.name()
+    };
+    assert_eq!(
+        named(verify_url(
+            "https://hub.example",
+            "https://hub.example.evil/me/qa.git"
+        )),
+        "url_outside_hub"
+    );
+    assert_eq!(
+        named(verify_url(
+            "https://hub.example",
+            "https://hub.example/me/%2e%2e/qa.git"
+        )),
+        "url_not_canonical"
+    );
+    let mut moved = remote();
+    moved.owner = "someone".into();
+    assert_eq!(
+        named(verify_agent_location(
+            "https://hub.example",
+            "me",
+            "qa",
+            &moved
+        )),
+        "other_destination"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let repo = crate::domain::repo::Repo::init(directory.path()).unwrap();
+    let elsewhere = RemoteIdentity::new("https://two.example", &remote().agent_id).unwrap();
+    let client = crate::hub::Client::for_stored_hub_with_timeout(
+        "https://one.example",
+        std::time::Duration::from_secs(1),
+    );
+    assert_eq!(
+        named(publication_consent_with_client(&repo, "me/qa", &elsewhere, &client).map(|_| ())),
+        "hub_changed"
+    );
+}
+
 #[test]
 fn incomplete_inspection_and_native_failures_keep_their_exit_categories() {
     assert_eq!(
