@@ -755,6 +755,38 @@ async fn serve_described(
                                 let _ = output.send_work(response.to_json(), work);
                             });
                         }
+                        // Answered here like a history page and from the same workers: the read is
+                        // the conversation's, and the bytes never pass through the daemon.
+                        Ok(frame) if frame.method() == super::local_history::session_image::METHOD => {
+                            use super::local_history::{Failure, session_image};
+                            let Ok(permit) = history_slots.clone().try_acquire_owned() else {
+                                let response = Frame::error_response(original_id, session_image::rpc_error(Failure::Busy.into()));
+                                let _ = peer.output.send_work(response.to_json(), work);
+                                continue;
+                            };
+                            let output = peer.output.clone();
+                            let diagnostics = diagnostics.clone();
+                            tokio::spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    if frame.authority.departed() {
+                                        return Err(session_image::rpc_error(Failure::Busy.into()));
+                                    }
+                                    frame.authority.check()?;
+                                    let image = session_image::read(frame.params.unwrap_or_default()).map_err(session_image::rpc_error)?;
+                                    frame.authority.check()?;
+                                    Ok(image)
+                                }).await;
+                                let response = match result {
+                                    Ok(Ok(image)) => Frame::response(original_id, image),
+                                    Ok(Err(error)) => Frame::error_response(original_id, error),
+                                    Err(_) => Frame::error_response(original_id, RpcError::new(ErrorCode::RuntimeUnavailable, "Image reader stopped unexpectedly")),
+                                };
+                                // Records the outcome only; the body stays out of the log.
+                                if let Some(log) = &diagnostics { log.response(client, &response); }
+                                let _ = output.send_work(response.to_json(), work);
+                            });
+                        }
                         Ok(mut frame) => {
                             if pending.len() >= MAX_PENDING * MAX_CLIENTS || pending.values().filter(|(owner, _, _, _)| *owner == client).count() >= MAX_PENDING {
                                 let mut error = RpcError::new(ErrorCode::SessionBusy, "the device is handling too many requests; nothing was sent");

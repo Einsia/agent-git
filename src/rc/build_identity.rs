@@ -47,6 +47,9 @@ pub const RPC_FEATURES: &[&str] = &[
     // the owner may name one looser than the mode it would otherwise run in, judged as
     // `session.setPermissionMode` judges a switch.
     "resume-permission-mode-v1",
+    // `fs.readSessionImage` answers anyone who may read a conversation with an image one of its
+    // agent replies shows, from inside its folder (`rc::local_history::session_image`).
+    "session-image-read-v1",
     // The device sends `session.list.changed {workspace_id, project_id}` when a project's list
     // changes, to each connection whose own `session.list` shows a row that changed; a page that
     // sees this feature reads the list on the event instead of on a timer.

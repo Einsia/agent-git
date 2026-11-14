@@ -693,6 +693,7 @@ mod tests {
             ("session.subscribe", &stream, true),
             ("session.unwatch", &reference, true),
             ("session.history", &reference, true),
+            ("fs.readSessionImage", &reference, true),
             ("session.goal.read", &reference, true),
             ("session.resume", &reference, false),
             ("session.enqueue", &stream, false),

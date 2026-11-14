@@ -333,6 +333,7 @@ impl Controller {
                         | "session.list"
                         | "session.catalog.list"
                         | "session.history"
+                        | "fs.readSessionImage"
                         | "runtime.models"
                         | "session.start"
                 ),
@@ -353,6 +354,7 @@ impl Controller {
                         | "session.list"
                         | "session.catalog.list"
                         | "session.history"
+                        | "fs.readSessionImage"
                         | "session.goal.read"
                         | "session.publication.deliver"
                         | "session.subscribe"
@@ -532,24 +534,29 @@ mod tests {
         )
         .unwrap();
         assert!(controller.actor(&mut subscribe, &principal).is_err());
-        let (mut history, _) = access::authorize(
-            Frame::request("session.history", json!({"session_id":"visible"})),
-            &principal,
-            &policy,
-            &mut resources,
-        )
-        .unwrap();
-        controller.actor(&mut history, &principal).unwrap();
-        for id in ["hidden", "other"] {
-            assert!(
-                access::authorize(
-                    Frame::request("session.history", json!({"session_id":id})),
-                    &principal,
-                    &policy,
-                    &mut resources,
-                )
-                .is_err()
-            );
+        // An image a conversation shows is read with the conversation: a member denied this one
+        // session, or one outside the project, gets neither.
+        for method in ["session.history", "fs.readSessionImage"] {
+            let (mut read, _) = access::authorize(
+                Frame::request(method, json!({"session_id":"visible","path":"shot.png"})),
+                &principal,
+                &policy,
+                &mut resources,
+            )
+            .unwrap();
+            controller.actor(&mut read, &principal).unwrap();
+            for id in ["hidden", "other"] {
+                assert!(
+                    access::authorize(
+                        Frame::request(method, json!({"session_id":id,"path":"shot.png"})),
+                        &principal,
+                        &policy,
+                        &mut resources,
+                    )
+                    .is_err(),
+                    "{method} {id}"
+                );
+            }
         }
         let (mut mutation, _) = access::authorize(
             Frame::request("turn.start", json!({"session_id":"visible"})),

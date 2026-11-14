@@ -121,3 +121,15 @@ remote-control client that asked for them. The device requires the operator role
 viewers are refused, and it reads only inside the workspace's bound folders. An operator can
 already run commands in those folders, so reading a file grants nothing new. It never reaches a
 commit or a publication.
+
+`fs.readSessionImage` (`rc/local_history/session_image.rs`) sends the bytes of one image to a
+client that may read the conversation it names, viewers included, as `session.history` admits
+them. It reads only what that conversation already shows: a path an agent reply of the session
+names as an image (a CommonMark image, or a CodeLark `clk-send` image tag), never one named only
+by a prompt or a tool's output; after links are resolved, inside the session's own folder; a PNG,
+JPEG, GIF or WebP whose name and header agree, never SVG; and no larger than the file preview cap,
+refused rather than cut. Neither the path nor the bytes are logged, and it never reaches a commit
+or a publication. A tag or image quoted in code names nothing, as the page shows it as text.
+Each call walks the conversation's history newest first until a reply names the path, within the
+history reader's byte budget (`snapshot::MAX_BYTES`) and without a cache, so a page that shows
+several images reads that history once per image.

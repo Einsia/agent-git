@@ -181,6 +181,7 @@ pub fn authorize(
         }
         "session.catalog.settings"
         | "session.history"
+        | "fs.readSessionImage"
         | "session.goal.read"
         | "session.publication.deliver"
         | "session.subscribe"
@@ -212,6 +213,7 @@ pub fn authorize(
                     | "session.watch"
                     | "session.unwatch"
                     | "session.history"
+                    | "fs.readSessionImage"
                     | "session.enqueue"
             ) {
                 resources.resolve_catalog(&id).map_err(|_| {
@@ -283,6 +285,7 @@ pub fn authorize(
                         | "session.watch"
                         | "session.unwatch"
                         | "session.history"
+                        | "fs.readSessionImage"
                         | "session.enqueue"
                 ) && !managed_operation
                     && !watch_read
@@ -321,6 +324,7 @@ pub fn authorize(
             } else if matches!(
                 method.as_str(),
                 "session.history"
+                    | "fs.readSessionImage"
                     | "session.goal.read"
                     | "session.subscribe"
                     | "session.watch"
@@ -335,7 +339,10 @@ pub fn authorize(
             } else {
                 Need::Control
             };
-            if matches!(method.as_str(), "session.history" | "session.goal.read") {
+            if matches!(
+                method.as_str(),
+                "session.history" | "fs.readSessionImage" | "session.goal.read"
+            ) {
                 params["cwd"] = serde_json::json!(session.cwd);
                 params["runtime"] = serde_json::json!(session.runtime);
             }

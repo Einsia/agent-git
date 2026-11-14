@@ -4457,6 +4457,29 @@ pub fn items_from_lines(
     items_from_lines_with_mode(runtime, lines, super::codex_history::HistoryMode::Model)
 }
 
+/// The record one transcript line holds and the events it projects to, as
+/// [`items_from_lines_with_mode`] reads them. `None` for a line that projects to nothing.
+pub(crate) fn line_events(
+    runtime: &str,
+    adapter: &dyn crate::adapter::Adapter,
+    text: &str,
+    mode: super::codex_history::HistoryMode,
+) -> Option<(serde_json::Value, Vec<crate::adapter::Event>)> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    let (raw, events) = if runtime == "codex" {
+        let raw = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        let events = super::codex_history::events(&raw, mode);
+        (raw, events)
+    } else {
+        let parsed = adapter.parse(text).ok()?;
+        let raw = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        (raw, parsed.events)
+    };
+    (!events.is_empty()).then_some((raw, events))
+}
+
 /// [`items_from_lines`] for lines read in `mode`. A record goes as the harness wrote it: its
 /// `raw` is the line's own JSON, capped for the wire, and its `object_hash` is the hash the
 /// committed envelope carries, which is what lets the hub reconcile the live projection against
@@ -4471,27 +4494,9 @@ pub(crate) fn items_from_lines_with_mode(
     };
     let mut out = vec![];
     for line in lines {
-        if line.text.trim().is_empty() {
+        let Some((raw, events)) = line_events(runtime, adapter.as_ref(), &line.text, mode) else {
             continue;
-        }
-        let (raw, events) = if runtime == "codex" {
-            let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
-                continue;
-            };
-            let events = super::codex_history::events(&raw, mode);
-            (raw, events)
-        } else {
-            let Ok(parsed) = adapter.parse(&line.text) else {
-                continue;
-            };
-            let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line.text) else {
-                continue;
-            };
-            (raw, parsed.events)
         };
-        if events.is_empty() {
-            continue;
-        }
         let native_prompt_id = (runtime == "codex")
             .then(|| super::codex_history::prompt_identity(&raw, mode))
             .flatten();
