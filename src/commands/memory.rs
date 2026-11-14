@@ -634,6 +634,12 @@ fn upsert_index(existing: &str, scope: &str, lines: &[String]) -> String {
     for line in existing.split_inclusive('\n') {
         let trimmed = line.trim_end();
         if trimmed == begin_tag {
+            // The blank line that set the section apart goes with it: otherwise each section
+            // replaced or removed between two others leaves one more blank line in an index the
+            // runtime reads only the head of.
+            if kept.ends_with("\n\n") {
+                kept.pop();
+            }
             skipping = true;
             continue;
         }
@@ -1009,7 +1015,6 @@ pub fn materialize_with(
 ) -> crate::Result<Report> {
     let checkout = super::worktree::checkout(primary, branch)?;
     adopt_start_baseline(primary, &checkout, branch)?;
-    let mirror = mirror_dir(mem_dir, slug, branch);
     let mut report = Report {
         dir: mem_dir.to_path_buf(),
         ..Report::default()
@@ -1024,7 +1029,73 @@ pub fn materialize_with(
         report.withheld = collected.withheld;
     }
     let baseline = read_baseline(&checkout, mem_dir)?.unwrap_or_default();
-    let mut files = branch_files(&checkout, &tree_ref(branch))?;
+    let files = branch_files(&checkout, &tree_ref(branch))?;
+    let next = place(
+        primary,
+        branch,
+        slug,
+        mem_dir,
+        files,
+        &baseline,
+        &mut report,
+    )?;
+    store_baseline(&checkout, &next)?;
+    Ok(report)
+}
+
+/// Before a conversation whose branch is not born yet starts: the `memory/` of `source`, the tree
+/// its team memory comes from, → the runtime directory, under the branch it will settle on. The
+/// baseline waits in that branch's start record, which its first landing adopts, so the first
+/// collection takes in what the conversation itself changed and nothing it was given. A start
+/// record already there keeps its top-level files: what a conversation wrote since then is still
+/// its own.
+pub fn materialize_unborn(
+    primary: &Repo,
+    branch: &str,
+    slug: &str,
+    mem_dir: &Path,
+    source: &str,
+) -> crate::Result<Report> {
+    anyhow::ensure!(
+        !primary.has_ref(&tree_ref(branch)),
+        "branch `{branch}` already exists"
+    );
+    let mut report = Report {
+        dir: mem_dir.to_path_buf(),
+        ..Report::default()
+    };
+    let record = start_baseline_path(primary, branch)?;
+    let earlier = read_baseline_at(&record, mem_dir)?;
+    let files = branch_files(primary, source)?;
+    let mut next = place(
+        primary,
+        branch,
+        slug,
+        mem_dir,
+        files,
+        &earlier.clone().unwrap_or_default(),
+        &mut report,
+    )?;
+    if let Some(earlier) = earlier {
+        next.files = earlier.files;
+    }
+    write_baseline(&record, &next)?;
+    Ok(report)
+}
+
+/// The placing a start does, whether its branch exists or is not born yet: `files` (a tree's
+/// `memory/`) → the mirror of `slug@branch` in `mem_dir` and its index section, judged against
+/// `baseline`. Returns the baseline to keep.
+fn place(
+    primary: &Repo,
+    branch: &str,
+    slug: &str,
+    mem_dir: &Path,
+    mut files: BTreeMap<String, Vec<u8>>,
+    baseline: &Baseline,
+    report: &mut Report,
+) -> crate::Result<Baseline> {
+    let mirror = mirror_dir(mem_dir, slug, branch);
     for bytes in files.values_mut() {
         if let Ok(text) = std::str::from_utf8(bytes) {
             *bytes = crate::domain::privacy::service::transform(
@@ -1109,15 +1180,7 @@ pub fn materialize_with(
         let _ = std::fs::remove_dir(&mirror);
     }
 
-    // The index section: written only when there are mirrored files, otherwise the old section
-    // is deleted.
-    let index_path = mem_dir.join(INDEX_FILE);
-    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
-    let next = upsert_index(&existing, &index_scope(slug, branch), &index);
-    if next != existing && (!next.trim().is_empty() || index_path.exists()) {
-        std::fs::create_dir_all(mem_dir)?;
-        std::fs::write(&index_path, next)?;
-    }
+    write_index(mem_dir, slug, branch, &index)?;
 
     let mut next_baseline = Baseline::of(mem_dir, &md_files(mem_dir)?, &BTreeMap::new());
     next_baseline.mirror = placed_hashes;
@@ -1131,8 +1194,58 @@ pub fn materialize_with(
             }
         }
     }
-    store_baseline(&checkout, &next_baseline)?;
-    Ok(report)
+    Ok(next_baseline)
+}
+
+/// The index section of `slug@branch`: written only when there are mirrored files, otherwise the
+/// old section is deleted.
+fn write_index(mem_dir: &Path, slug: &str, branch: &str, index: &[String]) -> crate::Result<()> {
+    let index_path = mem_dir.join(INDEX_FILE);
+    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+    let next = upsert_index(&existing, &index_scope(slug, branch), index);
+    if next != existing && (!next.trim().is_empty() || index_path.exists()) {
+        std::fs::create_dir_all(mem_dir)?;
+        std::fs::write(&index_path, next)?;
+    }
+    Ok(())
+}
+
+/// Lists the mirror of `slug@branch` in its index section again, as it stands, placing and
+/// removing nothing: a conversation that comes back reads what it was given, and what it changed
+/// without collecting it yet.
+pub fn reindex(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
+    let index: Vec<String> = md_files(&mirror_dir(mem_dir, slug, branch))?
+        .iter()
+        .map(|(name, bytes)| index_line(name, bytes, &mirror_relative(slug, branch, name)))
+        .collect();
+    write_index(mem_dir, slug, branch, &index)
+}
+
+/// Takes the index sections of `slug`'s branches outside `keep` out of `mem_dir`'s index. Their
+/// mirror files stay where they are, with any edit not collected yet; [`reindex`] lists them
+/// again. The runtime reads only the head of its index, so sections nobody reads any more would
+/// push the current ones out of it.
+pub fn drop_sections(mem_dir: &Path, slug: &str, keep: &BTreeSet<String>) -> crate::Result<()> {
+    let index_path = mem_dir.join(INDEX_FILE);
+    let Ok(existing) = std::fs::read_to_string(&index_path) else {
+        return Ok(());
+    };
+    let opening = format!("{INDEX_BEGIN} {slug}@");
+    let dropped: Vec<String> = existing
+        .lines()
+        .filter_map(|line| line.trim_end().strip_prefix(opening.as_str()))
+        .filter_map(|rest| rest.strip_suffix(" -->"))
+        .filter(|branch| !keep.contains(*branch))
+        .map(str::to_owned)
+        .collect();
+    let mut next = existing.clone();
+    for branch in &dropped {
+        next = upsert_index(&next, &index_scope(slug, branch), &[]);
+    }
+    if next != existing {
+        std::fs::write(&index_path, next)?;
+    }
+    Ok(())
 }
 
 /// At settlement: the runtime directory → branch `memory/`. None means this runtime has no memory
@@ -2649,6 +2762,62 @@ mod tests {
             file(&primary, "refs/heads/s1", "decisions.md").as_deref(),
             Some(body)
         );
+    }
+
+    /// A conversation whose branch is born only at its first landing, as one started from the Hub
+    /// is, gets a tree's memory at its start, and its first collection takes in what it changed
+    /// since: its edit to a placed file and a file it wrote, never the personal file already
+    /// there. A start that keeps its baseline anywhere the landing does not adopt it from collects
+    /// nothing, and one that records no top-level files collects the personal one.
+    #[test]
+    fn a_branch_born_after_its_start_collects_only_what_its_conversation_changed() {
+        let (_d, primary, mem) = fixture();
+        std::fs::write(mem.join("personal.md"), "my own notes\n").unwrap();
+        let report = materialize_unborn(&primary, "s2", SLUG, &mem, "refs/heads/main").unwrap();
+        assert_eq!(report.placed, 1);
+        let index = std::fs::read_to_string(mem.join(INDEX_FILE)).unwrap();
+        assert!(
+            index.contains(&mirror_relative(SLUG, "s2", "team.md")),
+            "{index}"
+        );
+
+        // The first landing births the branch with no memory of its own, as a device-local
+        // repository's first landing does.
+        let mut snap = Meta::new_session_line("claude-code".into(), "/w".into());
+        snap.session = format!("{}{}", meta::ID_PREFIX, "c".repeat(meta::ID_HEX_LEN));
+        let tree = super::super::plumbing::tree_apply_owned(
+            &primary,
+            "refs/heads/main",
+            vec![
+                (
+                    meta::FILE.into(),
+                    Some(meta::to_text(&snap).unwrap().into_bytes()),
+                ),
+                (format!("{TREE_DIR}/team.md"), None),
+            ],
+        )
+        .unwrap();
+        let root = super::super::plumbing::commit_tree(&primary, &tree, &[], "first turn").unwrap();
+        primary
+            .git(&["update-ref", "refs/heads/s2", &root])
+            .unwrap();
+        let edited = "uid, not user_id; ids are ULIDs\n";
+        std::fs::write(mirror_dir(&mem, SLUG, "s2").join("team.md"), edited).unwrap();
+        std::fs::write(
+            mem.join("learned.md"),
+            "the build needs the nightly toolchain\n",
+        )
+        .unwrap();
+        collect_with(&primary, "s2", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            file(&primary, "refs/heads/s2", "team.md").as_deref(),
+            Some(edited)
+        );
+        assert_eq!(
+            file(&primary, "refs/heads/s2", "learned.md").as_deref(),
+            Some("the build needs the nightly toolchain\n")
+        );
+        assert!(file(&primary, "refs/heads/s2", "personal.md").is_none());
     }
 
     #[test]

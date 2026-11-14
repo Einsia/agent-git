@@ -116,6 +116,12 @@ impl SessionOpening {
         match self {
             Self::Ready(value) => Ok(value),
             Self::Launch(mut spawn, reply) => {
+                // Held until `finish_spawn` lists the conversation as running.
+                let _launching = spawn
+                    .spec
+                    .agit_session
+                    .as_ref()
+                    .map(crate::rc::team_memory::Launching::enter);
                 let result = spawn.open(&daemon, &mut stop).await;
                 let exiting = match &result {
                     Err(failure) => failure.exiting.clone(),
@@ -280,6 +286,16 @@ impl PreparedSpawn {
             .await
             .persist_capture(self)
             .map_err(SpawnFailure::before_launch)?;
+        let memory = AssertUnwindSafe(self.place_memory(daemon)).catch_unwind();
+        tokio::select! {
+            biased;
+            _ = stop.changed() => {
+                return Err(SpawnFailure::before_launch(stopping(
+                    "the daemon is stopping; nothing was launched",
+                )));
+            }
+            _ = memory => {}
+        }
         let groups = crate::rc::harness::proc::LaunchGroups::default();
         let launch = AssertUnwindSafe(groups.scope(self.execute())).catch_unwind();
         let result = tokio::select! {
@@ -369,6 +385,33 @@ impl PreparedSpawn {
         self.spec.agit_session = None;
         self.info.agent = None;
         self.info.branch = None;
+    }
+
+    /// The team memory of the repository this conversation settles in, placed before the runtime
+    /// reads its memory at start (`crate::rc::team_memory`). It never stops the launch.
+    async fn place_memory(&self, daemon: &Arc<Mutex<Daemon>>) {
+        let Some(lineage) = self.spec.agit_session.clone() else {
+            return;
+        };
+        if self.spec.attach_only {
+            return;
+        }
+        let (runtime, cwd) = (self.info.runtime.clone(), self.spec.cwd.clone());
+        let fresh = self.spec.resume_from.is_none();
+        let daemon = daemon.clone();
+        crate::rc::team_memory::place_for_launch(
+            lineage,
+            runtime,
+            cwd,
+            fresh,
+            crate::rc::team_memory::FETCH_WITHIN,
+            |slug| async move {
+                let mut running = daemon.lock().await.running_branches(&slug);
+                running.extend(crate::rc::team_memory::launching(&slug));
+                running
+            },
+        )
+        .await;
     }
 
     async fn revalidate_capture(&self) -> Result<(), RpcError> {
@@ -797,6 +840,15 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// The branches of repository `slug` whose conversations run here now.
+    pub(super) fn running_branches(&self, slug: &str) -> BTreeSet<String> {
+        self.sessions
+            .values()
+            .filter(|live| !live.ended && live.info.agent.as_deref() == Some(slug))
+            .filter_map(|live| live.info.branch.clone())
+            .collect()
     }
 
     pub(super) fn finish_spawn(
