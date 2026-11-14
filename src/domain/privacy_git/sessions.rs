@@ -11,6 +11,8 @@ use crate::hub::{
 };
 use objects::Objects;
 
+#[path = "gemini_delta.rs"]
+mod gemini_delta;
 #[path = "session_objects.rs"]
 mod objects;
 #[path = "session_projection.rs"]
@@ -2520,6 +2522,7 @@ fn conversation_commit(
     });
     let mut shared = 0;
     let mut public_lines = Vec::with_capacity(log.len());
+    let mut first_published = vec![false; spliced.len()];
     let mut fresh = Vec::new();
     let mut contents = Vec::new();
     let mut batched = 0;
@@ -2551,10 +2554,15 @@ fn conversation_commit(
                 line = prefix.line(&prefix.public[shared])?;
             }
             shared += 1;
-        } else if !published.ids.contains(&id) {
-            batched += line.len();
-            fresh.push(index);
-            contents.push(candidate.content.clone());
+        } else {
+            // Past the lines the public parent published, by position: a line equal to one
+            // published elsewhere is still this snapshot's own.
+            first_published[index] = true;
+            if !published.ids.contains(&id) {
+                batched += line.len();
+                fresh.push(index);
+                contents.push(candidate.content.clone());
+            }
         }
         public_lines.push(Some(line));
         if batched >= PROTECTION_BATCH_BYTES {
@@ -2563,6 +2571,11 @@ fn conversation_commit(
         }
     }
     protect(&mut fresh, &mut contents, &mut public_lines)?;
+    // After protection, which judged each record whole: a Gemini CLI message written again on
+    // every change publishes each of its parts once.
+    if gemini_delta::applies(spliced.iter().flatten()) {
+        gemini_delta::publish_once(&mut public_lines, &first_published)?;
+    }
     let mut published = BTreeMap::<&str, Option<String>>::new();
     let mut public_log = String::new();
     let mut changed = false;

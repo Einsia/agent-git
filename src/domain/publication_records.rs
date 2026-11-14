@@ -53,6 +53,7 @@ pub const RUNTIMES: &[&str] = &[
     "hermes",
     "openclaw",
     "workbuddy",
+    "gemini-cli",
 ];
 
 /// The runtimes whose user messages are published with only the request inside their
@@ -266,6 +267,7 @@ impl Classifier {
             }
             "openclaw" => openclaw(record),
             "workbuddy" => workbuddy(record),
+            "gemini-cli" => gemini(record),
             _ => None,
         }
     }
@@ -1357,6 +1359,313 @@ fn workbuddy(record: &Map<String, Value>) -> Option<Value> {
         _ => false,
     };
     kept.then(|| Value::Object(record.clone()))
+}
+
+// ---- Gemini CLI ---------------------------------------------------------------------------
+
+/// Where Gemini CLI starts the referenced files it appends to a prompt's words.
+pub(crate) const GEMINI_REFERENCES_START: &str = "--- Content from referenced files ---";
+/// Where that block ends.
+pub(crate) const GEMINI_REFERENCES_END: &str = "--- End of content ---";
+/// The note Gemini CLI puts between a prompt's words and its referenced files when the person
+/// picked agents with `@`.
+const GEMINI_SYSTEM_NOTE: &str = "<system_note>";
+
+/// Gemini CLI: the person's prompts and Gemini's replies, with their reasoning, tool calls and
+/// results. A prompt is published as the person typed it: its `displayContent` when it has one,
+/// never the `content` that was expanded from it. Without one, the referenced files Gemini appended
+/// to the words are cut out and marked; a prompt whose block can't be cut cleanly is replaced
+/// whole by a notice. Bookkeeping (session metadata, `$set`, `$rewindTo`), notices (`info`,
+/// `warning`, `error`), usage and display fields are left out, and a `$patch` keeps only the tool
+/// results it brings.
+///
+/// Only fields present are kept, and a kept record judged again is unchanged, so a record the CLI
+/// published, or the part of one a later snapshot added, passes the Hub's judgement as it is.
+fn gemini(record: &Map<String, Value>) -> Option<Value> {
+    if let Some(patch) = record.get("$patch") {
+        return gemini_patch(patch);
+    }
+    let id = record.get("id")?.as_str()?;
+    let mut kept = Map::new();
+    kept.insert("id".into(), Value::String(id.to_owned()));
+    if let Some(timestamp) = record.get("timestamp") {
+        kept.insert("timestamp".into(), timestamp.clone());
+    }
+    match record.get("type").and_then(Value::as_str)? {
+        "user" => {
+            // Context Gemini adds as a prompt of its own (the session's environment, a hook's
+            // output) is the runtime's, not the person's, whatever its `displayContent` says.
+            if record.get("content").is_some_and(gemini_context) {
+                return None;
+            }
+            let content = match record
+                .get("displayContent")
+                .filter(|value| !value.is_null())
+            {
+                Some(display) if gemini_holds_context(display) => Some(
+                    serde_json::json!([{"text": crate::domain::privacy::omission::Omission::NativeRecord.text()}]),
+                ),
+                Some(display) => Some(gemini_parts(display)),
+                None => record.get("content").map(gemini_prompt),
+            };
+            kept.insert("type".into(), Value::String("user".into()));
+            // A copy of a prompt published before carries no content of its own.
+            if let Some(content) = content {
+                kept.insert("content".into(), content);
+            }
+        }
+        "gemini" => {
+            kept.insert("type".into(), Value::String("gemini".into()));
+            if let Some(content) = record.get("content") {
+                kept.insert("content".into(), gemini_parts(content));
+            }
+            if let Some(thoughts) = record.get("thoughts").and_then(Value::as_array) {
+                let thoughts = thoughts
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(|thought| keep_fields(thought, &["subject", "description", "timestamp"]))
+                    .collect();
+                kept.insert("thoughts".into(), Value::Array(thoughts));
+            }
+            if let Some(calls) = record.get("toolCalls").and_then(Value::as_array) {
+                let calls = calls
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .map(gemini_call)
+                    .collect();
+                kept.insert("toolCalls".into(), Value::Array(calls));
+            }
+        }
+        _ => return None,
+    }
+    Some(Value::Object(kept))
+}
+
+/// A tool call as published: its id, name, arguments, status, time and result, without the
+/// fields Gemini keeps for its own display.
+fn gemini_call(call: &Map<String, Value>) -> Value {
+    let mut kept = keep_fields(call, &["id", "name", "args", "status", "timestamp"]);
+    if let Some(result) = call.get("result")
+        && let Some(object) = kept.as_object_mut()
+    {
+        object.insert("result".into(), gemini_parts(result));
+    }
+    kept
+}
+
+/// A `$patch` as published: the tool results its updates bring, by message and call id, and
+/// nothing else; `None` when it brings none.
+fn gemini_patch(patch: &Value) -> Option<Value> {
+    // A patch whose results were all published before is kept with none.
+    if *patch == serde_json::json!({"updates": []}) {
+        return Some(serde_json::json!({"$patch": patch}));
+    }
+    let updates: Vec<&Value> = std::iter::once(patch)
+        .filter(|patch| patch.get("id").is_some())
+        .chain(patch["updates"].as_array().into_iter().flatten())
+        .collect();
+    let mut kept = Vec::new();
+    for update in updates {
+        let Some(id) = update["id"].as_str() else {
+            continue;
+        };
+        let results: Vec<Value> = update["toolCalls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|call| call["id"].is_string() && !call["result"].is_null())
+            .map(|call| serde_json::json!({"id": call["id"], "result": gemini_parts(&call["result"])}))
+            .collect();
+        if !results.is_empty() {
+            kept.push(serde_json::json!({"id": id, "toolCalls": results}));
+        }
+    }
+    (!kept.is_empty()).then(|| serde_json::json!({"$patch": {"updates": kept}}))
+}
+
+fn keep_fields(object: &Map<String, Value>, fields: &[&str]) -> Value {
+    Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| fields.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// Gemini content parts with inline or uploaded data replaced by a notice; text, calls and
+/// responses as they are.
+fn gemini_parts(value: &Value) -> Value {
+    match value {
+        Value::Array(parts) => Value::Array(parts.iter().map(gemini_parts).collect()),
+        Value::Object(part) if part.contains_key("inlineData") || part.contains_key("fileData") => {
+            serde_json::json!({"text": crate::domain::privacy::omission::Omission::Attachment.text()})
+        }
+        other => other.clone(),
+    }
+}
+
+/// Where Gemini CLI starts the context it records as a prompt of its own: the session's
+/// environment (date, system, directories, memory files) and a hook's output.
+const GEMINI_CONTEXT_TAGS: [(&str, &str); 2] = [
+    ("<session_context>", "</session_context>"),
+    ("<hook_context>", "</hook_context>"),
+];
+
+/// The text of Gemini content parts, joined, without thought parts.
+fn gemini_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts.iter().map(gemini_text).collect(),
+        Value::Object(part) if part.get("thought") != Some(&Value::Bool(true)) => part
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// Whether a prompt's content is context Gemini recorded as a prompt: it opens with a context
+/// tag, as Gemini's own reader tells such a record from the person's words.
+fn gemini_context(content: &Value) -> bool {
+    let text = gemini_text(content);
+    let text = text.trim();
+    GEMINI_CONTEXT_TAGS
+        .iter()
+        .any(|(open, _)| text.starts_with(open))
+}
+
+/// Whether `value` holds a context tag anywhere.
+fn gemini_holds_context(value: &Value) -> bool {
+    let text = value.to_string();
+    GEMINI_CONTEXT_TAGS
+        .iter()
+        .any(|(open, close)| text.contains(open) || text.contains(close))
+}
+
+/// A prompt's `content` without what Gemini appended to the person's words: the words, then a
+/// notice where each appended block was. A hook's output is a last part opening and closing with
+/// the hook tags; the referenced files follow [`gemini_prompt_words`]. A context tag anywhere else,
+/// or a hook block not closed as its own last part, can't be told apart from the words, so the
+/// whole prompt becomes a notice.
+fn gemini_prompt(content: &Value) -> Value {
+    use crate::domain::privacy::omission::Omission;
+    let whole = || serde_json::json!([{"text": Omission::NativeRecord.text()}]);
+    let (open, close) = GEMINI_CONTEXT_TAGS[1];
+    let hook_part = |text: &str| {
+        let text = text.trim();
+        text.starts_with(open)
+            && text.ends_with(close)
+            && text.matches(open).count() == 1
+            && text.matches(close).count() == 1
+    };
+    // A hook's output Gemini appended after the words, as a part of its own, is cut first.
+    let (words, hook) = match content {
+        Value::Array(parts)
+            if parts
+                .last()
+                .and_then(|part| part.as_str().or_else(|| part["text"].as_str()))
+                .is_some_and(hook_part) =>
+        {
+            (Value::Array(parts[..parts.len() - 1].to_vec()), true)
+        }
+        Value::String(text) => match text.find(open) {
+            Some(at) if hook_part(&text[at..]) => (Value::String(text[..at].to_owned()), true),
+            _ => (content.clone(), false),
+        },
+        _ => (content.clone(), false),
+    };
+    // Context anywhere else can't be told apart from the words.
+    if gemini_holds_context(&words) {
+        return whole();
+    }
+    let mut published = gemini_prompt_words(&words);
+    if hook
+        && published != whole()
+        && let Some(parts) = published.as_array_mut()
+    {
+        parts.push(serde_json::json!({"text": Omission::MessageContent.text()}));
+    }
+    published
+}
+
+/// [`gemini_prompt`] for a prompt without hook output: the words, then a notice where the
+/// referenced files were. That block starts at a part (or a line of a string prompt) that opens
+/// with the agent note or the referenced files' start marker, and ends with the referenced files'
+/// end marker (or the agent note's close, when no files follow it), with nothing after. A start
+/// marker among the words, a second one inside the block, or a block that doesn't end that way
+/// can't be told apart from the words, so the whole prompt becomes a notice.
+fn gemini_prompt_words(content: &Value) -> Value {
+    use crate::domain::privacy::omission::Omission;
+    const NOTE_END: &str = "</system_note>";
+    let opens =
+        |text: &str, marker: &str| text.trim_start_matches(['\n', '\r']).starts_with(marker);
+    let starts_block =
+        |text: &str| opens(text, GEMINI_REFERENCES_START) || opens(text, GEMINI_SYSTEM_NOTE);
+    let ends_block = |block: &str| {
+        let block = block.trim_end();
+        if block.contains(GEMINI_REFERENCES_START) {
+            block.ends_with(GEMINI_REFERENCES_END)
+                && block.matches(GEMINI_REFERENCES_START).count() == 1
+        } else {
+            block.ends_with(NOTE_END)
+        }
+    };
+    let with_notice = |mut words: Vec<Value>| {
+        words.push(serde_json::json!({"text": Omission::File.text()}));
+        Value::Array(words)
+    };
+    let whole = || serde_json::json!([{"text": Omission::NativeRecord.text()}]);
+    match content {
+        Value::String(text) => {
+            let line_start = |at: usize| at == 0 || text[..at].ends_with('\n');
+            let start = text
+                .match_indices(GEMINI_SYSTEM_NOTE)
+                .chain(text.match_indices(GEMINI_REFERENCES_START))
+                .map(|(at, _)| at)
+                .find(|&at| line_start(at));
+            match start {
+                None if !text.contains(GEMINI_REFERENCES_START) => gemini_parts(content),
+                Some(at)
+                    if !text[..at].contains(GEMINI_REFERENCES_START) && ends_block(&text[at..]) =>
+                {
+                    let words = text[..at].trim_end();
+                    with_notice(if words.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![serde_json::json!({"text": words})]
+                    })
+                }
+                _ => whole(),
+            }
+        }
+        Value::Array(parts) => {
+            fn text(part: &Value) -> &str {
+                part.as_str()
+                    .or_else(|| part["text"].as_str())
+                    .unwrap_or("")
+            }
+            let holds = |part: &Value| part.to_string().contains(GEMINI_REFERENCES_START);
+            let start = parts.iter().position(|part| starts_block(text(part)));
+            match start {
+                None if !parts.iter().any(holds) => gemini_parts(content),
+                Some(at) if !parts[..at].iter().any(holds) => {
+                    let block: String = parts[at..].iter().map(text).collect::<Vec<_>>().join("");
+                    let plain = parts[at..]
+                        .iter()
+                        .all(|part| part.is_string() || part.get("text").is_some());
+                    if plain && ends_block(&block) {
+                        with_notice(parts[..at].iter().map(gemini_parts).collect())
+                    } else {
+                        whole()
+                    }
+                }
+                _ => whole(),
+            }
+        }
+        _ => whole(),
+    }
 }
 
 #[cfg(test)]

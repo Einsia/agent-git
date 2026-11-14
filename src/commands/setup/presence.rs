@@ -333,7 +333,7 @@ fn preview() -> Vec<String> {
 /// file "y" writes nor names a tool the person does not have.
 fn integrations(runtime: &str, installed: bool) -> &'static str {
     match runtime {
-        "claude-code" | "workbuddy" => "Skill, hooks, MCP",
+        "claude-code" | "workbuddy" | "gemini-cli" => "Skill, hooks, MCP",
         "codex" => "Skill, MCP, and hooks if this Codex supports them",
         "cursor" | "opencode" => "Skill, MCP",
         "hermes" if installed => "Skill, hooks, MCP",

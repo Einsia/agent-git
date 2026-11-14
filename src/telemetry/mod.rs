@@ -768,7 +768,7 @@ fn single(observation: Observation) -> (&'static str, serde_json::Value) {
 pub fn runtime(value: &str) {
     let runtime = match value {
         "claude-code" | "codex" | "cursor" | "opencode" | "claude-desktop" | "openclaw"
-        | "hermes" | "workbuddy" => value,
+        | "hermes" | "workbuddy" | "gemini-cli" => value,
         _ => "other",
     };
     if let Ok(mut run) = RUN.lock()

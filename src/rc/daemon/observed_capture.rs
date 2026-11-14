@@ -117,7 +117,13 @@ impl Carrier {
     /// unchanged too, and checking it never restores it. Whether a whole read is due all the same
     /// is not asked here; [`Recorded::unchanged`] asks both.
     fn current_and_unchanged(&self, entry: &roster::Entry) -> bool {
-        if current_carrier(entry).is_none_or(|current| normalized(&current) != self.path) {
+        let current = current_carrier(entry);
+        // Gemini CLI deletes a session past its retention; with no other file in its place the
+        // conversation is cold, not changed, and is never read again.
+        if current.is_none() && entry.runtime == "gemini-cli" && !self.path.exists() {
+            return true;
+        }
+        if current.is_none_or(|current| normalized(&current) != self.path) {
             return false;
         }
         match std::fs::metadata(&self.path) {

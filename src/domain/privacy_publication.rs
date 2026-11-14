@@ -29,6 +29,10 @@ use super::privacy::omission::Omission;
 mod snapshot;
 pub(crate) use snapshot::PublicationSnapshot;
 
+/// Why sharing or exporting with `--redact` refuses a Gemini CLI conversation.
+pub const GEMINI_NOT_PROJECTED: &str =
+    "sharing a Gemini CLI conversation, or exporting one with --redact, isn't supported yet";
+
 const PUBLIC_SESSION: &str = "agit-0000000000000000000000000000000000000001";
 
 /// Per-sequence source admission budget, before secret hydration and private-layer encoding.
@@ -456,6 +460,15 @@ pub fn project_frozen_with_sources(
     metadata: &Meta,
     additional: &[super::privacy::mandatory::MandatoryPolicy],
 ) -> Result<SessionProjection> {
+    // This projection judges each record alone, and Gemini CLI writes a message again whole at
+    // each change: an earlier copy holding only part of a value would go out with the value
+    // unrecognised. Until it publishes each part of a message once, it takes no such record.
+    ensure!(
+        !storage::parse_envelopes(log)?
+            .iter()
+            .any(|record| record.source == "gemini-cli"),
+        GEMINI_NOT_PROJECTED
+    );
     let input = FrozenInput {
         branch: branch.map(str::to_owned),
         log: log.into(),
@@ -1200,6 +1213,10 @@ impl Projector<'_> {
                     "is_error":value["isError"] == true || matches!(value["status"].as_str(), Some("failed" | "error"))
                 })],
             )),
+            "gemini-cli" => gemini_message(&crate::domain::publication_records::published(
+                "gemini-cli",
+                value,
+            )?),
             "workbuddy" if value["type"] == "reasoning" => Some((
                 "assistant".into(),
                 vec![reasoning_block(&{
@@ -1671,6 +1688,68 @@ impl Projector<'_> {
             }
             other => other.clone(),
         })
+    }
+}
+
+/// A Gemini CLI record, as publication keeps it, in message blocks: a prompt's words; a reply's
+/// reasoning, words, tool calls and the results they already hold; or the results a `$patch`
+/// brings.
+fn gemini_message(value: &Value) -> Option<(String, Vec<Value>)> {
+    use crate::adapter::gemini_cli::{parts_text, result_text};
+    let result = |call: &Value| {
+        json!({
+            "type":"tool_result",
+            "tool_use_id":call["id"].as_str().unwrap_or_default(),
+            "content":result_text(&call["result"]),
+            "is_error":matches!(call["status"].as_str(), Some("error" | "cancelled")),
+        })
+    };
+    if let Some(patch) = value.get("$patch") {
+        let blocks: Vec<Value> = patch["updates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|update| update["toolCalls"].as_array().into_iter().flatten())
+            .map(result)
+            .collect();
+        return (!blocks.is_empty()).then_some(("user".into(), blocks));
+    }
+    let text = parts_text(&value["content"]);
+    match value["type"].as_str()? {
+        "user" => {
+            (!text.is_empty()).then(|| ("user".into(), vec![json!({"type":"text", "text":text})]))
+        }
+        "gemini" => {
+            let mut blocks: Vec<Value> = value["thoughts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|thought| {
+                    reasoning_block(
+                        thought["description"]
+                            .as_str()
+                            .or(thought["subject"].as_str())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            if !text.is_empty() {
+                blocks.push(json!({"type":"text", "text":text}));
+            }
+            for call in value["toolCalls"].as_array().into_iter().flatten() {
+                blocks.push(json!({
+                    "type":"tool_use",
+                    "id":call["id"].as_str().unwrap_or_default(),
+                    "name":call["name"].as_str().unwrap_or("tool"),
+                    "input":call["args"].clone(),
+                }));
+                if !call["result"].is_null() {
+                    blocks.push(result(call));
+                }
+            }
+            (!blocks.is_empty()).then_some(("assistant".into(), blocks))
+        }
+        _ => None,
     }
 }
 
@@ -2170,6 +2249,29 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use crypto_box::SecretKey;
     use serde_json::json;
+
+    /// The frozen projection, which share and `export --privacy` use, judges each record alone,
+    /// so it refuses a session holding Gemini CLI records rather than publish every copy of a
+    /// message Gemini wrote again. A refusal only in export's own flag handling lets share through.
+    #[test]
+    fn frozen_projection_refuses_a_gemini_session() {
+        let session = format!("agit-{}", "b".repeat(40));
+        let raw = format!(
+            "{}\n",
+            json!({"id":"m1","timestamp":"2026-11-14T00:00:00Z","type":"user","content":[{"text":"hello"}]})
+        );
+        let log = transcript::wrap_lines(&raw, "gemini-cli", &session);
+        let Err(refused) = project_frozen(
+            None,
+            None,
+            &log,
+            &log,
+            &Meta::new(session, "gemini-cli".into(), String::new()),
+        ) else {
+            panic!("a session holding Gemini CLI records was projected");
+        };
+        assert!(format!("{refused:#}").contains(GEMINI_NOT_PROJECTED));
+    }
 
     #[test]
     fn tool_policy_defaults_open_and_scoped_overrides_control_both_halves() {
