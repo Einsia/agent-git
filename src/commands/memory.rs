@@ -1870,7 +1870,6 @@ struct Target {
 }
 
 fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
-    let cwd = std::env::current_dir()?;
     let (slug, branch) = match into {
         Some(raw) => {
             let t = super::target::branch_only(raw)?;
@@ -1882,7 +1881,13 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
             (slug, t.base.expect("branch_only guarantees a branch"))
         }
         None => {
-            let ctx = super::context::resolve(&cwd)?;
+            // The shared no-target error names a positional `<owner>/<repo>@<branch>`; here the
+            // target is `--into` (a positional of `distill` is a file name).
+            let ctx = super::context::from_env().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no explicit session target; name it with `--into <owner>/<repo>@<branch>` or set AGIT_SESSION=<owner>/<repo>@<branch>"
+                )
+            })?;
             (super::context::qualify(&ctx.repo), ctx.branch)
         }
     };
