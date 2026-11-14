@@ -175,6 +175,8 @@ fn test_approval(approval_id: &str) -> crate::protocol::ApprovalRequest {
         can_allow_for_session: true,
         suggested_permission_mode: Some(crate::protocol::PermissionMode::Bypass),
         requested_at: "now".into(),
+        denied_this_turn: 0,
+        denied_same_target: 0,
     }
 }
 

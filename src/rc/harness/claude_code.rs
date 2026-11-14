@@ -1267,6 +1267,8 @@ impl ClaudeCodeDriver {
                     can_allow_for_session,
                     suggested_permission_mode,
                     requested_at: chrono::Utc::now().to_rfc3339(),
+                    denied_this_turn: 0,
+                    denied_same_target: 0,
                 }))
             }
 

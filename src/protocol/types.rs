@@ -1509,6 +1509,19 @@ pub struct ApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggested_permission_mode: Option<PermissionMode>,
     pub requested_at: String,
+    /// How many approvals this turn already had denied. The runtime asks one tool call at a time
+    /// and plans its next step after each answer, so how many requests are still to come is not
+    /// known here; how often this turn was refused is, and it tells a repeated request from a
+    /// new one. Absent when zero and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "no_denials")]
+    pub denied_this_turn: u32,
+    /// Of those, how many were for the same tool on the same path as this request.
+    #[serde(default, skip_serializing_if = "no_denials")]
+    pub denied_same_target: u32,
+}
+
+fn no_denials(count: &u32) -> bool {
+    *count == 0
 }
 
 /// A missing field is owner-only.
