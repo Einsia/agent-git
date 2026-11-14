@@ -1252,6 +1252,47 @@ fn scan_notice_reports_its_scope_and_finds_evidence_where_that_scope_reaches() {
     ));
 }
 
+/// With no target, a memory command names the way it takes one: `--into`, or AGIT_SESSION. The
+/// session-target error every other command shares names a positional `<owner>/<repo>@<branch>`,
+/// which `memory` refuses as an unexpected argument (and which `distill` would read as a file
+/// name). What the error names must be accepted by the same command, so the test follows it.
+#[test]
+fn a_memory_command_without_a_target_names_the_form_it_takes() {
+    let lab = Lab::new();
+    for args in [
+        vec!["memory", "status"],
+        vec!["memory", "sync"],
+        vec!["memory", "diff"],
+        vec!["distill"],
+    ] {
+        let refused = lab.run(None, &args);
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}: {refused:?}");
+        let said = String::from_utf8(refused.stderr).unwrap();
+        assert!(
+            said.contains("no explicit session target"),
+            "{args:?}: {said}"
+        );
+        assert!(
+            said.contains("--into <owner>/<repo>@<branch>"),
+            "{args:?}: {said}"
+        );
+        assert!(said.contains("AGIT_SESSION="), "{args:?}: {said}");
+    }
+
+    // The two ways the error names both work.
+    let mut named = vec!["memory", "status", "--into", SELECTED];
+    notice(
+        lab.run(None, &named),
+        "target: alice/context@selected (via explicit arguments)",
+    );
+    named.truncate(2);
+    notice(
+        lab.run(Some(SELECTED), &named),
+        "target: alice/context@selected (via AGIT_SESSION)",
+    );
+}
+
 #[test]
 fn no_op_distillation_names_the_source_branch_and_main_destination() {
     let lab = Lab::new();
