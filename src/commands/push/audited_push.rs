@@ -227,10 +227,8 @@ fn previews_again(report: &PublicationReport) -> Option<&'static str> {
 /// A receipt refusal's category, as the Hub sends it, in words for the person.
 fn receipt_refusal_words(category: &str) -> &'static str {
     match category {
-        "expired" => "this publication's receipt ran out before the upload reached the Hub",
-        "binding" => {
-            "the repository's visibility or publication settings changed on the Hub after this was previewed"
-        }
+        "expired" => crate::commands::push::RECEIPT_EXPIRED,
+        "binding" => crate::commands::push::RECEIPT_SETTINGS_CHANGED,
         "policy" => "the repository's privacy policy changed on the Hub after this was previewed",
         "snapshot" => "the Hub received a publication other than the one confirmed",
         "unavailable" => "the Hub no longer holds this publication's receipt",
@@ -441,6 +439,21 @@ fn publication_recovery(report: &PublicationReport, retry: &str, repository: &st
                 .contains(crate::commands::push::UNSUPPORTED_BLOCK)
     }) {
         return crate::commands::push::ENCRYPTED_REFUSED.to_owned();
+    }
+    // Turned away while someone else wrote the repository, before any ref moved: the same push
+    // goes through once that write is done.
+    if report.error.is_none()
+        && refused(report).any(|attempt| {
+            matches!(
+                attempt.outcome.refusal_kind(),
+                Some(crate::hub::git::REPOSITORY_BUSY | "publication_refs_moved")
+            )
+        })
+    {
+        return format!(
+            "publication did not complete: {}; rerunning `{retry}` sends it, and an automatic upload tries again by itself",
+            crate::commands::push::ANOTHER_WRITER
+        );
     }
     // The same push meets the same refusal, so rerunning it is no way forward.
     if report.error.is_none()

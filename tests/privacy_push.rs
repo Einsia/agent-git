@@ -110,6 +110,9 @@ enum Cut {
     /// 403, before anything is taken: a refusal, not a Hub that didn't answer. It stays in place,
     /// refusing every receive, as the Hub refuses the same push again, until the test clears it.
     Refused,
+    /// The Hub's refusal of a receive that met another write to the repository, before anything
+    /// is taken, in the bytes the Hub sends.
+    Busy,
 }
 
 impl Hub {
@@ -658,6 +661,17 @@ impl Hub {
                             }
                         })
                         .flatten();
+                    if cut == Some(Cut::Busy) {
+                        pending_receipt.take();
+                        let line = "ERR HTTP 503 repository_busy: another write to this repository is still in progress; nothing was changed. Retry the push.\n";
+                        let mut packet = format!("{:04x}{line}", line.len() + 4);
+                        if contains(b"side-band") {
+                            packet = format!("{:04x}\u{1}{packet}", packet.len() + 5);
+                        }
+                        let body = format!("{packet}0000");
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-result\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        continue;
+                    }
                     if let Some(answer @ (Cut::BeforeApplying | Cut::Refused)) = cut {
                         // The receipt is spent all the same, as the Hub spends a preview once.
                         pending_receipt.take();
@@ -3624,7 +3638,10 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
 /// confirmation and receive on every push. A walk of the whole history declares every earlier turn
 /// again. If a branch head of the advertisement that history was read from moves before a receipt
 /// binds it, the declaration may leave out commits the Hub no longer holds, so the publication is
-/// refused before anything is sent.
+/// refused before anything is sent. Another branch moving takes nothing this push relies on, also
+/// when the branch's head on the Hub is a public commit only the projection's store holds, as a
+/// replaced credential makes it; a check that read that history from the checkout alone would
+/// find the head missing and refuse.
 ///
 /// The bound applies to commits, not to tags: a tag the branch reaches below the boundary that the
 /// Hub lacks still arrives, both one added to an earlier turn after it was published and a version
@@ -3848,6 +3865,55 @@ fn continued_plain_session_declares_only_what_it_adds() {
             std::slice::from_ref(&fifth)
         );
     }
+
+    // A turn whose publication differs from its source: the branch's head on the Hub is then a
+    // public commit the checkout doesn't have.
+    let replaced = turn("turn 5, with ghp_R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr");
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    let projected = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    assert_ne!(projected, replaced);
+    assert!(
+        !git_command(repo.root())
+            .arg("-C")
+            .arg(repo.root())
+            .args(["cat-file", "-e", &format!("{projected}^{{commit}}")])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    // Another conversation's branch moving meanwhile, as its own upload does, takes nothing from
+    // the history this push relies on, which the branches it publishes still hold: the push goes
+    // through and leaves that branch as the Hub has it.
+    let main = git(&remote, &["rev-parse", "refs/heads/main"]);
+    let commit = |parent: &str, message: &str| {
+        git(
+            &remote,
+            &[
+                "-c",
+                "user.name=Source Writer",
+                "-c",
+                "user.email=source@example.invalid",
+                "commit-tree",
+                &format!("{main}^{{tree}}"),
+                "-p",
+                parent,
+                "-m",
+                message,
+            ],
+        )
+    };
+    let other = commit(&main, "Another conversation's turn");
+    git(&remote, &["update-ref", "refs/heads/other", &other]);
+    let elsewhere = commit(&other, "Another conversation's next turn");
+    *hub.move_on_strategy.lock().unwrap() = Some(("refs/heads/other".into(), elsewhere.clone()));
+    let before = git(&remote, &["rev-parse", "refs/heads/talk"]);
+    turn("turn 5, continued");
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/other"]), elsewhere);
+    assert_ne!(git(&remote, &["rev-parse", "refs/heads/talk"]), before);
+    git(&remote, &["update-ref", "-d", "refs/heads/other"]);
 
     turn("turn 6");
     let earlier = hub.previews.lock().unwrap().len();
@@ -9952,7 +10018,9 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
 /// - a push the Hub took before its answer was lost is recorded as uploaded and not sent again;
 /// - one cut off before the Hub took anything is retried once its time comes, with no turn,
 ///   command or daemon to start it, and a turn settled after the failure is not in the retry;
-/// - one that waited out another upload of the repository preparing is retried the same way;
+/// - one that waited out another upload of the repository preparing is retried the same way, and
+///   so is one the Hub turned away while another write to the repository held it, told as
+///   someone else writing rather than a Hub that didn't answer;
 /// - one the Hub refused (403) is never retried, and one dropped after the failure goes with its
 ///   record and is never tried again.
 ///
@@ -9967,6 +10035,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     const REFUSED: &str = "cccccccc-0000-4000-8000-00000000000c";
     const DROPPED: &str = "dddddddd-0000-4000-8000-00000000000d";
     const WAITED: &str = "eeeeeeee-0000-4000-8000-00000000000e";
+    const CONTENDED: &str = "ffffffff-0000-4000-8000-00000000000f";
     const START: i64 = 1_900_000_000;
 
     let temp = tempfile::tempdir().unwrap();
@@ -10236,6 +10305,41 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         "{busy}"
     );
 
+    // Turned away by the Hub while another write held the repository: an answer, so nothing is
+    // settled as unanswered, the push says plainly that nothing moved, and it is tried again the
+    // same way.
+    hub.cut_receives.lock().unwrap().push(Cut::Busy);
+    let contended = upload(CONTENDED, "foxtrot contended", &[]);
+    let contended_at = git(repo.root(), &["rev-parse", &contended]);
+    let lost = record(&contended).unwrap();
+    assert_eq!(
+        (&lost["reason"], &lost["retry_after"]),
+        (&json!("another_writer"), &json!(START + 60)),
+        "{lost}"
+    );
+    let said = lost["said"].as_str().unwrap();
+    assert!(
+        said.contains("someone else was writing to this repository, so nothing was changed")
+            && !said.contains("didn't answer"),
+        "{lost}"
+    );
+    assert!(on_hub(&contended).is_empty());
+    let status = agit(&["status", "--json"], None, &[]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let item = status["result"]["value"]["uploads_not_through"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["target"] == format!("alice/app@{contended}"))
+        .unwrap_or_else(|| panic!("{status}"))
+        .clone();
+    assert!(
+        item["description"].as_str().unwrap().starts_with(
+            "someone else was writing to this repository at the same time; agit tries again by itself (next try about "
+        ),
+        "{item}"
+    );
+
     // A turn settled on the branch after its upload failed waits for its own upload.
     let tree = git(
         repo.root(),
@@ -10311,6 +10415,10 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         record(&waited).is_some_and(|record| record["state"] == "uploaded")
     });
     assert_eq!(on_hub(&waited), git(repo.root(), &["rev-parse", &waited]));
+    wait("the contended upload's retry", &|| {
+        record(&contended).is_some_and(|record| record["state"] == "uploaded")
+    });
+    assert_eq!(on_hub(&contended), contended_at);
     // The retry is an upload of its own, previewed and confirmed again.
     assert!(hub.previews.lock().unwrap().len() > previews);
     // The conversation dropped meanwhile was not tried again.

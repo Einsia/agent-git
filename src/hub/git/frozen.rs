@@ -46,6 +46,11 @@ pub use prepared::{
 /// A prepared destination and publication plan survive ambient configuration and ref changes.
 /// Local preparation creates temporary content owners; it performs no network request.
 /// Callers enforce review and confirmation before push.
+/// How a publication refused because the history it relied on left the destination begins its
+/// error; an automatic upload's parent reads it to run the upload once more from the start.
+pub(crate) const HISTORY_CHANGED: &str =
+    "the destination's published history changed during this publication";
+
 pub struct FrozenPublication {
     transport: TransportIdentity,
     directory: tempfile::TempDir,
@@ -55,6 +60,10 @@ pub struct FrozenPublication {
     lfs_objects: std::result::Result<PathBuf, lfs_cache::Failure>,
     lfs_preferences: std::result::Result<BTreeMap<String, String>, http::Failure>,
     plan: PublicationPlan,
+    /// The repository holding the plan's objects, where its history is read again: for a
+    /// projected publication, the projection's store, which holds public commits the
+    /// configuration repository may never have.
+    plan_root: PathBuf,
     scope: crate::domain::repo::publication::InspectionScope,
     lfs_inventory: Vec<crate::domain::lfs::Pointer>,
     heads: Vec<Vec<FrozenRef>>,
@@ -254,12 +263,16 @@ impl FrozenPublication {
         protocols: &str,
     ) -> Result<Self> {
         let content = captured::GitContent::capture(&source, plan)?;
-        Self::from_captured(source, content, url, identity, client, protocols)
+        let plan_root = source.root.clone();
+        Self::from_captured(source, content, plan_root, url, identity, client, protocols)
     }
 
+    /// `source` is the repository whose configuration the transport takes; `plan_root` is the one
+    /// holding the captured objects, which a projected publication keeps apart from it.
     fn from_captured(
         source: Source,
         content: captured::GitContent,
+        plan_root: PathBuf,
         url: String,
         identity: RemoteIdentity,
         client: Option<crate::hub::Client>,
@@ -308,6 +321,7 @@ impl FrozenPublication {
             lfs_objects,
             lfs_preferences,
             plan,
+            plan_root,
             lfs_inventory,
             scope,
             heads,
@@ -944,12 +958,15 @@ impl FrozenPublication {
         )
     }
 
-    /// A publication declares as new only what the Hub lacked when its held history was read. If
-    /// a branch head of that advertisement has since moved or gone, other than by this
-    /// publication's own update, the declaration may leave out commits the Hub no longer holds,
-    /// and their content would reach it without inspection; such a receipt is refused before
-    /// anything is sent. Heads that appeared since only make the declaration larger than needed,
-    /// which the Hub refuses itself.
+    /// A publication declares as new only what the Hub lacked when its held history was read:
+    /// the history below the commits its plan stopped at. If a branch head of that advertisement
+    /// has since moved or gone, other than by this publication's own update, that history may no
+    /// longer be on the Hub, and its content would reach it without inspection. The receipt is
+    /// then refused before anything is sent, unless every commit the plan stopped at is still
+    /// reachable from a head the Hub holds as it was read, or holds at what this publication
+    /// sent. Another branch moving, as another conversation's upload of its own branch does,
+    /// then changes nothing this publication relies on. Heads that appeared since only make the
+    /// declaration larger than needed, which the Hub refuses itself.
     ///
     /// A head this publication moved itself is at its frozen tip or at a stage of it that an
     /// earlier request in `delivered` acknowledged. Every request is a fast-forward, so such a
@@ -961,20 +978,37 @@ impl FrozenPublication {
         before: &BTreeMap<String, String>,
         delivered: &[ReceiveBatch<'_>],
     ) -> Result<()> {
+        let own = |name: &str, current: &str| {
+            self.plan
+                .heads()
+                .iter()
+                .chain(delivered.iter().flat_map(|batch| &batch.refs))
+                .any(|reference| reference.name() == name && reference.oid() == current)
+        };
+        let mut moved = false;
+        let mut covers = Vec::new();
         for (name, oid) in held {
-            let current = before.get(name);
-            let own = current.is_some_and(|current| {
-                self.plan
-                    .heads()
-                    .iter()
-                    .chain(delivered.iter().flat_map(|batch| &batch.refs))
-                    .any(|reference| reference.name() == name && reference.oid() == current)
-            });
-            ensure!(
-                current == Some(oid) || own,
-                "the destination's published history changed during this publication; publish again"
-            );
+            match before.get(name) {
+                Some(current) if current == oid || own(name, current) => {
+                    covers.push(current.clone());
+                }
+                _ => moved = true,
+            }
         }
+        if !moved {
+            return Ok(());
+        }
+        covers.extend(
+            before
+                .iter()
+                .filter(|(name, current)| !held.contains_key(*name) && own(name, current))
+                .map(|(_, current)| current.clone()),
+        );
+        let repo = crate::domain::repo::Repo::at(&self.plan_root).local_objects_only();
+        ensure!(
+            self.plan.boundary_covered(&repo, &covers)?,
+            "{HISTORY_CHANGED}; publish again"
+        );
         Ok(())
     }
 

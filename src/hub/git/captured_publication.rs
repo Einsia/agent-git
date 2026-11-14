@@ -426,6 +426,7 @@ impl CapturedPublication {
         } = self;
         let content = Source::at(repo, source.environment.clone())?;
         git.attach(&content)?;
+        let plan_root = content.root.clone();
         let source = Source::at(transport_repo, source.environment)?;
         let (url, client) = match client {
             Some(client) => FrozenPublication::destination_with_client(
@@ -439,6 +440,7 @@ impl CapturedPublication {
         let mut publication = FrozenPublication::from_captured(
             source,
             git,
+            plan_root,
             url,
             identity.clone(),
             Some(client),
