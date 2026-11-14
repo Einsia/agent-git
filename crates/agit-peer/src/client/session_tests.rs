@@ -30,6 +30,7 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
         runtime: "codex".into(),
         generation: 7,
         access: crate::access::Access::Admin,
+        delivery_only: false,
     };
     let grant = ConnectionGrant {
         id: "connection".into(),

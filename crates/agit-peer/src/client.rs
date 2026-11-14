@@ -1000,6 +1000,7 @@ mod tests {
             runtime: "codex".into(),
             generation: 1,
             access: crate::access::Access::Control,
+            delivery_only: false,
         });
         assert!(client.validate_grant(&delegated).is_ok());
         delegated.target.owner.account_id = "another-owner".into();

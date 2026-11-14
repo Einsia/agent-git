@@ -51,6 +51,10 @@ pub const RPC_FEATURES: &[&str] = &[
     // changes, to each connection whose own `session.list` shows a row that changed; a page that
     // sees this feature reads the list on the event instead of on a timer.
     "session-list-changed-v1",
+    // A session controller grant may carry `delivery_only`: the device then admits only
+    // `session.publication.deliver` for that session on the connection, sends it no events, and
+    // takes no ownership of the session from the controller that holds it.
+    "publication-delivery-only-v1",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

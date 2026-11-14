@@ -172,7 +172,13 @@ impl Registry {
                     (validated, _) => validated?,
                 }
             }
-            client.controller = owners.accept(&grant).await?;
+            // A delivery-only connection takes no ownership of the session: taking it would end
+            // the controller the person's page holds, and nothing it may ask needs it.
+            client.controller = if delivery_only(&grant) {
+                None
+            } else {
+                owners.accept(&grant).await?
+            };
             client.grant = Some(grant);
             if let Some(controller) = client.controller.as_mut() {
                 controller.resource_pin = resource_pin;
@@ -380,7 +386,23 @@ pub enum Rejection {
     Reply(RpcError),
 }
 
+/// What a delivery-only connection is told for any request but its own.
+const DELIVERY_ONLY: &str = "this connection only collects publication receipts";
+
+/// Whether `grant` is the Hub's publication delivery for one session (see
+/// [`agit_peer::cloud::SessionController::delivery_only`]).
+fn delivery_only(grant: &agit_peer::cloud::ConnectionGrant) -> bool {
+    grant
+        .session_controller
+        .as_ref()
+        .is_some_and(|scope| scope.delivery_only)
+}
+
 impl Client {
+    fn delivery_only(&self) -> bool {
+        self.grant.as_ref().is_some_and(delivery_only)
+    }
+
     fn current(&self) -> bool {
         *self
             .live
@@ -407,6 +429,10 @@ impl Client {
     }
 
     pub fn accepts_notification(&self, frame: &Frame) -> bool {
+        // A delivery-only connection follows no stream: it hears only its own requests' answers.
+        if self.delivery_only() {
+            return false;
+        }
         if frame.method() == crate::protocol::method::SESSION_LIST_CHANGED {
             return self.hears_list_change(frame);
         }
@@ -470,6 +496,16 @@ impl Client {
         // An error reply with a reused ID would consume the original request's permit.
         if permits.len() >= 64 || frame.id.as_ref().is_none_or(|id| permits.contains_key(id)) {
             return Err(Rejection::Close);
+        }
+        // Admitted by name, before the grant's access is consulted: whatever that access allows,
+        // a delivery-only connection asks for receipts and nothing else.
+        if self.delivery_only()
+            && frame.method() != crate::protocol::method::SESSION_PUBLICATION_DELIVER
+        {
+            return Err(Rejection::Reply(RpcError::new(
+                crate::protocol::ErrorCode::Forbidden,
+                DELIVERY_ONLY,
+            )));
         }
         let mut state = self
             .state
@@ -737,6 +773,7 @@ mod tests {
                         runtime: "codex".into(),
                         generation: 1,
                         access: Access::Control,
+                        delivery_only: false,
                     }),
                 };
                 let request = || {
@@ -802,6 +839,118 @@ mod tests {
     }
 
     /// Destination setup requires an owned machine grant and cannot lend receipt-delivery authority.
+    /// A delivery-only controller is let through by name: `session.publication.deliver` for its
+    /// session and nothing else, every other method refused with the same reason whatever the
+    /// grant's access allows, and no event of the session reaches it. Admitting it leaves the
+    /// controller that holds the session current. A device that refused a list of methods would
+    /// let a method off that list through; one that took ownership for it would cut off the
+    /// person's page whenever the Hub collected a receipt.
+    #[test]
+    fn a_delivery_only_controller_collects_receipts_and_nothing_else() {
+        let home = tempfile::tempdir().unwrap();
+        crate::rc::with_agit_home(home.path(), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                use agit_peer::cloud::{ConnectionGrant, Device, SessionController};
+                let registry = Registry::fixed(
+                    Policy::new(
+                        1,
+                        vec![Rule {
+                            principal: principal(),
+                            resource: Resource::Session("native".into()),
+                            access: Access::Control,
+                        }],
+                    )
+                    .unwrap(),
+                );
+                registry.state.write().unwrap().resources.observe(
+                    "session.list",
+                    &json!({"sessions":[{
+                        "session_id":"logical", "runtime_session_id":"native", "runtime":"codex",
+                        "workspace_id":"local-owner", "cwd":"/trusted"
+                    }]}),
+                );
+                let device = Device {
+                    id: "executor".into(),
+                    owner: principal(),
+                    machine_id: "machine".into(),
+                    display_name: "Fixture".into(),
+                    credential_epoch: 1,
+                    certificate: agit_peer::Identity::generate()
+                        .unwrap()
+                        .certificate()
+                        .clone(),
+                };
+                let now = chrono::Utc::now().timestamp_millis();
+                let grant = |id: &str, generation: u64, delivery_only: bool| ConnectionGrant {
+                    id: id.into(),
+                    caller: principal(),
+                    source: Device {
+                        id: "controller".into(),
+                        ..device.clone()
+                    },
+                    target: device.clone(),
+                    expires_at_ms: now + 60_000,
+                    project_controller: None,
+                    session_controller: Some(SessionController {
+                        session_id: "native".into(),
+                        runtime: "codex".into(),
+                        generation,
+                        access: Access::Control,
+                        delivery_only,
+                    }),
+                };
+                let page = registry.admitted(grant("page", 1, false)).await.unwrap();
+                let history = || Frame::request("session.history", json!({"session_id":"logical"}));
+                assert!(page.authorize(history()).is_ok());
+
+                let driver = registry.admitted(grant("driver", 2, true)).await.unwrap();
+                let deliver = driver
+                    .authorize(Frame::request(
+                        crate::protocol::method::SESSION_PUBLICATION_DELIVER,
+                        json!({"session_id":"logical"}),
+                    ))
+                    .unwrap();
+                assert_eq!(deliver.authority.publication_grant().unwrap().id, "driver");
+                for (method, params) in [
+                    ("session.history", json!({"session_id":"logical"})),
+                    ("session.watch", json!({"session_id":"logical"})),
+                    (
+                        "session.subscribe",
+                        json!({"session_id":"logical", "after_seq":0}),
+                    ),
+                    (
+                        "turn.start",
+                        json!({"session_id":"logical", "message":"hello"}),
+                    ),
+                    (
+                        "session.setPermissionMode",
+                        json!({"session_id":"logical", "mode":"bypass"}),
+                    ),
+                    ("terminal.open", json!({"cwd":"/trusted"})),
+                    ("fs.readFile", json!({"path":"/trusted/notes.md"})),
+                ] {
+                    match driver.authorize(Frame::request(method, params)) {
+                        Err(Rejection::Reply(error)) => {
+                            assert_eq!(error.message, DELIVERY_ONLY, "{method}")
+                        }
+                        other => panic!("{method} reached a delivery-only connection: {other:?}"),
+                    }
+                }
+                let event = Frame::event("logical", 1, "item.completed", json!({"item_id":"1"}));
+                assert!(page.accepts_notification(&event));
+                assert!(!driver.accepts_notification(&event));
+                assert!(
+                    page.authorize(history()).is_ok(),
+                    "the page's controller stays current"
+                );
+            });
+        });
+    }
+
     #[tokio::test]
     async fn project_publication_grants_require_the_current_device_owner() {
         use agit_peer::cloud::{ConnectionGrant, Device};

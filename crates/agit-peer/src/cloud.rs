@@ -74,6 +74,13 @@ pub struct SessionController {
     pub runtime: String,
     pub generation: u64,
     pub access: crate::access::Access,
+    /// The Hub's publication delivery for this session, and nothing else: the device admits only
+    /// `session.publication.deliver` on it, sends it no events, and lets it take no ownership of
+    /// the session from the controller that holds it. Left out when false, so a full
+    /// controller's grant reads as it always did; a device that doesn't know the field refuses
+    /// the whole grant rather than taking it for a full controller.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delivery_only: bool,
 }
 
 /// Project delegation discovers sessions and creates them without owning their event streams.
@@ -147,6 +154,30 @@ pub struct DataReady {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full controller's scope is written without `delivery_only`, so a device that doesn't
+    /// know the field still takes it; a delivery-only scope carries it, and such a device refuses
+    /// that scope whole. Writing `false` out would make every older device refuse every
+    /// controller.
+    #[test]
+    fn only_a_delivery_only_controller_names_the_field() {
+        let mut scope = SessionController {
+            session_id: "session".into(),
+            runtime: "codex".into(),
+            generation: 1,
+            access: crate::access::Access::Control,
+            delivery_only: false,
+        };
+        let full = serde_json::to_value(&scope).unwrap();
+        assert!(full.get("delivery_only").is_none(), "{full}");
+        scope.delivery_only = true;
+        let delivery = serde_json::to_value(&scope).unwrap();
+        assert_eq!(delivery["delivery_only"], true);
+        assert_eq!(
+            serde_json::from_value::<SessionController>(delivery).unwrap(),
+            scope
+        );
+    }
 
     #[test]
     fn diagnostics_do_not_format_secret_payloads() {
