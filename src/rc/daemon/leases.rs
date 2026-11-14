@@ -54,6 +54,33 @@ impl Daemon {
         }
     }
 
+    /// Records that the rows of `thread`'s conversations changed: a row shows who writes it, so
+    /// a lease that moves (a terminal takes over, a handover ends) changes the list.
+    pub(super) fn thread_list_changed(&mut self, thread: &str) {
+        let live: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, live)| {
+                live.runtime_thread_id.as_deref() == Some(thread)
+                    || live.info.runtime_session_id.as_deref() == Some(thread)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &live {
+            self.list_changed(id);
+        }
+        let dormant: Vec<_> = self
+            .roster
+            .sessions
+            .iter()
+            .filter(|(id, entry)| entry.thread_id == thread && !self.sessions.contains_key(*id))
+            .map(|(id, entry)| super::dormant_row(id, entry))
+            .collect();
+        for session in dormant {
+            self.list_changes.session(session);
+        }
+    }
+
     /// The live headless Claude Code supervisor writing `thread`, by logical session id.
     fn headless_writer(&self, thread: &str) -> Option<String> {
         self.sessions
@@ -146,6 +173,7 @@ impl Daemon {
             self.stop_if_idle(session_id);
         }
         self.save_leases();
+        self.thread_list_changed(thread);
         let lease = self.leases.get(thread);
         control::Reply::TerminalOpened {
             state: lease.map(|lease| lease.state),
@@ -161,6 +189,7 @@ impl Daemon {
         if self.headless_writer(thread).is_some() {
             self.leases.writer_reported(thread, leaf, now_ms());
             self.save_leases();
+            self.thread_list_changed(thread);
         }
     }
 
@@ -193,6 +222,7 @@ impl Daemon {
             )
         {
             self.save_leases();
+            self.thread_list_changed(&thread);
         }
         let Some(thread) = self.headless_thread(session_id) else {
             return;
@@ -227,6 +257,7 @@ impl Daemon {
         if method == method::TURN_STARTED {
             self.leases.writer_turn_started(&thread);
             self.save_leases();
+            self.thread_list_changed(&thread);
         }
         if method == method::TURN_COMPLETED
             && self.leases.releasing(&thread)
@@ -271,6 +302,7 @@ impl Daemon {
             .headless_ended(thread, session_id, &descends, now_ms())
         {
             self.save_leases();
+            self.thread_list_changed(thread);
         }
     }
 
@@ -292,6 +324,7 @@ impl Daemon {
             .release_failed(thread, session_id, writer, now_ms())
         {
             self.save_leases();
+            self.thread_list_changed(thread);
             match process {
                 Some((pid, _)) => eprintln!(
                     "agitd: session {session_id} ended without releasing conversation {thread}; \
@@ -310,12 +343,12 @@ impl Daemon {
     /// keep a reopened terminal waiting forever, and lift failed releases whose recorded writer
     /// process has gone.
     pub(super) fn enforce_lease_deadlines(&mut self) {
-        if !self
-            .leases
-            .lift_gone_writers(terminal_alive, now_ms())
-            .is_empty()
-        {
+        let gone = self.leases.lift_gone_writers(terminal_alive, now_ms());
+        if !gone.is_empty() {
             self.save_leases();
+            for thread in &gone {
+                self.thread_list_changed(thread);
+            }
         }
         // A handover whose writer's row is gone and whose recorded process has exited will never
         // hear from that writer again: the waiting terminal takes over as stale. A writer that
@@ -333,6 +366,9 @@ impl Daemon {
                 lifted.len()
             );
             self.save_leases();
+            for thread in &lifted {
+                self.thread_list_changed(thread);
+            }
         }
         for session_id in self.leases.overdue(now_ms()) {
             if let Some(live) = self.sessions.get(&session_id) {

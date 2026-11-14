@@ -1,6 +1,8 @@
 mod guards;
 #[cfg(unix)]
 mod leases;
+#[cfg(unix)]
+mod list_changes;
 mod metadata;
 mod mode_restart;
 #[cfg(unix)]
@@ -82,6 +84,7 @@ pub(super) fn rpc_test_daemon(
         deferred_slot: None,
         replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
         outbound: None,
+        list_changes: Default::default(),
         opts: Options {
             local_owner: false,
             hub: "https://hub.invalid".into(),

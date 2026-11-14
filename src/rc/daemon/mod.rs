@@ -1178,6 +1178,8 @@ pub struct Daemon {
     /// journal** and already carry their numbers — and they must go through the waiting
     /// `send_replay`, which is what the main loop cannot do (one wait stops everything).
     outbound: Option<crate::rc::outbound::OutboundTx>,
+    /// Projects whose session list changed since the flush tick last sent `session.list.changed`.
+    list_changes: crate::rc::list_changes::Pending,
     opts: Options,
     journal: Journal,
     mirror: Mirror,
@@ -2830,3 +2832,106 @@ mod tests;
 
 #[cfg(test)]
 mod preview_tests;
+
+/// The `session.list` row of a roster conversation with no live writer (one that ended, or one
+/// the daemon watches), as the readers of a list change see it.
+pub(super) fn dormant_row(
+    id: &str,
+    entry: &crate::rc::roster::Entry,
+) -> crate::rc::cloud::resources::Session {
+    crate::rc::cloud::resources::Session {
+        id: id.to_string(),
+        native_id: entry.thread_id.clone(),
+        source: entry.native_source.clone(),
+        runtime: entry.runtime.clone(),
+        cwd: String::new(),
+        project: entry.project_id.clone(),
+    }
+}
+
+impl Daemon {
+    /// Records that the `session.list` row of the managed session `stream` changed, for the next
+    /// flush. A watched conversation's tail is not a managed row and changes nothing here. A
+    /// conversation whose writer has ended stays listed from the roster, and so does its change:
+    /// the status that ends a writer can be projected after the live handle is gone.
+    pub(super) fn list_changed(&mut self, stream: &str) {
+        if self.watches.contains_key(stream) {
+            return;
+        }
+        let row = if let Some(live) = self.sessions.get(stream) {
+            let info = &live.info;
+            crate::rc::cloud::resources::Session {
+                id: info.session_id.clone(),
+                native_id: info.runtime_session_id.clone().unwrap_or_default(),
+                source: info.native_source.clone(),
+                runtime: info.runtime.clone(),
+                // Who may read a row never depends on its folder path.
+                cwd: String::new(),
+                project: info.project_id.clone(),
+            }
+        } else if let Some(entry) = self.roster.sessions.get(stream) {
+            dormant_row(stream, entry)
+        } else {
+            return;
+        };
+        self.list_changes.session(row);
+    }
+
+    /// Records catalog rows that changed, each in the project whose folder holds it, as the
+    /// cloud filter assigns projects. A reset changes every bound project once, and each row the
+    /// rebuilt catalog holds.
+    pub(super) fn catalog_changed(&mut self, changes: crate::rc::runtime_catalog::CatalogChanges) {
+        let roots: Vec<(String, std::path::PathBuf)> = self
+            .mirror
+            .to_local()
+            .into_iter()
+            .filter(|workspace| workspace.workspace_id == crate::rc::endpoint::WORKSPACE)
+            .flat_map(|workspace| workspace.projects)
+            .filter_map(|project| {
+                self.mirror
+                    .project_path(crate::rc::endpoint::WORKSPACE, &project.project_id)
+                    .map(|root| (project.project_id, root))
+            })
+            .collect();
+        let rows = match changes {
+            crate::rc::runtime_catalog::CatalogChanges::Rows(rows) => rows,
+            // Readers of a whole project hear of rows the rebuild dropped; a reader allowed only
+            // some sessions hears of each that is there now.
+            crate::rc::runtime_catalog::CatalogChanges::Reset(rows) => {
+                for (project, _) in &roots {
+                    self.list_changes.project(project);
+                }
+                rows
+            }
+        };
+        for row in rows {
+            let project = roots
+                .iter()
+                .filter(|(_, root)| row.cwd.starts_with(root))
+                .max_by_key(|(_, root)| root.components().count())
+                .map(|(id, _)| id.clone());
+            self.list_changes
+                .session(crate::rc::cloud::resources::Session {
+                    id: row.session_ref,
+                    native_id: row.native_session_id,
+                    source: row.source,
+                    runtime: row.runtime,
+                    cwd: row.cwd.to_string_lossy().into_owned(),
+                    project,
+                });
+        }
+    }
+
+    /// Sends one `session.list.changed` per project whose list changed since the last flush.
+    pub(super) fn send_list_changes(&mut self) {
+        if self.list_changes.is_empty() {
+            return;
+        }
+        let frames = self.list_changes.take();
+        if let Some(outbound) = &self.outbound {
+            for frame in frames {
+                outbound.send(frame);
+            }
+        }
+    }
+}

@@ -65,6 +65,7 @@ impl Daemon {
             deferred_slot: None,
             replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
             outbound: None,
+            list_changes: Default::default(),
             opts,
             journal: Journal::restored(),
             mirror: Mirror::load(),
@@ -116,7 +117,8 @@ impl Daemon {
         {
             eprintln!("agitd: default runtime source is unavailable: {error}");
         }
-        let _catalog_worker = crate::rc::runtime_catalog::Worker::start();
+        let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel();
+        let _catalog_worker = crate::rc::runtime_catalog::Worker::start(Some(catalog_tx));
         // Unix publication and lifetime ownership belong to the listener. Its worker retains
         // the lock until process exit; no shutdown unlink can erase a replacement's state.
         #[cfg(windows)]
@@ -938,6 +940,13 @@ impl Daemon {
                     // effect immediately" is an empty phrase: the in-memory copy is frozen at the
                     // moment the daemon started, and typing the command does nothing.
                     g.reload_grants();
+                    // After the projections above, so a status reconciled on this tick is in it.
+                    g.send_list_changes();
+                }
+                Some(changes) = catalog_rx.recv() => {
+                    // Rows the catalog found, changed or dropped: they are the local rows of
+                    // `session.list`, sent with the next flush.
+                    d.lock().await.catalog_changed(changes);
                 }
                 Some(request) = safe_stop_rx.recv(), if !stopping => {
                     let prepared = {

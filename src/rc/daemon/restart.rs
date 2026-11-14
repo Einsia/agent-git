@@ -110,6 +110,8 @@ impl Daemon {
                 }),
             );
             if self.roster.get(&id).is_some() {
+                // The row now reads as paused to the lists that show it.
+                self.list_changed(&id);
                 self.roster
                     .paused
                     .insert(id, crate::protocol::Pause { at: at.clone() });
@@ -452,7 +454,15 @@ mod tests {
                         commands.get_mut("agit-left").unwrap().try_recv(),
                         Ok(Command::ShutdownUnattended)
                     ));
+                    assert!(
+                        !state.list_changes.take().is_empty(),
+                        "the list showing the paused row hears of it"
+                    );
                     state.reap_idle_writers(now + std::time::Duration::from_secs(1));
+                    assert!(
+                        state.list_changes.is_empty(),
+                        "a writer not stopped again changes no list"
+                    );
                     assert!(
                         commands.get_mut("agit-left").unwrap().try_recv().is_err(),
                         "a writer already told to stop is not told again"

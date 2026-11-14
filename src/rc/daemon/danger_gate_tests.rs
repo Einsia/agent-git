@@ -250,6 +250,7 @@ fn a_failed_danger_ledger_write_never_reaches_the_approval_driver() {
                     deferred_slot: None,
                     replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
                     outbound: None,
+                    list_changes: Default::default(),
                     opts: Options {
                         local_owner: false,
                         hub: "https://hub.invalid".into(),

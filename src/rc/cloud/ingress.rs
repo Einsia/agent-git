@@ -407,6 +407,9 @@ impl Client {
     }
 
     pub fn accepts_notification(&self, frame: &Frame) -> bool {
+        if frame.method() == crate::protocol::method::SESSION_LIST_CHANGED {
+            return self.hears_list_change(frame);
+        }
         if !self.current()
             || self
                 .controller
@@ -428,6 +431,32 @@ impl Client {
             &self.principal,
         );
         access::event_allowed(frame, &state.resources, &effective, &self.principal)
+    }
+
+    /// A `session.list.changed` reaches this connection only if its own `session.list` shows a
+    /// row that changed, judged under the policy in force now and narrowed by any delegation, as
+    /// the list's filter judges it. It needs no session stream, so a controller limited to one
+    /// project hears changes there, and it passes while session events are off: the owner's own
+    /// route turns those off to carry only terminals, and this is the only way the owner's local
+    /// rows tell that route they changed. It carries no content.
+    fn hears_list_change(&self, frame: &Frame) -> bool {
+        let Some(audience) = frame.list_audience.as_deref() else {
+            return false;
+        };
+        if !self.current() {
+            return false;
+        }
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effective = delegation::policy(
+            self.controller.as_ref(),
+            &state.policy,
+            &state.resources,
+            &self.principal,
+        );
+        audience.heard_by(&effective, &self.principal)
     }
 
     pub fn authorize(&self, frame: Frame) -> Result<Frame, Rejection> {
@@ -534,9 +563,21 @@ impl Client {
     }
 
     pub fn project(&self, record: &str) -> crate::Result<Option<String>> {
+        self.project_queued(record, None)
+    }
+
+    /// [`Self::project`] for a record taken from this client's queue, with the audience of the
+    /// `session.list.changed` it carries: the JSON can't hold it, and the last check before
+    /// writing asks it again under the policy in force then.
+    pub(crate) fn project_queued(
+        &self,
+        record: &str,
+        audience: Option<Arc<crate::rc::list_changes::Audience>>,
+    ) -> crate::Result<Option<String>> {
         let mut frame: Frame =
             serde_json::from_str(record).context("executor produced an invalid frame")?;
         if frame.id.is_none() {
+            frame.list_audience = audience;
             // Queued events must still be readable when their writer reaches them.
             return Ok(self.accepts_notification(&frame).then(|| frame.to_json()));
         }
@@ -1183,6 +1224,59 @@ mod tests {
                 .is_err()
         );
         assert!(!utility.session_events.load(Ordering::Relaxed));
+    }
+
+    /// A `session.list.changed` reaches a connection exactly when that connection's own
+    /// `session.list` would show a row that changed, under the policy in force when it is sent. It
+    /// passes on a route that turned session events off, since the owner's own route does that
+    /// and its local rows have no other way to say they changed. A rule that kept the
+    /// session-events gate, required a stream, or judged by the project alone would fail one of
+    /// these.
+    #[tokio::test]
+    async fn a_list_change_reaches_whoever_may_list_a_changed_row() {
+        let registry = Registry::fixed(
+            Policy::new(
+                1,
+                vec![
+                    Rule {
+                        principal: principal(),
+                        resource: Resource::Project("p".into()),
+                        access: Access::Read,
+                    },
+                    Rule {
+                        principal: principal(),
+                        resource: Resource::Session("private".into()),
+                        access: Access::Deny,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let reader = registry.client(principal(), i64::MAX);
+        reader.session_events.store(false, Ordering::Relaxed);
+        let changed = |id: &str| {
+            let mut pending = crate::rc::list_changes::Pending::default();
+            pending.session(crate::rc::cloud::resources::Session {
+                id: id.into(),
+                native_id: id.into(),
+                source: None,
+                runtime: "codex".into(),
+                cwd: String::new(),
+                project: Some("p".into()),
+            });
+            pending.take().remove(0)
+        };
+        assert!(!reader.accepts_notification(&changed("private")));
+        assert!(reader.accepts_notification(&changed("shared")));
+        // Only the device mints one: a frame with this method and no audience reaches nobody,
+        // even a reader of the project it names.
+        let bare = Frame::notification(
+            crate::protocol::method::SESSION_LIST_CHANGED,
+            json!({"project_id": "p"}),
+        );
+        assert!(!reader.accepts_notification(&bare));
+        registry.state.write().unwrap().policy = Policy::default();
+        assert!(!reader.accepts_notification(&changed("shared")));
     }
 
     #[tokio::test]

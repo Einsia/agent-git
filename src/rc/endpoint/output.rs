@@ -44,6 +44,9 @@ impl ClientRecords {
 struct ClientMessage {
     records: ClientRecords,
     lease: std::sync::Arc<ClientLease>,
+    /// Who may hear the `session.list.changed` this message carries. It waits beside the JSON,
+    /// which can't hold it, so the cloud writer's last check before writing can still ask it.
+    audience: Option<std::sync::Arc<crate::rc::list_changes::Audience>>,
 }
 
 impl ClientMessage {
@@ -56,6 +59,7 @@ impl ClientMessage {
                 _replay: None,
                 _recovery: None,
             }),
+            audience: None,
         }
     }
 }
@@ -67,6 +71,8 @@ pub(super) enum Next {
 
 pub(super) struct ClientWrite {
     pub(super) record: String,
+    /// See [`ClientMessage::audience`].
+    pub(super) audience: Option<std::sync::Arc<crate::rc::list_changes::Audience>>,
     _lease: std::sync::Arc<ClientLease>,
     _replay_bytes: Option<OwnedSemaphorePermit>,
 }
@@ -96,6 +102,7 @@ impl ClientMessage {
         };
         Ok(record.map(|record| ClientWrite {
             record,
+            audience: self.audience.clone(),
             _lease: self.lease.clone(),
             _replay_bytes: permit,
         }))
@@ -146,6 +153,7 @@ impl ClientMessages {
                         _replay: None,
                         _recovery: None,
                     }),
+                    audience: None,
                 });
                 continue;
             }
@@ -237,6 +245,12 @@ impl ClientOutput {
             // streams and RPC receipts keep their own bounded lanes and continue immediately.
             return self.stopping(self.recovery.lagged(stream, seq));
         }
+        if let Some(audience) = &frame.list_audience {
+            let result = self
+                .enqueue_heard(record.to_owned(), audience.clone())
+                .map_err(|_| ());
+            return self.stopping(result);
+        }
         self.try_send(record.to_owned())
     }
 
@@ -270,6 +284,7 @@ impl ClientOutput {
                     _replay: slot,
                     _recovery: Some(completed),
                 }),
+                audience: None,
             })
             .map_err(|_| ())
     }
@@ -378,12 +393,36 @@ impl ClientOutput {
         response_slot.send(ClientMessage {
             records: ClientRecords::Single(Some(response)),
             lease: lease.clone(),
+            audience: None,
         });
         replay_slot.send(ClientMessage {
             records: ClientRecords::Replay(replay.frames.into()),
             lease,
+            audience: None,
         });
         Ok(())
+    }
+
+    /// Queues a `session.list.changed` with who may hear it, for the writer's last check.
+    fn enqueue_heard(
+        &self,
+        record: String,
+        audience: std::sync::Arc<crate::rc::list_changes::Audience>,
+    ) -> Result<(), String> {
+        let Ok(count) = u32::try_from(record.len().max(1)) else {
+            return Err(record);
+        };
+        let Ok(permit) = self.bytes.clone().try_acquire_many_owned(count) else {
+            return Err(record);
+        };
+        let mut message = ClientMessage::single(record, permit, None);
+        message.audience = Some(audience);
+        self.sender
+            .try_send(message)
+            .map_err(|error| match error.into_inner().records {
+                ClientRecords::Single(Some(record)) => record,
+                _ => unreachable!("an event carries one record"),
+            })
     }
 
     fn enqueue(&self, record: String, work: Option<Work>) -> Result<(), String> {
@@ -411,6 +450,54 @@ mod tests {
         frame.stream = Some(stream.into());
         frame.seq = Some(seq);
         frame
+    }
+
+    /// A `session.list.changed` keeps who may hear it while it waits in a client's queue, so the
+    /// cloud writer's last check before writing can still ask: the queued JSON alone carries no
+    /// audience, and a writer that checked only the JSON would drop every such event for every
+    /// cloud client, owner included.
+    #[tokio::test]
+    async fn a_queued_list_change_reaches_the_cloud_writer_with_its_audience() {
+        use agit_peer::access::{Access, Policy, Principal, Resource, Rule};
+        let reader = Principal {
+            issuer: "https://cloud.example".into(),
+            account_id: "reader".into(),
+        };
+        let registry = crate::rc::cloud::ingress::Registry::fixed(
+            Policy::new(
+                1,
+                vec![Rule {
+                    principal: reader.clone(),
+                    resource: Resource::Project("p".into()),
+                    access: Access::Read,
+                }],
+            )
+            .unwrap(),
+        );
+        let client = registry.client(reader, i64::MAX);
+        let mut pending = crate::rc::list_changes::Pending::default();
+        pending.project("p");
+        let changed = pending.take().remove(0);
+        assert!(client.accepts_notification(&changed));
+
+        let (stop, _stopped) = watch::channel(());
+        let (output, mut messages) = ClientOutput::channel(stop);
+        output.send_event(&changed, &changed.to_json()).unwrap();
+        let Next::Write(write) = messages.next().await.unwrap().unwrap() else {
+            panic!("a list change is written, not recovered");
+        };
+        assert!(
+            client.project(&write.record).unwrap().is_none(),
+            "the queued JSON alone reaches nobody"
+        );
+        let written = client
+            .project_queued(&write.record, write.audience.clone())
+            .unwrap()
+            .expect("the writer's check hears it with its audience");
+        assert!(
+            !written.contains("audience"),
+            "the audience never goes on the wire"
+        );
     }
 
     /// A reader that falls behind keeps its connection: a reply larger than the free budget

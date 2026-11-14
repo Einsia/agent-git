@@ -91,6 +91,7 @@ impl Daemon {
                 })?;
                 let _ = self.mirror.save();
                 self.refresh_confinement();
+                self.list_changes.project(&p.project_id);
                 Ok(serde_json::to_value(ProjectBindResult {
                     project_id: p.project_id,
                     git_origin: crate::rc::mirror::git_origin(&dir),
@@ -114,6 +115,7 @@ impl Daemon {
                 self.mirror.unbind(&p.workspace_id, &p.project_id);
                 let _ = self.mirror.save();
                 self.refresh_confinement();
+                self.list_changes.project(&p.project_id);
                 // The folder's record of the conversations it held when its uploads were turned
                 // on goes with its last binding; one that stays only keeps more out.
                 if let Some(folder) = folder
@@ -767,6 +769,7 @@ mod tests {
             deferred_slot: None,
             replay_slots: Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
             outbound: None,
+            list_changes: Default::default(),
             opts: Options {
                 local_owner: false,
                 hub: "https://hub.invalid".into(),
