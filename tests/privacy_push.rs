@@ -1068,15 +1068,12 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     fs::create_dir_all(&project).unwrap();
     let published = run_at(&create, false, &home, &project);
     assert_success(&published);
-    // The first push the person makes from a folder that never uploaded by itself tells their
-    // agent it could, to this repository, and to ask them first.
-    let offered = String::from_utf8_lossy(&published.stdout);
-    assert!(offered.contains("For the agent:"), "{offered}");
-    assert!(offered.contains("`agit on --repo alice/app`"), "{offered}");
-    assert!(
-        offered.contains("(private: only you and people you add can read it)"),
-        "{offered}"
-    );
+    // A push of a file line alone (main carries shared files, no conversation) says nothing about
+    // where this folder's conversations go: an agent would interrupt a file edit to ask, and a no
+    // would turn the folder off. The folder keeps its one offer for a push that carries one.
+    let said = String::from_utf8_lossy(&published.stdout);
+    assert!(!said.contains("For the agent:"), "{said}");
+    assert!(!said.contains("agit on --repo"), "{said}");
     let progress = String::from_utf8_lossy(&published.stderr);
     for stage in [
         "Preparing publication snapshots",
@@ -1311,7 +1308,17 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     *hub.viewing_public.lock().unwrap() = STANDARD.encode(rotated.public_key().as_bytes());
     hub.key_version.store(2, Ordering::Release);
     hub.corrupt_receipt.store(false, Ordering::Release);
-    assert_success(&run(&args, false));
+    let published = run_at(&args, false, &home, &project);
+    assert_success(&published);
+    // The first push the person makes from a folder that never uploaded by itself, and that
+    // publishes a conversation, tells their agent it could, to this repository, and to ask first.
+    let offered = String::from_utf8_lossy(&published.stdout);
+    assert!(offered.contains("For the agent:"), "{offered}");
+    assert!(offered.contains("`agit on --repo alice/app`"), "{offered}");
+    assert!(
+        offered.contains("(private: only you and people you add can read it)"),
+        "{offered}"
+    );
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), planned);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/legacy"]), plain);
     assert_eq!(
