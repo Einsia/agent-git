@@ -1827,7 +1827,10 @@ mod tests {
     /// terminal choice, and whether its uploads are off; read without writing, so a bind the
     /// person cancels, or one the Hub answers with a choice, leaves no record of a destination
     /// they never confirmed. A report that wrote the record would make the next binding read as
-    /// "already the folder's destination".
+    /// "already the folder's destination". The terminal's own destination is reported apart and
+    /// stays the terminal choice once the folder's record names another repository: a report
+    /// that gave the folder's record there would tell the person their terminal conversations go
+    /// where the web ones do. Another account's terminal choice is none of this account's.
     #[test]
     fn a_folder_bind_reports_where_the_folder_uploads_without_recording_it() {
         if crate::rc::in_isolated_test(
@@ -1838,32 +1841,59 @@ mod tests {
         let folder = fixture("account-lin");
         let report =
             || local_repository::publication::folder_destination(&folder.directory, HUB).unwrap();
-        assert_eq!(report(), None, "nothing chosen");
+        let terminal =
+            || local_repository::publication::terminal_destination(&folder.directory, HUB).unwrap();
+        let organization = Some(crate::protocol::PublicationTarget {
+            repository: "simco/lumen-agents".into(),
+            agent_id: ORG.into(),
+        });
+        assert_eq!((report(), terminal()), (None, None), "nothing chosen");
         crate::commands::project::save_policy_for_test(
             &folder.directory,
             "simco/lumen-agents",
             &RemoteIdentity::new(HUB, ORG).unwrap(),
             "account-lin",
         );
-        assert_eq!(
-            report(),
-            Some(crate::protocol::PublicationTarget {
-                repository: "simco/lumen-agents".into(),
-                agent_id: ORG.into(),
-            }),
-            "the terminal choice"
-        );
+        assert_eq!(report(), organization, "the terminal choice");
+        assert_eq!(terminal(), organization);
         assert!(
             crate::rc::folder_destination::chosen(&folder.key("account-lin"))
                 .unwrap()
                 .is_none(),
             "reporting it records nothing"
         );
+        crate::rc::folder_destination::adopt(&folder.key("account-lin"), "lin/lumen", OWN).unwrap();
+        assert_eq!(
+            report(),
+            Some(crate::protocol::PublicationTarget {
+                repository: "lin/lumen".into(),
+                agent_id: OWN.into(),
+            }),
+            "the folder's own record"
+        );
+        assert_eq!(
+            terminal(),
+            organization,
+            "the terminal keeps its own choice"
+        );
         crate::commands::project::turn_policy_off_for_test(&folder.directory);
         assert_eq!(
             crate::commands::project::uploads_automatically(&folder.directory),
             Some(false),
             "a folder turned off reports so"
+        );
+        // A terminal choice another account made for the folder is not this account's.
+        let colleague = fixture("account-lin");
+        crate::commands::project::save_policy_for_test(
+            &colleague.directory,
+            "simco/lumen-agents",
+            &RemoteIdentity::new(HUB, ORG).unwrap(),
+            "account-marco",
+        );
+        assert_eq!(
+            local_repository::publication::terminal_destination(&colleague.directory, HUB).unwrap(),
+            None,
+            "another account's terminal choice"
         );
     }
 

@@ -211,7 +211,27 @@ pub(crate) fn folder_destination(
             agent_id: chosen.repository_id,
         }));
     }
-    Ok(crate::commands::project::folder_choice(key.root())
+    Ok(terminal_choice(&key, hub))
+}
+
+/// Where `root`'s terminal conversations upload for the account signed in to `hub`: the person's
+/// own terminal choice for the folder, when it is that account's on that Hub. A web binding never
+/// changes it, so it can differ from [`folder_destination`].
+pub(crate) fn terminal_destination(
+    root: &std::path::Path,
+    hub: &str,
+) -> crate::Result<Option<crate::protocol::PublicationTarget>> {
+    let Some(key) = crate::rc::folder_destination::Key::signed_in(root, hub)? else {
+        return Ok(None);
+    };
+    Ok(terminal_choice(&key, hub))
+}
+
+fn terminal_choice(
+    key: &crate::rc::folder_destination::Key,
+    hub: &str,
+) -> Option<crate::protocol::PublicationTarget> {
+    crate::commands::project::folder_choice(key.root())
         .filter(|(_, identity, account)| {
             account == key.account()
                 && identity::normalize_hub(hub).is_ok_and(|hub| identity.hub == hub)
@@ -221,7 +241,7 @@ pub(crate) fn folder_destination(
                 repository,
                 agent_id: identity.agent_id,
             },
-        ))
+        )
 }
 
 fn folders_and_projects(repo: &Repo) -> crate::Result<(Vec<std::path::PathBuf>, Vec<String>)> {

@@ -707,7 +707,8 @@ impl Daemon {
 }
 
 /// What `project.bind` says of `folder` to the Hub that asked: where it uploads for the account
-/// this device is signed in to there, and whether its uploads are off. Only a bind the device's
+/// this device is signed in to there, where its terminal conversations upload, and whether its
+/// uploads are off. Only a bind the device's
 /// owner made through their own grant names that Hub and account, and only when the device's
 /// sign-in is the same account; anything else says nothing, which the Hub takes for a device that
 /// cannot tell.
@@ -718,11 +719,13 @@ fn bound_folder(frame: &Frame, folder: &std::path::Path) -> Option<crate::protoc
     {
         return None;
     }
-    let destination =
-        crate::rc::local_repository::publication::folder_destination(folder, &owner.issuer).ok()?;
+    use crate::rc::local_repository::publication;
+    let destination = publication::folder_destination(folder, &owner.issuer).ok()?;
+    let terminal = publication::terminal_destination(folder, &owner.issuer).ok()?;
     Some(crate::protocol::BoundFolder {
         destination,
         uploads_off: crate::commands::project::uploads_automatically(folder) == Some(false),
+        terminal,
     })
 }
 

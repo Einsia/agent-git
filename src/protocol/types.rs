@@ -305,6 +305,14 @@ pub struct BoundFolder {
     /// The person turned this folder's uploads off here (`agit off`), so nothing it holds uploads
     /// until they turn them on again.
     pub uploads_off: bool,
+    /// Where the folder's terminal conversations upload for the same account: the person's own
+    /// terminal choice for it, which a web binding never changes, so it can differ from
+    /// `destination`; `None` when the account has none here. Always sent, as `null` when `None`,
+    /// so a Hub can tell "no terminal choice" from a device that doesn't report it, which sends
+    /// no key: taking the one for the other would tell the person their terminal conversations
+    /// go somewhere they don't.
+    #[serde(default)]
+    pub terminal: Option<PublicationTarget>,
 }
 
 /// An owned Cloud machine binds a confirmed project to an immutable private Hub repository.
@@ -1628,6 +1636,22 @@ mod tests {
         assert!(create.create);
         #[cfg(feature = "rc")]
         assert!(crate::rc::build_identity::RPC_FEATURES.contains(&"project_bind_create"));
+    }
+
+    /// A folder report always carries `terminal`, as `null` when the account has no terminal
+    /// choice: a Hub tells that from a device that doesn't report it only by the key being
+    /// there. A field left out when it is `None` would make the two read alike.
+    #[test]
+    fn a_folder_report_always_says_where_the_terminal_uploads() {
+        let report = BoundFolder {
+            destination: None,
+            uploads_off: false,
+            terminal: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&report).unwrap(),
+            serde_json::json!({"destination": null, "uploads_off": false, "terminal": null})
+        );
     }
 
     #[test]
