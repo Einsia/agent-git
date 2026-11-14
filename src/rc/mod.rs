@@ -93,6 +93,7 @@ pub(crate) mod lease;
 pub mod lifecycle;
 pub mod lineage;
 pub mod link;
+pub(crate) mod list_changes;
 pub mod local;
 pub mod local_goal;
 pub mod local_history;

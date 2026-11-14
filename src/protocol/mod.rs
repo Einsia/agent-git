@@ -171,6 +171,11 @@ pub struct Frame {
     #[serde(skip)]
     #[cfg(feature = "rc")]
     pub(crate) settlement_boundary: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// The rows a `session.list.changed` is about, so delivery asks each connection the question
+    /// `session.list` asks of those rows. Machine-local, never on the wire.
+    #[serde(skip)]
+    #[cfg(feature = "rc")]
+    pub(crate) list_audience: Option<Arc<crate::rc::list_changes::Audience>>,
     /// Who the hub says is asking, and with what standing.
     ///
     /// # Why the daemon cannot just trust `params`
@@ -383,6 +388,8 @@ impl Frame {
             #[cfg(feature = "rc")]
             settlement_boundary: None,
             #[cfg(feature = "rc")]
+            list_audience: None,
+            #[cfg(feature = "rc")]
             authority: Default::default(),
         }
     }
@@ -413,6 +420,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            list_audience: None,
             #[cfg(feature = "rc")]
             authority: Default::default(),
         }
@@ -448,6 +457,8 @@ impl Frame {
             #[cfg(feature = "rc")]
             settlement_boundary: None,
             #[cfg(feature = "rc")]
+            list_audience: None,
+            #[cfg(feature = "rc")]
             authority: Default::default(),
         }
     }
@@ -469,6 +480,8 @@ impl Frame {
             connection_delivery: None,
             #[cfg(feature = "rc")]
             settlement_boundary: None,
+            #[cfg(feature = "rc")]
+            list_audience: None,
             #[cfg(feature = "rc")]
             authority: Default::default(),
         }
@@ -606,6 +619,9 @@ pub mod method {
     pub const TURN_STEER_DROPPED: &str = "turn.steer_dropped";
     pub const TURN_COMPLETED: &str = "turn.completed";
     pub const SESSION_STATUS: &str = "session.status";
+    /// A project's session list changed. Names the project only; who hears it is decided per
+    /// connection by what that connection's own `session.list` shows (`crate::rc::list_changes`).
+    pub const SESSION_LIST_CHANGED: &str = "session.list.changed";
     /// Generic alert only: never carries the local rule id, name or matched bytes.
     pub const SECRET_DETECTED: &str = "secret.detected";
 

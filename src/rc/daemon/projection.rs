@@ -181,6 +181,17 @@ impl Daemon {
                 .and_then(|status| status.target.clone());
             live.info.publication = Some(status);
         }
+        // A `session.list` row shows the status, the title a finished turn may change, and the
+        // publication: each of these events changes the row, so the list's readers hear of it.
+        if matches!(
+            frame.method(),
+            method::SESSION_STATUS
+                | method::TURN_COMPLETED
+                | method::SESSION_PUBLICATION_CHANGED
+                | method::COMMIT_LOCAL_SETTLED
+        ) {
+            self.list_changed(&stream);
+        }
         // `through_seq` is a journal coordinate. The supervisor cannot derive
         // it from transcript items because status/turn/approval events also
         // consume sequence numbers.
@@ -1022,6 +1033,7 @@ mod bound_lineage_tests {
                             REPLAY_SLOTS,
                         )),
                         outbound: None,
+                        list_changes: Default::default(),
                         opts: Options {
                             local_owner: false,
                             hub: "https://hub.invalid".into(),

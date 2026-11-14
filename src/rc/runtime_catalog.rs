@@ -844,9 +844,205 @@ fn bump(connection: &Connection) -> rusqlite::Result<usize> {
 
 pub(crate) struct Worker(tokio::task::JoinHandle<()>);
 
+/// A catalog row that changed: what `session.list`'s filter reads of it. A removed row keeps only
+/// its reference and folder.
+#[derive(Clone)]
+pub(crate) struct ChangedRow {
+    pub session_ref: String,
+    pub native_session_id: String,
+    pub source: Option<crate::protocol::NativeSourceRef>,
+    pub runtime: String,
+    pub cwd: PathBuf,
+    /// The row is in the catalog after this change; a removal has nothing else to say.
+    pub present: bool,
+}
+
+/// The rows the worker last reported as present, by reference. A reset names the rows the
+/// catalog holds now, and also these: a row that went while the journal didn't continue (the
+/// catalog rebuilt without it, or its removal pruned) is still on a list read before, and a reader
+/// allowed only that session hears of it through its own row and nothing else.
+#[derive(Default)]
+struct KnownRows(std::collections::HashMap<String, ChangedRow>);
+
+impl KnownRows {
+    fn starting_from(rows: Vec<ChangedRow>) -> Self {
+        Self(
+            rows.into_iter()
+                .map(|row| (row.session_ref.clone(), row))
+                .collect(),
+        )
+    }
+
+    /// What to send for `changes`, and the rows known after them.
+    fn report(&mut self, changes: CatalogChanges) -> CatalogChanges {
+        match changes {
+            CatalogChanges::Rows(rows) => {
+                for row in &rows {
+                    if row.present {
+                        self.0.insert(row.session_ref.clone(), row.clone());
+                    } else {
+                        self.0.remove(&row.session_ref);
+                    }
+                }
+                CatalogChanges::Rows(rows)
+            }
+            CatalogChanges::Reset(rows) => {
+                let now = Self::starting_from(rows.clone());
+                let gone = std::mem::replace(self, now)
+                    .0
+                    .into_values()
+                    .filter(|row| !self.0.contains_key(&row.session_ref));
+                CatalogChanges::Reset(rows.into_iter().chain(gone).collect())
+            }
+        }
+    }
+}
+
+/// How far the worker has read the change journal: which journal, and how far into it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct JournalPosition {
+    instance: String,
+    sequence: u64,
+}
+
+/// What one reconciliation round reports to the daemon.
+pub(crate) enum CatalogChanges {
+    /// Rows found, changed or removed since the last report.
+    Rows(Vec<ChangedRow>),
+    /// The journal no longer continues from where the last report left off: the catalog was
+    /// rebuilt, or its journal was pruned past that point. Which rows changed is unknown, so every
+    /// bound project counts as changed once, and so does every row the catalog holds now and
+    /// every row known before that is gone ([`KnownRows`]): a reader allowed one session but not
+    /// its project hears of that session only through its row. Reporting nothing would leave
+    /// lists that no longer poll without the rows found meanwhile.
+    Reset(Vec<ChangedRow>),
+}
+
+impl Catalog {
+    /// Where the change journal is now, by the rule `deltas` uses for list cursors.
+    fn journal_position(&self) -> crate::Result<JournalPosition> {
+        let (instance, sequence): (String, i64) = self.connection()?.query_row(
+            "SELECT instance,max(floor,coalesce((SELECT max(sequence) FROM changes),0)) FROM change_state WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(JournalPosition {
+            instance,
+            sequence: sequence.max(0) as u64,
+        })
+    }
+
+    /// One round of the worker: runs `reconcile` and reports what changed from `after`, or, on the
+    /// first round, from where the journal stood before this round's reconciliation. Starting from
+    /// the position after it would swallow the rows the first scan found, and a page that read
+    /// its list before that scan finished would never hear of them: later scans finding the same
+    /// rows record no change.
+    fn reconcile_and_report(
+        &self,
+        after: Option<&JournalPosition>,
+        reconcile: impl FnOnce(&Self) -> crate::Result<()>,
+    ) -> crate::Result<(JournalPosition, Option<CatalogChanges>)> {
+        let from = match after {
+            Some(after) => after.clone(),
+            None => self.journal_position()?,
+        };
+        reconcile(self)?;
+        self.changes_after(&from)
+    }
+
+    /// What changed after `after`, and the position this report reaches. A journal that doesn't
+    /// continue from `after` (another instance, pruned past it, or behind it) is a reset.
+    fn changes_after(
+        &self,
+        after: &JournalPosition,
+    ) -> crate::Result<(JournalPosition, Option<CatalogChanges>)> {
+        let now = self.journal_position()?;
+        let floor: i64 = self.connection()?.query_row(
+            "SELECT floor FROM change_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if now.instance != after.instance
+            || now.sequence < after.sequence
+            || floor.max(0) as u64 > after.sequence
+        {
+            return Ok((now, Some(CatalogChanges::Reset(self.current_rows()?))));
+        }
+        let (through, rows) = self.changed_after(after.sequence)?;
+        let position = JournalPosition {
+            instance: now.instance,
+            sequence: through.max(after.sequence),
+        };
+        Ok((
+            position,
+            (!rows.is_empty()).then_some(CatalogChanges::Rows(rows)),
+        ))
+    }
+
+    /// The rows changed after journal sequence `after`, oldest first, and the sequence they reach.
+    fn changed_after(&self, after: u64) -> crate::Result<(u64, Vec<ChangedRow>)> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT sequence,session_ref,cwd,row FROM changes WHERE sequence>?1 ORDER BY sequence",
+        )?;
+        let mut through = after;
+        let mut rows = Vec::new();
+        let mut found = statement.query([after as i64])?;
+        while let Some(found) = found.next()? {
+            let sequence: i64 = found.get(0)?;
+            through = through.max(sequence.max(0) as u64);
+            rows.push(changed_row(found.get(1)?, found.get(2)?, found.get(3)?));
+        }
+        Ok((through, rows))
+    }
+
+    /// Every row the catalog holds now.
+    fn current_rows(&self) -> crate::Result<Vec<ChangedRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT session_ref,cwd,row FROM sessions")?;
+        let mut rows = Vec::new();
+        let mut found = statement.query([])?;
+        while let Some(found) = found.next()? {
+            rows.push(changed_row(found.get(0)?, found.get(1)?, found.get(2)?));
+        }
+        Ok(rows)
+    }
+}
+
+/// A stored catalog row as `session.list`'s filter reads it; a removed row has no stored row and
+/// keeps only its reference and folder.
+fn changed_row(session_ref: String, cwd: String, row: Option<String>) -> ChangedRow {
+    let present = row.is_some();
+    let row = row.and_then(|row| serde_json::from_str::<serde_json::Value>(&row).ok());
+    let field = |name: &str| {
+        row.as_ref()
+            .and_then(|row| row[name].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let source = row.as_ref().and_then(|row| {
+        Some(crate::protocol::NativeSourceRef {
+            source_id: row["source_id"].as_str()?.into(),
+            generation: row["source_generation"].as_u64()?,
+        })
+    });
+    ChangedRow {
+        native_session_id: field("native_session_id"),
+        runtime: field("runtime"),
+        source,
+        session_ref,
+        cwd: PathBuf::from(cwd),
+        present,
+    }
+}
+
 impl Worker {
-    pub fn start() -> Self {
-        Self(tokio::spawn(async {
+    /// Runs discovery and reconciliation. Each round's changed rows go to `changes`, from the
+    /// journal position the worker starts at, so a restart doesn't report the catalog's history.
+    pub fn start(changes: Option<tokio::sync::mpsc::UnboundedSender<CatalogChanges>>) -> Self {
+        Self(tokio::spawn(async move {
+            let mut seen: Option<JournalPosition> = None;
+            let mut known = KnownRows::default();
             let mut next_discovery = tokio::time::Instant::now();
             let mut next_sweep = tokio::time::Instant::now();
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -862,34 +1058,60 @@ impl Worker {
                 if sweep {
                     next_sweep = tokio::time::Instant::now() + RESTORATION_SWEEP;
                 }
-                let _ = tokio::task::spawn_blocking(move || -> crate::Result<()> {
-                    let catalog = Catalog::open()?;
-                    catalog.registry.enroll_default()?;
-                    if sweep {
-                        for source in catalog.registry.list()? {
-                            if source.enabled && source.runtime == "codex" {
-                                crate::adapter::codex_rollout::sweep_restorations(
-                                    &source.home,
-                                    RESTORATION_SWEEP,
-                                );
+                let after = seen.clone();
+                let reported = tokio::task::spawn_blocking(
+                    move || -> crate::Result<(
+                        JournalPosition,
+                        Option<CatalogChanges>,
+                        Option<Vec<ChangedRow>>,
+                    )> {
+                        let catalog = Catalog::open()?;
+                        catalog.registry.enroll_default()?;
+                        if sweep {
+                            for source in catalog.registry.list()? {
+                                if source.enabled && source.runtime == "codex" {
+                                    crate::adapter::codex_rollout::sweep_restorations(
+                                        &source.home,
+                                        RESTORATION_SWEEP,
+                                    );
+                                }
                             }
                         }
-                    }
-                    let mirror = super::mirror::Mirror::load();
-                    let roots = CanonicalRoots::from_verified(
-                        mirror
-                            .workspaces
-                            .keys()
-                            .flat_map(|id| mirror.roots(id).to_vec())
-                            .collect(),
-                    );
-                    if discover {
-                        let report = super::runtime_discovery::discover(&catalog.registry, &roots)?;
-                        catalog.registry.record_discovery(report)?;
-                    }
-                    catalog.reconcile(&roots)
-                })
+                        let mirror = super::mirror::Mirror::load();
+                        let roots = CanonicalRoots::from_verified(
+                            mirror
+                                .workspaces
+                                .keys()
+                                .flat_map(|id| mirror.roots(id).to_vec())
+                                .collect(),
+                        );
+                        if discover {
+                            let report =
+                                super::runtime_discovery::discover(&catalog.registry, &roots)?;
+                            catalog.registry.record_discovery(report)?;
+                        }
+                        // The first round reports from before its own scan; the rows there then
+                        // are what later rounds' changes apply to.
+                        let baseline = after.is_none().then(|| catalog.current_rows()).transpose()?;
+                        let (position, reported) = catalog
+                            .reconcile_and_report(after.as_ref(), |catalog| {
+                                catalog.reconcile(&roots)
+                            })?;
+                        Ok((position, reported, baseline))
+                    },
+                )
                 .await;
+                if let Ok(Ok((position, reported, baseline))) = reported {
+                    seen = Some(position);
+                    if let Some(baseline) = baseline {
+                        known = KnownRows::starting_from(baseline);
+                    }
+                    if let Some(reported) = reported.map(|reported| known.report(reported))
+                        && let Some(changes) = &changes
+                    {
+                        let _ = changes.send(reported);
+                    }
+                }
             }
         }))
     }
@@ -904,6 +1126,135 @@ impl Drop for Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The worker's report reaches every row a list could miss: its first round reports the rows
+    /// that round's own scan found, a catalog recreated under a new instance reports a reset for
+    /// the position read before it, naming the rows the rebuilt catalog already holds, and a row
+    /// changed after that is reported from the new position. A worker that started after its
+    /// first scan would swallow that scan's rows; one that kept comparing sequences across
+    /// instances would read nothing until the new journal passed the old position; a reset that
+    /// named no rows would reach only readers of a whole project, never a reader allowed one
+    /// session. Either way rows would stay off lists that no longer poll.
+    #[test]
+    fn changes_reach_lists_from_the_first_scan_and_across_a_rebuild() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("runtime");
+        let project = temporary.path().join("project");
+        for directory in [&home, &project] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let registry = Registry::at(temporary.path().join("registry")).unwrap();
+        let source = registry.register(&home, None, None, None).unwrap();
+        let path = temporary.path().join("catalog");
+        let insert = |catalog: &Catalog, native: &str| {
+            let row = CatalogRow {
+                session_ref: source.session_ref(native),
+                source_id: source.source_id.clone(),
+                source_generation: source.generation,
+                runtime: "codex".into(),
+                native_session_id: native.into(),
+                cwd: project.canonicalize().unwrap(),
+                title: None,
+                gist: None,
+                updated_at_ms: None,
+                writer_active: None,
+                parent_session_ref: None,
+                technical: false,
+            };
+            catalog
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO sessions VALUES(?1,?2,?3,1,?4)",
+                    params![
+                        row.session_ref,
+                        row.source_id,
+                        row.cwd.to_string_lossy(),
+                        serde_json::to_string(&row).unwrap()
+                    ],
+                )
+                .unwrap();
+        };
+        let reported = |changes: Option<CatalogChanges>| match changes {
+            Some(CatalogChanges::Rows(rows)) => rows
+                .into_iter()
+                .map(|row| row.native_session_id)
+                .collect::<Vec<_>>(),
+            Some(CatalogChanges::Reset(rows)) => std::iter::once("reset".to_string())
+                .chain(rows.into_iter().map(|row| row.native_session_id))
+                .collect(),
+            None => vec![],
+        };
+
+        let catalog = Catalog::at(registry.clone(), path.clone()).unwrap();
+        let (read, changes) = catalog
+            .reconcile_and_report(None, |catalog| {
+                insert(catalog, "before");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reported(changes), ["before"], "the first scan's own rows");
+        let (read, changes) = catalog.changes_after(&read).unwrap();
+        assert!(
+            reported(changes).is_empty(),
+            "nothing new, nothing reported"
+        );
+
+        drop(catalog);
+        std::fs::remove_dir_all(&path).unwrap();
+        let rebuilt = Catalog::at(registry.clone(), path).unwrap();
+        insert(&rebuilt, "again");
+        let (fresh, changes) = rebuilt.changes_after(&read).unwrap();
+        assert_eq!(
+            reported(changes),
+            ["reset", "again"],
+            "a reset names the rows the rebuilt catalog holds"
+        );
+        insert(&rebuilt, "after");
+        let (_, changes) = rebuilt.changes_after(&fresh).unwrap();
+        assert_eq!(reported(changes), ["after"]);
+    }
+
+    /// A reset names the rows that went while the journal didn't continue, once, alongside the
+    /// rows there now: a row the rebuild dropped, or whose removal was pruned, is still on a list
+    /// read before, and a reader allowed only that session hears of it through that row alone. A
+    /// row whose removal was already reported isn't named again. A reset of the current rows only
+    /// leaves that reader's list showing a conversation that is gone.
+    #[test]
+    fn a_reset_names_the_rows_that_went_while_the_journal_did_not_continue() {
+        let row = |name: &str, present: bool| ChangedRow {
+            session_ref: format!("codex:{name}"),
+            native_session_id: name.into(),
+            source: None,
+            runtime: "codex".into(),
+            cwd: "/w/p".into(),
+            present,
+        };
+        let names = |changes: CatalogChanges| {
+            let (CatalogChanges::Rows(rows) | CatalogChanges::Reset(rows)) = changes;
+            let mut names: Vec<_> = rows.into_iter().map(|row| row.native_session_id).collect();
+            names.sort();
+            names
+        };
+        let mut known = KnownRows::starting_from(vec![row("kept", true), row("gone", true)]);
+        known.report(CatalogChanges::Rows(vec![row("brief", true)]));
+        known.report(CatalogChanges::Rows(vec![row("brief", false)]));
+        assert_eq!(
+            names(known.report(CatalogChanges::Reset(vec![
+                row("kept", true),
+                row("new", true)
+            ]))),
+            ["gone", "kept", "new"]
+        );
+        assert_eq!(
+            names(known.report(CatalogChanges::Reset(vec![
+                row("kept", true),
+                row("new", true)
+            ]))),
+            ["kept", "new"],
+            "a row is named as gone once"
+        );
+    }
 
     #[test]
     fn scoped_changes_survive_restart_and_reset_after_scope_or_journal_loss() {

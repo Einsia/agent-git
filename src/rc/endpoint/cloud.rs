@@ -192,7 +192,9 @@ pub(super) fn attach(
                         serde_json::json!({"client_id":client}),
                     );
                 }
-                if let Some(text) = projection.project(&message.record)? {
+                if let Some(text) =
+                    projection.project_queued(&message.record, message.audience.clone())?
+                {
                     let frame_bytes = text.len();
                     let started = std::time::Instant::now();
                     if (opening || frame_bytes >= 16 * 1024)

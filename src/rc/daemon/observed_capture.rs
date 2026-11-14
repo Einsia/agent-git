@@ -414,6 +414,10 @@ async fn collect(
             roster.record(&logical, entry.clone())?;
             roster.save()?;
             state.roster = roster;
+            // The row's repository and branch come from this lineage.
+            state
+                .list_changes
+                .session(super::dormant_row(&logical, &entry));
         }
     }
     let now = tokio::time::Instant::now();
@@ -836,10 +840,12 @@ impl Daemon {
             archive.agent = Some(lineage.slug());
             archive.branch = Some(lineage.branch().into());
         }
+        let row = super::dormant_row(&logical, &entry);
         roster.record(&logical, entry)?;
         if roster.observed.insert(logical) || changed_danger {
             roster.save()?;
             self.roster = roster;
+            self.list_changes.session(row);
         }
         Ok(Some(archive))
     }

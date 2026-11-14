@@ -2027,6 +2027,7 @@ fn a_confinement_update_lands_even_when_no_session_is_listening() {
         deferred_slot: None,
         replay_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(REPLAY_SLOTS)),
         outbound: None,
+        list_changes: Default::default(),
         opts: Options {
             local_owner: false,
             hub: "https://hub.invalid".into(),
