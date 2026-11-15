@@ -1281,13 +1281,42 @@ pub(crate) fn open_browser(url: &str) -> bool {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(cmd)
-        .arg(url)
+    let mut command = std::process::Command::new(cmd);
+    command.arg(url);
+    launch_browser(command, BROWSER_LAUNCH_GRACE)
+}
+
+/// How long a browser launcher may run before it counts as having opened the link.
+#[cfg(not(windows))]
+const BROWSER_LAUNCH_GRACE: Duration = Duration::from_millis(500);
+
+/// Start a browser launcher without blocking the approval poll on it. `xdg-open` may stay in
+/// the foreground for as long as the browser it started runs; if this waited for it to exit,
+/// the request could be approved and expire unpolled. A launcher that fails within `grace`
+/// reports false; one still running then counts as opened and is reaped in the background.
+#[cfg(not(windows))]
+fn launch_browser(mut command: std::process::Command, grace: Duration) -> bool {
+    let Ok(mut child) = command
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    else {
+        return false;
+    };
+    let until = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => break,
+            Err(_) => return false,
+        }
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    true
 }
 
 #[derive(Debug)]
@@ -1342,6 +1371,26 @@ fn session_credential(response: crate::hub::LoginResponse) -> (HubCredential, St
 
 #[cfg(test)]
 mod identity_tests {
+    /// The approval poll starts only after the launcher returns, so a launcher that keeps
+    /// running (as `xdg-open` does under a minimal window manager) must count as opened
+    /// without being waited for, while one that exits non-zero still reports failure.
+    #[cfg(not(windows))]
+    #[test]
+    fn browser_launch_returns_while_the_launcher_keeps_running() {
+        let mut lingering = std::process::Command::new("sh");
+        lingering.args(["-c", "sleep 30"]);
+        let started = std::time::Instant::now();
+        assert!(super::launch_browser(
+            lingering,
+            super::BROWSER_LAUNCH_GRACE
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(!super::launch_browser(
+            std::process::Command::new("false"),
+            super::BROWSER_LAUNCH_GRACE
+        ));
+    }
+
     #[test]
     fn windows_url_buffer_keeps_query_and_fragment_as_one_system_argument() {
         let url = "https://agent-git.com/auth/cli?state=synthetic&installation_id=opaque#fragment";
