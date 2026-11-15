@@ -56,6 +56,7 @@ pub(crate) mod auto_push;
 pub mod commit;
 pub mod file;
 pub mod memory;
+pub(crate) mod settle_failures;
 pub mod tag;
 pub(crate) mod upload_outcome;
 

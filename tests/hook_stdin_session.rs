@@ -2033,3 +2033,114 @@ fn a_signed_out_claude_code_turn_says_it_isnt_saved() {
     );
     assert!(said.get("decision").is_none(), "{said}");
 }
+
+/// A Pi turn that isn't saved is kept on this computer and told once. Pi's extension discards
+/// what agit prints except the notice line: the settlement prints it the first time a
+/// conversation's turn fails that way at a run Pi shows it, and `agit status` lists the
+/// conversation until a settlement of it succeeds. A settlement that said nothing leaves the
+/// person believing the turn saved; one that said it at every failure repeats it at every run.
+#[test]
+fn a_pi_turn_that_isnt_saved_is_told_once_and_listed_until_one_is() {
+    const PI: &str = "019a0000-0000-7000-8000-0000000000b1";
+    let lab = Lab::new();
+    let pi = lab.home.join("pi-agent");
+    let work = lab.work.canonicalize().unwrap();
+    let slug: String = work
+        .to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '\\' | ':') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let sessions = pi.join("sessions").join(format!("--{slug}--"));
+    fs::create_dir_all(&sessions).unwrap();
+    let file = sessions.join(format!("2026-11-15T00-00-00-000Z_{PI}.jsonl"));
+    let header = serde_json::json!({"type":"session","version":3,"id":PI,
+        "timestamp":"2026-11-15T00:00:00.000Z","cwd":work});
+    fs::write(&file, format!("{header}\n")).unwrap();
+    // The conversation holds a branch of a repository this computer doesn't have.
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let mut claim = agit::domain::link::Link::new("pi", PI, Some(&work));
+    claim.owner = Some("me".into());
+    claim.agent = Some("gone".into());
+    claim.branch = Some("s1".into());
+    agit::domain::link::write(&store, &claim).unwrap();
+    let settle = |shows: bool| {
+        let mut child = lab
+            .agit(&["hooks", "settle", "--runtime", "pi"])
+            .env("PI_CODING_AGENT_DIR", &pi)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({"runtime":"pi","session_id":PI,"transcript_path":file,
+                    "cwd":work,"hook_event_name":"agent_settled","shows_notice":shows})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let unsaved = || {
+        let out = lab
+            .agit(&["--json", "status"])
+            .env("PI_CODING_AGENT_DIR", &pi)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["result"]["value"]["unsaved_turns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{value}"))
+            .iter()
+            .map(|turn| {
+                (
+                    turn["session_id"].clone(),
+                    turn["kind"].clone(),
+                    turn["reason"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let listed = vec![(
+        serde_json::json!(PI),
+        serde_json::json!("not_saved"),
+        serde_json::json!("me/gone isn't on this computer"),
+    )];
+
+    // Where Pi shows nothing, the failure is kept and not told.
+    assert_eq!(settle(false), "");
+    assert_eq!(unsaved(), listed);
+    let told = settle(true);
+    let notice: serde_json::Value =
+        serde_json::from_str(told.trim_end()).unwrap_or_else(|error| panic!("{error}: {told:?}"));
+    assert_eq!(
+        notice,
+        serde_json::json!({"notice":
+            "agit: this turn isn't saved: me/gone isn't on this computer; `agit status` here shows it again"}),
+        "{told:?}"
+    );
+    assert_eq!(settle(true), "", "the same failure was told twice");
+
+    // A settlement that succeeds takes it off the list; the same failure later is listed again,
+    // and not told again.
+    agit::domain::link::remove(&store, "pi", PI).unwrap();
+    assert_eq!(settle(true), "");
+    assert_eq!(unsaved(), []);
+    agit::domain::link::write(&store, &claim).unwrap();
+    assert_eq!(settle(true), "");
+    assert_eq!(unsaved(), listed);
+}

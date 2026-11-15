@@ -262,6 +262,19 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(said) = super::project::opencode_not_captured(&cwd) {
         println!("  {said}");
     }
+    // A conversation whose host shows nothing agit says hears here that its last turn wasn't
+    // saved.
+    for (runtime, session, failure) in unsaved_turns(&cwd) {
+        println!(
+            "  {} {} (conversation {})",
+            ui::warn_text(&format!(
+                "{}'s last turn here wasn't saved:",
+                super::front::runtime_name(runtime)
+            )),
+            failure.line,
+            crate::domain::link::short(&session)
+        );
+    }
     // Told once: branches already on the Hub that the folder they ran in keeps back.
     if let Ok(uploads) =
         super::project::kept_back_uploads_to_tell(|repository| scope.covers(repository))
@@ -789,6 +802,15 @@ fn ran_in(link: &link::Link, folder: &std::path::Path) -> bool {
 
 /// In a git worktree its main checkout's policy covers, how many sessions from before that
 /// coverage wait for `agit save --all`; `None` anywhere else.
+/// The conversations of the folder `cwd` is in whose last settlement failed where their host
+/// shows nothing of agit's ([`super::settle_failures`]).
+fn unsaved_turns(
+    cwd: &std::path::Path,
+) -> Vec<(&'static str, String, super::settle_failures::Failure)> {
+    let folder = super::front::folder(cwd).unwrap_or_else(|_| cwd.to_owned());
+    super::settle_failures::in_folder(&folder)
+}
+
 fn worktree_left_out(cwd: &std::path::Path) -> Option<usize> {
     let folder = super::front::folder(cwd).ok()?;
     super::project::worktree_of(&folder)?;
@@ -1008,6 +1030,10 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
         "bound_repo": crate::domain::workspace::read(&cwd).map(|workspace| workspace.repo),
         "worktree": super::project::worktree_notice(&cwd),
         "web_binding_waiting": super::front::web_binding_waiting(&cwd),
+        "unsaved_turns": unsaved_turns(&cwd).into_iter().map(|(runtime, session, failure)| serde_json::json!({
+            "runtime": runtime, "session_id": session, "kind": failure.kind,
+            "reason": failure.line, "at": failure.at,
+        })).collect::<Vec<_>>(),
         // Uploading the sessions from before is the person's choice: the agent asks.
         "earlier_sessions_not_uploaded": earlier.filter(|count| *count > 0).map(|count| serde_json::json!({
             "count": count,
