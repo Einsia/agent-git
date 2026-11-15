@@ -71,13 +71,19 @@ pub fn run() -> CmdResult {
     {
         let _ = crate::commands::project::catch_up(root);
     }
-    sessions.truncate(SHOWN);
+    // A failure is told while its conversation is not on the Hub, among all of the folder's.
+    let uploaded = |id: &str| {
+        sessions
+            .iter()
+            .any(|session| session.id == id && session.upload() == Some(Upload::Uploaded))
+    };
     let failure = root
         .as_deref()
-        .and_then(crate::commands::project::last_failure);
+        .and_then(|root| crate::commands::project::last_failure(root, uploaded));
     let failure_said = root
         .as_deref()
-        .and_then(crate::commands::project::last_failure_described);
+        .and_then(|root| crate::commands::project::last_failure_described(root, uploaded));
+    sessions.truncate(SHOWN);
     // An on folder whose uploads are held is said to be on and held, never to upload.
     let held = match (state, root.as_deref().map(crate::commands::project::saving)) {
         (FolderState::On, Some(crate::commands::project::Saving::Held { held, .. })) => Some(held),

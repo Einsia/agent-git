@@ -1045,13 +1045,20 @@ impl FrozenPublication {
                 Err(error) if error.transient && attempt < delays.len() => {
                     std::thread::sleep(delays[attempt])
                 }
+                // A temporary failure is the Hub not answering, which a push reports as one so
+                // its caller tries the upload again; any other is a refusal.
+                Err(error) if error.transient => {
+                    return Err(anyhow::Error::new(AdvertisementUnread::from_read(
+                        error,
+                        super::PROBE_TIMEOUT,
+                    ))
+                    .context(
+                        "cannot read the complete publication destination refs after bounded retries: temporary Hub or network failure",
+                    ));
+                }
                 Err(error) => {
-                    let context = if error.transient {
-                        "cannot read the complete publication destination refs after bounded retries: temporary Hub or network failure"
-                    } else {
-                        "cannot read the complete publication destination refs"
-                    };
-                    return Err(anyhow::Error::new(error).context(context));
+                    return Err(anyhow::Error::new(error)
+                        .context("cannot read the complete publication destination refs"));
                 }
             }
         }

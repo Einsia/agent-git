@@ -3112,24 +3112,35 @@ pub(crate) fn covering_repository(path: &Path) -> Option<String> {
     governing(path).ok()?.map(|(project, _)| project.repository)
 }
 
-/// The last automatic upload's error, when it failed.
-pub(crate) fn last_failure(path: &Path) -> Option<String> {
+/// The last automatic upload of the folder `path` is in, when it failed and the failure still
+/// stands. `uploaded` says whether the conversation of an id is on the Hub now: one put there
+/// since, by a retry, the person's own push or another computer, has no failed upload left, and
+/// told one it would be pushed again.
+fn standing_failure(path: &Path, uploaded: impl Fn(&str) -> bool) -> Option<serde_json::Value> {
     let (project, _) = governing(path).ok()??;
     let last = project.last_result?;
-    (last["ok"] == false).then(|| last["error"].as_str().unwrap_or("unknown error").to_owned())
+    (last["ok"] == false && !last["session_id"].as_str().is_some_and(uploaded)).then_some(last)
+}
+
+/// The last automatic upload's error, when it failed and still stands ([`standing_failure`]).
+pub(crate) fn last_failure(path: &Path, uploaded: impl Fn(&str) -> bool) -> Option<String> {
+    let last = standing_failure(path, uploaded)?;
+    Some(last["error"].as_str().unwrap_or("unknown error").to_owned())
 }
 
 /// [`last_failure`] said in a fixed sentence by its reason, for a line the person reads: a
-/// failure's own error can hold URLs, header values and paths. `None` when the last upload did
-/// not fail; a failure recorded without a reason reads as one this computer could not complete.
-pub(crate) fn last_failure_described(path: &Path) -> Option<&'static str> {
-    let (project, _) = governing(path).ok()??;
-    let last = project.last_result?;
-    (last["ok"] == false).then(|| {
+/// failure's own error can hold URLs, header values and paths. `None` when no failure stands; a
+/// failure recorded without a reason reads as one this computer could not complete.
+pub(crate) fn last_failure_described(
+    path: &Path,
+    uploaded: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let last = standing_failure(path, uploaded)?;
+    Some(
         serde_json::from_value::<UploadFailure>(last["reason"].clone())
             .unwrap_or(UploadFailure::Other)
-            .describe()
-    })
+            .describe(),
+    )
 }
 
 /// Sessions under `root` that the policy left out when it was bound without earlier history and
@@ -5948,16 +5959,17 @@ fn standing(
 
 /// Where a saved branch whose local head is `head` stands on the Hub, whose head this checkout
 /// last saw as `remote`. `uploaded` when the Hub has `head`: the last upload pushed it, the Hub's
-/// head is it, or `holds` finds the Hub's head is its published form. `waiting` when the Hub has
-/// an older head; `not_uploaded` when it has none this checkout knows of. `agit status` answers
-/// with this too, from its own bounded reads.
+/// head is it, or `holds` finds the Hub's head is its published form or, with no head of the Hub
+/// fetched, that the Hub acknowledged publishing it ([`crate::domain::privacy_git::hub_holds_head`]),
+/// which a push records without fetching. `waiting` when the Hub has an older head; `not_uploaded` when it has none this
+/// checkout knows of. `agit status` answers with this too, from its own bounded reads.
 pub(crate) fn hub_standing(
     head: Option<&str>,
     remote: Option<&str>,
     pushed: bool,
     holds: impl FnOnce() -> bool,
 ) -> &'static str {
-    if pushed || (remote.is_some() && remote == head) || (remote.is_some() && holds()) {
+    if pushed || (remote.is_some() && remote == head) || (head.is_some() && holds()) {
         "uploaded"
     } else if remote.is_some() {
         "waiting"
@@ -6557,6 +6569,16 @@ fn folder_json(
         ),
         None => ("local_only", 0, None),
     };
+    // A failure whose conversation the Hub holds now no longer stands ([`standing_failure`]).
+    let last = last.filter(|last| {
+        last.ok
+            || !last.session_id.as_deref().is_some_and(|id| {
+                folder.sessions.iter().any(|session| {
+                    session.id == id
+                        && standing(session, store, checkouts, Some(last)).status == "uploaded"
+                })
+            })
+    });
     let repository_url =
         slug.map(|(owner, name)| format!("{}/@{owner}/{name}", folder.hub.trim_end_matches('/')));
     let recent: Vec<_> = folder

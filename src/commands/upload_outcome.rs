@@ -511,14 +511,15 @@ impl Place {
         Some(undone)
     }
 
-    /// The Hub acknowledged a push of the branch whose commit `covers` a tip when it is that tip
-    /// or a descendant of it. An upload of a covered tip that failed, ended without saying how it
-    /// went or didn't run no longer stands for the branch, so its record or note goes. One of a
-    /// tip the commit doesn't hold stays, as a push frozen before that turn was saved never
-    /// uploaded it; so does the record of an upload still running, whose own outcome is recorded
-    /// over it. Each is read, judged and removed under the lock it is written under, and without
-    /// that lock it stays.
-    fn acknowledge(self, covers: impl Fn(&str) -> bool) {
+    /// The Hub acknowledged a push of the branch at `source`, whose commit `covers` a tip when it
+    /// is that tip or a descendant of it. An upload of a covered tip that failed or ended without
+    /// saying how it went no longer stands for the branch: its record says the branch is uploaded
+    /// at `source`, so the turn end and `agit status` say so, and nothing tries it again. The note
+    /// of one that didn't run goes. One of a tip the commit doesn't hold stays, as a push frozen
+    /// before that turn was saved never uploaded it; so does the record of an upload still
+    /// running, whose own outcome is recorded over it. Each is read, judged and replaced under the
+    /// lock it is written under, and without that lock it stays.
+    fn acknowledge(self, source: &str, covers: impl Fn(&str) -> bool) {
         under_write_lock(&self.note_lock(), || {
             let note = std::fs::read(&self.skipped)
                 .ok()
@@ -535,7 +536,12 @@ impl Place {
                 Some(Outcome::Uploaded { .. }) | None => false,
             };
             if stale {
-                let _ = std::fs::remove_file(&paths.record);
+                let _ = write(
+                    &paths.record,
+                    &Outcome::Uploaded {
+                        tip: source.to_owned(),
+                    },
+                );
             }
         });
     }
@@ -862,12 +868,12 @@ pub(crate) fn clear_failure_with_upload_off(repository: &str, branch: &str) {
 
 /// The Hub acknowledged `repository@branch` at the local commit `source`, whoever pushed it:
 /// `repository` is the local checkout the branch's uploads are recorded by, whichever repository
-/// on the Hub the push published to. See [`Place::acknowledge`] for what that clears.
+/// on the Hub the push published to. See [`Place::acknowledge`] for what that records.
 pub(crate) fn acknowledged(repo: &Repo, repository: &str, branch: &str, source: &str) {
     let Ok(place) = Place::of(repository, branch) else {
         return;
     };
-    place.acknowledge(|tip| {
+    place.acknowledge(source, |tip| {
         tip == source
             || repo
                 .git_opt(&["merge-base", "--is-ancestor", tip, source])
@@ -1401,14 +1407,21 @@ mod tests {
                 _ => true,
             }
         };
-        place().acknowledge(holds("tip-0"));
+        place().acknowledge("tip-0", holds("tip-0"));
         assert_eq!(
             place().undone().unwrap(),
             failed,
             "an older commit's acknowledgement erased a newer turn's failure"
         );
-        place().acknowledge(holds("tip-1"));
+        place().acknowledge("tip-1", holds("tip-1"));
         assert_eq!(place().undone().unwrap(), None);
+        assert_eq!(
+            read(&at(&records).record),
+            Some(Outcome::Uploaded {
+                tip: "tip-1".into()
+            }),
+            "a failure the push covers was not recorded as uploaded"
+        );
 
         std::fs::remove_dir_all(&blocked).unwrap();
         std::fs::write(&blocked, b"").unwrap();
@@ -1422,9 +1435,9 @@ mod tests {
             .is_err()
         );
         assert_eq!(pushes.get(), 2);
-        place().acknowledge(holds("tip-1"));
+        place().acknowledge("tip-1", holds("tip-1"));
         assert_eq!(place().undone().unwrap(), Some(Undone::Unrecorded));
-        place().acknowledge(holds("tip-2"));
+        place().acknowledge("tip-2", holds("tip-2"));
         std::fs::remove_file(&blocked).unwrap();
         assert_eq!(place().undone().unwrap(), None);
 
@@ -1443,7 +1456,7 @@ mod tests {
         );
         let (landed, landing) = std::sync::mpsc::channel();
         let newer = std::cell::RefCell::new(None);
-        place().acknowledge(|tip| {
+        place().acknowledge("tip-2", |tip| {
             if newer.borrow().is_none() {
                 let (records, notes, landed) = (records.clone(), notes.clone(), landed.clone());
                 *newer.borrow_mut() = Some(std::thread::spawn(move || {

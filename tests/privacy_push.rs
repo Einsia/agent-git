@@ -10244,7 +10244,11 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
 ///   so is one the Hub turned away while another write to the repository held it, told as
 ///   someone else writing rather than a Hub that didn't answer;
 /// - one the Hub refused (403) is never retried, and one dropped after the failure goes with its
-///   record and is never tried again.
+///   record and is never tried again;
+/// - one the person pushes before its next try is recorded as uploaded, listed as uploaded, and no
+///   longer told as the folder's failed upload;
+/// - one whose folder is turned off before its next try is not tried again: nothing of it is sent
+///   once its time comes.
 ///
 /// A worker that pushed a landed upload again would send it twice; one that waited for a trigger
 /// would leave the retry to the next turn; one that published the branch's tip would send a turn
@@ -10258,6 +10262,8 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     const DROPPED: &str = "dddddddd-0000-4000-8000-00000000000d";
     const WAITED: &str = "eeeeeeee-0000-4000-8000-00000000000e";
     const CONTENDED: &str = "ffffffff-0000-4000-8000-00000000000f";
+    const PUSHED: &str = "cdcdcdcd-0000-4000-8000-0000000000cd";
+    const TURNED_OFF: &str = "abababab-0000-4000-8000-0000000000ab";
     const START: i64 = 1_900_000_000;
 
     let temp = tempfile::tempdir().unwrap();
@@ -10660,6 +10666,92 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     assert!(on_hub(&dropped).is_empty());
     assert!(on_hub(&refused).is_empty());
     assert_eq!(record(&refused).unwrap(), refusal);
+
+    // Cut off, then pushed by the person before the folder's next try: this computer says the Hub
+    // holds it, in its record, in `agit status` and in the folder's last upload, so nothing sends
+    // the person to push it again.
+    let session_upload = || {
+        let status = agit(
+            &[
+                "--json",
+                "--json-version",
+                "2",
+                "status",
+                "--offset",
+                "0",
+                "--limit",
+                "50",
+            ],
+            None,
+            &[],
+        );
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        status["result"]["value"]["sessions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == PUSHED)
+            .unwrap_or_else(|| panic!("{status}"))["upload"]
+            .clone()
+    };
+    let last_upload = || {
+        let listed = agit(&["--json", "project", "list"], None, &[]);
+        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        listed["result"]["value"]["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|folder| folder["folder"] == work.to_str().unwrap())
+            .unwrap_or_else(|| panic!("{listed}"))["last_upload"]
+            .clone()
+    };
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let pushed = upload(PUSHED, "golf pushed", &[]);
+    let pushed_at = git(repo.root(), &["rev-parse", &pushed]);
+    assert_eq!(record(&pushed).unwrap()["reason"], "hub");
+    assert_eq!(session_upload(), "not_uploaded");
+    assert_eq!(last_upload()["ok"], false);
+    agit(
+        &["--yes", "push", &format!("alice/app@{pushed}")],
+        None,
+        &[],
+    );
+    assert_eq!(on_hub(&pushed), published_form(&repo, &pushed, &pushed_at));
+    assert_eq!(
+        record(&pushed).unwrap(),
+        json!({"state": "uploaded", "tip": pushed_at})
+    );
+    assert_eq!(session_upload(), "uploaded");
+    assert!(last_upload().is_null(), "{}", last_upload());
+    let listed = agit(&["project", "list"], None, &[]);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).contains("the last upload failed"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // Cut off, and the folder turned off before its next try: its record goes with the folder,
+    // and the folder's worker, run past the time the try was due, sends nothing.
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let turned_off = upload(TURNED_OFF, "golf turned off", &[]);
+    let pending = record(&turned_off).unwrap();
+    assert_eq!(pending["reason"], "hub", "{pending}");
+    let retry_at = pending["retry_after"].as_i64().unwrap();
+    let posts = hub.posts.load(Ordering::Acquire);
+    let previews = hub.previews.lock().unwrap().len();
+    agit(&["off"], None, &[]);
+    assert_eq!(record(&turned_off), None);
+    fs::write(&later_clock, (retry_at + 1).to_string()).unwrap();
+    agit(
+        &["--quiet", "project", "capture", work.to_str().unwrap()],
+        None,
+        &[("AGIT_TEST_CLOCK_FILE", later_clock.to_str().unwrap())],
+    );
+    assert!(on_hub(&turned_off).is_empty());
+    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+    assert_eq!(hub.previews.lock().unwrap().len(), previews);
+    // The workers still waiting for a try find nothing due, and end.
+    fs::write(&clock, (retry_at + 1).to_string()).unwrap();
 }
 
 /// A file line that diverged from the Hub's, as when two people distill the same memory into

@@ -928,17 +928,25 @@ impl FolderSession {
             "--quiet",
             &format!("refs/remotes/origin/{branch}"),
         ]);
+        let holds = repo
+            .git_opt(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .is_some()
+            && crate::domain::privacy_git::hub_holds_head(&repo, branch);
         Some(match remote {
-            None => Upload::NotUploaded,
+            None if !holds => Upload::NotUploaded,
             // A Stop hook that did not run leaves the branch as it was pushed while the
             // conversation goes on, so the transcript is compared with its last upload too.
-            Some(_)
-                if crate::domain::privacy_git::hub_holds_head(&repo, branch)
-                    && !super::project::changed_since_upload(self.runtime, &self.id, &self.cwd) =>
+            _ if holds
+                && !super::project::changed_since_upload(self.runtime, &self.id, &self.cwd) =>
             {
                 Upload::Uploaded
             }
-            Some(_) => Upload::Waiting,
+            _ => Upload::Waiting,
         })
     }
 

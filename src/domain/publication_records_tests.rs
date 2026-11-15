@@ -1585,6 +1585,27 @@ fn a_pasted_image_caption_is_published_from_the_typed_record() {
     );
 }
 
+/// A Codex local shell call goes out as the command it ran, where and for how long, without the
+/// environment it was given or the account it ran as, which can hold values of the person's
+/// environment; judged again it is unchanged. Publishing it whole sends those values.
+#[test]
+fn codex_local_shell_calls_go_out_without_their_environment() {
+    const SECRET: &str = "CANARY-CODEX-SHELL-ENV-5f1d";
+    let record = codex(
+        "response_item",
+        json!({"type":"local_shell_call","call_id":"call-1","status":"completed",
+            "action":{"type":"exec","command":["make","test"],"working_directory":"/work",
+                "timeout_ms":1000,"env":{"API_TOKEN":SECRET},"user":"root"}}),
+    );
+    let kept = published("codex", &record).unwrap();
+    assert!(!kept.to_string().contains(SECRET), "{kept}");
+    assert_eq!(
+        kept["payload"]["action"],
+        json!({"type":"exec","command":["make","test"],"working_directory":"/work","timeout_ms":1000})
+    );
+    assert_eq!(published("codex", &kept), Some(kept.clone()));
+}
+
 #[test]
 fn codex_tool_outputs_strip_injected_elements() {
     // Codex tool output text follows the block rule of Claude tool results: an environment block

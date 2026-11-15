@@ -150,14 +150,15 @@ fn upload(
         remote.as_deref(),
         false,
         || {
-            let public = remote.as_deref().unwrap_or_default();
-            uploads
-                .projections
-                .get_or_insert_with(|| {
-                    crate::domain::privacy_git::Projections::open_within(&uploads.repo, deadline)
-                })
-                .source(branch, public)
-                .is_some_and(|source| source == head)
+            let projections = uploads.projections.get_or_insert_with(|| {
+                crate::domain::privacy_git::Projections::open_within(&uploads.repo, deadline)
+            });
+            match remote.as_deref() {
+                None => projections.acknowledged(branch, &head),
+                Some(public) => projections
+                    .source(branch, public)
+                    .is_some_and(|source| source == head),
+            }
         },
     );
     if standing == "not_uploaded" {
