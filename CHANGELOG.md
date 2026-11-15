@@ -8,6 +8,53 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.53] - 2026-11-16
+
+### Added
+
+- Gemini CLI conversations are saved, uploaded and resumed like Claude Code and Codex ones: hooks in
+  `~/.gemini/settings.json` save each turn, and a published conversation carries the person's own words and each reply
+  once.
+- Pi conversations are saved, uploaded and resumed, on another computer too.
+- The Hub's page of a conversation can show an image an agent's reply names: agit reads it from this computer only if
+  it is an image file inside the conversation's folder, and only for people who may read the conversation.
+- The Hub can collect a conversation's publication receipts from this computer without a page open, on a connection
+  that can do nothing else; a device's presence says it accepts one.
+
+### Changed
+
+- The author's home directory shows as `~` in sessions others read.
+- A folder added from the web reports where its terminal conversations upload, so the Hub can say whether they save
+  there too.
+- `agit status` and `agit on` say which runtimes this computer doesn't capture, and the command that sets them up.
+- A failed `agit rc local start` shows what the daemon wrote.
+- `agit memory status` and `agit memory diff` read the folder's conversation when it has only one, and name it; after
+  a distill confirmed at a terminal, agit asks whether to publish main now (default no).
+
+### Fixed
+
+- An automatic upload that the Hub was too slow to answer is tried again by itself, and a conversation pushed by hand
+  after a failed automatic upload shows as uploaded. If your automatic uploads stopped this way, upgrade to 0.2.53.
+- `agit push` of files alone, such as a wiki page, no longer ends by suggesting that the folder's conversations upload
+  to that repository.
+- A conversation started from the Hub starts with the team memory of the repository it uploads to, and a session sees
+  only its own repository's team memory, no longer that of its repository's branches whose conversations have ended.
+- A reason given when denying a tool call from the web reaches the agent as the person's words, in Claude Code, Codex
+  and OpenCode.
+- `agit distill` stops and names `agit pull <owner>/<repo>@main` when the Hub's main has changes this computer hasn't
+  pulled, instead of reporting success; after landing it says per file what it carried or merged. Memory commands say
+  when a session's branch isn't on this computer, and without a target they list this folder's conversations to name.
+- `agit rc local start` no longer gives up on a slow daemon, and stops at once with the reason when the daemon exits.
+- `agit login` no longer stays on "waiting for approval" after you approve, when the browser launcher keeps running
+  (as under some Linux window managers).
+- A Pi turn agit couldn't save is shown on Pi's screen and in `agit status`.
+- The agit skill tells an agent that a bare `agit share --yes` inside its own turn shares the current conversation,
+  and what happens when that conversation has no saved turn yet.
+- A shared Codex conversation keeps its patch and local shell calls and their outputs; `agit share <session id>` says
+  how many of the conversation's turns the Hub hasn't received before it asks to confirm.
+- `agit init` in a directory bound to another repository names both ways on: `--no-bind` to keep the binding,
+  `--rebind` to move it.
+- A session that only read files no longer shows edits.
 ## [0.2.52] - 2026-11-14
 
 ### Changed
