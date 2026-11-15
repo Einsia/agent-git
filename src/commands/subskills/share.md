@@ -17,16 +17,28 @@ agit share rm <slug>
 by anyone with its link, until it expires (in 7 days unless `--expire` says otherwise) or you
 revoke it. Create a session link, invite link or read-only copy only when the person asks for one; never create one on your own to finish a task.
 
+Inside an agent's own turn, a bare `agit share --yes` shares the conversation that turn
+belongs to, found the way `agit status` finds it: the VIEW of its branch at its last saved
+turn. The turn in progress is not in that link; agit says so, names the turn the link ends at,
+and names `agit share <session-id>` for a copy that includes it. When the conversation has no
+saved turns yet, no share is created, since its link would open empty: agit names
+`agit share <session-id>`, a read-only copy of the conversation as it is now, the turn in
+progress included, which does not upload it to the repository, and, in a folder that saves
+its turns by itself, a bare `agit share` again once the turn has ended. A command that runs
+inside more than one agent conversation is refused with each one's `agit share <session-id>`.
+
 A bare `agit share` in a human terminal opens a wizard: choose a saved session,
 then encrypted or public visibility and an expiry. The selection is temporary;
-it does not bind another command to that session. Agents and scripts supply a
-saved ref or `AGIT_SESSION`. `--yes` skips final confirmation, not target selection.
+it does not bind another command to that session. With `AGIT_SESSION` set, a bare share
+shares that session instead. Scripts outside an agent's turn name a saved ref or set
+`AGIT_SESSION`. Without a terminal, `--yes` confirms the share; it skips final confirmation,
+not target selection.
 
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `[ref-or-session]` | Explicit `owner/repo@branch`, another saved ref, `@`, or native session ID/prefix; omitted targets and `@` require `AGIT_SESSION` outside the terminal picker |
+| `[ref-or-session]` | Explicit `owner/repo@branch`, another saved ref, `@`, or native session ID/prefix; omitted, it is `AGIT_SESSION` when set, else the agent conversation this command runs in, else the terminal picker; `@` requires `AGIT_SESSION` |
 | `--full-log` | Share the saved point's full LOG instead of its VIEW; requires a saved ref |
 | `--public` | Create an unencrypted link that can be fetched directly |
 | `--expire <24h\|7d\|30d\|never>` | Expiration; default `7d` |
@@ -40,6 +52,7 @@ saved ref or `AGIT_SESSION`. `--yes` skips final confirmation, not target select
 
 ```bash
 agit share
+agit share --yes
 agit share owner/repo@branch --expire 24h --password
 agit share 132bf69f-22a --public --views 10
 agit share list
