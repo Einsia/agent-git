@@ -529,6 +529,9 @@ pub fn run(args: Args) -> CmdResult {
                 ),
             ])
         );
+        for gap in super::setup::presence::uncaptured_to_say() {
+            ui::warning(&gap.line());
+        }
     }
 
     // ── Unadopted sessions (expensive, explicitly triggered) ──
@@ -1028,6 +1031,9 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
         "repositories": repositories, "repositories_omitted": repositories_omitted,
         "shared_files": shared_files, "merge_transactions": merge_transactions,
         "code_repository": {"path": code_repo, "adopted_sessions": adopted_here},
+        // Setting a runtime up is the person's choice: the agent asks.
+        "not_captured": super::setup::presence::uncaptured().iter()
+            .map(super::setup::presence::Uncaptured::to_json).collect::<Vec<_>>(),
         "unadopted": {"checked": args.check_missing,
             "sessions": missing.as_ref().map(|(sessions, _)| sessions),
             "incomplete": missing.as_ref().map(|(_, errors)| !errors.is_empty()),

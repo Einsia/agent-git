@@ -704,6 +704,82 @@ fn turning_a_folder_on_says_it_downloads_the_repository_first() {
     );
 }
 
+/// `agit status` names a runtime whose conversations this computer doesn't capture, with the one
+/// command that sets it up, and `agit on` says it as it turns a folder on; once capture is set up,
+/// neither names it, and `AGIT_SKIP_SETUP` silences the printed line as it silences the setup
+/// notice. No agit process runs when such a conversation starts or ends, so nothing else can say
+/// it. Each runtime is judged on its own: a status that took Claude Code's Skill alone for capture
+/// would stay quiet while none of its conversations is saved, and one that asked whether the
+/// computer is set up at all would hide a Codex with nothing once Claude Code has its hooks.
+#[test]
+fn a_runtime_this_computer_does_not_capture_is_named_until_its_capture_is_set_up() {
+    let lab = Lab::new();
+    let repo = lab.folder("app", true);
+    let solo = lab.folder("solo", false);
+    let setup = |what: &str| {
+        let out = lab.agit(&repo, &["setup", what, "--runtime", "claude-code", "--yes"]);
+        assert!(out.status.success(), "{out:?}");
+    };
+    let not_captured = || {
+        let out = lab.agit(&repo, &["status", "--json"]);
+        assert!(out.status.success(), "{out:?}");
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["result"]["value"]
+            ["not_captured"]
+            .clone()
+    };
+    let line = "Claude Code conversations on this computer aren't captured: its SessionStart and Stop hooks are not installed. `agit setup --runtime claude-code --hooks` sets that up";
+
+    setup("--skill");
+    let gaps = not_captured();
+    assert_eq!(gaps.as_array().map(Vec::len), Some(1), "{gaps}");
+    assert_eq!(gaps[0]["runtime"], "claude-code", "{gaps}");
+    assert_eq!(
+        gaps[0]["command"], "agit setup --runtime claude-code --hooks",
+        "{gaps}"
+    );
+    // A lab silences the setup notice, which these lines follow; here it is a computer as set up.
+    let said = |dir: &std::path::Path, args: &[&str]| {
+        let out = lab
+            .command(dir, args)
+            .env_remove("AGIT_SKIP_SETUP")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    assert!(said(&repo, &["status"]).contains(line));
+    let silenced = lab.agit(&repo, &["status"]);
+    assert!(
+        !String::from_utf8_lossy(&silenced.stderr).contains("aren't captured"),
+        "{silenced:?}"
+    );
+    // The folder is on already, so `agit on` confirms it without downloading from the Hub.
+    lab.turn_on(&solo, "me/solo-sessions");
+    let on = lab
+        .command(&solo, &["on"])
+        .env_remove("AGIT_SKIP_SETUP")
+        .output()
+        .unwrap();
+    assert!(
+        on.status.success() && String::from_utf8_lossy(&on.stderr).contains(line),
+        "{on:?}"
+    );
+
+    setup("--hooks");
+    assert_eq!(not_captured(), serde_json::json!([]));
+    assert!(!said(&repo, &["status"]).contains("aren't captured"));
+
+    // Codex has run here and has nothing of agit's, while Claude Code is fully set up.
+    std::fs::create_dir_all(lab.home.join(".codex")).unwrap();
+    let gaps = not_captured();
+    assert_eq!(gaps.as_array().map(Vec::len), Some(1), "{gaps}");
+    assert_eq!(gaps[0]["runtime"], "codex", "{gaps}");
+    assert_eq!(gaps[0]["command"], "agit setup --runtime codex", "{gaps}");
+    assert!(said(&repo, &["status"]).contains(
+        "Codex conversations on this computer aren't captured: agit isn't set up for it. `agit setup --runtime codex` sets that up"
+    ));
+}
+
 #[test]
 fn a_folder_set_up_for_a_public_repository_is_refused_before_anything_changes() {
     let lab = Lab::new();
