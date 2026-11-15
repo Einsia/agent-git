@@ -13,6 +13,8 @@ use objects::Objects;
 
 #[path = "gemini_delta.rs"]
 mod gemini_delta;
+#[path = "home.rs"]
+mod home;
 #[path = "session_objects.rs"]
 mod objects;
 #[path = "session_projection.rs"]
@@ -1053,7 +1055,8 @@ impl ProjectedHistory {
         let mut preserved = BTreeSet::new();
         let mut reports = Vec::new();
         let mut left_out = LeftOut::default();
-        let mut rechecked = Rechecked::default();
+        let mut rechecked =
+            Rechecked::writing_home_of(crate::infra::config::user_home().as_deref());
         // The source commit holding each plain public commit's LOG, for public commits this run
         // writes.
         let mut written = std::collections::HashMap::new();
@@ -1483,6 +1486,7 @@ impl ProjectedHistory {
                                 && neutral.is_none()
                                 && public_parents == parents[oid]
                                 && conversation.is_none()
+                                && !rechecked.homes.found_in_meta(&published)
                             {
                                 oid.clone()
                             } else {
@@ -1492,7 +1496,7 @@ impl ProjectedHistory {
                                     &repo,
                                     (conversation.as_deref().unwrap_or(oid), neutral.as_deref()),
                                     &public_parents,
-                                    Some(&published),
+                                    Some((&published, &rechecked.homes)),
                                 )?
                             }
                         } else if neutral.is_some() || public_parents != parents[oid] {
@@ -2295,6 +2299,19 @@ struct Rechecked {
     protected: std::collections::HashMap<String, serde_json::Value>,
     /// Commit messages protection leaves as they are.
     messages: std::collections::HashSet<String>,
+    /// The pushing user's home, written as `~` after protection. Protection runs on the text as
+    /// captured, so a value the person blocked still matches before any path changes.
+    homes: home::Homes,
+}
+
+impl Rechecked {
+    /// A run that writes the home of the user pushing as `~`. `Rechecked::default()` writes none.
+    fn writing_home_of(home: Option<&Path>) -> Self {
+        Self {
+            homes: home::Homes::of(home),
+            ..Self::default()
+        }
+    }
 }
 
 impl Rechecked {
@@ -2346,14 +2363,20 @@ impl Rechecked {
             "protection returned a different number of records than it was given"
         );
         for ((index, digest, text), line) in pending.into_iter().zip(lines) {
-            if line == text {
+            let mut record: serde_json::Value = if line == text {
+                contents[index].clone()
+            } else {
+                serde_json::from_str(line).context("a protected record is not one JSON record")?
+            };
+            // The home pass runs on protection's output, so a placeholder, which never holds a
+            // path, cannot be touched by it.
+            let rewritten = self.homes.in_record(&mut record);
+            if line == text && !rewritten {
                 self.unchanged.insert(digest);
                 continue;
             }
-            let protected: serde_json::Value =
-                serde_json::from_str(line).context("a protected record is not one JSON record")?;
-            self.protected.insert(digest, protected.clone());
-            contents[index] = protected;
+            self.protected.insert(digest, record.clone());
+            contents[index] = record;
             changed.push(index);
         }
         Ok(changed)
@@ -2394,12 +2417,13 @@ impl Rechecked {
                 "a commit message this publication carries did not pass today's privacy check, so nothing was published",
             )
         })?;
-        if protected == message {
+        let published = self.homes.in_text(&protected);
+        if published == message {
             self.messages.insert(digest);
             return Ok(commit);
         }
         let mut rewritten = original[..boundary + 2].to_vec();
-        rewritten.extend_from_slice(protected.as_bytes());
+        rewritten.extend_from_slice(published.as_bytes());
         Ok(Some(rewritten))
     }
 }
@@ -2418,7 +2442,7 @@ struct Carried<'a> {
 
 /// The commit whose LOG and VIEW plain publication sends for `oid`, a turn on `parent`, when
 /// `public_parent` is the published form of `parent`: what the next push publishes for it, under
-/// this computer's rules today. `None` when `public_parent` doesn't show by its own tree that it
+/// this computer's protection today. `None` when `public_parent` doesn't show by its own tree that it
 /// is plain, since the push then passes every line through protection again.
 pub(super) fn plain_published(
     source: &Repo,
@@ -2440,6 +2464,9 @@ pub(super) fn plain_published(
         &parents,
         &[public_parent.to_owned()],
     )?;
+    // The turn this is compared with is one the Hub already holds, and a line the Hub holds goes
+    // out as it was published: another computer, or an older version, may have published its home
+    // as it was. So it is judged by protection alone, and the home is not written as `~` here.
     let conversation = conversation_commit(
         source,
         oid,
@@ -2690,7 +2717,7 @@ fn plain_commit(
     destination: &Repo,
     (oid, commit): (&str, Option<&[u8]>),
     parents: &[String],
-    metadata: Option<&Meta>,
+    metadata: Option<(&Meta, &home::Homes)>,
 ) -> Result<String> {
     fn replace(
         objects: &Objects,
@@ -2734,7 +2761,7 @@ fn plain_commit(
         Some(commit) => commit.to_vec(),
         None => own,
     };
-    let tree = if let Some(metadata) = metadata {
+    let tree = if let Some((metadata, homes)) = metadata {
         let mut value: serde_json::Value = serde_json::from_slice(
             &objects
                 .read(
@@ -2750,6 +2777,7 @@ fn plain_commit(
         if metadata.milestone.is_some() {
             value["milestone"] = json!(metadata.milestone);
         }
+        homes.in_meta(&mut value);
         let fields = value
             .as_object_mut()
             .context("session metadata must be an object")?;

@@ -515,6 +515,27 @@ impl Meta {
     }
 }
 
+/// A recorded `cwd` a publication wrote as `~` or `~/…`, read against this device's own home, for
+/// a hint or a refusal only. `None` for any other value, or when this device has no usable home.
+///
+/// A published session records its author's home as `~`, and this device's home is not the
+/// author's. So the expanded path may add a refusal or say where a session ran, but a judgement
+/// that allows an upload or chooses where one goes reads the value as recorded: if expansion
+/// reached those, a reader whose `~/x` exists would be let through, or uploaded somewhere, on the
+/// strength of the author's path. A directory capture records is absolute and never starts with
+/// `~`, so a value that did not come from a publication is never expanded.
+pub fn expanded_for_hint_or_refusal(recorded: &str) -> Option<PathBuf> {
+    let rest = recorded.strip_prefix('~')?;
+    if !rest.is_empty() && !rest.starts_with(['/', '\\']) {
+        return None;
+    }
+    let home = crate::infra::config::user_home()?;
+    if !home.is_absolute() || home.parent().is_none() {
+        return None;
+    }
+    Some(home.join(rest.trim_start_matches(['/', '\\'])))
+}
+
 pub fn path_in(repo_root: &Path) -> PathBuf {
     repo_root.join(FILE)
 }
