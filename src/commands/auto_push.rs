@@ -366,6 +366,11 @@ fn every_background_push_is_spawned_as_automatic() {
             r#"&["push", slug, "--all", "--to-hub", current],"#,
             "a command suggested to the person",
         ),
+        (
+            "src/commands/memory.rs",
+            r#".args(["push", &format!("{slug}@main")])"#,
+            "the person's yes at a terminal, after a distill",
+        ),
     ];
     const TESTS: &[&str] = &[
         "src/commands/auto_push.rs",

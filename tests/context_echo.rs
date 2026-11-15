@@ -1252,21 +1252,16 @@ fn scan_notice_reports_its_scope_and_finds_evidence_where_that_scope_reaches() {
     ));
 }
 
-/// With no target, a memory command names the way it takes one: `--into`, or AGIT_SESSION. The
-/// session-target error every other command shares names a positional `<owner>/<repo>@<branch>`,
-/// which `memory` refuses as an unexpected argument (and which `distill` would read as a file
-/// name). What the error names must be accepted by the same command, so the test follows it. It
-/// also names the conversation this folder saved to as a target to copy: a session's branch name
-/// is long, and nothing else in the terminal shows it.
+/// With no target, a memory command that writes names the way it takes one: `--into`, or
+/// AGIT_SESSION. The session-target error every other command shares names a positional
+/// `<owner>/<repo>@<branch>`, which `memory` refuses as an unexpected argument (and which
+/// `distill` would read as a file name). What the error names must be accepted by the same
+/// command, so the test follows it. It also names the conversation this folder saved to as a
+/// target to copy: a session's branch name is long, and nothing else in the terminal shows it.
 #[test]
 fn a_memory_command_without_a_target_names_the_form_it_takes() {
     let lab = Lab::new();
-    for args in [
-        vec!["memory", "status"],
-        vec!["memory", "sync"],
-        vec!["memory", "diff"],
-        vec!["distill"],
-    ] {
+    for args in [vec!["memory", "sync"], vec!["distill"]] {
         let refused = lab.run(None, &args);
         assert!(!refused.status.success(), "{args:?}: {refused:?}");
         assert!(refused.stdout.is_empty(), "{args:?}: {refused:?}");
@@ -1299,6 +1294,202 @@ fn a_memory_command_without_a_target_names_the_form_it_takes() {
         lab.run(Some(SELECTED), &named),
         "target: alice/context@selected (via AGIT_SESSION)",
     );
+}
+
+/// Without a target, `memory status` and `diff`, which only read, take the folder's only
+/// conversation and name it on their first line. With two, and no terminal to ask at, they pick
+/// neither and list both. Taking the newest of two unasked would show another conversation's
+/// memory as this one's; refusing the folder's only one leaves the person typing its branch. An
+/// AGIT_SESSION that is refused, as malformed or as stale against the runtime's own claim, is a
+/// target the person gave: the folder's conversation does not stand in for it.
+#[test]
+fn memory_status_and_diff_read_the_folders_only_conversation() {
+    let lab = Lab::new();
+    for args in [vec!["memory", "status"], vec!["memory", "diff"]] {
+        notice(
+            lab.run(None, &args),
+            "target: alice/context@newest (via this folder)",
+        );
+        for given in ["malformed", ""] {
+            let malformed = lab.run(Some(given), &args);
+            assert!(
+                !malformed.status.success(),
+                "{args:?} {given:?}: {malformed:?}"
+            );
+            assert!(
+                malformed.stdout.is_empty(),
+                "{args:?} {given:?}: {malformed:?}"
+            );
+        }
+        // The runtime's own claim is on `newest`; AGIT_SESSION naming `selected` is stale.
+        let stale = lab
+            .command(Some(SELECTED), &args)
+            .env("CODEX_THREAD_ID", RUNTIME_ID)
+            .output()
+            .unwrap();
+        assert!(!stale.status.success(), "{args:?}: {stale:?}");
+        assert!(stale.stdout.is_empty(), "{args:?}: {stale:?}");
+        assert!(
+            String::from_utf8_lossy(&stale.stderr).contains("refusing the stale target"),
+            "{args:?}: {stale:?}"
+        );
+    }
+    fs::write(
+        lab.store
+            .join("store/codex")
+            .join("aaaaaaaa-0000-4000-8000-000000000002.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "cwd": lab.work,
+            "owner": "alice",
+            "agent": "context",
+            "branch": "selected",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for args in [vec!["memory", "status"], vec!["memory", "diff"]] {
+        let refused = lab.run(None, &args);
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}: {refused:?}");
+        let said = String::from_utf8(refused.stderr).unwrap();
+        for named in [
+            "`--into alice/context@newest`",
+            "`--into alice/context@selected`",
+        ] {
+            assert!(said.contains(named), "{args:?}: {named}: {said}");
+        }
+    }
+}
+
+/// Links five more conversations to the lab's folder, on branches made from main, each newer
+/// than the one before, the lab's own `newest` link the oldest of them all.
+fn six_conversations(lab: &Lab) -> Vec<String> {
+    let mut branches = vec!["newest".to_owned()];
+    let links = lab.store.join("store/codex");
+    let start = std::time::SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(links.join(format!("{RUNTIME_ID}.json")))
+        .unwrap()
+        .set_modified(start - std::time::Duration::from_secs(60))
+        .unwrap();
+    for n in 1..=5 {
+        let branch = format!("more-{n}");
+        lab.git(&lab.repo, &["branch", &branch, "main"]);
+        let link = links.join(format!("aaaaaaaa-0000-4000-8000-00000000001{n}.json"));
+        fs::write(
+            &link,
+            serde_json::to_vec(&serde_json::json!({
+                "cwd": lab.work, "owner": "alice", "agent": "context", "branch": branch,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&link)
+            .unwrap()
+            .set_modified(start - std::time::Duration::from_secs(60 - n * 10))
+            .unwrap();
+        branches.push(branch);
+    }
+    branches
+}
+
+/// With more conversations in the folder than the refusal names, it names the newest and says
+/// how many more there are; at a terminal, the question offers every one of them, the oldest
+/// included. A question built from the shortened list leaves the oldest unreachable however the
+/// person moves through it.
+#[test]
+fn every_conversation_of_a_crowded_folder_can_be_chosen() {
+    let lab = Lab::new();
+    let branches = six_conversations(&lab);
+    let refused = lab.run(None, &["memory", "status"]);
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8(refused.stderr).unwrap();
+    assert!(said.contains("`--into alice/context@more-5`"), "{said}");
+    assert!(said.contains(", and 1 more"), "{said}");
+    assert!(!said.contains("`--into alice/context@newest`"), "{said}");
+
+    #[cfg(all(unix, feature = "rc"))]
+    {
+        let shown = lab.cancel_at_terminal(&["memory", "status"], "alice/context@newest");
+        for branch in &branches {
+            assert!(
+                shown.contains(&format!("alice/context@{branch}")),
+                "{branch}: {shown}"
+            );
+        }
+    }
+    #[cfg(not(all(unix, feature = "rc")))]
+    let _ = branches;
+}
+
+#[cfg(all(unix, feature = "rc"))]
+impl Lab {
+    /// Runs agit at a terminal in the lab's folder with the lab's environment, presses Esc once
+    /// the screen shows `shown`, and returns everything the terminal showed.
+    fn cancel_at_terminal(&self, args: &[&str], shown: &str) -> String {
+        use std::io::{Read as _, Write as _};
+        let template = self.command(None, args);
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command.env("TERM", "xterm-256color");
+        command.cwd(&self.work);
+        command.args(args);
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 40,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let mut writer = pty.master.take_writer().unwrap();
+        let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = std::sync::Arc::clone(&screen);
+        let output = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = reader.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                shared.lock().unwrap().extend_from_slice(&chunk[..read]);
+            }
+        });
+        let mut child = pty.slave.spawn_command(command).unwrap();
+        drop(pty.slave);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut pressed = false;
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            let now = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+            if !pressed && now.contains(shown) {
+                writer.write_all(b"\x1b").unwrap();
+                writer.flush().unwrap();
+                pressed = true;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("no exit within a minute: {now}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(writer);
+        drop(pty.master);
+        output.join().unwrap();
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        assert!(pressed, "the question never showed: {shown}");
+        shown
+    }
 }
 
 /// A memory command given a branch this clone doesn't hold says so and where to run it, before
