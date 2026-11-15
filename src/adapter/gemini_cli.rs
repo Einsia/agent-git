@@ -848,6 +848,7 @@ impl Adapter for GeminiCli {
         let path = install_at(&home()?, content, id, cwd)?;
         Ok(Installed {
             path,
+            session_id: id.to_string(),
             next: Next::Resume(format!(
                 "(cd {} && {command})",
                 super::shell_arg(&cwd.to_string_lossy())

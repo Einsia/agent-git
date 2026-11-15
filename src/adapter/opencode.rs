@@ -2207,6 +2207,7 @@ impl Adapter for OpenCode {
         native_snapshot::read(&source, limits)
             .context("the imported OpenCode session cannot be read completely")?;
         Ok(Installed {
+            session_id: new_id.to_string(),
             next: Next::Resume(format!(
                 "(cd {} && opencode --session {new_id})",
                 cwd.display()
@@ -2243,6 +2244,7 @@ fn install_via(
     }
     run_import(&mut cmd, &path, cwd, false)?;
     Ok(Installed {
+        session_id: new_id.to_string(),
         next: Next::Resume(format!(
             "(cd {} && opencode --session {new_id})",
             cwd.display()
