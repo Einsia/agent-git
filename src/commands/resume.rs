@@ -1228,7 +1228,12 @@ pub(crate) fn prepare_archive_memory(
     branch: &str,
     launch: &ArchiveLaunch,
 ) {
-    materialize_memory(repo, branch, slug, &launch.runtime, &launch.cwd);
+    // A merge agent's runtime is not one this process waits for, so the section is not held.
+    match super::memory::materialize(repo, branch, slug, &launch.runtime, &launch.cwd) {
+        Ok(Some(report)) => super::memory::report_materialize(&report),
+        Ok(None) => {}
+        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
+    }
 }
 
 fn resume_branch_for(
@@ -1859,7 +1864,7 @@ fn confirm_conversion(from: &str, to: &str, decided: Decided) -> crate::Result<(
 }
 
 fn materialize_memory(repo: &Repo, branch: &str, slug: &str, runtime: &str, cwd: &Path) {
-    match super::memory::materialize(repo, branch, slug, runtime, cwd) {
+    match super::memory::start(repo, branch, slug, runtime, cwd) {
         Ok(Some(report)) => super::memory::report_materialize(&report),
         Ok(None) => {}
         Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
@@ -2921,6 +2926,7 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
     match res.cmd {
         Some(cmd) => {
             if no_launch {
+                super::memory::unhold();
                 println!("\n  {}", ui::accent(&cmd));
                 return Ok(ExitCode::Ok);
             }
@@ -2928,6 +2934,7 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
             let launch = super::upload_outcome::launching(slug, branch);
             let started = std::time::Instant::now();
             let status = runtime_launch(&cmd).status();
+            super::memory::let_go();
             crate::telemetry::operation(
                 crate::telemetry::Operation::RuntimeLaunch,
                 status.as_ref().is_ok_and(std::process::ExitStatus::success),

@@ -15,6 +15,11 @@
 //! subdirectory and the runtime's `MEMORY.md` only gains one marked index section pointing at
 //! them; a local top-level file with the same name and the same content is not placed again.
 //!
+//! The runtime directory belongs to a folder, and conversations of several repositories can start
+//! in one folder. A session sees only its own repository's team memory: each start takes every
+//! other repository's section out of the index and parks its mirror files in agit's home until
+//! that repository starts there again ([`keep_to_repository`]).
+//!
 //! # Only what this session changed
 //!
 //! What enters the branch at settlement is the change **against the baseline**: at start, the
@@ -978,8 +983,8 @@ pub fn forget_codex_mirrors() {
 
 // ──────────────────── The two directions ────────────────────
 
-/// Before start: branch `memory/` → the runtime directory. None means this runtime has no memory
-/// directory.
+/// Before start: branch `memory/` → the runtime directory, for a start that holds no lock for its
+/// section ([`start`] holds one). None means this runtime has no memory directory.
 pub fn materialize(
     primary: &Repo,
     branch: &str,
@@ -990,6 +995,7 @@ pub fn materialize(
     let Some(mem) = crate::infra::runtime_memory::locate(runtime, cwd) else {
         return Ok(None);
     };
+    unmark(&mem.dir, slug, branch);
     materialize_with(
         primary,
         branch,
@@ -1015,6 +1021,7 @@ pub fn materialize_with(
 ) -> crate::Result<Report> {
     let checkout = super::worktree::checkout(primary, branch)?;
     adopt_start_baseline(primary, &checkout, branch)?;
+    keep_to_repository(mem_dir, slug, &surely_running)?;
     let mut report = Report {
         dir: mem_dir.to_path_buf(),
         ..Report::default()
@@ -1060,6 +1067,7 @@ pub fn materialize_unborn(
         !primary.has_ref(&tree_ref(branch)),
         "branch `{branch}` already exists"
     );
+    keep_to_repository(mem_dir, slug, &surely_running)?;
     let mut report = Report {
         dir: mem_dir.to_path_buf(),
         ..Report::default()
@@ -1214,6 +1222,7 @@ fn write_index(mem_dir: &Path, slug: &str, branch: &str, index: &[String]) -> cr
 /// removing nothing: a conversation that comes back reads what it was given, and what it changed
 /// without collecting it yet.
 pub fn reindex(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
+    keep_to_repository(mem_dir, slug, &surely_running)?;
     let index: Vec<String> = md_files(&mirror_dir(mem_dir, slug, branch))?
         .iter()
         .map(|(name, bytes)| index_line(name, bytes, &mirror_relative(slug, branch, name)))
@@ -1246,6 +1255,422 @@ pub fn drop_sections(mem_dir: &Path, slug: &str, keep: &BTreeSet<String>) -> cra
         std::fs::write(&index_path, next)?;
     }
     Ok(())
+}
+
+/// Before a conversation of `slug` starts in `mem_dir`: a session sees only its own repository's
+/// team memory. Every other repository's index section is taken out, and its mirror files move to
+/// a folder of agit's own ([`parked_dir`]) unless `surely_running` says that conversation still
+/// runs; `slug`'s own files parked by an earlier start come back. Nothing is deleted: a file moved
+/// either way keeps any edit not collected yet, and collection reads a parked file where the
+/// runtime directory has none ([`mirror_files`]). Where both sides have a file, the runtime
+/// directory's copy is the newer one and wins.
+///
+/// The same repository's other branches are left to [`drop_sections`]: their readers are this
+/// repository's.
+pub fn keep_to_repository(
+    mem_dir: &Path,
+    slug: &str,
+    surely_running: &dyn Fn(&str, &str) -> bool,
+) -> crate::Result<()> {
+    let index_path = mem_dir.join(INDEX_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&index_path) {
+        let others: Vec<String> = existing
+            .lines()
+            .filter_map(|line| line.trim_end().strip_prefix(INDEX_BEGIN))
+            .filter_map(|rest| rest.strip_prefix(' ')?.strip_suffix(" -->"))
+            .filter(|scope| scope.split_once('@').is_none_or(|(other, _)| other != slug))
+            .map(str::to_owned)
+            .collect();
+        let mut next = existing.clone();
+        for scope in &others {
+            next = upsert_index(&next, scope, &[]);
+        }
+        if next != existing {
+            std::fs::write(&index_path, next)?;
+        }
+    }
+    let parked = parked_dir(mem_dir)?;
+    let mirrors = mem_dir.join(MIRROR_DIR);
+    // Folders name a repository as `<owner>/<name>`, with `local` for a slug without an owner.
+    let own = match slug.split_once('/') {
+        Some(_) => slug.to_owned(),
+        None => format!("local/{slug}"),
+    };
+    for (other, branch) in scopes_under(&mirrors)? {
+        if other != own && !surely_running(&other, &branch) {
+            let from = mirror_dir(mem_dir, &other, &branch);
+            let to = scope_dir(&parked, &other, &branch);
+            for name in plain_files(&from)? {
+                crate::infra::config::create_state_dir(&to)?;
+                move_file(&from.join(&name), &to.join(&name))?;
+                restrict(&to.join(&name))?;
+            }
+            remove_empty_dirs(&from, &mirrors);
+        }
+    }
+    for (scope, branch) in scopes_under(&parked)? {
+        if scope == own {
+            let from = scope_dir(&parked, &scope, &branch);
+            let to = mirror_dir(mem_dir, &scope, &branch);
+            for name in plain_files(&from)? {
+                if to.join(&name).exists() {
+                    std::fs::remove_file(from.join(&name))
+                        .with_context(|| format!("cannot remove {}", from.join(&name).display()))?;
+                } else {
+                    std::fs::create_dir_all(&to)?;
+                    move_file(&from.join(&name), &to.join(&name))?;
+                }
+            }
+            remove_empty_dirs(&from, &parked);
+        }
+    }
+    Ok(())
+}
+
+/// Whether a Claude Code conversation on `slug@branch` is known to run on this device: a link
+/// claims the branch and Claude Code's registry lists its session live. Only a yes is exact, so a
+/// caller treats a no as "not known".
+pub fn surely_running(slug: &str, branch: &str) -> bool {
+    let Some((owner, agent)) = slug.split_once('/') else {
+        return false;
+    };
+    let Ok(Some(store)) = crate::domain::store::Store::open() else {
+        return false;
+    };
+    crate::domain::link::active_for_branch(&store, owner, agent, branch)
+        .iter()
+        .any(|link| {
+            link.source == "claude-code"
+                && crate::rc::claude_inbox::session_is_live(&link.session_id)
+        })
+}
+
+/// The sections this process's launches hold: a shared OS lock per runtime directory and branch,
+/// with a marker beside it saying a holding launch placed that section. A launch spends its life
+/// waiting for its runtime, and the OS releases the lock when the process ends, a crash included,
+/// so a marked section whose lock nobody holds belongs to a conversation that is surely gone. A
+/// lock that only exists as a file would read a crashed launch as running for ever.
+static HELD: std::sync::Mutex<Vec<(crate::infra::local_state::HeldLock, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The lock file and the marker of `slug@branch` in `mem_dir`, under agit's home. Lock files stay
+/// once made: one removed while a launch holds it would let the next launch lock a new file
+/// beside the held one.
+fn held_paths(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<(PathBuf, PathBuf)> {
+    let dir = crate::infra::config::agit_home()?
+        .join("runtime-memory")
+        .join("held")
+        .join(sha(mem_dir.to_string_lossy().as_bytes()));
+    let key = sha(index_scope(slug, branch).as_bytes());
+    Ok((
+        dir.join(format!("{key}.lock")),
+        dir.join(format!("{key}.placed")),
+    ))
+}
+
+/// Before `agit new` or `agit resume` launches a runtime on `slug@branch` from `cwd`: holds its
+/// section for as long as this process runs, takes out the sections of the repository's other
+/// branches whose conversation is surely gone ([`drop_finished`]), and places the branch's
+/// memory as [`materialize`] does. None means this runtime has no memory directory.
+pub fn start(
+    primary: &Repo,
+    branch: &str,
+    slug: &str,
+    runtime: &str,
+    cwd: &Path,
+) -> crate::Result<Option<Report>> {
+    let Some(mem) = crate::infra::runtime_memory::locate(runtime, cwd) else {
+        return Ok(None);
+    };
+    start_with(
+        primary,
+        branch,
+        slug,
+        &mem.dir,
+        Policy::from_config(Scope::SinceBaseline),
+    )
+    .map(Some)
+}
+
+/// The body of [`start`], with the directory and the policy given explicitly.
+fn start_with(
+    primary: &Repo,
+    branch: &str,
+    slug: &str,
+    mem_dir: &Path,
+    policy: Policy,
+) -> crate::Result<Report> {
+    hold(mem_dir, slug, branch)?;
+    drop_finished(primary, mem_dir, slug, branch)?;
+    materialize_with(primary, branch, slug, mem_dir, policy)
+}
+
+fn hold(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
+    use std::io::Write as _;
+    let (lock, marker) = held_paths(mem_dir, slug, branch)?;
+    if let Some(dir) = lock.parent() {
+        crate::infra::config::create_state_dir(dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let file = crate::infra::config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .with_context(|| format!("cannot open {}", lock.display()))?;
+    let held = crate::infra::local_state::HeldLock::shared(file, &lock, "the memory section lock")?;
+    crate::infra::config::state_file_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&marker)
+        .and_then(|mut file| writeln!(file, "{}", index_scope(slug, branch)))
+        .with_context(|| format!("cannot write {}", marker.display()))?;
+    HELD.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((held, marker));
+    Ok(())
+}
+
+/// Lets go of the sections this process's launches hold once their runtime has exited: their
+/// conversation is gone, and the next start in the folder may take their sections out.
+pub fn let_go() {
+    HELD.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// Takes back the marks of this process's launches when it leaves the runtime for the person to
+/// start (`--no-launch`): that conversation may run long after this process, which holds nothing
+/// for it then, so its section is no longer known to be gone when the lock is free.
+pub fn unhold() {
+    for (_held, marker) in HELD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(..)
+    {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Takes back the mark of `slug@branch` in `mem_dir`, for a placing that holds no lock for it, so
+/// that a mark left by an earlier launch does not read as gone while this one runs.
+pub fn unmark(mem_dir: &Path, slug: &str, branch: &str) {
+    if let Ok((_, marker)) = held_paths(mem_dir, slug, branch) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Takes the sections of `slug`'s other branches out of `mem_dir`'s index when their
+/// conversation is surely gone: the branch no longer exists in `primary`, so nothing settles into
+/// it, or a launch marked the section and nobody holds its lock. Every other section stays, a
+/// section placed by an agit without marks or under `--no-launch` included: taking out the
+/// section of a conversation that still runs hides its memory from it at its next read of the
+/// index, while a stale one only costs a few lines. Mirror files stay either way, as in
+/// [`drop_sections`]. A gone section's lock is held until the index is written, so a launch of
+/// that branch starting meanwhile places its section after this, not before.
+fn drop_finished(primary: &Repo, mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
+    let Ok(existing) = std::fs::read_to_string(mem_dir.join(INDEX_FILE)) else {
+        return Ok(());
+    };
+    let opening = format!("{INDEX_BEGIN} {slug}@");
+    let listed: Vec<String> = existing
+        .lines()
+        .filter_map(|line| line.trim_end().strip_prefix(opening.as_str()))
+        .filter_map(|rest| rest.strip_suffix(" -->"))
+        .map(str::to_owned)
+        .collect();
+    let mut keep: BTreeSet<String> = BTreeSet::from([branch.to_owned()]);
+    let mut probes = Vec::new();
+    let mut deleted = Vec::new();
+    for other in listed.into_iter().filter(|other| other != branch) {
+        if !primary.has_ref(&tree_ref(&other)) {
+            deleted.push(other);
+            continue;
+        }
+        match gone(mem_dir, slug, &other) {
+            Some(probe) => probes.push(probe),
+            None => {
+                keep.insert(other);
+            }
+        }
+    }
+    drop_sections(mem_dir, slug, &keep)?;
+    for (_probe, marker) in probes {
+        let _ = std::fs::remove_file(marker);
+    }
+    for other in &deleted {
+        unmark(mem_dir, slug, other);
+    }
+    Ok(())
+}
+
+/// The lock of a marked section nobody holds, taken, with its marker; None when the section is
+/// not marked, its lock is held, or either cannot be read.
+fn gone(
+    mem_dir: &Path,
+    slug: &str,
+    branch: &str,
+) -> Option<(crate::infra::local_state::HeldLock, PathBuf)> {
+    let (lock, marker) = held_paths(mem_dir, slug, branch).ok()?;
+    if !marker.is_file() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .ok()?;
+    let probe =
+        crate::infra::local_state::HeldLock::try_exclusive(file, &lock, "the memory section lock")
+            .ok()?;
+    Some((probe, marker))
+}
+
+/// Where the mirror files [`keep_to_repository`] moved out of `mem_dir` wait, under agit's home:
+/// one folder per runtime directory, owner-only, and in no runtime's memory directory.
+fn parked_dir(mem_dir: &Path) -> crate::Result<PathBuf> {
+    Ok(crate::infra::config::agit_home()?
+        .join("runtime-memory")
+        .join("parked")
+        .join(sha(mem_dir.to_string_lossy().as_bytes())))
+}
+
+/// `root/<owner>/<name>/<branch>`, the layout of the mirror under [`MIRROR_DIR`] and of the
+/// parked files alike.
+fn scope_dir(root: &Path, slug: &str, branch: &str) -> PathBuf {
+    let (owner, name) = slug.split_once('/').unwrap_or(("local", slug));
+    root.join(owner).join(name).join(branch)
+}
+
+/// The mirror of `slug@branch` as collection reads it, file by file: the runtime directory's copy,
+/// else the one a start of another repository parked. A file counts as gone only when neither
+/// side has it.
+fn mirror_files(
+    mem_dir: &Path,
+    slug: &str,
+    branch: &str,
+) -> crate::Result<BTreeMap<String, Vec<u8>>> {
+    let mut files = md_files(&mirror_dir(mem_dir, slug, branch))?;
+    // With no agit home to find, nothing was parked either.
+    if let Ok(parked) = parked_dir(mem_dir) {
+        for (name, bytes) in md_files(&scope_dir(&parked, slug, branch))? {
+            files.entry(name).or_insert(bytes);
+        }
+    }
+    Ok(files)
+}
+
+/// Removes the parked copy of each file of `slug@branch` the runtime directory holds again, once a
+/// collection has read the runtime copy. Kept, the older parked copy would be read as the file
+/// the moment the runtime copy is deleted, and the deletion would collect as a return to the
+/// older bytes.
+fn drop_shadowed_parked(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
+    let Ok(parked) = parked_dir(mem_dir) else {
+        return Ok(());
+    };
+    let from = scope_dir(&parked, slug, branch);
+    for name in plain_files(&mirror_dir(mem_dir, slug, branch))? {
+        let path = from.join(&name);
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("cannot remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    remove_empty_dirs(&from, &parked);
+    Ok(())
+}
+
+/// Every `(slug, branch)` with a file under `root/<owner>/<name>/`. A branch name may hold `/`,
+/// so a branch is any folder below a repository's that holds a file of its own.
+fn scopes_under(root: &Path) -> crate::Result<Vec<(String, String)>> {
+    let mut scopes = Vec::new();
+    for owner in sub_dirs(root)? {
+        for name in sub_dirs(&root.join(&owner))? {
+            let repository = root.join(&owner).join(&name);
+            let mut pending = sub_dirs(&repository)?;
+            while let Some(branch) = pending.pop() {
+                let dir = repository.join(&branch);
+                if !plain_files(&dir)?.is_empty() {
+                    scopes.push((format!("{owner}/{name}"), branch.clone()));
+                }
+                pending.extend(
+                    sub_dirs(&dir)?
+                        .into_iter()
+                        .map(|sub| format!("{branch}/{sub}")),
+                );
+            }
+        }
+    }
+    Ok(scopes)
+}
+
+/// The names of the folders in `dir`; none when it does not exist.
+fn sub_dirs(dir: &Path) -> crate::Result<Vec<String>> {
+    entries_of(dir, |kind| kind.is_dir())
+}
+
+/// The names of the regular files in `dir`; none when it does not exist.
+fn plain_files(dir: &Path) -> crate::Result<Vec<String>> {
+    entries_of(dir, |kind| kind.is_file())
+}
+
+fn entries_of(dir: &Path, wanted: fn(&std::fs::FileType) -> bool) -> crate::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("cannot list {}", dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot list {}", dir.display()))?;
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("cannot stat {}", entry.path().display()))?;
+        if wanted(&kind) {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Moves one file, replacing what `to` held; across file systems by a copy, then removal.
+fn move_file(from: &Path, to: &Path) -> crate::Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(from, to)
+        .with_context(|| format!("cannot copy {} to {}", from.display(), to.display()))?;
+    std::fs::remove_file(from).with_context(|| format!("cannot remove {}", from.display()))?;
+    Ok(())
+}
+
+/// Leaves a parked file readable by its owner only.
+fn restrict(path: &Path) -> crate::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot restrict {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Removes `dir` and each parent below `root` that is left empty.
+fn remove_empty_dirs(dir: &Path, root: &Path) {
+    let mut current = dir;
+    while current != root && current.starts_with(root) && std::fs::remove_dir(current).is_ok() {
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
 }
 
 /// At settlement: the runtime directory → branch `memory/`. None means this runtime has no memory
@@ -1298,7 +1723,7 @@ pub fn collect_with(
     adopt_start_baseline(primary, &checkout, branch)?;
     let in_branch = branch_files(&checkout, &tree_ref(branch))?;
     let top = md_files(mem_dir)?;
-    let mirror = md_files(&mirror_dir(mem_dir, slug, branch))?;
+    let mirror = mirror_files(mem_dir, slug, branch)?;
     let baseline = read_baseline(&checkout, mem_dir)?;
     let plan = plan_collect(baseline.as_ref(), &top, &mirror, &in_branch, policy.scope);
     let privacy = crate::domain::privacy::PrivacyPolicy::load(primary).unwrap_or_default();
@@ -1343,6 +1768,11 @@ pub fn collect_with(
     if !edits.is_empty() {
         let message = format!("agit: memory sync ({} changes)", edits.len());
         report.commit = Some(commit_memory(primary, branch, edits, &message)?);
+    }
+    if let Err(error) = drop_shadowed_parked(mem_dir, slug, branch) {
+        report.warnings.push(format!(
+            "an older parked memory copy was not removed: {error:#}"
+        ));
     }
     let mut next = Baseline::of(mem_dir, &top, &mirror);
     if let Some(previous) = &baseline {
@@ -2090,7 +2520,7 @@ fn status(target: &Target) -> CmdResult {
     let (top, mirror, plan) = match &runtime {
         Some((_, dir)) if !dir_missing => {
             let top = md_files(dir)?;
-            let mirror = md_files(&mirror_dir(dir, &target.slug, branch))?;
+            let mirror = mirror_files(dir, &target.slug, branch)?;
             let baseline = match super::worktree::existing(primary, branch)? {
                 Some(checkout) => read_baseline(&checkout, dir)?,
                 None => None,
@@ -2818,6 +3248,189 @@ mod tests {
             Some("the build needs the nightly toolchain\n")
         );
         assert!(file(&primary, "refs/heads/s2", "personal.md").is_none());
+    }
+
+    /// A repository other than [`SLUG`] whose conversations start in the same folder.
+    const OTHER: &str = "you/lab";
+
+    /// Points agit's home at a folder of the test's own while it lives: parked mirror files go
+    /// there.
+    struct AgitHome {
+        old: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AgitHome {
+        fn at(dir: &Path) -> Self {
+            let lock = crate::infra::config::env_lock();
+            let old = std::env::var_os("AGIT_HOME");
+            unsafe { std::env::set_var("AGIT_HOME", dir) };
+            Self { old, _lock: lock }
+        }
+    }
+
+    impl Drop for AgitHome {
+        fn drop(&mut self) {
+            unsafe {
+                match self.old.take() {
+                    Some(value) => std::env::set_var("AGIT_HOME", value),
+                    None => std::env::remove_var("AGIT_HOME"),
+                }
+            }
+        }
+    }
+
+    fn sections(mem: &Path) -> Vec<String> {
+        std::fs::read_to_string(mem.join(INDEX_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix(INDEX_BEGIN)?
+                    .strip_prefix(' ')?
+                    .strip_suffix(" -->")
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A session sees only its own repository's team memory: a start of another repository in the
+    /// same folder leaves neither this repository's index section nor its files in the runtime
+    /// directory, and keeps the files, owner-only, in agit's home. This repository's next start
+    /// puts them back as they were, with the edit its conversation never collected, and collects
+    /// that edit. Dropping only the section leaves the files for the other conversation to list;
+    /// deleting them, or placing the branch's bytes over them, loses the edit.
+    #[test]
+    fn a_start_of_another_repository_parks_this_ones_mirror_until_it_starts_again() {
+        let (d, primary, mem) = fixture();
+        let _home = AgitHome::at(&d.path().join("agit"));
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        let edited = "uid, not user_id; ids are ULIDs\n";
+        std::fs::write(mirror(&mem).join("team.md"), edited).unwrap();
+
+        materialize_unborn(&primary, "s2", OTHER, &mem, "refs/heads/main").unwrap();
+        assert_eq!(sections(&mem), ["you/lab@s2"]);
+        assert!(!mem.join(MIRROR_DIR).join("me").exists());
+        let parked = scope_dir(&parked_dir(&mem).unwrap(), SLUG, "s1").join("team.md");
+        assert_eq!(std::fs::read_to_string(&parked).unwrap(), edited);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(parked.as_path()), 0o600);
+            assert_eq!(mode(parked.parent().unwrap()), 0o700);
+        }
+
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror(&mem).join("team.md")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").as_deref(),
+            Some(edited)
+        );
+        assert_eq!(sections(&mem), ["me/qa@s1"]);
+        assert!(!mem.join(MIRROR_DIR).join("you").exists());
+        assert!(!parked.exists());
+    }
+
+    /// While another repository's start holds this conversation's mirror parked, its settlement
+    /// reads each file where it is: a file its agent writes back under the old path is collected,
+    /// and a file only the parked side has is no deletion. A collection that reads only the
+    /// runtime directory, or judges the folder as a whole, deletes the parked files from the
+    /// branch. A file written back under the old path and collected replaces its parked copy for
+    /// good, so deleting it later collects as a deletion; a parked copy kept beside it would be
+    /// read back then and return the branch to the older bytes. A start that knows this
+    /// conversation still runs leaves its files where its agent reads them and takes only its
+    /// section out, and the edit is collected all the same.
+    #[test]
+    fn a_parked_mirror_is_read_file_by_file_and_a_running_one_keeps_its_files() {
+        let (d, primary, mem) = fixture();
+        let _home = AgitHome::at(&d.path().join("agit"));
+        materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        let edited = "uid, not user_id; ids are ULIDs\n";
+        std::fs::write(mirror(&mem).join("team.md"), edited).unwrap();
+        let running = |slug: &str, branch: &str| slug == SLUG && branch == "s1";
+        keep_to_repository(&mem, OTHER, &running).unwrap();
+        assert!(sections(&mem).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(mirror(&mem).join("team.md")).unwrap(),
+            edited
+        );
+        collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").as_deref(),
+            Some(edited)
+        );
+
+        materialize_unborn(&primary, "s2", OTHER, &mem, "refs/heads/main").unwrap();
+        assert!(!mirror(&mem).exists());
+        std::fs::create_dir_all(mirror(&mem)).unwrap();
+        let learned = "the build needs the nightly toolchain\n";
+        std::fs::write(mirror(&mem).join("learned.md"), learned).unwrap();
+        let report = collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(report.collected, 1);
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").as_deref(),
+            Some(edited)
+        );
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "learned.md").as_deref(),
+            Some(learned)
+        );
+
+        let rewritten = "uid, not user_id; ids are UUIDv7\n";
+        std::fs::write(mirror(&mem).join("team.md"), rewritten).unwrap();
+        collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            file(&primary, "refs/heads/s1", "team.md").as_deref(),
+            Some(rewritten)
+        );
+        std::fs::remove_file(mirror(&mem).join("team.md")).unwrap();
+        collect_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(file(&primary, "refs/heads/s1", "team.md"), None);
+    }
+
+    /// A launch takes out the section of the repository's other branch whose conversation is
+    /// surely gone: its launch marked the section and nobody holds its lock, or its branch no
+    /// longer exists. It keeps the sections it cannot tell: one whose launch still holds its
+    /// lock, and one placed without a mark, as under `--no-launch` or by an agit that marks
+    /// nothing. A gone section's mirror files stay. Reading a free lock alone as gone takes the
+    /// section from a conversation still running under `--no-launch`; reading the mark alone
+    /// takes it from one whose launch still runs.
+    #[test]
+    fn a_launch_takes_out_only_the_sections_of_conversations_surely_gone() {
+        let (d, primary, mem) = fixture();
+        let _home = AgitHome::at(&d.path().join("agit"));
+        for branch in ["s2", "s3"] {
+            primary.git(&["branch", branch, "s1"]).unwrap();
+        }
+        let listed = |mem: &Path| sections(mem).into_iter().collect::<BTreeSet<_>>();
+        let scopes = |branches: &[&str]| {
+            branches
+                .iter()
+                .map(|branch| index_scope(SLUG, branch))
+                .collect::<BTreeSet<_>>()
+        };
+
+        start_with(&primary, "s3", SLUG, &mem, ON).unwrap();
+        unhold();
+        start_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        start_with(&primary, "s2", SLUG, &mem, ON).unwrap();
+        assert_eq!(listed(&mem), scopes(&["s1", "s2", "s3"]));
+        let_go();
+        let line = index_line(
+            "team.md",
+            b"x",
+            &mirror_relative(SLUG, "deleted", "team.md"),
+        );
+        write_index(&mem, SLUG, "deleted", &[line]).unwrap();
+
+        start_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(listed(&mem), scopes(&["s1", "s3"]));
+        assert!(mirror_dir(&mem, SLUG, "s2").join("team.md").is_file());
+        assert!(!held_paths(&mem, SLUG, "s2").unwrap().1.exists());
+        let_go();
     }
 
     #[test]
