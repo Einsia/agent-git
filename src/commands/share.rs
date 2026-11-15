@@ -195,6 +195,15 @@ pub fn run(mut args: Args) -> CmdResult {
         }
         output.flush()?;
     }
+    // A live copy holds the conversation as this computer has it, and the person confirming it
+    // (or the agent running it with `--yes`) is told what of that the Hub doesn't have.
+    if source.unreceived > 0 {
+        ui::warning(&format!(
+            "this link holds the conversation as it is on this computer, including {} turn{} the Hub has not received",
+            source.unreceived,
+            if source.unreceived == 1 { "" } else { "s" }
+        ));
+    }
     if let Some(running) = &source.running {
         ui::warning(&match source.metadata.turn {
             Some(turn) => format!(
@@ -359,6 +368,8 @@ struct ShareSource {
     /// The conversation still writing to the branch whose tip is the selected point, when its
     /// transcript holds work that point does not have yet.
     running: Option<link::Link>,
+    /// For a live transcript, how many of its turns the Hub has not received.
+    unreceived: usize,
 }
 
 impl ShareSource {
@@ -662,6 +673,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         native.source.clone(),
         cwd,
     );
+    let unreceived = unreceived_turns(adapter.as_ref(), &raw, &native);
     Ok(ShareSource {
         raw,
         envelope: None,
@@ -678,7 +690,88 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         branch: native.branch.clone(),
         repository: None,
         running: None,
+        unreceived,
     })
+}
+
+/// How many turns of the live transcript `raw` the Hub has not received: every turn with a
+/// conversation record past the longest run of records the transcript shares, record by record
+/// and by whole content, with the conversation the Hub's copy of its branch holds. A turn's
+/// summary leaves out what its tools were given and gave back, so comparing turns would miss a
+/// result that came in after the upload, or the same tool run with other input elsewhere; the
+/// records hold all of it. A conversation with no copy the Hub holds has every turn unreceived.
+fn unreceived_turns(
+    adapter: &dyn crate::adapter::Adapter,
+    raw: &str,
+    native: &link::Link,
+) -> usize {
+    let Ok(session) = adapter.parse(raw) else {
+        return 0;
+    };
+    let held = hub_held_records(native).unwrap_or_default();
+    let common = transcript::live_hashes(raw)
+        .iter()
+        .zip(&held)
+        .take_while(|(here, there)| here == there)
+        .count();
+    // The file line of the first record past that run; the events of a turn carry theirs.
+    let Some(from) = raw
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        .map(|(number, _)| number)
+        .nth(common)
+    else {
+        return 0;
+    };
+    crate::domain::turn::groups_of(&session)
+        .iter()
+        .filter(|turn| {
+            turn.iter().any(|&index| {
+                let event = &session.events[index];
+                crate::adapter::is_conversation(event.kind)
+                    && event.line.is_some_and(|line| line >= from)
+            })
+        })
+        .count()
+}
+
+/// The record hashes of the conversation the Hub's copy of `native`'s branch holds, read from the
+/// local commit that copy publishes; None when there is no copy to read here.
+fn hub_held_records(native: &link::Link) -> Option<Vec<String>> {
+    let (owner, agent) = super::parse_slug(&format!(
+        "{}/{}",
+        native.owner.as_deref()?,
+        native.agent.as_deref()?
+    ))
+    .ok()?;
+    let branch = native.branch.as_deref()?;
+    let repo = Repo::open(&config::repo_dir(&owner, &agent).ok()?)?;
+    let looked = super::resume::look_at_hub(&repo, &format!("{owner}/{agent}"), branch);
+    let fetched = repo
+        .git_opt(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}^{{commit}}"),
+        ])
+        .map(|tip| tip.trim().to_owned());
+    let hub = held_tip(&looked, fetched)?;
+    let local = crate::domain::privacy_git::Projections::open(&repo)
+        .source(branch, &hub)
+        .unwrap_or(hub);
+    let log = storage::materialize_at(repo.root(), &local, meta::LOG_FILE).ok()?;
+    Some(transcript::envelope_hashes(&log))
+}
+
+/// The Hub's tip to compare with: the copy last fetched, unless the Hub has just said it has no
+/// such branch, in which case an earlier fetch's copy stands for nothing it holds. A Hub that
+/// can't be asked leaves the last fetched copy as the best word there is.
+fn held_tip(looked: &super::resume::Looked, fetched: Option<String>) -> Option<String> {
+    match looked {
+        super::resume::Looked::Absent => None,
+        _ => fetched,
+    }
 }
 
 fn resolve_point(
@@ -816,6 +909,7 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         branch: point.branch,
         repository: Some(point.slug),
         running,
+        unreceived: 0,
     })
 }
 
@@ -1025,6 +1119,21 @@ mod tests {
     use super::*;
     use crate::domain::{session, storage};
 
+    /// A copy an earlier fetch left of a branch the Hub has since said it doesn't have holds
+    /// nothing the Hub has: read as held, a share of that conversation would go out without its
+    /// line. A Hub that can't be asked leaves the last fetched copy as the best word there is.
+    #[test]
+    fn a_branch_the_hub_says_is_gone_holds_nothing() {
+        use crate::commands::resume::Looked;
+        let fetched = Some("0123456789abcdef".to_owned());
+        assert_eq!(held_tip(&Looked::Absent, fetched.clone()), None);
+        assert_eq!(
+            held_tip(&Looked::Unreachable("down".into()), fetched.clone()),
+            fetched
+        );
+        assert_eq!(held_tip(&Looked::Checked, fetched.clone()), fetched);
+    }
+
     fn claim() -> String {
         format!("{}{}", meta::ID_PREFIX, "b".repeat(meta::ID_HEX_LEN))
     }
@@ -1154,6 +1263,7 @@ mod tests {
             branch: Some("talk".into()),
             repository: Some("alice/app".into()),
             running: None,
+            unreceived: 0,
         };
         let lines = |runtime: &str| {
             let conversation = link::Link::new(

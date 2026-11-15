@@ -1653,6 +1653,22 @@ fn codex_tool_outputs_strip_injected_elements() {
     }
 }
 
+/// The upload keeps every call Codex writes as it is, which a share or export of the same
+/// conversation projects as tool calls too: a kind the upload kept and the projection dropped
+/// shows the work on the Hub's page and leaves it out of the share.
+#[test]
+fn codex_calls_of_every_kind_are_kept_for_upload() {
+    for payload in [
+        json!({"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}),
+        json!({"type":"custom_tool_call","call_id":"c2","name":"apply_patch","input":"*** Begin Patch"}),
+        json!({"type":"local_shell_call","call_id":"c3","status":"completed",
+            "action":{"type":"exec","command":["ls"]}}),
+    ] {
+        let record = codex("response_item", payload.clone());
+        assert_eq!(published("codex", &record), Some(record), "{payload}");
+    }
+}
+
 /// A tool output that is neither text nor parts, a structured result or a scalar, goes through the
 /// one rule for Claude and Codex alike: it is kept as it is, for protection to mask its credential
 /// fields and keep its references.
