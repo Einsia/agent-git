@@ -179,7 +179,7 @@ fn plain_publication_writes_the_tree_gits_own_round_trip_writes() {
         &destination,
         (&commit, None),
         &[],
-        Some(&metadata),
+        Some((&metadata, &Default::default())),
     )
     .unwrap();
     let written = git(

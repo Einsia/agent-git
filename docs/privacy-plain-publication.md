@@ -182,6 +182,17 @@ exclusion replaces the whole result of a tool call that read an excluded path wi
 (`~/.claude/**`, `~/.codex/**` and their equivalents) is excluded by default even when the rest
 of anonymization is off, because those files describe the person rather than the task.
 
+Independently of that setting, the author's home directory shows as `~` in sessions others
+read. A push writes the home of the user pushing as `~` wherever it is a whole path prefix in what
+that push adds: records, commit messages, and the published `session/meta.json` (`cwd`, `code`,
+`cwd_state.origin`, `title`, `milestone`). It does so after credential protection, so blocks and
+placeholders are decided on the text as captured. The local repository and what resume installs
+keep the original text, lines the Hub already holds are not rewritten, and identity fields and
+opaque carriers stay as they are. Other users' homes and forms a runtime encodes into a name
+(`-Users-<name>-…`, `--Users-<name>-…--`), Windows 8.3 names, percent-encoded paths and WSL's
+view of a Windows profile are not covered. A reader expands a published `~` against its own home
+only for a hint or a refusal, never to allow an upload or to choose where one goes.
+
 ## 10 Budgets
 
 Encrypted production disappears, and with it the client input, private-layer, projection and

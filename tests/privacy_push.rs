@@ -874,6 +874,17 @@ fn write_snapshot(root: &Path, log: &str, view: &str) -> anyhow::Result<()> {
     storage::write_snapshot(root, log, view)
 }
 
+/// The commit the Hub holds for `local` on `branch` once a push published it: `local` itself, or
+/// the published form the checkout's publication record names for it. A push sends a published
+/// form whenever it changes what it sends, and the author's home in a session's directory is
+/// enough for that.
+fn published_form(repo: &Repo, branch: &str, local: &str) -> String {
+    agit::domain::privacy_git::published_copies(repo, branch)
+        .into_iter()
+        .find(|(_, source)| source == local)
+        .map_or_else(|| local.to_owned(), |(public, _)| public)
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let out = git_command(root)
         .arg("-C")
@@ -1615,7 +1626,10 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     hub.corrupt_receipt.store(false, Ordering::Release);
     assert_success(&run(&plain_push, false));
     let plain_head = git(&remote, &["rev-parse", "refs/heads/publish-plain"]);
-    assert_eq!(plain_head, second_plain_source);
+    assert_eq!(
+        plain_head,
+        published_form(&repo, "publish-plain", &second_plain_source)
+    );
     assert_eq!(
         git(repo.root(), &["rev-parse", "refs/heads/publish-plain"]),
         second_plain_source
@@ -1642,7 +1656,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     );
     assert_eq!(
         git(&remote, &["rev-parse", &format!("{plain_head}^")]),
-        first_plain_source
+        published_form(&repo, "publish-plain", &first_plain_source)
     );
     assert_success(&run(&plain_push, false));
     assert_eq!(
@@ -1663,7 +1677,7 @@ fn session_push_registers_owner_and_preserves_mixed_history_and_immutable_retrie
     assert_eq!(receipt.published, next_plain);
     assert_eq!(
         receipt.mode,
-        agit::domain::privacy_receipt::PublicationMode::Ordinary
+        agit::domain::privacy_receipt::PublicationMode::SessionPlain
     );
     assert_eq!(hub.key_requests.load(Ordering::Acquire), key_requests);
     for (target, mode, reason) in [
@@ -2220,7 +2234,11 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     assert_success(&run(&["--yes", "push", "alice/app@work"]));
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
-        git(repo.root(), &["rev-parse", "refs/heads/work"])
+        published_form(
+            &repo,
+            "work",
+            &git(repo.root(), &["rev-parse", "refs/heads/work"])
+        )
     );
 
     *hub.visibility.lock().unwrap() = "private";
@@ -2230,7 +2248,11 @@ fn unattended_plain_publication_to_a_public_repository_needs_explicit_confirmati
     assert_success(&run(&["push", "alice/app@work"]));
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
-        git(repo.root(), &["rev-parse", "refs/heads/work"])
+        published_form(
+            &repo,
+            "work",
+            &git(repo.root(), &["rev-parse", "refs/heads/work"])
+        )
     );
 }
 
@@ -2365,7 +2387,11 @@ fn a_push_waits_a_bounded_time_for_another_upload_of_its_repository() {
     assert!(waited.success(), "{said}");
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
-        git(repo.root(), &["rev-parse", "refs/heads/work"])
+        published_form(
+            &repo,
+            "work",
+            &git(repo.root(), &["rev-parse", "refs/heads/work"])
+        )
     );
 }
 
@@ -2429,6 +2455,10 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
         }
         command
             .current_dir(temp.path())
+            // The sessions here run outside the home, so each is published as the commit it is and
+            // the refusals below can name a part by its local tip.
+            .env("HOME", temp.path().join("elsewhere"))
+            .env("USERPROFILE", temp.path().join("elsewhere"))
             .env("AGIT_HOME", &home)
             .env("CODEX_HOME", home.join("codex"))
             .env("CLAUDE_CONFIG_DIR", home.join("claude"))
@@ -2828,7 +2858,11 @@ fn a_receipt_refused_because_the_repository_moved_is_previewed_again_once() {
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), talk);
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
-        git(repo.root(), &["rev-parse", "refs/heads/work"])
+        published_form(
+            &repo,
+            "work",
+            &git(repo.root(), &["rev-parse", "refs/heads/work"])
+        )
     );
 }
 
@@ -4494,6 +4528,87 @@ fn plain_publication_carries_only_conversation_records() {
         &remote,
         &["rev-parse", "--verify", &format!("refs/heads/{named}")],
     );
+
+    // What a push publishes carries the pushing user's home as `~`: in a record's directory, a
+    // tool's input, a tool's output that quotes it as JSON does, the agent's words, the published
+    // metadata and the commit message. The local snapshot keeps them as captured. A push that
+    // rewrote only the directory fields, or one spelling, leaves the home in the tool output; one
+    // that rewrote the local repository moves its commit.
+    let user_home = temp.path().to_string_lossy().into_owned();
+    let escaped = user_home.replace('\\', "\\\\");
+    // The home as the file system resolves it, a second spelling where a parent is a link
+    // (macOS's `/var`), written as Git and tools write it on Windows.
+    let canonical = temp.path().canonicalize().unwrap();
+    let canonical = canonical.to_string_lossy();
+    let canonical = canonical
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&canonical)
+        .to_owned();
+    let project = format!("{user_home}/proj");
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "b".repeat(40)),
+        "claude-code".into(),
+        project.clone(),
+    );
+    session.title = Some(format!("Config under {project}"));
+    let records = [
+        json!({"type":"user","uuid":"h1","parentUuid":null,"sessionId":"h","cwd":project,"message":{"role":"user","content":"read the config"}}),
+        json!({"type":"assistant","uuid":"h2","parentUuid":"h1","sessionId":"h","cwd":project,"message":{"role":"assistant","content":[
+            {"type":"text","text":format!("Reading {project}/config.toml.")},
+            {"type":"tool_use","id":"toolu_h","name":"Read","input":{"file_path":format!("{project}/config.toml")}}]}}),
+        json!({"type":"user","uuid":"h3","parentUuid":"h2","sessionId":"h","cwd":project,"message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"toolu_h","content":format!("{{\"root\":\"{escaped}\",\"log\":\"{canonical}/proj/log\"}}")}]}}),
+    ];
+    let text: String = records.iter().map(|record| format!("{record}\n")).collect();
+    let log = transcript::wrap_lines(&text, "claude-code", &session.session);
+    repo.git(&["checkout", "-q", "-B", "home"]).unwrap();
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit(&format!("read {project}/config.toml")).unwrap();
+    let local = git(repo.root(), &["rev-parse", "HEAD"]);
+    repo.git(&["checkout", "-q", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@home"]));
+    assert_eq!(
+        git(repo.root(), &["rev-parse", "refs/heads/home"]),
+        local,
+        "the local snapshot keeps the home as captured"
+    );
+    let published = git(&remote, &["rev-parse", "refs/heads/home"]);
+    let (log, view) = storage::materialize_pair_at(&remote, &published).unwrap();
+    let metadata = git(
+        &remote,
+        &[
+            "cat-file",
+            "blob",
+            &format!("{published}:session/meta.json"),
+        ],
+    );
+    let message = git(&remote, &["log", "-1", "--format=%B", &published]);
+    for (what, text) in [
+        ("LOG", &log),
+        ("VIEW", &view),
+        ("meta.json", &metadata),
+        ("commit message", &message),
+    ] {
+        for home in [&user_home, &escaped, &canonical] {
+            assert!(
+                !text.contains(home.as_str()),
+                "{what} holds the home: {text}"
+            );
+        }
+        assert!(
+            text.contains("~/proj"),
+            "{what} names the project from ~: {text}"
+        );
+    }
+    for expected in [
+        "Reading ~/proj/config.toml.",
+        "\"file_path\":\"~/proj/config.toml\"",
+        "~/proj/log",
+    ] {
+        assert!(log.contains(expected), "{expected} in {log}");
+    }
 }
 
 /// A conversation whose first message quotes a placeholder this computer never made publishes,
@@ -8497,7 +8612,11 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     );
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/work"]),
-        git(repo.root(), &["rev-parse", "refs/heads/work"])
+        published_form(
+            &repo,
+            "work",
+            &git(repo.root(), &["rev-parse", "refs/heads/work"])
+        )
     );
     assert_eq!(launch(String::new()), None);
 
@@ -8907,7 +9026,7 @@ fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
     ));
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/kept"]),
-        git(repo.root(), &["rev-parse", "kept"])
+        published_form(&repo, "kept", &git(repo.root(), &["rev-parse", "kept"]))
     );
 
     // A session the person dropped from the folder goes only where a push names its branch.
@@ -8959,7 +9078,11 @@ fn an_automatic_push_leaves_out_a_conversation_its_folder_keeps_back() {
     assert_success(&run(&["--yes", "push", "alice/app@dropped"], false));
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/dropped"]),
-        git(repo.root(), &["rev-parse", "dropped"])
+        published_form(
+            &repo,
+            "dropped",
+            &git(repo.root(), &["rev-parse", "dropped"])
+        )
     );
 }
 
@@ -9331,7 +9454,7 @@ fn automatic_upload_into_a_public_repository_is_switched_on_by_an_explicit_answe
                 if publishes {
                     assert_eq!(
                         git(&remote, &["rev-parse", &format!("refs/heads/{branch}")]),
-                        local
+                        published_form(&Repo::at(&fresh.join("repos/alice/app")), &branch, &local)
                     );
                 } else {
                     assert!(
@@ -9393,7 +9516,10 @@ fn automatic_upload_into_a_public_repository_is_switched_on_by_an_explicit_answe
             let pushed = run(&["--json", "push", "alice/app@work"], true);
             assert_eq!(pushed.status.success(), publishes, "{case}: {pushed:?}");
             if publishes {
-                assert_eq!(git(&remote, &["rev-parse", "refs/heads/work"]), local);
+                assert_eq!(
+                    git(&remote, &["rev-parse", "refs/heads/work"]),
+                    published_form(&repo, "work", &local)
+                );
             } else {
                 assert!(
                     format!(
@@ -9953,7 +10079,11 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
     assert!(!stop(OTHER).contains("systemMessage"));
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/other"]),
-        git(repo.root(), &["rev-parse", "refs/heads/other"])
+        published_form(
+            &repo,
+            "other",
+            &git(repo.root(), &["rev-parse", "refs/heads/other"])
+        )
     );
 
     add_turn(SID, 3);
@@ -10238,7 +10368,10 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let receives = hub.posts.load(Ordering::Acquire);
     let landed = upload(LANDED, "alpha landed", &[]);
     assert_eq!(record(&landed).unwrap()["state"], "uploaded");
-    assert_eq!(on_hub(&landed), git(repo.root(), &["rev-parse", &landed]));
+    assert_eq!(
+        on_hub(&landed),
+        published_form(&repo, &landed, &git(repo.root(), &["rev-parse", &landed]))
+    );
     assert_eq!(hub.posts.load(Ordering::Acquire), receives + 1);
 
     // Cut off before the Hub took anything: it waits for the worker's next try.
@@ -10417,15 +10550,24 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(on_hub(&retried), failed_at);
+    assert_eq!(
+        on_hub(&retried),
+        published_form(&repo, &retried, &failed_at)
+    );
     wait("the waited upload's retry", &|| {
         record(&waited).is_some_and(|record| record["state"] == "uploaded")
     });
-    assert_eq!(on_hub(&waited), git(repo.root(), &["rev-parse", &waited]));
+    assert_eq!(
+        on_hub(&waited),
+        published_form(&repo, &waited, &git(repo.root(), &["rev-parse", &waited]))
+    );
     wait("the contended upload's retry", &|| {
         record(&contended).is_some_and(|record| record["state"] == "uploaded")
     });
-    assert_eq!(on_hub(&contended), contended_at);
+    assert_eq!(
+        on_hub(&contended),
+        published_form(&repo, &contended, &contended_at)
+    );
     // The retry is an upload of its own, previewed and confirmed again.
     assert!(hub.previews.lock().unwrap().len() > previews);
     // The conversation dropped meanwhile was not tried again.

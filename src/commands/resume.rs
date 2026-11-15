@@ -1008,7 +1008,12 @@ fn cwd_state_notice(
     let comparison = current
         .map(|current| compare_cwd_state(recorded, current))
         .unwrap_or(CwdStateComparison::Unknown);
-    let same_directory = Path::new(&snapshot.cwd) == cwd;
+    // A published session records its author's home as `~`. Read against this device's home it
+    // only decides whether the notice says the directory changed; the value printed below is the
+    // one recorded.
+    let same_directory = Path::new(&snapshot.cwd) == cwd
+        || meta::expanded_for_hint_or_refusal(&snapshot.cwd)
+            .is_some_and(|recorded| recorded == cwd);
     if comparison == CwdStateComparison::Equal
         && same_directory
         && recorded.worktree == meta::WorktreeStatus::Clean

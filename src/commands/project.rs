@@ -5443,8 +5443,27 @@ pub(crate) fn folder_refuses_upload(
             .is_none(),
         "cannot resolve the session directory to verify the folder's policy"
     );
+    if refuses_at(&meta, slug, branch, automatic, Path::new(&hydrated.content))? {
+        return Ok(true);
+    }
+    // A published session records its author's home as `~`. The value as recorded was judged
+    // above; read against this device's home it can only add a refusal, never lift one.
+    match crate::domain::meta::expanded_for_hint_or_refusal(&hydrated.content) {
+        Some(expanded) => refuses_at(&meta, slug, branch, automatic, &expanded),
+        None => Ok(false),
+    }
+}
+
+/// Whether the folder governing `recorded`, the directory `meta`'s conversation ran in, refuses
+/// its upload.
+fn refuses_at(
+    meta: &crate::domain::meta::Meta,
+    slug: &str,
+    branch: &str,
+    automatic: bool,
+    recorded: &Path,
+) -> Result<bool> {
     // A folder's policy is kept by its path, so a directory removed since still finds it.
-    let recorded = Path::new(&hydrated.content);
     let cwd = recorded
         .canonicalize()
         .unwrap_or_else(|_| recorded.to_path_buf());
@@ -9447,6 +9466,19 @@ mod tests {
         save(&policy).unwrap();
         assert!(!refused());
 
+        // A published session records its author's home as `~`. As recorded the value names no
+        // folder on this device; read against this device's home it names this one, whose refusal
+        // then holds. A judgement that read only the recorded value would let it through.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        metadata.cwd = "~/folder".into();
+        commit(&metadata);
+        assert!(!refused(), "the folder uploads by itself");
+        policy.enabled = false;
+        save(&policy).unwrap();
+        assert!(refused(), "the folder ~/folder names on this device is off");
+        policy.enabled = true;
+        save(&policy).unwrap();
+
         metadata.cwd = String::new();
         commit(&metadata);
         assert!(!refused(), "no directory, no folder");
@@ -9483,6 +9515,19 @@ mod tests {
         meta::write(repo.root(), &metadata).unwrap();
         repo.add_all().unwrap();
         repo.commit("Unavailable project directory").unwrap();
+        assert!(blocks_auto_push(&repo, "alice/app", "work").is_err());
+
+        // A published session records its author's home as `~`. The automatic push never reads it
+        // against this device's home, though `~/…` names a folder here: that would let it through
+        // wherever this device's own folder uploads by itself, on the strength of the author's path.
+        let open = temp.path().join("open");
+        fs::create_dir(&open).unwrap();
+        save(&self::project(&open)).unwrap();
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        metadata.cwd = "~/open".into();
+        meta::write(repo.root(), &metadata).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Published project directory").unwrap();
         assert!(blocks_auto_push(&repo, "alice/app", "work").is_err());
     }
 
