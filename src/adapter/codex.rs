@@ -1366,6 +1366,7 @@ impl Adapter for Codex {
         Ok(Installed {
             next: Next::Resume(resume_command(new_id, &cwd)),
             path,
+            session_id: new_id.to_string(),
         })
     }
 }

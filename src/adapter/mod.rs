@@ -987,6 +987,10 @@ pub trait Adapter {
 #[derive(Debug, Clone)]
 pub struct Installed {
     pub path: PathBuf,
+    /// The installed session's own id, as its runtime names it. A file name need not hold it (Pi
+    /// and Gemini CLI name a file by its time as well), so a reader that takes it from the path
+    /// looks for a session that doesn't exist.
+    pub session_id: String,
     /// What to do once the install is done.
     pub next: Next,
 }

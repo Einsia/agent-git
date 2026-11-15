@@ -13619,7 +13619,10 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
 /// The published copy, which has no session header, is what another computer shows and resumes:
 /// a reader that required the header would refuse it. A privacy export projects the same words,
 /// replies and tool results; a projection that did not know Pi's messages would replace each one
-/// with a notice.
+/// with a notice. Another computer, with an agit home and a Pi folder of its own, clones the
+/// repository and resumes the conversation: the session it installs carries a uuid as Pi mints
+/// one and the moment it was created, and resume reads it back by that id. A resume that took the
+/// id from the file name, whose time comes first, looks for a session that doesn't exist.
 #[test]
 fn a_pi_session_publishes_only_the_persons_words_and_the_agents_work() {
     const SYSTEM: &str = "CANARY-PI-SYSTEM-PROMPT-AGENTS-MD-5d21";
@@ -13837,4 +13840,88 @@ fn a_pi_session_publishes_only_the_persons_words_and_the_agents_work() {
     ] {
         assert!(!exported.contains(canary), "{canary}: {exported}");
     }
+
+    // The same person on another computer, with an agit home and a Pi folder of its own, resumes
+    // the published conversation.
+    let laptop = temp.path().join("laptop");
+    let laptop_pi = temp.path().join("laptop-pi");
+    startup_cache::seed(&laptop);
+    save_at(
+        &laptop
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let on_laptop = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &laptop)
+            .env("PI_CODING_AGENT_DIR", &laptop_pi)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert_success(&on_laptop(&["clone", "alice/app", "--no-bind"]));
+    let resumed = on_laptop(&["resume", "alice/app@pi", "--no-launch"]);
+    assert_success(&resumed);
+    let installed: Vec<PathBuf> = walkdir::WalkDir::new(laptop_pi.join("sessions"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    assert_eq!(installed.len(), 1, "{installed:?}");
+    let name = installed[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let header: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&installed[0])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let id = header["id"].as_str().unwrap();
+    // Named and stamped as Pi names a session it creates: the install's time, then its uuid.
+    assert!(
+        uuid::Uuid::try_parse(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id),
+        "{header}"
+    );
+    assert!(name.ends_with(&format!("_{id}.jsonl")), "{name}");
+    assert_ne!(header["timestamp"], "2026-01-01T00:00:00.000Z", "{header}");
+    let said = String::from_utf8_lossy(&resumed.stdout);
+    assert!(said.contains("pi --session"), "{said}");
 }

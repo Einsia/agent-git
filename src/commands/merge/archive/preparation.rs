@@ -438,12 +438,8 @@ fn prepare_with(
         require_transaction(&request, request.transaction_json)?;
         let (receipt, converted) = install(&install_text, &metadata.runtime, runtime, request.cwd)?;
         lossy |= converted;
-        let id = receipt
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(adapter::session_id_from_stem)
-            .context("installed archive runtime has no native ID")?;
+        let id = receipt.session_id.clone();
+        ensure!(!id.is_empty(), "installed archive runtime has no native ID");
         let native = RuntimeLinkKey {
             runtime: runtime.into(),
             session_id: id,
@@ -655,6 +651,7 @@ mod tests {
                     Ok((
                         Installed {
                             path,
+                            session_id: format!("FILE_{index}"),
                             next: adapter::Next::Resume("not executed".into()),
                         },
                         false,
@@ -1170,6 +1167,7 @@ mod tests {
             Ok((
                 Installed {
                     path,
+                    session_id: format!("NEW_{}", self.installs.load(Ordering::Relaxed)),
                     next: adapter::Next::Resume("unused launcher".into()),
                 },
                 converted,

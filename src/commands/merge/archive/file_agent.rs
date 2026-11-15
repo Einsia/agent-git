@@ -44,6 +44,7 @@ pub(super) fn install_fresh_claude(cwd: &Path) -> Result<crate::adapter::Install
     merge_archive::durable_publish_bytes(&path, b"", false)?;
     Ok(crate::adapter::Installed {
         path,
+        session_id: id.to_string(),
         next: crate::adapter::Next::Resume(format!("claude --session-id {id}")),
     })
 }

@@ -150,11 +150,10 @@ fn id_char(ch: char) -> bool {
     alphanumeric(ch) || matches!(ch, '-' | '_' | '.')
 }
 
-/// A session id Pi accepts, with no `-` in it. Pi's own ids are uuidv7, which hold `-`, and those
-/// stay as Pi wrote them; an id minted here is only ever a fresh identity, so it can be the shape
-/// that also makes a filename unambiguous (see [`session_id`]).
+/// A fresh session id in the form Pi mints its own: a hyphenated uuid v7. A file name stays
+/// unambiguous, since its timestamp part holds no `_`.
 fn fresh_id() -> String {
-    uuid::Uuid::now_v7().simple().to_string()
+    uuid::Uuid::now_v7().to_string()
 }
 
 pub struct Pi;
@@ -472,12 +471,27 @@ impl Adapter for Pi {
 }
 
 /// Installs `raw` as session `id` of `cwd` in Pi's sessions folder `sessions`: a file of its own in
-/// the folder Pi keeps `cwd`'s sessions in, opened by its path.
+/// the folder Pi keeps `cwd`'s sessions in, named for the moment it is created as Pi names its
+/// own, and opened by its path. A header agit gave a copy that brought none (a published copy)
+/// holds the fixed time of [`stamp`]; that session is created now, so its header says so too, as
+/// Pi shows and orders sessions by that time.
 fn install_at(sessions: &Path, raw: &str, id: &str, cwd: &Path) -> Result<Installed> {
-    let content = Pi.localize(raw, id, cwd)?;
+    let now = chrono::Utc::now();
+    let mut content = Pi.localize(raw, id, cwd)?;
+    let (header, rest) = content
+        .split_once('\n')
+        .context("a localized Pi session opens with its header")?;
+    let mut header: Value = serde_json::from_str(header)?;
+    if header["timestamp"] == stamp(None).as_str() {
+        header["timestamp"] = json!(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
+        content = format!("{header}\n{rest}");
+    }
     let dir = sessions.join(format!("--{}--", slug(cwd)));
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let path = dir.join(format!("{}_{id}.jsonl", file_stamp()));
+    let path = dir.join(format!(
+        "{}_{id}.jsonl",
+        now.format("%Y-%m-%dT%H-%M-%S-%3fZ")
+    ));
     ensure!(
         !path.exists(),
         "Pi already has a session file at {}",
@@ -490,6 +504,7 @@ fn install_at(sessions: &Path, raw: &str, id: &str, cwd: &Path) -> Result<Instal
     Ok(Installed {
         next: Next::Resume(launch(Some(&session), cwd, None, None)),
         path,
+        session_id: id.to_owned(),
     })
 }
 
@@ -773,13 +788,6 @@ fn stamp(at: Option<&str>) -> String {
     at.unwrap_or("2026-01-01T00:00:00.000Z").to_owned()
 }
 
-/// The timestamp part of a session filename, which Pi builds by replacing `:` and `.` in the
-/// header's timestamp. A fresh install has no earlier timestamp to keep, so it uses one fixed
-/// instant; the session id is what makes the name unique.
-fn file_stamp() -> String {
-    stamp(None).replace([':', '.'], "-")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -899,7 +907,12 @@ mod tests {
             json!({"type":"message","id":"a","parentId":"u","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Renamed."}],"stopReason":"stop"}})
         );
         let id = Pi.mint_id();
+        assert!(
+            uuid::Uuid::try_parse(&id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id),
+            "{id}"
+        );
         let installed = install_at(&sessions, &raw, &id, &work).unwrap();
+        assert_eq!(installed.session_id, id);
         assert_eq!(
             installed.path.parent().unwrap(),
             sessions.join(format!("--{}--", slug(&work)))

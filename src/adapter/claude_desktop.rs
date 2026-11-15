@@ -132,6 +132,7 @@ impl Adapter for ClaudeDesktop {
         let written = ClaudeCode.install(content, new_id, cwd)?;
         Ok(Installed {
             path: written.path,
+            session_id: written.session_id,
             next: handoff(new_id, cwd),
         })
     }

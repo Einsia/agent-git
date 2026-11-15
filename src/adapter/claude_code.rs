@@ -1279,6 +1279,7 @@ impl Adapter for ClaudeCode {
         std::fs::write(&path, content)
             .with_context(|| format!("cannot write {}", path.display()))?;
         Ok(Installed {
+            session_id: new_id.to_string(),
             next: Next::Resume(format!(
                 "(cd {} && claude --resume {new_id})",
                 cwd.display()

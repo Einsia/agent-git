@@ -2700,11 +2700,7 @@ fn materialize_and_resume(
 
     // Registration: the new instance's baseline = the byte count and hash of the materialized
     // file at this moment; the identity is injected as `AGIT_SESSION`.
-    let sid = installed
-        .path
-        .file_stem()
-        .map(|s| adapter::session_id_from_stem(&s.to_string_lossy()))
-        .unwrap_or_default();
+    let sid = installed.session_id.clone();
     use sha2::Digest as _;
     let mut lk = Link::new(to, &sid, Some(cwd));
     match slug.split_once('/') {

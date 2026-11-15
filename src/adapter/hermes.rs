@@ -644,6 +644,7 @@ impl Adapter for Hermes {
             .context("Hermes did not expose the installed session")?;
         Ok(Installed {
             path,
+            session_id: id.to_string(),
             next: Next::Resume(format!(
                 "(cd {} && {})",
                 super::shell_arg(&cwd.to_string_lossy()),
