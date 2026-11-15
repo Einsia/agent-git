@@ -12513,6 +12513,222 @@ fn main_push_after_a_distill(tagged: bool) {
     );
 }
 
+/// A distill plans against this clone's main, so while the Hub's main holds a teammate's change
+/// that this clone hasn't pulled, it stops with nothing written and names the pull; after the
+/// pull the teammate's change to the same file is merged in, and the landing says so for the
+/// file. A distill that skips the Hub's tip lands without a word of the teammate's change, and
+/// only the push then refuses main as diverged. With the Hub unreachable it says the Hub's main
+/// was not checked and lands all the same.
+#[test]
+fn a_distill_against_a_main_the_hub_moved_past_stops_until_pulled() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [29; 32]);
+    let base = hub.base.clone();
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    const HEADER: &str = "---\nname: decisions\n---\n";
+    // A blank line between decisions keeps a change to one from touching the next, as git
+    // merges changes only when an unchanged line separates them.
+    let decisions = |lines: [&str; 3]| format!("{HEADER}{}\n", lines.join("\n\n"));
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::create_dir_all(repo.root().join("memory")).unwrap();
+    fs::write(
+        repo.root().join("memory/decisions.md"),
+        decisions([
+            "1. ids are uids",
+            "2. retry three times",
+            "3. ping every 30 seconds",
+        ]),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+    for name in ["decisions.md", "team.md"] {
+        assert_success(&run(&[
+            "privacy",
+            "policy",
+            "allow-memory",
+            "--repo",
+            "alice/app",
+            "--",
+            name,
+        ]));
+    }
+
+    // This session changes decision 2 and adds a file of its own.
+    repo.git(&["checkout", "-b", "talk"]).unwrap();
+    let mut session = meta::Meta::new(
+        format!("agit-{}", "e".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    session.committer_account =
+        Some(agit::domain::session_privacy::AccountIdentity::new(&base, "account-1").unwrap());
+    let log = transcript::wrap_lines(
+        &format!(
+            "{}\n",
+            json!({"type":"user","message":{"role":"user","content":"retry five times"}})
+        ),
+        "claude-code",
+        &session.session,
+    );
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    fs::write(
+        repo.root().join("memory/decisions.md"),
+        decisions([
+            "1. ids are uids",
+            "2. retry five times",
+            "3. ping every 30 seconds",
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        repo.root().join("memory/team.md"),
+        format!("{HEADER}reviews happen on Thursdays\n"),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn 1").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+
+    // Meanwhile a teammate's distill changes decision 3 on the Hub's main.
+    let teammate = temp.path().join("teammate");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "-q",
+            &remote.to_string_lossy(),
+            &teammate.to_string_lossy(),
+        ],
+    );
+    fs::write(
+        teammate.join("memory/decisions.md"),
+        decisions([
+            "1. ids are uids",
+            "2. retry three times",
+            "3. ping every 10 seconds",
+        ]),
+    )
+    .unwrap();
+    git(
+        &teammate,
+        &[
+            "-c",
+            "user.name=Teammate",
+            "-c",
+            "user.email=teammate@example.invalid",
+            "commit",
+            "-qam",
+            "Teammate's distill",
+        ],
+    );
+    git(&teammate, &["push", "-q", "origin", "main"]);
+    let before = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+
+    let distill = |name: &str| run(&["distill", name, "-y", "--into", "alice/app@talk"]);
+    let refused = distill("decisions.md");
+    assert!(!refused.status.success(), "{refused:?}");
+    let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+    for expected in [
+        "alice/app's main on the Hub has changes this clone doesn't have (local +",
+        "so nothing was distilled",
+        "→ bring them in: `agit pull alice/app@main`, then distill again",
+    ] {
+        assert!(said.contains(expected), "{expected}: {said}");
+    }
+    assert_eq!(git(repo.root(), &["rev-parse", "refs/heads/main"]), before);
+
+    assert_success(&run(&["pull", "alice/app@main"]));
+    let landed = distill("decisions.md");
+    assert_success(&landed);
+    let said = String::from_utf8_lossy(&landed.stdout).into_owned();
+    assert!(
+        said.contains(
+            "memory/decisions.md: merged; the changes alice/app's main had made to it are kept"
+        ),
+        "{said}"
+    );
+    assert_eq!(
+        git(
+            repo.root(),
+            &["show", "refs/heads/main:memory/decisions.md"]
+        ),
+        decisions([
+            "1. ids are uids",
+            "2. retry five times",
+            "3. ping every 10 seconds"
+        ])
+        .trim_end()
+    );
+
+    // With the Hub gone, the distill says its main wasn't checked, and lands.
+    drop(hub);
+    let unchecked = distill("team.md");
+    assert_success(&unchecked);
+    let said = String::from_utf8_lossy(&unchecked.stderr).into_owned();
+    assert!(
+        said.contains("couldn't check alice/app's main on the Hub ("),
+        "{said}"
+    );
+    assert!(said.contains("is not taken into account"), "{said}");
+    assert_eq!(
+        git(repo.root(), &["show", "refs/heads/main:memory/team.md"]),
+        format!("{HEADER}reviews happen on Thursdays")
+    );
+}
+
 /// A main push after a distill in a repository of many sessions sends only main: one session
 /// branch published and fetched back (so its Hub version tags and remote-tracking ref are here)
 /// with a later turn never pushed, and one session branch never pushed, each turn carrying a local

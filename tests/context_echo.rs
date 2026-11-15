@@ -1255,7 +1255,9 @@ fn scan_notice_reports_its_scope_and_finds_evidence_where_that_scope_reaches() {
 /// With no target, a memory command names the way it takes one: `--into`, or AGIT_SESSION. The
 /// session-target error every other command shares names a positional `<owner>/<repo>@<branch>`,
 /// which `memory` refuses as an unexpected argument (and which `distill` would read as a file
-/// name). What the error names must be accepted by the same command, so the test follows it.
+/// name). What the error names must be accepted by the same command, so the test follows it. It
+/// also names the conversation this folder saved to as a target to copy: a session's branch name
+/// is long, and nothing else in the terminal shows it.
 #[test]
 fn a_memory_command_without_a_target_names_the_form_it_takes() {
     let lab = Lab::new();
@@ -1278,6 +1280,12 @@ fn a_memory_command_without_a_target_names_the_form_it_takes() {
             "{args:?}: {said}"
         );
         assert!(said.contains("AGIT_SESSION="), "{args:?}: {said}");
+        assert!(
+            said.contains(
+                "this folder's conversations, newest first: `--into alice/context@newest`"
+            ),
+            "{args:?}: {said}"
+        );
     }
 
     // The two ways the error names both work.
@@ -1291,6 +1299,35 @@ fn a_memory_command_without_a_target_names_the_form_it_takes() {
         lab.run(Some(SELECTED), &named),
         "target: alice/context@selected (via AGIT_SESSION)",
     );
+}
+
+/// A memory command given a branch this clone doesn't hold says so and where to run it, before
+/// git's own refusal of the missing ref, which names neither, can reach the person. Nothing is
+/// written.
+#[test]
+fn a_memory_command_on_a_branch_this_clone_lacks_says_so() {
+    let lab = Lab::new();
+    let before = lab.git(&lab.repo, &["show-ref"]);
+    for args in [
+        vec!["memory", "status", "--into", "alice/context@elsewhere"],
+        vec!["memory", "diff", "--into", "alice/context@elsewhere"],
+        vec!["distill", "--into", "alice/context@elsewhere", "-y"],
+    ] {
+        let refused = lab.run(None, &args);
+        assert!(!refused.status.success(), "{args:?}: {refused:?}");
+        let said = String::from_utf8(refused.stderr).unwrap();
+        for expected in [
+            "`elsewhere` is not in this clone of alice/context",
+            "→ run this on the computer that holds that session",
+        ] {
+            assert!(said.contains(expected), "{args:?}: {expected}: {said}");
+        }
+        assert!(
+            !said.contains("Needed a single revision"),
+            "{args:?}: {said}"
+        );
+    }
+    assert_eq!(lab.git(&lab.repo, &["show-ref"]), before);
 }
 
 #[test]

@@ -617,6 +617,13 @@ carried, so it never undoes a colleague's change on main, and a file both sides 
 changes. Where they changed the same lines, `distill` stops with nothing written and shows those
 lines with who changed them on main; make yours match main's there, or keep yours with
 `agit distill --take-mine notes.md`, which names whose change it replaces. `commit --milestone` and `push` report how many items are not distilled yet.
+Distillation compares against this clone's `main`, so it first reads the Hub's: when the Hub's
+`main` has changes this clone's lacks, it stops with nothing written and names
+`agit pull <owner>/<repo>@main`, after which a colleague's change to the same file is merged or
+shown as above instead of missed; when the Hub can't be reached it says so and goes on. Once a
+distill lands, it says for each file whether it was carried as the branch has it or merged with
+main's changes. The session's branch must be in this clone: memory commands read the session's
+own branch, so a colleague's session is distilled on the computer that holds it.
 `agit memory sync` does one bidirectional sync right away. Only Claude Code has a per-project
 memory directory on disk; on other runtimes `sync` is a no-op, while `status` / `distill` work on
 the branch as usual.
