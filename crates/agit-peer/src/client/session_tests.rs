@@ -51,16 +51,33 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
     device.target.credential_epoch += 1;
     let mut controller = grant.clone();
     controller.source.id = "another-controller".into();
-    let responses = [grant, missing, session, generation, device, controller];
+    // A delivery-only scope asks for that grant, and a full grant answered to it is refused like
+    // any other change of authority.
+    let mut delivery_scope = scope.clone();
+    delivery_scope.delivery_only = true;
+    let mut delivery = grant.clone();
+    delivery.session_controller = Some(delivery_scope.clone());
+    let full_for_delivery = grant.clone();
+    let responses = [
+        (grant, false),
+        (missing, false),
+        (session, false),
+        (generation, false),
+        (device, false),
+        (controller, false),
+        (full_for_delivery, true),
+        (delivery, true),
+    ];
     let requests = responses.len();
     let server = tokio::spawn(async move {
-        for grant in responses {
+        for (grant, asks_delivery) in responses {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
             let mut line = String::new();
             socket.read_line(&mut line).await.unwrap();
             assert_eq!(line, "POST /api/peer/session-connections HTTP/1.1\r\n");
             let mut service_authenticated = false;
+            let mut length = 0;
             loop {
                 line.clear();
                 assert!(socket.read_line(&mut line).await.unwrap() > 0);
@@ -69,8 +86,28 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
                 }
                 service_authenticated |=
                     line.eq_ignore_ascii_case("authorization: bearer service-fixture\r\n");
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
             }
             assert!(service_authenticated);
+            let mut body = vec![0; length];
+            tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body)
+                .await
+                .unwrap();
+            let asked: serde_json::Value = if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+            assert_eq!(
+                asked,
+                if asks_delivery {
+                    serde_json::json!({"delivery_only": true})
+                } else {
+                    serde_json::Value::Null
+                }
+            );
             let body = serde_json::to_string(&DialedConnection {
                 connection: GrantedConnection {
                     grant,
@@ -95,11 +132,12 @@ async fn service_admission_pins_both_endpoints_and_session_authority() {
     });
     let client = Client::new(&issuer).unwrap();
     for index in 0..requests {
-        let result = client.connect_session(&source, &target, &scope).await;
-        if index == 0 {
+        let asked = if index < 6 { &scope } else { &delivery_scope };
+        let result = client.connect_session(&source, &target, asked).await;
+        if index == 0 || index == requests - 1 {
             assert_eq!(
                 result.unwrap().connection.grant.session_controller,
-                Some(scope.clone())
+                Some(asked.clone())
             );
         } else {
             assert!(
