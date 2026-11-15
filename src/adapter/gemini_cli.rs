@@ -298,6 +298,9 @@ struct Seen {
     results: BTreeSet<String>,
 }
 
+/// What Gemini CLI names its tool that edits a file in place (`EDIT_TOOL_NAME`).
+const EDIT_TOOL: &str = "replace";
+
 pub(super) struct Parsed {
     pub session: Session,
     pub calls: Vec<Call>,
@@ -474,7 +477,13 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
                             name: call["name"].as_str().unwrap_or("unknown").to_owned(),
                             input: call["args"].clone(),
                         };
-                        events.push(message::tool_event(&native, ts.clone()));
+                        let mut event = message::tool_event(&native, ts.clone());
+                        // Gemini's edit tool is `replace`, a name the shared set leaves out as
+                        // too general across runtimes; `write_file` is in it.
+                        if native.name == EDIT_TOOL {
+                            event.kind = EventKind::FileEdit;
+                        }
+                        events.push(event);
                         parsed.calls.push(native);
                         parsed.pending.push(call_id.to_owned());
                     }
@@ -948,6 +957,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["c2"]
         );
+    }
+
+    /// A Gemini call is an edit when it writes a file: `replace`, Gemini's edit tool, and
+    /// `write_file`. Its reads, searches and listings name a path too and are calls. A reader that
+    /// left `replace` out shows a session that edited files as one that changed nothing.
+    #[test]
+    fn a_gemini_edit_is_a_call_that_writes_a_file() {
+        let call = |id: &str, name: &str, args: Value| json!({"id":id,"name":name,"args":args,"status":"success","timestamp":"t"});
+        let text = [
+            json!({"sessionId":SESSION,"projectHash":"p","startTime":"t","lastUpdated":"t","kind":"main"}),
+            json!({"id":"m1","timestamp":"t","type":"user","content":"tidy it"}),
+            json!({"id":"m2","timestamp":"t","type":"gemini","content":"Done.","toolCalls":[
+                call("c1", "read_file", json!({"file_path":"a.rs"})),
+                call("c2", "glob", json!({"pattern":"*.rs"})),
+                call("c3", "replace", json!({"file_path":"a.rs","old_string":"a","new_string":"b"})),
+                call("c4", "write_file", json!({"file_path":"b.rs","content":"b"})),
+            ]}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+        let session = GeminiCli.parse(&text).unwrap();
+        let edits: Vec<&str> = session
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::FileEdit)
+            .filter_map(|event| event.tool.as_deref())
+            .collect();
+        assert_eq!(edits, ["replace", "write_file"]);
+        assert_eq!(session.counts().edits, 2);
     }
 
     /// Sessions are found through `projects.json` alone and named by their full uuid; a

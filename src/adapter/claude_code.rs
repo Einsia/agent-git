@@ -913,12 +913,12 @@ impl Adapter for ClaudeCode {
                                         .to_string();
                                     let paths = extract_paths(b.get("input"));
                                     events.push(Event {
-                                        // A call carrying a file path counts as an edit —
-                                        // this is the signal for what the session changed.
-                                        kind: if paths.is_empty() {
-                                            EventKind::ToolUse
-                                        } else {
+                                        // What the session changed: a call that writes a
+                                        // file, whatever else names one ([`writes_a_file`]).
+                                        kind: if writes_a_file(&name) {
                                             EventKind::FileEdit
+                                        } else {
+                                            EventKind::ToolUse
                                         },
                                         text: Some(name.clone()),
                                         timestamp: ts.clone(),
@@ -1643,6 +1643,14 @@ fn extract_tool_results(content: Option<&serde_json::Value>) -> Option<Vec<Strin
     if saw_tool_result { Some(out) } else { None }
 }
 
+/// Whether Claude Code's tool `name` writes a file: its built-in tools that do. A call counts as
+/// an edit by its tool, not by naming a path, since Read, Glob and Grep name one too. A tool
+/// outside the set, an MCP tool that writes among them, counts as a call: the edit count can come
+/// out low, never high.
+fn writes_a_file(name: &str) -> bool {
+    matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
+}
+
 /// Take file paths out of a tool call's input.
 ///
 /// Only a few agreed key names are recognized. The heuristic is deliberate: the point is to tell
@@ -1828,6 +1836,65 @@ mod tests {
 
     use super::*;
 
+    /// Only a call that writes a file is an edit: Edit, MultiEdit, Write and NotebookEdit. Read,
+    /// Glob and Grep name a path too; counted by the path, a session that only read files reads
+    /// as having edited them, and the Hub shows edits beside no changes. A read still names its
+    /// file.
+    #[test]
+    fn only_a_call_that_writes_a_file_is_an_edit() {
+        let call = |name: &str, input: serde_json::Value| serde_json::json!({"type":"tool_use","name":name,"input":input});
+        let content = [
+            call("Read", serde_json::json!({"file_path":"/repo/a.rs"})),
+            call(
+                "Glob",
+                serde_json::json!({"pattern":"**/*.rs","path":"/repo"}),
+            ),
+            call(
+                "Grep",
+                serde_json::json!({"pattern":"fn","path":"/repo/src"}),
+            ),
+            call(
+                "Edit",
+                serde_json::json!({"file_path":"/repo/a.rs","old_string":"a","new_string":"b"}),
+            ),
+            call(
+                "MultiEdit",
+                serde_json::json!({"file_path":"/repo/b.rs","edits":[]}),
+            ),
+            call(
+                "Write",
+                serde_json::json!({"file_path":"/repo/c.rs","content":"c"}),
+            ),
+            call(
+                "NotebookEdit",
+                serde_json::json!({"notebook_path":"/repo/d.ipynb","new_source":"d"}),
+            ),
+        ];
+        let text = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"user","message":{"role":"user","content":"look"},
+                "sessionId":"s1","uuid":"u1"}),
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","content":content},
+                "sessionId":"s1","uuid":"u2","parentUuid":"u1"}),
+        );
+        let session = ClaudeCode.parse(&text).unwrap();
+        let edits: Vec<&str> = session
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::FileEdit)
+            .filter_map(|event| event.tool.as_deref())
+            .collect();
+        assert_eq!(edits, ["Edit", "MultiEdit", "Write", "NotebookEdit"]);
+        assert_eq!(session.counts().edits, 4);
+        let read = session
+            .events
+            .iter()
+            .find(|event| event.tool.as_deref() == Some("Read"))
+            .unwrap();
+        assert_eq!(read.kind, EventKind::ToolUse);
+        assert_eq!(read.paths, ["/repo/a.rs"]);
+    }
+
     #[test]
     fn parses_both_content_shapes() {
         let text = r#"{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"s1","cwd":"/repo","timestamp":"2026-01-01T00:00:00Z","uuid":"u1"}
@@ -1838,7 +1905,7 @@ mod tests {
         let c = s.counts();
         assert_eq!(c.prompts, 1);
         assert_eq!(c.replies, 1);
-        assert_eq!(c.edits, 1, "a tool_use with file_path is an edit");
+        assert_eq!(c.edits, 1, "an Edit call is an edit");
     }
 
     /// Claude Code writes request snapshots (`api-request-blob`) that copy earlier messages,
