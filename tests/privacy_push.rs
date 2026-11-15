@@ -13390,3 +13390,235 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
         "{refused:?}"
     );
 }
+
+/// A Pi session publishes the person's words, the replies and the tool calls with their results,
+/// and nothing Pi or its extensions put into the context. A skill the person invoked goes out as
+/// the words typed after it, files named on the command line as one notice, and the system prompt,
+/// a `!` command and its output, an extension's message, a compaction summary, a tool result's
+/// interface-only details and bookkeeping never go out. A path Pi left with `/tree` is published
+/// too, in file order. Every published entry links to a published one or to none, and is one the
+/// Hub's own judgement keeps unchanged. A push that sent the session as captured would carry the
+/// skill's file, the inlined file and the system prompt.
+///
+/// The published copy, which has no session header, is what another computer shows and resumes:
+/// a reader that required the header would refuse it. A privacy export projects the same words,
+/// replies and tool results; a projection that did not know Pi's messages would replace each one
+/// with a notice.
+#[test]
+fn a_pi_session_publishes_only_the_persons_words_and_the_agents_work() {
+    const SYSTEM: &str = "CANARY-PI-SYSTEM-PROMPT-AGENTS-MD-5d21";
+    const SKILL_BODY: &str = "CANARY-PI-SKILL-BODY-7c40";
+    const FILE_BODY: &str = "CANARY-PI-INLINED-FILE-BODY-e9a3";
+    const BASH: &str = "CANARY-PI-BASH-OUTPUT-31f6";
+    const EXTENSION: &str = "CANARY-PI-EXTENSION-MESSAGE-0b8d";
+    const COMPACTION: &str = "CANARY-PI-COMPACTION-SUMMARY-42ce";
+    const DETAILS: &str = "CANARY-PI-TOOL-DETAILS-9f17";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [31; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    let entry = |id: &str, parent: Option<&str>, body: serde_json::Value| {
+        let mut entry = json!({"type":"message","id":id,"parentId":parent,"timestamp":"2026-11-14T08:00:00.000Z"});
+        entry["message"] = body;
+        entry
+    };
+    let text = |text: &str| json!([{"type":"text","text":text}]);
+    let records = [
+        json!({"type":"session","version":3,"id":"019a0000-0000-7000-8000-0000000000a1","timestamp":"2026-11-14T08:00:00.000Z","cwd":"/work"}),
+        entry("e0000001", None, json!({"role":"system","content":SYSTEM})),
+        entry(
+            "e0000002",
+            Some("e0000001"),
+            json!({"role":"user","content":text(&format!(
+                "<skill name=\"review\" location=\"/home/p/.pi/agent/skills/review/SKILL.md\">\nReferences are relative to /home/p/.pi/agent/skills/review.\n\n{SKILL_BODY}\n</skill>\n\nreview the parser"
+            ))}),
+        ),
+        entry(
+            "e0000003",
+            Some("e0000002"),
+            json!({"role":"assistant","content":[{"type":"text","text":"Reading it."},{"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"src/parser.rs"}}],"stopReason":"toolUse"}),
+        ),
+        entry(
+            "e0000004",
+            Some("e0000003"),
+            json!({"role":"toolResult","toolCallId":"call-1","toolName":"read","content":text("fn parse() {}"),"isError":false,"details":{"fullOutputPath":DETAILS}}),
+        ),
+        entry(
+            "e0000005",
+            Some("e0000004"),
+            json!({"role":"bashExecution","command":"cat .env","output":BASH,"exitCode":0,"cancelled":false,"truncated":false}),
+        ),
+        json!({"type":"custom_message","id":"e0000006","parentId":"e0000005","timestamp":"2026-11-14T08:00:00.000Z","customType":"ext","content":EXTENSION,"display":true}),
+        json!({"type":"compaction","id":"e0000007","parentId":"e0000006","timestamp":"2026-11-14T08:00:00.000Z","summary":COMPACTION,"firstKeptEntryId":"e0000002","tokensBefore":1000}),
+        entry(
+            "e0000008",
+            Some("e0000007"),
+            json!({"role":"assistant","content":text("The parser is fine."),"stopReason":"stop"}),
+        ),
+        // The person went back with `/tree` to the first prompt and asked again.
+        entry(
+            "e0000009",
+            Some("e0000002"),
+            json!({"role":"user","content":text(&format!(
+                "<file name=\"/work/notes.txt\">\n{FILE_BODY}\n</file>\nuse these notes"
+            ))}),
+        ),
+        entry(
+            "e000000a",
+            Some("e0000009"),
+            json!({"role":"assistant","content":text("Using them."),"stopReason":"stop"}),
+        ),
+    ];
+    let session = meta::Meta::new(
+        format!("agit-{}", "a".repeat(40)),
+        "pi".into(),
+        String::new(),
+    );
+    repo.git(&["checkout", "-b", "pi"]).unwrap();
+    let lines: String = records.iter().map(|record| format!("{record}\n")).collect();
+    let log = transcript::wrap_lines(&lines, "pi", &session.session);
+    write_snapshot(repo.root(), &log, &log).unwrap();
+    meta::write(repo.root(), &session).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("turn").unwrap();
+    repo.git(&["checkout", "main"]).unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@pi"]));
+
+    let public = git(&remote, &["rev-parse", "refs/heads/pi"]);
+    let (public_log, _) = storage::materialize_pair_at(&remote, &public).unwrap();
+    for canary in [
+        SYSTEM, SKILL_BODY, FILE_BODY, BASH, EXTENSION, COMPACTION, DETAILS,
+    ] {
+        assert!(!public_log.contains(canary), "{canary}: {public_log}");
+    }
+    let published: Vec<serde_json::Value> = storage::parse_envelopes(&public_log)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            assert_eq!(record.source, "pi");
+            assert_eq!(
+                agit::domain::publication_records::published("pi", &record.content),
+                Some(record.content.clone()),
+                "the Hub's judgement changes a published record"
+            );
+            record.content
+        })
+        .collect();
+    let ids: Vec<&str> = published
+        .iter()
+        .map(|record| record["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "e0000002", "e0000003", "e0000004", "e0000008", "e0000009", "e000000a"
+        ]
+    );
+    for record in &published {
+        let parent = &record["parentId"];
+        assert!(
+            parent.is_null() || ids.contains(&parent.as_str().unwrap()),
+            "{record}"
+        );
+    }
+    assert_eq!(published[0]["parentId"], serde_json::Value::Null);
+    assert_eq!(published[3]["parentId"], "e0000004");
+    let words = |index: usize| published[index]["message"]["content"].clone();
+    assert_eq!(words(0), text("review the parser"));
+    assert_eq!(
+        words(4),
+        json!([{"type":"text","text":"[File content excluded by policy]"},{"type":"text","text":"use these notes"}])
+    );
+
+    let pi = agit::adapter::get("pi").unwrap();
+    let copy: String = published
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect();
+    let shown = pi.parse(&copy).unwrap();
+    for said in ["review the parser", "Using them."] {
+        assert!(
+            shown
+                .events
+                .iter()
+                .any(|event| event.text.as_deref() == Some(said)),
+            "{said}"
+        );
+    }
+    let restored = "019a0000-0000-7000-8000-0000000000b2";
+    let resumed = pi.localize(&copy, restored, Path::new("/work")).unwrap();
+    assert_eq!(pi.parse(&resumed).unwrap().id, restored);
+
+    let exported = run(&["export", "alice/app@pi", "--privacy"]);
+    assert_success(&exported);
+    let exported = String::from_utf8_lossy(&exported.stdout);
+    for kept in [
+        "review the parser",
+        "Reading it.",
+        "fn parse() {}",
+        "The parser is fine.",
+        "Using them.",
+    ] {
+        assert!(exported.contains(kept), "{kept}: {exported}");
+    }
+    for canary in [
+        SYSTEM, SKILL_BODY, FILE_BODY, BASH, EXTENSION, COMPACTION, DETAILS,
+    ] {
+        assert!(!exported.contains(canary), "{canary}: {exported}");
+    }
+}

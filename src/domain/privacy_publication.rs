@@ -964,7 +964,7 @@ impl Projector<'_> {
             "opencode" if value["kind"] == "message" => {
                 (value["id"].as_str(), value["data"]["role"].as_str())
             }
-            "openclaw" if value["type"] == "message" => {
+            "openclaw" | "pi" if value["type"] == "message" => {
                 (value["id"].as_str(), value["message"]["role"].as_str())
             }
             _ => (None, None),
@@ -1148,7 +1148,10 @@ impl Projector<'_> {
                 };
                 (!blocks.is_empty()).then_some((role.into(), blocks))
             }
-            "openclaw" if matches!(value["type"].as_str(), Some("message" | "custom_message")) => {
+            // Pi and OpenClaw store messages alike; publication leaves Pi only its `message` rows.
+            "openclaw" | "pi"
+                if matches!(value["type"].as_str(), Some("message" | "custom_message")) =>
+            {
                 let body = if value["type"] == "message" {
                     &value["message"]
                 } else {
@@ -2031,7 +2034,7 @@ fn record_cwd(record: &Envelope) -> Option<&str> {
         }
         "claude-code" | "claude-desktop" | "cursor" => value["cwd"].as_str(),
         "workbuddy" => value["cwd"].as_str(),
-        "openclaw" if value["type"] == "session" => value["cwd"].as_str(),
+        "openclaw" | "pi" if value["type"] == "session" => value["cwd"].as_str(),
         _ => None,
     }
 }

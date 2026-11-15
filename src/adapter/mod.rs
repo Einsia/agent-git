@@ -44,6 +44,7 @@ pub mod native_snapshot;
 pub mod native_title;
 pub mod openclaw;
 pub mod opencode;
+pub mod pi;
 pub(crate) mod preview;
 pub(crate) mod probe;
 pub(crate) mod protocol_ids;
@@ -1335,6 +1336,7 @@ mod tests {
             ("openclaw", Capability::Resumable, "openclaw"),
             ("workbuddy", Capability::Resumable, "workbuddy"),
             ("gemini-cli", Capability::Resumable, "gemini-cli"),
+            ("pi", Capability::Resumable, "pi"),
         ];
         let got: Vec<_> = all()
             .iter()
@@ -1367,6 +1369,7 @@ mod tests {
                 "hermes",
                 "openclaw",
                 "opencode",
+                "pi",
                 "workbuddy"
             ]
         );

@@ -336,6 +336,7 @@ fn integrations(runtime: &str, installed: bool) -> &'static str {
         "claude-code" | "workbuddy" | "gemini-cli" => "Skill, hooks, MCP",
         "codex" => "Skill, MCP, and hooks if this Codex supports them",
         "cursor" | "opencode" => "Skill, MCP",
+        "pi" => "Skill, extension",
         "hermes" if installed => "Skill, hooks, MCP",
         "openclaw" if installed => "Skill, hooks",
         _ => "Skill",

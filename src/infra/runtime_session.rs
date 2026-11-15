@@ -39,6 +39,7 @@ pub const ENV_SESSIONS: &[(&str, &str)] = &[
     ("CODEX_SESSION_ID", "codex"),
     ("CODEX_THREAD_ID", "codex"),
     ("OPENCODE_SESSION_ID", "opencode"),
+    ("PI_SESSION_ID", "pi"),
 ];
 
 /// `<runtime>:<native id>` of the conversation a Claude Code session environment file belongs
