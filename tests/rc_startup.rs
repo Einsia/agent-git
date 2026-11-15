@@ -591,6 +591,30 @@ async fn bridge_waits_for_another_process_to_release_the_lifecycle_lock() {
     bridge.kill().await.unwrap();
 }
 
+/// A start whose daemon exits before it reports online fails as soon as the daemon has exited, says
+/// so, and carries the daemon's own last words. A start that waited on a fixed time would report a
+/// daemon that never became ready and leave the reason in a log a test's home takes with it.
+#[cfg(unix)]
+#[test]
+fn a_daemon_that_exits_at_start_ends_the_start_with_its_last_words() {
+    let home = tempfile::tempdir().unwrap();
+    let out = command(home.path())
+        .args(["rc", "local", "start", "--detach"])
+        .env("AGIT_TEST_DAEMON_EXIT_AT_START", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("exited before it reported online (exit status: 3)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("agitd: exiting at start as AGIT_TEST_DAEMON_EXIT_AT_START asks"),
+        "{stderr}"
+    );
+}
+
 /// A child started by another agit build refuses before it reads, writes or sends anything, with
 /// its own exit status; one started by this build runs. A child that ignored the parent's build
 /// would take another build's arguments and replies as its own.
