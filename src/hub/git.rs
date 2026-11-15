@@ -102,6 +102,8 @@ pub(crate) fn looks_like_auth_failure(stderr: &str) -> bool {
 const TRANSPORT_MARKERS: &[&str] = &[
     "timed out",
     "timeout",
+    // Git's low-speed limit (`http.lowSpeedTime`): the connection stalled with no answer.
+    "operation too slow",
     "connection reset",
     "connection refused",
     "failed to connect",
@@ -2505,19 +2507,23 @@ mod git_credential_lifecycle_tests {
                             } else {
                                 "Unauthorized"
                             };
-                            write!(
-                                stream,
-                                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-                                response.status,
-                                reason,
-                                response.content_type,
-                                response.body.len()
-                            )?;
-                            for (name, value) in response.headers {
-                                write!(stream, "{name}: {value}\r\n")?;
-                            }
-                            stream.write_all(b"\r\n")?;
-                            stream.write_all(&response.body)?;
+                            // A client that stopped waiting before the answer (a read that timed
+                            // out) is the client's outcome, and the server goes on serving.
+                            let _ = (|| -> std::io::Result<()> {
+                                write!(
+                                    stream,
+                                    "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                    response.status,
+                                    reason,
+                                    response.content_type,
+                                    response.body.len()
+                                )?;
+                                for (name, value) in response.headers {
+                                    write!(stream, "{name}: {value}\r\n")?;
+                                }
+                                stream.write_all(b"\r\n")?;
+                                stream.write_all(&response.body)
+                            })();
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(5));

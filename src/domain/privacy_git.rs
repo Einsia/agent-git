@@ -287,9 +287,12 @@ impl PolicyCheck {
     }
 }
 
-/// Whether the Hub's copy of `branch`, as this checkout last fetched it, is this checkout's head:
-/// the same commit, or the public commit the Hub accepted for it when publication carried a
-/// projection of it.
+/// Whether the Hub holds this checkout's head of `branch`: its copy, as this checkout last fetched
+/// it, is the head or the public commit the Hub accepted for it; or, with no fetched copy, the
+/// accepted publication record says the Hub acknowledged publishing the head. A push records that
+/// acknowledgement and fetches nothing, so after the person's own push of a branch only the record
+/// says the Hub holds it; read from a fetched copy alone, a branch the Hub took reads as never
+/// uploaded and is pushed again. A fetched copy that is another commit says the Hub moved since.
 pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
     let tip = |reference: String| repo.git_opt(&["rev-parse", "--verify", "--quiet", &reference]);
     let local = tip(format!("refs/heads/{branch}"));
@@ -297,7 +300,7 @@ pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
     if local == remote {
         return true;
     }
-    let (Some(local), Some(remote)) = (local, remote) else {
+    let Some(local) = local else {
         return false;
     };
     let Ok(Some(identity)) = crate::hub::identity::read(repo) else {
@@ -305,12 +308,11 @@ pub fn hub_holds_head(repo: &Repo, branch: &str) -> bool {
     };
     accepted::Ledger::open(repo, &identity)
         .ok()
-        .and_then(|ledger| {
+        .is_some_and(|ledger| {
             ledger
                 .get(branch, &local)
-                .map(|entry| entry.public == remote)
+                .is_some_and(|entry| remote.as_ref().is_none_or(|remote| &entry.public == remote))
         })
-        .unwrap_or(false)
 }
 
 /// Whether this checkout's accepted publication record names `commit`, as a local commit it
@@ -361,6 +363,14 @@ impl Projections {
             .accepted(branch)
             .find(|entry| entry.public == public && entry.source != entry.public)
             .map(|entry| entry.source.clone())
+    }
+
+    /// Whether the Hub acknowledged publishing the local commit `head` on `branch`, as
+    /// [`hub_holds_head`] counts it where this checkout fetched no copy of the branch.
+    pub fn acknowledged(&self, branch: &str, head: &str) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|ledger| ledger.get(branch, head).is_some())
     }
 }
 

@@ -787,7 +787,8 @@ fn cursor(record: &Map<String, Value>) -> Option<Value> {
 // ---- Codex ----------------------------------------------------------------------------------
 
 /// Codex: assistant messages, reasoning, tool calls and their output, and the conversation's own
-/// events. Developer and system messages, `session_meta` (base instructions), `turn_context`,
+/// events. A local shell call goes out without the environment it was given and the account it
+/// ran as. Developer and system messages, `session_meta` (base instructions), `turn_context`,
 /// `world_state` and usage records are left out. A user-role message is kept only when its
 /// provenance marks it as the person's input: Codex files AGENTS.md and the environment context
 /// in the user's role too.
@@ -806,7 +807,17 @@ fn codex(record: &Map<String, Value>) -> Option<Value> {
                 record["payload"]["output"] = tool_output(payload.get("output")?, false);
                 return Some(record);
             }
-            "reasoning" | "function_call" | "custom_tool_call" | "local_shell_call" => true,
+            "local_shell_call" => {
+                // The call is the command, where it ran and how long it may take; the environment
+                // it was given and the account it ran as can hold values of the person's own.
+                let mut record = Value::Object(record.clone());
+                if let Some(action) = record["payload"]["action"].as_object_mut() {
+                    action.remove("env");
+                    action.remove("user");
+                }
+                return Some(record);
+            }
+            "reasoning" | "function_call" | "custom_tool_call" => true,
             _ => false,
         },
         "event_msg" if kind == Some("user_message") => {

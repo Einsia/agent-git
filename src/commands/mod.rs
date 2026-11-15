@@ -272,7 +272,15 @@ pub fn terminal_error_code(error: &anyhow::Error, fallback: ExitCode) -> ExitCod
         ExitCode::Precondition
     } else if error.is::<crate::hub::client::RequestConfiguration>() {
         ExitCode::Usage
-    } else if error.is::<RemoteRequest>() {
+    } else if error.is::<RemoteRequest>()
+        || error.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::hub::git::AdvertisementUnread>()
+                .is_some_and(|unread| unread.transient)
+        })
+    {
+        // A Hub that didn't answer a read, however deep it surfaced, is a network failure: the
+        // next try may get past it.
         ExitCode::Network
     } else if error.is::<Cancelled>() {
         ExitCode::Ok

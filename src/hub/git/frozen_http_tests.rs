@@ -464,6 +464,37 @@ mod frozen_publication_http {
         println!("{COMPLETE}");
     }
 
+    /// A destination read that a stalled Hub keeps from answering on every try ends the push as
+    /// the Hub not answering, a failure the folder's worker tries again by itself, whichever gives
+    /// up first: Git's low-speed limit (this fixture sets one) or the read's own deadline. Classed
+    /// any other way, an upload whose Hub was overloaded for a while is never tried again, and
+    /// nothing says so.
+    #[test]
+    fn a_destination_read_that_times_out_is_one_the_folder_tries_again() {
+        if !isolated("a_destination_read_that_times_out_is_one_the_folder_tries_again") {
+            return;
+        }
+        let home = IsolatedHome::new();
+        let wait = crate::hub::git::PROBE_TIMEOUT + std::time::Duration::from_secs(1);
+        // Every try waits out its read: the Hub serves for as long as the three take.
+        let hub = FakeHub::with_timeout(wait * 6, move |_| {
+            std::thread::sleep(wait);
+            advertisement()
+        });
+        let (repo, plan, url, identity) = source(&home, &hub.base);
+        let publication = FrozenPublication::prepare(&repo, &plan, &url, &identity).unwrap();
+        let error = publication.privacy_remote_refs().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("bounded retries"), "{message}");
+        use crate::commands::project::UploadFailure;
+        let code = crate::commands::terminal_error_code(&error, crate::ExitCode::Failure);
+        let class = UploadFailure::reported(Some(code.as_i32()), &message);
+        assert_eq!(class, UploadFailure::Hub, "{code:?}: {message}");
+        assert!(class.retried());
+        drop(hub.finish());
+        println!("{COMPLETE}");
+    }
+
     #[test]
     fn push_retry_keeps_prepared_endpoint_and_preserves_failure() {
         if !isolated("push_retry_keeps_prepared_endpoint_and_preserves_failure") {
