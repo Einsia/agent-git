@@ -260,26 +260,125 @@ fn require_usable(outcome: Outcome) -> crate::Result<()> {
     Ok(())
 }
 
-fn ready(requirements: &Requirements<'_>) -> crate::Result<()> {
+/// Waits for the daemon to report online and take connections. `started` is the daemon this
+/// command started, if it started one. A failure says what the wait last saw and carries what the
+/// daemon wrote, since its files may be gone by the time anyone reads the error: a test's home is
+/// removed when the test ends.
+fn ready(
+    requirements: &Requirements<'_>,
+    started: Option<&super::local::Started>,
+) -> crate::Result<()> {
+    let since = started.map_or_else(std::time::SystemTime::now, |started| started.at);
     let deadline = Instant::now() + WAIT;
     loop {
-        if let Ok(Some(status)) = probe() {
-            ensure!(
-                requirements.accepts(&status),
-                "replacement local daemon does not provide the required build or RPC features"
-            );
-            if status.online {
-                super::local::wait_ready()?;
-                return Ok(());
+        let seen = match probe() {
+            Ok(Some(status)) => {
+                ensure!(
+                    requirements.accepts(&status),
+                    "replacement local daemon does not provide the required build or RPC features"
+                );
+                if status.online {
+                    let dir = super::rc_dir()?;
+                    return super::local::wait_ready()
+                        .map_err(|error| not_ready(format!("{error:#}"), &dir, started, since));
+                }
+                format!(
+                    "daemon pid {} answered but had not reported online",
+                    status.pid
+                )
             }
+            Ok(None) => String::from("no daemon answered"),
+            Err(error) => format!("the daemon's state could not be read: {error:#}"),
+        };
+        if Instant::now() >= deadline {
+            let dir = super::rc_dir()?;
+            let mut summary = format!(
+                "local daemon did not become ready within {} s; at the end {seen}",
+                WAIT.as_secs()
+            );
+            if let Some(started) = started {
+                summary.push_str(&format!(" (this command started pid {})", started.pid));
+            }
+            summary.push_str(&format!(
+                "; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
+                dir.display()
+            ));
+            return Err(not_ready(summary, &dir, started, since));
         }
-        ensure!(
-            Instant::now() < deadline,
-            "local daemon did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
-            super::rc_dir()?.display()
-        );
         std::thread::sleep(POLL);
     }
+}
+
+/// Lines of a daemon file a failed start shows, from at most [`SHOWN_BYTES`] of its end.
+const SHOWN_LINES: usize = 30;
+const SHOWN_BYTES: u64 = 16 * 1024;
+
+/// `summary`, then the startup output of the daemon this command started, then the end of the
+/// newest diagnostics log in `dir` written since `since`. A diagnostics log older than that was
+/// left by an earlier daemon and would tell the reader about the wrong process.
+fn not_ready(
+    summary: String,
+    dir: &Path,
+    started: Option<&super::local::Started>,
+    since: std::time::SystemTime,
+) -> anyhow::Error {
+    let mut message = summary;
+    if let Some(started) = started {
+        shown(&mut message, "startup output", &started.log);
+    }
+    let diagnostics = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            (name.starts_with("diagnostics-") && name.ends_with(".jsonl") && modified >= since)
+                .then(|| (modified, entry.path()))
+        });
+    let when = if started.is_some() {
+        "since the start"
+    } else {
+        "since the wait began"
+    };
+    match diagnostics.max_by_key(|(modified, _)| *modified) {
+        Some((_, path)) => shown(&mut message, &format!("diagnostics written {when}"), &path),
+        None => message.push_str(&format!("\nno diagnostics were written {when}")),
+    }
+    anyhow::anyhow!(message)
+}
+
+/// Appends the last lines of `path` under `label`, each made inert for the terminal.
+fn shown(message: &mut String, label: &str, path: &Path) {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    match tail(path) {
+        Ok(lines) if lines.is_empty() => message.push_str(&format!("\n{label} ({name}): empty")),
+        Ok(lines) => {
+            message.push_str(&format!("\n{label} ({name}), last lines:"));
+            for line in lines {
+                message.push_str("\n  ");
+                message.push_str(&crate::ui::printable(&line));
+            }
+        }
+        Err(error) => message.push_str(&format!("\n{label} ({name}): unreadable: {error}")),
+    }
+}
+
+/// The last [`SHOWN_LINES`] lines in the last [`SHOWN_BYTES`] of `path`. A read that starts inside
+/// the file can start inside a line, so its first line is dropped.
+fn tail(path: &Path) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(SHOWN_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(SHOWN_BYTES).read_to_end(&mut bytes)?;
+    let mut lines: Vec<String> = String::from_utf8_lossy(&bytes)
+        .lines()
+        .skip(usize::from(start > 0))
+        .map(str::to_owned)
+        .collect();
+    Ok(lines.split_off(lines.len().saturating_sub(SHOWN_LINES)))
 }
 
 fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Outcome> {
@@ -316,7 +415,7 @@ fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Ou
                     .is_some_and(|current| current.instance_id != identity.instance_id) =>
             {
                 if requirements.accepts(&current) {
-                    ready(requirements)?;
+                    ready(requirements, None)?;
                     return Ok(Outcome::Unchanged);
                 }
                 return deferred(
@@ -330,8 +429,8 @@ fn replace(status: &Status, requirements: &Requirements<'_>) -> crate::Result<Ou
         }
         std::thread::sleep(POLL);
     }
-    super::local::spawn_daemon()?;
-    ready(requirements)?;
+    let started = super::local::spawn_daemon()?;
+    ready(requirements, Some(&started))?;
     Ok(Outcome::Restarted)
 }
 
@@ -374,13 +473,13 @@ fn attach_inner(ensure_daemon: bool, extra: &[String], current_build: bool) -> c
     let _lock = lock()?;
     let result = match probe()? {
         None if ensure_daemon => {
-            super::local::spawn_daemon()?;
-            ready(&requirements)?;
+            let started = super::local::spawn_daemon()?;
+            ready(&requirements, Some(&started))?;
             Outcome::Restarted
         }
         None => bail!("no local daemon is running; start it or pass --ensure"),
         Some(status) if requirements.accepts(&status) => {
-            ready(&requirements)?;
+            ready(&requirements, None)?;
             Outcome::Unchanged
         }
         Some(status) if ensure_daemon => replace(&status, &requirements)?,
@@ -842,6 +941,69 @@ pub fn report(outcome: &Outcome) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed start carries the end of the started daemon's own output and of the diagnostics
+    /// written since it started, made inert for the terminal. A report that took the newest
+    /// diagnostics whatever their age would describe an earlier daemon, one that took a log's head
+    /// would cut off the daemon's last words, and one that printed the log raw would let it drive
+    /// the terminal.
+    #[test]
+    fn a_failed_start_shows_the_started_daemons_last_words_and_nothing_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let earlier = dir.path().join("diagnostics-earlier.jsonl");
+        std::fs::write(&earlier, "{\"event\":\"earlier daemon\"}\n").unwrap();
+        let log = dir.path().join("agitd-test.log");
+        let lines: Vec<String> = (0..SHOWN_LINES + 5)
+            .map(|n| format!("startup line {n}"))
+            .collect();
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n\u{1b}]52;c;Y2xpcA==\u{7}last words\n",
+                lines.join("\n")
+            ),
+        )
+        .unwrap();
+        let at = std::fs::metadata(&log).unwrap().modified().unwrap();
+        File::options()
+            .write(true)
+            .open(&earlier)
+            .unwrap()
+            .set_modified(at - Duration::from_secs(60))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("diagnostics-current.jsonl"),
+            "{\"event\":\"current daemon\"}\n",
+        )
+        .unwrap();
+        let started = super::super::local::Started { pid: 7, log, at };
+        let message = not_ready("summary".into(), dir.path(), Some(&started), at).to_string();
+        assert!(
+            message.starts_with("summary\nstartup output (agitd-test.log), last lines:"),
+            "{message}"
+        );
+        assert!(message.contains(" last words"), "{message}");
+        assert!(message.contains("  startup line 6\n"), "{message}");
+        assert!(!message.contains("  startup line 5\n"), "{message}");
+        assert!(
+            !message.contains(['\u{1b}', '\u{7}']),
+            "the log's control characters reach the terminal: {message:?}"
+        );
+        assert!(
+            message.contains(
+                "diagnostics written since the start (diagnostics-current.jsonl), last lines:\n  {\"event\":\"current daemon\"}"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("earlier daemon"), "{message}");
+        std::fs::remove_file(dir.path().join("diagnostics-current.jsonl")).unwrap();
+        let message = not_ready("summary".into(), dir.path(), Some(&started), at).to_string();
+        assert!(
+            message.ends_with("\nno diagnostics were written since the start")
+                && !message.contains("earlier daemon"),
+            "only an earlier daemon's diagnostics are left: {message}"
+        );
+    }
 
     /// `rc local status` names an upgrade only while a watcher waits for it. The record says what
     /// the watcher last heard; once the watcher no longer holds the watch lock, the record is a
