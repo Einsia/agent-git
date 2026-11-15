@@ -21,7 +21,8 @@ use windows_sys::Win32::System::Pipes::{
 
 pub type Stream = NamedPipeServer;
 
-/// How long attaching waits for the daemon's pipe, both for it to appear and for a free instance.
+/// How long one attempt to connect waits for a free instance of the daemon's pipe. Whether the
+/// pipe appears at all is for the start's own wait to decide, which follows the daemon.
 const READY: Duration = Duration::from_secs(15);
 
 pub struct Listener {
@@ -129,30 +130,29 @@ fn connect_at(path: &std::path::Path, deadline: Instant) -> crate::Result<NamedP
     Ok(client)
 }
 
-async fn wait_ready() -> crate::Result<NamedPipeClient> {
-    let deadline = Instant::now() + READY;
+/// Waits until the daemon takes connections on its pipe, for as long as `going` allows: it fails
+/// once the daemon has exited or the start's time is up, and its error ends the wait.
+async fn wait_ready(going: &dyn Fn() -> crate::Result<()>) -> crate::Result<NamedPipeClient> {
     loop {
-        match connect(deadline) {
+        match connect(Instant::now() + READY) {
             Ok(client) => return Ok(client),
             Err(error) => {
                 let retryable = error.downcast_ref::<io::Error>().is_some_and(|error| {
                     error.raw_os_error().map(|code| code as u32) == Some(ERROR_FILE_NOT_FOUND)
                 });
-                if !retryable || Instant::now() >= deadline {
-                    return Err(error.context(format!(
-                        "agitd did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
-                        super::super::rc_dir()?.display()
-                    )));
+                if !retryable {
+                    return Err(error);
                 }
             }
         }
+        going()?;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Starts the daemon and returns its process id. The daemon must not retain the launcher's
-/// inheritable SSH pipe handles.
-pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<u32> {
+/// Starts the daemon and returns its process id; `exit` learns how it ends. The daemon must not
+/// retain the launcher's inheritable SSH pipe handles.
+pub(super) fn spawn_daemon(log: std::fs::File, exit: super::ExitWatch) -> crate::Result<u32> {
     use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
@@ -294,16 +294,36 @@ pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<u32> {
     {
         return Err(io::Error::last_os_error().into());
     }
-    let _process = security::Handle::new(process.hProcess)?;
+    let daemon = security::Handle::new(process.hProcess)?;
     let _thread = security::Handle::new(process.hThread)?;
+    /// The daemon's process handle, moved to the thread that waits on it and closes it.
+    struct Waited(security::Handle);
+    // SAFETY: a process handle may be waited on, queried and closed from any thread.
+    unsafe impl Send for Waited {}
+    let waited = Waited(daemon);
+    std::thread::spawn(move || {
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, INFINITE, WaitForSingleObject,
+        };
+        let waited = waited;
+        unsafe { WaitForSingleObject(waited.0.0, INFINITE) };
+        let mut code = 0u32;
+        exit.set(
+            if unsafe { GetExitCodeProcess(waited.0.0, &mut code) } != 0 {
+                format!("exit code {code}")
+            } else {
+                "an exit that could not be read".into()
+            },
+        );
+    });
     Ok(process.dwProcessId)
 }
 
-pub(super) fn wait_ready_sync() -> crate::Result<()> {
+pub(super) fn wait_ready_sync(going: &dyn Fn() -> crate::Result<()>) -> crate::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(wait_ready())?;
+    runtime.block_on(wait_ready(going))?;
     Ok(())
 }
 

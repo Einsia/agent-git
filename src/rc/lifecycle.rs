@@ -13,6 +13,11 @@ use std::{
 };
 
 const WAIT: Duration = Duration::from_secs(20);
+/// The longest a start waits on a daemon that is alive and still starting. A daemon that exited,
+/// or one that was running and is gone, ends the wait at once; this bound is only for one that
+/// neither comes up nor goes away, and it is loose so that a slow start on a busy machine is not
+/// taken for a failed one.
+const START_BOUND: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 const UPGRADE_RETRY: Duration = Duration::from_secs(5);
 const REQUIRED: &[&str] = &["peer-control-v1", "history-v2"];
@@ -260,52 +265,166 @@ fn require_usable(outcome: Outcome) -> crate::Result<()> {
     Ok(())
 }
 
-/// Waits for the daemon to report online and take connections. `started` is the daemon this
-/// command started, if it started one. A failure says what the wait last saw and carries what the
-/// daemon wrote, since its files may be gone by the time anyone reads the error: a test's home is
-/// removed when the test ends.
+/// What the readiness probe saw of the local daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Online,
+    Starting,
+    Absent,
+    Unreadable,
+}
+
+/// What a start does next.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Ready,
+    Wait,
+    /// The daemon this command started has exited, how it did.
+    Exited(String),
+    /// The daemon that was running when the wait began is gone.
+    Gone,
+    OutOfTime,
+}
+
+/// The next step of a start that has waited `waited` and saw `seen`. `started` is whether this
+/// command started the daemon, and `exited` how that daemon ended if it has. A daemon online is
+/// ready whoever started it. One that ended, or one that was running and is gone, ends the wait at
+/// once; a daemon still starting, or one this command started that hasn't opened its socket yet,
+/// is waited on until [`START_BOUND`].
+fn step(seen: Seen, started: bool, exited: Option<String>, waited: Duration) -> Step {
+    if seen == Seen::Online {
+        return Step::Ready;
+    }
+    if let Some(how) = exited {
+        return Step::Exited(how);
+    }
+    if seen == Seen::Absent && !started {
+        return Step::Gone;
+    }
+    if waited >= START_BOUND {
+        return Step::OutOfTime;
+    }
+    Step::Wait
+}
+
+/// While a daemon that reported online opens its socket: why the wait must end, if it must.
+/// `present` is whether a daemon still holds the local namespace, `exited` how the daemon this
+/// command started ended, when it is the one online. A daemon that went away, whoever started it,
+/// ends the wait at once; otherwise it lasts until [`START_BOUND`].
+fn socket_wait(present: bool, exited: Option<String>, waited: Duration) -> Option<String> {
+    if let Some(how) = exited {
+        return Some(format!(
+            "the local daemon this command started exited before it took connections ({how})"
+        ));
+    }
+    if !present {
+        return Some(String::from(
+            "the local daemon exited before it took connections",
+        ));
+    }
+    (waited >= START_BOUND).then(|| {
+        format!(
+            "local daemon reported online but took no connections within {} s",
+            START_BOUND.as_secs()
+        )
+    })
+}
+
+fn inspect(dir: &Path) -> String {
+    format!(
+        "inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
+        dir.display()
+    )
+}
+
+/// Waits for the daemon to report online and take connections, following the daemon itself (see
+/// [`step`]). `started` is the daemon this command started, if it started one. A failure says what
+/// the wait last saw and carries what the daemon wrote, since its files may be gone by the time
+/// anyone reads the error: a test's home is removed when the test ends.
 fn ready(
     requirements: &Requirements<'_>,
     started: Option<&super::local::Started>,
 ) -> crate::Result<()> {
     let since = started.map_or_else(std::time::SystemTime::now, |started| started.at);
-    let deadline = Instant::now() + WAIT;
+    let begun = Instant::now();
+    let exited = || started.and_then(|started| started.exit.exited());
     loop {
-        let seen = match probe() {
+        let mut online = None;
+        let (seen, line) = match probe() {
             Ok(Some(status)) => {
                 ensure!(
                     requirements.accepts(&status),
                     "replacement local daemon does not provide the required build or RPC features"
                 );
                 if status.online {
-                    let dir = super::rc_dir()?;
-                    return super::local::wait_ready()
-                        .map_err(|error| not_ready(format!("{error:#}"), &dir, started, since));
+                    online = Some(status.pid);
+                    (Seen::Online, String::new())
+                } else {
+                    (
+                        Seen::Starting,
+                        format!(
+                            "daemon pid {} answered but had not reported online",
+                            status.pid
+                        ),
+                    )
                 }
-                format!(
-                    "daemon pid {} answered but had not reported online",
-                    status.pid
-                )
             }
-            Ok(None) => String::from("no daemon answered"),
-            Err(error) => format!("the daemon's state could not be read: {error:#}"),
+            Ok(None) => (Seen::Absent, String::from("no daemon answered")),
+            Err(error) => (
+                Seen::Unreadable,
+                format!("the daemon's state could not be read: {error:#}"),
+            ),
         };
-        if Instant::now() >= deadline {
-            let dir = super::rc_dir()?;
-            let mut summary = format!(
-                "local daemon did not become ready within {} s; at the end {seen}",
-                WAIT.as_secs()
-            );
-            if let Some(started) = started {
-                summary.push_str(&format!(" (this command started pid {})", started.pid));
+        let dir = super::rc_dir()?;
+        let summary = match step(seen, started.is_some(), exited(), begun.elapsed()) {
+            Step::Wait => {
+                std::thread::sleep(POLL);
+                continue;
             }
-            summary.push_str(&format!(
-                "; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
-                dir.display()
-            ));
-            return Err(not_ready(summary, &dir, started, since));
-        }
-        std::thread::sleep(POLL);
+            Step::Ready => {
+                // Another daemon may be the one online; only this command's own daemon exiting
+                // ends the wait for its socket.
+                let ours = started.is_some_and(|started| online == Some(started.pid));
+                let going = || -> crate::Result<()> {
+                    let present = control::presence() != Presence::Absent;
+                    match socket_wait(present, exited().filter(|_| ours), begun.elapsed()) {
+                        Some(why) => bail!(why),
+                        None => Ok(()),
+                    }
+                };
+                return super::local::wait_ready(&going).map_err(|error| {
+                    not_ready(
+                        format!("{error:#}; {}", inspect(&dir)),
+                        &dir,
+                        started,
+                        since,
+                    )
+                });
+            }
+            Step::Exited(how) => format!(
+                "the local daemon this command started (pid {}) exited before it reported online ({how})",
+                started.map_or(0, |started| started.pid)
+            ),
+            Step::Gone => {
+                String::from("the local daemon that was running exited before it reported online")
+            }
+            Step::OutOfTime => {
+                let mut summary = format!(
+                    "local daemon did not become ready within {} s; at the end {line}",
+                    START_BOUND.as_secs()
+                );
+                if let Some(started) = started {
+                    summary.push_str(&format!(" (this command started pid {})", started.pid));
+                }
+                summary
+            }
+        };
+        return Err(not_ready(
+            format!("{summary}; {}", inspect(&dir)),
+            &dir,
+            started,
+            since,
+        ));
     }
 }
 
@@ -942,6 +1061,52 @@ pub fn report(outcome: &Outcome) -> crate::Result<()> {
 mod tests {
     use super::*;
 
+    /// A start waits on the daemon itself, not on a fixed time: a daemon still starting, or one this
+    /// command started that hasn't opened its socket yet, is waited on almost to [`START_BOUND`],
+    /// while one that exited, or one that was running and is gone, ends the wait at once, and a
+    /// daemon online is ready even after the one this command started gave way to it; the wait for
+    /// its socket then ends as soon as the daemon is gone, whoever started it. A wait on a
+    /// fixed time gives up on a slow start on a busy machine, and sits out the whole time on a
+    /// daemon that is already gone.
+    #[test]
+    fn a_start_waits_on_its_daemon_until_it_comes_up_exits_or_goes() {
+        let late = START_BOUND - Duration::from_millis(1);
+        let exit = || Some(String::from("exit status: 3"));
+        for seen in [Seen::Starting, Seen::Unreadable] {
+            assert_eq!(step(seen, true, None, late), Step::Wait, "{seen:?}");
+            assert_eq!(step(seen, false, None, late), Step::Wait, "{seen:?}");
+        }
+        assert_eq!(step(Seen::Absent, true, None, late), Step::Wait);
+        assert_eq!(
+            step(Seen::Starting, true, None, WAIT),
+            Step::Wait,
+            "a daemon still starting at what other waits here allow is not given up on"
+        );
+        assert_eq!(
+            step(Seen::Starting, true, exit(), Duration::ZERO),
+            Step::Exited("exit status: 3".into())
+        );
+        assert_eq!(
+            step(Seen::Absent, true, exit(), Duration::ZERO),
+            Step::Exited("exit status: 3".into())
+        );
+        assert_eq!(step(Seen::Absent, false, None, Duration::ZERO), Step::Gone);
+        assert_eq!(
+            step(Seen::Online, true, exit(), Duration::ZERO),
+            Step::Ready
+        );
+        assert_eq!(
+            step(Seen::Starting, true, None, START_BOUND),
+            Step::OutOfTime
+        );
+        // Once a daemon reported online, the wait for its socket follows it the same way, also
+        // for one this command did not start.
+        assert_eq!(socket_wait(true, None, late), None);
+        assert!(socket_wait(false, None, Duration::ZERO).is_some());
+        assert!(socket_wait(true, exit(), Duration::ZERO).is_some());
+        assert!(socket_wait(true, None, START_BOUND).is_some());
+    }
+
     /// A failed start carries the end of the started daemon's own output and of the diagnostics
     /// written since it started, made inert for the terminal. A report that took the newest
     /// diagnostics whatever their age would describe an earlier daemon, one that took a log's head
@@ -976,7 +1141,12 @@ mod tests {
             "{\"event\":\"current daemon\"}\n",
         )
         .unwrap();
-        let started = super::super::local::Started { pid: 7, log, at };
+        let started = super::super::local::Started {
+            pid: 7,
+            log,
+            at,
+            exit: Default::default(),
+        };
         let message = not_ready("summary".into(), dir.path(), Some(&started), at).to_string();
         assert!(
             message.starts_with("summary\nstartup output (agitd-test.log), last lines:"),

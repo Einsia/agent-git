@@ -19,8 +19,8 @@ mod windows;
 #[cfg(windows)]
 use windows::bridge;
 #[cfg(windows)]
-pub(super) fn wait_ready() -> crate::Result<()> {
-    windows::wait_ready_sync()
+pub(super) fn wait_ready(going: &dyn Fn() -> crate::Result<()>) -> crate::Result<()> {
+    windows::wait_ready_sync(going)
 }
 #[cfg(windows)]
 pub(super) use windows::{Listener, Stream, authenticate_client, listen};
@@ -228,6 +228,14 @@ pub fn start_foreground() -> crate::Result<()> {
             unsafe { std::env::remove_var(name) };
         }
     }
+    // In a debug build whose `AGIT_TEST_DAEMON_EXIT_AT_START` is set, the daemon says so in its
+    // startup output and exits before it reports online, so a test can show a start ends at once
+    // on such an exit and carries that line. A release build ignores it.
+    #[cfg(all(unix, debug_assertions))]
+    if std::env::var_os("AGIT_TEST_DAEMON_EXIT_AT_START").is_some() {
+        eprintln!("agitd: exiting at start as AGIT_TEST_DAEMON_EXIT_AT_START asks");
+        std::process::exit(3);
+    }
     let _guard = super::daemon_guard::install();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -242,9 +250,10 @@ pub fn ensure_daemon() -> crate::Result<()> {
     super::lifecycle::attach(true, &[], false)
 }
 
+/// Waits until the daemon takes connections on its socket, for as long as `going` allows: it fails
+/// once the daemon has exited or the start's time is up, and its error ends the wait.
 #[cfg(unix)]
-pub(super) fn wait_ready() -> crate::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+pub(super) fn wait_ready(going: &dyn Fn() -> crate::Result<()>) -> crate::Result<()> {
     loop {
         if let Ok(socket) =
             super::control::connect_within(&rpc_path()?, std::time::Duration::from_secs(1))
@@ -252,22 +261,38 @@ pub(super) fn wait_ready() -> crate::Result<()> {
             authenticate_server(socket, unsafe { libc::geteuid() })?;
             return Ok(());
         }
-        ensure!(
-            std::time::Instant::now() < deadline,
-            "agitd did not become ready; inspect agitd-*.log (startup output) and diagnostics-*.jsonl (what it did) in {}",
-            super::rc_dir()?.display()
-        );
+        going()?;
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-/// A daemon [`spawn_daemon`] started: its process, the log its startup output goes to, and when
-/// that log was made, by the clock of the filesystem it is on, so what the daemon wrote since can
-/// be told from what an earlier daemon left.
+/// How a daemon [`spawn_daemon`] started has ended, once it has. The thread that reaps the process
+/// records it, so a start that waits on the daemon learns of its exit as soon as it happens rather
+/// than when a time limit runs out.
+#[derive(Clone, Default)]
+pub(super) struct ExitWatch(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl ExitWatch {
+    fn set(&self, how: String) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(how);
+        }
+    }
+
+    /// How the daemon ended, or `None` while it runs.
+    pub(super) fn exited(&self) -> Option<String> {
+        self.0.lock().ok()?.clone()
+    }
+}
+
+/// A daemon [`spawn_daemon`] started: its process, the log its startup output goes to, when that
+/// log was made, by the clock of the filesystem it is on, so what the daemon wrote since can be
+/// told from what an earlier daemon left, and how it ended once it has.
 pub(super) struct Started {
     pub(super) pid: u32,
     pub(super) log: PathBuf,
     pub(super) at: std::time::SystemTime,
+    pub(super) exit: ExitWatch,
 }
 
 pub(super) fn spawn_daemon() -> crate::Result<Started> {
@@ -280,8 +305,9 @@ pub(super) fn spawn_daemon() -> crate::Result<Started> {
     let (log, path) = log.keep()?;
     let at = log.metadata()?.modified()?;
     eprintln!("agitd: startup diagnostics: {}", path.display());
+    let exit = ExitWatch::default();
     #[cfg(windows)]
-    let pid = windows::spawn_daemon(log)?;
+    let pid = windows::spawn_daemon(log, exit.clone())?;
     #[cfg(unix)]
     let pid = {
         let mut command = crate::infra::background::command(std::env::current_exe()?);
@@ -306,12 +332,21 @@ pub(super) fn spawn_daemon() -> crate::Result<Started> {
         }
         let mut child = command.spawn()?;
         let pid = child.id();
+        let watch = exit.clone();
         std::thread::spawn(move || {
-            let _ = child.wait();
+            watch.set(match child.wait() {
+                Ok(status) => status.to_string(),
+                Err(error) => format!("an exit that could not be read: {error}"),
+            });
         });
         pid
     };
-    Ok(Started { pid, log: path, at })
+    Ok(Started {
+        pid,
+        log: path,
+        at,
+        exit,
+    })
 }
 
 #[cfg(unix)]
