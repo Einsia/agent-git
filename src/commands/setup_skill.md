@@ -76,7 +76,7 @@ main file line       = AGENTS.md / memory/ / skills/ shared across sessions
 session files       = ordinary files in a branch worktree, including artifacts/
 ```
 
-Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos. Apart from `agit save` and a bare `agit share` run inside a conversation, which take that conversation, every existing-session operation selects its target through explicit arguments or `AGIT_SESSION`; directory state and native runtime IDs never select a session.
+Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also touches the project code repository; ordinary `agit commit` records the AgentGit conversation repository. Each directory has at most one persisted `bound repo`. Multiple session links may share the same cwd and belong to different repos. Apart from `agit save` and a bare `agit share` run inside a conversation, which take that conversation, and `agit memory status` and `agit memory diff`, which without a target read the folder's only conversation, every existing-session operation selects its target through explicit arguments or `AGIT_SESSION`; directory state and native runtime IDs never select a session.
 
 ## Working from an agent or script
 
@@ -93,7 +93,9 @@ Do not confuse the project's `.git` with `~/.agit/repos/...`. Only `--code` also
   state is needed for the requested operation. Existing
   sessions require an explicit `<owner/repo>@<branch>` or `AGIT_SESSION`, except
   that `agit save` and a bare `agit share` run inside a conversation take that
-  conversation. Workspace bindings and discovered runtime sessions do not supply
+  conversation, and `agit memory status` and `agit memory diff` without a target
+  read the folder's only conversation (with several, they list them; name one
+  with `--into`). Workspace bindings and discovered runtime sessions do not supply
   that target.
 - `@` means the session supplied through `AGIT_SESSION`. A known conflicting
   native runtime claim makes that environment stale; use the explicit target
@@ -432,7 +434,7 @@ Ordinary commands select an existing session from explicit arguments or `AGIT_SE
 
 `@` refers only to `AGIT_SESSION`. A registered native runtime claim may reveal that this environment value is stale after a runtime session switch; agit then refuses it and asks for an explicit target or a corrected environment value. It never chooses the runtime’s branch automatically. Hook payloads name their session explicitly and do not let an inherited environment value override that identity. A legacy link without a recorded owner cannot settle through hooks; run `agit import <session-id> --from <runtime> --into <owner>/<repo>@<branch>` to record the complete claim.
 
-Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target; only the runtime's own variables naming the current conversation do, for `agit save` and a bare `agit share`. Human terminal pickers collect an explicit user choice for the current command. `agit`, without a subcommand, opens the resume picker; `log`, `push`, and `share` can also select a session without saving a directory-wide default.
+Workspace bindings remain descriptive repo routes for creation and status. Native session links, cwd matches, the current checkout and the newest transcript cannot fill in a missing session target; only the runtime's own variables naming the current conversation do, for `agit save` and a bare `agit share`, and the folder's linked conversations do, for `agit memory status` and `agit memory diff`, which name the one they read on their first line. Human terminal pickers collect an explicit user choice for the current command. `agit`, without a subcommand, opens the resume picker; `log`, `push`, and `share` can also select a session without saving a directory-wide default.
 
 `new` and `import` create/adopt identity and should name the destination repo explicitly. `branch --repo <owner/repo>` manages a repo without selecting a current session.
 

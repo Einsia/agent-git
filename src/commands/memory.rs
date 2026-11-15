@@ -2412,8 +2412,14 @@ struct Target {
     branch: String,
 }
 
-fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
-    let (slug, branch) = match into {
+/// The session a memory command acts on, and how it was chosen. With `folder`, a command given
+/// no target reads the folder's conversation ([`folder_choice`]).
+fn target_of(
+    into: Option<&str>,
+    folder: bool,
+) -> crate::Result<Option<(Target, super::echo::Source)>> {
+    use super::echo::Source;
+    let (slug, branch, source) = match into {
         Some(raw) => {
             let t = super::target::branch_only(raw)?;
             let Some(slug) = t.repo else {
@@ -2421,14 +2427,31 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
                     "`--into` needs the full `<owner/repo>@<branch>` form"
                 )));
             };
-            (slug, t.base.expect("branch_only guarantees a branch"))
+            (
+                slug,
+                t.base.expect("branch_only guarantees a branch"),
+                Source::Explicit,
+            )
         }
-        None => {
-            // The shared no-target error names a positional `<owner>/<repo>@<branch>`; here the
-            // target is `--into` (a positional of `distill` is a file name).
-            let ctx = super::context::from_env().ok_or_else(no_target)?;
-            (super::context::qualify(&ctx.repo), ctx.branch)
-        }
+        // The shared no-target error names a positional `<owner>/<repo>@<branch>`; here the
+        // target is `--into` (a positional of `distill` is a file name).
+        None => match super::context::from_env() {
+            Some(ctx) => (
+                super::context::qualify(&ctx.repo),
+                ctx.branch,
+                Source::Environment,
+            ),
+            // Only where no session was named at all: an AGIT_SESSION refused as malformed (an
+            // empty one included) or stale is a target the person gave, and reading the folder's
+            // conversation instead would show another session's memory under it.
+            None if !folder || std::env::var_os("AGIT_SESSION").is_some() => {
+                return Err(no_target());
+            }
+            None => match folder_choice()? {
+                Some(((slug, branch), source)) => (slug, branch, source),
+                None => return Err(no_target()),
+            },
+        },
     };
     let parts = super::parse_slug(&slug);
     let (owner, name) = if into.is_some() {
@@ -2457,11 +2480,14 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
         ui::hint("run this on the computer that holds that session");
         return Ok(None);
     }
-    Ok(Some(Target {
-        primary,
-        slug,
-        branch,
-    }))
+    Ok(Some((
+        Target {
+            primary,
+            slug,
+            branch,
+        },
+        source,
+    )))
 }
 
 /// The refusal of a memory command given no target, naming the conversations this folder saved
@@ -2469,15 +2495,21 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
 /// shows it.
 fn no_target() -> anyhow::Error {
     let message = "no explicit session target; name it with `--into <owner>/<repo>@<branch>` or set AGIT_SESSION=<owner>/<repo>@<branch>".to_owned();
+    // Enough to copy from; the rest are named by count.
+    const SHOWN: usize = 5;
     let here = folder_targets();
     if here.is_empty() {
         return anyhow::anyhow!(message);
     }
-    let named = here
+    let mut named = here
         .iter()
-        .map(|target| format!("`--into {target}`"))
+        .take(SHOWN)
+        .map(|(slug, branch)| format!("`--into {slug}@{branch}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    if here.len() > SHOWN {
+        named.push_str(&format!(", and {} more", here.len() - SHOWN));
+    }
     super::Hinted {
         message,
         hint: format!("this folder's conversations, newest first: {named}"),
@@ -2485,9 +2517,8 @@ fn no_target() -> anyhow::Error {
     .into()
 }
 
-/// `<owner>/<repo>@<branch>` of each conversation linked to the current folder, newest first.
-fn folder_targets() -> Vec<String> {
-    const SHOWN: usize = 5;
+/// The repository and branch of each conversation linked to the current folder, newest first.
+fn folder_targets() -> Vec<(String, String)> {
     let (Ok(Some(store)), Ok(here)) =
         (crate::domain::store::Store::open(), std::env::current_dir())
     else {
@@ -2495,31 +2526,53 @@ fn folder_targets() -> Vec<String> {
     };
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let here = canonical(&here);
-    let mut found: Vec<(std::time::SystemTime, String)> = crate::domain::link::list(&store)
-        .into_iter()
-        .filter(|link| link.is_active())
-        .filter(|link| {
-            link.cwd
-                .as_deref()
-                .is_some_and(|cwd| canonical(Path::new(cwd)) == here)
-        })
-        .filter_map(|link| {
-            let target = format!(
-                "{}@{}",
-                super::context::slug_of_link(&link)?,
-                link.branch.as_deref()?
-            );
-            Some((crate::domain::link::touched_at(&store, &link), target))
-        })
-        .collect();
+    let mut found: Vec<(std::time::SystemTime, (String, String))> =
+        crate::domain::link::list(&store)
+            .into_iter()
+            .filter(|link| link.is_active())
+            .filter(|link| {
+                link.cwd
+                    .as_deref()
+                    .is_some_and(|cwd| canonical(Path::new(cwd)) == here)
+            })
+            .filter_map(|link| {
+                let target = (super::context::slug_of_link(&link)?, link.branch.clone()?);
+                Some((crate::domain::link::touched_at(&store, &link), target))
+            })
+            .collect();
     found.sort_by_key(|(touched, _)| std::cmp::Reverse(*touched));
     let mut seen = BTreeSet::new();
     found
         .into_iter()
         .map(|(_, target)| target)
         .filter(|target| seen.insert(target.clone()))
-        .take(SHOWN)
         .collect()
+}
+
+/// The conversation `memory status` and `diff` read when given no target: the folder's only one,
+/// or the one picked at a terminal from several. None when there is none, or none was picked.
+/// Both commands only read this computer's copies, so a wrong default writes nothing; distill
+/// writes main, and a target it picked for itself could carry another session's memory there.
+fn folder_choice() -> crate::Result<Option<((String, String), super::echo::Source)>> {
+    let here = folder_targets();
+    match here.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some((only.clone(), super::echo::Source::Folder))),
+        several => {
+            let options: Vec<String> = several
+                .iter()
+                .map(|(slug, branch)| format!("{slug}@{branch}"))
+                .collect();
+            let options: Vec<&str> = options.iter().map(String::as_str).collect();
+            // Nothing is highlighted: every answer reads a different conversation's memory.
+            let picked = ui::prompt::select_from(
+                "this folder has several conversations; whose memory?",
+                &options,
+                None,
+            )?;
+            Ok(picked.map(|index| (several[index].clone(), super::echo::Source::Interactive)))
+        }
+    }
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -2527,15 +2580,16 @@ pub fn run(args: Args) -> CmdResult {
 }
 
 fn run_inner(args: Args, command: &'static str) -> CmdResult {
-    let Some(target) = target_of(args.into.as_deref())? else {
+    let reads = matches!(&args.cmd, None | Some(Cmd::Status | Cmd::Diff { .. }));
+    let Some((target, source)) = target_of(args.into.as_deref(), reads)? else {
         return Ok(ExitCode::Precondition);
     };
-    let source = if args.into.is_some() {
-        super::echo::Source::Explicit
-    } else {
-        super::echo::Source::Environment
-    };
-    if !matches!(&args.cmd, Some(Cmd::Diff { .. } | Cmd::Distill { .. }))
+    // A session this folder chose is named first, before what it shows, `diff` included.
+    let chosen_here = matches!(
+        source,
+        super::echo::Source::Folder | super::echo::Source::Interactive
+    );
+    if (chosen_here || !matches!(&args.cmd, Some(Cmd::Diff { .. } | Cmd::Distill { .. })))
         && target.primary.has_ref(&tree_ref(&target.branch))
     {
         super::echo::emit(
@@ -3004,6 +3058,24 @@ fn distill_cmd(
             println!("  memory/{name}: {landed}");
         }
         let slug = &target.slug;
+        // Where the person just confirmed each change at a terminal, publishing main is one more
+        // question rather than another command to compose. It defaults to no, and the push asks
+        // what it asks anywhere; under `-y`, or for an agent, the line to run is all there is.
+        if !yes
+            && ui::prompt::can_ask()
+            && ui::prompt::confirm(
+                &format!("publish {main} on the Hub now (`agit push {slug}@main`)?"),
+                false,
+            )? == Some(true)
+        {
+            let pushed = push_main(slug)?;
+            if !crate::domain::privacy_git::hub_holds_head(primary, branch) {
+                ui::hint(&format!(
+                    "`{branch}`, which holds this memory too, isn't on the Hub yet: `agit push {slug}@{branch}`"
+                ));
+            }
+            return Ok(pushed);
+        }
         // Distill writes main here and publishes nothing. The session's own branch, which holds the
         // memory it carried, needs its own push while the Hub holds neither its tip nor the public
         // commit published for it; compared by commit id alone, a published branch would be told
@@ -3023,6 +3095,22 @@ fn distill_cmd(
         }
     }
     Ok(ExitCode::Ok)
+}
+
+/// Runs `agit push <slug>@main` in this terminal as the person would type it, so it shows and
+/// asks everything it does there.
+fn push_main(slug: &str) -> CmdResult {
+    let program =
+        std::env::current_exe().context("cannot find agit's own program; main was not pushed")?;
+    let status = std::process::Command::new(program)
+        .args(["push", &format!("{slug}@main")])
+        .status()
+        .context("cannot start `agit push`; main was not pushed")?;
+    Ok(if status.success() {
+        ExitCode::Ok
+    } else {
+        ExitCode::Failure
+    })
 }
 
 /// Where this clone's main stands against the Hub's, read before a distill is planned.

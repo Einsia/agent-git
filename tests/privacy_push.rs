@@ -864,6 +864,91 @@ fn git_command(root: &Path) -> Command {
     command
 }
 
+/// Runs agit with `args` at a terminal, answering each of `questions` with Enter (its default)
+/// once the screen shows it, in order; the exit code and everything the terminal showed.
+#[cfg(all(unix, feature = "rc"))]
+fn at_terminal(
+    root: &Path,
+    home: &Path,
+    hub: &str,
+    args: &[&str],
+    questions: &[&str],
+) -> (u32, String) {
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_agit"));
+    command.env_clear_local();
+    for (name, value) in git_command(root).get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    command.env("AGIT_HOME", home);
+    command.env("AGIT_HUB_URL", hub);
+    command.env("AGIT_TUI", "0");
+    command.env("AGIT_USE_SYSTEM_GIT", "1");
+    command.env(
+        "AGIT_SECRETS_KEYSTORE",
+        if cfg!(unix) { "file" } else { "os" },
+    );
+    command.env("NO_COLOR", "1");
+    command.env("TERM", "xterm-256color");
+    command.cwd(root);
+    command.args(args);
+    // Wide enough that no question is drawn across two lines.
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 240,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let mut writer = pty.master.take_writer().unwrap();
+    let screen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let shared = std::sync::Arc::clone(&screen);
+    let output = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(read) = reader.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            shared.lock().unwrap().extend_from_slice(&chunk[..read]);
+        }
+    });
+    let mut child = pty.slave.spawn_command(command).unwrap();
+    drop(pty.slave);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut answered = 0;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        if let Some(question) = questions.get(answered)
+            && shown.contains(question)
+        {
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            answered += 1;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("no exit within a minute: {shown}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    drop(writer);
+    drop(pty.master);
+    output.join().unwrap();
+    let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+    assert_eq!(
+        answered,
+        questions.len(),
+        "a question never showed: {shown}"
+    );
+    (status.exit_code(), shown)
+}
+
 /// Writes a session snapshot into the worktree as agit commits one: the tree then holds the
 /// events its LOG names and no others.
 fn write_snapshot(root: &Path, log: &str, view: &str) -> anyhow::Result<()> {
@@ -12517,8 +12602,10 @@ fn main_push_after_a_distill(tagged: bool) {
 /// that this clone hasn't pulled, it stops with nothing written and names the pull; after the
 /// pull the teammate's change to the same file is merged in, and the landing says so for the
 /// file. A distill that skips the Hub's tip lands without a word of the teammate's change, and
-/// only the push then refuses main as diverged. With the Hub unreachable it says the Hub's main
-/// was not checked and lands all the same.
+/// only the push then refuses main as diverged. At a terminal, once the change is confirmed, it
+/// offers to publish main, and Enter leaves main unpublished: publishing is never the default
+/// answer. With the Hub unreachable it says the Hub's main was not checked and lands all the
+/// same.
 #[test]
 fn a_distill_against_a_main_the_hub_moved_past_stops_until_pulled() {
     let temp = tempfile::tempdir().unwrap();
@@ -12691,15 +12778,41 @@ fn a_distill_against_a_main_the_hub_moved_past_stops_until_pulled() {
     assert_eq!(git(repo.root(), &["rev-parse", "refs/heads/main"]), before);
 
     assert_success(&run(&["pull", "alice/app@main"]));
-    let landed = distill("decisions.md");
-    assert_success(&landed);
-    let said = String::from_utf8_lossy(&landed.stdout).into_owned();
-    assert!(
-        said.contains(
-            "memory/decisions.md: merged; the changes alice/app's main had made to it are kept"
-        ),
-        "{said}"
-    );
+    // At a terminal, once its change is confirmed, distill offers to publish main; Enter is no.
+    let published = git(&remote, &["rev-parse", "refs/heads/main"]);
+    #[cfg(not(all(unix, feature = "rc")))]
+    {
+        let landed = distill("decisions.md");
+        assert_success(&landed);
+        let said = String::from_utf8_lossy(&landed.stdout).into_owned();
+        assert!(
+            said.contains(
+                "memory/decisions.md: merged; the changes alice/app's main had made to it are kept"
+            ),
+            "{said}"
+        );
+    }
+    #[cfg(all(unix, feature = "rc"))]
+    {
+        let (code, said) = at_terminal(
+            temp.path(),
+            &home,
+            &base,
+            &["distill", "decisions.md", "--into", "alice/app@talk"],
+            &[
+                "carry memory/decisions.md into alice/app's main",
+                "publish alice/app's main on the Hub now (`agit push alice/app@main`)?",
+            ],
+        );
+        assert_eq!(code, 0, "{said}");
+        for expected in [
+            "memory/decisions.md: merged; the changes alice/app's main had made to it are kept",
+            "publish it: `agit push alice/app@main`",
+        ] {
+            assert!(said.contains(expected), "{expected}: {said}");
+        }
+    }
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), published);
     assert_eq!(
         git(
             repo.root(),

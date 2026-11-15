@@ -17,7 +17,7 @@ agit file --into <team>/<repo>@main commit -m "Add <name>"
 agit push <team>/<repo>@main
 ```
 
-It plans against this clone's `main` after reading the Hub's: when the Hub's `main` has changes this clone's lacks, it stops with nothing written and names `agit pull <owner>/<repo>@main`. The session's branch must be in this clone.
+It plans against this clone's `main` after reading the Hub's: when the Hub's `main` has changes this clone's lacks, it stops with nothing written and names `agit pull <owner>/<repo>@main`. The session's branch must be in this clone. At a terminal, once the changes are confirmed, it asks whether to publish main now (default no); otherwise it prints `agit push <owner>/<repo>@main`.
 
 ## Synopsis
 
