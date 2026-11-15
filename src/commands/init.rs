@@ -180,6 +180,13 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
 
+    // The name as the person gave it, for a command to run again: a namespace they named stays in
+    // it, and one they left out stays left out, so the account's own namespace is never written
+    // as if it were another one the person chose.
+    let as_given = match &named_owner {
+        Some(owner) => format!("{owner}/{name}"),
+        None => name.clone(),
+    };
     let owner = named_owner.unwrap_or_else(|| {
         crate::infra::credentials::current_user().unwrap_or_else(|| "local".to_string())
     });
@@ -190,9 +197,13 @@ pub fn run(args: Args) -> CmdResult {
         && let Some(ws) = workspace::read(&cwd)
         && ws.repo != format!("{owner}/{name}")
     {
-        ui::error(&format!(
-            "this directory is already bound to {}; keep working there, or rebind it explicitly with `--rebind`",
+        ui::error(&format!("this directory is already bound to {}", ws.repo));
+        ui::hint(&format!(
+            "to create {owner}/{name} and keep this directory bound to {}: `agit init {as_given} --no-bind`",
             ws.repo
+        ));
+        ui::hint(&format!(
+            "to bind this directory to {owner}/{name} instead: `agit init {as_given} --rebind`"
         ));
         return Ok(ExitCode::Precondition);
     }

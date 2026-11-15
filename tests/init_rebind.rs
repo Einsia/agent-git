@@ -45,13 +45,32 @@ fn init_refuses_before_creating_anything_when_the_directory_is_bound_elsewhere()
     assert!(!out.status.success(), "init must refuse");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("me/other") && stderr.contains("--rebind"),
+        stderr.contains("this directory is already bound to me/other")
+            && stderr.contains(
+                "to create local/qa and keep this directory bound to me/other: `agit init qa --no-bind`"
+            )
+            && stderr.contains("to bind this directory to local/qa instead: `agit init qa --rebind`"),
         "{stderr}"
     );
     assert!(
         !home.join("repos/local/qa").exists(),
         "a refused init leaves no repository behind"
     );
+
+    let ws = fs::read_dir(home.join("workspaces"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let binding = fs::read(ws.path()).unwrap();
+    let out = agit(&home, &work, &["init", "unbound", "--no-bind"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(home.join("repos/local/unbound/.git").exists());
+    assert_eq!(fs::read(ws.path()).unwrap(), binding);
 
     let out = agit(&home, &work, &["init", "qa", "--rebind"]);
     assert!(
@@ -60,13 +79,81 @@ fn init_refuses_before_creating_anything_when_the_directory_is_bound_elsewhere()
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(home.join("repos/local/qa/.git").exists());
-    let ws = fs::read_dir(home.join("workspaces"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap();
     let text = fs::read_to_string(ws.path()).unwrap();
     assert!(text.contains("local/qa"), "{text}");
+}
+
+/// The commands the refusal offers repeat the name as it was given: a namespace the person named
+/// stays in them, and an unqualified name stays unqualified (the first test). Dropped, a named
+/// namespace makes or binds the same name in the person's own namespace; added, the account's own
+/// namespace is typed as one the person chose.
+#[test]
+fn init_binding_hints_preserve_a_namespaced_repository_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    bind(&home, &work, "me/other");
+
+    let out = agit(&home, &work, &["init", "team/qa"]);
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "to create team/qa and keep this directory bound to me/other: `agit init team/qa --no-bind`"
+        ) && stderr.contains(
+            "to bind this directory to team/qa instead: `agit init team/qa --rebind`"
+        ),
+        "{stderr}"
+    );
+    assert!(!home.join("repos/team/qa").exists());
+}
+
+#[test]
+fn signed_in_binding_hints_do_not_turn_the_account_into_an_explicit_namespace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    bind(&home, &work, "me/other");
+
+    let hub = "http://127.0.0.1:1";
+    let key = agit::infra::config::hub_host_key(hub).unwrap();
+    agit::infra::credentials::save_at(
+        &home.join("credentials").join(format!("{key}.json")),
+        &agit::infra::credentials::HubCredential {
+            account_id: None,
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: "synthetic-access".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_token: "synthetic-refresh".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+
+    for (given, target) in [("qa", "alice/qa"), ("team/qa", "team/qa")] {
+        let out = agit(&home, &work, &["init", given]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "to create {target} and keep this directory bound to me/other: `agit init {given} --no-bind`"
+            )) && stderr.contains(&format!(
+                "to bind this directory to {target} instead: `agit init {given} --rebind`"
+            )),
+            "{stderr}"
+        );
+        assert!(!home.join("repos").join(target).exists());
+    }
+    let bindings: Vec<serde_json::Value> = fs::read_dir(home.join("workspaces"))
+        .unwrap()
+        .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0]["repo"], "me/other");
 }
 
 #[test]
