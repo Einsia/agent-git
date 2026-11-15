@@ -961,6 +961,7 @@ pub(crate) fn runtime_name(runtime: &str) -> &str {
         "claude-code" => "Claude Code",
         "codex" => "Codex",
         "opencode" => "OpenCode",
+        "pi" => "Pi",
         other => other,
     }
 }

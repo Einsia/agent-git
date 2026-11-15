@@ -324,6 +324,9 @@ struct Event {
     /// The prompt that opened the turn a Stop ended, as Claude Code names it in the payload and
     /// in that prompt's own record (`promptId`).
     prompt_id: Option<String>,
+    /// Whether the extension that runs this settlement shows the line it prints when the turn
+    /// isn't saved ([`super::settle_failures`]).
+    shows_notice: bool,
 }
 
 fn parse_event(buf: &str) -> Option<Event> {
@@ -347,6 +350,7 @@ fn parse_event(buf: &str) -> Option<Event> {
         hook_event_name: get("hook_event_name"),
         permission_mode: get("permission_mode"),
         prompt_id: get("prompt_id"),
+        shows_notice: v.get("shows_notice").and_then(serde_json::Value::as_bool) == Some(true),
     })
 }
 
@@ -1456,15 +1460,40 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         .flatten()
         .collect();
     let failure = (!lines.is_empty()).then(|| lines.join("\n"));
-    let Some(failure) = failure else {
+    // A host that discards what agit prints keeps nobody informed: how its turn's settlement went
+    // is kept on this computer instead, and a failure is told by the one line its extension
+    // shows, when it shows one.
+    let unseen = (!await_reply && super::settle_failures::output_discarded(rt))
+        .then(|| (ev.session_id.clone(), ev.cwd.clone(), ev.shows_notice));
+    if failure.is_none() && unseen.is_none() {
         return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
-    };
-    println!("{}", serde_json::json!({ "systemMessage": failure }));
+    }
+    if let Some(failure) = failure {
+        println!("{}", serde_json::json!({ "systemMessage": failure }));
+    }
     // Claude Code reads the hook's whole stdout as that one response, so the settlement's own
     // notices go to stderr.
-    crate::ui::with_info_on_stderr(true, || {
+    let settled = crate::ui::with_info_on_stderr(true, || {
         settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
-    })
+    });
+    if let Some((session, cwd, shown)) = unseen
+        && let Some(notice) = super::settle_failures::settled(
+            rt,
+            &session,
+            cwd.as_deref().map(std::path::Path::new),
+            settled.as_ref().map(|_| ()),
+            shown,
+        )
+    {
+        use std::io::Write as _;
+        // The host may be gone by now; the settlement stands whether or not it reads the line.
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({ "notice": notice })
+        );
+    }
+    settled
 }
 
 /// The line a Codex conversation an older agit linked to a held branch is told, the first time
@@ -1567,11 +1596,12 @@ fn settle_event(
     let archive = lk.merge_archive.is_some();
     let (code, said) = crate::ui::recording_errors(|| super::commit::settle_from_link(&store, lk));
     if code? != crate::ExitCode::Ok && !archive {
-        anyhow::bail!(
-            "this turn isn't saved: {}",
+        return Err(super::settle_failures::NotSaved(
             said.first()
                 .map_or("`agit status` shows why", String::as_str)
-        );
+                .to_owned(),
+        )
+        .into());
     }
     Ok(())
 }

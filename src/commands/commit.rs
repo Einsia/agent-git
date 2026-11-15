@@ -744,7 +744,9 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     // never create one out of nowhere under any name — least of all for a link that records a
     // namespace, where a missing checkout is simply missing.
     if Repo::open(&dir).is_none() {
-        anyhow::bail!("this turn isn't saved: {slug} isn't on this computer");
+        return Err(
+            super::settle_failures::NotSaved(format!("{slug} isn't on this computer")).into(),
+        );
     }
     // A Codex session settles only into a session line of its own folder, unless agit itself
     // wrote its link for the branch: a session elsewhere that a shared Codex process put on this
