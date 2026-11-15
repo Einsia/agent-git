@@ -601,7 +601,7 @@ fn publish(mut args: Args) -> CmdResult {
                         ui::tilde(folder)
                     ),
                     Some(super::project::Exclusion::Dropped { folder, session }) => format!(
-                        "you stopped uploading it from {} (`agit project drop`). To upload it anyway: `agit save {session}` in that folder",
+                        "you stopped uploading it from {} (`agit project drop`). To upload it anyway: `agit save {session}` in that folder; it saves into a new branch, and this one stays as it is",
                         ui::tilde(folder)
                     ),
                     Some(super::project::Exclusion::Delegated) => {

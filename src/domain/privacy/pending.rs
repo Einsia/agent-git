@@ -106,7 +106,7 @@ pub fn steps(reason: &str) -> Option<Vec<String>> {
             "an older secret list cannot be read whole, so a value it blocks could pass; run `agit doctor` to see what cannot be read".into(),
         ]),
         "oversize" => Some(vec![
-            "a record in this conversation is too large to check, so it can't be published; it stays on this computer. To stop uploading this conversation, and only it, run `agit project drop` inside it; its local history stays".into(),
+            "a record in this conversation is too large to check, so it can't be published; it stays on this computer. To stop uploading this conversation for good, and only it, run `agit project drop` inside it; its local history stays, this can't be undone, and a later `agit save` of the conversation saves it into a new branch".into(),
         ]),
         "findings_cap" => Some(vec![
             "a record holds more secret values than one check replaces, so waiting does not end this; `agit scan` shows where they are".into(),
