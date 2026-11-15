@@ -196,6 +196,9 @@ fn log_counts_the_ir_category_without_dropping_sibling_tool_use_events() {
         repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
         let session = format!("agit-{}", "a".repeat(40));
         let mut history = String::new();
+        // Claude Code's file calls include a Read, a call like any other: only a call that
+        // writes a file is an edit.
+        let reads = usize::from(source.starts_with("claude"));
         for (index, sibling) in [false, true].into_iter().enumerate() {
             let records = native_file_calls(source, sibling);
             let native: String = records.iter().map(|record| format!("{record}\n")).collect();
@@ -207,7 +210,11 @@ fn log_counts_the_ir_category_without_dropping_sibling_tool_use_events() {
                     .any(|e| e.kind == agit::adapter::EventKind::FileEdit),
                 "{source}"
             );
-            assert_eq!(parsed.counts().tools, usize::from(sibling), "{source}");
+            assert_eq!(
+                parsed.counts().tools,
+                reads + usize::from(sibling),
+                "{source}"
+            );
             history.push_str(&raw(source, &records, &session));
             snapshot(
                 &repo,
@@ -228,7 +235,7 @@ fn log_counts_the_ir_category_without_dropping_sibling_tool_use_events() {
                 text.contains(&format!(
                     "{} events {} ToolUse",
                     records.len(),
-                    usize::from(sibling)
+                    reads + usize::from(sibling)
                 )),
                 "{source}: {text}"
             );
