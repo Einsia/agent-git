@@ -198,10 +198,13 @@ fn plan(
 }
 
 /// Writes `plan` into the runtime's index. A start takes the sections of the repository's
-/// conversations outside `running` out of it first; a conversation that comes back lists its own
-/// mirror again.
+/// conversations outside `running` out of it first, and every other repository's
+/// ([`memory::keep_to_repository`]); a conversation that comes back lists its own mirror again.
 fn apply(plan: Plan, running: &BTreeSet<String>) -> crate::Result<()> {
     let (slug, branch, dir) = (plan.lineage.slug(), plan.lineage.branch(), &plan.dir);
+    // The daemon holds no lock for the conversations it runs; a mark an earlier terminal launch
+    // left would read this one as gone.
+    memory::unmark(dir, &slug, branch);
     if let Step::Reindex = plan.step {
         return memory::reindex(dir, &slug, branch);
     }
@@ -219,7 +222,8 @@ fn apply(plan: Plan, running: &BTreeSet<String>) -> crate::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("the conversation's repository is gone"))?;
             memory::materialize_unborn(&repo, branch, &slug, dir, &source)?;
         }
-        Step::Reindex | Step::Nothing => {}
+        Step::Nothing => memory::keep_to_repository(dir, &slug, &memory::surely_running)?,
+        Step::Reindex => {}
     }
     Ok(())
 }
@@ -642,7 +646,8 @@ mod tests {
     /// A start takes out of the runtime's index the sections of the repository's conversations
     /// that are not running, and keeps a running one's. The mirror of one taken out stays as it
     /// is, an edit not collected yet included, and when that conversation comes back its section
-    /// lists the mirror again. A section of another repository is left alone.
+    /// lists the mirror again. A section of another repository goes too: a session sees only its
+    /// own repository's team memory.
     #[test]
     fn a_start_takes_out_idle_conversations_sections_and_keeps_their_edits() {
         if crate::rc::in_isolated_test(
@@ -663,7 +668,7 @@ mod tests {
         assert_eq!(folder.sections(), ["desktop-b", "desktop-c"]);
         assert_eq!(folder.given("desktop-a").as_deref(), Some(edited));
         let index = std::fs::read_to_string(folder.memory().join("MEMORY.md")).unwrap();
-        assert!(index.contains(other), "{index}");
+        assert!(!index.contains("simco/other@main"), "{index}");
 
         folder.launch(
             "desktop-a",

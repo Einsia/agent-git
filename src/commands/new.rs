@@ -364,7 +364,7 @@ pub fn run(args: Args) -> CmdResult {
     // longer materializes skills — they travel with the code repo's `.claude/skills` /
     // `.agents/skills`.
     materialize_shared(&repo, &from_head, &work_dir);
-    match super::memory::materialize(&repo, &branch, &slug, &runtime_of(&args), &work_dir) {
+    match super::memory::start(&repo, &branch, &slug, &runtime_of(&args), &work_dir) {
         Ok(Some(report)) => super::memory::report_materialize(&report),
         Ok(None) => {}
         Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
@@ -401,6 +401,7 @@ pub fn run(args: Args) -> CmdResult {
     // Asked here, a yes still sets up the hooks this session's runtime is about to load.
     super::setup::presence::when_ready();
     if args.no_launch {
+        super::memory::unhold();
         println!("\n  {}", ui::accent(&cmd));
         println!(
             "{}",
@@ -416,7 +417,9 @@ pub fn run(args: Args) -> CmdResult {
         }
         return Ok(ExitCode::Ok);
     }
-    let status = super::resume::runtime_launch(&cmd).status()?;
+    let status = super::resume::runtime_launch(&cmd).status();
+    super::memory::let_go();
+    let status = status?;
     Ok(match status.code() {
         Some(0) | None => ExitCode::Ok,
         Some(_) => ExitCode::Precondition,
