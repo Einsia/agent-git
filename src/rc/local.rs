@@ -261,7 +261,16 @@ pub(super) fn wait_ready() -> crate::Result<()> {
     }
 }
 
-pub(super) fn spawn_daemon() -> crate::Result<()> {
+/// A daemon [`spawn_daemon`] started: its process, the log its startup output goes to, and when
+/// that log was made, by the clock of the filesystem it is on, so what the daemon wrote since can
+/// be told from what an earlier daemon left.
+pub(super) struct Started {
+    pub(super) pid: u32,
+    pub(super) log: PathBuf,
+    pub(super) at: std::time::SystemTime,
+}
+
+pub(super) fn spawn_daemon() -> crate::Result<Started> {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let log = tempfile::Builder::new()
@@ -269,13 +278,12 @@ pub(super) fn spawn_daemon() -> crate::Result<()> {
         .suffix(super::daemon_guard::LOG_SUFFIX)
         .tempfile_in(super::rc_dir()?)?;
     let (log, path) = log.keep()?;
+    let at = log.metadata()?.modified()?;
     eprintln!("agitd: startup diagnostics: {}", path.display());
     #[cfg(windows)]
-    {
-        windows::spawn_daemon(log)
-    }
+    let pid = windows::spawn_daemon(log)?;
     #[cfg(unix)]
-    {
+    let pid = {
         let mut command = crate::infra::background::command(std::env::current_exe()?);
         command
             .args(["rc", "local", "start"])
@@ -297,11 +305,13 @@ pub(super) fn spawn_daemon() -> crate::Result<()> {
             });
         }
         let mut child = command.spawn()?;
+        let pid = child.id();
         std::thread::spawn(move || {
             let _ = child.wait();
         });
-        Ok(())
-    }
+        pid
+    };
+    Ok(Started { pid, log: path, at })
 }
 
 #[cfg(unix)]

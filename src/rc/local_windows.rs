@@ -150,8 +150,9 @@ async fn wait_ready() -> crate::Result<NamedPipeClient> {
     }
 }
 
-/// The daemon must not retain the launcher's inheritable SSH pipe handles.
-pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
+/// Starts the daemon and returns its process id. The daemon must not retain the launcher's
+/// inheritable SSH pipe handles.
+pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<u32> {
     use std::mem::{size_of, size_of_val};
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
@@ -295,7 +296,7 @@ pub(super) fn spawn_daemon(log: std::fs::File) -> crate::Result<()> {
     }
     let _process = security::Handle::new(process.hProcess)?;
     let _thread = security::Handle::new(process.hThread)?;
-    Ok(())
+    Ok(process.dwProcessId)
 }
 
 pub(super) fn wait_ready_sync() -> crate::Result<()> {
