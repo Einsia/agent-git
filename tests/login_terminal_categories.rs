@@ -1703,6 +1703,48 @@ fn wait_bounded(mut child: Child) -> Output {
     }
 }
 
+/// A browser launcher that stays in the foreground for as long as the browser it opened runs, as
+/// `xdg-open` does under a minimal window manager, doesn't hold the sign-in up: the approval is
+/// polled while it runs, and the sign-in completes once approved. A login that waited for the
+/// launcher to exit kept saying it was waiting after the person had approved.
+#[cfg(unix)]
+#[test]
+fn a_browser_launcher_that_keeps_running_does_not_hold_the_sign_in() {
+    use std::os::unix::fs::PermissionsExt;
+    let url = "https://hub.example.test/auth/cli?state=SYNTHETIC-state";
+    let hub = Hub::new(vec![
+        Reply::Json(json!({"state":"SYNTHETIC-state", "url":url, "expires_in":600})),
+        Reply::Json(session()),
+        Reply::Status(503),
+        Reply::Status(503),
+        Reply::Status(503),
+    ]);
+    let lab = Lab::new(&hub.base);
+    lab.seed(&hub.base);
+    let launchers = lab.home.join("launchers");
+    fs::create_dir_all(&launchers).unwrap();
+    for name in ["xdg-open", "open"] {
+        let launcher = launchers.join(name);
+        fs::write(&launcher, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        launchers.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let (status, output) =
+        terminal_command_with(&lab, &hub.base, "\r", &["login"], &[("PATH", &path)]);
+    assert_eq!(status.exit_code(), 0, "{output}");
+    let requests = hub.finish();
+    assert_request(&requests[0], "/api/auth/cli/session", json!({}));
+    assert_request(
+        &requests[1],
+        "/api/auth/cli/poll",
+        json!({"state":"SYNTHETIC-state"}),
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn terminal_enter_uses_browser_default_and_explicit_choices_select_their_flow() {
@@ -1804,6 +1846,18 @@ fn terminal_command(
     input: &str,
     args: &[&str],
 ) -> (portable_pty::ExitStatus, String) {
+    terminal_command_with(lab, base, input, args, &[])
+}
+
+/// [`terminal_command`] with `envs` set over the lab's environment.
+#[cfg(unix)]
+fn terminal_command_with(
+    lab: &Lab,
+    base: &str,
+    input: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (portable_pty::ExitStatus, String) {
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize::default())
         .unwrap();
@@ -1820,6 +1874,9 @@ fn terminal_command(
     command.env("NO_COLOR", "1");
     command.env("CI", "1");
     command.env("TERM", "xterm-256color");
+    for (name, value) in envs {
+        command.env(name, value);
+    }
     command.cwd(&lab.work);
     let mut reader = pair.master.try_clone_reader().unwrap();
     let mut writer = pair.master.take_writer().unwrap();
