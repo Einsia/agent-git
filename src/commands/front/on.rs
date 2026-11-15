@@ -26,7 +26,12 @@ pub struct OffArgs {
 }
 
 pub fn on(args: OnArgs) -> CmdResult {
-    super::finish(crate::commands::setup::presence::after(turn_on(args)))
+    let result = turn_on(args);
+    // The folder now relies on capture, so what this computer doesn't capture is said here.
+    if matches!(result, Ok(ExitCode::Ok)) {
+        crate::commands::setup::presence::say_uncaptured();
+    }
+    super::finish(crate::commands::setup::presence::after(result))
 }
 
 pub fn off(args: OffArgs) -> CmdResult {

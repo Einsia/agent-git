@@ -106,6 +106,106 @@ pub(crate) fn presence() -> Presence {
     }
 }
 
+/// A runtime on this computer whose conversations agit does not capture, why, and the one command
+/// that sets it up. No agit process runs when such a conversation starts or ends, so this is said
+/// by the commands that do run: `agit status`, and `agit on` when it turns a folder on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Uncaptured {
+    pub(crate) runtime: &'static str,
+    reason: String,
+    command: String,
+}
+
+impl Uncaptured {
+    /// The line for whoever reads it. Setting up writes into the person's runtimes, so an agent
+    /// reading it is told to ask the person first.
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "{} conversations on this computer aren't captured: {}. `{}` sets that up; an agent asks the person before running it.",
+            crate::adapter::runtime_label(self.runtime),
+            self.reason,
+            self.command
+        )
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "runtime": self.runtime, "reason": self.reason, "command": self.command,
+            "ask_user": self.line(),
+        })
+    }
+}
+
+/// Each runtime here that agit captures nothing from, judged on its own: one with neither agit's
+/// Skill nor its own capture hooks, and Claude Code holding agit's Skill without the SessionStart
+/// or Stop hook its capture runs from. A runtime counts as here as [`presence`] counts it, and one
+/// whose Skill the person turned off is their choice, not a gap. [`presence`] answers for the
+/// whole computer, so one runtime's hooks would hide another runtime that has nothing.
+pub(crate) fn uncaptured() -> Vec<Uncaptured> {
+    let off = super::skill_off::read();
+    let mut gaps = Vec::new();
+    for runtime in crate::adapter::setup_runtimes() {
+        let here = super::skill_path(runtime)
+            .and_then(|skill| runtime_folder(runtime, &skill))
+            .is_some_and(|folder| folder.symlink_metadata().is_ok());
+        if !here || off.contains(runtime) {
+            continue;
+        }
+        if !super::runtime_set_up(runtime) {
+            gaps.push(Uncaptured {
+                runtime,
+                reason: "agit isn't set up for it".into(),
+                command: format!("agit setup --runtime {runtime}"),
+            });
+        } else if runtime == "claude-code"
+            && let Some(missing) =
+                super::claude_hooks_missing().filter(|missing| !missing.is_empty())
+        {
+            gaps.push(Uncaptured {
+                runtime,
+                reason: format!(
+                    "its {} {} not installed",
+                    missing.join(" and "),
+                    if missing.len() == 1 {
+                        "hook is"
+                    } else {
+                        "hooks are"
+                    }
+                ),
+                command: "agit setup --runtime claude-code --hooks".into(),
+            });
+        }
+    }
+    gaps
+}
+
+/// Set once the running command has said [`uncaptured`] itself, so its setup notice does not say
+/// the same runtimes again.
+static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`uncaptured`] for lines a command prints, silenced by the same switches as the setup notice:
+/// `AGIT_SKIP_SETUP` and quiet presentation. A JSON answer carries [`uncaptured`] whatever they
+/// say, since it is data an agent reads, not a notice.
+pub(crate) fn uncaptured_to_say() -> Vec<Uncaptured> {
+    if skip_setup() || ui::quiet() {
+        return Vec::new();
+    }
+    uncaptured()
+}
+
+/// Says each of [`uncaptured_to_say`] now, for a command that has just made a folder rely on
+/// capture, so the person hears it at that moment rather than when the daily notice next comes
+/// round; a person at a terminal is still asked as the notice asks.
+pub(crate) fn say_uncaptured() {
+    let gaps = uncaptured_to_say();
+    for gap in &gaps {
+        ui::warning(&gap.line());
+    }
+    if !gaps.is_empty() {
+        SAID.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The runtimes installed on this computer, which bare `agit setup` sets up: those whose program is
 /// on PATH, or whose configuration folder exists, as it does once the runtime has run. A runtime
 /// installed later is set up by the next bare setup.
@@ -267,6 +367,8 @@ fn notice(may_ask: bool) {
         Action::Nothing => {}
         Action::Say => {
             match &presence {
+                // The command has just named these runtimes; the record still counts it as said.
+                _ if SAID.load(std::sync::atomic::Ordering::Relaxed) => {}
                 Presence::Partly(runtimes) => {
                     eprintln!("{}", ui::dim(&unattended_partly(runtimes)));
                 }
