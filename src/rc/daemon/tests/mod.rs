@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod bindings;
 mod guards;
 #[cfg(unix)]
 mod leases;
