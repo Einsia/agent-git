@@ -193,6 +193,88 @@ pub(crate) fn remove_opencode(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// The first line of agit's Pi extension; a file that does not start with it is not agit's.
+const PI_MARKER: &str = "// agentgit-pi-extension ";
+
+/// Where agit's Pi extension goes: a folder of its own among Pi's global extensions,
+/// `<agent dir>/extensions/agit/index.js`, which Pi loads in every folder without asking.
+pub(crate) fn pi_extension_path() -> Option<std::path::PathBuf> {
+    crate::adapter::pi::home()
+        .ok()
+        .map(|home| home.join("extensions/agit/index.js"))
+}
+
+/// agit's Pi extension for the agit at `exe`.
+fn pi_extension(exe: &str) -> String {
+    include_str!("pi.mjs")
+        .replace("__AGIT_PLUGIN_VERSION__", env!("CARGO_PKG_VERSION"))
+        .replace(
+            "__AGIT_EXE__",
+            &exe.replace('\\', "\\\\").replace('"', "\\\""),
+        )
+}
+
+/// Writes agit's Pi extension, named in setup's output. Its folder holds only that file: a folder
+/// there holding anything else, or a file agit did not write, stays as it is and setup says so,
+/// since Pi would load what is there in place of agit's. Nothing else among Pi's extensions is
+/// touched.
+pub(super) fn pi(exe: &str) -> SetupReport {
+    let Some(path) = pi_extension_path() else {
+        ui::warning("cannot install the Pi extension: HOME is not set");
+        return SetupReport::failure();
+    };
+    pi_at(&path, exe)
+}
+
+fn pi_at(path: &Path, exe: &str) -> SetupReport {
+    let ours = match std::fs::read_to_string(path) {
+        Ok(text) => text.starts_with(PI_MARKER),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let alone = path
+        .parent()
+        .is_none_or(|folder| match std::fs::read_dir(folder) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .all(|entry| entry.file_name() == "index.js"),
+            Err(_) => true,
+        });
+    if !ours || !alone {
+        ui::warning(&format!(
+            "cannot install the Pi extension: {} holds files agit did not write, so it was left as it is",
+            path.parent().unwrap_or(path).display()
+        ));
+        return SetupReport::failure();
+    }
+    let result = write_if_changed(path, &pi_extension(exe), "Pi extension");
+    if result.succeeded() {
+        ui::info(format_args!(
+            "  {} Pi extension: {}",
+            ui::ok(ui::theme::symbols().check),
+            path.display()
+        ));
+    }
+    result
+}
+
+/// Removes agit's Pi extension, and its folder once that is empty: a file there that agit did not
+/// write stays.
+pub(crate) fn remove_pi(path: &Path) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) if text.starts_with(PI_MARKER) => {
+            std::fs::remove_file(path)?;
+            if let Some(folder) = path.parent() {
+                // A folder that still holds something is not agit's to remove.
+                let _ = std::fs::remove_dir(folder);
+            }
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn openclaw_at(root: &Path, exe: &str) -> crate::Result<()> {
     let path = root.join("openclaw.json");
     let mut config: Value = match std::fs::read_to_string(&path) {
@@ -370,6 +452,58 @@ mod tests {
         assert!(!opencode_at(&path, "/a/agit").succeeded());
         assert!(!remove_opencode(&path).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        assert_eq!(std::fs::read_to_string(&neighbour).unwrap(), theirs);
+    }
+
+    /// Setup writes agit's Pi extension as the only file of its own folder among Pi's
+    /// extensions, replaces only that file, and removal deletes it and the folder it leaves empty.
+    /// A file there that agit did not write, or any other file in that folder, stays as it is and
+    /// setup refuses: Pi would load the folder's own entry in place of agit's. Other extensions
+    /// beside the folder are never touched. The extension runs this agit, starts it detached on
+    /// `agent_settled` and `session_shutdown`, and hands it only the session's id, file and folder
+    /// and which of the two it was.
+    /// A setup that overwrote by name would destroy the person's own extension, and one that
+    /// passed more would hand agit the conversation through a path no privacy check reads.
+    #[test]
+    fn setup_owns_only_its_own_pi_extension_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let extensions = root.path().join("extensions");
+        let path = extensions.join("agit/index.js");
+        let theirs = "export default function (pi) {}\n";
+        std::fs::create_dir_all(&extensions).unwrap();
+        let neighbour = extensions.join("theirs.js");
+        std::fs::write(&neighbour, theirs).unwrap();
+
+        assert!(pi_at(&path, "/a/agit").succeeded());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.starts_with(PI_MARKER));
+        assert!(written.contains("const AGIT = \"/a/agit\";"));
+        assert!(written.contains("pi.on(\"agent_settled\""));
+        assert!(written.contains("pi.on(\"session_shutdown\""));
+        assert!(written.contains("detached: true"));
+        assert!(written.contains(
+            "session_id: session,\n        transcript_path: file,\n        cwd: ctx.cwd,"
+        ));
+        assert!(!written.contains("__AGIT_"));
+        assert!(pi_at(&path, "/b/agit").succeeded());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("const AGIT = \"/b/agit\";")
+        );
+        assert!(remove_pi(&path).unwrap());
+        assert!(!path.exists() && !path.parent().unwrap().exists());
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, theirs).unwrap();
+        assert!(!pi_at(&path, "/a/agit").succeeded());
+        assert!(!remove_pi(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        std::fs::remove_file(&path).unwrap();
+        let manifest = path.with_file_name("package.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        assert!(!pi_at(&path, "/a/agit").succeeded());
+        assert!(!path.exists());
         assert_eq!(std::fs::read_to_string(&neighbour).unwrap(), theirs);
     }
 }

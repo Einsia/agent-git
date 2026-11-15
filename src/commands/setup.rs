@@ -649,6 +649,12 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
     {
         report.merge(native::opencode(&exe));
     }
+    if runtime.wants("pi")
+        && (runtime.named("pi")
+            || crate::adapter::get("pi").is_ok_and(|adapter| adapter.available()))
+    {
+        report.merge(native::pi(&exe));
+    }
 
     report
 }
@@ -1581,6 +1587,17 @@ fn remove_skill(targets: Targets<'_>) -> CmdResult {
         {
             ui::warning(&format!(
                 "cannot remove agit's OpenCode plugin {}: {error}",
+                path.display()
+            ));
+            failed = true;
+            continue;
+        }
+        if name == "pi"
+            && let Some(path) = native::pi_extension_path()
+            && let Err(error) = native::remove_pi(&path)
+        {
+            ui::warning(&format!(
+                "cannot remove agit's Pi extension {}: {error}",
                 path.display()
             ));
             failed = true;

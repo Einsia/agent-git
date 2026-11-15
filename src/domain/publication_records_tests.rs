@@ -443,6 +443,28 @@ fn every_runtime_keeps_its_replies_and_tools_and_withholds_unmarked_user_message
     use RecordClass::*;
     let cases = [
         (
+            "pi",
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"fix"}]}}),
+            Conversation,
+        ),
+        (
+            // Published, it loses the skill it was expanded with, so as written it is not the
+            // conversation.
+            "pi",
+            json!({"type":"message","id":"u2","parentId":"u1","timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"<skill name=\"s\" location=\"/s\">\nbody\n</skill>\n\nfix"}]}}),
+            RuntimeContext,
+        ),
+        (
+            "pi",
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"t","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{}}],"stopReason":"toolUse"}}),
+            Conversation,
+        ),
+        (
+            "pi",
+            json!({"type":"message","id":"s1","parentId":null,"timestamp":"t","message":{"role":"system","content":"rules"}}),
+            RuntimeContext,
+        ),
+        (
             "gemini-cli",
             json!({"id":"m1","type":"user","content":[{"text":"fix"}]}),
             Conversation,
@@ -1833,4 +1855,103 @@ fn openclaw_publishes_only_the_words_the_person_typed() {
         other["message"][field] = value;
         assert_eq!(published("openclaw", &other), None, "{field}");
     }
+}
+
+/// Pi publishes the words the person typed, the assistant's messages and the tool results without
+/// what only Pi's interface shows, and every one of them unchanged when judged again. A skill the
+/// person invoked keeps only the words after it; files named on the command line become one notice
+/// and take their images with them; a marker outside the place Pi expands into turns the prompt
+/// into a notice. The header, the system prompt, a `!` command, what extensions add, compaction and
+/// branch summaries and bookkeeping are left out, and a kept entry under a left-out one links to
+/// the nearest kept ancestor. A rule that kept the skill's file, the inlined file or the system
+/// prompt fails a row; one that dropped the words beside them fails another.
+#[test]
+fn pi_publishes_only_the_words_the_person_typed() {
+    use crate::domain::privacy::omission::Omission;
+    let file = Omission::File.text();
+    let whole = Omission::NativeRecord.text();
+    let user = |content: Value| {
+        json!({"type":"message","id":"u1","parentId":null,"timestamp":"t",
+            "message":{"role":"user","content":content,"timestamp":1}})
+    };
+    let image = json!({"type":"image","mimeType":"image/png","data":"CANARY-PI-IMAGE"});
+    let skill = "<skill name=\"review\" location=\"/home/p/.pi/agent/skills/review/SKILL.md\">\nReferences are relative to /home/p/.pi/agent/skills/review.\n\nCANARY-PI-SKILL-BODY\n</skill>";
+    let inlined = "<file name=\"/work/notes.txt\">\nCANARY-PI-FILE-BODY\n</file>\n<file name=\"/work/shot.png\"></file>\n";
+    let rows: Vec<(Value, Option<Value>)> = vec![
+        (json!("plain words"), Some(json!("plain words"))),
+        (
+            json!([{"type":"text","text":"look"}, image]),
+            Some(json!([{"type":"text","text":"look"}, image])),
+        ),
+        (
+            json!([{"type":"text","text":format!("{skill}\n\nfocus on tests")}]),
+            Some(json!([{"type":"text","text":"focus on tests"}])),
+        ),
+        (json!([{"type":"text","text":skill}]), None),
+        (
+            json!([{"type":"text","text":format!("{inlined}explain these")}, image]),
+            Some(json!([{"type":"text","text":file},{"type":"text","text":"explain these"}])),
+        ),
+        (json!(format!("{inlined}")), None),
+        (
+            json!([{"type":"text","text":format!("piped text\n{inlined}explain")}]),
+            Some(json!([{"type":"text","text":whole}])),
+        ),
+        (
+            json!([{"type":"text","text":"first"},{"type":"text","text":skill}]),
+            Some(json!([{"type":"text","text":whole}])),
+        ),
+        (
+            json!([{"type":"text","text":format!("{skill}\nno blank line")}]),
+            Some(json!([{"type":"text","text":whole}])),
+        ),
+        (
+            json!([{"type":"text","text":"<file name=\"/work/a\">\nunclosed"}]),
+            Some(json!([{"type":"text","text":whole}])),
+        ),
+    ];
+    for (content, expected) in rows {
+        let published_once = published("pi", &user(content.clone()));
+        assert_eq!(
+            published_once
+                .as_ref()
+                .map(|kept| &kept["message"]["content"]),
+            expected.as_ref(),
+            "{content}"
+        );
+        if let Some(kept) = &published_once {
+            assert_eq!(
+                published("pi", kept).as_ref(),
+                Some(kept),
+                "judged again: {kept}"
+            );
+        }
+    }
+
+    let result = json!({"type":"message","id":"r1","parentId":"a1","timestamp":"t","message":{
+        "role":"toolResult","toolCallId":"c1","toolName":"read","isError":false,
+        "content":[{"type":"text","text":"fn a() {}"}],
+        "details":{"fullOutputPath":"/tmp/CANARY-PI-DETAILS"},"nestedCalls":[{"id":"CANARY-PI-NESTED"}]}});
+    let kept = published("pi", &result).unwrap();
+    assert!(!kept.to_string().contains("CANARY-PI"), "{kept}");
+    assert_eq!(kept["message"]["content"], result["message"]["content"]);
+    assert_eq!(published("pi", &kept).as_ref(), Some(&kept));
+
+    let entries = [
+        json!({"type":"session","version":3,"id":"s","timestamp":"t","cwd":"/work"}),
+        json!({"type":"message","id":"sys","parentId":null,"timestamp":"t","message":{"role":"system","content":"CANARY-PI-SYSTEM"}}),
+        json!({"type":"message","id":"u1","parentId":"sys","timestamp":"t","message":{"role":"user","content":"fix it"}}),
+        json!({"type":"message","id":"b1","parentId":"u1","timestamp":"t","message":{"role":"bashExecution","command":"cat .env","output":"CANARY-PI-BASH"}}),
+        json!({"type":"custom_message","id":"x1","parentId":"b1","timestamp":"t","customType":"ext","content":"CANARY-PI-EXTENSION","display":true}),
+        json!({"type":"compaction","id":"k1","parentId":"x1","timestamp":"t","summary":"CANARY-PI-COMPACTION","firstKeptEntryId":"u1","tokensBefore":1}),
+        json!({"type":"branch_summary","id":"k2","parentId":"k1","timestamp":"t","fromId":"u1","summary":"CANARY-PI-BRANCH"}),
+        json!({"type":"model_change","id":"m1","parentId":"k2","timestamp":"t","provider":"p","modelId":"m"}),
+        json!({"type":"message","id":"a1","parentId":"m1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"Fixed."}],"stopReason":"stop"}}),
+    ];
+    let sequence = published_sequence(entries.iter().map(|entry| ("pi", entry)));
+    let kept: Vec<&Value> = sequence.iter().flatten().collect();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(!format!("{kept:?}").contains("CANARY-PI"), "{kept:?}");
+    assert_eq!(kept[0]["parentId"], Value::Null);
+    assert_eq!(kept[1]["parentId"], "u1");
 }

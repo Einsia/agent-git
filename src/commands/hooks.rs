@@ -398,9 +398,23 @@ fn event_from(runtime: Option<&str>, buf: &str) -> Option<Event> {
                 return None;
             }
         }
+        // Pi's extension names the session file; one that is not a Pi session file in Pi's
+        // sessions folder is not read.
+        Some("pi") if !names_pi_session(&event) => {
+            eprintln!("agit: the extension names no Pi session file; nothing captured");
+            return None;
+        }
         _ => {}
     }
     Some(event)
+}
+
+/// Whether `event` names a Pi session file agit may read.
+fn names_pi_session(event: &Event) -> bool {
+    event
+        .transcript_path
+        .as_deref()
+        .is_some_and(|path| crate::adapter::pi::is_session_file(std::path::Path::new(path)))
 }
 
 /// Which runtime is calling us.

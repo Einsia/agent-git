@@ -54,6 +54,7 @@ pub const RUNTIMES: &[&str] = &[
     "openclaw",
     "workbuddy",
     "gemini-cli",
+    "pi",
 ];
 
 /// The runtimes whose user messages are published with only the request inside their
@@ -268,6 +269,7 @@ impl Classifier {
             "openclaw" => openclaw(record),
             "workbuddy" => workbuddy(record),
             "gemini-cli" => gemini(record),
+            "pi" => pi(record),
             _ => None,
         }
     }
@@ -318,18 +320,25 @@ impl PublishedSequence {
                 .and_then(|parent| dropped.get(parent))
                 .cloned()
         };
+        // Pi's entries form a tree by `id` and `parentId`, the way Claude's chain by `uuid` and
+        // `parentUuid`.
+        let (own, links): (&str, &[&str]) = if source == "pi" {
+            ("id", &["parentId"])
+        } else {
+            ("uuid", &["parentUuid", "logicalParentUuid"])
+        };
         match kept {
             None => {
-                if let Some(uuid) = content.get("uuid").and_then(Value::as_str) {
-                    let parent = ancestor("parentUuid", &self.dropped)
-                        .or_else(|| content.get("parentUuid").cloned())
+                if let Some(uuid) = content.get(own).and_then(Value::as_str) {
+                    let parent = ancestor(links[0], &self.dropped)
+                        .or_else(|| content.get(links[0]).cloned())
                         .unwrap_or(Value::Null);
                     self.dropped.insert(uuid.to_owned(), parent);
                 }
                 None
             }
             Some(mut kept) => {
-                for field in ["parentUuid", "logicalParentUuid"] {
+                for &field in links {
                     if let Some(parent) = ancestor(field, &self.dropped) {
                         kept[field] = parent;
                     }
@@ -1359,6 +1368,143 @@ fn workbuddy(record: &Map<String, Value>) -> Option<Value> {
         _ => false,
     };
     kept.then(|| Value::Object(record.clone()))
+}
+
+// ---- Pi -----------------------------------------------------------------------------------
+
+/// Where Pi starts a skill it expanded into a prompt.
+const PI_SKILL_START: &str = "<skill name=\"";
+const PI_SKILL_END: &str = "\n</skill>";
+/// Where Pi starts a file named on its command line, inlined into the first prompt.
+const PI_FILE_START: &str = "<file name=\"";
+const PI_FILE_END: &str = "</file>";
+
+/// Pi: the person's prompts as they typed them, the assistant's replies, reasoning and tool calls,
+/// and tool results without what only Pi's interface shows (`details`, `nestedCalls`). The session
+/// header, the system prompt, a command the person ran with `!`, what extensions add, compaction
+/// and branch summaries, edits of earlier context, and bookkeeping (model, thinking level, usage,
+/// labels, names) are left out.
+fn pi(record: &Map<String, Value>) -> Option<Value> {
+    if record.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    let message = record.get("message")?.as_object()?;
+    match message.get("role")?.as_str()? {
+        "assistant" => Some(Value::Object(record.clone())),
+        "toolResult" => {
+            let mut kept = record.clone();
+            let message = kept.get_mut("message")?.as_object_mut()?;
+            message.remove("details");
+            message.remove("nestedCalls");
+            Some(Value::Object(kept))
+        }
+        "user" => {
+            let content = pi_prompt(message.get("content")?)?;
+            let mut kept = record.clone();
+            kept.get_mut("message")?["content"] = content;
+            Some(Value::Object(kept))
+        }
+        _ => None,
+    }
+}
+
+/// A Pi prompt's `content` as the person typed it. Pi stores what it sent, so a skill the person
+/// invoked is stored expanded, `<skill …>` with the skill's file, followed by the words typed after
+/// it; only those words are kept. Files named on the command line are inlined ahead of the words,
+/// each as a `<file …>` block, and are replaced by one notice; images that came with them are left
+/// out too, while an image pasted into a prompt without files is kept. Pi expands only into a
+/// prompt's first text part, so a marker anywhere else, or a block that does not close where Pi
+/// closes it, can't be told apart from the words, and the whole prompt becomes a notice. `None`
+/// when nothing typed is left. A prompt published this way is published unchanged when judged
+/// again.
+fn pi_prompt(content: &Value) -> Option<Value> {
+    use crate::domain::privacy::omission::Omission;
+    let whole = || Some(serde_json::json!([{"type":"text","text": Omission::NativeRecord.text()}]));
+    let notice = serde_json::json!({"type":"text","text": Omission::File.text()});
+    let parts = match content {
+        Value::String(text) if !pi_holds_marker(text) => {
+            return (!text.trim().is_empty()).then(|| content.clone());
+        }
+        Value::String(text) => vec![serde_json::json!({"type":"text","text": text})],
+        Value::Array(parts) => parts.clone(),
+        _ => return whole(),
+    };
+    let first = parts.iter().position(|part| part["type"] == "text");
+    let mut files = false;
+    let mut kept = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        match part["type"].as_str() {
+            Some("text") => {
+                let Some(text) = part["text"].as_str() else {
+                    return whole();
+                };
+                let words = if !pi_holds_marker(text) {
+                    text
+                } else if Some(index) == first {
+                    let Some((inlined, words)) = pi_typed_words(text) else {
+                        return whole();
+                    };
+                    if inlined {
+                        files = true;
+                        kept.push(notice.clone());
+                    }
+                    words
+                } else {
+                    return whole();
+                };
+                if !words.trim().is_empty() {
+                    let mut part = part.clone();
+                    part["text"] = Value::String(words.to_owned());
+                    kept.push(part);
+                }
+            }
+            Some("image") => kept.push(part.clone()),
+            _ => return whole(),
+        }
+    }
+    if files {
+        kept.retain(|part| part["type"] != "image");
+    }
+    kept.iter()
+        .any(|part| *part != notice)
+        .then_some(Value::Array(kept))
+}
+
+/// The words typed in a Pi prompt's first text part, and whether files were inlined ahead of
+/// them. `None` when a marker is not where Pi puts it: a skill block that is the whole part or is
+/// followed by a blank line and the words, file blocks that each open the rest of the part and close
+/// before the next, and no marker left among the words.
+fn pi_typed_words(text: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = text.strip_prefix(PI_SKILL_START) {
+        let end = rest.find(PI_SKILL_END)?;
+        let after = &rest[end + PI_SKILL_END.len()..];
+        if rest[..end].contains(PI_SKILL_START) || rest[..end].contains("</skill>") {
+            return None;
+        }
+        let words = match after {
+            "" => "",
+            _ => after.strip_prefix("\n\n")?,
+        };
+        return (!pi_holds_marker(words)).then_some((false, words));
+    }
+    let mut rest = text;
+    let mut inlined = false;
+    while let Some(block) = rest.strip_prefix(PI_FILE_START) {
+        let end = block.find(PI_FILE_END)?;
+        if block[..end].contains(PI_FILE_START) {
+            return None;
+        }
+        rest = &block[end + PI_FILE_END.len()..];
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+        inlined = true;
+    }
+    (inlined && !pi_holds_marker(rest)).then_some((true, rest))
+}
+
+fn pi_holds_marker(text: &str) -> bool {
+    [PI_SKILL_START, PI_FILE_START, "</skill>", PI_FILE_END]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 // ---- Gemini CLI ---------------------------------------------------------------------------
