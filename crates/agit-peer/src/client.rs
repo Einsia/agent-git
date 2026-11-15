@@ -376,12 +376,17 @@ impl Client {
         target: &Device,
         scope: &SessionController,
     ) -> anyhow::Result<DialedConnection> {
+        // A delivery-only scope asks for that grant and nothing wider; a full controller's request
+        // carries no body, as it always did.
+        let body = scope
+            .delivery_only
+            .then(|| serde_json::json!({"delivery_only": true}));
         let dialed: DialedConnection = self
             .request(
                 Method::POST,
                 "/api/peer/session-connections",
                 &source.token,
-                None,
+                body,
             )
             .await?;
         let grant = &dialed.connection.grant;
@@ -567,6 +572,10 @@ impl Client {
             headers.push(("X-Agit-Peer-Offer".into(), "grant-v1".into()));
             headers.push(("X-Agit-Session-Controller".into(), "session-v1".into()));
             headers.push(("X-Agit-Project-Controller".into(), "project-v1".into()));
+            // The device admits a delivery-only session controller (publication-delivery-only-v1):
+            // the Hub mints that grant, and runs its delivery driver, only for a device that says
+            // so here, before any controller route has described the device.
+            headers.push(("X-Agit-Session-Delivery".into(), "delivery-only-v1".into()));
         }
         Ok(config)
     }
@@ -985,6 +994,17 @@ mod tests {
             headers
                 .iter()
                 .any(|(name, value)| name == "X-Agit-Peer-Join" && value == "join-ticket")
+        );
+        // Presence says the device takes a delivery-only controller: the Hub reads it before any
+        // controller route exists, and mints nothing delivery-only for a device that doesn't say it.
+        let Config::WebSocket { headers, .. } = client.presence_config(&executor).unwrap() else {
+            panic!("cloud transport must remain a WebSocket");
+        };
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "X-Agit-Session-Delivery"
+                    && value == "delivery-only-v1")
         );
         assert!(serialized.get("session_controller").is_none());
         assert!(serialized.get("project_controller").is_none());
