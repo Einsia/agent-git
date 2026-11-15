@@ -167,7 +167,7 @@ pub(crate) fn run_when_ready<T>(
 }
 
 /// What looking at the Hub found before a branch is judged.
-enum Looked {
+pub(super) enum Looked {
     /// The repository has no Hub: no origin, or this machine's `local/` namespace.
     Unpublished,
     /// `origin/<branch>` holds the Hub's tip.
@@ -190,7 +190,7 @@ const HUB_LOOK: std::time::Duration = std::time::Duration::from_secs(20);
 /// The Hub's tip is read first and the branch fetched only when it moved, without tags: the Hub
 /// advertises every ref of the repository on each read, and a fetch of a repository with a turn
 /// tag per commit would also bring down every tag.
-fn look_at_hub(repo: &Repo, slug: &str, branch: &str) -> Looked {
+pub(super) fn look_at_hub(repo: &Repo, slug: &str, branch: &str) -> Looked {
     let Ok((owner, name)) = super::parse_slug(slug) else {
         return Looked::Unpublished;
     };

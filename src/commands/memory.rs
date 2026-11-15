@@ -2426,11 +2426,7 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
         None => {
             // The shared no-target error names a positional `<owner>/<repo>@<branch>`; here the
             // target is `--into` (a positional of `distill` is a file name).
-            let ctx = super::context::from_env().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no explicit session target; name it with `--into <owner>/<repo>@<branch>` or set AGIT_SESSION=<owner>/<repo>@<branch>"
-                )
-            })?;
+            let ctx = super::context::from_env().ok_or_else(no_target)?;
             (super::context::qualify(&ctx.repo), ctx.branch)
         }
     };
@@ -2445,11 +2441,85 @@ fn target_of(into: Option<&str>) -> crate::Result<Option<Target>> {
         ui::error(&format!("{slug} doesn’t exist locally."));
         return Ok(None);
     };
+    // Every memory command reads the session's own branch here. One that only the Hub holds, or
+    // only an earlier `agit fetch` brought down as the Hub's copy, has no memory of this
+    // computer's to read; git's own refusal of the missing ref names neither fact.
+    if !primary.has_ref(&tree_ref(&branch)) {
+        let fetched = primary.has_ref(&format!("refs/remotes/origin/{branch}"));
+        ui::error(&format!(
+            "`{branch}` is not in this clone of {slug}{}",
+            if fetched {
+                "; only the Hub's copy of it is here, and memory commands read the session's own branch"
+            } else {
+                ""
+            }
+        ));
+        ui::hint("run this on the computer that holds that session");
+        return Ok(None);
+    }
     Ok(Some(Target {
         primary,
         slug,
         branch,
     }))
+}
+
+/// The refusal of a memory command given no target, naming the conversations this folder saved
+/// to as targets to copy: a session's branch name is long, and nothing else in the terminal
+/// shows it.
+fn no_target() -> anyhow::Error {
+    let message = "no explicit session target; name it with `--into <owner>/<repo>@<branch>` or set AGIT_SESSION=<owner>/<repo>@<branch>".to_owned();
+    let here = folder_targets();
+    if here.is_empty() {
+        return anyhow::anyhow!(message);
+    }
+    let named = here
+        .iter()
+        .map(|target| format!("`--into {target}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    super::Hinted {
+        message,
+        hint: format!("this folder's conversations, newest first: {named}"),
+    }
+    .into()
+}
+
+/// `<owner>/<repo>@<branch>` of each conversation linked to the current folder, newest first.
+fn folder_targets() -> Vec<String> {
+    const SHOWN: usize = 5;
+    let (Ok(Some(store)), Ok(here)) =
+        (crate::domain::store::Store::open(), std::env::current_dir())
+    else {
+        return Vec::new();
+    };
+    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let here = canonical(&here);
+    let mut found: Vec<(std::time::SystemTime, String)> = crate::domain::link::list(&store)
+        .into_iter()
+        .filter(|link| link.is_active())
+        .filter(|link| {
+            link.cwd
+                .as_deref()
+                .is_some_and(|cwd| canonical(Path::new(cwd)) == here)
+        })
+        .filter_map(|link| {
+            let target = format!(
+                "{}@{}",
+                super::context::slug_of_link(&link)?,
+                link.branch.as_deref()?
+            );
+            Some((crate::domain::link::touched_at(&store, &link), target))
+        })
+        .collect();
+    found.sort_by_key(|(touched, _)| std::cmp::Reverse(*touched));
+    let mut seen = BTreeSet::new();
+    found
+        .into_iter()
+        .map(|(_, target)| target)
+        .filter(|target| seen.insert(target.clone()))
+        .take(SHOWN)
+        .collect()
 }
 
 pub fn run(args: Args) -> CmdResult {
@@ -2766,6 +2836,24 @@ fn distill_cmd(
         ui::error("this repo has no main file line.");
         return Ok(ExitCode::Precondition);
     }
+    match hub_main(target) {
+        HubMain::Behind(state) => {
+            ui::error(&format!(
+                "{}'s main on the Hub has changes this clone doesn't have ({state}); a distill planned now can't see them, so nothing was distilled",
+                target.slug
+            ));
+            ui::hint(&format!(
+                "bring them in: `agit pull {}@main`, then distill again",
+                target.slug
+            ));
+            return Ok(ExitCode::Precondition);
+        }
+        HubMain::Unchecked(cause) => ui::warning(&format!(
+            "couldn't check {}'s main on the Hub ({cause}); a change made there since this clone last fetched it is not taken into account",
+            target.slug
+        )),
+        HubMain::Holds => {}
+    }
     let plan = distill_plan(primary, branch)?;
     let pending = plan.items.clone();
     for p in paths.iter().chain(take_mine) {
@@ -2901,6 +2989,20 @@ fn distill_cmd(
         &commit[..9.min(commit.len())]
     ));
     if !ui::quiet() {
+        // The count alone does not say what main now holds of a file it had changed as well.
+        for item in &chosen {
+            let name = item.name();
+            let landed = match item {
+                Pending::Carry(_) => format!("carried as `{branch}` has it"),
+                Pending::Merge(_) => format!("merged; the changes {main} had made to it are kept"),
+                Pending::Clash(_) => format!(
+                    "your lines replace {main}'s change to the same lines; its other changes are kept"
+                ),
+                Pending::Remove(_) => format!("deleted from {main}"),
+                Pending::Conflict(_) => continue,
+            };
+            println!("  memory/{name}: {landed}");
+        }
         let slug = &target.slug;
         // Distill writes main here and publishes nothing. The session's own branch, which holds the
         // memory it carried, needs its own push while the Hub holds neither its tip nor the public
@@ -2921,6 +3023,73 @@ fn distill_cmd(
         }
     }
     Ok(ExitCode::Ok)
+}
+
+/// Where this clone's main stands against the Hub's, read before a distill is planned.
+enum HubMain {
+    /// The Hub's main holds nothing this clone's main lacks, or there is no Hub copy of it.
+    Holds,
+    /// The Hub's main has commits this clone's does not; the counts and the Hub's tip.
+    Behind(String),
+    /// The Hub could not be asked; why, in a sentence that names no secret.
+    Unchecked(String),
+}
+
+/// A distill plans against this clone's main, so one planned while the Hub's main holds a change
+/// to the same file sees none of it: the person is told the change landed, and only the push
+/// says main diverged. The Hub's tip is read into `origin/main`, as `agit fetch` would; main
+/// itself moves only by the distill's own commit, and `agit pull` stays the one way the Hub's
+/// changes come in. The Hub's tip counts as held when main holds it or the commit it publishes.
+fn hub_main(target: &Target) -> HubMain {
+    use super::resume::Looked;
+    let primary = &target.primary;
+    match super::resume::look_at_hub(primary, &target.slug, "main") {
+        // With no Hub copy of main, the Hub holds nothing this clone could miss.
+        Looked::Unpublished | Looked::Absent => return HubMain::Holds,
+        Looked::Unreachable(cause) => return HubMain::Unchecked(cause),
+        Looked::Checked => {}
+    }
+    let tip = |reference: &str| {
+        primary
+            .git_opt(&["rev-parse", "--verify", "--quiet", reference])
+            .map(|oid| oid.trim().to_owned())
+    };
+    let (Some(local), Some(hub)) = (
+        tip("refs/heads/main^{commit}"),
+        tip("refs/remotes/origin/main^{commit}"),
+    ) else {
+        return HubMain::Unchecked("its main could not be read here".into());
+    };
+    let holds = local == hub
+        || primary
+            .git_opt(&["merge-base", "--is-ancestor", &hub, &local])
+            .is_some()
+        || super::pull::published_from(
+            primary,
+            &crate::domain::privacy_git::Projections::open(primary),
+            "main",
+            &local,
+            &hub,
+        )
+        .is_some();
+    if holds {
+        return HubMain::Holds;
+    }
+    let short = &hub[..12.min(hub.len())];
+    let state = primary
+        .git_opt(&[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{local}...{hub}"),
+        ])
+        .and_then(|counts| {
+            let mut counts = counts.split_whitespace();
+            Some((counts.next()?.to_owned(), counts.next()?.to_owned()))
+        })
+        .map(|(ahead, behind)| format!("local +{ahead} / Hub +{behind}; Hub tip {short}"))
+        .unwrap_or_else(|| format!("Hub tip {short}"));
+    HubMain::Behind(state)
 }
 
 /// How a [`Pending::Conflict`] came about, for the sentence that reports it.
