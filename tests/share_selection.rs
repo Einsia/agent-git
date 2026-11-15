@@ -1374,6 +1374,222 @@ fn a_share_by_session_id_works_before_agit_has_a_session_store() {
     assert!(!store.exists());
 }
 
+/// A live copy holds the conversation as this computer has it, so before the confirmation the
+/// share says how many of its turns the Hub has not received, under `--yes` too, and nothing when
+/// the Hub has them all. What is compared is every record, whole: the same tool run with other
+/// input or giving another result, tool calls that came after the upload, or a new turn, each makes
+/// the turn one the Hub hasn't received, though the turn counts are equal. Without the line, work
+/// its author saw as not yet uploaded would be published unannounced; comparing turn counts, or
+/// turn summaries that leave out what tools were given and gave back, misses those.
+#[test]
+fn a_live_share_says_how_many_turns_the_hub_has_not_received() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let said = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+    const LINE: &str = "this link holds the conversation as it is on this computer, including 1 turn the Hub has not received";
+
+    // Never uploaded: its one turn.
+    f.native("never-uploaded");
+    let shared = f.success(&["never-uploaded", "--public"], None);
+    assert!(said(&shared).contains(LINE), "{}", said(&shared));
+
+    // Saved on `talk`, its second turn running a tool, and the Hub's copy of `talk` is that.
+    let id = "49249249-2492-4492-8492-492492492492";
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{id}.jsonl"));
+    let record = |uuid: &str, parent: &str, role: &str, content: Value| {
+        format!(
+            "{}\n",
+            json!({"type":role,"uuid":uuid,"parentUuid":parent,"sessionId":id,"cwd":f.home(),
+                "message":{"role":role,"content":content}})
+        )
+    };
+    let first = format!(
+        "{}{}",
+        record("u1", "", "user", json!("PROMPT-1")),
+        record(
+            "a1",
+            "u1",
+            "assistant",
+            json!([{"type":"text","text":"ANSWER-1"}])
+        )
+    );
+    let second = |command: &str, result: &str| {
+        format!(
+            "{}{}{}{}",
+            record("u2", "a1", "user", json!("PROMPT-2")),
+            record(
+                "a2",
+                "u2",
+                "assistant",
+                json!([{"type":"tool_use","id":"t1","name":"Bash","input":{"command":command}}])
+            ),
+            record(
+                "r1",
+                "a2",
+                "user",
+                json!([{"type":"tool_result","tool_use_id":"t1","content":result}])
+            ),
+            record(
+                "a3",
+                "r1",
+                "assistant",
+                json!([{"type":"text","text":"Done."}])
+            )
+        )
+    };
+    std::fs::write(&transcript, format!("{first}{}", second("ls", "a.txt"))).unwrap();
+    let imported = f.run_command(
+        "import",
+        &[
+            id,
+            "--from",
+            "claude-code",
+            "--into",
+            "me/paper@talk",
+            "--independent",
+        ],
+        None,
+    );
+    assert!(imported.status.success(), "{}", said(&imported));
+    f.repo
+        .git(&["update-ref", "refs/remotes/origin/talk", "refs/heads/talk"])
+        .unwrap();
+    let shared = f.success(&[id, "--public"], None);
+    assert!(
+        !said(&shared).contains("the Hub has not received"),
+        "{}",
+        said(&shared)
+    );
+
+    for (here, case) in [
+        (
+            format!("{first}{}", second("ls -la", "a.txt")),
+            "the same tool with other input",
+        ),
+        (
+            format!("{first}{}", second("ls", "b.txt")),
+            "the same call with another result",
+        ),
+        (
+            format!(
+                "{first}{}{}{}",
+                second("ls", "a.txt"),
+                record(
+                    "a4",
+                    "a3",
+                    "assistant",
+                    json!([{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"pwd"}}])
+                ),
+                record(
+                    "r2",
+                    "a4",
+                    "user",
+                    json!([{"type":"tool_result","tool_use_id":"t2","content":"/work"}])
+                )
+            ),
+            "only tool records came after the upload",
+        ),
+        (
+            format!(
+                "{first}{}{}",
+                second("ls", "a.txt"),
+                record("u3", "a3", "user", json!("PROMPT-3"))
+            ),
+            "a turn begun here",
+        ),
+    ] {
+        std::fs::write(&transcript, here).unwrap();
+        let shared = f.success(&[id, "--public"], None);
+        assert!(said(&shared).contains(LINE), "{case}: {}", said(&shared));
+    }
+}
+
+/// A shared Codex conversation keeps its tool calls and their outputs, of each kind Codex writes:
+/// `function_call`, `custom_tool_call` and `local_shell_call`, each paired with its output. A
+/// share that kept only the person's and the agent's words would show a page with the work left
+/// out.
+#[test]
+fn a_shared_codex_conversation_keeps_its_tool_calls() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let id = "019a4430-0000-7000-8000-000000000443";
+    let sessions = f.home().join(".codex/sessions/2026/11/15");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let item = |payload: Value| json!({"type": "response_item", "payload": payload});
+    let lines = [
+        json!({"type": "session_meta", "payload": {"id": id, "cwd": f.home(), "timestamp": "2026-11-15T00:00:00Z"}}),
+        item(
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look around"}]}),
+        ),
+        item(
+            json!({"type": "function_call", "call_id": "c1", "name": "shell", "arguments": json!({"command": ["echo", "SHELL-ARGUMENT-443"]}).to_string()}),
+        ),
+        item(
+            json!({"type": "function_call_output", "call_id": "c1", "output": "SHELL-OUTPUT-443"}),
+        ),
+        item(
+            json!({"type": "custom_tool_call", "call_id": "c2", "name": "apply_patch", "input": "PATCH-INPUT-443"}),
+        ),
+        item(
+            json!({"type": "custom_tool_call_output", "call_id": "c2", "output": "PATCH-OUTPUT-443"}),
+        ),
+        item(
+            json!({"type": "local_shell_call", "call_id": "c3", "status": "completed", "action": {"type": "exec", "command": ["echo", "LOCAL-ARGUMENT-443"]}}),
+        ),
+        item(
+            json!({"type": "local_shell_call_output", "call_id": "c3", "output": "LOCAL-OUTPUT-443"}),
+        ),
+        item(
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Looked."}]}),
+        ),
+    ];
+    std::fs::write(
+        sessions.join(format!("rollout-2026-11-15T00-00-00-{id}.jsonl")),
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let live = f.success(&[id], None);
+    let live = decrypted(&f, &live);
+    let imported = f.run_command(
+        "import",
+        &[
+            id,
+            "--from",
+            "codex",
+            "--into",
+            "me/paper@codex-line",
+            "--independent",
+        ],
+        None,
+    );
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let saved = f.success(&["me/paper@codex-line"], None);
+    let saved = decrypted(&f, &saved);
+    let mut missing = Vec::new();
+    for (source, payload) in [("live copy", &live), ("saved VIEW", &saved)] {
+        for marker in [
+            "SHELL-ARGUMENT-443",
+            "SHELL-OUTPUT-443",
+            "PATCH-INPUT-443",
+            "PATCH-OUTPUT-443",
+            "LOCAL-ARGUMENT-443",
+            "LOCAL-OUTPUT-443",
+        ] {
+            if !payload.contains(marker) {
+                missing.push(format!("{source}: {marker}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{missing:#?}");
+}
+
 /// An OpenCode conversation of one finished turn that ran in `cwd`, in OpenCode's own database
 /// under `home`, the only place that runtime keeps it.
 fn opencode_conversation(home: &Path, cwd: &Path, id: &str, prompt: &str) {

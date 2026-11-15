@@ -1043,7 +1043,27 @@ impl Projector<'_> {
                             "name":payload["name"], "input":decode_arguments(payload)
                         })],
                     )),
-                    Some("function_call_output") => Some((
+                    // The two other calls Codex writes pass the same gates as a function call:
+                    // the tool policy by name, the scanner and the placeholders.
+                    Some("custom_tool_call") => Some((
+                        "assistant".into(),
+                        vec![json!({
+                            "type":"tool_use", "id":payload["call_id"],
+                            "name":payload["name"], "input":{"input":payload["input"]}
+                        })],
+                    )),
+                    Some("local_shell_call") => Some((
+                        "assistant".into(),
+                        vec![json!({
+                            "type":"tool_use", "id":payload["call_id"],
+                            "name":"local_shell", "input":local_shell_input(&payload["action"])
+                        })],
+                    )),
+                    Some(
+                        "function_call_output"
+                        | "custom_tool_call_output"
+                        | "local_shell_call_output",
+                    ) => Some((
                         "user".into(),
                         vec![json!({
                             "type":"tool_result", "tool_use_id":payload["call_id"],
@@ -2039,6 +2059,21 @@ fn record_cwd(record: &Envelope) -> Option<&str> {
     }
 }
 
+/// What a Codex `local_shell_call` publishes of its action: the command, where it ran and its
+/// time limit. Its environment and user stay out: an environment can hold a key, and the model
+/// may have written one into it.
+fn local_shell_input(action: &Value) -> Value {
+    Value::Object(
+        ["command", "working_directory", "timeout_ms"]
+            .into_iter()
+            .filter_map(|field| {
+                let value = action.get(field).filter(|value| !value.is_null())?;
+                Some((field.to_owned(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
 fn decode_arguments(payload: &Value) -> Value {
     payload["arguments"]
         .as_str()
@@ -2276,6 +2311,12 @@ mod tests {
         assert!(format!("{refused:#}").contains(GEMINI_NOT_PROJECTED));
     }
 
+    /// Every call Codex writes, `function_call`, `custom_tool_call` and `local_shell_call`, and its
+    /// output are projected open by default and omitted by the tool policy, the scanner's
+    /// replacements applied to both halves. A kind left unmapped is projected as an unsupported
+    /// record, so a share or export shows the work as missing while the upload shows it. A
+    /// `local_shell_call` projects its command, folder and time limit, never its environment or
+    /// user: either can hold a key.
     #[test]
     fn tool_policy_defaults_open_and_scoped_overrides_control_both_halves() {
         use super::super::privacy::ToolPolicy;
@@ -2286,6 +2327,12 @@ mod tests {
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"shell","output":"SHELL_BODY PRIVATE_MARKER"}}),
             json!({"type":"response_item","payload":{"type":"function_call","call_id":"file","name":"read_file","arguments":"{\"path\":\"outside-include.txt\",\"extra_option\":true}"}}),
             json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"file","output":"FILE_BODY"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"patch","name":"apply_patch","input":"PATCH_INPUT PRIVATE_MARKER"}}),
+            json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"patch","output":"PATCH_BODY"}}),
+            json!({"type":"response_item","payload":{"type":"local_shell_call","call_id":"local","status":"completed","action":{
+                "type":"exec","command":["echo","LOCAL_COMMAND"],"timeout_ms":1000,
+                "env":{"TOKEN":"ENV_CANARY"},"user":"USER_CANARY"}}}),
+            json!({"type":"response_item","payload":{"type":"local_shell_call_output","call_id":"local","output":"LOCAL_BODY"}}),
         ].into_iter().map(|record| format!("{record}\n")).collect::<String>();
         let log = transcript::wrap_lines(&raw, "codex", &session);
         let mut policy = PrivacyPolicy {
@@ -2311,7 +2358,18 @@ mod tests {
         let visible = project(&policy);
         assert!(visible.log().contains("SHELL_BODY MASKED"));
         assert!(visible.log().contains("FILE_BODY"));
+        for shown in [
+            "PATCH_INPUT MASKED",
+            "PATCH_BODY",
+            "LOCAL_COMMAND",
+            "LOCAL_BODY",
+        ] {
+            assert!(visible.log().contains(shown), "{shown}");
+        }
         assert!(!visible.log().contains("PRIVATE_MARKER"));
+        for kept_out in ["ENV_CANARY", "USER_CANARY"] {
+            assert!(!visible.log().contains(kept_out), "{kept_out}");
+        }
         let default_digest = policy.digest().unwrap();
         policy.tools = ToolPolicy {
             omit: true,
@@ -2325,6 +2383,9 @@ mod tests {
         assert!(!hidden.log().contains("exec_command"));
         assert!(!hidden.log().contains("SHELL_BODY"));
         assert!(!hidden.log().contains("FILE_BODY"));
+        for hidden_part in ["PATCH_INPUT", "PATCH_BODY", "LOCAL_COMMAND", "LOCAL_BODY"] {
+            assert!(!hidden.log().contains(hidden_part), "{hidden_part}");
+        }
         assert!(hidden.log().contains(Omission::ToolCall.text()));
         assert!(hidden.log().contains(Omission::ToolOutput.text()));
         let parsed = transcript::display::parse(hidden.log()).unwrap();
