@@ -92,6 +92,8 @@ fn turn_on(mut args: OnArgs) -> CmdResult {
     })?;
     // An explicit `agit on` brings a policy that never looked at OpenCode's store forward, once.
     let look = crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None);
+    // And one bound before agit captured Pi, the same way.
+    let _ = crate::commands::project::look_for_earlier_pi(&root);
     let code = report(&root, &enabled, stays_off.as_deref())?;
     if !crate::commands::json::is_capturing()
         && let Some(line) = look
@@ -182,10 +184,11 @@ pub(crate) fn enable(
     let claude = crate::adapter::get("claude-code").is_ok_and(|adapter| adapter.available());
     let codex = crate::adapter::get("codex").is_ok_and(|adapter| adapter.available())
         && crate::commands::setup::codex_hooks_enabled();
-    if !claude && !codex {
+    let pi = crate::adapter::get("pi").is_ok_and(|adapter| adapter.available());
+    if !claude && !codex && !pi {
         return Err(Refusal::new(
             "no agent on this computer can upload its sessions by itself",
-            "install Claude Code, or Codex with its hooks feature enabled, then run this again",
+            "install Claude Code, Pi, or Codex with its hooks feature enabled, then run this again",
             ExitCode::Precondition,
         )
         .into());
@@ -779,7 +782,8 @@ impl RuntimeState {
 
 /// What each agent here does with the folder's conversations. Codex is asked whether it runs
 /// AgentGit's hooks in `root`: a folder can be on while Codex holds the hooks for review, and then
-/// nothing from Codex saves, so its line says so rather than that every turn saves.
+/// nothing from Codex saves, so its line says so rather than that every turn saves. Pi saves by
+/// itself only through agit's extension, so its line says so when this agit's isn't installed.
 fn runtimes(root: &Path) -> Vec<(&'static str, RuntimeState)> {
     let mut runtimes = Vec::new();
     if crate::adapter::get("claude-code").is_ok_and(|a| a.available()) {
@@ -795,6 +799,21 @@ fn runtimes(root: &Path) -> Vec<(&'static str, RuntimeState)> {
             RuntimeState::CatchUp
         };
         runtimes.push(("codex", state));
+    }
+    if crate::adapter::get("pi").is_ok_and(|a| a.available()) {
+        let installed = crate::commands::setup::native::pi_extension_current(
+            &crate::commands::setup::exe_str(),
+        );
+        runtimes.push((
+            "pi",
+            if installed {
+                RuntimeState::Automatic
+            } else {
+                RuntimeState::Inactive(
+                    "nothing is saved yet: agit's Pi extension isn't installed; to add it: `agit setup --runtime pi --hooks`".into(),
+                )
+            },
+        ));
     }
     runtimes
 }

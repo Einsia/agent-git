@@ -153,6 +153,10 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
     } else {
         None
     };
+    // And one bound before agit captured Pi, the same way.
+    if on {
+        let _ = crate::commands::project::look_for_earlier_pi(&root);
+    }
     let here = super::sessions_in(&root)?;
     let mut left_out = 0;
     let mut dropped = 0;
