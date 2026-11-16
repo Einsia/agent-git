@@ -2479,3 +2479,128 @@ mod opencode_status {
         );
     }
 }
+
+/// In a folder bound to a repository, `agit status` answers first whether the folder's
+/// conversations are uploaded, with the same verdict as each row's upload cell, and names each
+/// one that isn't with why and what to run (#498). It reports only that repository; the rest of
+/// the computer is behind `--all`, which still lists it. When a session record can't be read, it
+/// says it can't tell.
+#[test]
+fn status_answers_first_whether_the_folders_conversations_are_uploaded() {
+    use sha2::{Digest, Sha256};
+    let mut lab = Lab::new();
+    let work = lab.cwd();
+    let bindings = lab.root.path().join("agit/workspaces");
+    fs::create_dir_all(&bindings).unwrap();
+    let id = &hex::encode(Sha256::digest(work.to_string_lossy().as_bytes()))[..16];
+    fs::write(
+        bindings.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({"dir": work, "repo": "alice/notes"})).unwrap(),
+    )
+    .unwrap();
+    lab.claim.cwd = Some(work.to_string_lossy().into_owned());
+    lab.save();
+    // A second repository on this computer, which a bare status leaves to `--all`.
+    let other = Repo::at(lab.root.path().join("agit/repos/bob/other"));
+    fs::create_dir_all(other.root()).unwrap();
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["commit", "--allow-empty", "-m", "elsewhere", "--quiet"][..],
+        &["branch", "bob-branch"][..],
+    ] {
+        success(
+            lab.command("git")
+                .arg("-C")
+                .arg(other.root())
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+    }
+    let status = |args: &[&str]| {
+        let output = lab
+            .command(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let tree = lab.git(&["rev-parse", "HEAD^{tree}"]);
+    let older = lab.git(&["commit-tree", &tree, "-m", "an older upload"]);
+    for (remote, first, upload) in [
+        (
+            Some(lab.head.clone()),
+            "This folder's conversation is uploaded to alice/notes.".to_owned(),
+            "uploaded",
+        ),
+        (
+            Some(older),
+            "Not uploaded yet (1 of this folder's 1 in alice/notes):\n  alice/notes@topic: the Hub has an older copy of it\n    → `agit push alice/notes@topic`".to_owned(),
+            "waiting",
+        ),
+        (
+            None,
+            "Not uploaded yet (1 of this folder's 1 in alice/notes):\n  alice/notes@topic: the Hub has no copy of it yet\n    → `agit push alice/notes@topic`".to_owned(),
+            "not_uploaded",
+        ),
+    ] {
+        match &remote {
+            Some(commit) => lab.git(&["update-ref", "refs/remotes/origin/topic", commit]),
+            None => lab.git(&["update-ref", "-d", "refs/remotes/origin/topic"]),
+        };
+        let text = status(&["status"]);
+        assert!(text.starts_with(&first), "{first}\n---\n{text}");
+        assert!(!text.contains("bob/other") && !text.contains("bob-branch"), "{text}");
+        assert!(
+            text.contains("1 other repository on this computer: `agit status --all` reports it"),
+            "{text}"
+        );
+        // The answer and the row read the same cell.
+        let document: serde_json::Value =
+            serde_json::from_str(&status(&["--json", "status"])).unwrap();
+        let value = &document["result"]["value"];
+        let answer = &value["folder"]["conversations"][0];
+        assert_eq!(answer["target"], "alice/notes@topic", "{value:#}");
+        assert_eq!(answer["upload"], upload, "{value:#}");
+        assert_eq!(value["folder"]["complete"], true, "{value:#}");
+        assert_eq!(value["folder"]["all_uploaded"], upload == "uploaded");
+        let row = value["sessions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == SID)
+            .unwrap();
+        assert_eq!(row["upload"], answer["upload"], "{row:#}");
+    }
+    // `--all` still reports every repository.
+    let all = status(&["status", "--all"]);
+    assert!(all.contains("bob/other"), "{all}");
+    assert!(
+        !all.starts_with("This folder") && !all.contains("other repository on this computer"),
+        "{all}"
+    );
+    // A session record that can't be read may be one of this folder's, so the answer can't tell,
+    // as the rows can't, though every conversation it did read is uploaded.
+    lab.git(&["update-ref", "refs/remotes/origin/topic", &lab.head]);
+    fs::write(
+        lab.store.root().join(&lab.claim.source).join("broken.json"),
+        "{malformed",
+    )
+    .unwrap();
+    let text = status(&["status"]);
+    assert!(
+        text.starts_with("Can't tell whether this folder's conversations are all uploaded to alice/notes: some session records on this computer can't be read."),
+        "{text}"
+    );
+    assert!(!text.contains("conversation is uploaded"), "{text}");
+    let document: serde_json::Value = serde_json::from_str(&status(&["--json", "status"])).unwrap();
+    let value = &document["result"]["value"];
+    assert_eq!(value["sessions"]["incomplete"], true, "{value:#}");
+    assert_eq!(value["folder"]["complete"], false, "{value:#}");
+    assert!(value["folder"]["all_uploaded"].is_null(), "{value:#}");
+    assert!(
+        value["folder"]["conversations"][0]["uploaded"].is_null(),
+        "{value:#}"
+    );
+}
