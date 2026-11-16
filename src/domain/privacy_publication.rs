@@ -304,11 +304,14 @@ impl SessionProjection {
     /// private source LOG, for the person's own preview; nothing of it is published.
     pub fn left_out(&self) -> Result<LeftOut> {
         let records = storage::parse_envelopes(&self.source_log)?;
-        let published = crate::domain::publication_records::published_sequence(
-            records
-                .iter()
-                .map(|record| (record.source.as_str(), &record.content)),
-        );
+        let published =
+            crate::domain::publication_records::published_sequence(records.iter().map(|record| {
+                (
+                    record.source.as_str(),
+                    record.session_id.as_str(),
+                    &record.content,
+                )
+            }));
         let reason = Omission::NativeRecord.reason();
         let mut left_out = LeftOut::default();
         let mut kinds = BTreeMap::<String, usize>::new();
@@ -675,11 +678,13 @@ pub fn project_session(
     // The public projection carries conversation records only; the private layer keeps them all.
     // A quote is projected as the record it quotes, so it carries no more than that record does.
     let public_records: Vec<Option<Envelope>> =
-        crate::domain::publication_records::published_sequence(
-            records
-                .iter()
-                .map(|record| (record.source.as_str(), &record.content)),
-        )
+        crate::domain::publication_records::published_sequence(records.iter().map(|record| {
+            (
+                record.source.as_str(),
+                record.session_id.as_str(),
+                &record.content,
+            )
+        }))
         .into_iter()
         .zip(&records)
         .map(|(kept, record)| {

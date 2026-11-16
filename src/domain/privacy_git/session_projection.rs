@@ -335,7 +335,8 @@ impl Projector {
                 .then(|| deliveries.as_typed(&envelope.content))
                 .flatten();
             let recorded = typed.as_ref().unwrap_or(&envelope.content);
-            let Some(content) = sequence.next(&envelope.source, recorded) else {
+            let Some(content) = sequence.next(&envelope.source, &envelope.session_id, recorded)
+            else {
                 rewritten += 1;
                 occurrences.push(None);
                 return Ok(());

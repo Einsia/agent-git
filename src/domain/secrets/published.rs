@@ -336,11 +336,13 @@ impl<'a> Pass<'a> {
             self.unscanned.record_unsupported(label);
             return;
         };
-        let published = publication_records::published_sequence(
-            envelopes
-                .iter()
-                .map(|envelope| (envelope.source.as_str(), &envelope.content)),
-        );
+        let published = publication_records::published_sequence(envelopes.iter().map(|envelope| {
+            (
+                envelope.source.as_str(),
+                envelope.session_id.as_str(),
+                &envelope.content,
+            )
+        }));
         for (index, record) in published.into_iter().enumerate() {
             let Some(mut record) = record else {
                 continue;

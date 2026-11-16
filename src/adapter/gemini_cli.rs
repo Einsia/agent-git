@@ -24,7 +24,7 @@ use super::{
 use crate::Result;
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -298,6 +298,107 @@ struct Seen {
     results: BTreeSet<String>,
 }
 
+/// The messages Gemini's loader holds after the records read so far, in its order. A message
+/// written again keeps its place; one removed and then written again goes last.
+#[derive(Default)]
+pub(crate) struct Replay {
+    order: Vec<String>,
+    held: HashSet<String>,
+}
+
+impl Replay {
+    /// Replays one record the way Gemini's loader does: a rewind, then a patch's removals and
+    /// order, then a message, then a legacy `$set.messages`.
+    pub(crate) fn apply(&mut self, record: &Value) {
+        if let Some(target) = record["$rewindTo"].as_str() {
+            self.rewind(target);
+        } else if let Some(patch) = record.get("$patch") {
+            for id in patch["removeIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                self.remove(id);
+            }
+            if let Some(ids) = patch["orderIds"].as_array() {
+                self.reorder(ids.iter().filter_map(Value::as_str));
+            }
+        } else if let Some(id) = record["id"].as_str() {
+            self.message(id);
+        } else if let Some(messages) = record["$set"]["messages"].as_array() {
+            self.replace(
+                messages
+                    .iter()
+                    .filter(|message| message.get("$patch").is_none())
+                    .filter_map(|message| message["id"].as_str()),
+            );
+        }
+    }
+
+    /// Whether message `id` is part of the conversation.
+    pub(crate) fn holds(&self, id: &str) -> bool {
+        self.held.contains(id)
+    }
+
+    /// For a rewind to `id`: the first message from `id` on that `wanted` accepts, `Some(None)`
+    /// when none from there is, and `None` when the conversation does not hold `id`.
+    pub(crate) fn first_from(
+        &self,
+        id: &str,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Option<Option<&str>> {
+        let at = self.order.iter().position(|held| held == id)?;
+        Some(
+            self.order[at..]
+                .iter()
+                .map(String::as_str)
+                .find(|held| wanted(held)),
+        )
+    }
+
+    fn message(&mut self, id: &str) {
+        if self.held.insert(id.to_owned()) {
+            self.order.push(id.to_owned());
+        }
+    }
+
+    /// `$rewindTo`: the message and every one after it go. A target it does not hold empties it.
+    fn rewind(&mut self, id: &str) {
+        let keep = self.order.iter().position(|held| held == id).unwrap_or(0);
+        for gone in self.order.drain(keep..) {
+            self.held.remove(&gone);
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        if self.held.remove(id) {
+            self.order.retain(|held| held != id);
+        }
+    }
+
+    /// `orderIds`: the messages it names and holds move to the end, in its order.
+    fn reorder<'a>(&mut self, ids: impl Iterator<Item = &'a str>) {
+        let mut moved = Vec::<String>::new();
+        for id in ids {
+            if self.held.contains(id) && !moved.iter().any(|known| known == id) {
+                moved.push(id.to_owned());
+            }
+        }
+        self.order.retain(|held| !moved.contains(held));
+        self.order.extend(moved);
+    }
+
+    /// A legacy `$set.messages`: the conversation is the messages it lists.
+    fn replace<'a>(&mut self, ids: impl Iterator<Item = &'a str>) {
+        self.order.clear();
+        self.held.clear();
+        for id in ids {
+            self.message(id);
+        }
+    }
+}
+
 /// What Gemini CLI names its tool that edits a file in place (`EDIT_TOOL_NAME`).
 const EDIT_TOOL: &str = "replace";
 
@@ -370,6 +471,88 @@ fn call_failed(call: &Value) -> bool {
             .all(|part| part["functionResponse"]["response"]["error"].is_null())
 }
 
+/// The events message record `value` (message `id`, of `kind`) yields: what is new in it for its
+/// message, past what `seen` says earlier lines showed. Each call it brings is owned by `id`.
+fn read_message(
+    value: &Value,
+    id: &str,
+    kind: &str,
+    line: usize,
+    seen: &mut HashMap<String, Seen>,
+    parsed: &mut Parsed,
+    call_owner: &mut HashMap<String, String>,
+) -> Vec<Event> {
+    let ts = message::timestamp(&value["timestamp"]);
+    let mut events = Vec::new();
+    let entry = seen.entry(id.to_owned()).or_default();
+    let text = parts_text(&value["content"]);
+    if !entry.text && !text.is_empty() {
+        entry.text = true;
+        let event_kind = match kind {
+            "user" => EventKind::UserPrompt,
+            "gemini" => EventKind::AssistantReply,
+            _ => EventKind::Other,
+        };
+        events.push(Event::text(event_kind, text, ts.clone()));
+    }
+    let thoughts = value["thoughts"].as_array().map(Vec::len).unwrap_or(0);
+    for thought in value["thoughts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .skip(entry.thoughts)
+    {
+        let words = thought["description"]
+            .as_str()
+            .or(thought["subject"].as_str())
+            .unwrap_or_default();
+        events.push(Event::text(EventKind::Other, words, ts.clone()));
+    }
+    entry.thoughts = entry.thoughts.max(thoughts);
+    if kind == "gemini" {
+        for call in value["toolCalls"].as_array().into_iter().flatten() {
+            let Some(call_id) = call["id"].as_str() else {
+                continue;
+            };
+            if entry.calls.insert(call_id.to_owned()) {
+                let native = Call {
+                    line,
+                    id: call_id.to_owned(),
+                    name: call["name"].as_str().unwrap_or("unknown").to_owned(),
+                    input: call["args"].clone(),
+                };
+                let mut event = message::tool_event(&native, ts.clone());
+                // Gemini's edit tool is `replace`, a name the shared set leaves out as too general
+                // across runtimes; `write_file` is in it.
+                if native.name == EDIT_TOOL {
+                    event.kind = EventKind::FileEdit;
+                }
+                events.push(event);
+                call_owner.insert(call_id.to_owned(), id.to_owned());
+                parsed.calls.push(native);
+                parsed.pending.push(call_id.to_owned());
+            }
+            if call_finished(call)
+                && entry.results.insert(call_id.to_owned())
+                && !parsed.outputs.iter().any(|output| output.id == call_id)
+            {
+                let output = Output {
+                    id: call_id.to_owned(),
+                    text: result_text(&call["result"]),
+                    error: call_failed(call),
+                };
+                events.push(Event::text(EventKind::ToolResult, &output.text, ts.clone()));
+                parsed.outputs.push(output);
+                parsed.pending.retain(|pending| pending != call_id);
+            }
+        }
+    }
+    events
+}
+
+/// The conversation in `text` as Gemini replays it. A message a later rewind or patch removed
+/// yields no conversation event, and its calls and results are not part of the session, so what
+/// is shown, counted or resumed into another runtime is the conversation Gemini resumes.
 pub(super) fn parse(text: &str) -> Result<Parsed> {
     let mut parsed = Parsed {
         session: Session {
@@ -383,6 +566,10 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
         pending: vec![],
     };
     let mut seen: HashMap<String, Seen> = HashMap::new();
+    let mut replay = Replay::default();
+    // The message each event, and each call, belongs to.
+    let mut owners: Vec<Option<String>> = Vec::new();
+    let mut call_owner: HashMap<String, String> = HashMap::new();
     let mut lines = text.lines().enumerate().peekable();
     while let Some((line, raw)) = lines.next() {
         if raw.trim().is_empty() {
@@ -402,11 +589,13 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
             );
             parsed.session.id = id.to_owned();
         }
+        replay.apply(&value);
         let ts = message::timestamp(&value["timestamp"]);
         let mut events = Vec::new();
+        let mut owned: Vec<Option<String>> = Vec::new();
         if let Some(patch) = value.get("$patch") {
-            // A patch answers calls by id; it can also edit or drop messages, which only the VIEW
-            // follows: what was read before stays as it was read.
+            // A patch answers calls by id, and can remove or reorder messages, which the replay
+            // follows; a message it edits stays as it was read.
             let updates: Vec<&Value> = std::iter::once(patch)
                 .chain(patch["updates"].as_array().into_iter().flatten())
                 .collect();
@@ -419,7 +608,7 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
                         continue;
                     }
                     let owner = update["id"].as_str().unwrap_or_default().to_owned();
-                    let entry = seen.entry(owner).or_default();
+                    let entry = seen.entry(owner.clone()).or_default();
                     if entry.results.insert(id.to_owned())
                         && !parsed.outputs.iter().any(|output| output.id == id)
                     {
@@ -429,6 +618,7 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
                             error: call_failed(call),
                         };
                         events.push(Event::text(EventKind::ToolResult, &output.text, ts.clone()));
+                        owned.push(Some(owner.clone()));
                         parsed.outputs.push(output);
                         parsed.pending.retain(|pending| pending != id);
                     }
@@ -440,66 +630,60 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
         } else if let (Some(id), Some(kind)) = (value["id"].as_str(), value["type"].as_str())
             && !is_metadata(&value)
         {
-            let entry = seen.entry(id.to_owned()).or_default();
-            let text = parts_text(&value["content"]);
-            if !entry.text && !text.is_empty() {
-                entry.text = true;
-                let event_kind = match kind {
-                    "user" => EventKind::UserPrompt,
-                    "gemini" => EventKind::AssistantReply,
-                    _ => EventKind::Other,
-                };
-                events.push(Event::text(event_kind, text, ts.clone()));
+            events = read_message(
+                &value,
+                id,
+                kind,
+                line,
+                &mut seen,
+                &mut parsed,
+                &mut call_owner,
+            );
+            if events.is_empty() {
+                events.push(Event::text(EventKind::Other, "", ts));
             }
-            let thoughts = value["thoughts"].as_array().map(Vec::len).unwrap_or(0);
-            for thought in value["thoughts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .skip(entry.thoughts)
+            owned = vec![Some(id.to_owned()); events.len()];
+        } else if let Some(messages) = value["$set"]["messages"].as_array() {
+            // A legacy checkpoint: the conversation is the messages it lists, each read as the
+            // record it is. It replaces what came before whole, a message it lists again under the
+            // same id included: that message's earlier text and calls are not part of it, nor a
+            // call it no longer holds.
+            for (event, owner) in parsed.session.events.iter_mut().zip(owners.iter_mut()) {
+                if owner.take().is_some() {
+                    let line = event.line;
+                    *event = Event::text(EventKind::Other, "", event.timestamp.take());
+                    event.line = line;
+                }
+            }
+            let replaced: BTreeSet<String> = parsed
+                .calls
+                .iter()
+                .filter(|call| call_owner.contains_key(&call.id))
+                .map(|call| call.id.clone())
+                .collect();
+            parsed.calls.retain(|call| !replaced.contains(&call.id));
+            parsed
+                .outputs
+                .retain(|output| !replaced.contains(&output.id));
+            parsed.pending.retain(|id| !replaced.contains(id));
+            call_owner.clear();
+            seen.clear();
+            for message in messages
+                .iter()
+                .filter(|message| message.get("$patch").is_none())
             {
-                let words = thought["description"]
-                    .as_str()
-                    .or(thought["subject"].as_str())
-                    .unwrap_or_default();
-                events.push(Event::text(EventKind::Other, words, ts.clone()));
-            }
-            entry.thoughts = entry.thoughts.max(thoughts);
-            if kind == "gemini" {
-                for call in value["toolCalls"].as_array().into_iter().flatten() {
-                    let Some(call_id) = call["id"].as_str() else {
-                        continue;
-                    };
-                    if entry.calls.insert(call_id.to_owned()) {
-                        let native = Call {
-                            line,
-                            id: call_id.to_owned(),
-                            name: call["name"].as_str().unwrap_or("unknown").to_owned(),
-                            input: call["args"].clone(),
-                        };
-                        let mut event = message::tool_event(&native, ts.clone());
-                        // Gemini's edit tool is `replace`, a name the shared set leaves out as
-                        // too general across runtimes; `write_file` is in it.
-                        if native.name == EDIT_TOOL {
-                            event.kind = EventKind::FileEdit;
-                        }
-                        events.push(event);
-                        parsed.calls.push(native);
-                        parsed.pending.push(call_id.to_owned());
-                    }
-                    if call_finished(call)
-                        && entry.results.insert(call_id.to_owned())
-                        && !parsed.outputs.iter().any(|output| output.id == call_id)
-                    {
-                        let output = Output {
-                            id: call_id.to_owned(),
-                            text: result_text(&call["result"]),
-                            error: call_failed(call),
-                        };
-                        events.push(Event::text(EventKind::ToolResult, &output.text, ts.clone()));
-                        parsed.outputs.push(output);
-                        parsed.pending.retain(|pending| pending != call_id);
-                    }
+                if let (Some(id), Some(kind)) = (message["id"].as_str(), message["type"].as_str()) {
+                    let read = read_message(
+                        message,
+                        id,
+                        kind,
+                        line,
+                        &mut seen,
+                        &mut parsed,
+                        &mut call_owner,
+                    );
+                    owned.extend(vec![Some(id.to_owned()); read.len()]);
+                    events.extend(read);
                 }
             }
             if events.is_empty() {
@@ -508,11 +692,32 @@ pub(super) fn parse(text: &str) -> Result<Parsed> {
         } else {
             events.push(Event::text(EventKind::Other, "", ts));
         }
+        owned.resize(events.len(), None);
+        owners.extend(owned);
         parsed
             .session
             .events
             .extend(events.into_iter().map(|event| event.at_line(line)));
     }
+    let gone = |id: &String| !replay.holds(id);
+    for (event, owner) in parsed.session.events.iter_mut().zip(&owners) {
+        if owner.as_ref().is_some_and(gone) {
+            let line = event.line;
+            *event = Event::text(EventKind::Other, "", event.timestamp.take());
+            event.line = line;
+        }
+    }
+    let dropped: BTreeSet<String> = parsed
+        .calls
+        .iter()
+        .filter(|call| call_owner.get(&call.id).is_some_and(gone))
+        .map(|call| call.id.clone())
+        .collect();
+    parsed.calls.retain(|call| !dropped.contains(&call.id));
+    parsed
+        .outputs
+        .retain(|output| !dropped.contains(&output.id));
+    parsed.pending.retain(|id| !dropped.contains(id));
     Ok(parsed)
 }
 
@@ -957,6 +1162,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["c2"]
         );
+    }
+
+    /// A message a rewind or a patch removed is not part of the conversation, as Gemini's loader
+    /// replays the file: a rewind drops its target and every message after it in the order a patch
+    /// left, a removal drops one message, a rewind to a message the file does not hold drops them
+    /// all, and a legacy checkpoint replaces them whole with the messages it lists, one it lists
+    /// under an id read before included. A call of a dropped message is not open. A reader that
+    /// kept every message the file wrote shows and resumes what the person took back; one that
+    /// ignored the order drops the wrong messages; one that read a checkpoint on top of what came
+    /// before keeps a message's old text and its calls.
+    #[test]
+    fn a_message_taken_back_is_not_part_of_the_conversation() {
+        let text = [
+            json!({"sessionId":SESSION,"projectHash":"p","startTime":"t","lastUpdated":"t","kind":"main"}),
+            json!({"id":"m1","timestamp":"t","type":"user","content":[{"text":"FIRST"}]}),
+            json!({"id":"m2","timestamp":"t","type":"gemini","content":[{"text":"SECOND"}],
+                "toolCalls":[{"id":"c1","name":"read_file","args":{"file_path":"a"},"status":"scheduled"}]}),
+            json!({"id":"m3","timestamp":"t","type":"user","content":[{"text":"THIRD"}]}),
+            json!({"$patch":{"orderIds":["m1"]}}),
+            json!({"$rewindTo":"m3"}),
+            json!({"id":"m4","timestamp":"t","type":"user","content":[{"text":"FOURTH"}]}),
+            json!({"$patch":{"removeIds":["m2"]}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+        let said = |text: &str| -> Vec<String> {
+            GeminiCli
+                .parse(text)
+                .unwrap()
+                .events
+                .into_iter()
+                .filter_map(|event| event.text)
+                .filter(|text| !text.is_empty())
+                .collect()
+        };
+        assert_eq!(said(&text), ["FOURTH"]);
+        assert!(GeminiCli.open_tool_calls(&text).is_empty());
+        // A legacy checkpoint is the conversation it lists, read from the checkpoint itself.
+        let checkpoint = format!(
+            "{text}{}\n",
+            json!({"$set":{"messages":[{"id":"m9","timestamp":"t","type":"user","content":"NEW"}]}})
+        );
+        assert_eq!(said(&checkpoint), ["NEW"]);
+        // It replaces a message it lists under the same id whole: its earlier text, and a call it
+        // no longer holds.
+        let reused = [
+            json!({"id":"m1","timestamp":"t","type":"user","content":"OLD"}),
+            json!({"id":"m2","timestamp":"t","type":"gemini","content":"WORKING",
+                "toolCalls":[{"id":"c1","name":"read_file","args":{"file_path":"a"},"status":"scheduled"}]}),
+            json!({"$set":{"messages":[
+                {"id":"m1","timestamp":"t","type":"user","content":"NEW"},
+                {"id":"m2","timestamp":"t","type":"gemini","content":"DONE"},
+            ]}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+        assert_eq!(said(&reused), ["NEW", "DONE"]);
+        assert!(GeminiCli.open_tool_calls(&reused).is_empty());
+        let cleared = format!("{text}{}\n", json!({"$rewindTo":"elsewhere"}));
+        assert!(said(&cleared).is_empty());
     }
 
     /// A Gemini call is an edit when it writes a file: `replace`, Gemini's edit tool, and

@@ -12,7 +12,13 @@
 //! Every line a snapshot keeps has a published line, a stub included, so the public LOG names the
 //! records the source LOG keeps one for one: the next snapshot finds the lines published before it
 //! by position, and reads what they hold from them, never from the source lines they came from.
+//!
+//! A message the person took back before it was ever published, by a rewind or a patch among the
+//! lines the same snapshot adds, goes out as stubs and its results not at all: the published
+//! rewind still names it, so a copy replays to the same conversation. What was published before
+//! stays as it was; only the lines a snapshot adds can publish less.
 
+use crate::adapter::gemini_cli::Replay;
 use crate::domain::{storage, transcript::Envelope};
 use anyhow::Result;
 use serde_json::{Map, Value};
@@ -55,6 +61,18 @@ pub(super) fn publish_once(public_lines: &mut [Option<String>], fresh: &[bool]) 
             .flatten()
             .map(|id| (record.session_id.clone(), id.to_owned()))
     };
+    // What each session's conversation holds once every line, published or added, is replayed.
+    let mut replays: HashMap<String, Replay> = HashMap::new();
+    for record in records.iter().flatten() {
+        if record.source == SOURCE {
+            replays
+                .entry(record.session_id.clone())
+                .or_default()
+                .apply(&record.content);
+        }
+    }
+    let taken_back =
+        |session: &str, id: &str| replays.get(session).is_some_and(|replay| !replay.holds(id));
     let mut last = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(record) = record
@@ -73,12 +91,15 @@ pub(super) fn publish_once(public_lines: &mut [Option<String>], fresh: &[bool]) 
             hold(&mut held, &record.session_id, &record.content);
             continue;
         }
-        let content = if key(record).is_some_and(|key| last.get(&key) != Some(&index)) {
+        let kept = without_taken_back(&record.content, |id| taken_back(&record.session_id, id));
+        let content = if key(record).is_some_and(|key| {
+            last.get(&key) != Some(&index) || taken_back(&record.session_id, &key.1)
+        }) {
             None
         } else {
-            new_parts(&held, &record.session_id, &record.content)
+            new_parts(&held, &record.session_id, &kept)
         }
-        .unwrap_or_else(|| stub(&record.content));
+        .unwrap_or_else(|| stub(&kept));
         hold(&mut held, &record.session_id, &content);
         if content != record.content {
             public_lines[index] = Some(storage::envelope_line(&Envelope {
@@ -92,10 +113,36 @@ pub(super) fn publish_once(public_lines: &mut [Option<String>], fresh: &[bool]) 
     Ok(())
 }
 
+/// `content` without the results a patch brings to messages `taken_back` names.
+fn without_taken_back(content: &Value, taken_back: impl Fn(&str) -> bool) -> Value {
+    let mut content = content.clone();
+    if let Some(updates) = content
+        .get_mut("$patch")
+        .and_then(|patch| patch.get_mut("updates"))
+        .and_then(Value::as_array_mut)
+    {
+        updates.retain(|update| !update["id"].as_str().is_some_and(&taken_back));
+    }
+    content
+}
+
+/// A patch as published: `updates`, with the messages it removes and orders kept beside them so a
+/// copy replays the same way.
+fn patch_with(patch: &Value, updates: Vec<Value>) -> Value {
+    let mut published = Map::new();
+    published.insert("updates".into(), Value::Array(updates));
+    for key in ["removeIds", "orderIds"] {
+        if let Some(ids) = patch.get(key) {
+            published.insert(key.into(), ids.clone());
+        }
+    }
+    serde_json::json!({"$patch": published})
+}
+
 /// A record naming only its message, for a copy whose parts are published elsewhere.
 fn stub(content: &Value) -> Value {
-    if content.get("$patch").is_some() {
-        return serde_json::json!({"$patch": {"updates": []}});
+    if let Some(patch) = content.get("$patch") {
+        return patch_with(patch, Vec::new());
     }
     let mut stub = Map::new();
     for field in ["id", "timestamp", "type"] {
@@ -182,7 +229,7 @@ fn new_parts(held: &HashMap<Key, Parts>, session: &str, content: &Value) -> Opti
                 })
             })
             .collect();
-        return (!updates.is_empty()).then(|| serde_json::json!({"$patch": {"updates": updates}}));
+        return (!updates.is_empty()).then(|| patch_with(patch, updates));
     }
     let Some(id) = content["id"].as_str() else {
         return Some(content.clone());
@@ -324,6 +371,40 @@ mod tests {
             published[5],
             Some(json!({"$patch":{"updates":[]}})),
             "a result already published"
+        );
+    }
+
+    /// A message the person took back before it was ever published goes out as stubs, and the
+    /// result a patch brings it not at all; a message published before keeps what it published,
+    /// and the snapshot adds only the rewind and the removal. A patch keeps the messages it
+    /// removes and orders. Publishing every added line sends what the person took back; stubbing a
+    /// published line rewrites what readers already hold.
+    #[test]
+    fn a_message_taken_back_before_it_was_published_is_not_sent() {
+        let mut lines = vec![
+            line(json!({"id":"m1","type":"user","content":"PUBLISHED"})),
+            line(json!({"id":"m2","type":"gemini","content":[{"text":"PUBLISHED REPLY"}]})),
+            line(json!({"id":"m3","type":"user","content":"TAKEN BACK"})),
+            line(
+                json!({"id":"m4","type":"gemini","content":[{"text":"TAKEN BACK REPLY"}],"toolCalls":[{"id":"c1","name":"read_file","args":{}}]}),
+            ),
+            line(
+                json!({"$patch":{"updates":[{"id":"m4","toolCalls":[{"id":"c1","result":[{"text":"TAKEN BACK RESULT"}]}]}]}}),
+            ),
+            line(json!({"$rewindTo":"m3"})),
+            line(json!({"$patch":{"updates":[],"removeIds":["m2"],"orderIds":["m1"]}})),
+        ];
+        let published_before = lines[..2].to_vec();
+        publish_once(&mut lines, &[false, false, true, true, true, true, true]).unwrap();
+        assert_eq!(lines[..2], published_before[..]);
+        let published = contents(&lines);
+        assert_eq!(published[2], Some(json!({"id":"m3","type":"user"})));
+        assert_eq!(published[3], Some(json!({"id":"m4","type":"gemini"})));
+        assert_eq!(published[4], Some(json!({"$patch":{"updates":[]}})));
+        assert_eq!(published[5], Some(json!({"$rewindTo":"m3"})));
+        assert_eq!(
+            published[6],
+            Some(json!({"$patch":{"updates":[],"removeIds":["m2"],"orderIds":["m1"]}}))
         );
     }
 }

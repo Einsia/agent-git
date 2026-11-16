@@ -205,8 +205,16 @@ pub(super) fn splice(
     let narrowed =
         crate::domain::publication_records::published_sequence(records.iter().zip(&earlier).map(
             |(record, earlier)| match earlier {
-                Some(earlier) => (earlier.source.as_str(), &earlier.content),
-                None => (record.source.as_str(), &record.content),
+                Some(earlier) => (
+                    earlier.source.as_str(),
+                    earlier.session_id.as_str(),
+                    &earlier.content,
+                ),
+                None => (
+                    record.source.as_str(),
+                    record.session_id.as_str(),
+                    &record.content,
+                ),
             },
         ));
     Ok(records
@@ -957,7 +965,9 @@ mod tests {
         ]));
         let records = [original, meta];
         let kept = crate::domain::publication_records::published_sequence(
-            records.iter().map(|r| (r.source.as_str(), &r.content)),
+            records
+                .iter()
+                .map(|r| (r.source.as_str(), r.session_id.as_str(), &r.content)),
         );
         let lines = splice(&records, kept, Some(&published), &[]).unwrap();
         let turn = lines[0].as_deref().expect("the turn is published");
@@ -972,7 +982,9 @@ mod tests {
         // records themselves and held to that projection too. One whose lines can only be matched
         // by position can't say which records it published, so nothing is published.
         let kept = crate::domain::publication_records::published_sequence(
-            records.iter().map(|r| (r.source.as_str(), &r.content)),
+            records
+                .iter()
+                .map(|r| (r.source.as_str(), r.session_id.as_str(), &r.content)),
         );
         let merged = splice(&records, kept.clone(), None, &[&published]).unwrap();
         assert_eq!(merged, lines);
@@ -1069,7 +1081,9 @@ mod continuation_tests {
     }
     fn kept(records: &[Envelope]) -> Vec<Option<serde_json::Value>> {
         crate::domain::publication_records::published_sequence(
-            records.iter().map(|r| (r.source.as_str(), &r.content)),
+            records
+                .iter()
+                .map(|r| (r.source.as_str(), r.session_id.as_str(), &r.content)),
         )
     }
 
