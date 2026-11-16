@@ -57,3 +57,7 @@ After revoking a device, sign in as its owner and run `agit rc start --detach` o
 machine to reconnect intentionally. Startup replaces a revoked registration while keeping
 the device identity used by its workspaces. Healthy registrations keep their credentials;
 background connection retries cannot undo revocation.
+
+## Supervised workspaces
+
+- With `AGIT_RC=1`, a daemon supervises a shared workspace. Messages may come from other viewers/operators and approvals go to the workspace owner.

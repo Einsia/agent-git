@@ -231,3 +231,55 @@ and the `agit on` command that would turn this on. Ask the user once, in your ow
 wait for their next message; don't run anything in the turn you ask. Run that `agit on` command only
 if they say yes. Any other reply, or none because they moved on, is no: run `agit off` in that
 folder, which records it, and don't ask again. agit shows that line at most once per folder.
+
+## From an agent
+
+- For a new repository's first push, explicitly pass `--public` or `--private`
+  according to the user's visibility instruction; if none is given, use `--private`.
+- For an authorized explicit push, run `agit push <owner/repo>@<branch> --yes`
+  directly. Push prints the destination, visibility and snapshot summary as it
+  uploads; that is a record, not a preview. In an agent a plain session can
+  publish to a private repository even without `--yes`, so leaving it out is no
+  safety check: run push only when the user asked to upload. When the user wants
+  to see what would be published first, run the same command with `--dry-run` and
+  wait for their go. Never pass `--yes` for a public destination unless the person
+  confirmed publishing it publicly in this conversation. Push also checks the
+  sign-in itself: when it says to sign in, follow the login steps in [login](login.md) and rerun
+  the same push. Read
+  [push](push.md) for the dry-run diagnostics and audit mode.
+- To publish several branches of one repository, name them all in one command:
+  `agit push <owner/repo> -b <branch> -b <branch> … --keep-going --yes`, or `--all`
+  for every settled branch. Each push pays the destination checks and ref listing
+  once, so a loop of single-branch pushes repeats that cost for every branch. With
+  `--keep-going` a branch that cannot be published is reported at the end and does
+  not stop the others; without it the first failure stops the push.
+- To take an upload down: when it exposed a secret, tell the person to rotate that
+  secret first, since a withdrawal doesn't undo a copy someone already made. Then have
+  them withdraw the session on its Hub page (the link push printed; owners can also
+  erase it there). Revoke a share link with `agit share rm <slug>`. agit has no
+  command that withdraws a session yet.
+
+## Automatic local privacy
+
+Proceed with an authorized push without requiring a scan or secret acceptance flag.
+Local privacy processing replaces detected secrets with durable reversible placeholders.
+Optional processing failures skip affected work. Encrypted publication requires complete original
+recovery from a frozen dictionary and stops if that recovery is unavailable. The Hub does not scan content.
+Every push independently schedules encrypted dictionary synchronization; pending records and
+unavailable cloud keys do not gate uploads. LFS payloads are excluded.
+
+For an explicitly requested diagnostic review, use `agit secrets review --repo
+<agent-repo-path> --json` and `agit scan <owner/repo>@<branch> --secrets --json`. Correct
+confirmed false positives using local `allow` decisions. Removing context from VIEW preserves
+LOG and Git history. Read [secrets](secrets.md) for policy and recovery.
+
+## Recording and publishing
+
+In ordinary CLI mode:
+
+```text
+agit commit = write to the local Agent repo
+agit push   = separately publish existing local refs
+```
+
+Claude hooks may run `agit hooks settle` at Stop (older installs wrote `agit commit --from-hook`; `agit setup` retires it). In `AGIT_RC=1` supervisor mode, `agitd` may settle and push at turn boundaries; that is integration behavior, not a general CLI guarantee. When offline, the local Agent repo remains authoritative. Automatic publication is opt-in: `agit config --global push.auto true` enables it for repositories without overrides, while `agit config --repo <owner/repo> push.auto false` keeps one repository local. `init`, `clone`, and full `setup` offer this choice. Successful session settlement then pushes only that branch through ordinary access and integrity checks; upload failure never discards the local commit.

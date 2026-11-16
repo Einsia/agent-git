@@ -201,3 +201,10 @@ login and a validated code origin. Explicit empty `--query` values are refused.
 
 The origin is resolved once before dispatching a batch. Saved-author and time filters
 intersect it, and every structured result includes the acknowledged `applied_filters`.
+
+## From an agent
+
+- Search prior work with `agit search "question" --repo owner/name --json`, or
+  across the person's organizations with `--scope org` when they ask how the team
+  did something. Repeat `--query` to batch related searches with shared filters. Read
+  `search.md` for pagination, limits, and uncertainty fields.

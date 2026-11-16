@@ -152,3 +152,47 @@ writers are not locked, so ordinary settlement checks still govern later changes
 Repeating an import into the same active, explicitly selected claim keeps the
 ordinary idempotent settlement path. No hidden runtime or directory identity is
 used to choose a destination.
+
+## Adopt the current session when it is not managed yet
+
+For a Claude Code or Codex conversation use `agit save` (SKILL.md). For other runtimes, or when
+the user names an explicit repository and branch, uploading the current conversation takes two
+commands. Do not run `agit status --json`, `whoami`, `login`, `doctor`, `log`,
+`push --dry-run` or `--help` before either: save and push check the sign-in and show the
+destination, count and visibility themselves.
+
+- Already saved (`agit status` names its `<owner/repo>@<branch>`): `agit commit
+  <owner/repo>@<branch>`, then `agit push <owner/repo>@<branch> --yes`.
+- Not saved yet: `agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
+  --independent`, then `agit push <owner/repo>@<branch> --private --yes`. The repo is the
+  one the user named, otherwise the `bound repo` from one plain `agit status`. Use
+  `--independent` only when this conversation does not continue a saved session; when
+  it does, pass `--onto <ref>` instead.
+
+Push only when the user asked to upload. Always pass `--private` for a new repository,
+and `--public` only when the user says public. The details below cover other runtimes,
+an unknown native ID and the lineage choice.
+
+When the user asks to upload, save, or adopt the current conversation and its native session ID is needed, find the session below. An absent `AGIT_SESSION` alone is not a reason to scan or adopt transcripts. Do not use `agit new` to upload the running conversation:
+
+```bash
+agit status --check-missing
+```
+
+This reports the resolved identity, if any, and scans the runtime directories for sessions that no Agent repo has adopted yet. The current transcript may already be adopted even when `AGIT_SESSION` is absent. Match its native session ID from the runtime or hook against the reported metadata; never choose by recency alone.
+
+Status also reports the conversation the runtime names (`runtime_session` in JSON): its runtime, native ID, the variable it came from, and the target it is already saved to. It is display only and never selects a command target. In WorkBuddy the current native ID is `$CODEBUDDY_SESSION_ID`; in Claude Code it is `$CLAUDE_CODE_SESSION_ID`. When the current conversation is already saved, do not import anything: when the user asks to save it, settle its new turns with `agit commit <owner/repo>@<branch>` using the reported target, and publish with `agit push <owner/repo>@<branch>` only when the user asks to. Candidate lists leave out every saved session, the current one included, so never import a different session because it is the only unsaved candidate. An import that names another session of the same runtime prints a warning with both IDs and is not pushed automatically; recheck the ID before publishing it with `agit push`. When the variables name several conversations (a nested runtime), ask the user which one to save.
+
+When the user asks to upload, save, or adopt the current session and it is not saved yet, explicitly pass its native session ID (or choose it in the interactive import picker) and adopt it into the repo chosen by the rules in [new](new.md):
+
+```bash
+agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>
+```
+
+`agit import` links that existing transcript to a real session branch and records its first version after an explicit lineage choice. Use the full native ID and `--from` runtime. A terminal offers verified bases, independent import, or cancellation; pipes, JSON, CI and agent calls return choices without adopting. Pass `--onto <ref>` or `--independent` to make the decision explicitly in automation. `--propose-lineage` only inspects local evidence. `agit new` cannot take over the session that is already running: it launches a different session with an empty VIEW. Use `new` only when the user explicitly asks to start a fresh session. `-n <agent-name>` is only for naming a new Agent repo when none can be reused; it does not pick the branch.
+
+Import cannot change the calling process's environment. Keep using the selected
+`<owner/repo>@<branch>` explicitly for later commands, or supply that exact
+`AGIT_SESSION` to each invocation. To inspect saved context without preparing a
+runtime, use `show` or `view`. `resume --no-launch --json` prepares a runtime
+session and records its claim; it is not a read-only preview.

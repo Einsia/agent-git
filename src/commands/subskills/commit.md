@@ -65,3 +65,31 @@ Staging is done for you: without `-- <path>...` every change in the checkout goe
 ## Turns are atomic
 
 A turn is settled only once it has ended. A turn whose tool call has not returned yet — including the `agit commit` you are running right now from inside the turn — stays in the runtime and settles on the next `agit commit` (the Stop hook does this). So an `agit commit && agit push` issued mid-turn publishes history up to the previous turn; the current turn reaches the Hub with the next push.
+
+## Shared files on the file line
+
+`main` is the file line: it never carries a session, and it is where README.md, AGENTS.md, `memory/` and `skills/` live. Everything `agit new` inherits and everything teammates see when they `agit clone` comes from here. Updating it is a file commit — no `git add`, no session link:
+
+```bash
+cd "$(agit repo path <owner/repo>)"                  # the Agent repo checkout: a plain Git worktree
+$EDITOR README.md memory/decisions.md                  # edit or add shared files
+agit commit <owner/repo>@main -m "docs: describe the repo"
+agit push <owner/repo> -b main --dry-run
+agit push <owner/repo> -b main --yes                    # follow the dry-run decision above
+```
+
+- `-m` on the file line is always a pure file commit; `--milestone`, `--tag` and `--code` belong to turn commits.
+- Without `-- <path>...` every change in the checkout is staged (`git add -A`); add `-- README.md` to limit the commit. AgentGit storage paths (`session/`, `LOG`, `VIEW`, `events/`) are excluded automatically.
+- On a session branch `-m` is legal only while no new turns are pending; settle turns with `agit commit` first.
+- Use `agit commit <owner/repo>@main -m "..."` to select the file line explicitly. The shorter `agit commit main -m "..."` requires `AGIT_SESSION` to supply the repo; a workspace binding does not select it.
+- To write README.md for a repo the user names (for example "add a README to hachi/agit-dev"), use exactly this flow; do not `git commit` inside `~/.agit/repos` by hand.
+
+## Milestones
+
+- One user turn normally becomes one AgentGit commit. When a phase genuinely completes (working feature and passing tests), settle it:
+
+  ```bash
+  agit commit <owner/repo>@<branch> --milestone "short phase summary" --code
+  ```
+
+  Run it from inside the turn that completes the phase: the milestone waits on the session and goes on this turn when the turn is saved. With nothing new left to save, it names the last saved turn. Add `--tag <name>` only when the user asks for a tag. A tag on a session turn takes no `-m`; `agit push` publishes it on the turn's public commit, or names it and says why not.

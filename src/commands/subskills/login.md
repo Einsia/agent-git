@@ -104,3 +104,15 @@ quick attempt to claim an approved recorded request, and otherwise name
 Use `--with-token` only when a PAT has already been explicitly provided for that
 purpose. `--device` is a waiting flow for a human terminal and cannot be combined
 with `--json`; if the agent runtime stops it, finish it with `agit login --complete`.
+
+## From an agent
+
+- When login is needed, run `agit login --json`, show its `authorization_url` to
+  the human, and ask them to sign in and approve CLI access; add `--continue <link>`
+  when the sign-in started from a Hub link the human gave you. It returns exit `8`
+  while human action is needed. After approval, run the returned `complete_command`
+  argument array with the same `AGIT_HOME` and explicit Hub. Continue only after
+  it succeeds; do not ask for passwords or tokens. Then tell the human which
+  account they are signed in as (`result.value.account`) and what comes next: the
+  task they asked for, carried on to its result, or `result.value.next`. Read
+  `login.md` for pending and expired requests.

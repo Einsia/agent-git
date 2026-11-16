@@ -94,3 +94,45 @@ A cached object is verified locally; otherwise the command uses the repository's
 stored Hub identity and authenticated download transport. It checks the SHA-256
 and declared size before replacing the destination. Repository-provided LFS URLs
 cannot redirect authentication or silently trigger checkout downloads.
+
+## Deliver files at completed milestones
+
+When a milestone is ready, select the deliverables you intend to present to the
+user: documents, PDFs, slides, images, videos, or HTML. Put them in `artifacts/`,
+beside `memory/` and `skills/`, and explicitly stage and commit them:
+
+```bash
+agit file cwd
+agit file add /absolute/path/report.pdf
+agit file diff --staged
+agit file commit -m "Deliver the report"
+agit file link artifacts/report.pdf
+```
+
+`cwd` prints the selected branch's real file directory, where you can read and
+edit files directly. External inputs default to `artifacts/<name>`; `--to` chooses
+another relative path. Use `agit file --into owner/repo@branch` when `AGIT_SESSION`
+is absent. Read `file.md` for the complete command set.
+
+Commit only material useful to the user; exclude scratch files, caches and build
+dependencies. Stage the exact version to deliver. A file commit consumes only
+that branch's index and never settles the conversation. Turn settlement and
+automatic memory collection preserve manually staged files. Memory continues to
+be collected automatically; other files require an explicit file commit.
+
+Present the commit-and-path permalink returned by `agit file link`. Publish the
+branch with `agit push` when the user has asked to share it or the workflow already
+authorizes publication; a local file commit alone does not upload anything.
+Use `agit file add --lfs /absolute/path/video.mp4` for videos and large binary
+deliverables. This stages standard Git LFS pointers and their attributes; finish
+with the same explicit file commit. `agit push` uploads selected history's objects
+before publishing its Git refs and refuses missing or corrupt payloads. LFS payloads are excluded from privacy processing. Git LFS
+must be installed. Hub PPTX preview keeps the editable original; include a PDF
+when exact presentation fidelity matters. HTML preview is a static document;
+use inline styles and embedded images, without scripts or external assets.
+
+After cloning or switching a branch, an LFS worktree entry can still contain its
+pointer. Use `agit file get artifacts/video.mp4 --output /absolute/path/video.mp4`
+to extract verified payload bytes. A cold object is downloaded through that
+repository's authenticated Hub connection. Automatic checkout never follows a
+repository-supplied LFS endpoint.

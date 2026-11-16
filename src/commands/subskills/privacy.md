@@ -137,3 +137,11 @@ Its `metadata` setting defaults to `"minimal"`; `"project"` additionally publish
 project origin and worktree summary. Push retains these processed fields in `metadata.privacy`
 in both the public envelope and Git metadata. They are presentation facts, not local permissions
 or workspace bindings.
+
+## Encryption for a new session
+
+New sessions default to plain publication. If the user requests encryption,
+run `agit privacy mode <owner/repo>@<branch> encrypted` before the session's first remote registration,
+then publish normally. The choice follows the logical session across branches. Repository
+visibility (`push --public` / `--private`) is separate; registered modes cannot change.
+Read [privacy](privacy.md) for confirmation and registration boundaries.
