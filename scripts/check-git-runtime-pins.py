@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Report pinned runtime inputs that upstream no longer serves, and Alpine pins that upstream replaced.
+"""Report pinned runtime inputs that upstream or the package mirror no longer serves, and Alpine
+pins that upstream replaced.
 
 Every release build downloads the archives git-runtime-lock.json pins. Upstream can remove one at
 any time (Alpine replaces a package's revision and drops the old file), and the GitHub release
 build then fails on that download. This reads every pinned upstream URL, compares its bytes with
 the pin, and for the Alpine pins also reads the branch's package index to name the version
-upstream now carries. It changes nothing: a moved Alpine version is reported for a lock update by
-hand, never applied.
+upstream now carries. Inside a CI job it also reads the project's package mirror, which builds read
+before upstream: a pin the mirror lost or holds with other bytes sends every build back upstream,
+and nothing would say so. It changes nothing: a moved Alpine version is reported for a lock update
+by hand, never applied, and a lost mirror copy is restored by the git-runtime:mirror job.
 
-Exit status 1 when any pinned URL cannot be read or no longer matches its pin: the next release
-build would fail. Exit status 2 when every pin still downloads but upstream now carries a newer
-version of an Alpine pin: the pinned file can disappear at any time, so the lock should move
-before it does. Exit status 0 when neither holds.
+Exit status 1 when any pinned URL cannot be read or no longer matches its pin, or the package
+mirror lacks a pin or holds other bytes for it: the next release build would fail, or every build
+reads that pin from upstream again. Exit status 2 when every pin still downloads but upstream now
+carries a newer version of an Alpine pin: the pinned file can disappear at any time, so the lock
+should move before it does. Exit status 0 when neither holds.
 """
 
 import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -76,6 +81,34 @@ def check(lock, fetch_bytes=fetch, read_index=alpine_index):
     return failures, moved
 
 
+def check_mirror(lock, read_mirror):
+    """Return the pins the package mirror lacks, holds with other bytes, or cannot serve.
+
+    read_mirror(pin) returns the SHA-256 of the mirror's copy, or None when the mirror has none.
+    """
+    failures = []
+    for pin in mirror.upstream_pins(lock):
+        name = pin["url"].rsplit("/", 1)[-1]
+        try:
+            digest = read_mirror(pin)
+        except (OSError, ValueError) as error:
+            failures.append(f"the package mirror copy of {name} cannot be read: {error}")
+            continue
+        if digest is None:
+            failures.append(f"the package mirror has no copy of {name} ({pin['sha256']})")
+        elif digest != pin["sha256"]:
+            failures.append(f"the package mirror copy of {name} does not match its pin {pin['sha256']}")
+    return failures
+
+
+def mirror_reader(environ):
+    """Return (read_mirror, None) for the package mirror of this CI job, or (None, why it cannot read it)."""
+    api, project, token = (environ.get(key) for key in ("CI_API_V4_URL", "CI_PROJECT_ID", "CI_JOB_TOKEN"))
+    if not (api and project and token):
+        return None, "CI_API_V4_URL, CI_PROJECT_ID or CI_JOB_TOKEN is unset"
+    return (lambda pin: mirror.mirrored_digest(mirror.runtime.mirror_url(pin, api, project), token)), None
+
+
 def main():
     lock = json.loads(Path(__file__).with_name("git-runtime-lock.json").read_text())
     pins = list(mirror.upstream_pins(lock))
@@ -84,6 +117,15 @@ def main():
         return 1
     failures, moved = check(lock)
     print(f"checked {len(pins)} pinned upstream files", flush=True)
+    read_mirror, unreadable = mirror_reader(os.environ)
+    if read_mirror:
+        failures += check_mirror(lock, read_mirror)
+        print(f"checked {len(pins)} package mirror copies", flush=True)
+    elif os.environ.get("CI"):
+        # A scheduled run that skipped the mirror would report it whole.
+        failures.append(f"the package mirror was not checked: {unreadable}")
+    else:
+        print(f"package mirror not checked outside CI: {unreadable}", flush=True)
     for line in moved:
         print("UPSTREAM MOVED: " + line, flush=True)
     for line in failures:

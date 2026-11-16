@@ -299,6 +299,35 @@ class RuntimeArchiveTests(unittest.TestCase):
         self.assertTrue(any("changed-1-r0.apk no longer matches" in failure for failure in failures))
         self.assertEqual(moved, [f"replaced 1-r0 -> 2-r0 ({directory})"])
 
+    def test_pin_watch_fails_when_the_package_mirror_lost_a_pin_or_holds_other_bytes(self):
+        """Every pin must be in the package mirror with its own bytes, or the scheduled check fails.
+
+        Builds read the mirror before upstream, so a lost copy only shows as slow builds that go
+        back upstream; a watch that took a missing copy or a mismatched one as fine would never
+        say so. Inside CI a run that could not read the mirror must fail too, not report it whole.
+        """
+        lock = {"macos": {name: {"version": "1", "url": f"https://example.invalid/{name}.tar.gz",
+                                 "sha256": hashlib.sha256(name.encode()).hexdigest()}
+                          for name in ("kept", "lost", "changed")}}
+
+        def read_mirror(pin):
+            name = pin["url"].rsplit("/", 1)[-1].removesuffix(".tar.gz")
+            return {"kept": pin["sha256"], "lost": None, "changed": "f" * 64}[name]
+
+        failures = pins.check_mirror(lock, read_mirror)
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(any("no copy of lost.tar.gz" in failure for failure in failures))
+        self.assertTrue(any("copy of changed.tar.gz does not match" in failure for failure in failures))
+        self.assertEqual(pins.check_mirror(lock, lambda pin: pin["sha256"]), [])
+
+        read, why = pins.mirror_reader({"CI_API_V4_URL": "https://gitlab.invalid/api/v4", "CI_PROJECT_ID": "87",
+                                        "CI_JOB_TOKEN": "token"})
+        self.assertTrue(callable(read) and why is None)
+        read, why = pins.mirror_reader({"CI": "true", "CI_API_V4_URL": "https://gitlab.invalid/api/v4",
+                                        "CI_PROJECT_ID": "87"})
+        self.assertIsNone(read)
+        self.assertIn("CI_JOB_TOKEN", why)
+
 
 class RuntimeSourceTests(unittest.TestCase):
     def test_every_copyleft_runtime_pin_has_a_published_source(self):
