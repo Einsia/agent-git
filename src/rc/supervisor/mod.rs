@@ -1391,6 +1391,14 @@ pub enum Command {
         attribution: MessageAttribution,
         reply: Ticket<Delivery>,
     },
+    /// A person stops the running turn to send `message` as the next one: it waits at the front
+    /// of the next-turn queue while the turn is stopped as by that person's interrupt. Only that
+    /// person's request makes one; nothing sends one on its own.
+    StopAndSend {
+        message: String,
+        attribution: MessageAttribution,
+        reply: Ticket<Delivery>,
+    },
     Interrupt {
         expected_turn_id: Option<String>,
         reply: Ticket<()>,
@@ -1457,7 +1465,7 @@ fn accept(c: &Command) -> bool {
         | Command::Runtime { reply, .. }
         | Command::Enqueue { reply, .. } => reply.accept(),
         Command::Turn { reply, .. } => reply.accept(),
-        Command::Steer { reply, .. } => reply.accept(),
+        Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => reply.accept(),
         Command::Interrupt { reply, .. } => reply.accept(),
         Command::Approve { reply, .. } => reply.accept(),
         Command::SetPermissionMode { reply, .. } => reply.accept(),
@@ -1472,6 +1480,7 @@ impl Command {
             Command::InitialTurn { attribution, .. }
             | Command::Turn { attribution, .. }
             | Command::Steer { attribution, .. }
+            | Command::StopAndSend { attribution, .. }
             | Command::Keep { attribution } => attribution
                 .sender
                 .as_ref()
@@ -1483,9 +1492,9 @@ impl Command {
     /// The sender's own id for the words this command carries, when it carries words.
     pub(crate) fn client_msg_id(&self) -> Option<&str> {
         match self {
-            Command::Turn { attribution, .. } | Command::Steer { attribution, .. } => {
-                attribution.client_msg_id.as_deref()
-            }
+            Command::Turn { attribution, .. }
+            | Command::Steer { attribution, .. }
+            | Command::StopAndSend { attribution, .. } => attribution.client_msg_id.as_deref(),
             _ => None,
         }
     }
@@ -2866,6 +2875,10 @@ impl Session {
                             if self.info.status == SessionStatus::Ended { return; }
                         }
                         Some(Command::Keep { .. } | Command::DaemonExiting) => {}
+                        Some(Command::StopAndSend { message, attribution, reply }) => {
+                            self.stop_and_send(message, attribution, reply).await;
+                            if self.info.status == SessionStatus::Ended { return; }
+                        }
                         Some(Command::Interrupt { expected_turn_id, reply }) => {
                             if self.pending_interrupt_command.is_some() {
                                 reply.finish(Err(anyhow::anyhow!("a native stop is awaiting its receipt")));

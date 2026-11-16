@@ -465,7 +465,9 @@ impl Session {
         }
         let (authority, owner) = match &command {
             Command::Turn { reply, .. } => (reply.authority(), reply.owner_control()),
-            Command::Steer { reply, .. } => (reply.authority(), reply.owner_control()),
+            Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => {
+                (reply.authority(), reply.owner_control())
+            }
             _ => return Some(command),
         };
         let Some(account) = command.sender_account().map(str::to_owned) else {
@@ -558,6 +560,63 @@ impl Session {
         };
         self.persist_waiting();
         command
+    }
+
+    /// A person stops the running turn to send `message` as the next one. It waits at the front
+    /// of the queue, kept like any waiting message, and is answered as one: it goes when the turn
+    /// ends, which the stop makes now, and which a stop that can't be made leaves to the turn.
+    /// The turn is stopped the way that person's interrupt would stop it. Whoever may steer the
+    /// session and stop it may do this, colleagues as the owner; with no turn running, nothing is
+    /// stopped and the message just goes next. The device keeps it in the order it arrived, as
+    /// every waiting message: after a restart there is no turn left to stop, and it waits for its
+    /// sender like the rest.
+    pub(super) async fn stop_and_send(
+        &mut self,
+        message: String,
+        attribution: MessageAttribution,
+        reply: Ticket<Delivery>,
+    ) {
+        if self.steer_queue.waiting.len() >= MAX_WAITING {
+            reply.finish(Err(anyhow::anyhow!(
+                "too many messages already wait for this turn to end"
+            )));
+            return;
+        }
+        let shown = self.redactor.scrub(&message);
+        self.alert_registered(shown.registered_ids, "turn_steer")
+            .await;
+        self.steer_queue.waiting.push_front(QueuedTurn {
+            message,
+            attribution: attribution.clone(),
+            authority: reply.authority(),
+            owner: reply.owner_control(),
+            arrived: tokio::time::Instant::now(),
+            arrived_ms: now_ms(),
+            restored: None,
+        });
+        self.persist_waiting();
+        self.emit(
+            method::TURN_STEERED,
+            crate::protocol::TurnSteered {
+                message: shown.text,
+                delivery: Delivery::WhenIdle,
+                by: attribution.by,
+                sender: attribution.sender,
+                client_msg_id: attribution.client_msg_id,
+                native_prompt_id: None,
+            },
+        )
+        .await;
+        reply.finish(Ok(Delivery::WhenIdle));
+        if self.may_start_queued() || self.pending_interrupt_command.is_some() {
+            return;
+        }
+        // The stop is the person's own, answered to nobody: the message's answer is above.
+        let (stop, _answer) = crate::rc::ticket::ticket();
+        match self.driver.interrupt(None).await {
+            InterruptDispatch::Resolved(result) => self.resolve_interrupt(stop, result).await,
+            InterruptDispatch::Awaiting => self.pending_interrupt_command = Some(stop),
+        }
     }
 
     /// Whether a waiting message may start a turn now: none runs or waits to start.
@@ -1117,6 +1176,176 @@ mod tests {
                     assert!(waiting_on_device(&conversation).is_empty());
                 }
             }
+        });
+    }
+
+    /// A colleague's stop-and-send waits for the interrupted turn's native result, then starts
+    /// before older queued input even when the runtime goes silent after that result. Dispatching
+    /// at the interruption notice would drop the message; waiting for another event would stall
+    /// it. A full queue refuses the request without announcing acceptance.
+    #[cfg(unix)]
+    #[test]
+    fn a_message_sent_to_stop_the_turn_first_goes_next() {
+        with_home(|| async {
+            let control = tempfile::tempdir().unwrap();
+            let release = control.path().join("release-result");
+            let mut driver = crate::rc::harness::claude_code::ClaudeCodeDriver::test_driver_running(
+                &format!(
+                    r#"while IFS= read -r line; do
+                        case "$line" in
+                            *'"subtype":"interrupt"'*)
+                                printf '%s\n' '{{"type":"user","message":{{"role":"user","content":[{{"type":"text","text":"[Request interrupted by user]"}}]}}}}'
+                                while [ ! -e '{}' ]; do sleep 0.01; done
+                                printf '%s\n' '{{"type":"result","is_error":true}}'
+                                ;;
+                            *'"type":"user"'*)
+                                printf '%s\n' "$line" '{{"type":"result","is_error":false}}'
+                                ;;
+                        esac
+                    done"#,
+                    release.display()
+                ),
+            );
+            driver.set_test_current_turn("running-turn");
+            let (mut session, mut out, notes) =
+                super::super::tests::harness_test_session_with_channels(
+                    AnyDriver::ClaudeCode(Box::new(driver)),
+                    "claude-code",
+                    SessionStatus::Running,
+                );
+            drop(notes);
+            let conversation = session.driver.runtime_thread_id().unwrap();
+            // Distinct arrival times separate durable arrival order from next-turn priority.
+            let mut earlier = waiting_from(OWNER, "earlier");
+            earlier.arrived_ms -= 1;
+            session.steer_queue.waiting.push_back(earlier);
+            let (commands, mut command_rx) = mpsc::channel(1);
+            let worker = tokio::spawn(async move {
+                session.run_inner(&mut command_rx).await;
+                session
+            });
+            let (reply, mut receipt) = crate::rc::ticket::ticket();
+            let mut attribution = sent_by(Some(MEMBER));
+            attribution.client_msg_id = Some("now".into());
+            commands
+                .send(Command::StopAndSend {
+                    message: "now".into(),
+                    attribution,
+                    reply: reply.with_control_ceiling(false),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                receipt.wait_until_closed().await,
+                Ok(Ok(Delivery::WhenIdle))
+            ));
+
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut frames = Vec::new();
+                let mut durable = Vec::new();
+                let mut completed = 0;
+                while let Some(frame) = out.recv().await {
+                    if frame.method() == method::TURN_COMPLETED {
+                        let turn: crate::protocol::TurnCompleted = frame.params_as().unwrap();
+                        if turn.turn_id == "running-turn" {
+                            durable = waiting_on_device(&conversation);
+                            std::fs::write(&release, "").unwrap();
+                        }
+                        completed += 1;
+                    }
+                    let done = completed == 3 || frame.method() == method::TURN_STEER_DROPPED;
+                    frames.push(frame);
+                    if done {
+                        break;
+                    }
+                }
+                (frames, durable)
+            })
+            .await;
+            // Release the native result before cleanup even if the observation timed out.
+            std::fs::write(&release, "").unwrap();
+            commands.send(Command::Shutdown).await.unwrap();
+            let mut session = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+                .await
+                .expect("the supervisor stops after the check")
+                .expect("the supervisor joins");
+            let (frames, durable) = observed
+                .expect("queued input starts without another native event after the result");
+            let dropped: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.method() == method::TURN_STEER_DROPPED)
+                .map(|frame| {
+                    frame
+                        .params_as::<crate::protocol::TurnSteerDropped>()
+                        .unwrap()
+                })
+                .map(|notice| (notice.client_msg_id, notice.reason))
+                .collect();
+            assert!(
+                dropped.is_empty(),
+                "an interrupted turn still closing cannot discard queued input: {dropped:?}"
+            );
+            assert_eq!(durable, ["earlier", "now"]);
+            let shown: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.method() == method::TURN_STEERED)
+                .map(|frame| frame.params_as::<crate::protocol::TurnSteered>().unwrap())
+                .map(|steered| (steered.client_msg_id, steered.delivery))
+                .collect();
+            assert_eq!(shown, [(Some("now".into()), Delivery::WhenIdle)]);
+            let started: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.method() == method::TURN_STARTED)
+                .map(|frame| frame.params_as::<crate::protocol::TurnStarted>().unwrap())
+                .collect();
+            assert_eq!(started.len(), 3);
+            assert_eq!(started[0].turn_id, "running-turn");
+            assert_eq!(started[1].client_msg_id.as_deref(), Some("now"));
+            assert_eq!(started[1].prompt.as_deref(), Some("now"));
+            assert_eq!(started[2].prompt.as_deref(), Some("earlier"));
+            let completed: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame.method() == method::TURN_COMPLETED)
+                .map(|frame| frame.params_as::<crate::protocol::TurnCompleted>().unwrap())
+                .map(|turn| (turn.turn_id, turn.outcome))
+                .collect();
+            assert_eq!(
+                completed,
+                [
+                    (
+                        started[0].turn_id.clone(),
+                        crate::protocol::TurnOutcome::Interrupted
+                    ),
+                    (started[1].turn_id.clone(), crate::protocol::TurnOutcome::Ok),
+                    (started[2].turn_id.clone(), crate::protocol::TurnOutcome::Ok),
+                ]
+            );
+
+            for _ in 0..MAX_WAITING {
+                session
+                    .steer_queue
+                    .waiting
+                    .push_back(waiting_from(OWNER, "waiting"));
+            }
+            let (reply, mut receipt) = crate::rc::ticket::ticket();
+            session
+                .stop_and_send("overflow".into(), sent_by(Some(MEMBER)), reply)
+                .await;
+            let error = receipt.wait_until_closed().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("too many messages"));
+            assert_eq!(session.steer_queue.waiting.len(), MAX_WAITING);
+            assert!(
+                session
+                    .steer_queue
+                    .waiting
+                    .iter()
+                    .all(|q| q.message == "waiting")
+            );
+            assert!(
+                std::iter::from_fn(|| out.try_recv().ok())
+                    .all(|frame| frame.method() != method::TURN_STEERED),
+                "a refused message is never announced as accepted"
+            );
         });
     }
 

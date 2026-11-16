@@ -84,7 +84,9 @@ impl Session {
         // the session ever ran unchecked or its mode can't be read.
         match command {
             Command::Turn { reply, .. } => reply.check_control(false),
-            Command::Steer { reply, .. } => reply.check_control(false),
+            Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => {
+                reply.check_control(false)
+            }
             Command::Enqueue { reply, .. } => reply.check_control(false),
             Command::Runtime { reply, .. } => reply.check_control(false),
             Command::Model { reply, .. } => {
@@ -180,7 +182,9 @@ impl Session {
                     ),
                 }))
             }
-            Command::Steer { reply, .. } => reply.finish(Err(error)),
+            Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => {
+                reply.finish(Err(error))
+            }
             Command::Interrupt { reply, .. } => reply.finish(Err(error)),
             Command::Approve { reply, .. } => reply.finish(Err(error)),
             Command::SetPermissionMode { reply, .. } => reply.finish(Err(error)),

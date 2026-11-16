@@ -301,18 +301,25 @@ impl Daemon {
                 let p: TurnSteer = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
+                let attribution = MessageAttribution::from_caller(&caller, p.by, p.client_msg_id);
+                let reply_ticket = ticket.with_control_ceiling(caller_is_owner);
+                let command = if p.stop_first {
+                    Command::StopAndSend {
+                        message: p.message,
+                        attribution,
+                        reply: reply_ticket,
+                    }
+                } else {
+                    Command::Steer {
+                        message: p.message,
+                        attribution,
+                        reply: reply_ticket,
+                    }
+                };
                 (
                     SessionRpcOperation::Steer {
                         tx: d.tx,
-                        command: Command::Steer {
-                            message: p.message,
-                            attribution: MessageAttribution::from_caller(
-                                &caller,
-                                p.by,
-                                p.client_msg_id,
-                            ),
-                            reply: ticket.with_control_ceiling(caller_is_owner),
-                        },
+                        command,
                         reply: SessionReceipt(reply),
                     },
                     false,

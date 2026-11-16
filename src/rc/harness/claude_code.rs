@@ -1478,6 +1478,11 @@ impl ClaudeCodeDriver {
         self.current_turn.as_deref()
     }
 
+    /// An interrupted turn still owns native input until its terminal result drains.
+    pub(crate) fn has_active_turn(&self) -> bool {
+        self.current_turn.is_some() || self.interrupt_draining
+    }
+
     #[cfg(test)]
     pub(crate) fn test_driver() -> ClaudeCodeDriver {
         Self::test_driver_on(

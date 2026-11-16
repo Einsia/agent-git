@@ -796,10 +796,11 @@ impl AnyDriver {
 
     pub(crate) fn has_active_turn(&self) -> bool {
         match self {
+            Self::ClaudeCode(driver) => driver.has_active_turn(),
             Self::Codex(driver) => driver.has_active_turn(),
             #[cfg(unix)]
             Self::ClaudeNative(driver) => driver.has_active_turn(),
-            _ => false,
+            Self::OpenCode(_) => false,
         }
     }
 
