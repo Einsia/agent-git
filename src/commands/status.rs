@@ -1523,6 +1523,29 @@ fn uploads_not_through(scope: &Scope) -> UploadsNotThrough {
 }
 
 /// The command that shows what kept an upload of `target` from going through and what to do.
+/// The release steps of `found`'s targets, judged together (see
+/// [`super::project::continue_steps_for`]).
+fn continue_steps(
+    found: &UploadsNotThrough,
+) -> std::collections::BTreeMap<(String, String), (String, String)> {
+    let targets: Vec<(String, String)> = found
+        .items
+        .iter()
+        .filter_map(|(target, _)| target.split_once('@'))
+        .map(|(slug, branch)| (slug.to_owned(), branch.to_owned()))
+        .collect();
+    super::project::continue_steps_for(&targets)
+}
+
+/// The release step for an upload's `owner/name@branch` target, if it has one.
+fn step_for<'a>(
+    steps: &'a std::collections::BTreeMap<(String, String), (String, String)>,
+    target: &str,
+) -> Option<&'a (String, String)> {
+    let (slug, branch) = target.split_once('@')?;
+    steps.get(&(slug.to_owned(), branch.to_owned()))
+}
+
 fn inspect_command(target: &str) -> String {
     #[cfg(windows)]
     use crate::ui::quote_powershell_argument as quote_arg;
@@ -1572,15 +1595,19 @@ fn print_uploads_not_through(found: &UploadsNotThrough) {
     }
     ui::section("uploads that didn't go through");
     let reader = super::project::Reader::of_this_process();
+    let steps = continue_steps(found);
     for (target, undone) in &found.items {
         println!(
             "  {target}: {}",
             undone.describe_for(target, reader, said_at(target).as_deref())
         );
-        println!(
-            "    {}",
-            ui::dim(&format!("→ inspect: `{}`", inspect_command(target)))
-        );
+        match step_for(&steps, target) {
+            Some((line, _)) => println!("    {}", ui::dim(&format!("→ {line}"))),
+            None => println!(
+                "    {}",
+                ui::dim(&format!("→ inspect: `{}`", inspect_command(target)))
+            ),
+        }
     }
     for (what, error) in &found.unreadable {
         println!(
@@ -1598,6 +1625,7 @@ pub(crate) fn uploads_not_through_json() -> serde_json::Value {
 /// [`uploads_not_through_json`] for uploads already read.
 fn not_through_json(found: &UploadsNotThrough) -> serde_json::Value {
     let reader = super::project::Reader::of_this_process();
+    let steps = continue_steps(found);
     serde_json::json!({
         "items": found.items.iter().map(|(target, undone)| {
             let said = said_at(target);
@@ -1607,7 +1635,8 @@ fn not_through_json(found: &UploadsNotThrough) -> serde_json::Value {
                 "reason": undone.reason(),
                 "description": undone.describe_for(target, reader, said.as_deref()),
                 "said": said,
-                "command": inspect_command(target),
+                "command": step_for(&steps, target)
+                    .map_or_else(|| inspect_command(target), |(_, command)| command.clone()),
             })
         }).collect::<Vec<_>>(),
         "unreadable": found.unreadable.iter().map(|(what, error)| serde_json::json!({

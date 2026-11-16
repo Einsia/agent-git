@@ -615,10 +615,18 @@ fn publish(mut args: Args) -> CmdResult {
                 ));
                 ui::hint("its local history stays; nothing was sent to the Hub");
                 if reason == super::project::Withholding::UnknownStart {
-                    ui::hint(&format!(
-                        "to stop it from recording into this branch: `agit project drop {}@{branch}`",
-                        checkout.slug()
-                    ));
+                    let slug = checkout.slug();
+                    // An opener this computer holds no claim of began elsewhere, and continuing it
+                    // here releases the branch; an opener whose start is lost has no such way.
+                    if super::project::opener_here(&slug, &branch).unwrap_or(true) {
+                        ui::hint(&format!(
+                            "to stop it from recording into this branch for good: `agit project drop {slug}@{branch}`; this can't be undone, and a later `agit save` of the conversation saves it into a new branch"
+                        ));
+                    } else {
+                        ui::hint(&format!(
+                            "to upload it, continue it in a folder that uploads to {slug}: `agit resume {slug}@{branch}`"
+                        ));
+                    }
                 }
                 return Ok(ExitCode::Policy);
             }
@@ -946,6 +954,8 @@ pub(crate) const RECEIPT_SETTINGS_CHANGED: &str = "the repository's visibility o
 pub(crate) fn refused_for_good(message: &str) -> bool {
     [
         REFUSED_AGAIN,
+        // A branch this computer keeps back is kept back again until what keeps it changes.
+        WITHHELD_HERE,
         UPGRADE_FIRST,
         UPGRADE_FIRST_ELSEWHERE,
         OVERSIZED,
