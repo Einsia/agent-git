@@ -590,7 +590,10 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
             doc["hooks"]["SessionStart"][0],
             original["hooks"]["SessionStart"][0]
         );
-        assert_eq!(doc["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            doc["hooks"]["SessionStart"].as_array().unwrap().len(),
+            if cfg!(unix) { 3 } else { 2 }
+        );
         assert_eq!(doc["hooks"]["Stop"].as_array().unwrap().len(), 1);
         expected_files.insert(
             path.strip_prefix(lab.root.path()).unwrap().to_owned(),

@@ -43,6 +43,8 @@ use super::CmdResult;
 use super::skill_bundle;
 use crate::{ExitCode, ui};
 pub(crate) mod claude_mcp;
+#[cfg(unix)]
+mod claude_relay;
 mod codex_trust;
 mod json_text;
 mod legacy;
@@ -445,7 +447,13 @@ const GEMINI_HOOKS: &[(&str, &[&str])] = &[
     ("SessionEnd", &["hooks", "settle"]),
 ];
 
-/// Hooks installed for Claude Code alone, each with its timeout in seconds. A PermissionRequest
+/// Refresh the inbox hook for existing local Claude integrations during ordinary startup.
+pub fn refresh_claude_relay() {
+    #[cfg(unix)]
+    claude_relay::refresh();
+}
+
+/// Hooks installed for Claude Code alone. A PermissionRequest
 /// hook waits for an answer a person gives in shared control while the terminal's dialog stays
 /// up beside it. Claude Code goes on when the terminal answers but leaves the hook running, so
 /// the hook leaves once the daemon says the session moved past its ask; its timeout only bounds
@@ -453,10 +461,47 @@ const GEMINI_HOOKS: &[(&str, &[&str])] = &[
 /// classic events where an organization's security default is seated, so this ask reaches agit
 /// only through settings.
 #[cfg(unix)]
-const CLAUDE_HOOKS: &[(&str, &[&str], u64)] =
-    &[("PermissionRequest", &["hooks", "native-permission"], 86_400)];
+const CLAUDE_HOOKS: &[(&str, &[&str], HookOptions)] = &[
+    (
+        "PermissionRequest",
+        &["hooks", "native-permission"],
+        HookOptions::Timeout(86_400),
+    ),
+    ("SessionStart", &["hooks", "relay"], HookOptions::Async),
+];
 #[cfg(not(unix))]
-const CLAUDE_HOOKS: &[(&str, &[&str], u64)] = &[];
+const CLAUDE_HOOKS: &[(&str, &[&str], HookOptions)] = &[];
+
+/// Async hook output becomes model context, so its descriptors are discarded by the shell.
+const RELAY_OUTPUT: &str = " >/dev/null 2>&1";
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(unix), allow(dead_code))]
+enum HookOptions {
+    Default,
+    Timeout(u64),
+    Async,
+}
+
+impl HookOptions {
+    fn apply(self, entry: &mut serde_json::Value) -> bool {
+        match self {
+            Self::Default => false,
+            Self::Timeout(timeout) => {
+                let changed = entry.get("timeout").and_then(|v| v.as_u64()) != Some(timeout);
+                entry["timeout"] = timeout.into();
+                changed
+            }
+            Self::Async => {
+                let changed = entry.get("async").and_then(|v| v.as_bool()) != Some(true)
+                    || entry.get("timeout").is_some();
+                entry["async"] = true.into();
+                entry.as_object_mut().unwrap().remove("timeout");
+                changed
+            }
+        }
+    }
+}
 
 /// Hooks agit no longer installs and must retire. **Matched by argv, without the exe path** —
 /// once the install location moves (npm's `/usr/local/bin` ↔ `setup.sh`'s `~/.local/bin`),
@@ -469,7 +514,11 @@ const RETIRED_HOOKS: &[(&str, &str)] = &[("Stop", "commit --from-hook")];
 /// The command string of one hook. Every runtime that takes a hook as one string (Claude Code,
 /// Codex, WorkBuddy) hands it to a shell, so the executable is written as one shell word.
 fn hook_command(exe: &str, argv: &[&str], runtime: Option<&str>) -> String {
-    format!("{} {}", shell_word(exe), hook_arguments(argv, runtime))
+    let mut command = format!("{} {}", shell_word(exe), hook_arguments(argv, runtime));
+    if argv == ["hooks", "relay"] && runtime.is_none() {
+        command.push_str(RELAY_OUTPUT);
+    }
+    command
 }
 
 /// `exe` as one word of a shell command line. Left bare, a path with a space
@@ -502,7 +551,13 @@ fn shell_word_for(exe: &str, windows: bool) -> Cow<'_, str> {
 /// it as written: a `$` or a backtick expands inside double quotes, so a hook that chooses its
 /// path at run time is the user's, and claiming it would replace their choice with ours.
 fn hook_program<'a>(command: &'a str, arguments: &str) -> Option<Cow<'a, str>> {
-    let rest = command.trim().strip_suffix(arguments)?;
+    let command = command.trim();
+    let command = if arguments == "hooks relay" {
+        command.strip_suffix(RELAY_OUTPUT).unwrap_or(command)
+    } else {
+        command
+    };
+    let rest = command.strip_suffix(arguments)?;
     let word = rest.trim_end();
     // A real separator must sit between the executable and the arguments; otherwise a matching
     // tail like `.../notagit-commit --from-hook` counts too.
@@ -975,8 +1030,12 @@ fn repair_hook_file(
 /// before agit first changed it and may predate later edits. Without the copy, a rewrite the person
 /// did not expect has nothing to compare against.
 fn keep_original(path: &Path, text: &str) -> std::io::Result<()> {
+    keep_copy(path, text, ".agit-backup", true)
+}
+
+fn keep_copy(path: &Path, text: &str, suffix: &str, accept_existing: bool) -> std::io::Result<()> {
     let mut backup = path.as_os_str().to_owned();
-    backup.push(".agit-backup");
+    backup.push(suffix);
     let mut options = crate::infra::config::state_file_options();
     options.write(true).create_new(true);
     // The copy is for its owner only, and never more readable than the original: a hook file can
@@ -991,7 +1050,9 @@ fn keep_original(path: &Path, text: &str) -> std::io::Result<()> {
         .open(&backup)
         .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
     {
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if accept_existing && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(())
+        }
         kept => kept,
     }
 }
@@ -1144,7 +1205,7 @@ fn install_hook_file(
     label: &str,
     exe: &str,
     runtime_flag: Option<&str>,
-    extra: &[(&str, &[&str], u64)],
+    extra: &[(&str, &[&str], HookOptions)],
 ) -> SetupReport {
     install_hook_events(path, label, exe, runtime_flag, HOOKS, extra)
 }
@@ -1157,7 +1218,7 @@ fn install_hook_events(
     exe: &str,
     runtime_flag: Option<&str>,
     events: &[(&str, &[&str])],
-    extra: &[(&str, &[&str], u64)],
+    extra: &[(&str, &[&str], HookOptions)],
 ) -> SetupReport {
     let original = match std::fs::read_to_string(path) {
         Ok(text) => Some(text),
@@ -1269,7 +1330,7 @@ fn add_hooks(
     exe: &str,
     runtime_flag: Option<&str>,
     events: &[(&str, &[&str])],
-    extra: &[(&str, &[&str], u64)],
+    extra: &[(&str, &[&str], HookOptions)],
 ) -> usize {
     let hooks = doc
         .as_object_mut()
@@ -1287,17 +1348,17 @@ fn add_hooks(
             event,
             &hook_command(exe, argv, runtime_flag),
             &hook_arguments(argv, runtime_flag),
-            None,
+            HookOptions::Default,
             on_path.as_deref(),
         );
     }
-    for (event, argv, timeout) in extra {
+    for (event, argv, options) in extra {
         added += upsert_hook(
             hooks,
             event,
             &hook_command(exe, argv, runtime_flag),
             &hook_arguments(argv, runtime_flag),
-            Some(*timeout),
+            *options,
             on_path.as_deref(),
         );
     }
@@ -1400,7 +1461,7 @@ fn upsert_hook(
     event: &str,
     cmd: &str,
     arguments: &str,
-    timeout: Option<u64>,
+    options: HookOptions,
     on_path: Option<&Path>,
 ) -> usize {
     let arr = hooks
@@ -1432,10 +1493,11 @@ fn upsert_hook(
             .and_then(|value| value.as_str())
             .is_some_and(|command| {
                 command == cmd
-                    || hook_program(command, arguments).is_some_and(|exe| {
-                        on_path.is_some_and(|on_path| Path::new(&*exe) == on_path)
-                            || runs_this_agit(&exe)
-                    })
+                    || ((arguments != "hooks relay" || command.ends_with(RELAY_OUTPUT))
+                        && hook_program(command, arguments).is_some_and(|exe| {
+                            on_path.is_some_and(|on_path| Path::new(&*exe) == on_path)
+                                || runs_this_agit(&exe)
+                        }))
             })
     };
     // Prefer an entry that already carries the current command, so a settled file stays as is.
@@ -1456,9 +1518,7 @@ fn upsert_hook(
         .map(|(group, index, _)| (group, index));
     let Some((keep_group, keep_index)) = keep else {
         let mut entry = serde_json::json!({"type": "command", "command": cmd});
-        if let Some(timeout) = timeout {
-            entry["timeout"] = timeout.into();
-        }
+        options.apply(&mut entry);
         arr.push(serde_json::json!({ "hooks": [entry] }));
         return 1;
     };
@@ -1491,12 +1551,7 @@ fn upsert_hook(
         kept["command"] = serde_json::Value::String(cmd.to_owned());
         changed += 1;
     }
-    if let Some(timeout) = timeout
-        && kept.get("timeout").and_then(|value| value.as_u64()) != Some(timeout)
-    {
-        kept["timeout"] = timeout.into();
-        changed += 1;
-    }
+    changed += usize::from(options.apply(kept));
     // Only groups this call emptied go away; every other group stays as it was.
     let mut group_index = 0;
     arr.retain(|_| {
@@ -2928,7 +2983,7 @@ mod tests {
                     "SessionStart",
                     command,
                     "hooks ingest",
-                    None,
+                    HookOptions::Default,
                     None
                 ),
                 1
@@ -2943,7 +2998,7 @@ mod tests {
                     "SessionStart",
                     command,
                     "hooks ingest",
-                    None,
+                    HookOptions::Default,
                     None
                 ),
                 0
@@ -2985,7 +3040,14 @@ mod tests {
         );
         let command = hook_command(exe, argv, None);
         assert_eq!(
-            upsert_hook(&mut hooks, event, &command, &arguments, None, None),
+            upsert_hook(
+                &mut hooks,
+                event,
+                &command,
+                &arguments,
+                HookOptions::Default,
+                None
+            ),
             1
         );
         assert_eq!(
@@ -3194,8 +3256,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         let exe = "/home/me/.local/bin/agit";
-        let extra: &[(&str, &[&str], u64)] =
-            &[("PermissionRequest", &["hooks", "native-permission"], 86_400)];
+        let extra: &[(&str, &[&str], HookOptions)] = &[(
+            "PermissionRequest",
+            &["hooks", "native-permission"],
+            HookOptions::Timeout(86_400),
+        )];
         std::fs::write(
             &path,
             r#"{
@@ -3291,6 +3356,63 @@ mod tests {
         assert!(!install_hook_file(&path, "Claude Code", exe, None, extra).succeeded());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), twice);
         assert!(!dir.path().join("settings.json.agit-backup").exists());
+    }
+
+    /// SessionStart must return without waiting for the relay, and no hook output may become
+    /// model context. Reinstalling deduplicates only owned commands and keeps the user's hooks.
+    #[cfg(unix)]
+    #[test]
+    fn the_claude_relay_hook_is_async_silent_and_idempotent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("agit");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\nprintf 'synthetic-message'\nprintf 'synthetic-token' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut doc = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "/old/agit hooks relay", "timeout": 10},
+            {"type": "command", "command": "/other/agit hooks relay >/dev/null 2>&1"},
+            {"type": "command", "command": "echo user-hook"}
+        ]}]}});
+        assert!(add_hooks(&mut doc, exe.to_str().unwrap(), None, HOOKS, CLAUDE_HOOKS) > 0);
+        let hooks: Vec<_> = doc["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .collect();
+        let relays: Vec<_> = hooks
+            .iter()
+            .filter(|hook| {
+                hook["command"]
+                    .as_str()
+                    .is_some_and(|command| is_our_hook(command, "hooks relay"))
+            })
+            .collect();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0]["async"], true);
+        assert!(relays[0].get("timeout").is_none());
+        assert!(hooks.iter().any(|hook| hook["command"] == "echo user-hook"));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(relays[0]["command"].as_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        let before = doc.clone();
+        assert_eq!(
+            add_hooks(&mut doc, exe.to_str().unwrap(), None, HOOKS, CLAUDE_HOOKS),
+            0
+        );
+        assert_eq!(doc, before);
+        assert!(!is_our_hook(
+            "/bin/agit hooks relay >/tmp/user-output",
+            "hooks relay"
+        ));
     }
 
     /// A hook repair (`setup --hooks --installed-only`) changes only the command text of agit's
@@ -3457,7 +3579,7 @@ mod tests {
                     event,
                     &hook_command("agit", argv, None),
                     &hook_arguments(argv, None),
-                    None,
+                    HookOptions::Default,
                     None,
                 ),
                 1
@@ -3474,7 +3596,7 @@ mod tests {
                     event,
                     &hook_command("agit", argv, None),
                     &hook_arguments(argv, None),
-                    None,
+                    HookOptions::Default,
                     None,
                 ),
                 0
@@ -3509,7 +3631,7 @@ mod tests {
                 event,
                 &hook_command("agit", argv, None),
                 &hook_arguments(argv, None),
-                None,
+                HookOptions::Default,
                 None,
             );
         }
@@ -3583,7 +3705,7 @@ mod tests {
                 "Stop",
                 "agit hooks settle",
                 "hooks settle",
-                None,
+                HookOptions::Default,
                 None
             ),
             1

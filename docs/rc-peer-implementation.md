@@ -11,6 +11,23 @@ unwraps peer event envelopes into its existing machine event API. It does not
 start the persistent SSH control process. SSH configuration discovery and the
 installation/version probe remain Desktop setup operations.
 
+## Local Claude Code messages
+
+After upgrading, an ordinary agit command adds the missing inbox hook to an
+existing Claude Code integration when local remote control is configured. It
+backs up the settings, preserves existing hooks, and respects a later removal.
+Restart Claude Code to load it. If the automatic update cannot preserve the
+settings, agit asks you to run `agit setup --runtime claude-code --hooks` instead.
+The new session starts its inbox relay through an asynchronous SessionStart hook,
+so receiving an authorized Workspace message does not require finishing a turn
+in Bypass first. A running session must restart to load the hook configuration.
+
+The relay remains a child of that Claude process and stops when the process exits,
+loads another session, or loses its matching registration. Claude's explicit
+inbound hold/refuse policy still applies. A `session.enqueue` response with
+`status: "queued"` does not prove that Claude admitted or read the message; a held
+message must be reviewed locally, and an uncertain send must not be replayed.
+
 ## Consolidated RC changes
 
 This branch includes the complete source history of CLI !182 (Desktop bridge and
