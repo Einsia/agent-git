@@ -2604,3 +2604,96 @@ fn status_answers_first_whether_the_folders_conversations_are_uploaded() {
         "{value:#}"
     );
 }
+
+/// In a folder bound to a repository, `agit status --json` without `--repo` or `--all` reports
+/// only that repository, as the text view does, and counts what it leaves out without naming it:
+/// another repository's checkout and its saved session appear nowhere in the document. `--all
+/// --json` still names them. A report that narrowed the session rows but kept the repository
+/// list, or that dropped the rest without counting it, fails here.
+#[test]
+fn status_json_in_a_bound_folder_reports_only_its_repository() {
+    use sha2::{Digest, Sha256};
+    let mut lab = Lab::new();
+    let work = lab.cwd();
+    let bindings = lab.root.path().join("agit/workspaces");
+    fs::create_dir_all(&bindings).unwrap();
+    let id = &hex::encode(Sha256::digest(work.to_string_lossy().as_bytes()))[..16];
+    fs::write(
+        bindings.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({"dir": work, "repo": "alice/notes"})).unwrap(),
+    )
+    .unwrap();
+    lab.claim.cwd = Some(work.to_string_lossy().into_owned());
+    lab.save();
+    // Another repository on this computer, with a saved session of its own.
+    let other = Repo::at(lab.root.path().join("agit/repos/bob/other"));
+    fs::create_dir_all(other.root()).unwrap();
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["commit", "--allow-empty", "-m", "elsewhere", "--quiet"][..],
+        &["branch", "bob-branch"][..],
+    ] {
+        success(
+            lab.command("git")
+                .arg("-C")
+                .arg(other.root())
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+    }
+    let mut elsewhere = link::Link::new("codex", "019d0000-0000-7000-8000-00000000b0b0", None);
+    elsewhere.owner = Some("bob".into());
+    elsewhere.agent = Some("other".into());
+    elsewhere.branch = Some("bob-branch".into());
+    link::write(&lab.store, &elsewhere).unwrap();
+    let status = |args: &[&str]| -> serde_json::Value {
+        let output = lab
+            .command(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let narrowed = status(&["--json", "status"]);
+    let value = &narrowed["result"]["value"];
+    assert_eq!(
+        value["scope"],
+        json!({"kind": "repository", "repository": "alice/notes", "narrowed_to_folder": true}),
+        "{value:#}"
+    );
+    let text = narrowed.to_string();
+    assert!(
+        !text.contains("bob/other") && !text.contains("bob-branch") && !text.contains("b0b0"),
+        "{value:#}"
+    );
+    assert_eq!(
+        value["sessions"]["items"].as_array().unwrap().len(),
+        1,
+        "{value:#}"
+    );
+    assert!(
+        value["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|repository| repository["repo"] == "alice/notes"),
+        "{value:#}"
+    );
+    assert_eq!(value["left_out"]["repositories"], 1, "{value:#}");
+    assert_eq!(value["left_out"]["sessions"], 1, "{value:#}");
+    assert_eq!(value["left_out"]["command"], "agit status --all --json");
+
+    let all = status(&["--json", "status", "--all"]);
+    let value = &all["result"]["value"];
+    assert_eq!(value["scope"]["kind"], "machine", "{value:#}");
+    assert_eq!(value["scope"]["narrowed_to_folder"], false);
+    assert!(value["left_out"].is_null(), "{value:#}");
+    let text = all.to_string();
+    assert!(
+        text.contains("bob/other") && text.contains("bob-branch"),
+        "{value:#}"
+    );
+}

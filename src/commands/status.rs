@@ -202,17 +202,18 @@ pub fn run(args: Args) -> CmdResult {
         Ok(scope) => scope,
         Err(code) => return Ok(code),
     };
-    if super::json::requested() {
-        return structured(&args, &scope);
-    }
-    let s = ui::theme::symbols();
     let cwd = std::env::current_dir()?;
     // In a folder bound to a repository this computer has, a bare status reports that repository
-    // and leaves the rest of the computer to `--all` (#498).
+    // and leaves the rest of the computer to `--all`, as text and as JSON: status output often
+    // reaches an agent as tool output, which is published with its conversation.
     let narrowed = (args.repo.is_none() && !args.all)
         .then(|| folder_repository(&cwd))
         .flatten();
     let scope = narrowed.clone().map(Scope::Repository).unwrap_or(scope);
+    if super::json::requested() {
+        return structured(&args, &scope, narrowed.is_some());
+    }
+    let s = ui::theme::symbols();
     let ClaimInventory {
         store,
         mut links,
@@ -1043,7 +1044,7 @@ fn runtime_session_json(sessions: &[super::context::RuntimeSession]) -> serde_js
     })
 }
 
-fn structured(args: &Args, scope: &Scope) -> CmdResult {
+fn structured(args: &Args, scope: &Scope, narrowed: bool) -> CmdResult {
     let cwd = std::env::current_dir()?;
     let earlier = worktree_left_out(&cwd);
     let ClaimInventory {
@@ -1197,11 +1198,14 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
             .map(|answer| answer.json()),
         "store_path": store.as_ref().map(|store| store.root()),
         "scope": match scope {
-            Scope::Machine => serde_json::json!({"kind": "machine", "repository": null}),
-            Scope::Repository(repository) => {
-                serde_json::json!({"kind": "repository", "repository": repository})
-            }
+            Scope::Machine => serde_json::json!({
+                "kind": "machine", "repository": null, "narrowed_to_folder": false,
+            }),
+            Scope::Repository(repository) => serde_json::json!({
+                "kind": "repository", "repository": repository, "narrowed_to_folder": narrowed,
+            }),
         },
+        "left_out": narrowed.then(|| left_out_json(scope, &links)),
         "repository_summary": summary,
         "sessions": {"items": items, "total": in_scope, "offset": args.offset,
             "limit": limit, "next_offset": (next < in_scope).then_some(next),
@@ -1578,6 +1582,30 @@ fn save_waits(scope: &Scope) -> Vec<(String, crate::rc::settle_blocked::Waiting)
         .into_iter()
         .filter(|(target, _)| scope.covers_target(target))
         .collect()
+}
+
+/// What a status narrowed to the folder's repository leaves out, counted and never named: the
+/// other repositories on this computer, the sessions and waits outside the scope, and the command
+/// that reports them. Without it a reader of the narrowed report takes "not listed" for "nothing".
+fn left_out_json(scope: &Scope, links: &[link::Link]) -> serde_json::Value {
+    let repositories = super::clone::list_local()
+        .unwrap_or_default()
+        .iter()
+        .filter(|(owner, name, _)| !scope.covers(&format!("{owner}/{name}")))
+        .count();
+    serde_json::json!({
+        "repositories": repositories,
+        "sessions": links.iter().filter(|link| !scope.covers_link(link)).count(),
+        "upload_waits": crate::domain::privacy::pending::upload::load()
+            .keys()
+            .filter(|target| !scope.covers_target(target))
+            .count(),
+        "save_waits": save_waits(&Scope::Machine)
+            .iter()
+            .filter(|(target, _)| !scope.covers_target(target))
+            .count(),
+        "command": "agit status --all --json",
+    })
 }
 
 /// [`print_save_waits`] for `status --json`.
