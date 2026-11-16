@@ -116,6 +116,17 @@ struct Uploads {
     projections: Option<crate::domain::privacy_git::Projections>,
 }
 
+/// The upload cell of each claim, as the rows show it ([`upload`]), under one deadline: the
+/// folder's first answer reads the same cell, so the two never disagree.
+pub(super) fn upload_cells(claims: &[&link::Link]) -> Vec<String> {
+    let deadline = Deadline::new();
+    let mut repos = std::collections::BTreeMap::new();
+    claims
+        .iter()
+        .map(|claim| upload(&mut repos, claim, deadline))
+        .collect()
+}
+
 /// Whether the Hub has the claim's branch, for every row of a page: the eight-row bound is on
 /// transcript inspection, and a saved conversation past it is still uploaded or not. It answers
 /// as `agit project list` does, from the branch's two refs and the accepted publication record,

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 
 mod branches;
+mod folder;
 mod merges;
 mod project;
 mod scope;
@@ -206,11 +207,19 @@ pub fn run(args: Args) -> CmdResult {
     }
     let s = ui::theme::symbols();
     let cwd = std::env::current_dir()?;
+    // In a folder bound to a repository this computer has, a bare status reports that repository
+    // and leaves the rest of the computer to `--all` (#498).
+    let narrowed = (args.repo.is_none() && !args.all)
+        .then(|| folder_repository(&cwd))
+        .flatten();
+    let scope = narrowed.clone().map(Scope::Repository).unwrap_or(scope);
     let ClaimInventory {
         store,
         mut links,
         issues: link_issues,
     } = claim_inventory(config::store_root()?);
+    let not_through = uploads_not_through(&scope);
+    let upload_off = automatic_upload_off(&scope);
     let (in_folder, in_scope) = order_in(&mut links, &cwd, &scope);
     // The display budget never cuts the current folder's sessions; it applies to the rest.
     let limit = (args.limit.unwrap_or(8) as usize).max(in_folder.saturating_sub(args.offset));
@@ -224,6 +233,14 @@ pub fn run(args: Args) -> CmdResult {
         take,
     );
     let inventory_complete = page.inventory_complete;
+    // The first answer: whether this folder's conversations are uploaded, once the rows have
+    // checked the session records. `--all` and `--repo` stay the full report they were.
+    if narrowed.is_some()
+        && let Some(answer) =
+            folder::answer(&cwd, &links, inventory_complete, &not_through, &upload_off)
+    {
+        answer.print();
+    }
     let scoped = &links[..in_scope];
 
     // ── Who am I (PRD status, first block: the context resolution result and its route) ──
@@ -289,8 +306,6 @@ pub fn run(args: Args) -> CmdResult {
             super::front::earlier_note(count, "here", super::front::Reader::of_this_process())
         );
     }
-    let not_through = uploads_not_through(&scope);
-    let upload_off = automatic_upload_off(&scope);
     print_upload_waits(&scope);
     print_save_waits(&scope);
     print_uploads_not_through(&not_through);
@@ -592,8 +607,34 @@ pub fn run(args: Args) -> CmdResult {
     } else {
         ui::hint("--check-missing lists this repo’s unadopted sessions");
     }
+    if let Some(repository) = &narrowed {
+        let others = super::clone::list_local()
+            .unwrap_or_default()
+            .iter()
+            .filter(|(owner, name, _)| format!("{owner}/{name}") != *repository)
+            .count();
+        if others > 0 {
+            println!();
+            println!(
+                "{others} other repositor{} on this computer: `agit status --all` reports {}",
+                if others == 1 { "y" } else { "ies" },
+                if others == 1 { "it" } else { "them" }
+            );
+        }
+    }
 
     Ok(ExitCode::Ok)
+}
+
+/// The repository the folder `cwd` is in is bound to, when this computer has it.
+fn folder_repository(cwd: &std::path::Path) -> Option<String> {
+    let root = super::front::folder(cwd).ok()?;
+    let repository = super::front::bound(&root)?;
+    super::clone::list_local()
+        .unwrap_or_default()
+        .iter()
+        .any(|(owner, name, _)| format!("{owner}/{name}") == repository)
+        .then_some(repository)
 }
 
 /// Puts the sessions that ran in the folder of `cwd` first, then, within each part, active claims
@@ -1151,6 +1192,9 @@ fn structured(args: &Args, scope: &Scope) -> CmdResult {
         "save_waits": save_waits_json(scope),
         "uploads_not_through": not_through_json(&not_through),
         "automatic_upload_off": upload_off,
+        // The folder's first answer (#498): whether its conversations are uploaded.
+        "folder": folder::answer(&cwd, &links, inventory_complete, &not_through, &upload_off)
+            .map(|answer| answer.json()),
         "store_path": store.as_ref().map(|store| store.root()),
         "scope": match scope {
             Scope::Machine => serde_json::json!({"kind": "machine", "repository": null}),
