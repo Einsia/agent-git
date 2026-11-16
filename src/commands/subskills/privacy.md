@@ -124,8 +124,12 @@ excluded or outside-root files use stable `<private-file-N>` placeholders. The r
 never part of tracked repository content or a public preview.
 
 The shared projection path aliases paths, applies configured replacements, and scans the rewritten
-result before public bytes are produced. An excluded candidate produces no bytes, and an allowed
-candidate can be sealed in the versioned private envelope used by later publication integrations.
+result before public bytes are produced. Like the tool and attachment settings, a replacement
+(`agit privacy policy replace`) applies only there: plain push publishes the conversation as it
+was saved, with only secret protection applied (detected credentials, and values registered with
+`agit secrets add <label>`, which is where a value that must never be published belongs). An
+excluded candidate produces no bytes, and an allowed candidate can be sealed in the versioned
+private envelope used by later publication integrations.
 
 For direct editing, `agit privacy policy file --repo alice/agent` prints the JSON path. The file
 must retain the current policy version and is validated before it is used.

@@ -237,6 +237,32 @@ fn privacy_export_sanitizes_the_selected_snapshot_and_preserves_output_on_budget
         assert!(!text.contains("PRIVATE_DOCUMENT_BODY"));
         assert_eq!(text.contains("diagram.png"), mode == "metadata");
     }
+    // A replacement applies where the projection runs, never to a plain push, so adding one says
+    // so and names the command for a value that must never be published.
+    let replaced = run(&[
+        "privacy",
+        "policy",
+        "replace",
+        "PRIVATE_DOCUMENT_BODY",
+        "public body",
+        "--repo",
+        "alice/app",
+    ]);
+    assert!(replaced.status.success(), "{replaced:?}");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&replaced.stdout),
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    for words in ["plain push does not apply it", "`agit secrets add <label>`"] {
+        assert!(said.contains(words), "{words}: {said}");
+    }
+    let help = run(&["privacy", "policy", "replace", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("plain push does not apply") && help.contains("agit secrets add"),
+        "{help}"
+    );
     assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), before);
     let output = temp.path().join("export.json");
 
