@@ -617,11 +617,11 @@ fn order(links: &mut Vec<link::Link>, cwd: &std::path::Path) -> usize {
     leading
 }
 
-/// The one saved conversation that ran in `cwd`'s folder, as its repository and branch: what a
-/// command that needs a target can name when nothing selected one. `None` when none or several
-/// did, or when the inventory is incomplete (an unreadable record or an exhausted budget may hide a
-/// second one); it never selects a target itself.
-pub(crate) fn folder_saved_session(cwd: &std::path::Path) -> Option<(String, String)> {
+/// The saved conversations that ran in `cwd`'s folder, as repository and branch, in order: what a
+/// command that needs a target can name when nothing selected one. `None` when the inventory is
+/// incomplete (an unreadable record or an exhausted budget may hide one); it never selects a
+/// target itself.
+pub(crate) fn folder_saved_sessions(cwd: &std::path::Path) -> Option<Vec<(String, String)>> {
     let folder = super::front::folder(cwd).ok()?;
     let ClaimInventory { links, issues, .. } = claim_inventory(config::store_root().ok()?);
     if !issues.is_empty() {
@@ -637,9 +637,117 @@ pub(crate) fn folder_saved_session(cwd: &std::path::Path) -> Option<(String, Str
             ))
         })
         .collect();
-    let mut saved = saved.into_iter();
-    let one = saved.next()?;
-    saved.next().is_none().then_some(one)
+    Some(saved.into_iter().collect())
+}
+
+/// What a refusal that names no target may say about the conversations saved from `cwd`'s folder.
+/// The refusal often reaches an agent as tool output, which a plain publication keeps, so it names
+/// only conversations of the repository the folder is bound to and counts the rest: a folder bound
+/// to another repository before must not show that repository or its branches to this one's
+/// readers. A folder bound to none names none.
+pub(crate) struct FolderSaved {
+    /// The bound repository's conversations, as `(owner/repo, branch)`.
+    pub here: Vec<(String, String)>,
+    /// The others: saved to other repositories, or all of them when the folder is bound to none.
+    pub elsewhere: usize,
+}
+
+pub(crate) fn folder_saved(cwd: &std::path::Path) -> Option<FolderSaved> {
+    let saved = folder_saved_sessions(cwd)?;
+    let bound = super::front::folder(cwd)
+        .ok()
+        .and_then(|root| super::front::bound(&root));
+    let (here, elsewhere): (Vec<_>, Vec<_>) = saved
+        .into_iter()
+        .partition(|(slug, _)| bound.as_deref() == Some(slug.as_str()));
+    Some(FolderSaved {
+        here,
+        elsewhere: elsewhere.len(),
+    })
+}
+
+impl FolderSaved {
+    /// The one conversation saved from the folder, when it is the only one and may be named.
+    pub(crate) fn one(&self) -> Option<&(String, String)> {
+        match (&self.here[..], self.elsewhere) {
+            ([one], 0) => Some(one),
+            _ => None,
+        }
+    }
+
+    /// For any other count: how many were saved, each one that may be named, and how many more
+    /// the person finds in a terminal. `None` for none or [`FolderSaved::one`].
+    pub(crate) fn choice(&self) -> Option<String> {
+        let total = self.here.len() + self.elsewhere;
+        if total == 0 || self.one().is_some() {
+            return None;
+        }
+        let were = |n: usize| if n == 1 { "was" } else { "were" };
+        let names = |n: usize| {
+            if n == 1 {
+                "`agit project list` in a terminal names it"
+            } else {
+                "`agit project list` in a terminal names them"
+            }
+        };
+        if self.here.is_empty() {
+            let noun = if total == 1 {
+                "conversation"
+            } else {
+                "conversations"
+            };
+            return Some(format!(
+                "{total} {noun} {} saved from this folder; {}",
+                were(total),
+                names(total)
+            ));
+        }
+        let mut line = choice_of(&self.here, total)?;
+        if self.elsewhere > 0 {
+            line.push_str(&format!(
+                "; {} more {} saved to other repositories ({})",
+                self.elsewhere,
+                were(self.elsewhere),
+                names(self.elsewhere)
+            ));
+        }
+        Some(line)
+    }
+}
+
+/// The one saved conversation that ran in `cwd`'s folder and may be named ([`FolderSaved::one`]).
+pub(crate) fn folder_saved_session(cwd: &std::path::Path) -> Option<(String, String)> {
+    folder_saved(cwd)?.one().cloned()
+}
+
+/// For a refusal that names no target, any count of saved conversations but the one
+/// [`folder_saved_session`] names ([`FolderSaved::choice`]).
+pub(crate) fn folder_saved_choice(cwd: &std::path::Path) -> Option<String> {
+    folder_saved(cwd)?.choice()
+}
+
+/// The line naming `named`, `total` conversations saved from the folder in all, so the person or
+/// agent names one instead of guessing. `None` when there is nothing to choose between.
+pub(crate) fn choice_of(named: &[(String, String)], total: usize) -> Option<String> {
+    const SHOWN: usize = 10;
+    if named.is_empty() || total < 2 {
+        return None;
+    }
+    let mut names = named
+        .iter()
+        .take(SHOWN)
+        .map(|(slug, branch)| format!("{slug}@{branch}"))
+        .collect::<Vec<_>>();
+    if named.len() > SHOWN {
+        names.push(format!(
+            "and {} more (`agit status` lists them)",
+            named.len() - SHOWN
+        ));
+    }
+    Some(format!(
+        "{total} conversations were saved from this folder; name the one you mean: {}",
+        names.join(", ")
+    ))
 }
 
 /// [`order`], then the claims `scope` covers ahead of the rest, each part in that order. Returns

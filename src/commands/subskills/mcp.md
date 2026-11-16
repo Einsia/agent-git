@@ -35,8 +35,11 @@ than yours, so it returns an error naming the runtime session its environment na
 (for example through `CODEBUDDY_SESSION_ID`) and that session's saved target. Compare
 that ID with your own conversation's ID and, if they match, call `commit` again with
 that `target`. An unsaved conversation, several named conversations, or no identity
-at all is an error naming the next command; the tool never falls back to a directory
-binding or the most recent session.
+at all is an error naming the next command. It also names the conversations saved from the
+server's folder to the repository the folder is bound to: the target of the only one, or how
+many there are and each one's target. Conversations saved to other repositories are only
+counted, since the error is tool output this conversation may publish. Pass one only if it is
+yours; the tool never falls back to a directory binding or the most recent session by itself.
 
 Tool failures set MCP `isError: true`; a failed search batch still carries its
 successful entries. Non-search tools use the unified CLI JSON envelope, except
