@@ -1178,9 +1178,8 @@ pub struct TurnQueuedResult {
     pub delivery: Delivery,
 }
 
-/// Add to the *current* turn without stopping it. Distinct verb from interrupt
-/// on purpose — "also do X" and "stop, don't do that" are different intents and
-/// the UI must not make the user express them by wording.
+/// Send a message into the current turn. Stopping that turn first requires an explicit
+/// `stop_first` request on a device advertising support; the message's words never choose it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnSteer {
     pub session_id: String,
@@ -1189,6 +1188,11 @@ pub struct TurnSteer {
     pub by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
+    /// The sender asks to stop the running turn and send this as the next one, rather than wait
+    /// for the turn to end. Only a device listing `steer-stop-first-v1` knows it; another steers
+    /// as usual.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_first: bool,
 }
 
 /// `session.enqueue.keep`: the sender of `client_msg_id`, which waits for this session's next

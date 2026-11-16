@@ -2489,8 +2489,8 @@ async fn a_colleague_runs_every_runtime_command() {
     }
 }
 
-/// An operator's `turn.start` and `turn.steer` go on into a session in every mode, Auto, Accept
-/// edits and one the device cannot read included, as the owner's do.
+/// An operator's messages enter every session mode as the owner's do. Only an explicit
+/// `stop_first` request selects stop-and-send; ordinary steering must leave the turn running.
 #[test]
 fn a_non_owners_words_enter_a_turn_in_every_mode() {
     use crate::protocol::PermissionMode as M;
@@ -2513,17 +2513,25 @@ fn a_non_owners_words_enter_a_turn_in_every_mode() {
                         },
                     );
                     start.caller = Some(caller.clone());
-                    let mut steer = Frame::request(
-                        method::TURN_STEER,
-                        TurnSteer {
-                            session_id: "session-a".into(),
-                            message: "inspect".into(),
-                            by: None,
-                            client_msg_id: Some("message-steer".into()),
-                        },
-                    );
-                    steer.caller = Some(caller);
-                    [("start", start), ("steer", steer)]
+                    let steer = |stop_first| {
+                        let mut frame = Frame::request(
+                            method::TURN_STEER,
+                            TurnSteer {
+                                session_id: "session-a".into(),
+                                message: "inspect".into(),
+                                by: None,
+                                client_msg_id: Some("message-steer".into()),
+                                stop_first,
+                            },
+                        );
+                        frame.caller = Some(caller.clone());
+                        frame
+                    };
+                    [
+                        ("start", start),
+                        ("steer", steer(false)),
+                        ("stop-and-send", steer(true)),
+                    ]
                 };
                 for role in ["operator", "owner"] {
                     for mode in [
@@ -2543,9 +2551,31 @@ fn a_non_owners_words_enter_a_turn_in_every_mode() {
                         );
                         let mut state = daemon.try_lock().unwrap();
                         for (name, frame) in frames(role) {
-                            if let Err(error) = state.prepare_session_rpc(&frame).map(drop) {
-                                panic!("{role} {name} {mode:?}: {error:?}");
-                            }
+                            let prepared =
+                                state.prepare_session_rpc(&frame).unwrap_or_else(|error| {
+                                    panic!("{role} {name} {mode:?}: {error:?}")
+                                });
+                            assert!(
+                                matches!(
+                                    (name, &prepared.operation),
+                                    ("start", SessionRpcOperation::Turn { .. })
+                                        | (
+                                            "steer",
+                                            SessionRpcOperation::Steer {
+                                                command: Command::Steer { .. },
+                                                ..
+                                            }
+                                        )
+                                        | (
+                                            "stop-and-send",
+                                            SessionRpcOperation::Steer {
+                                                command: Command::StopAndSend { .. },
+                                                ..
+                                            }
+                                        )
+                                ),
+                                "{role} {name} {mode:?}: the explicit request chooses the command"
+                            );
                         }
                     }
                 }

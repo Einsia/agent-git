@@ -17,6 +17,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "session-permissions-v1",
     "session-permission-capabilities-v1",
     "session-approvals-v1",
+    "steer-stop-first-v1",
     #[cfg(unix)]
     "native-claude-control-v1",
     "codex-turn-interrupt-fence-v1",
