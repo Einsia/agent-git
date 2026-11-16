@@ -1183,22 +1183,22 @@ fn upload_notice(upload: &super::project::AutomaticUpload) -> String {
     // up at a turn's end, so the notice names the push that publishes instead.
     match (upload.sign_in, upload.upload_off) {
         (SignIn::Current, false) => format!(
-            "agit: this conversation is uploaded to {repository} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is uploaded to {repository} ({audience}) at the end of each turn{because}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
         (SignIn::Current, true) => format!(
-            "agit: this conversation is saved on this computer for {repository} at the end of each turn{because}. Automatic upload is off for it here, so nothing goes up by itself: `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is saved on this computer for {repository} at the end of each turn{because}. Automatic upload is off for it here, so nothing goes up by itself: `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
         (SignIn::Expired, false) => format!(
-            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to {repository} ({audience}) as before{because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to {repository} ({audience}) as before{because}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
         (SignIn::Expired, true) => format!(
-            "agit: signed out. This conversation is still saved on this computer for {repository}{because}. Automatic upload is off for it here: after `agit login`, `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: signed out. This conversation is still saved on this computer for {repository}{because}. Automatic upload is off for it here: after `agit login`, `agit push {repository}` publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
         (SignIn::Absent, false) => format!(
-            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to {repository} ({audience}){because}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to {repository} ({audience}){because}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
         (SignIn::Absent, true) => format!(
-            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included{because}. Automatic upload is off for it here, so `agit push {repository}` then publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for {repository} yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included{because}. Automatic upload is off for it here, so `agit push {repository}` then publishes it{push_audience}. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         ),
     }
 }
@@ -2287,11 +2287,11 @@ mod tests {
         };
         assert_eq!(
             signed(SignIn::Expired, Some("public")),
-            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to acme/widget (public: anyone can read it) as before. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: signed out. This conversation is still saved on this computer; after `agit login` its turns upload to acme/widget (public: anyone can read it) as before. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         assert_eq!(
             signed(SignIn::Absent, Some("private")),
-            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to acme/widget (private to acme: its owners and the people granted access can read it). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation, earlier turns included, and uploads it to acme/widget (private to acme: its owners and the people granted access can read it). Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         let notice_reading = |visibility: Option<&str>, org: Option<bool>, members_read| {
             super::upload_notice(&crate::commands::project::AutomaticUpload {
@@ -2313,7 +2313,7 @@ mod tests {
         );
         assert_eq!(
             notice_reading(Some("private"), Some(true), Some(false)),
-            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is uploaded to acme/widget (private to acme: its owners and the people granted access can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         assert!(
             notice(Some("private"), Some(false))
@@ -2436,15 +2436,15 @@ mod tests {
         let off = |sign_in, worktree| off_reading(None, sign_in, worktree);
         assert_eq!(
             off(SignIn::Current, None),
-            "agit: this conversation is saved on this computer for acme/widget at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push acme/widget` publishes it. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: this conversation is saved on this computer for acme/widget at the end of each turn. Automatic upload is off for it here, so nothing goes up by itself: `agit push acme/widget` publishes it. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         assert_eq!(
             off_reading(Some("public"), SignIn::Expired, None),
-            "agit: signed out. This conversation is still saved on this computer for acme/widget. Automatic upload is off for it here: after `agit login`, `agit push acme/widget` publishes it (public: anyone can read it). Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: signed out. This conversation is still saved on this computer for acme/widget. Automatic upload is off for it here: after `agit login`, `agit push acme/widget` publishes it (public: anyone can read it). Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         assert_eq!(
             off(SignIn::Absent, None),
-            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included. Automatic upload is off for it here, so `agit push acme/widget` then publishes it. Not this one? Run `agit project drop` (or ask your agent to run it)."
+            "agit: not signed in, so this conversation is not saved for acme/widget yet; after `agit login`, the next turn saves this whole conversation on this computer, earlier turns included. Automatic upload is off for it here, so `agit push acme/widget` then publishes it. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch."
         );
         for sign_in in [SignIn::Current, SignIn::Expired, SignIn::Absent] {
             let line = off(sign_in, Some(("/w/widget-tree", "/w/widget")));

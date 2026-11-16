@@ -446,7 +446,7 @@ fn opencode_earlier(look: Option<&crate::commands::project::OpencodeLook>) -> se
 fn report_dropped(dropped: usize) {
     if dropped > 0 {
         println!(
-            "{dropped} session{} you stopped uploading (`agit project drop`) {} left out; to upload one anyway, name it: {}",
+            "{dropped} session{} you stopped uploading (`agit project drop`) {} left out; to upload one anyway, name it: {} (it saves into a new branch)",
             if dropped == 1 { "" } else { "s" },
             if dropped == 1 { "is" } else { "are" },
             ui::accent("agit save SESSION-ID")

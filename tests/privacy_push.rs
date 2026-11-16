@@ -10512,6 +10512,16 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         &[],
     );
     assert_eq!(record(&dropped), None);
+    // A drop is for good, and a later `agit save` of the conversation saves it into another
+    // branch: the dropped one stays where it was. Every hint that offers the drop says both
+    // (#491).
+    let kept = git(repo.root(), &["rev-parse", &dropped]);
+    let before = branches();
+    agit(&["--json", "save", DROPPED], None, &[]);
+    let added: Vec<String> = branches().difference(&before).cloned().collect();
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_ne!(added[0], dropped);
+    assert_eq!(git(repo.root(), &["rev-parse", &dropped]), kept);
 
     // Another upload of the repository is preparing for the whole wait: tried again as well.
     let lock = repo.root().join(".git/agit/privacy-publication/lock");

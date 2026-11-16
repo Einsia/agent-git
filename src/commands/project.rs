@@ -4174,7 +4174,7 @@ pub(crate) fn save_now(
         // `--all` and `--today` ask for earlier sessions, never for one the person dropped.
         if project.excluded.contains(&session_key) {
             saved.push(Saved::Refused(format!(
-                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`"
+                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`, which saves it into a new branch"
             )));
             continue;
         }

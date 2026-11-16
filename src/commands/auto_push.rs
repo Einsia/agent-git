@@ -254,7 +254,9 @@ pub(super) fn after_settlement(
                 ui::success(&format!("automatically pushed {target}"));
                 // The next turn uploads again, so the way to stop it comes with the notice.
                 if super::project::binds(slug) {
-                    ui::hint(&format!("not this one? `agit project drop {target}`"));
+                    ui::hint(&format!(
+                        "not this one? `agit project drop {target}` stops recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch"
+                    ));
                 }
             }
         }
