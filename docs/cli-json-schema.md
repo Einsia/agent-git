@@ -75,6 +75,15 @@ that Hub, or `null` when the checkout records none there), `account` (the
 account saved for that Hub, or `null`), and `upstream`. A checkout holds one
 pinned Hub, so the list is empty or holds `origin` as the upstream.
 
+`share`, when it creates a link, returns it in `result.value`: `link` (with the
+key after `#k=` for an encrypted link), `slug` (for `agit share rm`), `source`
+(what was copied), `encrypted`, `expires` (the `--expire` value, or `null` for a
+link that never expires), `views` (the view cap, or `null`), `passphrase`, and
+`made_in_this_conversation`: `true` when the copied conversation is one the
+command ran inside, so what that conversation wrote after the command, the
+agent's answer included, is not in the link. The preview, the report and the
+notes stay in `diagnostics`.
+
 ## Platforms and execution
 
 The envelope is available on macOS, Linux, and native Windows MSVC builds.

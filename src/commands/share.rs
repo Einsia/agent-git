@@ -182,11 +182,12 @@ pub fn run(mut args: Args) -> CmdResult {
         "share exceeds the upload budget; no content was sent"
     );
 
+    let left_out = prepared.projection.left_out()?;
     {
         use std::io::Write;
         use ui::privacy_preview;
         let mut output = std::io::stderr().lock();
-        privacy_preview::write_report(&mut output, &prepared.report)?;
+        privacy_preview::write_report(&mut output, &prepared.report, &left_out)?;
         writeln!(output, "Public metadata:")?;
         privacy_preview::write_value(&mut output, &public["metadata"], 2)?;
         if args.show_preview {
@@ -202,6 +203,22 @@ pub fn run(mut args: Args) -> CmdResult {
             "this link holds the conversation as it is on this computer, including {} turn{} the Hub has not received",
             source.unreceived,
             if source.unreceived == 1 { "" } else { "s" }
+        ));
+    }
+    if !left_out.conversation.is_empty() {
+        let n = left_out.conversation.len();
+        ui::warning(&format!(
+            "this link leaves out {n} record{} of the conversation that agit can't show; the preview above names {}",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "it" } else { "them" }
+        ));
+    }
+    if let (Some(session), None) = (&source.inside, &source.running) {
+        ui::warning(
+            "this link ends at this command: what this conversation writes after it, the agent's answer included, is not in it",
+        );
+        ui::hint(&format!(
+            "for a link that holds this whole turn: `agit share {session}` again once the turn has ended"
         ));
     }
     if let Some(running) = &source.running {
@@ -283,7 +300,6 @@ pub fn run(mut args: Args) -> CmdResult {
         resp.slug
     );
 
-    ui::success("read-only copy created");
     crate::telemetry::activation::reached(
         crate::telemetry::activation::Milestone::FirstShare,
         client.base(),
@@ -294,6 +310,25 @@ pub fn run(mut args: Args) -> CmdResult {
         Some(k) => format!("{}#k={}", resp.url, k),
         None => resp.url.clone(),
     };
+    if super::json::requested() {
+        // An agent relays what the link leaves out from `made_in_this_conversation`.
+        println!(
+            "{}",
+            serde_json::json!({
+                "link": link,
+                "slug": resp.slug,
+                "source": source.label,
+                "encrypted": !args.public,
+                "expires": (expire_secs != 0).then(|| args.expire.clone()),
+                "views": args.views,
+                "passphrase": args.password,
+                "made_in_this_conversation": source.inside.is_some(),
+            })
+        );
+        ui::hint(&format!("revoke: agit share rm {}", resp.slug));
+        return Ok(ExitCode::Ok);
+    }
+    ui::success("read-only copy created");
     println!("\n  {}\n", ui::accent(&link));
 
     print!(
@@ -370,6 +405,9 @@ struct ShareSource {
     running: Option<link::Link>,
     /// For a live transcript, how many of its turns the Hub has not received.
     unreceived: usize,
+    /// The session ID of the conversation it copies, when that is one this command runs inside:
+    /// what the conversation writes after the command, the agent's answer included, is not in it.
+    inside: Option<String>,
 }
 
 impl ShareSource {
@@ -523,7 +561,7 @@ fn this_conversation_source(full_log: bool) -> crate::Result<ShareSource> {
         )),
         [session] => {
             let Some(target) = &session.target else {
-                let mut hint = live_copy(&session.session_id);
+                let mut hint = live_copy(&session.session_id, true);
                 match &session.project {
                     Some(save) if save.upload_off => hint.push_str(
                         "\nor, once this turn has ended and saved on this computer: `agit share`",
@@ -554,11 +592,26 @@ fn this_conversation_source(full_log: bool) -> crate::Result<ShareSource> {
     }
 }
 
-/// The step that shares conversation `session` as it is now, the turn in progress included.
-fn live_copy(session: &str) -> String {
+/// The step that shares conversation `session` as it is now, the turn in progress included. From
+/// inside that conversation's own turn the copy ends at that command, so it is not said to hold
+/// the turn.
+fn live_copy(session: &str, inside: bool) -> String {
+    let holds = if inside {
+        "up to that command"
+    } else {
+        "the turn in progress included"
+    };
     format!(
-        "`agit share {session}` makes a read-only copy of the conversation as it is now, the turn in progress included; it does not upload the conversation to the repository"
+        "`agit share {session}` makes a read-only copy of the conversation as it is now, {holds}; it does not upload the conversation to the repository"
     )
+}
+
+/// Whether `session` is a conversation this command runs inside, as the runtime's own variables
+/// name it.
+fn runs_inside(session: &str) -> bool {
+    crate::infra::runtime_session::named()
+        .iter()
+        .any(|named| named.session_id == session)
 }
 
 fn parse_share_ref(target: &str) -> crate::Result<refs::RefSpec> {
@@ -691,6 +744,7 @@ fn live_source(native: link::Link, full_log: bool) -> crate::Result<ShareSource>
         repository: None,
         running: None,
         unreceived,
+        inside: runs_inside(&native.session_id).then(|| native.session_id.clone()),
     })
 }
 
@@ -908,6 +962,10 @@ fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource>
         metadata: snapshot,
         branch: point.branch,
         repository: Some(point.slug),
+        inside: running
+            .as_ref()
+            .map(|running| running.session_id.clone())
+            .filter(|session| runs_inside(session)),
         running,
         unreceived: 0,
     })
@@ -947,7 +1005,7 @@ fn running_conversation(point: &SharePoint, snapshot: &meta::Meta) -> Option<lin
 /// counts this conversation among the ones it saves; otherwise the wait would end with the branch
 /// where it is.
 fn including_running(source: &ShareSource, running: &link::Link) -> Vec<String> {
-    let mut lines = vec![live_copy(&running.session_id)];
+    let mut lines = vec![live_copy(&running.session_id, source.inside.is_some())];
     let (Some(repository), Some(branch), Some(cwd)) =
         (&source.repository, &source.branch, running.cwd.as_deref())
     else {
@@ -1264,6 +1322,7 @@ mod tests {
             repository: Some("alice/app".into()),
             running: None,
             unreceived: 0,
+            inside: None,
         };
         let lines = |runtime: &str| {
             let conversation = link::Link::new(
