@@ -619,7 +619,7 @@ fn report(root: &Path, enabled: &Enabled, stays_off: Option<&Path>) -> CmdResult
                 "grant_access_page": enabled.grant_page,
                 "earlier_sessions_not_uploaded": earlier,
                 "stays_off": stays_off,
-                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).chain(crate::commands::project::opencode_not_captured(root).map(|said| serde_json::json!({"runtime": "opencode", "state": "not_captured", "says": said}))).collect::<Vec<_>>(),
+                "runtimes": runtimes.iter().map(|(r, state)| serde_json::json!({"runtime": r, "state": state.name(), "says": state.describe()})).chain(crate::commands::project::opencode_not_captured(root).map(|said| serde_json::json!({"runtime": "opencode", "state": "not_captured", "says": said}))).chain(crate::commands::project::pi_earlier_unread(root).map(|said| serde_json::json!({"runtime": "pi", "state": "earlier_unread", "says": said}))).collect::<Vec<_>>(),
                 // Uploading the sessions from before is the person's choice: the agent asks.
                 "next": (waiting > 0).then(|| serde_json::json!({
                     "ask_user": super::earlier_note(waiting, "here", super::Reader::Agent),
@@ -722,6 +722,9 @@ fn report(root: &Path, enabled: &Enabled, stays_off: Option<&Path>) -> CmdResult
         println!("  {}: {}", super::runtime_name(runtime), state.describe());
     }
     if let Some(said) = crate::commands::project::opencode_not_captured(root) {
+        println!("  {said}");
+    }
+    if let Some(said) = crate::commands::project::pi_earlier_unread(root) {
         println!("  {said}");
     }
     let here =

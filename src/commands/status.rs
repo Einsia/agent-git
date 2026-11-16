@@ -280,6 +280,9 @@ pub fn run(args: Args) -> CmdResult {
     if let Some(said) = super::project::opencode_not_captured(&cwd) {
         println!("  {said}");
     }
+    if let Some(said) = super::project::pi_earlier_unread(&cwd) {
+        println!("  {said}");
+    }
     // A conversation whose host shows nothing agit says hears here that its last turn wasn't
     // saved.
     for (runtime, session, failure) in unsaved_turns(&cwd) {

@@ -93,6 +93,9 @@ pub fn run() -> CmdResult {
     let opencode = root
         .as_deref()
         .and_then(crate::commands::project::opencode_not_captured);
+    let pi_earlier = root
+        .as_deref()
+        .and_then(crate::commands::project::pi_earlier_unread);
     // An old agit section in a folder agit set up still tells agents to run agit at every session
     // start; the person removes it, as the file may be committed.
     let legacy = crate::commands::setup::legacy_folder_sections();
@@ -127,6 +130,7 @@ pub fn run() -> CmdResult {
                     "error": error,
                 })).collect::<Vec<_>>(),
                 "opencode_not_captured": opencode,
+                "pi_earlier_unread": pi_earlier,
                 "legacy_agents_sections": legacy.iter().map(|section| serde_json::json!({
                     "file": section.file,
                     "tracked": section.tracked,
@@ -209,6 +213,9 @@ pub fn run() -> CmdResult {
                 (FolderState::NotSaved, _) => println!("{folder} is not saved"),
             }
             if let Some(said) = opencode {
+                println!("  {said}");
+            }
+            if let Some(said) = pi_earlier {
                 println!("  {said}");
             }
             if codex_untrusted {
