@@ -842,8 +842,8 @@ struct PendingApproval {
     /// the execution side can require a durable danger permit before echoing a
     /// bypass suggestion.
     suggested_permission_mode: Option<PermissionMode>,
-    /// The tool and first path it asks about, so a denial is counted against both.
-    target: Target,
+    /// Reliable target evidence for this request; absent evidence counts only toward the total.
+    target: Option<Target>,
     /// A denial handed to a native Claude Code ask and not yet counted: it counts once its hook
     /// has taken it (`true`), never if it was withdrawn first.
     handed_denial: Option<tokio::sync::watch::Receiver<bool>>,
@@ -887,8 +887,54 @@ impl PendingApproval {
     }
 }
 
-/// A tool and the first path it touches, if any.
-type Target = (String, Option<String>);
+/// Target evidence stays in the current turn's memory and never leaves the supervisor.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Target {
+    File { tool: String, path: String },
+    Command { tool: String, digest: [u8; 32] },
+}
+
+impl Target {
+    fn of(request: &crate::protocol::ApprovalRequest) -> Option<Self> {
+        let tool = request.tool.clone();
+        if matches!(tool.as_str(), "Bash" | "shell" | "execute") {
+            use sha2::Digest as _;
+
+            let command = request.input.get("command")?.as_str()?;
+            if command.trim().is_empty() {
+                return None;
+            }
+            let mut digest = sha2::Sha256::new();
+            digest.update((command.len() as u64).to_be_bytes());
+            digest.update(command.as_bytes());
+            // Lengths and presence markers keep distinct commands and explicit directories
+            // distinct, without retaining another copy of command text or display metadata.
+            for field in ["cwd", "workdir"] {
+                if let Some(value) = request.input.get(field) {
+                    let directory = value.as_str()?;
+                    if directory.is_empty() {
+                        return None;
+                    }
+                    digest.update([1]);
+                    digest.update((directory.len() as u64).to_be_bytes());
+                    digest.update(directory.as_bytes());
+                } else {
+                    digest.update([0]);
+                }
+            }
+            Some(Self::Command {
+                tool,
+                digest: digest.finalize().into(),
+            })
+        } else {
+            let path = request.paths.first().filter(|path| !path.is_empty())?;
+            Some(Self::File {
+                tool,
+                path: path.clone(),
+            })
+        }
+    }
+}
 
 /// What an answer's outcome proves about whether the runtime took a denial.
 enum DenialProof {
@@ -922,15 +968,24 @@ struct Denials {
 
 impl Denials {
     /// An approval for `target` was denied.
-    fn record(&mut self, target: Target) {
+    fn record(&mut self, target: Option<Target>) {
         self.total = self.total.saturating_add(1);
-        let count = self.by_target.entry(target).or_default();
-        *count = count.saturating_add(1);
+        if let Some(target) = target {
+            let count = self.by_target.entry(target).or_default();
+            *count = count.saturating_add(1);
+        }
     }
 
     /// The denials so far in this turn, and those for `target`.
-    fn of(&self, target: &Target) -> (u32, u32) {
-        (self.total, self.by_target.get(target).copied().unwrap_or(0))
+    fn of(&self, target: &Option<Target>) -> (u32, u32) {
+        (
+            self.total,
+            target
+                .as_ref()
+                .and_then(|target| self.by_target.get(target))
+                .copied()
+                .unwrap_or(0),
+        )
     }
 }
 
@@ -3595,7 +3650,7 @@ impl Session {
                 // reaches, for whoever reads the card.
                 req.requires_owner = false;
                 req.owner_reason = reason;
-                let target: Target = (req.tool.clone(), req.paths.first().cloned());
+                let target = Target::of(&req);
                 // A handed denial taken by now counts even if its ask's close is still on its way.
                 for pending in self.pending.values_mut() {
                     pending.count_taken_denial(&mut self.denials);

@@ -12,7 +12,7 @@ async fn shared_approval_resolution_preserves_other_pending_requests() {
             id.into(),
             PendingApproval {
                 suggested_permission_mode: None,
-                target: ("tool".into(), None),
+                target: None,
                 handed_denial: None,
             },
         );
@@ -1426,7 +1426,7 @@ async fn run_ambiguous_claude_approval(
         "approval-1".into(),
         PendingApproval {
             suggested_permission_mode: suggested_mode,
-            target: ("tool".into(), None),
+            target: None,
             handed_denial: None,
         },
     );
@@ -1747,7 +1747,7 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
         "current-approval".into(),
         PendingApproval {
             suggested_permission_mode: None,
-            target: ("tool".into(), None),
+            target: None,
             handed_denial: None,
         },
     );
@@ -1803,7 +1803,7 @@ async fn a_fenced_interrupt_leaves_a_claude_turn_running() {
         "current-approval".into(),
         PendingApproval {
             suggested_permission_mode: None,
-            target: ("tool".into(), None),
+            target: None,
             handed_denial: None,
         },
     );
@@ -2093,7 +2093,7 @@ async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
                 "approval-deny".into(),
                 PendingApproval {
                     suggested_permission_mode: None,
-                    target: ("tool".into(), None),
+                    target: None,
                     handed_denial: None,
                 },
             );
@@ -2307,7 +2307,8 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
 /// A turn's end clears both. A count kept across turns, one that counted allows, refused or
 /// withdrawn answers, a shared request's close, or a handed denial twice, one that let a malformed
 /// retry erase a denial handed before it, or one that ignored the path would each mislabel a
-/// request below.
+/// request below. Commands without paths compare their full input command and explicit working
+/// directory, so an unrelated command or a truncated display summary cannot identify a repeat.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_approval_request_says_how_often_this_turn_was_denied() {
@@ -2465,6 +2466,80 @@ async fn an_approval_request_says_how_often_this_turn_was_denied() {
         "a new turn starts with no denials"
     );
 
+    let command_request = |id: &str, tool: &str, input: serde_json::Value| {
+        let HarnessEvent::Approval(mut approval) = request(id, "", "command-turn") else {
+            unreachable!()
+        };
+        approval.kind = crate::protocol::ApprovalKind::Exec;
+        approval.tool = tool.into();
+        approval.summary = crate::rc::harness::summarize_tool(tool, &input);
+        approval.input = input;
+        approval.paths.clear();
+        HarnessEvent::Approval(approval)
+    };
+    // Each harness supplies a different tool name for a command with no declared file path.
+    // The command suffix is outside the card summary, and descriptive metadata is not identity.
+    for (tool, directory_field) in [("Bash", "cwd"), ("shell", "cwd"), ("execute", "workdir")] {
+        let command = format!("printf '%s' '{}A'", "x".repeat(240));
+        let unrelated = format!("printf '%s' '{}B'", "x".repeat(240));
+        let (mut session, mut out, _) = session_with(&["command-denied"]);
+        session
+            .on_harness_event(command_request(
+                "command-denied",
+                tool,
+                serde_json::json!({"command": command, (directory_field): "/one", "description": "first"}),
+            ))
+            .await;
+        assert_eq!(counts(&mut out), (0, 0));
+        let mut session = decide(session, "command-denied", ApprovalDecision::Deny, true).await;
+        let mut ledger = std::mem::take(&mut session.denials);
+        for (id, input, expected) in [
+            (
+                "unrelated-command",
+                serde_json::json!({"command": unrelated, (directory_field): "/one"}),
+                (1, 0),
+            ),
+            (
+                "repeated-command",
+                serde_json::json!({"command": command, (directory_field): "/one", "description": "another label"}),
+                (1, 1),
+            ),
+            (
+                "other-directory",
+                serde_json::json!({"command": command, (directory_field): "/two"}),
+                (1, 0),
+            ),
+            (
+                "unknown-command",
+                serde_json::json!({"description": "unknown"}),
+                (1, 0),
+            ),
+        ] {
+            let (next, mut out, _) = session_with(&[]);
+            session = next;
+            session.denials = std::mem::take(&mut ledger);
+            session
+                .on_harness_event(command_request(id, tool, input))
+                .await;
+            assert_eq!(counts(&mut out), expected, "{tool}: {id}");
+            ledger = std::mem::take(&mut session.denials);
+            session.driver.shutdown().await.unwrap();
+        }
+        // Missing command evidence never forms a shared target, even after another unknown ask
+        // was denied. The denial still contributes to the turn's overall count.
+        for (id, expected) in [("unknown-denied", (1, 0)), ("unknown-again", (2, 0))] {
+            let (next, mut out, _) = session_with(&[id]);
+            session = next;
+            session.denials = std::mem::take(&mut ledger);
+            session
+                .on_harness_event(command_request(id, tool, serde_json::json!({})))
+                .await;
+            assert_eq!(counts(&mut out), expected, "{tool}: {id}");
+            session = decide(session, id, ApprovalDecision::Deny, true).await;
+            ledger = std::mem::take(&mut session.denials);
+        }
+    }
+
     // A denial handed to a native Claude Code ask counts once its hook has taken it, already at
     // the next request if the ask's close is still on its way, and only once; one withdrawn
     // before its hook took it never counts. A shared request that closed does not say whose
@@ -2479,7 +2554,10 @@ async fn an_approval_request_says_how_often_this_turn_was_denied() {
     ] {
         let mut pending = PendingApproval {
             suggested_permission_mode: None,
-            target: ("Edit".into(), Some("docs/c.md".into())),
+            target: Some(Target::File {
+                tool: "Edit".into(),
+                path: "docs/c.md".into(),
+            }),
             handed_denial: None,
         };
         pending.note_answer(ApprovalDecision::Deny, &outcome, &mut session.denials);
