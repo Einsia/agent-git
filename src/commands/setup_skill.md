@@ -1,6 +1,6 @@
 ---
 name: agit
-description: "Use AgentGit when the user requests AgentGit operations or the current session has an explicit AgentGit identity. Save, resume, inspect, or publish session history. Unrelated tasks do not need AgentGit checks."
+description: "Use AgentGit when the user requests AgentGit operations, such as saving, uploading or sharing this conversation as a link, or the current session has an explicit AgentGit identity. Save, resume, inspect, share, or publish session history. Unrelated tasks do not need AgentGit checks."
 ---
 
 # AgentGit overview
@@ -9,6 +9,8 @@ description: "Use AgentGit when the user requests AgentGit operations or the cur
 
 Use this workflow when the user requests an AgentGit operation, or when
 `AGIT_SESSION` or `AGIT_MERGE_TX` explicitly identifies the current managed session.
+Saving, uploading or sharing this conversation, a read-only link to it included,
+is an AgentGit operation.
 An installed skill, a workspace binding, or a generic instruction in an ancestor
 `AGENTS.md` does not by itself make an unrelated task an AgentGit operation.
 For ordinary questions, device troubleshooting, browsing, or unmanaged project
