@@ -6374,11 +6374,40 @@ pub(crate) enum Saving {
 /// OpenCode conversation of the folder ran it: a plugin file alone may be one OpenCode never
 /// loaded. Every surface asks this one function, so none of them says it where another stays
 /// silent.
-pub(crate) fn opencode_not_captured(folder: &Path) -> Option<&'static str> {
+pub(crate) fn opencode_not_captured(folder: &Path) -> Option<String> {
     (crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available())
         && saving(folder) == Saving::Uploads
         && !opencode_plugin_runs(folder))
-    .then_some(OPENCODE_NOT_CAPTURED)
+    .then(|| {
+        format!(
+            "{OPENCODE_NOT_CAPTURED}; {}",
+            opencode_next_step(Reader::of_this_process())
+        )
+    })
+}
+
+/// What makes OpenCode tell agit when a turn ends, for [`opencode_not_captured`]: `agit on`
+/// installs agit's plugin where it is missing or another agit's, and an OpenCode started before
+/// the plugin was there loads it once restarted. A file agit did not write where the plugin goes
+/// is named by `agit doctor`, and `agit on` leaves it as it is.
+fn opencode_next_step(reader: Reader) -> &'static str {
+    use super::setup::native::{OpencodePlugin, opencode_plugin_path, opencode_plugin_state};
+    let state =
+        opencode_plugin_path().map(|path| opencode_plugin_state(&path, &super::setup::exe_str()));
+    match (state, reader) {
+        (Some(OpencodePlugin::Current), _) => {
+            "agit's plugin is installed, so restarting OpenCode loads it and its turns go up as each ends"
+        }
+        (Some(OpencodePlugin::Foreign), _) => {
+            "a file agit did not write is where agit's OpenCode plugin goes; `agit doctor` says where"
+        }
+        (_, Reader::Person) => {
+            "`agit on` here installs agit's plugin, so its turns go up as each ends"
+        }
+        (_, Reader::Agent) => {
+            "the user installs agit's plugin with `agit on` here, so its turns go up as each ends"
+        }
+    }
 }
 
 /// Whether OpenCode tells this agit when a turn ends in `folder`: the plugin is this agit's, and

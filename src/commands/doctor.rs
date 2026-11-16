@@ -193,7 +193,7 @@ pub fn run(args: Args) -> CmdResult {
         .ok()
         .and_then(|cwd| super::project::opencode_not_captured(&cwd))
     {
-        checks.push(("opencode".into(), Check::Warn(said.into())));
+        checks.push(("opencode".into(), Check::Warn(said)));
     }
 
     // ── git ──

@@ -10245,6 +10245,8 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
 ///   someone else writing rather than a Hub that didn't answer;
 /// - one the Hub refused (403) is never retried, and one dropped after the failure goes with its
 ///   record and is never tried again;
+/// - one whose worker is gone before its next try, as when the computer was off, is started by the
+///   folder's next agit command once it is due, and uploads;
 /// - one the person pushes before its next try is recorded as uploaded, listed as uploaded, and no
 ///   longer told as the folder's failed upload;
 /// - one whose folder is turned off before its next try is not tried again: nothing of it is sent
@@ -10263,6 +10265,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     const WAITED: &str = "eeeeeeee-0000-4000-8000-00000000000e";
     const CONTENDED: &str = "ffffffff-0000-4000-8000-00000000000f";
     const PUSHED: &str = "cdcdcdcd-0000-4000-8000-0000000000cd";
+    const ASLEEP: &str = "efefefef-0000-4000-8000-0000000000ef";
     const TURNED_OFF: &str = "abababab-0000-4000-8000-0000000000ab";
     const START: i64 = 1_900_000_000;
 
@@ -10740,6 +10743,35 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         String::from_utf8_lossy(&listed.stdout)
     );
 
+    // Cut off, and the computer off before the folder's next try: its worker is gone. The worker
+    // here reads a clock that stands still before the try, so it never acts, as one a shutdown
+    // ended. Once the try is due, the folder's next agit command starts a worker of its own, which
+    // uploads it; that worker's clock is set back after, so it takes no later try.
+    let frozen = temp.path().join("frozen-clock");
+    fs::write(&frozen, START.to_string()).unwrap();
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let asleep = upload(
+        ASLEEP,
+        "hotel asleep",
+        &[("AGIT_TEST_CLOCK_FILE", frozen.to_str().unwrap())],
+    );
+    let asleep_at = git(repo.root(), &["rev-parse", &asleep]);
+    let pending = record(&asleep).unwrap();
+    assert_eq!(pending["reason"], "hub", "{pending}");
+    let due = pending["retry_after"].as_i64().unwrap();
+    let restarted = temp.path().join("restarted-clock");
+    fs::write(&restarted, (due + 1).to_string()).unwrap();
+    agit(
+        &["status"],
+        None,
+        &[("AGIT_TEST_CLOCK_FILE", restarted.to_str().unwrap())],
+    );
+    wait("the retry the folder's next command started", &|| {
+        record(&asleep).is_some_and(|record| record["state"] == "uploaded")
+    });
+    assert_eq!(on_hub(&asleep), published_form(&repo, &asleep, &asleep_at));
+    fs::write(&restarted, START.to_string()).unwrap();
+
     // Cut off, and the folder turned off before its next try: its record goes with the folder,
     // and the folder's worker, run past the time the try was due, sends nothing.
     hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
@@ -10761,7 +10793,9 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     assert_eq!(hub.posts.load(Ordering::Acquire), posts);
     assert_eq!(hub.previews.lock().unwrap().len(), previews);
     // The workers still waiting for a try find nothing due, and end.
-    fs::write(&clock, (retry_at + 1).to_string()).unwrap();
+    for file in [&clock, &frozen, &restarted] {
+        fs::write(file, (retry_at + 1).to_string()).unwrap();
+    }
 }
 
 /// A file line that diverged from the Hub's, as when two people distill the same memory into
