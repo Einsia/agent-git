@@ -885,11 +885,19 @@ fn session_page(repo: &Repo, owner: &str, agent: &str, branch: &str) -> String {
         .flatten()
         .map(|identity| identity.hub)
         .unwrap_or_else(config::hub_url);
+    let session = crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}"))
+        .ok()
+        .flatten()
+        .map(|meta| meta.session);
+    page_on(&hub, owner, agent, session.as_deref())
+}
+
+/// The page of `session` in `owner/agent` on `hub`, or the repository's page when `session` is no
+/// session id: never an address the Hub doesn't serve.
+pub(crate) fn page_on(hub: &str, owner: &str, agent: &str, session: Option<&str>) -> String {
     let repository = format!("{}/@{owner}/{agent}", hub.trim_end_matches('/'));
-    match crate::domain::meta::read_at_ref_result(repo, &format!("refs/heads/{branch}")) {
-        Ok(Some(meta)) if meta::is_bare_id(&meta.session) => {
-            format!("{repository}/s/{}", meta.session)
-        }
+    match session {
+        Some(session) if meta::is_bare_id(session) => format!("{repository}/s/{session}"),
         _ => repository,
     }
 }

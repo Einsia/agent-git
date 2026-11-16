@@ -491,6 +491,8 @@ pub(super) fn run(
     };
     let mut finishing = false;
     let mut published = 0usize;
+    // What the Hub took as new, for the lines that close the push.
+    let mut taken = Taken::default();
     // The tags the last prepared part left out, named once the push ends.
     let mut left_out_tags = Vec::new();
     let mut repo = repo;
@@ -806,7 +808,7 @@ pub(super) fn run(
                         "--yes no longer applies in this push, because an earlier publication changed after it was given",
                     );
                 }
-                let answered = Answer {
+                let who = Answer {
                     person_only,
                     public,
                     delivery_confirmed: delivery_answers,
@@ -815,8 +817,8 @@ pub(super) fn run(
                     agit_yes: yes_answers,
                     encrypted,
                     can_ask: ui::prompt::can_ask(),
-                }
-                .without_asking();
+                };
+                let answered = who.without_asking();
                 if answered == Some(true) {
                     if person_only {
                         crate::hub::git::confirm_person_publication();
@@ -856,6 +858,19 @@ pub(super) fn run(
                         intent.hub, intent.visibility
                     ),
                 };
+                // The line before the question offers only a `--yes` that answers it: with one given
+                // and withdrawn, the line above says why, and under audit the final confirmation
+                // stays with the person whatever the flags.
+                if !yes.given() && ui::prompt::can_ask() && who.yes_would_answer() {
+                    ui::hint(&format!(
+                        "{}it confirms the preview above before anything is published; `{retry_command} --yes` answers it ahead of time",
+                        if named {
+                            "asked although the repository and branch are named: "
+                        } else {
+                            ""
+                        }
+                    ));
+                }
                 let answer = ui::prompt::answer(&question, false)?;
                 if answer.is_none() && !args.audit {
                     return Err(crate::commands::InteractionRequired("session publication requires confirmation of its preview; use --yes or an interactive terminal".into()).into());
@@ -1235,6 +1250,7 @@ pub(super) fn run(
             )?;
         }
         record_published_tags(&repo, &projected);
+        taken.add(&report, [projected.repo(), &repo], &intent);
         if let (Some(reply), Some(candidate)) = (supervisor.take(), supervised) {
             reply.complete(&repo, candidate)?;
         }
@@ -1290,15 +1306,102 @@ pub(super) fn run(
             finishing = true;
         }
     }
-    if in_parts {
-        ui::success(&format!(
-            "Published reviewed sessions to {repository} in {published} parts."
-        ));
-    } else {
-        ui::success(&format!("Published reviewed sessions to {repository}."));
-    }
+    taken.say(&repository, in_parts.then_some(published));
     report_left_out_tags(&left_out_tags);
     Ok(ExitCode::Ok)
+}
+
+/// What a push changed on the Hub: each session it published with its page, the other branches
+/// whose files it published, and how many tags. A ref the Hub already had at the published object
+/// was not published by this push, so it isn't named.
+#[derive(Default)]
+struct Taken {
+    sessions: Vec<(String, String)>,
+    files: Vec<String>,
+    tags: usize,
+}
+
+impl Taken {
+    /// Adds what `report` says the Hub took as new. A session's page is read from the commit the
+    /// Hub received, in the first of `repos` that holds it: a delivery to another Hub publishes
+    /// the session under that Hub's id.
+    fn add(&mut self, report: &PublicationReport, repos: [&Repo; 2], intent: &super::Intent) {
+        let updated = |phase: Option<&crate::hub::git::PublicationPhase>| {
+            phase
+                .into_iter()
+                .flat_map(|phase| &phase.attempts)
+                .flat_map(|attempt| &attempt.refs)
+                .filter(|sent| sent.status == PublicationStatus::Updated)
+                .map(|sent| sent.reference.clone())
+                .collect::<Vec<_>>()
+        };
+        for reference in updated(report.heads.as_ref()) {
+            let Some(branch) = reference.name().strip_prefix("refs/heads/") else {
+                continue;
+            };
+            let session = repos
+                .iter()
+                .find_map(|repo| {
+                    crate::domain::meta::read_at_ref_result(repo, reference.oid())
+                        .ok()
+                        .flatten()
+                })
+                .filter(crate::domain::meta::Meta::is_session_line)
+                .map(|meta| meta.session);
+            match session {
+                Some(session) => {
+                    let page = crate::commands::project::page_on(
+                        &intent.hub,
+                        &intent.owner,
+                        &intent.name,
+                        Some(&session),
+                    );
+                    // A session sent in parts keeps one line, with its page as the last part left it.
+                    self.sessions.retain(|(sent, _)| sent != branch);
+                    self.sessions.push((branch.to_owned(), page));
+                }
+                None if !self.files.iter().any(|sent| sent == branch) => {
+                    self.files.push(branch.to_owned());
+                }
+                None => {}
+            }
+        }
+        self.tags += updated(report.tags.as_ref()).len();
+    }
+
+    /// The lines that close a push that went through: never "sessions" when none was published.
+    fn say(&self, repository: &str, parts: Option<usize>) {
+        let parts = parts.map_or_else(String::new, |parts| format!(" in {parts} parts"));
+        let files = self.files.join(", ");
+        match self.sessions.as_slice() {
+            [] if !self.files.is_empty() => ui::success(&format!(
+                "Published the file changes on {files} to {repository}{parts}; no session was published."
+            )),
+            [] if self.tags > 0 => ui::success(&format!(
+                "Published {} tag{} to {repository}{parts}; its branches were already on the Hub.",
+                self.tags,
+                if self.tags == 1 { "" } else { "s" }
+            )),
+            [] => ui::success(&format!(
+                "{repository} already had everything this push sends; nothing new was published."
+            )),
+            sessions => {
+                ui::success(&format!(
+                    "Published {} session{} to {repository}{parts}{}:",
+                    sessions.len(),
+                    if sessions.len() == 1 { "" } else { "s" },
+                    if self.files.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", with the file changes on {files}")
+                    }
+                ));
+                for (branch, page) in sessions {
+                    ui::info(format_args!("  {repository}@{branch}: {page}"));
+                }
+            }
+        }
+    }
 }
 
 /// The refs of `phases` the Hub acknowledged: updated, or already at the published object. Only
@@ -1413,6 +1516,16 @@ impl Answer {
                 && (self.agit_yes || (!self.encrypted && !self.public && !self.can_ask))))
             .then_some(true)
     }
+
+    /// Whether `--yes` on this push would answer the question without asking.
+    fn yes_would_answer(self) -> bool {
+        Answer {
+            agit_yes: true,
+            ..self
+        }
+        .without_asking()
+            == Some(true)
+    }
 }
 
 /// [`crate::hub::git::PublicationReport::settle_unanswered`] by the Hub's refs as they are now,
@@ -1482,6 +1595,45 @@ fn unsent_outcome(target: &str, published: usize, total: usize) -> String {
 #[cfg(test)]
 mod answer_tests {
     use super::Answer;
+
+    /// The line before the publication question offers `--yes` only where `--yes` answers it: for
+    /// plain and encrypted sessions and for a member publishing to a public repository, never under
+    /// audit, whose final confirmation stays with the person. A line that offered it under audit
+    /// would send the person to a retry that asks the same question again.
+    #[test]
+    fn the_question_offers_yes_only_where_yes_answers_it() {
+        let asked = Answer {
+            person_only: false,
+            public: false,
+            delivery_confirmed: false,
+            automatic: false,
+            audit: false,
+            agit_yes: false,
+            encrypted: false,
+            can_ask: true,
+        };
+        for answer in [
+            asked,
+            Answer {
+                encrypted: true,
+                ..asked
+            },
+            Answer {
+                person_only: true,
+                public: true,
+                ..asked
+            },
+        ] {
+            assert_eq!(answer.without_asking(), None);
+            assert!(answer.yes_would_answer());
+        }
+        let audit = Answer {
+            audit: true,
+            ..asked
+        };
+        assert_eq!(audit.without_asking(), None);
+        assert!(!audit.yes_would_answer());
+    }
 
     /// A public repository written only through the base permission is answered by the person:
     /// at a terminal, or by an explicit `--yes` (`AGIT_YES`) on a one-off push. An automatic upload,
