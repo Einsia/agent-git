@@ -470,6 +470,55 @@ fn selected_secret_scope_and_invalid_selectors_never_widen_the_upload() {
     f.refuse_without_upload(&["me/paper@chosen", "--public"], None);
 }
 
+/// Sharing `main` is refused, and the refusal says why in the person's terms: `main` is the
+/// repository's shared branch, not a conversation. It gives the form that works and where to list
+/// session branches, and names no other branch, since a branch name can carry another
+/// conversation's opening (CLI #513).
+#[test]
+fn sharing_main_says_it_is_no_conversation_and_how_to_name_one() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let main = f.repo.git(&["rev-parse", "main"]).unwrap();
+    let main = main.trim();
+    for (target, named) in [
+        (
+            "me/paper@main",
+            "me/paper@main is the repository's shared branch".to_owned(),
+        ),
+        (
+            "paper@main",
+            "me/paper@main is the repository's shared branch".to_owned(),
+        ),
+        (
+            &format!("me/paper@{main}") as &str,
+            format!(
+                "me/paper@{} is on the repository's shared branch",
+                &main[..9]
+            ),
+        ),
+    ] {
+        f.refuse_without_upload(&[target, "--public"], None);
+        let result = f.run(&[target, "--public"], None);
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for expected in [
+            format!(
+                "{named}, not a conversation, and `agit share` shares a saved conversation; no share was created"
+            ),
+            "share a conversation by its branch: `agit share me/paper@<session branch>`; `agit log me/paper` lists them".to_owned(),
+        ] {
+            assert!(said.contains(&expected), "{target}: {expected}\n---\n{said}");
+        }
+        assert!(
+            !said.contains("chosen"),
+            "{target}: names another branch\n{said}"
+        );
+        assert!(!said.contains("not a settled session"), "{said}");
+    }
+}
+
 #[test]
 fn native_ids_remain_live_and_local_ref_ambiguities_are_rejected() {
     let f = Fixture::new("EXCLUDED-LOG");

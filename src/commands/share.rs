@@ -893,7 +893,29 @@ fn resolve_point(
 /// Metadata, content and confirmation describe the same immutable saved point.
 fn point_source(point: SharePoint, full_log: bool) -> crate::Result<ShareSource> {
     let snapshot = storage::metadata_local(point.repo.root(), &point.sha)?;
-    if !snapshot.is_session_line() || snapshot.session.is_empty() {
+    // A share shows one saved conversation. `main` and the other file lines hold the repository's
+    // shared files, so the refusal says what the point is in the person's terms and gives the form
+    // that works, naming no other branch: a branch name can carry another conversation's opening.
+    if !snapshot.is_session_line() {
+        let slug = &point.slug;
+        let named = match &point.branch {
+            Some(branch) => format!("{slug}@{branch} is the repository's shared branch"),
+            None => format!(
+                "{slug}@{} is on the repository's shared branch",
+                &point.sha[..9.min(point.sha.len())]
+            ),
+        };
+        return Err(super::Hinted {
+            message: format!(
+                "{named}, not a conversation, and `agit share` shares a saved conversation; no share was created"
+            ),
+            hint: format!(
+                "share a conversation by its branch: `agit share {slug}@<session branch>`; `agit log {slug}` lists them"
+            ),
+        }
+        .into());
+    }
+    if snapshot.session.is_empty() {
         anyhow::bail!(
             "this point is not a settled session; select a session branch or recorded version"
         );
