@@ -1681,3 +1681,137 @@ fn head_of(repo: &Repo, branch: &str) -> String {
         .trim()
         .to_owned()
 }
+
+/// A share says what it leaves out by kind (#215): a runtime's bookkeeping as counts on one line,
+/// and a record of the conversation it can't show by its own line and a warning, so a person can
+/// tell whether an answer is missing from the link.
+#[test]
+fn a_share_says_what_kinds_of_records_it_leaves_out() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    let write = |id: &str, answers: &[Value]| {
+        let mut records = vec![
+            json!({"type":"user","sessionId":id,"message":{"role":"user","content":"Run pwd"}}),
+            json!({"type":"progress","sessionId":id,"data":{"type":"hook_progress"}}),
+            json!({"type":"attachment","sessionId":id,"attachment":{"type":"environment","text":"ENV-215"}}),
+            json!({"type":"attachment","sessionId":id,"attachment":{"type":"environment","text":"ENV-215"}}),
+            json!({"type":"system","sessionId":id,"subtype":"turn_duration","durationMs":5}),
+        ];
+        records.extend(answers.iter().map(|content| {
+            json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":content}})
+        }));
+        let text = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        std::fs::write(project.join(format!("{id}.jsonl")), text).unwrap();
+    };
+    let answer = json!([{"type":"text","text":"ANSWER-215"}]);
+
+    let whole = "5b1d0215-0000-4000-8000-000000000001";
+    write(whole, std::slice::from_ref(&answer));
+    let shared = f.success(&[whole], None);
+    let stderr = String::from_utf8_lossy(&shared.stderr);
+    assert!(
+        stderr.contains(
+            "  4 Claude Code bookkeeping records left out, not part of the conversation: \
+             2 attachment (environment), 1 progress (hook_progress), 1 system (turn_duration)\n  \
+             no record of the conversation itself is left out\n"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Source LOG record"), "{stderr}");
+    assert!(!stderr.contains("can't show"), "{stderr}");
+    assert!(decrypted(&f, &shared).contains("ANSWER-215"));
+
+    let missing = "5b1d0215-0000-4000-8000-000000000002";
+    write(missing, &[json!([]), answer]);
+    let shared = f.success(&[missing], None);
+    let stderr = String::from_utf8_lossy(&shared.stderr);
+    for said in [
+        "  4 Claude Code bookkeeping records left out, not part of the conversation: ",
+        "  1 record of the conversation left out, in a format agit can't show: 1 assistant\n",
+        "  Source LOG record 6: omitted from public content\n    | unsupported native record (assistant), a record of the conversation\n",
+        "this link leaves out 1 record of the conversation that agit can't show; the preview above names it",
+    ] {
+        assert!(stderr.contains(said), "{said}: {stderr}");
+    }
+    assert!(
+        !stderr.contains("no record of the conversation"),
+        "{stderr}"
+    );
+    assert!(decrypted(&f, &shared).contains("ANSWER-215"));
+}
+
+/// Two Claude Code conversations in the fixture's home, each with a prompt and an answer.
+fn two_conversations(f: &Fixture) -> [&'static str; 2] {
+    let ids = [
+        "5b1d0453-0000-4000-8000-000000000001",
+        "5b1d0453-0000-4000-8000-000000000002",
+    ];
+    let project = f.home().join(".claude/projects/fixture");
+    std::fs::create_dir_all(&project).unwrap();
+    for id in ids {
+        let records = [
+            json!({"type":"user","sessionId":id,"message":{"role":"user","content":"Share this conversation"}}),
+            json!({"type":"assistant","sessionId":id,"message":{"role":"assistant","content":[{"type":"text","text":"Sharing it"}]}}),
+        ];
+        let text = records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>();
+        std::fs::write(project.join(format!("{id}.jsonl")), text).unwrap();
+    }
+    ids
+}
+
+/// `agit --json -y share <id>` run inside conversation `inside`: the envelope, and stdout.
+fn json_share(f: &Fixture, id: &str, inside: &str) -> (Value, String) {
+    let out = f.run_env(
+        &["--json", "-y", "share"],
+        &[id],
+        &[("CLAUDE_CODE_SESSION_ID", inside)],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    (serde_json::from_str(&stdout).expect(&stdout), stdout)
+}
+
+const ENDS_AT_THIS_COMMAND: &str = "this link ends at this command: what this conversation writes after it, the agent's answer included, is not in it";
+
+/// A link an agent makes of its own conversation from inside its turn ends at that command, so
+/// the answer it then writes is not in it (Hub #453): agit says so, and the JSON result says so
+/// for the agent to tell the person.
+#[test]
+fn a_link_made_inside_its_own_conversation_says_it_ends_at_that_command() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let [own, _] = two_conversations(&f);
+    let (envelope, stdout) = json_share(&f, own, own);
+    let result = &envelope["result"]["value"];
+    assert_eq!(result["made_in_this_conversation"], true, "{stdout}");
+    assert!(
+        result["link"]
+            .as_str()
+            .is_some_and(|link| link.contains("#k=")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(ENDS_AT_THIS_COMMAND), "{stdout}");
+    assert!(
+        stdout.contains(&format!("`agit share {own}` again once the turn has ended")),
+        "{stdout}"
+    );
+}
+
+/// A link of another conversation holds it as it is now; nothing is said about this one.
+#[test]
+fn a_link_of_another_conversation_says_nothing_about_this_one() {
+    let f = Fixture::new("EXCLUDED-LOG");
+    let [own, other] = two_conversations(&f);
+    let (envelope, stdout) = json_share(&f, other, own);
+    assert_eq!(
+        envelope["result"]["value"]["made_in_this_conversation"], false,
+        "{stdout}"
+    );
+    assert!(!stdout.contains(ENDS_AT_THIS_COMMAND), "{stdout}");
+}

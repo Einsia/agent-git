@@ -169,7 +169,11 @@ pub fn run(args: Args) -> CmdResult {
         None
     };
     let selected = if let Some(projection) = &projection {
-        ui::privacy_preview::write_report(&mut std::io::stderr().lock(), projection.report())?;
+        ui::privacy_preview::write_report(
+            &mut std::io::stderr().lock(),
+            projection.report(),
+            &projection.left_out()?,
+        )?;
         projection.select(&selected)?
     } else {
         crate::domain::privacy::service::transform(

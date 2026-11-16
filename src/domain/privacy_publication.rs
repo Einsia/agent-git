@@ -156,6 +156,52 @@ pub enum ProjectionAction {
 
 type DecisionKey = (Option<usize>, Option<String>, String, ProjectionAction);
 
+/// The whole records a projection left out, by what they are.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LeftOut {
+    /// Records a runtime keeps for itself, which no publication carries: each native kind with
+    /// its count, most first.
+    pub bookkeeping: Vec<(String, usize)>,
+    /// The runtimes those records come from.
+    pub runtimes: BTreeSet<String>,
+    /// Conversation records the projection could not show: source LOG position, native kind.
+    pub conversation: BTreeMap<usize, String>,
+}
+
+/// A native record's own name for its kind: its type, with the kind the runtime nests in it, as
+/// `attachment (environment)`. A name that is not a plain identifier is not shown.
+fn native_kind(content: &Value) -> String {
+    let plain = |name: &&str| {
+        (1..=48).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+    };
+    let Some(kind) = [&content["type"], &content["kind"]]
+        .into_iter()
+        .find_map(Value::as_str)
+    else {
+        return "untyped".into();
+    };
+    if !plain(&kind) {
+        return "other".into();
+    }
+    let nested = [
+        &content["subtype"],
+        &content["attachment"]["type"],
+        &content["payload"]["type"],
+        &content["data"]["type"],
+    ]
+    .into_iter()
+    .find_map(Value::as_str)
+    .filter(plain)
+    .or_else(|| (content["isMeta"] == true).then_some("isMeta"));
+    match nested {
+        Some(nested) => format!("{kind} ({nested})"),
+        None => kind.into(),
+    }
+}
+
 /// The public and private halves are produced together from the same validated snapshot.
 #[derive(Serialize, Deserialize)]
 pub struct SessionProjection {
@@ -252,6 +298,37 @@ impl SessionProjection {
 
     pub fn report(&self) -> &ProjectionReport {
         &self.report
+    }
+
+    /// What the whole records the report omits as [`Omission::NativeRecord`] are. Read from the
+    /// private source LOG, for the person's own preview; nothing of it is published.
+    pub fn left_out(&self) -> Result<LeftOut> {
+        let records = storage::parse_envelopes(&self.source_log)?;
+        let published = crate::domain::publication_records::published_sequence(
+            records
+                .iter()
+                .map(|record| (record.source.as_str(), &record.content)),
+        );
+        let reason = Omission::NativeRecord.reason();
+        let mut left_out = LeftOut::default();
+        let mut kinds = BTreeMap::<String, usize>::new();
+        for notice in self.report.omissions.iter().filter(|n| n.reason == reason) {
+            let Some(record) = records.get(notice.record) else {
+                continue;
+            };
+            let kind = native_kind(&record.content);
+            if published[notice.record].is_none() {
+                left_out.runtimes.insert(record.source.clone());
+                *kinds.entry(kind).or_default() += 1;
+            } else {
+                left_out.conversation.insert(notice.record, kind);
+            }
+        }
+        left_out.bookkeeping = kinds.into_iter().collect();
+        left_out
+            .bookkeeping
+            .sort_by(|(a, m), (b, n)| n.cmp(m).then_with(|| a.cmp(b)));
+        Ok(left_out)
     }
 
     /// Generated identities are not content. The scanner still sees every message body
@@ -3451,6 +3528,61 @@ mod tests {
                 crate::adapter::EventKind::Other,
                 crate::adapter::EventKind::AssistantReply,
             ]
+        );
+    }
+
+    #[test]
+    fn left_out_records_are_named_by_kind_and_conversation_ones_apart() {
+        let session = format!("agit-{}", "e".repeat(40));
+        let raw = [
+            json!({"type":"user","message":{"role":"user","content":"Run pwd"}}),
+            json!({"type":"progress","data":{"type":"hook_progress","message":"Working"}}),
+            json!({"type":"system","subtype":"turn_duration","durationMs":5}),
+            json!({"type":"attachment","attachment":{"type":"environment","text":"PRIVATE_ENV"}}),
+            json!({"type":"attachment","attachment":{"type":"environment","text":"PRIVATE_ENV"}}),
+            json!({"type":"file-history-snapshot","snapshot":{}}),
+            json!({"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat"}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[]}}),
+            json!({"type":"weird type\u{1b}[2J","message":"x"}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}),
+        ]
+        .into_iter()
+        .map(|value| format!("{value}\n"))
+        .collect::<String>();
+        let log = transcript::wrap_lines(&raw, "claude-code", &session);
+        let metadata = Meta::new(session, "claude-code".into(), String::new());
+        let projection = project_session(
+            &PrivacyPolicy::default(),
+            &mut PathAliasStore::default(),
+            None,
+            &log,
+            &log,
+            &metadata,
+            &Redactor::new(Default::default()),
+        )
+        .unwrap();
+        assert_eq!(projection.report.omissions.len(), 8);
+
+        let left_out = projection.left_out().unwrap();
+        assert_eq!(
+            left_out.bookkeeping,
+            [
+                ("attachment (environment)", 2),
+                ("file-history-snapshot", 1),
+                ("other", 1),
+                ("progress (hook_progress)", 1),
+                ("system (turn_duration)", 1),
+                ("user (isMeta)", 1),
+            ]
+            .map(|(kind, n)| (kind.to_owned(), n))
+        );
+        assert_eq!(
+            left_out.runtimes,
+            BTreeSet::from(["claude-code".to_owned()])
+        );
+        assert_eq!(
+            left_out.conversation,
+            BTreeMap::from([(7, "assistant".to_owned())])
         );
     }
 

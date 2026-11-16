@@ -655,13 +655,15 @@ fn quiet_share_json_keeps_the_complete_created_result() {
             );
             assert!(out.stderr.is_empty());
             let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-            assert!(
-                value["result"]["lines"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|v| v.as_str().unwrap().contains("read-only copy created"))
+            let created = &value["result"]["value"];
+            assert_eq!(value["result"]["format"], "json", "{value}");
+            assert_eq!(
+                created["link"], "https://example.invalid/s/owned-share",
+                "{value}"
             );
+            assert_eq!(created["slug"], "owned-share", "{value}");
+            assert_eq!(created["encrypted"], false, "{value}");
+            assert_eq!(created["made_in_this_conversation"], false, "{value}");
             outputs.push(value);
         }
         assert_eq!(outputs[0], outputs[1]);

@@ -20,12 +20,18 @@ revoke it. Create a session link, invite link or read-only copy only when the pe
 Inside an agent's own turn, a bare `agit share --yes` shares the conversation that turn
 belongs to, found the way `agit status` finds it: the VIEW of its branch at its last saved
 turn. The turn in progress is not in that link; agit says so, names the turn the link ends at,
-and names `agit share <session-id>` for a copy that includes it. When the conversation has no
-saved turns yet, no share is created, since its link would open empty: agit names
-`agit share <session-id>`, a read-only copy of the conversation as it is now, the turn in
-progress included, which does not upload it to the repository, and, in a folder that saves
-its turns by itself, a bare `agit share` again once the turn has ended. A command that runs
-inside more than one agent conversation is refused with each one's `agit share <session-id>`.
+and names `agit share <session-id>` for a copy that holds the turn up to that command. When the
+conversation has no saved turns yet, no share is created, since its link would open empty: agit
+names `agit share <session-id>`, a read-only copy of the conversation as it is now, which does
+not upload it to the repository, and, in a folder that saves its turns by itself, a bare
+`agit share` again once the turn has ended. A command that runs inside more than one agent
+conversation is refused with each one's `agit share <session-id>`.
+
+A link made from inside its own conversation ends at the command that made it: what the
+conversation writes after it, your reply with the link included, is not in it. agit says so,
+and with global `--json` the result's `made_in_this_conversation` is `true`. When you give the
+person the link, tell them it stops before this reply, and offer a new link once this turn has
+ended.
 
 A bare `agit share` in a human terminal opens a wizard: choose a saved session,
 then encrypted or public visibility and an expiry. The selection is temporary;
