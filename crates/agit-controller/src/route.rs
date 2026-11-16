@@ -9,6 +9,9 @@ pub enum Authority {
     CloudPrincipal,
     #[cfg(feature = "cloud")]
     CloudSessionController,
+    /// A receipt-only session grant, with target identity verified before opening completes.
+    #[cfg(feature = "cloud")]
+    CloudSessionDelivery,
     #[cfg(feature = "cloud")]
     CloudProjectController,
 }
@@ -19,9 +22,19 @@ impl Authority {
             Self::LocalOwner => "local-owner",
             Self::CloudPrincipal => "cloud-principal",
             #[cfg(feature = "cloud")]
-            Self::CloudSessionController => agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY,
+            Self::CloudSessionController | Self::CloudSessionDelivery => {
+                agit_peer::cloud::SESSION_CONTROLLER_AUTHORITY
+            }
             #[cfg(feature = "cloud")]
             Self::CloudProjectController => agit_peer::cloud::PROJECT_CONTROLLER_AUTHORITY,
+        }
+    }
+
+    pub(crate) fn describes_machine(self) -> bool {
+        match self {
+            #[cfg(feature = "cloud")]
+            Self::CloudSessionDelivery => false,
+            _ => true,
         }
     }
 }

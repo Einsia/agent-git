@@ -225,7 +225,7 @@ pub(super) async fn run(
                 let progress = connection.progress();
                 let (mut sink, mut source) = connection.split();
                 let describing = std::time::Instant::now();
-                let description = {
+                let description = if route.authority().describes_machine() {
                     let handshake = tokio::time::timeout(
                         HANDSHAKE,
                         describe(&mut sink, &mut source, route.as_ref()),
@@ -233,13 +233,17 @@ pub(super) async fn run(
                     tokio::pin!(handshake);
                     loop {
                         tokio::select! {
-                            result = &mut handshake => break result.context("peer handshake timed out").and_then(|r| r),
+                            result = &mut handshake => break result.context("peer handshake timed out").and_then(|r| r).map(Some),
                             request = requests.recv() => match request {
                                 Some(request) => request.fail("not_sent", "peer handshake is pending"),
                                 None => return,
                             },
                         }
                     }
+                } else {
+                    // The route verifies its exact grant and peer certificate before returning
+                    // this connection. Receipt-only authority permits no discovery RPC.
+                    Ok(None)
                 };
                 {
                     let current = status.borrow();
@@ -256,25 +260,27 @@ pub(super) async fn run(
                 }
                 match description {
                     Ok(description) => {
-                        let actual = description["machine"]["machine_fingerprint"]
-                            .as_str()
-                            .unwrap_or("");
-                        if actual.is_empty()
-                            || fingerprint
-                                .as_deref()
-                                .is_some_and(|expected| expected != actual)
-                        {
-                            publish(&status, &events, |s| {
-                                s.state = State::Rejected;
-                                s.error = Some("peer fingerprint changed or is missing".into());
-                            });
-                            return;
+                        if let Some(description) = &description {
+                            let actual = description["machine"]["machine_fingerprint"]
+                                .as_str()
+                                .unwrap_or("");
+                            if actual.is_empty()
+                                || fingerprint
+                                    .as_deref()
+                                    .is_some_and(|expected| expected != actual)
+                            {
+                                publish(&status, &events, |s| {
+                                    s.state = State::Rejected;
+                                    s.error = Some("peer fingerprint changed or is missing".into());
+                                });
+                                return;
+                            }
+                            fingerprint = Some(actual.into());
                         }
-                        fingerprint = Some(actual.into());
                         publish(&status, &events, |s| {
                             s.generation += 1;
                             s.state = State::Online;
-                            s.description = Some(description);
+                            s.description = description;
                             s.worker_pid = Some(pid);
                             s.error = None;
                         });
@@ -442,6 +448,7 @@ async fn online(
     events: &broadcast::Sender<Event>,
     shared_budget: Option<Arc<tokio::sync::Semaphore>>,
 ) -> anyhow::Result<()> {
+    let probes = status.borrow().description.is_some();
     let (writes, mut queued) = mpsc::channel::<Write>(MAX_PENDING);
     let (failed, mut failure) = oneshot::channel();
     let _writer = Task(tokio::spawn(async move {
@@ -558,7 +565,7 @@ async fn online(
                         anyhow::bail!("peer health check timed out");
                     }
                 }
-                _ = health.tick(), if health_request.is_none() => {
+                _ = health.tick(), if probes && health_request.is_none() => {
                     let id = uuid::Uuid::new_v4().to_string();
                     let frame = serde_json::json!({"jsonrpc":"2.0","id":id,"method":"machine.describe","params":{}});
                     let sent = tokio::time::Instant::now();

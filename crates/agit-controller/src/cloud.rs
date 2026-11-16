@@ -134,7 +134,11 @@ impl Connector for SessionRoute {
     }
 
     fn authority(&self) -> Authority {
-        Authority::CloudSessionController
+        if self.scope.delivery_only {
+            Authority::CloudSessionDelivery
+        } else {
+            Authority::CloudSessionController
+        }
     }
 
     fn open<'a>(&'a self, worker: &'a Worker) -> Opening<'a> {

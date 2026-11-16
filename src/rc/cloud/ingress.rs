@@ -497,6 +497,8 @@ impl Client {
         if permits.len() >= 64 || frame.id.as_ref().is_none_or(|id| permits.contains_key(id)) {
             return Err(Rejection::Close);
         }
+        let id = frame.id.clone().unwrap();
+        permits.insert(id.clone(), None);
         // Admitted by name, before the grant's access is consulted: whatever that access allows,
         // a delivery-only connection asks for receipts and nothing else.
         if self.delivery_only()
@@ -512,8 +514,6 @@ impl Client {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let State { policy, resources } = &mut *state;
-        let id = frame.id.clone().unwrap();
-        permits.insert(id.clone(), None);
         let owner = self
             .controller
             .as_ref()
@@ -916,6 +916,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(deliver.authority.publication_grant().unwrap().id, "driver");
                 for (method, params) in [
+                    ("machine.describe", json!({})),
                     ("session.history", json!({"session_id":"logical"})),
                     ("session.watch", json!({"session_id":"logical"})),
                     (
@@ -933,9 +934,19 @@ mod tests {
                     ("terminal.open", json!({"cwd":"/trusted"})),
                     ("fs.readFile", json!({"path":"/trusted/notes.md"})),
                 ] {
-                    match driver.authorize(Frame::request(method, params)) {
+                    let request = Frame::request(method, params);
+                    match driver.authorize(request.clone()) {
                         Err(Rejection::Reply(error)) => {
-                            assert_eq!(error.message, DELIVERY_ONLY, "{method}")
+                            assert_eq!(error.message, DELIVERY_ONLY, "{method}");
+                            assert!(error.is(crate::protocol::ErrorCode::Forbidden));
+                            assert!(matches!(
+                                driver.authorize(request.clone()),
+                                Err(Rejection::Close)
+                            ));
+                            let denial =
+                                Frame::error_response(request.id.unwrap(), error).to_json();
+                            assert_eq!(driver.project(&denial).unwrap(), Some(denial.clone()));
+                            assert!(driver.project(&denial).unwrap().is_none());
                         }
                         other => panic!("{method} reached a delivery-only connection: {other:?}"),
                     }

@@ -78,6 +78,173 @@ fn request(
     })
 }
 
+// Delivery authority has no discovery RPC, even after the health interval; full session
+// authority must discover before becoming ready. Exercising both through the controller keeps
+// a broad discovery bypass, a delivery handshake, and a delayed health probe observable.
+#[cfg(feature = "cloud")]
+#[tokio::test(start_paused = true)]
+async fn delivery_routes_are_ready_without_discovery_and_full_session_routes_still_discover() {
+    use agit_peer::{
+        Identity,
+        access::{Access, Principal},
+        client::Client,
+        cloud::{Device, DeviceCredential, Secret, SessionController},
+    };
+    use agit_tunnel::Packet;
+
+    struct Admitted {
+        route: cloud::SessionRoute,
+        connection: Mutex<Option<Connection>>,
+    }
+    impl Connector for Admitted {
+        fn key(&self) -> &str {
+            self.route.key()
+        }
+        fn authority(&self) -> Authority {
+            self.route.authority()
+        }
+        fn open<'a>(&'a self, _: &'a Worker) -> Opening<'a> {
+            let connection = self.connection.lock().unwrap().take();
+            Box::pin(async { connection.context("fixture connection already opened") })
+        }
+    }
+
+    for delivery_only in [true, false] {
+        let identity = Arc::new(Identity::generate().unwrap());
+        let source = DeviceCredential {
+            device: Device {
+                id: "source".into(),
+                owner: Principal {
+                    issuer: "https://cloud.example".into(),
+                    account_id: "owner".into(),
+                },
+                machine_id: "source-machine".into(),
+                display_name: "Source".into(),
+                certificate: identity.certificate().clone(),
+                credential_epoch: 1,
+            },
+            token: Secret::new("fixture".into()),
+        };
+        let target = Device {
+            id: "target".into(),
+            ..source.device.clone()
+        };
+        let route = cloud::SessionRoute::new(
+            Client::new("https://cloud.example").unwrap(),
+            identity,
+            source,
+            target,
+            SessionController {
+                session_id: "native".into(),
+                runtime: "codex".into(),
+                generation: 1,
+                access: Access::Admin,
+                delivery_only,
+            },
+        )
+        .unwrap();
+        let (outbound, mut written) = mpsc::unbounded_channel();
+        let sink = futures_util::sink::unfold(outbound, |outbound, packet| async move {
+            outbound.send(packet).unwrap();
+            Ok::<_, anyhow::Error>(outbound)
+        });
+        let (inbound, received) = mpsc::unbounded_channel();
+        let stream = futures_util::stream::unfold(received, |mut received| async move {
+            received.recv().await.map(|packet| (Ok(packet), received))
+        });
+        let route = Arc::new(Admitted {
+            route,
+            connection: Mutex::new(Some(Connection::from_parts(
+                0,
+                Box::pin(sink),
+                Box::pin(stream),
+            ))),
+        });
+        let controller = controller();
+        if delivery_only {
+            assert!(
+                controller
+                    .connect_with("peer".into(), route.clone(), Some("device-pin".into()))
+                    .is_err()
+            );
+        }
+        controller.connect_with("peer".into(), route, None).unwrap();
+        let decode = |packet| match packet {
+            Packet::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
+            _ => panic!("expected an RPC request"),
+        };
+        let answer = |id: &Value, result: Value| {
+            inbound
+                .send(Packet::Text(
+                    json!({"jsonrpc":"2.0","id":id,"result":result}).to_string(),
+                ))
+                .unwrap();
+        };
+        let description = json!({
+            "protocol_version":1,"authority":"cloud-session-controller","instance_id":"instance",
+            "machine":{"machine_fingerprint":"device-pin"},
+        });
+        if !delivery_only {
+            let describe = decode(
+                tokio::time::timeout(WAIT, written.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(describe["method"], "machine.describe");
+            assert!(matches!(controller.list()[0].state, State::Connecting));
+            answer(&describe["id"], description.clone());
+        }
+        let ready = controller.ready("peer", WAIT).await.unwrap();
+        assert!(matches!(ready.state, State::Online));
+        assert_eq!(ready.description.is_none(), delivery_only);
+        assert_eq!(ready.generation, 1);
+
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        if !delivery_only {
+            let probe = decode(
+                tokio::time::timeout(WAIT, written.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            assert_eq!(probe["method"], "machine.describe");
+            answer(&probe["id"], description);
+        } else {
+            assert!(matches!(
+                written.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        let action = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                controller
+                    .request_at(
+                        ready.target(),
+                        "session.publication.deliver".into(),
+                        json!({"session_id":"native"}),
+                        WAIT,
+                    )
+                    .await
+            })
+        };
+        let deliver = decode(
+            tokio::time::timeout(WAIT, written.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(deliver["method"], "session.publication.deliver");
+        answer(&deliver["id"], json!({"pending":0}));
+        assert_eq!(
+            action.await.unwrap().unwrap()["result"],
+            json!({"pending":0})
+        );
+        controller.disconnect("peer");
+    }
+}
+
 #[tokio::test]
 async fn discovery_recovers_a_missing_reply_and_accepts_a_delayed_original() {
     for delayed_original in [false, true] {

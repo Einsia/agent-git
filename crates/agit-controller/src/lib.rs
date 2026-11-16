@@ -71,6 +71,7 @@ pub struct Status {
     pub route_id: String,
     pub generation: u64,
     pub state: State,
+    /// Receipt-only routes authenticate through their grant and TLS and have no description.
     pub description: Option<Value>,
     pub worker_pid: Option<u32>,
     pub error: Option<String>,
@@ -237,6 +238,10 @@ impl Controller {
         ensure!(!id.is_empty() && id.len() <= 256, "invalid peer identity");
         let route_key = route.key().to_owned();
         let authority = route.authority();
+        ensure!(
+            authority.describes_machine() || fingerprint.is_none(),
+            "a delivery-only route cannot verify a machine description fingerprint"
+        );
         ensure!(
             !route_key.is_empty() && route_key.len() <= 131072,
             "invalid peer route identity"
