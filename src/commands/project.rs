@@ -4466,7 +4466,9 @@ impl Withholding {
     pub(crate) fn describe(self) -> &'static str {
         match self {
             Self::StartedOutside => "the conversation started outside the project folder",
-            Self::UnknownStart => "agit cannot verify where the conversation started",
+            Self::UnknownStart => {
+                "agit can't find where this conversation started, so it doesn't upload it automatically"
+            }
             Self::Excluded => "the conversation is excluded from the project",
             Self::Dropped => "the conversation was dropped from the project",
         }
@@ -4659,6 +4661,7 @@ fn judge(
     branch: &str,
     claims: &[link::Link],
     origin: Option<&meta::CaptureOrigin>,
+    on_branch: &dyn Fn(&str) -> bool,
 ) -> Option<Withholding> {
     let excluded = |session: String| projects.iter().any(|p| p.leaves_out(&session));
     if claims
@@ -4677,7 +4680,11 @@ fn judge(
             .find(|claim| capture_branch(&claim.source, &claim.session_id) == branch),
         None => return None,
     };
-    match opener.and_then(start) {
+    let start = match opener {
+        Some(opener) => start(opener),
+        None => continued_here(projects, claims, on_branch),
+    };
+    match start {
         Some(start)
             if projects
                 .iter()
@@ -4688,6 +4695,151 @@ fn judge(
         Some(_) => Some(Withholding::StartedOutside),
         None => Some(Withholding::UnknownStart),
     }
+}
+
+/// Where the person continued, on this computer, a conversation whose opener has no claim here,
+/// as when it began on another one: the folder of a claim recording into the branch that the
+/// person materialized from that branch's own history (`agit resume`, the only thing that records
+/// `materialized_from`), when that folder is in a project that is on and saves to the repository.
+/// Its turns from here are then the person's own, continued in that folder. A claim without that
+/// record, one materialized from a commit outside the branch's history, or one continued outside
+/// such a folder leaves the start unknown, so the branch stays withheld.
+fn continued_here(
+    projects: &[Project],
+    claims: &[link::Link],
+    on_branch: &dyn Fn(&str) -> bool,
+) -> Option<PathBuf> {
+    claims.iter().find_map(|claim| {
+        let from = claim.materialized_from.as_deref()?;
+        let folder = Path::new(claim.cwd.as_deref()?).canonicalize().ok()?;
+        (on_branch(from)
+            && projects
+                .iter()
+                .any(|p| p.enabled && includes(p, &folder).unwrap_or(false)))
+        .then_some(folder)
+    })
+}
+
+/// Whether the conversation that opened `slug@branch` has a claim on this computer. When it has
+/// none, as when it began on another computer, continuing it here in a folder that uploads to the
+/// repository releases the branch (see [`continued_here`]); when it has one whose start cannot be
+/// found, nothing does.
+pub(crate) fn opener_here(slug: &str, branch: &str) -> Result<bool> {
+    opener_among(&link::list(&Store::at(config::store_root()?)), slug, branch)
+}
+
+/// [`opener_here`] among claims already read.
+fn opener_among(links: &[link::Link], slug: &str, branch: &str) -> Result<bool> {
+    let (owner, agent) = super::parse_slug(slug)?;
+    let claims = recording_into(links, &owner, &agent, branch);
+    Ok(match capture_origin(slug, branch)? {
+        Some(origin) => claims
+            .iter()
+            .any(|claim| claim.source == origin.runtime && claim.session_id == origin.session),
+        None => claims
+            .iter()
+            .any(|claim| capture_branch(&claim.source, &claim.session_id) == branch),
+    })
+}
+
+/// For each `(owner/name, branch)` in `targets` kept back because the conversation that opened it
+/// has no claim here: the line that says how to release it, by continuing it in a folder that
+/// uploads to the repository, and that command. Other targets, whose way on their refused push
+/// names, have no entry. The claims are read once and each repository's branches are judged
+/// together, since `agit project list` and `agit status` ask this on every poll of the menu bar.
+pub(crate) fn continue_steps_for(
+    targets: &[(String, String)],
+) -> BTreeMap<(String, String), (String, String)> {
+    let mut steps = BTreeMap::new();
+    let Ok(root) = config::store_root() else {
+        return steps;
+    };
+    let links = link::list(&Store::at(root));
+    let mut by_repository: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (slug, branch) in targets {
+        by_repository
+            .entry(slug.as_str())
+            .or_default()
+            .push(branch.clone());
+    }
+    for (slug, branches) in by_repository {
+        let Ok(verdicts) = withheld_all(slug, &branches) else {
+            continue;
+        };
+        for (branch, verdict) in branches.into_iter().zip(verdicts) {
+            if verdict != Some(Withholding::UnknownStart)
+                || opener_among(&links, slug, &branch).unwrap_or(true)
+            {
+                continue;
+            }
+            let target = format!("{slug}@{branch}");
+            #[cfg(windows)]
+            let quoted = crate::ui::quote_powershell_argument(&target);
+            #[cfg(not(windows))]
+            let quoted = crate::ui::session::shell_arg(&target);
+            let command = format!("agit resume {quoted}");
+            let line = format!(
+                "to upload it, continue it in a folder that uploads to {slug}: `{command}`"
+            );
+            steps.insert((slug.to_owned(), branch), (line, command));
+        }
+    }
+    steps
+}
+
+/// [`continue_steps_for`] the branches the claims made in `folder` record into in its repository,
+/// so `agit project list` can name the step under the folder's row.
+fn continue_steps(folder: &Project) -> Vec<serde_json::Value> {
+    let Ok((owner, agent)) = super::parse_slug(&folder.repository) else {
+        return Vec::new();
+    };
+    let Ok(root) = config::store_root() else {
+        return Vec::new();
+    };
+    let mut branches: Vec<String> = link::list(&Store::at(root))
+        .into_iter()
+        .filter(|claim| {
+            claim.owner.as_deref() == Some(owner.as_str())
+                && claim.agent.as_deref() == Some(agent.as_str())
+                && claim
+                    .cwd
+                    .as_deref()
+                    .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                    .is_some_and(|cwd| includes(folder, &cwd).unwrap_or(false))
+        })
+        .filter_map(|claim| claim.branch)
+        .collect();
+    branches.sort();
+    branches.dedup();
+    let targets: Vec<_> = branches
+        .into_iter()
+        .map(|branch| (folder.repository.clone(), branch))
+        .collect();
+    continue_steps_for(&targets)
+        .into_iter()
+        .map(|((_, branch), (line, command))| {
+            serde_json::json!({"branch": branch, "line": line, "command": command})
+        })
+        .collect()
+}
+
+/// Whether `commit` is in the history of `branch` in `repo`, by ancestry. Only a full commit id
+/// is asked about, so nothing read from a claim reaches Git as an option.
+fn in_branch_history(repo: Option<&Repo>, branch: &str, commit: &str) -> bool {
+    let Some(repo) = repo else {
+        return false;
+    };
+    if !(commit.len() == 40 || commit.len() == 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    repo.git_status_local(&[
+        "merge-base",
+        "--is-ancestor",
+        commit,
+        &format!("refs/heads/{branch}"),
+    ])
+    .is_ok_and(|(code, _, _)| code == Some(0))
 }
 
 /// Every claim, current or superseded, that records into `owner/agent@branch`.
@@ -4774,7 +4926,15 @@ pub(crate) fn withheld_all(slug: &str, branches: &[String]) -> Result<Vec<Option
         };
         let claims = recording_into(links, &owner, &agent, branch);
         let origin = capture_origin(slug, branch)?;
-        verdicts.push(judge(&projects, branch, &claims, origin.as_ref()));
+        let repo = Repo::open(config::repo_dir(&owner, &agent)?);
+        let on_branch = |commit: &str| in_branch_history(repo.as_ref(), branch, commit);
+        verdicts.push(judge(
+            &projects,
+            branch,
+            &claims,
+            origin.as_ref(),
+            &on_branch,
+        ));
     }
     Ok(verdicts)
 }
@@ -4944,7 +5104,9 @@ fn recheck() -> Result<()> {
         // A branch whose metadata cannot be read is judged by its name here and so is not dropped;
         // publication reads the metadata again and refuses on the error.
         let origin = capture_origin(&slug, &branch).ok().flatten();
-        match judge(&bound, &branch, &claims, origin.as_ref()) {
+        let repo = config::repo_dir(&owner, &agent).ok().and_then(Repo::open);
+        let on_branch = |commit: &str| in_branch_history(repo.as_ref(), &branch, commit);
+        match judge(&bound, &branch, &claims, origin.as_ref(), &on_branch) {
             None | Some(Withholding::UnknownStart) => {}
             Some(reason) => release(&store, &slug, &branch, &claims, reason, false)?,
         }
@@ -6776,6 +6938,7 @@ fn folder_json(
         "sessions_here": folder.sessions.len(),
         "awaiting_upload": awaiting_upload,
         "capture": capture_json(folder, &asking.in_folder(&folder.root), asking.reader),
+        "continue": folder.project.as_ref().map(continue_steps).unwrap_or_default(),
         "recent": recent,
     })
 }
@@ -6864,6 +7027,16 @@ fn list() -> CmdResult {
                 "  {} {}",
                 ui::warn_text("the last upload failed:"),
                 folder["last_upload"]["error"].as_str().unwrap_or_default()
+            );
+        }
+        for step in folder["continue"].as_array().map_or(&[][..], Vec::as_slice) {
+            println!(
+                "  {} agit can't find where this conversation started; {}",
+                ui::warn_text(&format!(
+                    "{} isn't uploading:",
+                    step["branch"].as_str().unwrap_or_default()
+                )),
+                step["line"].as_str().unwrap_or_default()
             );
         }
         for capture in folder["capture"].as_array().map_or(&[][..], Vec::as_slice) {
@@ -9589,7 +9762,13 @@ mod tests {
             session: dropped.into(),
         };
         assert_eq!(
-            judge(std::slice::from_ref(&after), "any", &[], Some(&origin)),
+            judge(
+                std::slice::from_ref(&after),
+                "any",
+                &[],
+                Some(&origin),
+                &|_| false
+            ),
             Some(Withholding::Excluded)
         );
         assert!(!left_out(
@@ -10191,6 +10370,117 @@ mod tests {
         );
     }
 
+    /// A conversation that began on another computer, whose opener has no claim here, is judged by
+    /// where the person continued it here: a claim recording into its branch that `agit resume`
+    /// materialized from that branch's own history, in a folder that is on and saves to the
+    /// repository, passes. Each other row breaks one of those and leaves the branch withheld for
+    /// its unknown start. A gate that let any claim recording into the branch stand in for the
+    /// opener would publish turns continued in any folder, or ones a claim only says it continued.
+    #[test]
+    fn a_conversation_begun_elsewhere_is_judged_by_where_it_was_continued_here() {
+        if !isolated("a_conversation_begun_elsewhere_is_judged_by_where_it_was_continued_here") {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut project = project(work.path());
+        save(&project).unwrap();
+        let store = Store::at(config::store_root().unwrap());
+        let repo = Repo::init(&config::repo_dir("alice", "app").unwrap()).unwrap();
+        let branch = "in-the-scheduler-core-77fc";
+        let record = |cwd: &str, title: &str| -> String {
+            let mut metadata = Meta::new(
+                format!("agit-{}", "a".repeat(40)),
+                "claude-code".into(),
+                cwd.into(),
+            );
+            metadata.capture = Some(meta::CaptureOrigin {
+                runtime: "claude-code".into(),
+                session: "aaaaaaaa-0000-4000-8000-000000000041".into(),
+            });
+            metadata.title = Some(title.into());
+            meta::write(repo.root(), &metadata).unwrap();
+            repo.add_all().unwrap();
+            repo.commit(title).unwrap();
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string()
+        };
+        // The colleague's conversation opened the branch on their computer; none of its claims is
+        // here, and the person resumed it from this commit.
+        repo.git(&["checkout", "-q", "-B", branch]).unwrap();
+        let opened = record("/elsewhere/lumen", "opened elsewhere");
+        // A commit on another line, made after the branch's tip, is not in its history.
+        repo.git(&["checkout", "-q", "-b", "another-line"]).unwrap();
+        let beside = record("/elsewhere/lumen", "another line");
+        // The turn the person added here, recorded with the folder it ran in.
+        repo.git(&["checkout", "-q", branch]).unwrap();
+        record(&project.root.to_string_lossy(), "continued here");
+        // The person's own session, whose transcript this computer holds, records into the branch.
+        let continued = |project: &Project, cwd: &Path, from: Option<&str>| {
+            let mut claim = captured(project, "bbbbbbbb-0000-4000-8000-000000000042", cwd);
+            claim.cwd = Some(cwd.to_string_lossy().into_owned());
+            claim.branch = Some(branch.into());
+            claim.materialized_from = from.map(str::to_owned);
+            link::write(&store, &claim).unwrap();
+        };
+        let elsewhere = outside.path().canonicalize().unwrap();
+        let root = project.root.clone();
+        for (case, cwd, from, on, expected) in [
+            ("continued here", &root, Some(&opened), true, None),
+            (
+                "no record of a resume",
+                &root,
+                None,
+                true,
+                Some(Withholding::UnknownStart),
+            ),
+            (
+                "resumed from outside the branch's history",
+                &root,
+                Some(&beside),
+                true,
+                Some(Withholding::UnknownStart),
+            ),
+            (
+                "continued outside the folder",
+                &elsewhere,
+                Some(&opened),
+                true,
+                Some(Withholding::UnknownStart),
+            ),
+            (
+                "the folder is off",
+                &root,
+                Some(&opened),
+                false,
+                Some(Withholding::UnknownStart),
+            ),
+        ] {
+            project.enabled = on;
+            save(&project).unwrap();
+            continued(&project, cwd, from.map(String::as_str));
+            assert_eq!(withheld("alice/app", branch).unwrap(), expected, "{case}");
+            // The opener is not here, so the way forward is to continue it, not to drop it, and
+            // only a branch kept back names it.
+            assert!(!opener_here("alice/app", branch).unwrap(), "{case}");
+            assert_eq!(
+                continue_steps_for(&[("alice/app".into(), branch.into())])
+                    .into_values()
+                    .next()
+                    .map(|(_, command)| command),
+                expected
+                    .is_some()
+                    .then(|| format!("agit resume alice/app@{branch}")),
+                "{case}"
+            );
+            // Automatic upload goes to this very branch, and only when it is not withheld.
+            assert_eq!(
+                blocks_auto_push(&repo, "alice/app", branch).unwrap(),
+                expected.is_some(),
+                "{case}"
+            );
+        }
+    }
+
     /// An excluded branch says which exclusion keeps it, and names the session to save where
     /// saving lets it in: one from before the folder was on, or one the person dropped. A refusal
     /// that only said "excluded" would leave the person no way forward.
@@ -10583,7 +10873,7 @@ mod tests {
             UploadFailure::Refused
         );
         let kept_back = format!(
-            "`alice/app@talk` {}: agit cannot verify where the conversation started",
+            "`alice/app@talk` {}: agit can't find where this conversation started, so it doesn't upload it automatically",
             super::super::push::WITHHELD_HERE
         );
         assert_eq!(
