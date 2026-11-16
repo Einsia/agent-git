@@ -77,7 +77,7 @@ const TOKEN_ENV: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
 const SOCKET_ENV: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const BYPASS: &str = "bypassPermissions";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Record {
     pid: u32,
@@ -393,34 +393,104 @@ pub(crate) fn discover(session_id: &str) -> Option<Live> {
     )
 }
 
+type LiveSnapshot = (
+    Instant,
+    PathBuf,
+    std::collections::HashMap<String, Vec<Record>>,
+);
+static LIVE_SNAPSHOT: std::sync::Mutex<Option<LiveSnapshot>> = std::sync::Mutex::new(None);
+
 /// Whether a live Claude Code process runs this session.
 ///
-/// Only a positive answer is exact: a session missing from the registry can still run in a
-/// process that does not register itself. Listings ask once per session, so one registry read
-/// serves every question for a moment.
+/// Listings share a snapshot, which can outlive a process. A missing registration also cannot
+/// prove the session stopped: older processes may not register. Write admission must instead
+/// call `session_may_have_writer` and retain its transcript recency guard.
 pub(crate) fn session_is_live(session_id: &str) -> bool {
-    use std::{collections::HashSet, sync::Mutex};
-    type Snapshot = (Instant, PathBuf, HashSet<String>);
-    static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
     const FRESH: Duration = Duration::from_secs(2);
     let Ok(registry) = crate::adapter::claude_code::sessions_dir() else {
         return false;
     };
-    let mut snapshot = SNAPSHOT.lock().unwrap_or_else(|error| error.into_inner());
+    let mut snapshot = LIVE_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     if !snapshot
         .as_ref()
         .is_some_and(|(at, dir, _)| *dir == registry && at.elapsed() < FRESH)
     {
-        let live = records(&registry)
-            .into_iter()
-            .filter(|(pid, record)| listening(*pid, record).is_some())
-            .map(|(_, record)| record.session_id)
-            .collect();
+        let mut live = std::collections::HashMap::<String, Vec<Record>>::new();
+        for (pid, record) in records(&registry) {
+            if listening(pid, &record).is_some() {
+                live.entry(record.session_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
         *snapshot = Some((Instant::now(), registry, live));
     }
     snapshot
         .as_ref()
-        .is_some_and(|(_, _, live)| live.contains(session_id))
+        .is_some_and(|(_, _, live)| live.contains_key(session_id))
+}
+
+/// Fresh evidence for write admission. A cached writer needs both a readable identity (or a
+/// removed registration) and a definitely absent pid before it can be disregarded. A live or
+/// reused pid, an unknown process state, or a damaged known registration still holds the session.
+/// Newly registered competitors must be checked even when the listing snapshot says idle.
+#[cfg(unix)]
+pub(crate) fn session_may_have_writer(session_id: &str) -> bool {
+    fn absent(pid: u32) -> bool {
+        libc::pid_t::try_from(pid).is_ok_and(|pid| {
+            pid > 0
+                && unsafe { libc::kill(pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })
+    }
+
+    let Ok(registry) = crate::adapter::claude_code::sessions_dir() else {
+        return true;
+    };
+    let known = LIVE_SNAPSHOT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|(_, dir, _)| *dir == registry)
+        .and_then(|(_, _, live)| live.get(session_id).cloned())
+        .unwrap_or_default();
+    for previous in known {
+        if !absent(previous.pid) {
+            return true;
+        }
+        match read_bounded(
+            &registry.join(format!("{}.json", previous.pid)),
+            RECORD_LIMIT,
+        ) {
+            Ok(bytes) => {
+                let Ok(current) = serde_json::from_slice::<Record>(&bytes) else {
+                    return true;
+                };
+                if current.pid != previous.pid
+                    || current.session_id != previous.session_id
+                    || current.proc_start != previous.proc_start
+                    || current.messaging_socket_path != previous.messaging_socket_path
+                {
+                    return true;
+                }
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(_) => return true,
+        }
+    }
+    records(&registry)
+        .into_iter()
+        .any(|(pid, record)| record.session_id == session_id && !absent(pid))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn session_may_have_writer(_: &str) -> bool {
+    false
 }
 
 /// Whether a Claude Code transcript ever ran with permission checks bypassed.

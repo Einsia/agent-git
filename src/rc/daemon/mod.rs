@@ -2433,32 +2433,35 @@ fn resume_lineage(
     }
 }
 
-/// Native writer ownership, when it is observable; `None` leaves only transcript age.
+/// Fresh native writer evidence for admission; `None` leaves the transcript recency guard.
 fn native_writer_active(runtime: &str, thread_id: &str) -> Option<bool> {
     if runtime == "codex"
         && let Some(active) = crate::adapter::codex_ownership::writer_active(thread_id)
     {
         return Some(active);
     }
-    // A registered Claude Code process is an exact writer even while its transcript is quiet;
-    // without a registration only recency is known.
-    (runtime == "claude-code" && crate::rc::claude_inbox::session_is_live(thread_id))
+    // A live registration or an uncertain known writer holds even a quiet transcript.
+    (runtime == "claude-code" && crate::rc::claude_inbox::session_may_have_writer(thread_id))
         .then_some(true)
 }
 
-/// Native writer ownership takes precedence over transcript age when it is observable.
+/// Listings may reuse a native writer snapshot; they never grant a write lease.
 fn native_session_likely_active(
     runtime: &str,
     thread_id: &str,
     recent: impl FnOnce() -> bool,
 ) -> bool {
-    native_writer_active(runtime, thread_id).unwrap_or_else(recent)
+    let active = if runtime == "claude-code" {
+        crate::rc::claude_inbox::session_is_live(thread_id).then_some(true)
+    } else {
+        native_writer_active(runtime, thread_id)
+    };
+    active.unwrap_or_else(recent)
 }
 
 fn transcript_likely_active(runtime: &str, thread_id: &str, cwd: &std::path::Path) -> bool {
-    native_session_likely_active(runtime, thread_id, || {
-        transcript_recently_written(runtime, thread_id, cwd)
-    })
+    native_writer_active(runtime, thread_id)
+        .unwrap_or_else(|| transcript_recently_written(runtime, thread_id, cwd))
 }
 
 fn transcript_recently_written(runtime: &str, thread_id: &str, cwd: &std::path::Path) -> bool {
