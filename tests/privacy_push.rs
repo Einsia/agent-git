@@ -13504,16 +13504,21 @@ fn turning_a_folder_on_for_another_repository_moves_it() {
 /// bodies; an older prompt with no `displayContent` has its block of referenced files cut out and
 /// marked, and one whose block can't be cut cleanly is replaced whole. Context Gemini records as a
 /// prompt (the session's environment) never goes out, a hook's output appended after a prompt is
-/// cut and marked, and a `displayContent` holding context, or a context tag left unclosed among
-/// the words, replaces the prompt with a notice. Bookkeeping (metadata, `$set`, a legacy
-/// `$set.messages`, `$rewindTo`, a `$patch` that drops or reorders messages), notices, usage,
-/// display fields and inline data never go out. A token whose first copy of a reply held only its
-/// beginning is judged on the last copy, whole, and replaced; publishing each copy would send that
-/// beginning. Every published record is one the Hub's own judgement keeps unchanged. A third turn
-/// writes the reply again, once exactly as published and once with a new call: each part still
-/// goes out once, and every earlier turn's published LOG stays the start of the next; a push that
-/// judged a published line by its text, not its place, sends a part again. Exporting with
-/// `--redact`, which judges each record alone, refuses the session.
+/// cut and marked, and a `displayContent` holding context, or a context tag left unclosed among the
+/// words, replaces the prompt with a notice. Bookkeeping (metadata, `$set`, a legacy
+/// `$set.messages`), notices, usage, display fields and inline data never go out. A rewind and a
+/// patch's removals and order go out as the ids they name and nothing else, so the published copy
+/// reads back as the conversation Gemini resumes; what a patch writes into a message, and a patch
+/// whose ids carry words, do not. A rewind to a message publication leaves out names the first
+/// published message after it, since a copy holding no such message would empty its conversation. A
+/// message rewound before it was ever published goes out as stubs naming it; messages a previous
+/// turn published and this turn rewound keep what they published. A token whose first copy of a
+/// reply held only its beginning is judged on the last copy, whole, and replaced; publishing each
+/// copy would send that beginning. Every published record is one the Hub's own judgement keeps
+/// unchanged. A third turn writes the reply again, once exactly as published and once with a new
+/// call: each part still goes out once, and every earlier turn's published LOG stays the start of
+/// the next; a push that judged a published line by its text, not its place, sends a part again.
+/// Exporting with `--redact`, which judges each record alone, refuses the session.
 #[test]
 fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
     const FILE_BODY: &str = "CANARY-GEMINI-EXPANDED-FILE-BODY-41c7";
@@ -13532,6 +13537,10 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
     const HOOK_CONTEXT: &str = "CANARY-GEMINI-HOOK-CONTEXT-e13d";
     const DISPLAYED_CONTEXT: &str = "CANARY-GEMINI-DISPLAYED-CONTEXT-4c7b";
     const UNCLOSED_CONTEXT: &str = "CANARY-GEMINI-UNCLOSED-CONTEXT-91fe";
+    const TAKEN_BACK: &str = "CANARY-GEMINI-REWOUND-BEFORE-PUBLISHED-6e2a";
+    const TAKEN_BACK_REPLY: &str = "CANARY-GEMINI-REWOUND-REPLY-b04d";
+    const PATCHED: &str = "CANARY-GEMINI-PATCH-CONTENT-3f8c";
+    const SMUGGLED: &str = "CANARY-GEMINI-SMUGGLED-IN-AN-ID-d71e";
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("agit");
     startup_cache::seed(&home);
@@ -13674,8 +13683,6 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
             "content":[{"text":"go"}]}),
         json!({"id":"m10","timestamp":"t","type":"user",
             "content":[{"text":format!("see <hook_context>{UNCLOSED_CONTEXT}")}]}),
-        json!({"$rewindTo":"m7"}),
-        json!({"$patch":{"removeIds":["m6"],"orderIds":["m1","m2","m5"]}}),
     ]);
     // A later turn writes the reply again: once exactly as an earlier turn published it, once with
     // a third call. Only the third call is new.
@@ -13690,6 +13697,19 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
             ]),
             serde_json::Value::Null,
         ),
+        // The person asks, takes it back before anything is published, and goes back further,
+        // to messages the previous turn published.
+        json!({"id":"m11","timestamp":"t","type":"user","content":[{"text":TAKEN_BACK}]}),
+        json!({"id":"m12","timestamp":"t","type":"gemini","content":[{"text":TAKEN_BACK_REPLY}]}),
+        json!({"$rewindTo":"m11"}),
+        json!({"$rewindTo":"m7"}),
+        json!({"$patch":{"removeIds":["m6"],"orderIds":["m1","m2","m5"],
+            "updates":[{"id":"m5","content":[{"text":PATCHED}]}]}}),
+        json!({"$patch":{"removeIds":[format!("m5 {SMUGGLED}")]}}),
+        // A rollback whose first message is a notice publication leaves out.
+        json!({"id":"m13","timestamp":"t","type":"info","content":INFO}),
+        json!({"id":"m14","timestamp":"t","type":"user","content":[{"text":"AFTER THE NOTICE"}]}),
+        json!({"$rewindTo":"m13"}),
     ]);
     // Each turn's published commit stays as it was: the next one's LOG extends it.
     assert!(second_log.starts_with(&first_log) && public_log.starts_with(&second_log));
@@ -13725,9 +13745,10 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
         "\"tokens\"",
         "displayContent",
         "renderOutputAsMarkdown",
-        "$rewindTo",
-        "removeIds",
-        "orderIds",
+        TAKEN_BACK,
+        TAKEN_BACK_REPLY,
+        PATCHED,
+        SMUGGLED,
         "projectHash",
     ] {
         assert!(
@@ -13802,6 +13823,53 @@ fn a_gemini_session_publishes_each_part_once_and_only_the_persons_words() {
         content_of("m7"),
         [&json!([{"text":"what is in this picture"},{"text":"[Attachment omitted by policy]"}])]
     );
+    // Rewound before it was published: stubs naming the messages, and the rewinds that name them.
+    for taken_back in ["m11", "m12"] {
+        assert!(content_of(taken_back).is_empty(), "{taken_back}");
+        assert!(published.iter().any(|record| record["id"] == taken_back));
+    }
+    for rewind in [
+        json!({"$rewindTo":"m11"}),
+        json!({"$rewindTo":"m7"}),
+        // The notice is not published, so the rewind names the first published message after it.
+        json!({"$rewindTo":"m14"}),
+    ] {
+        assert!(published.contains(&rewind), "{rewind}");
+    }
+    assert!(!published.contains(&json!({"$rewindTo":"m13"})));
+    assert!(content_of("m14").is_empty());
+    assert!(
+        published.contains(
+            &json!({"$patch":{"updates":[],"removeIds":["m6"],"orderIds":["m1","m2","m5"]}})
+        ),
+        "{public_log}"
+    );
+    // Read back, the copy is the conversation Gemini resumes: the rewound and removed prompts
+    // are gone, the ones before them stay.
+    let copy: String = published
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect();
+    let said: Vec<String> = agit::adapter::get("gemini-cli")
+        .unwrap()
+        .parse(&copy)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|event| event.text)
+        .collect();
+    for kept in ["Summarize @notes.md", "Explain @old.md"] {
+        assert!(
+            said.iter().any(|text| text.contains(kept)),
+            "{kept}: {said:?}"
+        );
+    }
+    for gone in ["what is in this picture", "Run the tests"] {
+        assert!(
+            !said.iter().any(|text| text.contains(gone)),
+            "{gone}: {said:?}"
+        );
+    }
 
     // Redacting and sharing judge each record alone, so they refuse this session for now.
     let refused = run(&["export", "alice/app@gemini", "--redact"]);

@@ -715,7 +715,7 @@ fn a_published_chain_skips_the_records_it_leaves_out() {
         json!({"type":"system","uuid":"e","parentUuid":null,"logicalParentUuid":"d","subtype":"compact_boundary"}),
         json!({"type":"user","uuid":"f","parentUuid":"e","isCompactSummary":true,"message":{"role":"user","content":"summary"}}),
     ];
-    let out = published_sequence(records.iter().map(|record| ("claude-code", record)));
+    let out = published_sequence(records.iter().map(|record| ("claude-code", "s", record)));
     let chain: Vec<_> = out
         .iter()
         .flatten()
@@ -1743,7 +1743,10 @@ fn hermes_publishes_only_the_words_the_person_typed() {
     let records = sample(HERMES_ROWS);
     let (header, rows) = records.split_first().unwrap();
     assert_eq!(header["data"]["source"], "local");
-    let in_order: Vec<(&str, &Value)> = records.iter().map(|record| ("hermes", record)).collect();
+    let in_order: Vec<(&str, &str, &Value)> = records
+        .iter()
+        .map(|record| ("hermes", "s", record))
+        .collect();
     let typed: Vec<String> = published_sequence(in_order.clone())
         .into_iter()
         .flatten()
@@ -1902,6 +1905,98 @@ fn openclaw_publishes_only_the_words_the_person_typed() {
 /// branch summaries and bookkeeping are left out, and a kept entry under a left-out one links to
 /// the nearest kept ancestor. A rule that kept the skill's file, the inlined file or the system
 /// prompt fails a row; one that dropped the words beside them fails another.
+/// A Gemini CLI rewind to a message publication leaves out goes out naming the first published
+/// message from it on, and one that drops only left-out messages, as a rollback of a trailing
+/// notice does, is left out; a rewind to a message the session never held goes out as written. A
+/// copy of what is published then reads back as the conversation Gemini resumes. Publishing the
+/// target as written makes a copy, which holds no such message, empty its conversation.
+#[test]
+fn a_gemini_rewind_to_a_left_out_message_names_the_next_published_one() {
+    let user = |id: &str, text: &str| json!({"id":id,"type":"user","content":[{"text":text}]});
+    let notice = |id: &str| json!({"id":id,"type":"info","content":"Request cancelled."});
+    let records = [
+        user("m1", "KEEP"),
+        notice("n1"),
+        user("m2", "TAKEN BACK"),
+        json!({"$rewindTo":"n1"}),
+        user("m3", "AGAIN"),
+        notice("n2"),
+        json!({"$rewindTo":"n2"}),
+    ];
+    let published = published_sequence(records.iter().map(|record| ("gemini-cli", "s", record)));
+    assert_eq!(published[1], None, "a notice is left out");
+    assert_eq!(published[3], Some(json!({"$rewindTo":"m2"})));
+    assert_eq!(published[6], None, "it drops only a left-out notice");
+    let copy: String = published
+        .iter()
+        .flatten()
+        .map(|record| format!("{record}\n"))
+        .collect();
+    let said: Vec<String> = crate::adapter::get("gemini-cli")
+        .unwrap()
+        .parse(&copy)
+        .unwrap()
+        .events
+        .into_iter()
+        .filter_map(|event| event.text)
+        .filter(|text| !text.is_empty())
+        .collect();
+    assert_eq!(said, ["KEEP", "AGAIN"]);
+    let unknown = json!({"$rewindTo":"elsewhere"});
+    assert_eq!(
+        published_sequence([("gemini-cli", "s", &unknown)]),
+        [Some(unknown.clone())]
+    );
+}
+
+/// A LOG interleaves its source sessions' records, and a Gemini CLI rewind is judged in its own
+/// session's conversation: one that drops only a notice publication left out is left out, whatever
+/// another session wrote in between, and each session's copy reads back as its conversation.
+/// Judged against one order for the whole LOG, the rewind names the other session's message, and
+/// in a copy of its own session, which holds no such message, it empties the conversation.
+#[test]
+fn a_gemini_rewind_is_judged_in_its_own_sessions_conversation() {
+    let user = |id: &str, text: &str| json!({"id":id,"type":"user","content":[{"text":text}]});
+    let records = [
+        ("a", user("a1", "KEEP A")),
+        (
+            "a",
+            json!({"id":"a-notice","type":"info","content":"Request cancelled."}),
+        ),
+        ("b", user("b1", "KEEP B")),
+        ("a", json!({"$rewindTo":"a-notice"})),
+    ];
+    let published = published_sequence(
+        records
+            .iter()
+            .map(|(session, record)| ("gemini-cli", *session, record)),
+    );
+    assert_eq!(
+        published[3], None,
+        "it drops only a left-out notice of its own"
+    );
+    let said = |session: &str| -> Vec<String> {
+        let copy: String = records
+            .iter()
+            .zip(&published)
+            .filter(|((of, _), _)| *of == session)
+            .filter_map(|(_, published)| published.as_ref())
+            .map(|record| format!("{record}\n"))
+            .collect();
+        crate::adapter::get("gemini-cli")
+            .unwrap()
+            .parse(&copy)
+            .unwrap()
+            .events
+            .into_iter()
+            .filter_map(|event| event.text)
+            .filter(|text| !text.is_empty())
+            .collect()
+    };
+    assert_eq!(said("a"), ["KEEP A"]);
+    assert_eq!(said("b"), ["KEEP B"]);
+}
+
 #[test]
 fn pi_publishes_only_the_words_the_person_typed() {
     use crate::domain::privacy::omission::Omission;
@@ -1985,7 +2080,7 @@ fn pi_publishes_only_the_words_the_person_typed() {
         json!({"type":"model_change","id":"m1","parentId":"k2","timestamp":"t","provider":"p","modelId":"m"}),
         json!({"type":"message","id":"a1","parentId":"m1","timestamp":"t","message":{"role":"assistant","content":[{"type":"text","text":"Fixed."}],"stopReason":"stop"}}),
     ];
-    let sequence = published_sequence(entries.iter().map(|entry| ("pi", entry)));
+    let sequence = published_sequence(entries.iter().map(|entry| ("pi", "s", entry)));
     let kept: Vec<&Value> = sequence.iter().flatten().collect();
     assert_eq!(kept.len(), 2, "{kept:?}");
     assert!(!format!("{kept:?}").contains("CANARY-PI"), "{kept:?}");

@@ -2515,6 +2515,7 @@ fn conversation_commit(
         |(envelope, typed)| {
             (
                 envelope.source.as_str(),
+                envelope.session_id.as_str(),
                 typed.as_ref().unwrap_or(&envelope.content),
             )
         },

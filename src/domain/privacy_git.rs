@@ -458,11 +458,13 @@ pub fn published_events_from(
         return Ok(None);
     };
     let published = records(holder, public)?;
-    let kept = publication_records::published_sequence(
-        local
-            .iter()
-            .map(|(_, envelope)| (envelope.source.as_str(), &envelope.content)),
-    );
+    let kept = publication_records::published_sequence(local.iter().map(|(_, envelope)| {
+        (
+            envelope.source.as_str(),
+            envelope.session_id.as_str(),
+            &envelope.content,
+        )
+    }));
     let kept = local
         .into_iter()
         .zip(&kept)

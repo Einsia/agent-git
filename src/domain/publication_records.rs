@@ -19,7 +19,7 @@
 //! Local history and resume keep the complete native transcript; only publication applies this.
 
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What a native record is, for publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,16 +285,17 @@ pub fn published(source: &str, content: &Value) -> Option<Value> {
     Classifier::default().published(source, content)
 }
 
-/// A session's records in order, each as it is published or `None`. Claude-shaped records chain
-/// by `parentUuid`; a kept record whose parent is left out is linked to its nearest kept ancestor,
-/// so the published conversation still reads as one chain.
+/// A LOG's records in order, each as it is published or `None`, given as its runtime, the source
+/// session it came from and its content. Claude-shaped records chain by `parentUuid`; a kept
+/// record whose parent is left out is linked to its nearest kept ancestor, so the published
+/// conversation still reads as one chain.
 pub fn published_sequence<'a>(
-    records: impl IntoIterator<Item = (&'a str, &'a Value)>,
+    records: impl IntoIterator<Item = (&'a str, &'a str, &'a Value)>,
 ) -> Vec<Option<Value>> {
     let mut sequence = PublishedSequence::default();
     records
         .into_iter()
-        .map(|(source, content)| sequence.next(source, content))
+        .map(|(source, session, content)| sequence.next(source, session, content))
         .collect()
 }
 
@@ -307,12 +308,78 @@ pub struct PublishedSequence {
     classifier: Classifier,
     /// Each left-out record's uuid, and the parent its kept children are linked to instead.
     dropped: HashMap<String, Value>,
+    /// Each source session's Gemini CLI conversation as a copy of what is published replays it,
+    /// with the messages publication left out still in their places, and the ids of the messages
+    /// it published. A LOG interleaves the records of its source sessions, and a rewind in one
+    /// names a message of its own conversation; judged against another's order, it drops that
+    /// other session's messages from its own.
+    gemini: HashMap<String, GeminiOrder>,
+}
+
+#[derive(Default)]
+struct GeminiOrder {
+    replay: crate::adapter::gemini_cli::Replay,
+    published: HashSet<String>,
+}
+
+impl std::fmt::Debug for GeminiOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeminiOrder")
+            .field("published", &self.published.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GeminiOrder {
+    /// A Gemini CLI record as published, given `kept`, what its rule publishes on its own. A rewind
+    /// to a message publication left out names the first published message from it on instead,
+    /// so a copy drops what Gemini drops: a copy holds no such id, and Gemini empties a
+    /// conversation that does not hold the message it rewinds to. A rewind that drops only
+    /// messages never published is left out.
+    fn next(&mut self, content: &Value, kept: Option<Value>) -> Option<Value> {
+        if let (Some(target), Some(kept)) =
+            (content.get("$rewindTo").and_then(Value::as_str), &kept)
+        {
+            let published = match self
+                .replay
+                .first_from(target, |id| self.published.contains(id))
+            {
+                Some(Some(first)) => Some(serde_json::json!({"$rewindTo": first})),
+                Some(None) => None,
+                None => Some(kept.clone()),
+            };
+            // The rewind as written drops the left-out messages too; among the published ones it
+            // drops what the published rewind drops.
+            self.replay.apply(content);
+            return published;
+        }
+        if content.get("$patch").is_some() {
+            // Replayed as published: a copy never sees what publication left out of a patch.
+            if let Some(kept) = &kept {
+                self.replay.apply(kept);
+            }
+        } else if let Some(id) = content.get("id").and_then(Value::as_str) {
+            self.replay.apply(content);
+            if kept.is_some() {
+                self.published.insert(id.to_owned());
+            }
+        }
+        kept
+    }
 }
 
 impl PublishedSequence {
-    /// The next record as it is published, or `None` when it is left out.
-    pub fn next(&mut self, source: &str, content: &Value) -> Option<Value> {
+    /// The next record, of the source session `session`, as it is published, or `None` when it is
+    /// left out.
+    pub fn next(&mut self, source: &str, session: &str, content: &Value) -> Option<Value> {
         let kept = self.classifier.published(source, content);
+        if source == "gemini-cli" {
+            return self
+                .gemini
+                .entry(session.to_owned())
+                .or_default()
+                .next(content, kept);
+        }
         let ancestor = |field: &str, dropped: &HashMap<String, Value>| {
             content
                 .get(field)
@@ -1532,13 +1599,18 @@ const GEMINI_SYSTEM_NOTE: &str = "<system_note>";
 /// results. A prompt is published as the person typed it: its `displayContent` when it has one,
 /// never the `content` that was expanded from it. Without one, the referenced files Gemini appended
 /// to the words are cut out and marked; a prompt whose block can't be cut cleanly is replaced
-/// whole by a notice. Bookkeeping (session metadata, `$set`, `$rewindTo`), notices (`info`,
-/// `warning`, `error`), usage and display fields are left out, and a `$patch` keeps only the tool
-/// results it brings.
+/// whole by a notice. Bookkeeping (session metadata, `$set`), notices (`info`, `warning`,
+/// `error`), usage and display fields are left out. A rewind keeps only the message it rewinds to,
+/// and a `$patch` only the tool results it brings and the messages it removes and orders, so a
+/// copy replays to the conversation Gemini resumes; an id that is not a Gemini message id leaves
+/// the rewind out, and the patch with its results alone, since such a field could carry words.
 ///
 /// Only fields present are kept, and a kept record judged again is unchanged, so a record the CLI
 /// published, or the part of one a later snapshot added, passes the Hub's judgement as it is.
 fn gemini(record: &Map<String, Value>) -> Option<Value> {
+    if let Some(target) = record.get("$rewindTo") {
+        return gemini_id(target).then(|| serde_json::json!({"$rewindTo": target}));
+    }
     if let Some(patch) = record.get("$patch") {
         return gemini_patch(patch);
     }
@@ -1610,13 +1682,31 @@ fn gemini_call(call: &Map<String, Value>) -> Value {
     kept
 }
 
-/// A `$patch` as published: the tool results its updates bring, by message and call id, and
-/// nothing else; `None` when it brings none.
+/// Whether `value` has the shape of a Gemini message id, as Gemini mints them.
+fn gemini_id(value: &Value) -> bool {
+    value.as_str().is_some_and(|id| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
+}
+
+/// A `$patch` as published: the tool results its updates bring, by message and call id, and the
+/// messages it removes and orders, and nothing else; `None` when it brings none of them.
 fn gemini_patch(patch: &Value) -> Option<Value> {
     // A patch whose results were all published before is kept with none.
     if *patch == serde_json::json!({"updates": []}) {
         return Some(serde_json::json!({"$patch": patch}));
     }
+    let lists: Vec<(&str, &Value)> = ["removeIds", "orderIds"]
+        .into_iter()
+        .filter_map(|key| patch.get(key).map(|ids| (key, ids)))
+        .collect();
+    let lists_clean = lists
+        .iter()
+        .all(|(_, ids)| ids.as_array().is_some_and(|ids| ids.iter().all(gemini_id)));
     let updates: Vec<&Value> = std::iter::once(patch)
         .filter(|patch| patch.get("id").is_some())
         .chain(patch["updates"].as_array().into_iter().flatten())
@@ -1637,7 +1727,15 @@ fn gemini_patch(patch: &Value) -> Option<Value> {
             kept.push(serde_json::json!({"id": id, "toolCalls": results}));
         }
     }
-    (!kept.is_empty()).then(|| serde_json::json!({"$patch": {"updates": kept}}))
+    let mut published = Map::new();
+    published.insert("updates".into(), Value::Array(kept));
+    if lists_clean {
+        for (key, ids) in lists {
+            published.insert(key.into(), ids.clone());
+        }
+    }
+    (published.len() > 1 || published["updates"] != serde_json::json!([]))
+        .then(|| serde_json::json!({"$patch": published}))
 }
 
 fn keep_fields(object: &Map<String, Value>, fields: &[&str]) -> Value {

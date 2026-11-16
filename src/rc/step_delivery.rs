@@ -279,7 +279,7 @@ mod tests {
             records
                 .iter()
                 .zip(&typed)
-                .map(|(record, typed)| ("claude-code", typed.as_ref().unwrap_or(record))),
+                .map(|(record, typed)| ("claude-code", "s", typed.as_ref().unwrap_or(record))),
         )
     }
 
