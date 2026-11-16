@@ -290,7 +290,7 @@ fn publish(directory: &Path, registration: &Registration) -> crate::Result<Regis
 }
 
 #[cfg(target_os = "macos")]
-fn process(pid: u32) -> Option<(Process, u32)> {
+pub(crate) fn process(pid: u32) -> Option<(Process, u32)> {
     let pid = i32::try_from(pid).ok().filter(|pid| *pid > 0)?;
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of_val(&info) as i32;
@@ -303,21 +303,22 @@ fn process(pid: u32) -> Option<(Process, u32)> {
             size,
         )
     };
-    (read == size && info.pbi_uid == unsafe { libc::geteuid() }).then_some((
-        Process {
-            pid: pid as u32,
-            birth: Birth {
-                boot: String::new(),
-                seconds: info.pbi_start_tvsec,
-                fraction: info.pbi_start_tvusec,
+    (read == size && info.pbi_status != libc::SZOMB && info.pbi_uid == unsafe { libc::geteuid() })
+        .then_some((
+            Process {
+                pid: pid as u32,
+                birth: Birth {
+                    boot: String::new(),
+                    seconds: info.pbi_start_tvsec,
+                    fraction: info.pbi_start_tvusec,
+                },
             },
-        },
-        info.pbi_ppid,
-    ))
+            info.pbi_ppid,
+        ))
 }
 
 #[cfg(target_os = "linux")]
-fn process(pid: u32) -> Option<(Process, u32)> {
+pub(crate) fn process(pid: u32) -> Option<(Process, u32)> {
     if pid == 0 {
         return None;
     }
@@ -327,6 +328,10 @@ fn process(pid: u32) -> Option<(Process, u32)> {
     }
     let stat = std::fs::read_to_string(path.join("stat")).ok()?;
     let fields: Vec<_> = stat.rsplit_once(") ")?.1.split_whitespace().collect();
+    // An unreaped writer has already lost its authority to receive or approve input.
+    if matches!(fields.first().copied(), Some("Z" | "X")) {
+        return None;
+    }
     Some((
         Process {
             pid,
@@ -344,7 +349,7 @@ fn process(pid: u32) -> Option<(Process, u32)> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process(_: u32) -> Option<(Process, u32)> {
+pub(crate) fn process(_: u32) -> Option<(Process, u32)> {
     None
 }
 

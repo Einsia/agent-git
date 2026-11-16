@@ -10,10 +10,10 @@
 //!
 //! * the daemon sends with the session's peer token. Claude Code accepts such a message in
 //!   prompting modes and holds it for approval on the machine in bypass-permissions mode;
-//! * a relay started from agit's own Claude Code Stop hook sends with the child token that the
-//!   session exports only to its hooks and tools. Claude Code admits that message as one the
-//!   session sent itself, in every mode. The relay receives the token through its inherited
-//!   environment and keeps it in memory; no file or log ever holds it.
+//! * an asynchronous SessionStart hook stays in Claude Code's child-process tree and sends with
+//!   the child token the session exports to hooks and tools. Claude Code can admit the owner's
+//!   message as the session's own, subject to its inbound policy. The relay consumes the token
+//!   from its inherited environment and keeps it only in memory.
 //!
 //! Claude Code applies its hold by the session's live permission mode, which the transcript
 //! records late or not at all. So only the device owner's messages may pass through a relay; every
@@ -56,7 +56,8 @@ const RECORD_LIMIT: u64 = 64 * 1024;
 /// Bounds a queued message: the inbox limit plus attribution, with JSON escaping.
 const PENDING_LIMIT: u64 = 256 * 1024;
 const RELAY_POLL: Duration = Duration::from_millis(500);
-/// A registration that Claude Code is rewriting cannot be read for a moment.
+/// SessionStart may run before the process publishes its socket registration.
+#[cfg(unix)]
 const RELAY_PATIENCE: Duration = Duration::from_secs(10);
 /// How long the owner's message waits for a running relay to take it before the daemon sends it
 /// itself. It spans several relay polls, so a relay between polls or busy with another message
@@ -69,11 +70,14 @@ const HANDOFF_CHECK: Duration = Duration::from_millis(50);
 const PENDING_TTL: Duration = Duration::from_secs(30);
 const _: () = assert!(PENDING_TTL.as_millis() > HANDOFF.as_millis());
 /// A probe shares the relay lock only for the instant it looks, so a relay retries through it.
+#[cfg(unix)]
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 const PENDING: &str = "pending";
 const SENDING: &str = "sending";
 const LOCK: &str = "relay.lock";
+#[cfg(unix)]
 const TOKEN_ENV: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
+#[cfg(unix)]
 const SOCKET_ENV: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
 const BYPASS: &str = "bypassPermissions";
 
@@ -646,6 +650,7 @@ struct Pending {
     proc_start: Option<String>,
 }
 
+#[cfg(unix)]
 impl Pending {
     fn expired(&self, now: u64) -> bool {
         u128::from(now.abs_diff(self.enqueued_at)) > PENDING_TTL.as_millis()
@@ -698,13 +703,8 @@ fn names(path: &Path, file: &std::fs::File) -> bool {
     }
 }
 
-#[cfg(not(unix))]
-fn names(_: &Path, _: &std::fs::File) -> bool {
-    true
-}
-
-/// A note about a relay decision. The relay runs detached with its output discarded, so only a
-/// debug build run by hand shows it.
+/// Fixed relay diagnostics are visible only in debug builds with output attached.
+#[cfg(unix)]
 fn debug_note(note: std::fmt::Arguments<'_>) {
     if cfg!(debug_assertions) {
         eprintln!("agit hooks relay: {note}");
@@ -717,8 +717,10 @@ pub(crate) struct Queue {
 }
 
 /// Held by the session's live relay. Dropping it lets the next relay of the session start.
+#[cfg(unix)]
 pub(crate) struct RelayLock(std::fs::File);
 
+#[cfg(unix)]
 impl Drop for RelayLock {
     fn drop(&mut self) {
         // A forked child can retain the open file description until exec; unlocking explicitly
@@ -781,6 +783,7 @@ impl Queue {
     }
 
     /// The relay lock, or `None` while another relay of this session holds it.
+    #[cfg(unix)]
     pub(crate) fn try_lock(&self) -> crate::Result<Option<RelayLock>> {
         let file = self.lock_file()?;
         match fs2::FileExt::try_lock_exclusive(&file) {
@@ -848,6 +851,7 @@ impl Queue {
     }
 
     /// Pending keys, oldest first.
+    #[cfg(unix)]
     fn pending(&self) -> crate::Result<Vec<String>> {
         let mut keys = Vec::new();
         for entry in std::fs::read_dir(self.dir.join(PENDING))? {
@@ -876,6 +880,7 @@ impl Queue {
     }
 
     /// Read a pending message without taking it.
+    #[cfg(unix)]
     fn peek(&self, key: &str) -> crate::Result<Pending> {
         Ok(serde_json::from_slice(&read_bounded(
             &self.message(PENDING, key),
@@ -913,6 +918,7 @@ impl Queue {
     }
 
     /// Return a claimed message that certainly did not reach the session.
+    #[cfg(unix)]
     fn release(&self, key: &str) -> crate::Result<()> {
         std::fs::rename(self.message(SENDING, key), self.message(PENDING, key))?;
         super::native_inbox::sync_directory(&self.dir.join(PENDING))?;
@@ -928,6 +934,7 @@ impl Queue {
     /// Remove the queue once nothing waits in it. Only the holder of the relay lock calls this,
     /// so no running relay loses its queue, and each step removes only an empty directory, so a
     /// message queued meanwhile keeps the rest.
+    #[cfg(unix)]
     fn remove_if_idle(&self) {
         let _ = std::fs::remove_dir(self.dir.join(PENDING))
             .and_then(|()| std::fs::remove_dir(self.dir.join(SENDING)))
@@ -977,11 +984,13 @@ pub(crate) async fn forward(queue: &Queue, live: &Live, key: &str) -> Result<(),
 
 /// The messaging credentials a Claude Code session exports to its own hooks. The socket path
 /// names one live process, so it binds the token to that process.
+#[cfg(unix)]
 pub(crate) struct Credentials {
     token: String,
     socket: PathBuf,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -992,41 +1001,65 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
+#[cfg(unix)]
 impl Credentials {
-    pub(crate) fn from_env() -> Option<Self> {
-        let token = std::env::var(TOKEN_ENV)
-            .ok()
-            .filter(|token| token_shape(token))?;
+    /// Consume the hook credential before any helper can inherit it.
+    ///
+    /// # Safety
+    /// Called only by the binary entry point before threads or helper processes start.
+    pub(crate) unsafe fn take_env() -> Option<Self> {
+        let token = std::env::var(TOKEN_ENV).ok();
+        // SAFETY: the caller guarantees that environment mutation is still exclusive.
+        unsafe { std::env::remove_var(TOKEN_ENV) };
+        let token = token.filter(|token| token_shape(token))?;
         let socket = PathBuf::from(std::env::var_os(SOCKET_ENV)?);
         socket.is_absolute().then_some(Self { token, socket })
     }
 }
 
 /// Delivers the owner's queued messages for one session as messages the session sent itself.
+#[cfg(unix)]
 struct Relay {
     registry: PathBuf,
     queue: Queue,
     session_id: String,
     credentials: Credentials,
+    origin: super::native_claude::Process,
     poll: Duration,
     patience: Duration,
 }
 
+#[cfg(unix)]
 impl Relay {
-    /// The process that runs this session, when it is the process whose token the relay holds.
-    fn holder(&self) -> Option<Live> {
-        discover_in(&self.registry, &self.session_id)
-            .filter(|live| live.socket == self.credentials.socket)
+    /// The credential belongs to this session's socket and to an ancestor of the hook.
+    fn holder(&self) -> Option<(Live, super::native_claude::Process)> {
+        let live = discover_in(&self.registry, &self.session_id)?;
+        let (process, _) = super::native_claude::process(live.pid)?;
+        if live.socket != self.credentials.socket {
+            return None;
+        }
+        let (origin, _) = super::native_claude::process(self.origin.pid)?;
+        if origin != self.origin {
+            return None;
+        }
+        let mut pid = origin.pid;
+        for _ in 0..64 {
+            let (ancestor, parent) = super::native_claude::process(pid)?;
+            if ancestor == process {
+                return Some((live, process));
+            }
+            pid = parent;
+        }
+        None
     }
 
-    /// Whether `pid` still runs this session. A registration that cannot be read while it is
-    /// rewritten says nothing; one naming another session means the process switched sessions,
-    /// and frames naming this one would be dropped.
-    fn still_held(&self, pid: u32) -> bool {
-        process_alive(pid)
-            && own_socket(&self.credentials.socket)
-            && record(&self.registry.join(format!("{pid}.json")))
-                .is_none_or(|record| record.session_id == self.session_id)
+    /// Missing or changed registration and PID reuse revoke the relay's authority immediately.
+    fn still_held(&self, holder: &Live, process: &super::native_claude::Process) -> bool {
+        super::native_claude::process(holder.pid).is_some_and(|(current, _)| current == *process)
+            && process_alive(holder.pid)
+            && self.holder().is_some_and(|(current, identity)| {
+                current.same_process(holder) && identity == *process
+            })
     }
 
     /// The relay lock, retried through probes that share it for an instant. A relay that holds
@@ -1060,7 +1093,7 @@ impl Relay {
 
     async fn serve(&self, lock: &mut Option<RelayLock>) -> crate::Result<()> {
         let started = Instant::now();
-        let holder = loop {
+        let (holder, process) = loop {
             if let Some(holder) = self.holder() {
                 break holder;
             }
@@ -1074,8 +1107,11 @@ impl Relay {
         if lock.is_none() {
             return Ok(());
         }
-        while self.still_held(holder.pid) {
+        while self.still_held(&holder, &process) {
             for key in self.queue.pending()? {
+                if !self.still_held(&holder, &process) {
+                    return Ok(());
+                }
                 let now = now_millis();
                 // The owner's fresh entry for another process stays for the daemon that queued
                 // it, which claims it back; once expired it is dropped like any refused entry.
@@ -1116,15 +1152,20 @@ impl Relay {
     }
 }
 
-/// `agit hooks relay`: deliver this session's queued messages while its process runs it.
-pub(crate) fn run_relay(session_id: &str) -> crate::Result<()> {
-    let credentials =
-        Credentials::from_env().context("Claude Code messaging credentials are absent")?;
+/// Run directly in the asynchronous hook; detaching loses Claude Code's child-process evidence.
+#[cfg(unix)]
+pub(crate) fn run_relay(session_id: &str, credentials: Credentials) -> crate::Result<()> {
+    if !remote_control_configured() {
+        return Ok(());
+    }
+    let (origin, _) = super::native_claude::process(std::process::id())
+        .context("the hook process identity is unavailable")?;
     let relay = Relay {
         registry: crate::adapter::claude_code::sessions_dir()?,
         queue: Queue::open(Queue::path_for(session_id)?)?,
         session_id: session_id.to_owned(),
         credentials,
+        origin,
         poll: RELAY_POLL,
         patience: RELAY_PATIENCE,
     };
@@ -1134,56 +1175,10 @@ pub(crate) fn run_relay(session_id: &str) -> crate::Result<()> {
         .block_on(relay.run())
 }
 
-/// Whether a session in `permission_mode`, as its Stop hook reports the live mode, needs a
-/// relay. Claude Code admits peer messages without approval in every other mode, and a hook that
-/// reports no mode leaves the need unknown.
-pub(crate) fn relay_serves(permission_mode: Option<&str>) -> bool {
-    permission_mode == Some(BYPASS)
-}
-
-/// Start the relay of the session whose Stop hook runs now, unless one already serves it.
-///
-/// Best effort and immediate: the relay runs detached, and without one the daemon still delivers
-/// with the peer token.
-pub(crate) fn start_relay(session_id: &str) {
-    let _ = try_start_relay(session_id);
-}
-
-fn try_start_relay(session_id: &str) -> crate::Result<()> {
-    if !cfg!(unix) || Credentials::from_env().is_none() || !remote_control_configured() {
-        return Ok(());
-    }
-    let queue = Queue::open(Queue::path_for(session_id)?)?;
-    if queue.relay_active()? {
-        return Ok(());
-    }
-    let mut command = crate::infra::background::command(std::env::current_exe()?);
-    command
-        .args(["hooks", "relay", "--session", session_id])
-        .current_dir(Path::new("/"))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and touches no state shared with the parent.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    command.spawn()?;
-    Ok(())
-}
-
 /// Workspace messages reach only a machine that bound a workspace for remote control, under
 /// either namespace `rc_dir` selects.
-fn remote_control_configured() -> bool {
+#[cfg(unix)]
+pub(crate) fn remote_control_configured() -> bool {
     crate::infra::config::agit_home().is_ok_and(|home| {
         ["rc", "desktop-rc"]
             .iter()
@@ -1265,6 +1260,10 @@ pub(crate) mod fixture {
                 token: token.to_owned(),
                 socket: socket.to_owned(),
             },
+            origin: super::discover_in(registry, session_id)
+                .and_then(|live| crate::rc::native_claude::process(live.pid))
+                .map(|(process, _)| process)
+                .unwrap(),
             poll: std::time::Duration::from_millis(20),
             patience: std::time::Duration::from_secs(5),
         };
@@ -1306,6 +1305,39 @@ mod tests {
         );
     }
     use serde_json::json;
+
+    /// A live PID and socket do not authorize continued use after its registration changes.
+    #[tokio::test]
+    async fn a_relay_exits_when_its_process_registration_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("sessions");
+        let socket = root.path().join("claude.sock");
+        let _connections = fixture::listen(&socket);
+        let pid = std::process::id();
+        let session = uuid::Uuid::new_v4().to_string();
+        fixture::register(&registry, pid, &session, &socket, None);
+        let dir = root.path().join("queue");
+        let queue = Queue::open(dir.clone()).unwrap();
+        let running = fixture::relay(&registry, &dir, &session, &socket, &"ab".repeat(16));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !queue.relay_active().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = registry.join(format!("{pid}.json"));
+        let mut registration: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        registration["procStart"] = "different-process-start".into();
+        std::fs::write(path, registration.to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("changed process identity revokes the relay")
+            .unwrap()
+            .unwrap();
+        assert!(!dir.exists());
+    }
 
     /// A relay authenticates with the token its session exported, so Claude Code admits the
     /// message as the session's own even in bypass-permissions mode. It sends only the owner's
@@ -1387,6 +1419,15 @@ mod tests {
             queue.relay_active().unwrap(),
             "a running relay holds the session lock"
         );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture::relay(&registry, &dir, &session, &socket, token),
+        )
+        .await
+        .expect("a duplicate SessionStart cannot keep another relay")
+        .unwrap()
+        .unwrap();
+        assert!(queue.relay_active().unwrap());
         tokio::time::timeout(Duration::from_secs(5), async {
             while queue.pending().unwrap() != [elsewhere.clone()]
                 || std::fs::read_dir(dir.join(SENDING)).unwrap().count() != 0

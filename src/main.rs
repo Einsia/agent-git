@@ -34,6 +34,10 @@ fn main() {
     agit::infra::own_image::refuse_foreign_parent();
     agit::infra::background::keep_inherited_handles_private();
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // SAFETY: no threads or helper processes have started on this entry path.
+    if let Some(code) = unsafe { commands::hooks::relay_entry(&raw_args) } {
+        exit(code);
+    }
     if let Some(code) = agit::domain::privacy::bench::entry(&raw_args) {
         exit(code);
     }
@@ -443,7 +447,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Activity(_) => Startup::ScopedActivity,
         Commands::Remote(_) => Startup::OfflineListing,
         Commands::Mcp(_) => Startup::ToolDispatcher,
-        // A relay outlives the hook that starts it and touches only its own message queue.
+        // A relay touches only its own message queue.
         Commands::Hooks(args)
             if matches!(args.action, Some(commands::hooks::Action::Relay { .. })) =>
         {
@@ -543,6 +547,9 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// The dispatch table. Deliberately too boring to get wrong — every change lives in the file
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
+    if !matches!(cmd, Commands::Hooks(_) | Commands::Setup(_)) {
+        commands::setup::refresh_claude_relay();
+    }
     agit::telemetry::observe(agit::telemetry::Observation::Stage("dispatch"));
     recheck_project_claims(&cmd);
     // A folder's upload that is due to be tried again starts its worker from the front door's
