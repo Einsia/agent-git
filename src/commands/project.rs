@@ -117,6 +117,11 @@ struct Project {
     /// as earlier until it is saved into this repository.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     earlier_opencode: bool,
+    /// Whether `earlier` holds the Pi conversations that ran here before the binding. A policy
+    /// bound before agit captured Pi never recorded them, so every Pi conversation there counts as
+    /// earlier until an explicit `agit on` or `agit save` records them ([`look_for_earlier_pi`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    earlier_pi: bool,
     /// The newest upload's result. A refusal an agit that still attempted uploads with `push.auto`
     /// off saved here is not read back: nothing failed.
     #[serde(default, deserialize_with = "last_result_without_refusal")]
@@ -700,16 +705,21 @@ fn update_covered<T>(
     Ok(result)
 }
 
-/// Where AgentGit records that Codex ran its hooks for `session`, `None` for an id that is not a
-/// plain file name.
-fn codex_hooked_path(session: &str) -> Option<PathBuf> {
+/// Where AgentGit records, in `record`, that a runtime ran agit's hooks for `session`; `None` for
+/// an id that is not a plain file name, so an id cannot name a path outside the record directory.
+fn hooked_path(record: &str, session: &str) -> Option<PathBuf> {
     let plain = !session.is_empty()
         && session
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
     plain
         .then(|| config::agit_home().ok())?
-        .map(|home| home.join("hooks-seen").join("codex-sessions").join(session))
+        .map(|home| home.join("hooks-seen").join(record).join(session))
+}
+
+/// Where AgentGit records that Codex ran its hooks for `session`.
+fn codex_hooked_path(session: &str) -> Option<PathBuf> {
+    hooked_path("codex-sessions", session)
 }
 
 /// Records, as a Codex hook (SessionStart or Stop) runs for `session`, that Codex runs AgentGit's
@@ -734,18 +744,9 @@ pub(crate) fn codex_capture_allowed(_root: &Path, session: &str) -> bool {
     codex_hooked_path(session).is_some_and(|path| path.exists())
 }
 
-/// Where AgentGit records that OpenCode ran agit's plugin for `session`, `None` for an id that is
-/// not a plain file name, so an id cannot name a path outside the record directory.
+/// Where AgentGit records that OpenCode ran agit's plugin for `session`.
 fn opencode_hooked_path(session: &str) -> Option<PathBuf> {
-    let plain = !session.is_empty()
-        && session
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    plain.then(|| config::agit_home().ok())?.map(|home| {
-        home.join("hooks-seen")
-            .join("opencode-sessions")
-            .join(session)
-    })
+    hooked_path("opencode-sessions", session)
 }
 
 /// Records, as agit's OpenCode plugin settles `session` in a folder a project covers, that
@@ -769,6 +770,26 @@ pub(crate) fn opencode_hooks_seen(session: &str) {
 pub(crate) fn opencode_capture_allowed(session: &str) -> bool {
     opencode_hooked_path(session).is_some_and(|path| path.exists())
         && adapter::opencode::started_by_another(session) == Some(false)
+}
+
+/// Records, as agit's Pi extension settles `session` in a folder a project covers, that Pi runs the
+/// extension for that conversation. Called only there: an extension settling in a folder no project
+/// covers leaves nothing behind.
+pub(crate) fn pi_hooks_seen(session: &str) {
+    if let Some(path) = hooked_path("pi-sessions", session)
+        && path
+            .parent()
+            .is_some_and(|dir| config::create_state_dir(dir).is_ok())
+    {
+        let _ = fs::write(path, b"");
+    }
+}
+
+/// Whether Pi's `session` uploads by itself when Pi settles: agit's extension ran for that very
+/// conversation. Without the extension Pi tells agit nothing when a run ends, so a computer without
+/// it uploads Pi conversations only when someone saves them.
+pub(crate) fn pi_capture_allowed(session: &str) -> bool {
+    hooked_path("pi-sessions", session).is_some_and(|path| path.exists())
 }
 
 /// Whether some OpenCode conversation in the folder at `root` ran agit's plugin, so its turns
@@ -975,6 +996,7 @@ pub(crate) fn policy_for_test(
             .collect(),
         earlier: BTreeSet::new(),
         earlier_opencode: false,
+        earlier_pi: false,
         last_result: None,
         push_auto_before: None,
     })
@@ -983,8 +1005,14 @@ pub(crate) fn policy_for_test(
 
 /// Whether the project keeps `candidate` because it is a Codex session that did not run with
 /// AgentGit's hooks in the folder (see [`codex_capture_allowed`]).
-fn codex_unhooked(project: &Project, candidate: &Candidate) -> bool {
-    candidate.runtime == "codex" && !codex_capture_allowed(&project.root, &candidate.session_id)
+/// Whether `candidate` is a conversation of a runtime whose own hook has to run before it uploads
+/// by itself, and that hook has not run for it.
+fn unhooked(project: &Project, candidate: &Candidate) -> bool {
+    match candidate.runtime.as_str() {
+        "codex" => !codex_capture_allowed(&project.root, &candidate.session_id),
+        "pi" => !pi_capture_allowed(&candidate.session_id),
+        _ => false,
+    }
 }
 
 /// Records that the project at `root` covers `worktree` from now on, unless it already does.
@@ -1093,7 +1121,7 @@ fn candidates(project: &Project) -> Result<Vec<Candidate>> {
     let mut result = Vec::new();
     let mut seen = BTreeSet::new();
     let worktrees = crate::domain::worktree::of(&project.root);
-    for runtime in ["codex", "claude-code"] {
+    for runtime in ["codex", "claude-code", "pi"] {
         let adapter = adapter::get(runtime)?;
         for session in adapter.all_session_choices()? {
             let cwd = session
@@ -1162,6 +1190,127 @@ fn opencode_earlier(project: &Project, session_id: &str) -> bool {
     project.history == History::None
         && !claimed_here(project, "opencode", session_id)
         && (!project.earlier_opencode || project.earlier.contains(&key("opencode", session_id)))
+}
+
+/// Whether a Pi conversation counts as earlier history of a folder bound without it, as
+/// [`opencode_earlier`] judges OpenCode's: a policy that never recorded Pi's earlier conversations
+/// fails closed, so every Pi conversation not saved into the project's repository counts as
+/// earlier until [`look_for_earlier_pi`] records them.
+fn pi_earlier(project: &Project, session_id: &str) -> bool {
+    project.history == History::None
+        && !claimed_here(project, "pi", session_id)
+        && (!project.earlier_pi || project.earlier.contains(&key("pi", session_id)))
+}
+
+/// The Pi conversations of the project, found the way [`candidates`] finds the others but from a
+/// complete reading of Pi's folders ([`crate::adapter::pi::every_session_in_full`]), and whether
+/// the reading was complete. One that wasn't must record nothing: a conversation it missed would
+/// count as new once Pi's folder reads again.
+fn pi_history(project: &Project) -> (Vec<Candidate>, bool) {
+    let Ok(sessions) = crate::adapter::pi::every_session_in_full() else {
+        return (Vec::new(), false);
+    };
+    let worktrees = crate::domain::worktree::of(&project.root);
+    let mut found = Vec::new();
+    for session in sessions {
+        let recorded = session.cwd.map(PathBuf::from);
+        let Some(cwd) = recorded.as_ref().and_then(|path| path.canonicalize().ok()) else {
+            // A folder that doesn't resolve now (one removed for a while) may be the folder's, so
+            // its session counts as earlier wherever it ran: one recorded that isn't the folder's
+            // keeps nothing in that would go out, one missed would go out as new once its folder
+            // is back.
+            found.push(Candidate {
+                runtime: "pi".into(),
+                session_id: session.id,
+                cwd: recorded.unwrap_or_default(),
+            });
+            continue;
+        };
+        let near = cwd.starts_with(&project.root)
+            || worktrees.iter().any(|worktree| cwd.starts_with(worktree));
+        match includes(project, &cwd) {
+            Ok(true) if near => found.push(Candidate {
+                runtime: "pi".into(),
+                session_id: session.id,
+                cwd,
+            }),
+            Ok(_) => {}
+            Err(_) => return (Vec::new(), false),
+        }
+    }
+    (found, true)
+}
+
+/// Records, for a bind of the folder at `root` to `repository` without its history, the folder's
+/// conversations from before it as earlier: `rows`, and what OpenCode's and Pi's complete readings
+/// hold. Earlier sessions stay out whether or not another repository claims them; only a session
+/// already claimed in this repository keeps publishing here. Those of the folder's git worktrees
+/// stay out by when the worktree was covered, recorded elsewhere. A Pi conversation whose folder
+/// doesn't resolve right now counts as earlier wherever its path points ([`pi_history`]): its path
+/// may name the folder another way, through a link, and once its folder resolves it would be the
+/// folder's.
+fn record_earlier_at_bind(
+    project: &mut Project,
+    rows: &[Candidate],
+    root: &Path,
+    repository: &str,
+) -> Result<()> {
+    let store = Store::at(config::store_root()?);
+    let (opencode, read) = opencode_history(project);
+    project.earlier_opencode = read;
+    let (pi, read) = pi_history(project);
+    project.earlier_pi = read;
+    let earlier: Vec<String> = rows
+        .iter()
+        .chain(&opencode)
+        .chain(&pi)
+        .filter(|s| s.cwd.starts_with(root) || (s.runtime == "pi" && s.cwd.canonicalize().is_err()))
+        .filter(|s| {
+            link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
+                link.branch.is_none()
+                    || format!(
+                        "{}/{}",
+                        link.owner.as_deref().unwrap_or_default(),
+                        link.agent.as_deref().unwrap_or_default()
+                    ) != repository
+            })
+        })
+        .map(|s| key(&s.runtime, &s.session_id))
+        .collect();
+    project.earlier.extend(earlier);
+    Ok(())
+}
+
+/// Brings a policy bound before agit captured Pi forward, once: the Pi conversations of the folder
+/// now count as earlier, so one started after this is the folder's own. Only an explicit `agit on`
+/// or `agit save` calls it; a run's end meets an unmarked policy and keeps failing closed
+/// ([`pi_earlier`]). A reading of Pi's folders that couldn't read every session marks nothing.
+/// Returns how many it recorded.
+pub(crate) fn look_for_earlier_pi(folder: &Path) -> Result<usize> {
+    let root = policy_root(folder);
+    if read(&root)?.is_none_or(|project| project.history != History::None || project.earlier_pi) {
+        return Ok(0);
+    }
+    let _guard = lock(&root)?;
+    let Some(mut project) = read(&root)? else {
+        return Ok(0);
+    };
+    if project.history != History::None || project.earlier_pi {
+        return Ok(0);
+    }
+    let (found, complete) = pi_history(&project);
+    if !complete {
+        return Ok(0);
+    }
+    let mut recorded = 0;
+    for candidate in &found {
+        if !claimed_here(&project, "pi", &candidate.session_id) {
+            recorded += usize::from(project.earlier.insert(key("pi", &candidate.session_id)));
+        }
+    }
+    project.earlier_pi = true;
+    save(&project)?;
+    Ok(recorded)
 }
 
 /// What one look at OpenCode's store recorded for a policy that had never looked: how many of
@@ -2046,14 +2195,21 @@ fn sync_skip(project: &Project, candidate: &Candidate) -> Option<&'static str> {
         .contains(&key(&candidate.runtime, &candidate.session_id))
     {
         Some("dropped")
-    } else if project
-        .earlier
-        .contains(&key(&candidate.runtime, &candidate.session_id))
-        || before_covered(project, candidate, true).unwrap_or(true)
+    } else if (if candidate.runtime == "pi" {
+        pi_earlier(project, &candidate.session_id)
+    } else {
+        project
+            .earlier
+            .contains(&key(&candidate.runtime, &candidate.session_id))
+    }) || before_covered(project, candidate, true).unwrap_or(true)
     {
         Some("before_on")
-    } else if codex_unhooked(project, candidate) {
-        Some("codex_hooks_not_seen")
+    } else if unhooked(project, candidate) {
+        Some(if candidate.runtime == "pi" {
+            "pi_extension_not_seen"
+        } else {
+            "codex_hooks_not_seen"
+        })
     } else if delegation_withheld(&project.repository, candidate, Some(project), true)
         .unwrap_or(true)
     {
@@ -2203,6 +2359,7 @@ pub fn run(args: Args) -> CmdResult {
                         history: History::None,
                         earlier: BTreeSet::new(),
                         earlier_opencode: false,
+                        earlier_pi: false,
                         last_result: None,
                         // The worktree's own policy replaced nothing; the main checkout keeps its
                         // record.
@@ -2350,6 +2507,7 @@ fn bind(
         excluded: BTreeSet::new(),
         earlier: BTreeSet::new(),
         earlier_opencode: false,
+        earlier_pi: false,
         last_result: None,
         push_auto_before: None,
     };
@@ -2420,28 +2578,7 @@ fn bind(
     }
     project.excluded.extend(kept_drops(&root)?);
     if history == History::None {
-        // Earlier sessions stay out whether or not another repository claims them; only a
-        // session already claimed in this repository keeps publishing here. Those of the
-        // folder's git worktrees stay out by when the worktree was covered, recorded below.
-        let store = Store::at(config::store_root()?);
-        let (opencode, read) = opencode_history(&project);
-        project.earlier_opencode = read;
-        project.earlier.extend(
-            rows.iter()
-                .chain(&opencode)
-                .filter(|s| s.cwd.starts_with(&root))
-                .filter(|s| {
-                    link::get(&store, &s.runtime, &s.session_id).is_none_or(|link| {
-                        link.branch.is_none()
-                            || format!(
-                                "{}/{}",
-                                link.owner.as_deref().unwrap_or_default(),
-                                link.agent.as_deref().unwrap_or_default()
-                            ) != repository
-                    })
-                })
-                .map(|s| key(&s.runtime, &s.session_id)),
-        );
+        record_earlier_at_bind(&mut project, &rows, &root, repository)?;
     }
     let client = super::require_login()?;
     let remote = super::remote_request(client.get_agent(&owner, &name))?;
@@ -2967,7 +3104,7 @@ pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Pat
         session_id: session_id.into(),
         cwd: cwd.to_path_buf(),
     };
-    earlier_history(&project, &candidate, false) || codex_unhooked(&project, &candidate)
+    earlier_history(&project, &candidate, false) || unhooked(&project, &candidate)
 }
 
 /// Whether `candidate` is earlier history of the folder, which uploads only when the person names
@@ -2976,12 +3113,12 @@ pub(crate) fn left_out(folder: &Path, runtime: &str, session_id: &str, cwd: &Pat
 /// that ([`opencode_earlier`]); every path that uploads by itself asks this one function, so none
 /// of them lets in a conversation another of them calls earlier. `adopt` as in [`before_covered`].
 fn earlier_history(project: &Project, candidate: &Candidate, adopt: bool) -> bool {
-    let recorded = if candidate.runtime == "opencode" {
-        opencode_earlier(project, &candidate.session_id)
-    } else {
-        project
+    let recorded = match candidate.runtime.as_str() {
+        "opencode" => opencode_earlier(project, &candidate.session_id),
+        "pi" => pi_earlier(project, &candidate.session_id),
+        _ => project
             .earlier
-            .contains(&key(&candidate.runtime, &candidate.session_id))
+            .contains(&key(&candidate.runtime, &candidate.session_id)),
     };
     // A covered git worktree outside the folder keeps its own earlier history by when it was
     // covered, whatever the runtime: a bind records only the folder's own earlier conversations.
@@ -3038,6 +3175,7 @@ pub(crate) fn save_policy_for_test(
         excluded: BTreeSet::new(),
         earlier: BTreeSet::new(),
         earlier_opencode: false,
+        earlier_pi: false,
         last_result: None,
         push_auto_before: None,
     })
@@ -3166,13 +3304,15 @@ pub(crate) fn earlier_count(root: &Path) -> usize {
 }
 
 /// Whether a project captures this conversation by itself: Claude Code's and Codex's, whose hooks
-/// call [`capture`], and OpenCode's once agit's plugin ran for it ([`opencode_capture_allowed`]).
+/// call [`capture`], OpenCode's once agit's plugin ran for it ([`opencode_capture_allowed`]), and
+/// Pi's once agit's extension ran for it ([`pi_capture_allowed`]).
 /// Any other conversation is saved only when someone imports it, so telling its agent the project
 /// saves it would leave it unsaved.
 fn captured_runtime(runtime: &str, session: &str) -> bool {
     match runtime {
         "codex" | "claude-code" => true,
         "opencode" => opencode_capture_allowed(session),
+        "pi" => pi_capture_allowed(session),
         _ => false,
     }
 }
@@ -3182,7 +3322,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
         return Ok(false);
     };
-    if !matches!(runtime, "codex" | "claude-code" | "opencode") {
+    if !matches!(runtime, "codex" | "claude-code" | "opencode" | "pi") {
         return Ok(false);
     }
     let Some((project, _)) = governing(&cwd)? else {
@@ -3192,6 +3332,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     match runtime {
         "codex" => codex_hooks_seen(session),
         "opencode" => opencode_hooks_seen(session),
+        "pi" => pi_hooks_seen(session),
         _ => {}
     }
     if !captured_runtime(runtime, session) {
@@ -3673,7 +3814,7 @@ fn drain_then(root: &Path, retrying: bool) -> Result<()> {
             let caught = caught(root);
             for candidate in candidates(&project)? {
                 if !before_covered(&project, &candidate, true).unwrap_or(true)
-                    && !codex_unhooked(&project, &candidate)
+                    && !unhooked(&project, &candidate)
                     && behind(&project, &candidate, &caught)
                 {
                     enqueue(root, &candidate)?;
@@ -6803,6 +6944,8 @@ mod tests {
             .env("CLAUDE_CONFIG_DIR", home.path().join("claude"))
             .env("CODEX_HOME", home.path().join("codex"))
             .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("PI_CODING_AGENT_DIR", home.path().join("pi"))
+            .env_remove("PI_CODING_AGENT_SESSION_DIR")
             .output()
             .unwrap();
         assert!(
@@ -6831,6 +6974,7 @@ mod tests {
             excluded: BTreeSet::new(),
             earlier: BTreeSet::new(),
             earlier_opencode: false,
+            earlier_pi: false,
             last_result: None,
             push_auto_before: None,
         }
@@ -7466,6 +7610,138 @@ mod tests {
         );
         assert!(left_out(&policy.root, "opencode", "ses_tree_before", &tree));
         assert!(in_tree("ses_tree_after"));
+    }
+
+    /// A Pi conversation uploads by itself only once agit's extension ran for it, and never while it
+    /// is earlier history of the folder. A policy bound before agit captured Pi recorded none of
+    /// Pi's conversations, so every one there counts as earlier until an explicit `agit on` or
+    /// `agit save` records what is there, from a reading of Pi's folders that read every session,
+    /// one whose folder is gone for now included; one started after that is the folder's. A look
+    /// that marked the policy from a reading that skipped a session would upload that session as
+    /// new once it, or its folder, reads again. A gate that let
+    /// Pi through without its extension, or that read Pi's earlier history from a record that never
+    /// held it, would upload a conversation the person kept out.
+    #[test]
+    fn a_pi_conversation_uploads_by_itself_only_once_its_extension_ran_for_a_new_conversation() {
+        if !isolated(
+            "a_pi_conversation_uploads_by_itself_only_once_its_extension_ran_for_a_new_conversation",
+        ) {
+            return;
+        }
+        let work = tempfile::tempdir().unwrap();
+        let folder = work.path().canonicalize().unwrap();
+        let sessions = crate::adapter::pi::project_dir(&folder).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let started = |id: &str, extension_ran: bool| {
+            let header = serde_json::json!({"type":"session","version":3,"id":id,
+                "timestamp":"2026-11-15T00:00:00.000Z","cwd":folder});
+            fs::write(
+                sessions.join(format!("2026-11-15T00-00-00-000Z_{id}.jsonl")),
+                format!("{header}\n"),
+            )
+            .unwrap();
+            if extension_ran {
+                // What the extension's settle records before it judges the conversation; recorded
+                // directly, so no capture worker starts here.
+                pi_hooks_seen(id);
+            }
+        };
+        started("before", true);
+        // A session of the folder that doesn't read yet, as one whose folder or file can't be
+        // opened for now.
+        let unreadable = sessions.join("2026-11-15T00-00-01-000Z_partial.jsonl");
+        fs::write(&unreadable, "{\"type\":\"sess").unwrap();
+        let mut policy = project(&folder);
+        policy.history = History::None;
+        save(&policy).unwrap();
+        let uploads = |session: &str| capturing("pi", session, &folder).is_some();
+
+        assert!(
+            !uploads("before"),
+            "a policy that never recorded Pi uploaded"
+        );
+        assert!(left_out(&folder, "pi", "before", &folder));
+        // A look that couldn't read every session records nothing, and the policy keeps failing
+        // closed; once the session reads, the look records it with the rest.
+        assert_eq!(look_for_earlier_pi(&folder).unwrap(), 0);
+        assert!(!read(&folder).unwrap().unwrap().earlier_pi);
+        let header = serde_json::json!({"type":"session","version":3,"id":"partial",
+            "timestamp":"2026-11-15T00:00:01.000Z","cwd":folder});
+        fs::write(&unreadable, format!("{header}\n")).unwrap();
+        pi_hooks_seen("partial");
+        // And one whose folder in the project is gone for now.
+        let away = folder.join("away");
+        let header = serde_json::json!({"type":"session","version":3,"id":"away",
+            "timestamp":"2026-11-15T00:00:02.000Z","cwd":away});
+        fs::write(
+            sessions.join("2026-11-15T00-00-02-000Z_away.jsonl"),
+            format!("{header}\n"),
+        )
+        .unwrap();
+        pi_hooks_seen("away");
+        assert_eq!(look_for_earlier_pi(&folder).unwrap(), 3);
+        fs::create_dir_all(&away).unwrap();
+        assert!(
+            capturing("pi", "away", &away).is_none(),
+            "a session whose folder was gone during the look uploaded"
+        );
+        assert!(
+            !uploads("partial"),
+            "a session the first look missed uploaded"
+        );
+        started("after", true);
+        started("unhooked", false);
+        assert!(!uploads("before"), "earlier history uploaded by itself");
+        assert!(uploads("after"));
+        assert!(
+            !uploads("unhooked"),
+            "a conversation whose extension never ran uploaded"
+        );
+        // A settle for earlier history queues nothing.
+        assert!(capture("pi", "before", folder.to_str()).unwrap());
+        assert!(markers(&policy.root).unwrap().is_empty());
+        // The record is a plain file name: an id naming a path records nothing.
+        pi_hooks_seen("../escape");
+        assert!(!pi_capture_allowed("../escape"));
+
+        // A new binding records the same way: a conversation that ran in a subfolder reached
+        // through a link, which Pi keeps under that spelling, gone while the folder is bound, is
+        // earlier history once it is back.
+        #[cfg(unix)]
+        {
+            // Beside the folder, named without `..`: a path through `..` starts with the folder's
+            // own path, and would be the folder's whichever way the bind judged it.
+            let link = work.path().parent().unwrap().join(format!(
+                "{}-link",
+                folder.file_name().unwrap().to_string_lossy()
+            ));
+            std::os::unix::fs::symlink(&folder, &link).unwrap();
+            let linked = link.join("linked");
+            let header = serde_json::json!({"type":"session","version":3,"id":"linked",
+                "timestamp":"2026-11-15T00:00:03.000Z","cwd":linked});
+            let kept = crate::adapter::pi::project_dir(&linked).unwrap();
+            fs::create_dir_all(&kept).unwrap();
+            fs::write(
+                kept.join("2026-11-15T00-00-03-000Z_linked.jsonl"),
+                format!("{header}\n"),
+            )
+            .unwrap();
+            pi_hooks_seen("linked");
+            let mut fresh = project(&folder);
+            fresh.history = History::None;
+            let rows = candidates(&fresh).unwrap();
+            let repository = fresh.repository.clone();
+            record_earlier_at_bind(&mut fresh, &rows, &folder, &repository).unwrap();
+            assert!(fresh.earlier_pi);
+            assert!(fresh.earlier.contains(&key("pi", "linked")));
+            save(&fresh).unwrap();
+            fs::create_dir_all(folder.join("linked")).unwrap();
+            assert!(
+                capturing("pi", "linked", &folder.join("linked")).is_none(),
+                "a session whose folder was gone at the bind uploaded"
+            );
+            fs::remove_file(&link).unwrap();
+        }
     }
 
     /// A computer with OpenCode and neither Claude Code nor Codex can turn a folder on for
@@ -9986,13 +10262,13 @@ mod tests {
         };
         for id in [A, B] {
             assert!(!codex_capture_allowed(&root, id));
-            assert!(codex_unhooked(&policy, &candidate(id)));
+            assert!(unhooked(&policy, &candidate(id)));
             assert!(left_out(&root, "codex", id, &root));
         }
         // A's hooks run; then the person untrusts them, and B runs without.
         codex_hooks_seen(A);
         assert!(codex_capture_allowed(&root, A));
-        assert!(!codex_unhooked(&policy, &candidate(A)));
+        assert!(!unhooked(&policy, &candidate(A)));
         assert!(!left_out(&root, "codex", A, &root));
         assert!(!codex_capture_allowed(&root, B));
         assert!(left_out(&root, "codex", B, &root));
@@ -10002,7 +10278,7 @@ mod tests {
         codex_hooks_seen("../escape");
         assert!(!codex_capture_allowed(&root, "../escape"));
         // Claude Code is not held back by Codex's hooks.
-        assert!(!codex_unhooked(
+        assert!(!unhooked(
             &policy,
             &Candidate {
                 runtime: "claude-code".into(),

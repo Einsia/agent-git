@@ -97,6 +97,58 @@ fn is_session_file_in(sessions: Option<&Path>, moved: Option<&Path>, path: &Path
     (under(sessions, 2) || under(moved, 1)) && header_of(&real).is_some()
 }
 
+/// Every session in Pi's sessions folder and in the folder `PI_CODING_AGENT_SESSION_DIR` names, or
+/// an error when any of them could not be read. Listing skips what it cannot read; a folder's
+/// earlier history must not, since a session left out of it would count as new once it reads
+/// again.
+pub fn every_session_in_full() -> Result<Vec<SessionRef>> {
+    list_in_full(&sessions_dir()?, moved_sessions_dir().as_deref())
+}
+
+/// [`every_session_in_full`] for `sessions` and `moved`. Only a file named as Pi names a session
+/// counts, and one that doesn't then read as a session is an error, not a skip.
+fn list_in_full(sessions: &Path, moved: Option<&Path>) -> Result<Vec<SessionRef>> {
+    let mut found = vec![];
+    for (root, depth) in [(Some(sessions), 2), (moved, 1)] {
+        let Some(root) = root else {
+            continue;
+        };
+        // Only a folder that is known not to be there holds nothing; one that can't be looked at
+        // may hold sessions.
+        if !root
+            .try_exists()
+            .with_context(|| format!("cannot look for Pi's sessions in {}", root.display()))?
+        {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root)
+            .min_depth(depth)
+            .max_depth(depth)
+        {
+            let entry = entry
+                .with_context(|| format!("cannot read Pi's sessions in {}", root.display()))?;
+            let named = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".jsonl"))
+                .and_then(|stem| stem.split_once('_'))
+                .is_some_and(|(stamp, id)| !stamp.is_empty() && valid_id(id));
+            if !named {
+                continue;
+            }
+            let session = is_session_file_in(Some(sessions), moved, entry.path())
+                .then(|| session_of(entry.path()))
+                .transpose()?
+                .flatten()
+                .with_context(|| {
+                    format!("cannot read the Pi session {}", entry.path().display())
+                })?;
+            found.push(session);
+        }
+    }
+    Ok(found)
+}
+
 /// The session header `path` opens with, read from its first line alone.
 fn header_of(path: &Path) -> Option<Value> {
     use std::io::{BufRead as _, Read as _};
@@ -937,6 +989,16 @@ mod tests {
             listed[0].cwd.as_deref(),
             Some(work.to_string_lossy().as_ref())
         );
+        // A complete reading reads the same sessions, finds none where Pi's folder isn't, and
+        // fails where it can't tell whether the folder is there.
+        assert_eq!(list_in_full(&sessions, None).unwrap().len(), 1);
+        assert!(list_in_full(&root.join("absent"), None).unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            let file = root.join("file");
+            std::fs::write(&file, "").unwrap();
+            assert!(list_in_full(&file.join("sessions"), None).is_err());
+        }
         let texts: Vec<_> = Pi
             .parse(&std::fs::read_to_string(&installed.path).unwrap())
             .unwrap()

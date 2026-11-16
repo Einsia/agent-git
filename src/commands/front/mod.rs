@@ -982,7 +982,7 @@ fn short(id: &str) -> &str {
 /// when a turn ends, so its conversations go up later than the others', but they are the folder's
 /// all the same: a list that left them out would hide an OpenCode conversation, uploaded or not,
 /// from the person who has to name it to save it.
-const SAVED: &[&str] = &["claude-code", "codex", "opencode"];
+const SAVED: &[&str] = &["claude-code", "codex", "opencode", "pi"];
 
 /// The conversations that ran in `root` or below it, except in a directory below that is set up
 /// on its own (those are that directory's), and in the git worktrees its policy covers, newest

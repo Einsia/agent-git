@@ -1110,8 +1110,11 @@ pub(crate) fn project_hook_runtimes() -> crate::Result<Vec<&'static str>> {
     if crate::adapter::get("opencode")?.available() {
         runtimes.push("opencode");
     }
+    if crate::adapter::get("pi")?.available() {
+        runtimes.push("pi");
+    }
     if runtimes.is_empty() {
-        let text = "no agent here can save its conversations by itself: install Claude Code or OpenCode, or turn on Codex's hooks feature; `agit project sync` uploads by hand meanwhile";
+        let text = "no agent here can save its conversations by itself: install Claude Code, OpenCode or Pi, or turn on Codex's hooks feature; `agit project sync` uploads by hand meanwhile";
         super::fix::refuse("no_capture_runtime", text, serde_json::json!({}));
         anyhow::bail!("{text}");
     }

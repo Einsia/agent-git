@@ -204,6 +204,14 @@ pub(crate) fn pi_extension_path() -> Option<std::path::PathBuf> {
         .map(|home| home.join("extensions/agit/index.js"))
 }
 
+/// Whether Pi's agent folder holds this agit's extension, the one setup writes for the agit at
+/// `exe`, so Pi tells this agit when a run ends.
+pub(crate) fn pi_extension_current(exe: &str) -> bool {
+    pi_extension_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| text == pi_extension(exe))
+}
+
 /// agit's Pi extension for the agit at `exe`.
 fn pi_extension(exe: &str) -> String {
     include_str!("pi.mjs")
