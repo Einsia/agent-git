@@ -90,9 +90,10 @@ fn turn_on(mut args: OnArgs) -> CmdResult {
         );
         Ok(ui::prompt::confirm(&question, true)? == Some(true))
     })?;
-    // An explicit `agit on` brings a policy that never looked at OpenCode's store forward, once.
+    // An explicit `agit on` records earlier conversations and installs the OpenCode plugin
+    // even when the folder is already on.
     let look = crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None);
-    // And one bound before agit captured Pi, the same way.
+    crate::commands::setup::native::bring_opencode_plugin_up();
     let _ = crate::commands::project::look_for_earlier_pi(&root);
     let code = report(&root, &enabled, stays_off.as_deref())?;
     if !crate::commands::json::is_capturing()

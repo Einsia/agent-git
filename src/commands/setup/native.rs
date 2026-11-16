@@ -183,6 +183,21 @@ fn opencode_at(path: &Path, exe: &str) -> SetupReport {
     result
 }
 
+/// Installs or refreshes agit's plugin only when OpenCode is available. Current plugins are
+/// unchanged; foreign files are preserved and reported by setup instead of being overwritten.
+pub(crate) fn bring_opencode_plugin_up() {
+    if !crate::adapter::get("opencode").is_ok_and(|adapter| adapter.available()) {
+        return;
+    }
+    let Some(path) = opencode_plugin_path() else {
+        return;
+    };
+    let exe = super::exe_str();
+    if opencode_plugin_state(&path, &exe) != OpencodePlugin::Current {
+        let _ = opencode_at(&path, &exe);
+    }
+}
+
 /// Removes agit's OpenCode plugin, and only it: a file there that agit did not write stays.
 pub(crate) fn remove_opencode(path: &Path) -> std::io::Result<bool> {
     match std::fs::read_to_string(path) {

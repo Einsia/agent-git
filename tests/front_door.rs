@@ -1266,8 +1266,10 @@ fn a_renamed_branch_keeps_its_conversation_saving_to_it() {
 /// per folder, that it isn't being saved there. A folder turned off says nothing at a
 /// conversation's start. A folder that uploads by itself says, once OpenCode is installed, that
 /// OpenCode's conversations go up only when its agent commits or the person saves, not at each
-/// turn's end; the overview, `agit status`, `agit doctor` and `agit on` say it only there, never
-/// in a folder that is held, only set up for a repository, or off. A surface that read only the
+/// turn's end, and what makes it tell agit: `agit on`, which installs agit's plugin there unless a
+/// file agit did not write is in its place, or a restart once the plugin is in; the overview,
+/// `agit status`, `agit doctor` and `agit on` say it only there, never in a folder that is held,
+/// only set up for a repository, or off. A surface that read only the
 /// folder's own switch would promise uploads that never happen; an `agit on` that moved only the
 /// checkout's setting would leave the recorded off in force while saying it is back on; one that
 /// repeated itself at every start, or spoke in a folder the person turned off, would be noise.
@@ -1371,6 +1373,13 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
         "{on}"
     );
     assert_eq!(on["held"], serde_json::Value::Null, "{on}");
+    // A folder being on does not prove the plugin is installed; returning early loses capture.
+    let plugin = lab.home.join(".config/opencode/plugin/agit.js");
+    let ours = |plugin: &std::path::Path| {
+        std::fs::read_to_string(plugin)
+            .is_ok_and(|text| text.starts_with("// agentgit-opencode-plugin "))
+    };
+    assert!(ours(&plugin), "{}", plugin.display());
     assert_eq!(value(&dir, &["--json"])["held"], serde_json::Value::Null);
     let said = said_at_start(&dir, "21212121-2121-4212-8212-212121212121");
     assert!(said.contains("is uploaded to me/solo "), "{said}");
@@ -1383,10 +1392,41 @@ fn every_surface_says_what_a_folder_does_with_its_conversations() {
     assert!(
         said.contains("its agent runs `agit commit`")
             && said.contains("`agit save`")
-            && said.contains("not at the end of each turn"),
+            && said.contains("not at the end of each turn")
+            && said.contains("restarting OpenCode loads it"),
         "{overview}"
     );
     assert_eq!(says_opencode(&dir), [true; 3]);
+    // Without agit's plugin, the line names the command that installs it, as the user's to run.
+    std::fs::remove_file(&plugin).unwrap();
+    let said = value(&dir, &["--json"])["opencode_not_captured"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        said.contains("the user installs agit's plugin with `agit on` here"),
+        "{said}"
+    );
+    // A file agit did not write where its plugin goes stays as it is, and `agit on` says so.
+    std::fs::write(&plugin, "// another plugin\n").unwrap();
+    let on = lab.agit(&dir, &["--yes", "on"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&on.stdout),
+        String::from_utf8_lossy(&on.stderr)
+    );
+    assert!(on.status.success(), "{said}");
+    assert!(
+        said.contains("is a file agit did not write, so it was left as it is"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&plugin).unwrap(),
+        "// another plugin\n"
+    );
+    std::fs::remove_file(&plugin).unwrap();
+    lab.agit(&dir, &["--yes", "on"]);
+    assert!(ours(&plugin));
     opencode(false);
     assert_eq!(says_opencode(&dir), [false; 3]);
     opencode(true);
