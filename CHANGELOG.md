@@ -15,7 +15,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - Gemini CLI conversations are saved, uploaded and resumed like Claude Code and Codex ones: hooks in
   `~/.gemini/settings.json` save each turn, and a published conversation carries the person's own words and each reply
   once.
-- Pi conversations are saved, uploaded and resumed, on another computer too.
+- Pi conversations brought in with `agit import --from pi <id> --into <owner>/<repo>@<branch> --independent` save each
+  later turn, upload it where the repository uploads by itself, and resume on another computer too. A new Pi
+  conversation in a folder turned on with `agit on` isn't saved by itself yet.
 - The Hub's page of a conversation can show an image an agent's reply names: agit reads it from this computer only if
   it is an image file inside the conversation's folder, and only for people who may read the conversation.
 - The Hub can collect a conversation's publication receipts from this computer without a page open, on a connection
