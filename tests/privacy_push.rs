@@ -14389,3 +14389,239 @@ fn a_push_names_each_session_it_published_with_its_page() {
     // The file line that went up before is not published again, so it isn't named.
     assert!(!text.contains("file changes on main"), "{text}");
 }
+
+/// The folder's first answer counts the saved turns the Hub hasn't received, from local evidence:
+/// every saved turn before anything was published; after a hand push and one more turn, one, from
+/// the accepted publication record, though a push fetches no tracking ref; with a tracking ref,
+/// one, from the Hub head's mapped source. The row and the answer agree that the Hub holds an older
+/// copy. A count taken from the tracking ref alone calls every turn missing after the hand push.
+#[test]
+fn the_folder_answer_counts_the_turns_the_hub_has_not_received() {
+    use sha2::{Digest, Sha256};
+    const NATIVE: &str = "eeeeeeee-0000-4000-8000-000000000503";
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("agit");
+    startup_cache::seed(&home);
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [35; 32]);
+    save_at(
+        &home
+            .join("credentials")
+            .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+        &HubCredential {
+            account_id: Some("account-1".into()),
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.base.clone()),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let work = temp.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let work = work.canonicalize().unwrap();
+    let run = |args: &[&str]| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env(
+                "AGIT_SECRETS_KEYSTORE",
+                if cfg!(unix) { "file" } else { "os" },
+            )
+            .stdin(Stdio::null())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Source Writer"]).unwrap();
+    repo.git(&["config", "user.email", "source@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&["--yes", "push", "alice/app@main"]));
+
+    // The folder is bound to alice/app and its conversation records into alice/app@talk.
+    let bindings = home.join("workspaces");
+    fs::create_dir_all(&bindings).unwrap();
+    let id = &hex::encode(Sha256::digest(work.to_string_lossy().as_bytes()))[..16];
+    fs::write(
+        bindings.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({"dir": work, "repo": "alice/app"})).unwrap(),
+    )
+    .unwrap();
+    let store = agit::domain::store::Store::at(home.join("store"));
+    let mut claim = agit::domain::link::Link::new("claude-code", NATIVE, Some(&work));
+    claim.owner = Some("alice".into());
+    claim.agent = Some("app".into());
+    claim.branch = Some("talk".into());
+    agit::domain::link::write(&store, &claim).unwrap();
+
+    let session_id = format!("agit-{}", "5".repeat(40));
+    let mut records = String::new();
+    let mut settle = |turn: u32| {
+        records.push_str(&format!(
+            "{}\n{}\n",
+            json!({"type":"user","sessionId":NATIVE,"cwd":work,"uuid":format!("u{turn}"),
+                "parentUuid":null,"message":{"role":"user","content":format!("Step {turn}.")}}),
+            json!({"type":"assistant","sessionId":NATIVE,"cwd":work,"uuid":format!("a{turn}"),
+                "parentUuid":format!("u{turn}"),
+                "message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}})
+        ));
+        let log = transcript::wrap_lines(&records, "claude-code", &session_id);
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        let mut session = meta::Meta::new(
+            session_id.clone(),
+            "claude-code".into(),
+            work.to_string_lossy().into_owned(),
+        );
+        session.turn = Some(turn);
+        meta::write(repo.root(), &session).unwrap();
+        repo.add_all().unwrap();
+        repo.commit(&format!("Turn {turn}")).unwrap();
+    };
+    let folder = |expected_upload: &str, expected_turns: u32, line: &str| {
+        let out = run(&["--json", "status"]);
+        assert_success(&out);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let answer = &document["result"]["value"]["folder"]["conversations"][0];
+        assert_eq!(answer["target"], "alice/app@talk", "{document:#}");
+        assert_eq!(answer["upload"], expected_upload, "{document:#}");
+        assert_eq!(answer["unreceived_turns"], expected_turns, "{document:#}");
+        let row = document["result"]["value"]["sessions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == NATIVE)
+            .cloned()
+            .unwrap_or_else(|| panic!("{document:#}"));
+        assert_eq!(row["upload"], answer["upload"], "{row:#}");
+        let text = run(&["status"]);
+        assert_success(&text);
+        let text = String::from_utf8_lossy(&text.stdout).into_owned();
+        assert!(text.contains(line), "{line}\n---\n{text}");
+    };
+
+    repo.git(&["checkout", "--quiet", "-B", "talk", "main"])
+        .unwrap();
+    settle(1);
+    settle(2);
+    folder(
+        "not_uploaded",
+        2,
+        "alice/app@talk: 2 saved turns not yet uploaded; the Hub has no copy of it yet",
+    );
+
+    // A hand push fetches no tracking ref; the accepted record says what the Hub took.
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    assert!(
+        repo.git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/remotes/origin/talk"
+        ])
+        .is_err()
+    );
+    folder(
+        "uploaded",
+        0,
+        "This folder's conversation is uploaded to alice/app.",
+    );
+    settle(3);
+    folder(
+        "waiting",
+        1,
+        "alice/app@talk: 1 saved turn not yet uploaded; the Hub has an older copy of it",
+    );
+
+    // With a tracking ref, its mapped source counts too.
+    assert_success(&run(&["--yes", "push", "alice/app@talk"]));
+    git(
+        repo.root(),
+        &[
+            "fetch",
+            "--quiet",
+            remote.to_str().unwrap(),
+            "+refs/heads/talk:refs/remotes/origin/talk",
+        ],
+    );
+    settle(4);
+    folder(
+        "waiting",
+        1,
+        "alice/app@talk: 1 saved turn not yet uploaded; the Hub has an older copy of it",
+    );
+
+    // Unknowns stay unknown. The branch now holds another session, so what the record accepted of
+    // its name, and the Hub head its tracking ref names, are on no history of this one: no older
+    // copy is claimed, and nothing is counted, with the tracking ref or without it.
+    let mut other = meta::Meta::new(
+        format!("agit-{}", "6".repeat(40)),
+        "claude-code".into(),
+        work.to_string_lossy().into_owned(),
+    );
+    other.turn = Some(1);
+    meta::write(repo.root(), &other).unwrap();
+    repo.add_all().unwrap();
+    let tree = git(repo.root(), &["write-tree"]);
+    let orphan = git(
+        repo.root(),
+        &["commit-tree", &tree, "-m", "another session"],
+    );
+    git(repo.root(), &["update-ref", "refs/heads/talk", &orphan]);
+    let unknown = |line: &str| {
+        let out = run(&["--json", "status"]);
+        assert_success(&out);
+        let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let answer = &document["result"]["value"]["folder"]["conversations"][0];
+        assert!(answer["unreceived_turns"].is_null(), "{document:#}");
+        // The session row reads the same evidence as the answer.
+        let row = document["result"]["value"]["sessions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == NATIVE)
+            .cloned()
+            .unwrap_or_else(|| panic!("{document:#}"));
+        assert_eq!(row["upload"], answer["upload"], "{row:#}");
+        let text = String::from_utf8_lossy(&run(&["status"]).stdout).into_owned();
+        assert!(text.contains(line), "{line}\n---\n{text}");
+        answer["upload"].clone()
+    };
+    assert!(
+        unknown("alice/app@talk: whether the Hub has it can't be read here").is_null(),
+        "a tracking ref of another session's history is unknown, not waiting"
+    );
+    repo.git(&["update-ref", "-d", "refs/remotes/origin/talk"])
+        .unwrap();
+    assert!(
+        unknown("alice/app@talk: whether the Hub has it can't be read here").is_null(),
+        "an unproven older copy is unknown, not waiting"
+    );
+    // Without its Hub identity pin the checkout's record can't be read, and that proves nothing
+    // about what was published: no count.
+    repo.git(&["config", "--unset", "agit.remoteIdentity"])
+        .unwrap();
+    unknown("alice/app@talk:");
+}

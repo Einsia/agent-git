@@ -24,6 +24,8 @@ pub(super) struct FolderConversation {
     pub target: String,
     /// The rows' upload cell: `uploaded`, `waiting`, `not uploaded`, or `—` when it can't be read.
     pub upload: String,
+    /// How many saved turns the Hub hasn't received; `None` when local evidence can't tell.
+    pub unreceived_turns: Option<u32>,
     /// Why it isn't uploaded, and the command that shows or does the rest.
     pub why: Option<String>,
     pub next: Option<String>,
@@ -55,14 +57,14 @@ pub(super) fn answer(
     let cells = if complete {
         sessions::upload_cells(&claims)
     } else {
-        vec!["—".to_owned(); claims.len()]
+        vec![("—".to_owned(), None); claims.len()]
     };
     let waits = crate::domain::privacy::pending::upload::load();
     let reader = crate::commands::project::Reader::of_this_process();
     let conversations = claims
         .iter()
         .zip(cells)
-        .map(|(claim, upload)| {
+        .map(|(claim, (upload, unreceived_turns))| {
             let target = format!(
                 "{repository}@{}",
                 claim.branch.as_deref().unwrap_or_default()
@@ -105,6 +107,7 @@ pub(super) fn answer(
             FolderConversation {
                 target,
                 upload,
+                unreceived_turns,
                 why,
                 next,
             }
@@ -155,8 +158,13 @@ impl FolderAnswer {
                 self.repository
             );
             for conversation in missing.iter().take(NAMED) {
+                let counted = match conversation.unreceived_turns {
+                    Some(1) => "1 saved turn not yet uploaded; ".to_owned(),
+                    Some(turns) if turns > 1 => format!("{turns} saved turns not yet uploaded; "),
+                    _ => String::new(),
+                };
                 println!(
-                    "  {}: {}",
+                    "  {}: {counted}{}",
                     conversation.target,
                     conversation.why.as_deref().unwrap_or("not uploaded")
                 );
@@ -186,6 +194,7 @@ impl FolderAnswer {
                 "upload": sessions::upload_json(&conversation.upload),
                 "uploaded": sessions::upload_json(&conversation.upload)
                     .map(|upload| upload == "uploaded"),
+                "unreceived_turns": conversation.unreceived_turns,
                 "why": conversation.why,
                 "next": conversation.next,
             })).collect::<Vec<_>>(),

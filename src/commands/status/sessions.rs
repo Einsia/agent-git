@@ -116,29 +116,42 @@ struct Uploads {
     projections: Option<crate::domain::privacy_git::Projections>,
 }
 
-/// The upload cell of each claim, as the rows show it ([`upload`]), under one deadline: the
-/// folder's first answer reads the same cell, so the two never disagree.
-pub(super) fn upload_cells(claims: &[&link::Link]) -> Vec<String> {
+/// The upload cell of each claim, as the rows show it ([`upload`]), with how many of its saved
+/// turns the Hub hasn't received ([`accepted_base`]), under one deadline: the folder's first
+/// answer reads the same cell, so the two never disagree.
+pub(super) fn upload_cells(claims: &[&link::Link]) -> Vec<(String, Option<u32>)> {
     let deadline = Deadline::new();
     let mut repos = std::collections::BTreeMap::new();
     claims
         .iter()
-        .map(|claim| upload(&mut repos, claim, deadline))
+        .map(|claim| upload_and_count(&mut repos, claim, deadline, true))
         .collect()
 }
 
 /// Whether the Hub has the claim's branch, for every row of a page: the eight-row bound is on
 /// transcript inspection, and a saved conversation past it is still uploaded or not. It answers
-/// as `agit project list` does, from the branch's two refs and the accepted publication record,
-/// and reads no commit.
+/// from the branch's two refs and the accepted publication record, and, for a head the Hub
+/// doesn't hold, from the same walk of its history the folder's answer reads, so a row and that
+/// answer never disagree.
 fn upload(
     repos: &mut std::collections::BTreeMap<String, Option<Uploads>>,
     claim: &link::Link,
     deadline: Deadline,
 ) -> String {
+    upload_and_count(repos, claim, deadline, false).0
+}
+
+/// [`upload`], and with `count` the number of saved turns the Hub hasn't received.
+fn upload_and_count(
+    repos: &mut std::collections::BTreeMap<String, Option<Uploads>>,
+    claim: &link::Link,
+    deadline: Deadline,
+    count: bool,
+) -> (String, Option<u32>) {
+    let unknown = || ("—".to_owned(), None);
     let (Some(owner), Some(name), Some(branch)) = (&claim.owner, &claim.agent, &claim.branch)
     else {
-        return "—".into();
+        return unknown();
     };
     let Some(uploads) = repos
         .entry(format!("{owner}/{name}"))
@@ -151,10 +164,10 @@ fn upload(
         })
         .as_mut()
     else {
-        return "—".into();
+        return unknown();
     };
     let Some((Some(head), remote)) = upload_heads(&uploads.repo, branch, deadline) else {
-        return "—".into();
+        return unknown();
     };
     let standing = crate::commands::project::hub_standing(
         Some(head.as_str()),
@@ -172,12 +185,123 @@ fn upload(
             }
         },
     );
-    if standing == "not_uploaded" {
-        "not uploaded"
-    } else {
-        standing
+    // A hand push fetches nothing, so the Hub's copy shows only in the accepted record. An older
+    // copy is said only when the record shows one of this session on the branch's current
+    // history; a record of the branch's name that shows neither leaves the answer unknown. A
+    // tracking ref names the Hub's head of the branch's name, and with the record read, the same
+    // walk decides whether that head is an older copy of this session.
+    let looked = (standing != "uploaded")
+        .then(|| accepted_base(uploads, branch, &head, remote.as_deref(), deadline));
+    let cell = match (standing, &looked) {
+        ("not_uploaded", Some(Accepted::Found { .. })) if remote.is_none() => "waiting",
+        ("not_uploaded", Some(Accepted::Unproven)) if remote.is_none() => "—",
+        ("not_uploaded", _) => "not uploaded",
+        ("waiting", Some(Accepted::Unproven)) => "—",
+        (standing, _) => standing,
+    };
+    let unreceived = match (cell, looked) {
+        ("uploaded", _) => Some(0),
+        (_, _) if !count => None,
+        (_, Some(Accepted::Nothing)) => turn_at(&uploads.repo, &head, deadline).map(|(t, _)| t),
+        (
+            _,
+            Some(Accepted::Found {
+                head_turn,
+                base_turn,
+            }),
+        ) => Some(head_turn - base_turn),
+        _ => None,
+    };
+    (cell.into(), unreceived)
+}
+
+/// What the accepted publication record shows of a branch's history, for its upload cell and
+/// the count of saved turns the Hub hasn't received.
+enum Accepted {
+    /// The record couldn't be read, or this checkout has no Hub identity pin to read it by.
+    Unread,
+    /// The record was read: the Hub accepted nothing of the branch, and no tracking ref names a
+    /// Hub head.
+    Nothing,
+    /// The newest accepted commit on the head's first-parent line, of the head's own session.
+    Found { head_turn: u32, base_turn: u32 },
+    /// Something of the branch's name was accepted, but nothing shows it on this history and this
+    /// session: another session's, rewritten, past the walk, or a turn that can't be read.
+    Unproven,
+}
+
+/// [`Accepted`] for `branch` at `head`: the newest commit on the head's first-parent line (walked
+/// within a bound) that the record accepted, or the Hub head's mapped source names. Publication
+/// order is never read from hashes. A missing tracking ref alone proves nothing: a hand push
+/// fetches none.
+fn accepted_base(
+    uploads: &mut Uploads,
+    branch: &str,
+    head: &str,
+    remote: Option<&str>,
+    deadline: Deadline,
+) -> Accepted {
+    const WALK: usize = 4_096;
+    let projections = uploads.projections.get_or_insert_with(|| {
+        crate::domain::privacy_git::Projections::open_within(&uploads.repo, deadline)
+    });
+    let Some(mut accepted) = projections.accepted_sources(branch) else {
+        return Accepted::Unread;
+    };
+    if let Some(public) = remote {
+        accepted.insert(
+            projections
+                .source(branch, public)
+                .unwrap_or_else(|| public.to_owned()),
+        );
     }
-    .into()
+    if accepted.is_empty() {
+        return Accepted::Nothing;
+    }
+    let base = uploads
+        .repo
+        .inspection_output_with_deadline(
+            &[
+                "rev-list",
+                "--first-parent",
+                &format!("--max-count={WALK}"),
+                head,
+            ],
+            WALK * 41 + 1,
+            deadline,
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|walk| {
+            std::str::from_utf8(&walk.stdout)
+                .ok()?
+                .lines()
+                .find(|commit| accepted.contains(*commit))
+                .map(str::to_owned)
+        });
+    let found = base.and_then(|base| {
+        let (head_turn, session) = turn_at(&uploads.repo, head, deadline)?;
+        let (base_turn, base_session) = turn_at(&uploads.repo, &base, deadline)?;
+        (base_session == session && base_turn <= head_turn).then_some(Accepted::Found {
+            head_turn,
+            base_turn,
+        })
+    });
+    found.unwrap_or(Accepted::Unproven)
+}
+
+/// The turn ordinal and session the commit's metadata records, within the deadline.
+fn turn_at(repo: &Repo, commit: &str, deadline: Deadline) -> Option<(u32, String)> {
+    let output = repo
+        .inspection_output_with_deadline(
+            &["show", &format!("{commit}:{}", meta::FILE)],
+            1 << 20,
+            deadline,
+        )
+        .ok()
+        .filter(|output| output.status.success())?;
+    let meta = meta::parse_strict(std::str::from_utf8(&output.stdout).ok()?, commit).ok()?;
+    Some((meta.turn?, meta.session))
 }
 
 /// The local and Hub heads of `branch` as its refs name them, within the page's deadline and

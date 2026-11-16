@@ -329,28 +329,47 @@ pub fn ever_published(repo: &Repo, commit: &str) -> Result<bool> {
 
 /// A checkout's accepted publication record, read once to answer for each of its branches. Read
 /// per branch instead, a repository with many published sessions costs a Hub identity lookup and a
-/// record read for every one of them.
-pub struct Projections(Option<accepted::Ledger>);
+/// record read for every one of them. The second field says whether the record was read. A
+/// checkout without its Hub identity pin has no record to read, and that says nothing about what
+/// was published: the pin is optional, so it counts as unread, as a record that can't be read does.
+pub struct Projections(Option<accepted::Ledger>, bool);
 
 impl Projections {
     pub fn open(repo: &Repo) -> Self {
-        Self(
-            crate::hub::identity::read(repo)
-                .ok()
-                .flatten()
-                .and_then(|identity| accepted::Ledger::open(repo, &identity).ok()),
-        )
+        match crate::hub::identity::read(repo) {
+            Ok(Some(identity)) => match accepted::Ledger::open(repo, &identity) {
+                Ok(ledger) => Self(Some(ledger), true),
+                Err(_) => Self(None, false),
+            },
+            Ok(None) | Err(_) => Self(None, false),
+        }
     }
 
     /// [`Projections::open`], with every Git read within `deadline`: `agit status` reads the
     /// record this way and must not wait on Git. Empty once the deadline has passed.
     #[cfg(feature = "cli")]
     pub(crate) fn open_within(repo: &Repo, deadline: crate::infra::local_git::Deadline) -> Self {
-        Self(
-            crate::hub::identity::read_within(repo, deadline)
-                .ok()
-                .flatten()
-                .and_then(|identity| accepted::Ledger::open_within(repo, &identity, deadline).ok()),
+        match crate::hub::identity::read_within(repo, deadline) {
+            Ok(Some(identity)) => match accepted::Ledger::open_within(repo, &identity, deadline) {
+                Ok(ledger) => Self(Some(ledger), true),
+                Err(_) => Self(None, false),
+            },
+            Ok(None) | Err(_) => Self(None, false),
+        }
+    }
+
+    /// The local commits of `branch` the Hub accepted publications of, in no order; `None` when
+    /// the record couldn't be read.
+    #[cfg(feature = "cli")]
+    pub(crate) fn accepted_sources(&self, branch: &str) -> Option<BTreeSet<String>> {
+        if !self.1 {
+            return None;
+        }
+        Some(
+            self.0
+                .as_ref()
+                .map(|ledger| ledger.accepted_sources(&[branch.to_owned()]))
+                .unwrap_or_default(),
         )
     }
 
@@ -1516,7 +1535,8 @@ mod projection_tests {
                 .is_some()
         );
         let passed = Deadline::at(std::time::Instant::now());
-        assert!(Projections::open_within(&inspection, passed).0.is_none());
+        let late = Projections::open_within(&inspection, passed);
+        assert!(late.0.is_none() && !late.1);
         assert!(accepted::Ledger::open_within(&inspection, &identity, passed).is_err());
     }
 }
