@@ -6419,6 +6419,25 @@ fn opencode_plugin_runs(folder: &Path) -> bool {
     }) && opencode_plugin_ran_in(&policy_root(folder))
 }
 
+/// How `folder` treats a new Pi conversation while its policy, bound without earlier history,
+/// has not recorded which Pi conversations came before it: every unsaved Pi conversation counts
+/// as earlier and stays out ([`pi_earlier`]) until a complete reading records them,
+/// which `agit on` and `agit save` try. `None` unless Pi is installed here, [`saving`] says
+/// [`Saving::Uploads`], and the policy is still unmarked. Every surface asks this one function.
+pub(crate) fn pi_earlier_unread(folder: &Path) -> Option<&'static str> {
+    let unmarked = governing(folder)
+        .ok()
+        .flatten()
+        .is_some_and(|(project, _)| project.history == History::None && !project.earlier_pi);
+    (unmarked
+        && crate::adapter::get("pi").is_ok_and(|adapter| adapter.available())
+        && saving(folder) == Saving::Uploads)
+        .then_some(PI_EARLIER_UNREAD)
+}
+
+/// The sentence every surface uses for [`pi_earlier_unread`].
+pub(crate) const PI_EARLIER_UNREAD: &str = "New Pi conversations here upload by themselves only once agit has read all of Pi's sessions on this computer, so it can tell the earlier ones apart; run `agit on` again";
+
 /// The sentence every surface uses for [`opencode_not_captured`].
 pub(crate) const OPENCODE_NOT_CAPTURED: &str = "OpenCode doesn't tell agit when a turn ends, so its conversations here go up when its agent runs `agit commit` or you run `agit save`, not at the end of each turn";
 
@@ -7830,7 +7849,9 @@ mod tests {
     /// that marked the policy from a reading that skipped a session would upload that session as
     /// new once it, or its folder, reads again. A gate that let
     /// Pi through without its extension, or that read Pi's earlier history from a record that never
-    /// held it, would upload a conversation the person kept out.
+    /// held it, would upload a conversation the person kept out. The waiting notice follows the
+    /// policy into ordinary subdirectories and clears when the scan completes; reading only a
+    /// directory's own policy would hide the reason its new conversations stay out.
     #[test]
     fn a_pi_conversation_uploads_by_itself_only_once_its_extension_ran_for_a_new_conversation() {
         if !isolated(
@@ -7865,6 +7886,35 @@ mod tests {
         policy.history = History::None;
         save(&policy).unwrap();
         let uploads = |session: &str| capturing("pi", session, &folder).is_some();
+        let bin = work.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let pi = bin.join(if cfg!(windows) { "pi.cmd" } else { "pi" });
+        fs::write(&pi, "").unwrap();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        // SAFETY: `isolated` runs this test alone in its own process.
+        unsafe {
+            std::env::set_var("PATH", path);
+            std::env::set_var("AGIT_HUB_URL", &policy.identity.hub);
+        }
+        credentials::save(
+            &policy.identity.hub,
+            &credentials::HubCredential {
+                account_id: None,
+                username: policy.account.clone(),
+                email: None,
+                hub: Some(policy.identity.hub.clone()),
+                access_token: "test-token".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_token: "test-refresh".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let nested = folder.join("nested");
+        fs::create_dir(&nested).unwrap();
 
         assert!(
             !uploads("before"),
@@ -7875,6 +7925,12 @@ mod tests {
         // closed; once the session reads, the look records it with the rest.
         assert_eq!(look_for_earlier_pi(&folder).unwrap(), 0);
         assert!(!read(&folder).unwrap().unwrap().earlier_pi);
+        assert_eq!(pi_earlier_unread(&folder), Some(PI_EARLIER_UNREAD));
+        assert_eq!(
+            pi_earlier_unread(&nested),
+            Some(PI_EARLIER_UNREAD),
+            "a subdirectory explains the covering policy's incomplete Pi scan"
+        );
         let header = serde_json::json!({"type":"session","version":3,"id":"partial",
             "timestamp":"2026-11-15T00:00:01.000Z","cwd":folder});
         fs::write(&unreadable, format!("{header}\n")).unwrap();
@@ -7890,6 +7946,7 @@ mod tests {
         .unwrap();
         pi_hooks_seen("away");
         assert_eq!(look_for_earlier_pi(&folder).unwrap(), 3);
+        assert_eq!(pi_earlier_unread(&nested), None);
         fs::create_dir_all(&away).unwrap();
         assert!(
             capturing("pi", "away", &away).is_none(),
