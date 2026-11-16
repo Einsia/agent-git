@@ -730,7 +730,7 @@ impl AnyDriver {
             if spec.attach_only {
                 return Err(proc::LaunchError::not_spawned(AttachOnlyNotRunning.into()));
             }
-            if crate::rc::claude_inbox::session_is_live(session) {
+            if crate::rc::claude_inbox::session_may_have_writer(session) {
                 return Err(proc::LaunchError::not_spawned(anyhow::anyhow!(
                     "native Claude control is still attaching"
                 )));

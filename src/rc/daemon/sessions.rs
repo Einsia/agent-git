@@ -74,7 +74,7 @@ fn active_writer_error(
     #[cfg(not(unix))]
     let _ = (cwd, caller);
     if native_writer_active(runtime, session) == Some(true) {
-        // An exact native writer holds the conversation until someone closes it there.
+        // A native writer or an uncertain known registration prevents another writer.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut error = classified(busy_error(), false, "native_writer_active");
         // The owner could share a terminal Claude session; say why this one cannot be.

@@ -4,6 +4,189 @@ use crate::protocol::PermissionMode;
 
 const THREAD: &str = "11111111-2222-4333-8444-555555555555";
 
+/// A listing can still remember a writer after it exits. Restart admission must recheck that
+/// process, while a real competing writer must still prevent the replacement from launching.
+#[cfg(unix)]
+#[test]
+fn bypass_restart_rechecks_a_reaped_writer_and_refuses_a_live_competitor() {
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::mode_restart::bypass_restart_rechecks_a_reaped_writer_and_refuses_a_live_competitor",
+    ) {
+        return;
+    }
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    use std::process::{Child, Stdio};
+
+    struct Writer(Child);
+    impl Writer {
+        fn start() -> Self {
+            Self(
+                std::process::Command::new("/bin/cat")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn reap(&mut self) {
+            self.0.stdin.take();
+            assert!(self.0.wait().unwrap().success());
+        }
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    // The isolated test process owns this runtime home before creating any worker thread.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude")) };
+    crate::rc::with_agit_home(home.path(), || {
+        with_claude_bypass_offered(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cwd = home.path().canonicalize().unwrap();
+                    let transcripts = crate::adapter::claude_code::projects_dir()
+                        .unwrap()
+                        .join(crate::domain::store::slug_for(&cwd));
+                    std::fs::create_dir_all(&transcripts).unwrap();
+                    let transcript = transcripts.join(format!("{THREAD}.jsonl"));
+                    std::fs::write(
+                        &transcript,
+                        serde_json::json!({"type":"user","sessionId":THREAD,
+                "cwd":cwd,"permissionMode":"default","message":{"role":"user","content":"fixture"}})
+                        .to_string()
+                            + "\n",
+                    )
+                    .unwrap();
+                    let stub = home.path().join("claude-stub");
+                    std::fs::write(&stub, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+                    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    let _program =
+                        crate::rc::harness::proc::override_harness_program(stub.to_string_lossy());
+                    let registry = crate::adapter::claude_code::sessions_dir().unwrap();
+                    let socket = home.path().join("writer.sock");
+                    let _listener = UnixListener::bind(&socket).unwrap();
+                    let mut previous = Writer::start();
+                    previous.reap();
+                    crate::rc::writer_release::record("claude-code", THREAD, &transcript).unwrap();
+                    let mut old = Writer::start();
+                    crate::rc::claude_inbox::fixture::register(
+                        &registry,
+                        old.0.id(),
+                        THREAD,
+                        &socket,
+                        None,
+                    );
+                    let (daemon, _commands) = claude_daemon(SessionStatus::Idle, true);
+                    let (frames, _frames_rx) = mpsc::channel(64);
+                    {
+                        let mut state = daemon.lock().await;
+                        state.sessions.clear();
+                        state.mirror.bind("ws-a", "project", &cwd).unwrap();
+                        state.roster.sessions.get_mut("session-a").unwrap().cwd =
+                            cwd.to_string_lossy().into_owned();
+                        state.session_frames = Some(frames);
+                    }
+                    async fn restart(
+                        daemon: &Arc<Mutex<Daemon>>,
+                    ) -> Result<serde_json::Value, RpcError> {
+                        let (_person, stopped) = tokio::sync::watch::channel(false);
+                        let (_stop, mut daemon_stop) = tokio::sync::watch::channel(false);
+                        super::super::mode_restart::restart_in_mode(
+                            daemon.clone(),
+                            "session-a",
+                            1,
+                            PermissionMode::Bypass,
+                            SessionResume {
+                                workspace_id: "ws-a".into(),
+                                session_id: "session-a".into(),
+                                project_id: None,
+                                prompt: None,
+                                by: None,
+                                agent: None,
+                                expected_agent_id: None,
+                                branch: None,
+                                attach_only: false,
+                                permission_mode: Some(PermissionMode::Bypass),
+                            },
+                            claim("owner", "ws-a"),
+                            Default::default(),
+                            stopped,
+                            &mut daemon_stop,
+                        )
+                        .await
+                    }
+                    async fn refused(daemon: &Arc<Mutex<Daemon>>) {
+                        let error = restart(daemon).await.unwrap_err();
+                        assert_eq!(error.code, ErrorCode::RuntimeUnavailable as i32);
+                        assert_eq!(error.data.unwrap()["reason"], "terminal_took_over");
+                        assert!(daemon.lock().await.sessions.is_empty());
+                    }
+
+                    assert!(crate::rc::claude_inbox::session_is_live(THREAD));
+                    let registration = registry.join(format!("{}.json", old.0.id()));
+                    let registered = std::fs::read(&registration).unwrap();
+                    std::fs::remove_file(&registration).unwrap();
+                    // Losing a registration is not evidence that its process stopped.
+                    refused(&daemon).await;
+                    old.reap();
+                    crate::rc::writer_release::record("claude-code", THREAD, &transcript).unwrap();
+                    std::fs::write(&registration, "{").unwrap();
+                    // A matching release cannot dismiss an unreadable known registration.
+                    refused(&daemon).await;
+                    std::fs::write(&registration, registered).unwrap();
+                    {
+                        use std::io::Write;
+                        std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&transcript)
+                            .unwrap()
+                            .write_all(b"{}\n")
+                            .unwrap();
+                    }
+                    // A subsequent write invalidates the release even after the known pid exits.
+                    refused(&daemon).await;
+                    crate::rc::writer_release::record("claude-code", THREAD, &transcript).unwrap();
+                    std::fs::remove_file(&registration).unwrap();
+                    std::fs::write(registry.join("2147483646.json"), "{").unwrap();
+                    assert!(
+                        crate::rc::claude_inbox::session_is_live(THREAD),
+                        "the listing still holds its snapshot"
+                    );
+                    assert_eq!(restart(&daemon).await.unwrap()["mode"], "bypass");
+                    let running = daemon.lock().await.sessions.remove("session-a").unwrap();
+                    running.tx.send(Command::Shutdown).await.unwrap();
+                    running.task.await.unwrap();
+
+                    // An ambiguous discovery still means writers exist, even if neither can be joined.
+                    let mut competitor = Writer::start();
+                    let mut second = Writer::start();
+                    for pid in [competitor.0.id(), second.0.id()] {
+                        crate::rc::claude_inbox::fixture::register(
+                            &registry, pid, THREAD, &socket, None,
+                        );
+                    }
+                    assert!(crate::rc::claude_inbox::discover(THREAD).is_none());
+                    assert!(crate::rc::writer_release::unchanged(
+                        "claude-code",
+                        THREAD,
+                        &std::fs::metadata(&transcript).unwrap(),
+                    ));
+                    refused(&daemon).await;
+                    competitor.reap();
+                    second.reap();
+                })
+        })
+    });
+}
+
 /// `session-a`, a Claude Code conversation in Default with its native id recorded, so a mode
 /// change for it is prepared at once.
 fn claude_daemon(
