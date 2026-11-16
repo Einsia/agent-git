@@ -116,3 +116,7 @@ requires the matching `AGIT_MERGE_TX=owner/repo@branch` and `AGIT_MERGE_GENERATI
 that operation, plus its durable completion evidence. Missing or conflicting identity refuses;
 the command never chooses the first or newest historical journal. Manual and file-line merges
 without Archive authority keep their ordinary transaction behavior.
+
+## Acting as the merge agent
+
+- With `AGIT_MERGE_TX=<owner/repo@target>`, act as the merge agent (`agit merge --status` names the source when the opening message withholds it): inspect `agit view <source> --json`, drill into events with `agit show`, select with `merge pick/drop`, edit shared `memory/`, `skills/`, and `AGENTS.md`, write `agit merge summary -m "..."`, then `agit merge --continue`. Use `--abort` when irreconcilable.

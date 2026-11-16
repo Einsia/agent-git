@@ -3671,21 +3671,26 @@ mod tests {
 
     /// The entrypoint has to keep `import` and `new` apart for an agent that is *not* yet
     /// managed: a skill that only describes `new` sends it off to create an empty session
-    /// instead of adopting the transcript it is already running in. Pins the discovery
-    /// command, the adoption command, and the sentence that says `new` cannot take over.
+    /// instead of adopting the transcript it is already running in. The entrypoint sends a
+    /// running conversation to `import` and its reference, and says `new` cannot take over; the
+    /// import reference pins the discovery command, the adoption command and the lineage choice.
     #[test]
     fn skill_distinguishes_importing_current_session_from_starting_a_new_one() {
         let skill = include_str!("setup_skill.md");
-        assert!(skill.contains("agit status --check-missing"));
+        let new_cannot = "`agit new` cannot take over the session that is already running";
+        assert!(skill.contains("adopt it with `agit import` (`import.md`)"));
+        assert!(skill.contains(new_cannot));
+        let import = include_str!("subskills/import.md");
+        assert!(import.contains("agit status --check-missing"));
         assert!(
-            skill.contains(
+            import.contains(
                 "agit import <session-id> --from <runtime> --repo <owner/repo> -b <branch>"
             )
         );
-        assert!(skill.contains("`agit import` links that existing transcript"));
-        assert!(skill.contains("--propose-lineage"));
-        assert!(skill.contains("pipes, JSON, CI and agent calls return choices without adopting"));
-        assert!(skill.contains("`agit new` cannot take over the session that is already running"));
+        assert!(import.contains("`agit import` links that existing transcript"));
+        assert!(import.contains("--propose-lineage"));
+        assert!(import.contains("pipes, JSON, CI and agent calls return choices without adopting"));
+        assert!(import.contains(new_cannot));
     }
 
     /// A save turns a folder that was never on on, and the user's ruling (ledger 121, choice A)

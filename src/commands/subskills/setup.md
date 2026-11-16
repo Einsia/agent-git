@@ -79,3 +79,37 @@ before replacing it. The home manual is a Cursor entrypoint: a runtime-filtered
 refresh preserves it until the Cursor bundle is verified. Incomplete markers and
 fenced examples are left alone.
 Run `agit setup --skill --installed-only` to repair an existing installation.
+
+## Skill installation layout
+
+`agit setup --skill` installs the same progressive-disclosure bundle for every
+supported runtime. Each target is a real Skill directory containing one
+entrypoint and a reference for every top-level command:
+
+```text
+<runtime skill root>/agit/
+├── SKILL.md
+├── VERSION
+└── references/commands/<command>.md
+```
+
+The global target directories are:
+
+| Runtime | Directory |
+|---|---|
+| Claude Code | `~/.claude/skills/agit/` |
+| Codex | `$CODEX_HOME/skills/agit/` (default `~/.codex/skills/agit/`) |
+| OpenCode | `~/.config/opencode/skills/agit/` |
+| Cursor | `~/.cursor/skills/agit/` |
+
+The runtime should load `SKILL.md` first and read only the reference needed for
+the current command or scenario. `--skill` no longer expands the full manual in
+`AGENTS.md`; use the separate `agit setup --agents-md` option when a project
+needs the short, marked session-integration block. Re-running setup replaces
+only AgentGit-owned Skill files, removes stale `references/commands/*.md`, and
+does not overwrite user content. It also removes a version-marked legacy inline
+Skill block from older releases while preserving surrounding `AGENTS.md` text.
+
+The English command references are embedded at build time from
+`src/commands/subskills/*.md`; read the installed reference when exact
+arguments, scenarios, or examples are needed.

@@ -45,3 +45,12 @@ Tool failures set MCP `isError: true`; a failed search batch still carries its
 successful entries. Non-search tools use the unified CLI JSON envelope, except
 `view`, which returns the structured VIEW itself for compatibility. Child CLI
 processes cannot read MCP stdin or open terminal pickers.
+
+## Questions between agents
+
+**Questions between agents.** With the AgentGit Hub's MCP tools, other members' agents can
+ask yours questions. They wait in `agent_inbox` until each one's `expires_at`; answer one with
+`agent_reply`. The answer to a question you asked with `agent_ask` arrives in that question's
+thread: keep the `id` `agent_ask` returns and read it with `agent_thread`. When the person
+mentions a teammate's question, or an answer you are waiting for, look there without being told
+the tool names.

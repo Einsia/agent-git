@@ -56,3 +56,7 @@ agit memory sync --into szh/p1@refund-fix
   for a missing allowlist entry. Eligible changes still need to pass content privacy checks.
 - `memory.track = off` (`agit config`) turns collection off for this machine, on every path including `sync`.
 - A session not started through agit has no baseline: `commit` only records one; `memory sync` collects every top-level file.
+
+## How memory flows
+
+- Memory flows by itself between the runtime's memory directory and the session branch (materialized at `new`/`resume`, collected at every `agit commit`). `main` only moves when you distill: at a milestone run `agit memory status`, then `agit distill` (or `agit memory distill <file>…`) to carry the facts worth sharing into `main`; `commit --milestone` and `push` remind you when files are pending.
