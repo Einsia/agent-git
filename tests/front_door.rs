@@ -1627,11 +1627,12 @@ fn without_a_terminal_no_output_hands_an_agent_save_all_for_earlier_sessions() {
 
 /// A push or a commit that names no target, run in a folder one saved conversation ran in, names
 /// that conversation with the exact command and still does nothing by itself. With a second saved
-/// conversation there, neither is named: naming one would be a guess.
+/// conversation there, both are listed and neither is offered as the one: choosing would be a guess.
 #[test]
 fn a_command_without_a_target_names_the_folders_one_saved_conversation() {
     let lab = Lab::new();
     let dir = lab.folder("parley", false);
+    lab.bind(&dir, "me/parley");
     let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
     repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
     agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
@@ -1668,11 +1669,154 @@ fn a_command_without_a_target_names_the_folders_one_saved_conversation() {
 
     saved("18181818-1818-4181-8181-181818181818", "other");
     let push = said(&["push", "me/parley"]);
+    let both = "2 conversations were saved from this folder; name the one you mean: me/parley@other, me/parley@talk";
     assert!(
-        push.contains("no explicit publish branch") && !push.contains("saved from this folder"),
+        push.contains("no explicit publish branch")
+            && push.contains(both)
+            && !push.contains("the conversation saved from this folder"),
         "{push}"
     );
-    assert!(!said(&["commit"]).contains("saved from this folder"));
+    let commit = said(&["commit"]);
+    assert!(
+        commit.contains(both) && !commit.contains("the conversation saved from this folder"),
+        "{commit}"
+    );
+}
+
+/// A push, a commit or the MCP commit tool that names no target, run in a folder, names the
+/// folder's saved conversations and chooses none (#278, #445): with none it names none, with one it
+/// gives the exact command, and with several it says how many and lists each one's target. Each
+/// still refuses, and nothing is saved or published.
+#[test]
+fn a_refusal_without_a_target_names_the_folders_saved_conversations_and_picks_none() {
+    let lab = Lab::new();
+    let dir = lab.folder("parley", false);
+    lab.bind(&dir, "me/parley");
+    let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
+    repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+    agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();
+    repo.add_all().unwrap();
+    repo.commit("synthetic shared history").unwrap();
+    repo.git(&["branch", "talk"]).unwrap();
+    repo.git(&["branch", "other"]).unwrap();
+    let store = agit::domain::store::Store::at(lab.agit_home.join("store"));
+    let saved = |id: &str, agent: &str, branch: &str| {
+        let mut link = agit::domain::link::Link::new("claude-code", id, Some(&dir));
+        link.owner = Some("me".into());
+        link.agent = Some(agent.into());
+        link.branch = Some(branch.into());
+        agit::domain::link::write(&store, &link).unwrap();
+    };
+    let tips = || repo.git(&["for-each-ref", "refs/heads"]).unwrap();
+    let mcp_commit = || {
+        let mut server = lab
+            .command(&dir, &["mcp"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut input = server.stdin.take().unwrap();
+            for request in [
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"front-door-test","version":"1"}}}),
+                serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"commit","arguments":{"milestone":"m"}}}),
+            ] {
+                writeln!(input, "{request}").unwrap();
+            }
+        }
+        let output = server.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reply = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|reply| reply["id"] == 2)
+            .unwrap_or_else(|| panic!("{output:?}"));
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let refused = |args: &[&str]| {
+        let out = lab.agit(&dir, args);
+        assert_ne!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let several = "2 conversations were saved from this folder; name the one you mean: me/parley@other, me/parley@talk";
+    // A conversation saved from this folder to another repository (the folder was bound there
+    // before) is counted, never named: the refusal is tool output a plain publication keeps.
+    let beside = "3 conversations were saved from this folder; name the one you mean: me/parley@other, me/parley@talk; 1 more was saved to other repositories (`agit project list` in a terminal names it)";
+    // Before any conversation is saved, then with one, with two, and with one elsewhere too.
+    type Case<'a> = (Option<(&'a str, &'a str, &'a str)>, [Option<String>; 4]);
+    let cases: [Case; 4] = [
+        (None, [None, None, None, None]),
+        (
+            Some(("17171717-1717-4171-8171-171717171717", "parley", "talk")),
+            [
+                Some("the conversation saved from this folder: agit push me/parley -b talk".into()),
+                Some("the conversation saved from this folder: agit push me/parley -b talk".into()),
+                Some("the conversation saved from this folder: `agit commit me/parley@talk`".into()),
+                Some("The one conversation saved from this folder is me/parley@talk; if it is this conversation, call commit again with target \"me/parley@talk\"".into()),
+            ],
+        ),
+        (
+            Some(("18181818-1818-4181-8181-181818181818", "parley", "other")),
+            [
+                Some(several.into()),
+                Some(several.into()),
+                Some(several.into()),
+                Some(format!("{several}; call commit again with the one that is this conversation as `target`")),
+            ],
+        ),
+        (
+            Some(("19191919-1919-4191-8191-191919191919", "secret-repo", "private-title")),
+            [
+                Some(beside.into()),
+                Some(several.into()),
+                Some(beside.into()),
+                Some(format!("{beside}; call commit again with the one that is this conversation as `target`")),
+            ],
+        ),
+    ];
+    for (save, expected) in cases {
+        if let Some((id, agent, branch)) = save {
+            saved(id, agent, branch);
+        }
+        let before = tips();
+        let said = [
+            refused(&["push"]),
+            refused(&["push", "me/parley"]),
+            refused(&["commit"]),
+            mcp_commit(),
+        ];
+        for (said, expected) in said.iter().zip(&expected) {
+            match expected {
+                Some(expected) => assert!(said.contains(expected.as_str()), "{expected}: {said}"),
+                None => assert!(!said.contains("saved from this folder"), "{said}"),
+            }
+            assert!(
+                !said.contains("secret-repo") && !said.contains("private-title"),
+                "{said}"
+            );
+        }
+        assert_eq!(tips(), before, "{save:?}");
+    }
+
+    // A folder bound to no repository names none of them, and only counts.
+    std::fs::remove_dir_all(lab.agit_home.join("workspaces")).unwrap();
+    let unbound =
+        "3 conversations were saved from this folder; `agit project list` in a terminal names them";
+    for said in [refused(&["push"]), refused(&["commit"]), mcp_commit()] {
+        assert!(said.contains(unbound), "{unbound}: {said}");
+        assert!(
+            !said.contains("me/parley@") && !said.contains("secret-repo"),
+            "{said}"
+        );
+    }
+    assert!(lab.created().is_empty());
 }
 
 /// A second saved conversation that cannot be read may be the folder's other candidate, so a push
@@ -1682,6 +1826,7 @@ fn a_command_without_a_target_names_the_folders_one_saved_conversation() {
 fn a_folder_with_an_unreadable_saved_conversation_names_no_one() {
     let lab = Lab::new();
     let dir = lab.folder("parley", false);
+    lab.bind(&dir, "me/parley");
     let repo = agit::domain::repo::Repo::init(&lab.agit_home.join("repos/me/parley")).unwrap();
     repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
     agit::domain::meta::write(repo.root(), &agit::domain::meta::Meta::new_file_line()).unwrap();

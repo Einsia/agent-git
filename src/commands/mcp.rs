@@ -327,6 +327,8 @@ fn explicit_commit_target(args: &serde_json::Value) -> Result<Option<String>, St
 /// caller never asked about, and no later call can undo it. So a runtime identity never selects
 /// the target here: without a target or `AGIT_SESSION` nothing runs, and the error names the
 /// saved target of the conversation the environment names for the caller to confirm and pass.
+/// When the environment names none with a target, it names the one conversation saved from the
+/// server's folder instead, as `agit commit` does, for the caller to confirm in the same way.
 fn commit_target(args: &serde_json::Value) -> Result<Option<String>, String> {
     if let Some(target) = explicit_commit_target(args)? {
         return Ok(Some(target));
@@ -335,21 +337,44 @@ fn commit_target(args: &serde_json::Value) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let sessions = super::context::runtime_sessions();
+    let folder = || {
+        let saved = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| super::status::folder_saved(&cwd))?;
+        if let Some((slug, branch)) = saved.one() {
+            return Some(format!(
+                ". The one conversation saved from this folder is {slug}@{branch}; if it is this conversation, call commit again with target \"{slug}@{branch}\""
+            ));
+        }
+        let choice = saved.choice()?;
+        Some(if saved.here.is_empty() {
+            format!(". {choice}")
+        } else {
+            format!(
+                ". {choice}; call commit again with the one that is this conversation as `target`"
+            )
+        })
+    };
     Err(match sessions.as_slice() {
-        [] => "no session target: pass `target` as owner/repo@branch; this server's environment names no runtime session and carries no AGIT_SESSION".into(),
+        [] => format!(
+            "no session target: pass `target` as owner/repo@branch; this server's environment names no runtime session and carries no AGIT_SESSION{}",
+            folder().unwrap_or_default()
+        ),
         [one] => match &one.target {
             Some(target) => format!(
                 "no session target: nothing was settled. This MCP server's environment names {} session {} (via {}), saved to {target}; the environment is fixed when the server starts and can name an earlier conversation. If {} is this conversation's id, call commit again with target \"{target}\"",
                 one.runtime, one.session_id, one.variable, one.session_id
             ),
             None => format!(
-                "no session target: nothing was settled. {}",
-                super::context::runtime_session_note(&sessions).unwrap_or_default()
+                "no session target: nothing was settled. {}{}",
+                super::context::runtime_session_note(&sessions).unwrap_or_default(),
+                folder().unwrap_or_default()
             ),
         },
         _ => format!(
-            "no session target: nothing was settled. {}; pass `target` as owner/repo@branch",
-            super::context::runtime_session_note(&sessions).unwrap_or_default()
+            "no session target: nothing was settled. {}; pass `target` as owner/repo@branch{}",
+            super::context::runtime_session_note(&sessions).unwrap_or_default(),
+            folder().unwrap_or_default()
         ),
     })
 }

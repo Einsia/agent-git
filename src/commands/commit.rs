@@ -1182,6 +1182,8 @@ fn resolve_target(store: &Store, args: &Args, quiet: bool) -> crate::Result<Opti
             ui::hint(&format!(
                 "the conversation saved from this folder: `agit commit {slug}@{branch}`"
             ));
+        } else if let Some(choice) = super::status::folder_saved_choice(&cwd) {
+            ui::hint(&choice);
         }
         ui::hint("use `agit commit <owner>/<repo>@<branch>`, or an adopted native session id");
     }
