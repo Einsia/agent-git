@@ -188,7 +188,8 @@ pub enum PolicyAction {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
-    /// Add a content replacement for the later projection stage.
+    /// Replace text in encrypted views, privacy exports and shares; plain push does not apply
+    /// this setting. A value that must never be published is a secret: `agit secrets add <label>`.
     Replace {
         pattern: String,
         replacement: String,
@@ -377,8 +378,11 @@ fn run_policy(command: PolicyAction) -> CmdResult {
                 });
                 Ok(())
             },
-            "replacement rule added",
-        ),
+            "replacement rule added for encrypted views, privacy exports and shares; plain push does not apply it",
+        )
+        .inspect(|_| {
+            ui::hint("for a value that must never be published, register it as a secret instead: `agit secrets add <label>`")
+        }),
     }
     .map(|_| ExitCode::Ok)
 }
