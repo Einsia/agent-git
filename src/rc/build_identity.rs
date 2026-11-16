@@ -65,6 +65,9 @@ pub const RPC_FEATURES: &[&str] = &[
     // conversation shows it as theirs. It goes as a message only from a caller who may send this
     // conversation one, and like any message it can be refused when it goes.
     "denial-reason-v1",
+    // Same-target denials compare the tool and complete command with explicit working directory,
+    // or the tool and first file path. Unreliable targets contribute only to the total count.
+    "approval-denial-target-v2",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

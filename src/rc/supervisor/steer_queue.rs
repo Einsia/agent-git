@@ -871,7 +871,7 @@ mod tests {
             "approval".into(),
             PendingApproval {
                 suggested_permission_mode: None,
-                target: ("tool".into(), None),
+                target: None,
                 handed_denial: None,
             },
         );
