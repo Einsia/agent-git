@@ -179,7 +179,9 @@ fn session_pages_preserve_runtime_identity_namespaces_and_supersession() {
         )
         .unwrap();
     }
-    let first = lab.run(&["status", "--json", "--limit", "1"]);
+    // The folder is bound to local/demo and the claims are organization/demo's, so the pages
+    // are read across the computer.
+    let first = lab.run(&["status", "--json", "--all", "--limit", "1"]);
     let first = &first["result"]["value"];
     assert_eq!(first["bound_repo"], "local/demo");
     assert!(first["selection"]["repo"].is_null());
@@ -193,7 +195,7 @@ fn session_pages_preserve_runtime_identity_namespaces_and_supersession() {
         first["sessions"]["items"][0]["session_id"],
         "aaaaaaaa-0000-4000-8000-000000000001"
     );
-    let last = lab.run(&["status", "--json", "--limit", "2", "--offset", "1"]);
+    let last = lab.run(&["status", "--json", "--all", "--limit", "2", "--offset", "1"]);
     let last = &last["result"]["value"]["sessions"];
     assert!(last["next_offset"].is_null());
     assert_eq!(last["items"][0]["runtime"], "codex");

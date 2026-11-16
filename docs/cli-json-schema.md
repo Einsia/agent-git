@@ -158,6 +158,20 @@ Unknown or unavailable comparisons use null counts. A failed inspection uses
 counts repositories outside the shared display budget. Status neither fetches
 missing objects nor treats the primary checkout's HEAD as every branch's sync state.
 
+## Folder scope in status
+
+In a folder bound to a repository this computer has, `agit status --json` without `--repo`
+or `--all` reports that repository only, as the text view does: `scope` is
+`{"kind": "repository", "repository": "<owner/name>", "narrowed_to_folder": true}`, and
+`sessions`, `repositories`, `upload_waits`, `save_waits`, `uploads_not_through`,
+`automatic_upload_off`, `shared_files` and `merge_transactions` cover that repository.
+`left_out` counts what the report leaves out, without naming it: `repositories` (other local
+repositories), `sessions` (claims outside the scope, unsaved ones included), `upload_waits` and
+`save_waits`, and gives the `command` that reports everything, `agit status --all --json`.
+An empty list in a narrowed report says nothing about other repositories; read `left_out`.
+`--repo` and `--all` report as before (`narrowed_to_folder: false`, `left_out: null`), and so
+does a folder that is not bound.
+
 ## Session order in status
 
 `sessions.items` lists the sessions that ran in the current folder first, marked
