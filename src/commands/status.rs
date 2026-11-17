@@ -312,6 +312,37 @@ pub fn run(args: Args) -> CmdResult {
     }
     print_upload_waits(&scope);
     print_save_waits(&scope);
+    match save_request_status(&cwd, &scope) {
+        Ok(report) => {
+            if report.omitted > 0 {
+                println!(
+                    "  {} save requests have a different or unknown destination and are not listed.",
+                    report.omitted
+                );
+            }
+            for row in report.items {
+                let message = match row["status"].as_str() {
+                    Some("pending") => "accepted locally; waiting for the folder's uploader",
+                    Some("retrying") => "upload did not finish; waiting to retry",
+                    Some("cancelled") => {
+                        "cancelled because its authorization changed; save again to request it"
+                    }
+                    Some("failed") => "could not finish; save again to retry",
+                    Some("refused") => "could not continue its saved branch",
+                    Some("elsewhere") => "left to the folder or repository that owns it",
+                    Some("superseded") => "a newer publication replaced this request",
+                    _ => continue,
+                };
+                println!(
+                    "  {} {}: {message}",
+                    row["runtime"].as_str().unwrap_or("conversation"),
+                    crate::domain::link::short(row["session_id"].as_str().unwrap_or_default())
+                );
+            }
+        }
+        Err(_) => ui::warning("accepted save requests could not be read"),
+    }
+
     print_uploads_not_through(&not_through);
     print_automatic_upload_off(&upload_off);
     print_held_branches(&scope);
@@ -832,6 +863,19 @@ fn resolve_scope(repo: Option<&str>) -> Result<Scope, ExitCode> {
     Ok(Scope::Repository(slug))
 }
 
+fn save_request_status(
+    cwd: &std::path::Path,
+    scope: &Scope,
+) -> anyhow::Result<super::project::SaveRequestStatus> {
+    super::project::save_request_status(
+        cwd,
+        match scope {
+            Scope::Machine => None,
+            Scope::Repository(repository) => Some(repository),
+        },
+    )
+}
+
 /// The local checkouts `scope` covers.
 fn in_scope_of(
     agents: Vec<(String, String, std::path::PathBuf)>,
@@ -1194,6 +1238,10 @@ fn structured(args: &Args, scope: &Scope, narrowed: bool) -> CmdResult {
         })),
         "upload_waits": upload_waits_json(scope),
         "save_waits": save_waits_json(scope),
+        "save_requests": match save_request_status(&cwd, scope) {
+            Ok(report) => serde_json::json!({"items": report.items, "omitted": report.omitted, "error": null}),
+            Err(_) => serde_json::json!({"items": null, "omitted": null, "error": "accepted save requests could not be read"}),
+        },
         "uploads_not_through": not_through_json(&not_through),
         "automatic_upload_off": upload_off,
         // The folder's first answer (#498): whether its conversations are uploaded.

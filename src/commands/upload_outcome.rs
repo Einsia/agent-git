@@ -125,6 +125,10 @@ struct Paths {
     writing: PathBuf,
     /// The attempt the turn-end line last told.
     told: PathBuf,
+    /// An intentionally cancelled attempt must not be recovered as an interrupted claim.
+    cancelled: PathBuf,
+    /// A recovered orphan can be claimed before any real upload supplies a retryable reason.
+    claimed: PathBuf,
 }
 
 impl Paths {
@@ -133,9 +137,30 @@ impl Paths {
             running: record.with_extension("lock"),
             writing: record.with_extension("write"),
             told: record.with_extension("told"),
+            cancelled: record.with_extension("cancelled"),
+            claimed: record.with_extension("claimed"),
             record,
         }
     }
+}
+
+fn marked(path: &Path, attempt: &str) -> crate::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(saved) => Ok(saved == attempt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_record(path: &Path) -> crate::Result<()> {
+    config::state_file_options()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().context("upload record has no directory")?)?.sync_all()?;
+    Ok(())
 }
 
 fn paths(repository: &str, branch: &str) -> crate::Result<Paths> {
@@ -791,7 +816,7 @@ pub(crate) fn retries(repository: &str, branches: &[String]) -> Vec<Due> {
                     retry,
                     retry_after: Some(at),
                     ..
-                } => Some(Due {
+                } if !marked(&place.paths.cancelled, &attempt).unwrap_or(true) => Some(Due {
                     branch: branch.clone(),
                     tip,
                     retry: retry + 1,
@@ -804,46 +829,209 @@ pub(crate) fn retries(repository: &str, branches: &[String]) -> Vec<Due> {
         .collect()
 }
 
+pub(crate) fn publication_tip(repository: &str, branch: &str) -> crate::Result<Option<String>> {
+    let path = paths(repository, branch)?.record;
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice::<Outcome>(&bytes)?.tip().to_owned(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) enum RequestPublication {
+    Uploaded,
+    RetryAt(i64),
+    Failed,
+    Superseded,
+    Cancelled,
+}
+
+/// Reconciles a durably bound save with its upload. A lost worker may leave a start or a
+/// claimed retry without a due time; only that request's still-authorized recovery repairs it.
+/// Permanent refusals and exhausted retries remain terminal.
+pub(crate) fn request_publication(
+    repository: &str,
+    branch: &str,
+    tip: &str,
+    recover: bool,
+    previous_tip: Option<&str>,
+) -> crate::Result<RequestPublication> {
+    let place = Place::of(repository, branch)?;
+    let directory = place
+        .paths
+        .record
+        .parent()
+        .context("upload result has no directory")?;
+    if !directory.try_exists()? {
+        if !recover {
+            return Ok(RequestPublication::Failed);
+        }
+        config::create_state_dir(directory)?;
+    }
+    under_write_lock(
+        &place.paths.writing,
+        || -> crate::Result<RequestPublication> {
+            let outcome = match std::fs::read(&place.paths.record) {
+                Ok(bytes) => Some(serde_json::from_slice::<Outcome>(&bytes)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            // A binding can land before its new attempt replaces the prior tip's record.
+            // Only that recorded predecessor may be replaced during request recovery.
+            let outcome = outcome.filter(|outcome| {
+                !recover || outcome.tip() == tip || Some(outcome.tip()) != previous_tip
+            });
+            let repaired = match outcome {
+                Some(Outcome::Uploaded { tip: seen }) => {
+                    return Ok(if seen == tip {
+                        RequestPublication::Uploaded
+                    } else {
+                        RequestPublication::Superseded
+                    });
+                }
+                Some(Outcome::Failed {
+                    tip: seen,
+                    reason,
+                    attempt,
+                    said,
+                    retry,
+                    retry_after,
+                }) => {
+                    if seen != tip {
+                        return Ok(RequestPublication::Superseded);
+                    }
+                    if marked(&place.paths.cancelled, &attempt)? {
+                        return Ok(RequestPublication::Cancelled);
+                    }
+                    if let Some(at) = retry_after {
+                        config::state_file_options()
+                            .read(true)
+                            .write(true)
+                            .open(&place.paths.record)?
+                            .sync_all()?;
+                        #[cfg(unix)]
+                        std::fs::File::open(directory)?.sync_all()?;
+                        return Ok(RequestPublication::RetryAt(at));
+                    }
+                    if !recover
+                        || (!reason.retried() && !marked(&place.paths.claimed, &attempt)?)
+                        || retry as usize >= RETRY_DELAYS.len()
+                    {
+                        return Ok(RequestPublication::Failed);
+                    }
+                    Outcome::Failed {
+                        tip: seen,
+                        reason,
+                        attempt,
+                        said,
+                        retry,
+                        retry_after: Some(now()),
+                    }
+                }
+                Some(Outcome::Started {
+                    tip: seen,
+                    attempt,
+                    retry,
+                }) => {
+                    if seen != tip {
+                        return Ok(RequestPublication::Superseded);
+                    }
+                    if held(&place.paths.running) {
+                        return Ok(RequestPublication::RetryAt(now() + 1));
+                    }
+                    if !recover {
+                        return Ok(RequestPublication::Failed);
+                    }
+                    Outcome::Failed {
+                        tip: seen,
+                        reason: UploadFailure::Other,
+                        attempt,
+                        said: None,
+                        retry,
+                        retry_after: Some(now()),
+                    }
+                }
+                None => {
+                    if !recover {
+                        return Ok(RequestPublication::Failed);
+                    }
+                    Outcome::Failed {
+                        tip: tip.into(),
+                        reason: UploadFailure::Other,
+                        attempt: uuid::Uuid::new_v4().to_string(),
+                        said: None,
+                        retry: 0,
+                        retry_after: Some(now()),
+                    }
+                }
+            };
+            write(&place.paths.record, &repaired)?;
+            config::state_file_options()
+                .read(true)
+                .write(true)
+                .open(&place.paths.record)?
+                .sync_all()?;
+            #[cfg(unix)]
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok(RequestPublication::RetryAt(now()))
+        },
+    )
+    .context("could not lock upload result")?
+}
+
 impl Due {
-    /// Takes the retry for this worker, or cancels it when `run` is false: either way the record
-    /// then names no next try. Only a record that still holds the failure this was read from is
-    /// changed, so of two workers that read it, one takes it. False when the record changed.
-    fn settle(&self, repository: &str, run: bool) -> bool {
-        let Ok(place) = Place::of(repository, &self.branch) else {
-            return false;
-        };
-        under_write_lock(&place.paths.writing, || match read(&place.paths.record) {
-            Some(Outcome::Failed {
-                tip,
-                reason,
-                attempt,
-                said,
-                retry,
-                retry_after: Some(_),
-            }) if attempt == self.attempt => {
-                let settled = Outcome::Failed {
+    /// Only the failed attempt this worker observed may be claimed or cancelled. Its disposition
+    /// lands durably before the due time is cleared, so interruption preserves that decision.
+    fn settle(&self, repository: &str, run: bool) -> crate::Result<bool> {
+        let place = Place::of(repository, &self.branch)?;
+        under_write_lock(&place.paths.writing, || -> crate::Result<bool> {
+            match read(&place.paths.record) {
+                Some(Outcome::Failed {
                     tip,
                     reason,
                     attempt,
                     said,
                     retry,
-                    retry_after: None,
-                };
-                write(&place.paths.record, &settled).is_ok() && run
+                    retry_after: Some(_),
+                }) if attempt == self.attempt => {
+                    if run && marked(&place.paths.cancelled, &attempt)? {
+                        return Ok(false);
+                    }
+                    let marker = if run {
+                        &place.paths.claimed
+                    } else {
+                        &place.paths.cancelled
+                    };
+                    replace(marker, attempt.as_bytes())?;
+                    sync_record(marker)?;
+                    let settled = Outcome::Failed {
+                        tip,
+                        reason,
+                        attempt,
+                        said,
+                        retry,
+                        retry_after: None,
+                    };
+                    write(&place.paths.record, &settled)?;
+                    sync_record(&place.paths.record)?;
+                    Ok(run)
+                }
+                _ => Ok(false),
             }
-            _ => false,
         })
-        .unwrap_or(false)
+        .context("could not lock upload result")?
     }
 
     /// Takes the retry for this worker; false when another took it or the branch's record changed.
-    pub(crate) fn claim(&self, repository: &str) -> bool {
+    pub(crate) fn claim(&self, repository: &str) -> crate::Result<bool> {
         self.settle(repository, true)
     }
 
     /// Cancels the retry: what it was for no longer holds, so the failure stands as it is.
-    pub(crate) fn cancel(&self, repository: &str) {
-        self.settle(repository, false);
+    pub(crate) fn cancel(&self, repository: &str) -> crate::Result<()> {
+        self.settle(repository, false).map(|_| ())
     }
 }
 
@@ -1216,6 +1404,88 @@ fn left_out(repo: &Repo, repository: &str, branch: &str) -> Option<&'static str>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Active cancellation is terminal even when clearing its due time is interrupted. A new
+    /// attempt at the same tip remains independent of the cancelled attempt's marker, including
+    /// a recovered orphan whose claim is itself interrupted before a real upload starts.
+    #[test]
+    fn cancelled_retries_do_not_recover_as_interrupted_claims() {
+        if crate::rc::in_isolated_test(
+            "commands::upload_outcome::tests::cancelled_retries_do_not_recover_as_interrupted_claims",
+        ) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("AGIT_HOME", temp.path().join("agit"));
+        }
+        let repository = "alice/app";
+        let branch = "work";
+        let tip = "1".repeat(40);
+        let fail = || {
+            recorded(
+                Place::of(repository, branch).map(|place| place.retried(0)),
+                &tip,
+                || (),
+                |_| {
+                    Some(Refusal::child(
+                        Some(crate::ExitCode::Network.as_i32()),
+                        "synthetic network failure".into(),
+                    ))
+                },
+            )
+            .unwrap();
+        };
+        fail();
+        let paths = paths(repository, branch).unwrap();
+        let before = std::fs::read(&paths.record).unwrap();
+        let due = retries(repository, &[branch.into()]).pop().unwrap();
+        due.cancel(repository).unwrap();
+        assert!(!due.claim(repository).unwrap());
+        // Restore the due record to model an exit after the durable cancellation write.
+        replace(&paths.record, &before).unwrap();
+        assert!(retries(repository, &[branch.into()]).is_empty());
+        assert!(matches!(
+            request_publication(repository, branch, &tip, true, None).unwrap(),
+            RequestPublication::Cancelled
+        ));
+        fail();
+        let replacement = retries(repository, &[branch.into()]).pop().unwrap();
+        assert!(replacement.claim(repository).unwrap());
+        assert!(matches!(
+            request_publication(repository, branch, &tip, true, None).unwrap(),
+            RequestPublication::RetryAt(_)
+        ));
+
+        std::fs::remove_file(&paths.record).unwrap();
+        assert!(matches!(
+            request_publication(repository, branch, &tip, true, None).unwrap(),
+            RequestPublication::RetryAt(_)
+        ));
+        let orphan = retries(repository, &[branch.into()]).pop().unwrap();
+        assert!(orphan.claim(repository).unwrap());
+        assert!(
+            matches!(
+                request_publication(repository, branch, &tip, true, None).unwrap(),
+                RequestPublication::RetryAt(_)
+            ),
+            "an interrupted recovered attempt must retain its retry"
+        );
+        recorded(
+            Place::of(repository, branch).map(|place| place.retried(0)),
+            &tip,
+            || (),
+            |_| Some(Refusal::unexplained()),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                request_publication(repository, branch, &tip, true, None).unwrap(),
+                RequestPublication::Failed
+            ),
+            "a real nonretryable refusal must not inherit an older claim"
+        );
+    }
 
     fn at(directory: &Path) -> Paths {
         Paths::of(directory.join("record.json"))

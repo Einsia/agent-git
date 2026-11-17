@@ -2647,6 +2647,46 @@ fn status_json_in_a_bound_folder_reports_only_its_repository() {
     elsewhere.agent = Some("other".into());
     elsewhere.branch = Some("bob-branch".into());
     link::write(&lab.store, &elsewhere).unwrap();
+    let hub = format!("http://{}", lab.hub.local_addr().unwrap());
+    agit::infra::credentials::save_at(
+        &lab.root.path().join("agit/credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(&hub).unwrap()
+        )),
+        &agit::infra::credentials::HubCredential {
+            account_id: None,
+            username: "alice".into(),
+            email: None,
+            hub: Some(hub.clone()),
+            access_token: "synthetic-access".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_token: "synthetic-refresh".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    // Parent-folder receipts retain their own destination when a child selects another one.
+    let parent = work.parent().unwrap().canonicalize().unwrap();
+    let requests = lab.root.path().join("agit/projects").join(format!(
+        "{}.save-requests",
+        &hex::encode(Sha256::digest(parent.to_string_lossy().as_bytes()))[..24]
+    ));
+    fs::create_dir_all(&requests).unwrap();
+    fs::write(
+        requests.join("parent.result"),
+        serde_json::to_vec(&json!({
+            "request_id": "parent-request", "runtime": "codex",
+            "session_id": "parent-only-conversation", "status": "cancelled",
+            "branch": "parent-only-branch",
+            "destination": {
+                "repository": "bob/other",
+                "identity": {"hub": hub, "agent_id": "bbbbbbbb-0000-4000-8000-000000000001"},
+                "account": "alice", "account_id": null,
+            },
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let status = |args: &[&str]| -> serde_json::Value {
         let output = lab
             .command(env!("CARGO_BIN_EXE_agit"))
@@ -2685,6 +2725,20 @@ fn status_json_in_a_bound_folder_reports_only_its_repository() {
     assert_eq!(value["left_out"]["repositories"], 1, "{value:#}");
     assert_eq!(value["left_out"]["sessions"], 1, "{value:#}");
     assert_eq!(value["left_out"]["command"], "agit status --all --json");
+    assert_eq!(value["save_requests"]["items"], json!([]));
+    assert_eq!(value["save_requests"]["omitted"], 1);
+    assert!(!text.contains("parent-only") && !text.contains("parent-request"));
+    let explicit = status(&["--json", "status", "--repo", "alice/notes"]);
+    assert_eq!(explicit["result"]["value"]["save_requests"]["omitted"], 1);
+    assert!(!explicit.to_string().contains("parent-only"));
+    let text = success(
+        lab.command(env!("CARGO_BIN_EXE_agit"))
+            .arg("status")
+            .output()
+            .unwrap(),
+    );
+    assert!(!text.contains("parent-only"), "{text}");
+    assert!(text.contains("1 save requests"), "{text}");
 
     let all = status(&["--json", "status", "--all"]);
     let value = &all["result"]["value"];
@@ -2696,4 +2750,9 @@ fn status_json_in_a_bound_folder_reports_only_its_repository() {
         text.contains("bob/other") && text.contains("bob-branch"),
         "{value:#}"
     );
+    assert_eq!(
+        value["save_requests"]["items"][0]["request_id"],
+        "parent-request"
+    );
+    assert_eq!(value["save_requests"]["omitted"], 0);
 }

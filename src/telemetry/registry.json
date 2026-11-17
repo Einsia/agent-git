@@ -103,7 +103,7 @@
     "privacy unlock": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"},"workspace":{"action":"Set","policy":"presence"}}},
     "project": {"aliases":[],"args":{}},
     "project bind": {"aliases":[],"args":{"auto_upload":{"action":"SetTrue","policy":"boolean"},"dry_run":{"action":"SetTrue","policy":"boolean"},"history":{"action":"Set","policy":"enum","values":["all","none"]},"path":{"action":"Set","policy":"presence"},"public_consent":{"action":"Set","policy":"presence"},"rebind":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
-    "project capture": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
+    "project capture": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"},"wait":{"action":"SetTrue","policy":"omitted"}}},
     "project drop": {"aliases":[],"args":{"target":{"action":"Set","policy":"presence"}}},
     "project list": {"aliases":[],"args":{}},
     "project status": {"aliases":[],"args":{"path":{"action":"Set","policy":"presence"}}},
