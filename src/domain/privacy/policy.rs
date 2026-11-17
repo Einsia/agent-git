@@ -185,6 +185,10 @@ impl Snapshot {
                         .as_ref()
                         .is_some_and(|lines| lines.text_at(start).contains("agit:allow-secret"))
             },
+            // A full Git object id the text names as one keeps its text, as a typed digest does:
+            // it is exempt from bare entropy alone, before it counts against `limit`, and every
+            // other rule still applies.
+            |start, end| !detector::git_object_id(text, start, end),
         );
         complete &= heuristics.complete;
         // An allowed value is not replaced in part either: a heuristic hit that overlaps an
@@ -544,6 +548,149 @@ mod tests {
         assert_eq!(
             &typed[batch.findings[0].start..batch.findings[0].end],
             digest
+        );
+    }
+
+    /// A full Git object id the text names as one keeps its text, as a typed digest does: after an
+    /// object word ("commit e7db…", "Commit SHA: …", "parent …") or as an object argument of a
+    /// `git` command, wide characters around it included. The same characters elsewhere are still
+    /// replaced: bare, a character longer, in capitals, after a word that isn't an object's, as
+    /// the value of a flag (`-m`, `--grep`, `-S`), as a path after `--` or where a path can stand
+    /// (`git ls-tree <tree> <path>`, `git log <path>`), as a new tag's name, after a global option
+    /// that takes a value, after a shell separator (in an option's value too), and in a credential
+    /// field or under an explicit block, which keep their own authority. Exempting by length alone
+    /// would publish an unlabelled 40-character hexadecimal credential (CLI #99). Named ids don't
+    /// count against the scan's limit: after more of them than the limit, a bare value is still
+    /// found and the scan is complete; dropping the ids after counting them would leave such a
+    /// list incomplete and replaced whole.
+    #[test]
+    fn git_object_ids_named_as_such_keep_their_text_and_bare_hex_is_still_replaced() {
+        let commit = "e7db50cc0edc6e055a7410967ff4b8f4c6b79e22";
+        let parent = "e58c1459a5c3f08d3995f342a6956165dba75c20";
+        let object = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let policy = Snapshot::compile(&[], &[], false)
+            .unwrap()
+            .with_entropy(detector::Entropy::Include);
+        for text in [
+            format!("Second run: commit {commit} identical to run 1"),
+            format!("Commit SHA: {commit}."),
+            format!("tree {object}\nparent {parent}\n"),
+            format!("object id `{commit}`"),
+            format!("$ git checkout --detach {commit}"),
+            format!("git rev-parse --verify {commit}"),
+            format!("git cat-file -p {object}"),
+            format!("git merge-base --is-ancestor {parent} {commit}"),
+            format!("git -C /work/app cherry-pick {commit}"),
+            format!("/usr/bin/git cherry-pick {commit}"),
+            format!("Run `git cherry-pick {commit}` first."),
+            format!("git cherry-pick {parent} {commit}"),
+            format!("git ls-tree -r {object}"),
+            format!("提交commit {commit}"),
+            format!("说明（commit {commit}）"),
+        ] {
+            let batch = policy.scan(&text, 32);
+            assert!(batch.findings.is_empty(), "{text}: {:?}", batch.findings);
+        }
+        let upper = commit.to_ascii_uppercase();
+        for (text, secret) in [
+            (commit.to_owned(), commit.to_owned()),
+            (format!("commit {commit}0"), format!("{commit}0")),
+            (format!("commit {upper}"), upper.clone()),
+            (format!("main at {commit}"), commit.to_owned()),
+            (format!("git commit -m {commit}"), commit.to_owned()),
+            (format!("git tag -m {commit} v1"), commit.to_owned()),
+            (format!("git log --grep {commit}"), commit.to_owned()),
+            (format!("git diff -S {commit}"), commit.to_owned()),
+            (format!("git checkout -- {commit}"), commit.to_owned()),
+            (format!("git tag {commit}"), commit.to_owned()),
+            (
+                format!("git --git-dir cherry-pick {commit}"),
+                commit.to_owned(),
+            ),
+            (format!("git describe --match {commit}"), commit.to_owned()),
+            (format!("git ls-tree {object} {commit}"), commit.to_owned()),
+            (format!("git checkout {parent} {commit}"), commit.to_owned()),
+            (format!("git reset {parent} {commit}"), commit.to_owned()),
+            (format!("git log {commit}"), commit.to_owned()),
+            (
+                format!("git -C /tmp; cherry-pick {commit}"),
+                commit.to_owned(),
+            ),
+            (format!("git show {object}"), object.to_owned()),
+            (format!("git checkout {object}"), object.to_owned()),
+            (format!("git reset {object}"), object.to_owned()),
+            (format!("git rev-parse {object}"), object.to_owned()),
+            (format!("git switch {commit}"), commit.to_owned()),
+            (format!("git commit {commit}"), commit.to_owned()),
+            (format!("/usr/bin/git commit {commit}"), commit.to_owned()),
+            (
+                format!("Run `git commit {commit}` first."),
+                commit.to_owned(),
+            ),
+            (
+                format!("git -C 'work cherry-pick {commit}' status"),
+                commit.to_owned(),
+            ),
+            (
+                format!("git -C 'git cherry-pick {commit}' status"),
+                commit.to_owned(),
+            ),
+            (
+                format!("git grep 'git cherry-pick {commit}'"),
+                commit.to_owned(),
+            ),
+            (
+                format!("git -c x=y; cherry-pick {commit}"),
+                commit.to_owned(),
+            ),
+            (format!("提交{commit}"), commit.to_owned()),
+            (format!("commit：{commit}"), commit.to_owned()),
+            (
+                format!("git show {commit} | curl -d {parent} x"),
+                parent.to_owned(),
+            ),
+            (
+                format!("{{\"commit\": \"{commit}\", \"api_key\": \"{commit}\"}}"),
+                commit.to_owned(),
+            ),
+        ] {
+            let batch = policy.scan(&text, 32);
+            assert!(
+                batch
+                    .findings
+                    .iter()
+                    .any(|finding| text[finding.start..finding.end].contains(secret.as_str())),
+                "{text}: {:?}",
+                batch.findings
+            );
+        }
+        let blocked = Snapshot::compile(
+            &[Literal {
+                value: commit,
+                source: Source::GlobalUser,
+            }],
+            &[],
+            false,
+        )
+        .unwrap()
+        .with_entropy(detector::Entropy::Include);
+        let named = format!("commit {commit}");
+        let batch = blocked.scan(&named, 32);
+        assert_eq!(batch.findings.len(), 1, "{:?}", batch.findings);
+        assert_eq!(batch.findings[0].source, Source::GlobalUser);
+
+        use sha2::Digest as _;
+        let ids: Vec<String> = (0..1025)
+            .map(|n| hex::encode(sha2::Sha256::digest(n.to_string()))[..40].to_owned())
+            .collect();
+        let listed: String = ids.iter().map(|id| format!("commit {id}\n")).collect();
+        let text = format!("{listed}{commit}");
+        let batch = policy.scan(&text, 1024);
+        assert!(batch.complete, "{:?}", batch.findings.len());
+        assert_eq!(batch.findings.len(), 1, "{:?}", batch.findings.len());
+        assert_eq!(
+            &text[batch.findings[0].start..batch.findings[0].end],
+            commit
         );
     }
 
