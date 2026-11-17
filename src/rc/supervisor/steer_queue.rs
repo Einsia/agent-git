@@ -884,6 +884,7 @@ mod tests {
         session.pending.insert(
             "approval".into(),
             PendingApproval {
+                turn_id: "turn-1".into(),
                 suggested_permission_mode: None,
                 target: None,
                 handed_denial: None,

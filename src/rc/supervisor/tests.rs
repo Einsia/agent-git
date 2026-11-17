@@ -11,6 +11,7 @@ async fn shared_approval_resolution_preserves_other_pending_requests() {
         session.pending.insert(
             id.into(),
             PendingApproval {
+                turn_id: "turn-1".into(),
                 suggested_permission_mode: None,
                 target: None,
                 handed_denial: None,
@@ -1425,6 +1426,7 @@ async fn run_ambiguous_claude_approval(
     session.pending.insert(
         "approval-1".into(),
         PendingApproval {
+            turn_id: "turn-1".into(),
             suggested_permission_mode: suggested_mode,
             target: None,
             handed_denial: None,
@@ -1746,6 +1748,7 @@ async fn a_stale_interrupt_preserves_the_running_turn_and_its_approvals() {
     session.pending.insert(
         "current-approval".into(),
         PendingApproval {
+            turn_id: "turn-1".into(),
             suggested_permission_mode: None,
             target: None,
             handed_denial: None,
@@ -1802,6 +1805,7 @@ async fn a_fenced_interrupt_leaves_a_claude_turn_running() {
     session.pending.insert(
         "current-approval".into(),
         PendingApproval {
+            turn_id: "turn-1".into(),
             suggested_permission_mode: None,
             target: None,
             handed_denial: None,
@@ -2092,6 +2096,7 @@ async fn a_colleagues_denial_note_reaches_claude_code_as_the_owners_does() {
             session.pending.insert(
                 "approval-deny".into(),
                 PendingApproval {
+                    turn_id: "turn-1".into(),
                     suggested_permission_mode: None,
                     target: None,
                     handed_denial: None,
@@ -2309,6 +2314,8 @@ async fn an_approval_reaches_viewers_as_it_is_and_a_colleague_answers_it() {
 /// retry erase a denial handed before it, or one that ignored the path would each mislabel a
 /// request below. Commands without paths compare their full input command and explicit working
 /// directory, so an unrelated command or a truncated display summary cannot identify a repeat.
+/// A new turn can precede the old completion; old receipts and duplicate starts cannot pollute
+/// or erase the new turn's counts.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_approval_request_says_how_often_this_turn_was_denied() {
@@ -2540,6 +2547,114 @@ async fn an_approval_request_says_how_often_this_turn_was_denied() {
         }
     }
 
+    let command_on = |id: &str, turn: &str| {
+        let HarnessEvent::Approval(mut approval) =
+            command_request(id, "Bash", serde_json::json!({"command": "printf ready"}))
+        else {
+            unreachable!()
+        };
+        approval.turn_id = turn.into();
+        HarnessEvent::Approval(approval)
+    };
+    let (mut session, mut out, _) = session_with(&["cross-denied"]);
+    session
+        .on_harness_event(command_on("cross-denied", "before"))
+        .await;
+    assert_eq!(counts(&mut out), (0, 0));
+    let mut session = decide(session, "cross-denied", ApprovalDecision::Deny, true).await;
+    let ledger = std::mem::take(&mut session.denials);
+    let (mut session, mut out, _) = session_with(&["next-denied"]);
+    session
+        .on_harness_event(HarnessEvent::TurnStarted {
+            turn_id: "before".into(),
+            prompt: None,
+        })
+        .await;
+    session.denials = ledger;
+    session
+        .on_harness_event(command_on("late-receipt", "before"))
+        .await;
+    assert_eq!(counts(&mut out), (1, 1));
+    let (took_old, taken_old) = tokio::sync::watch::channel(false);
+    session
+        .pending
+        .get_mut("late-receipt")
+        .unwrap()
+        .note_answer(
+            ApprovalDecision::Deny,
+            &ApprovalOutcome::Handed { taken: taken_old },
+            &mut session.denials,
+        );
+    session
+        .on_harness_event(HarnessEvent::TurnStarted {
+            turn_id: "after".into(),
+            prompt: None,
+        })
+        .await;
+    took_old.send_replace(true);
+    session
+        .on_harness_event(command_on("next-denied", "after"))
+        .await;
+    assert_eq!(
+        counts(&mut out),
+        (0, 0),
+        "neither a recorded nor a late native denial belongs to another turn"
+    );
+    let mut session = decide(session, "next-denied", ApprovalDecision::Deny, true).await;
+    let ledger = std::mem::take(&mut session.denials);
+    let announced = std::mem::take(&mut session.announced_turn_ids);
+    let (mut session, mut out, _) = session_with(&["next-handed"]);
+    session.denials = ledger;
+    session.announced_turn_ids = announced;
+    session
+        .on_harness_event(command_on("next-handed", "after"))
+        .await;
+    assert_eq!(counts(&mut out), (1, 1));
+    let (took_current, taken_current) = tokio::sync::watch::channel(false);
+    session.pending.get_mut("next-handed").unwrap().note_answer(
+        ApprovalDecision::Deny,
+        &ApprovalOutcome::Handed {
+            taken: taken_current,
+        },
+        &mut session.denials,
+    );
+    took_current.send_replace(true);
+    for turn in ["before", "after"] {
+        session
+            .on_harness_event(HarnessEvent::TurnStarted {
+                turn_id: turn.into(),
+                prompt: None,
+            })
+            .await;
+    }
+    session
+        .on_harness_event(HarnessEvent::TurnCompleted {
+            turn_id: "before".into(),
+            outcome: TurnOutcome::Ok,
+            error: None,
+            cost_usd: None,
+            duration_ms: None,
+        })
+        .await;
+    assert!(
+        session.pending.contains_key("next-handed"),
+        "an old completion cannot discard the current turn's native receipt"
+    );
+    assert_eq!(session.info.status, SessionStatus::AwaitingApproval);
+    session
+        .on_harness_event(command_on("next-repeat", "after"))
+        .await;
+    assert_eq!(
+        counts(&mut out),
+        (2, 2),
+        "duplicate starts and an old completion preserve applied and taken native denials"
+    );
+    assert_eq!(
+        session.driver.abandon_pending_approvals(),
+        1,
+        "the old completion preserves the current approval's driver half"
+    );
+
     // A denial handed to a native Claude Code ask counts once its hook has taken it, already at
     // the next request if the ask's close is still on its way, and only once; one withdrawn
     // before its hook took it never counts. A shared request that closed does not say whose
@@ -2553,6 +2668,7 @@ async fn an_approval_request_says_how_often_this_turn_was_denied() {
         ("shared-1", ApprovalOutcome::Resolved),
     ] {
         let mut pending = PendingApproval {
+            turn_id: "turn-3".into(),
             suggested_permission_mode: None,
             target: Some(Target::File {
                 tool: "Edit".into(),
