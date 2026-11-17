@@ -448,6 +448,46 @@ mod tests {
         assert!(span(&opted_in, opaque));
     }
 
+    /// An encrypted share link's key is replaced exactly, wherever the link is written, with the
+    /// entropy setting left off; the address in front of it and an address with no key stay. A
+    /// policy that left the key would publish a link that opens the share; one that took the
+    /// whole link would also take the keyless addresses that name a share to revoke. A longer
+    /// run of base64url characters after `#k=` is no key.
+    #[test]
+    fn a_share_links_key_is_replaced_and_its_address_stays() {
+        let key = "JjGmd6ZAB0ytnDA9d2YRAK3CvCDyN9dPDVLlYolzU8s";
+        let in_json = "Qk3vX9mT2pL7wR4nZ8cY1bH6sD0fJ5gE9aK2uM7tV3x";
+        let address = "https://hub.example.invalid/share/fixture";
+        let keyless = "https://hub.example.invalid/share/fixturb";
+        let longer = "R7kQ2mXv9LpZ4tNc8WjF3bHy6sVd1aGe5uKr2Tq8xYwZq";
+        let text = format!(
+            "read-only copy created\n\n  {address}#k={key}\n\n\
+             {{\"link\":\"{address}#k={in_json}\",\"slug\":\"fixture\"}}\n\
+             fixturb  {keyless}\n\
+             {address}#k={longer}\n"
+        );
+        let batch = Snapshot::compile(&[], &[], false).unwrap().scan(&text, 64);
+        let exact = |value: &str| {
+            let start = text.find(value).unwrap();
+            batch
+                .findings
+                .iter()
+                .any(|hit| (hit.start, hit.end) == (start, start + value.len()))
+        };
+        let touched = |value: &str| {
+            let start = text.find(value).unwrap();
+            batch
+                .findings
+                .iter()
+                .any(|hit| hit.start < start + value.len() && start < hit.end)
+        };
+        assert!(exact(key), "{:?}", batch.findings);
+        assert!(exact(in_json), "{:?}", batch.findings);
+        assert!(!touched(&format!("{address}#k=")));
+        assert!(!touched(keyless));
+        assert!(!touched(longer));
+    }
+
     /// A Basic header is evidence only when its payload decodes to a user/password pair.
     /// Treating the scheme word or arbitrary base64 as enough would hide ordinary text.
     #[test]

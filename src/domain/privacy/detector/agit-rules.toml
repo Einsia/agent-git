@@ -28,6 +28,16 @@ description = "AgentGit sign-up or web sign-in code"
 regex = '''\b(agit_(?:su|wh)_[A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
 keywords = ["agit_su_", "agit_wh_"]
 
+# The key in an encrypted share link's fragment (`#k=`): 32 random bytes in unpadded base64url.
+# Whoever holds the full link reads the share without an account, so the key is a credential
+# wherever it is written. The capture group frames the key: the link's address stays readable,
+# and an address without a key is not a credential.
+[[rules]]
+id = "agit-share-key"
+description = "AgentGit encrypted share link key"
+regex = '''#k=([A-Za-z0-9_-]{43})(?:[^A-Za-z0-9_-]|$)'''
+keywords = ["#k="]
+
 # A bearer credential wherever it is written: a configuration file's headers, a log line, a
 # pasted request. gitleaks recognises one only inside `curl -H`. The capture group frames the
 # credential, so the scheme name stays readable. A sentence's period the value ends with counts
