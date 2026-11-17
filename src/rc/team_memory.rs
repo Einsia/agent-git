@@ -5,9 +5,11 @@
 //! A conversation started from the Hub settles in a device-local repository with no `main` of its
 //! own, so the destination's `main` is read into a private ref of that repository. A start whose
 //! read does not finish in time goes on with the copy read last; with no copy it places nothing.
+//! The conversation is told of what was placed on its command line
+//! ([`crate::rc::harness::LaunchSpec::memory_context`]).
 
 use crate::{commands::memory, domain::repo::Repo, rc::lineage::AgitSession};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -33,53 +35,6 @@ fn index_lock(dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
-/// Branches whose launch is under way, by repository, with how many launches hold each.
-static LAUNCHING: LazyLock<Mutex<BTreeMap<(String, String), usize>>> =
-    LazyLock::new(Default::default);
-
-/// Keeps a launching conversation's index section from being taken out by another start in its
-/// folder, from before its memory is placed until the daemon lists it as running.
-pub(crate) struct Launching {
-    key: (String, String),
-}
-
-impl Launching {
-    pub(crate) fn enter(lineage: &AgitSession) -> Self {
-        let key = (lineage.slug(), lineage.branch().to_owned());
-        *LAUNCHING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(key.clone())
-            .or_default() += 1;
-        Self { key }
-    }
-}
-
-impl Drop for Launching {
-    fn drop(&mut self) {
-        let mut launching = LAUNCHING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = launching.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                launching.remove(&self.key);
-            }
-        }
-    }
-}
-
-/// The branches of `slug` whose launch is under way.
-pub(crate) fn launching(slug: &str) -> BTreeSet<String> {
-    LAUNCHING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .keys()
-        .filter(|(repository, _)| repository == slug)
-        .map(|(_, branch)| branch.clone())
-        .collect()
-}
-
 /// The private ref holding the `main` last read from the Hub repository `agent_id`.
 fn copy_ref(agent_id: &str) -> String {
     format!("refs/agit/memory-source/{agent_id}")
@@ -102,52 +57,56 @@ enum Step {
     Materialize,
     /// A start on a branch not born yet: the destination's `main`, as read into this ref.
     Unborn(String),
-    /// A start with nothing to place, which still takes idle sections out.
+    /// A start with nothing to place, which still takes old sections out.
     Nothing,
 }
 
 /// Places the team memory of `lineage`'s conversation before `runtime` starts in `cwd`, as a
-/// launch does: the Hub is read first, within `within`, and only then is the runtime's index
-/// locked and written, with `running` asked for the branches whose sections stay. A slow Hub
-/// therefore holds up no other placing, and a placing that waits longer than [`INDEX_WAIT`] for
-/// its index goes on without one. Nothing here stops a launch: what cannot be done is logged.
-pub(crate) async fn place_for_launch<F, Fut>(
+/// launch does, and returns what the conversation is to be told of it. The Hub is read first,
+/// within `within`, and only then is the runtime's memory directory locked and written. A slow
+/// Hub therefore holds up no other placing, and a placing that waits longer than [`INDEX_WAIT`]
+/// for the directory goes on without one. Nothing here stops a launch: what cannot be done is
+/// logged, and the conversation is then told nothing.
+pub(crate) async fn place_for_launch(
     lineage: AgitSession,
     runtime: String,
     cwd: PathBuf,
     fresh: bool,
     within: Duration,
-    running: F,
-) where
-    F: FnOnce(String) -> Fut,
-    Fut: std::future::Future<Output = BTreeSet<String>>,
-{
+) -> Option<String> {
     let planned =
         tokio::task::spawn_blocking(move || plan(&lineage, &runtime, &cwd, fresh, within)).await;
     let plan = match planned {
         Ok(Ok(Some(plan))) => plan,
-        Ok(Ok(None)) => return,
+        Ok(Ok(None)) => return None,
         Ok(Err(error)) => {
             eprintln!("agitd: team memory was not placed: {error:#}");
-            return;
+            return None;
         }
         Err(error) => {
             eprintln!("agitd: team memory was not placed: {error}");
-            return;
+            return None;
         }
     };
     let lock = index_lock(&plan.dir);
     let Ok(_index) = tokio::time::timeout(INDEX_WAIT, lock.lock_owned()).await else {
         eprintln!("agitd: team memory was not placed: another start kept the memory index busy");
-        return;
+        return None;
     };
-    let running = running(plan.lineage.slug()).await;
-    if let Ok(Err(error)) = tokio::task::spawn_blocking(move || apply(plan, &running)).await {
-        eprintln!("agitd: team memory was not placed: {error:#}");
+    match tokio::task::spawn_blocking(move || apply(plan)).await {
+        Ok(Ok(told)) => told,
+        Ok(Err(error)) => {
+            eprintln!("agitd: team memory was not placed: {error:#}");
+            None
+        }
+        Err(error) => {
+            eprintln!("agitd: team memory was not placed: {error}");
+            None
+        }
     }
 }
 
-/// [`place_for_launch`] in one go, without the index lock, for a caller that is the only one
+/// [`place_for_launch`] in one go, without the directory lock, for a caller that is the only one
 /// placing.
 #[cfg(test)]
 pub(crate) fn prepare(
@@ -155,14 +114,14 @@ pub(crate) fn prepare(
     runtime: &str,
     cwd: &Path,
     fresh: bool,
-    running: &BTreeSet<String>,
     within: Duration,
-) {
-    let placed = plan(lineage, runtime, cwd, fresh, within)
-        .and_then(|plan| plan.map_or(Ok(()), |plan| apply(plan, running)));
-    if let Err(error) = placed {
+) -> Option<String> {
+    let placed =
+        plan(lineage, runtime, cwd, fresh, within).and_then(|plan| plan.map_or(Ok(None), apply));
+    placed.unwrap_or_else(|error| {
         eprintln!("agitd: team memory was not placed: {error:#}");
-    }
+        None
+    })
 }
 
 /// Works out how `lineage`'s conversation gets its memory, reading the destination's `main` from
@@ -197,35 +156,30 @@ fn plan(
     }))
 }
 
-/// Writes `plan` into the runtime's index. A start takes the sections of the repository's
-/// conversations outside `running` out of it first, and every other repository's
-/// ([`memory::keep_to_repository`]); a conversation that comes back lists its own mirror again.
-fn apply(plan: Plan, running: &BTreeSet<String>) -> crate::Result<()> {
+/// Places `plan` in the runtime's memory directory and returns what the conversation is told of
+/// it. Every start takes the sections earlier versions of agit wrote out of the runtime's index
+/// and parks every other repository's mirror ([`memory::keep_to_repository`]); a conversation
+/// that comes back is told of its own mirror again.
+fn apply(plan: Plan) -> crate::Result<Option<String>> {
     let (slug, branch, dir) = (plan.lineage.slug(), plan.lineage.branch(), &plan.dir);
-    // The daemon holds no lock for the conversations it runs; a mark an earlier terminal launch
-    // left would read this one as gone.
-    memory::unmark(dir, &slug, branch);
-    if let Step::Reindex = plan.step {
-        return memory::reindex(dir, &slug, branch);
-    }
-    let mut keep = running.clone();
-    keep.insert(branch.to_owned());
-    memory::drop_sections(dir, &slug, &keep)?;
-    match plan.step {
+    let repo = || {
+        Repo::open(plan.lineage.repo_dir()?)
+            .ok_or_else(|| anyhow::anyhow!("the conversation's repository is gone"))
+    };
+    Ok(match &plan.step {
+        Step::Reindex => memory::reindex(dir, &slug, branch)?,
         Step::Materialize => {
-            let repo = Repo::open(plan.lineage.repo_dir()?)
-                .ok_or_else(|| anyhow::anyhow!("the conversation's repository is gone"))?;
-            memory::materialize(&repo, branch, &slug, &plan.runtime, &plan.cwd)?;
+            memory::materialize(&repo()?, branch, &slug, &plan.runtime, &plan.cwd)?
+                .and_then(|report| report.context())
         }
         Step::Unborn(source) => {
-            let repo = Repo::open(plan.lineage.repo_dir()?)
-                .ok_or_else(|| anyhow::anyhow!("the conversation's repository is gone"))?;
-            memory::materialize_unborn(&repo, branch, &slug, dir, &source)?;
+            memory::materialize_unborn(&repo()?, branch, &slug, dir, source)?.context()
         }
-        Step::Nothing => memory::keep_to_repository(dir, &slug, &memory::surely_running)?,
-        Step::Reindex => {}
-    }
-    Ok(())
+        Step::Nothing => {
+            memory::keep_to_repository(dir, &slug, &memory::surely_running)?;
+            None
+        }
+    })
 }
 
 /// The tree a new conversation's team memory comes from: `main` of the repository its turns
@@ -533,17 +487,16 @@ mod tests {
                 .dir
         }
 
-        /// Prepares the conversation on `branch` as a launch does: a start when `fresh`.
-        fn launch(&self, branch: &str, fresh: bool, running: &[&str], within: Duration) {
-            let running = running.iter().map(|branch| branch.to_string()).collect();
+        /// Prepares the conversation on `branch` as a launch does, a start when `fresh`, and
+        /// returns what it is told.
+        fn launch(&self, branch: &str, fresh: bool, within: Duration) -> Option<String> {
             prepare(
                 &self.lineage(branch),
                 "claude-code",
                 &self.cwd,
                 fresh,
-                &running,
                 within,
-            );
+            )
         }
 
         /// The team file as the conversation on `branch` was given it.
@@ -560,17 +513,18 @@ mod tests {
                 .join(branch)
         }
 
-        /// The branches whose sections the runtime's index lists.
-        fn sections(&self) -> Vec<String> {
-            let index =
-                std::fs::read_to_string(self.memory().join("MEMORY.md")).unwrap_or_default();
-            let opening = format!("<!-- agit:memory:begin {}@", self.repository.slug);
-            index
-                .lines()
-                .filter_map(|line| line.strip_prefix(opening.as_str()))
-                .filter_map(|rest| rest.strip_suffix(" -->"))
-                .map(str::to_owned)
-                .collect()
+        /// Whether `told` names the copy of the team file the conversation on `branch` was given.
+        fn names(&self, told: &Option<String>, branch: &str) -> bool {
+            let copy = self.mirror(branch).join("decisions.md");
+            told.as_deref()
+                .is_some_and(|told| told.contains(&copy.display().to_string()))
+        }
+
+        /// Whether the runtime's index holds a section of agit's.
+        fn has_sections(&self) -> bool {
+            std::fs::read_to_string(self.memory().join("MEMORY.md"))
+                .unwrap_or_default()
+                .contains("<!-- agit:memory:begin")
         }
     }
 
@@ -593,36 +547,27 @@ mod tests {
         let folder = Folder::new();
         // The process's default Hub is another one: the destination's own Hub is read.
         unsafe { std::env::set_var("AGIT_HUB_URL", "https://elsewhere.example") };
-        folder.launch("desktop-a", true, &[], FETCH_WITHIN);
+        let told = folder.launch("desktop-a", true, FETCH_WITHIN);
         assert_eq!(
             folder.given("desktop-a").as_deref(),
             Some("credits are integer milli-credits\n")
         );
-        assert_eq!(folder.sections(), ["desktop-a"]);
+        assert!(folder.names(&told, "desktop-a"), "{told:?}");
+        assert!(!folder.has_sections());
 
         folder.distill("credits are integer milli-credits\nrefunds go back as credits\n");
         folder.hub.answering.store(false, Ordering::Release);
-        folder.launch(
-            "desktop-b",
-            true,
-            &["desktop-a"],
-            Duration::from_millis(300),
-        );
+        let told = folder.launch("desktop-b", true, Duration::from_millis(300));
         assert_eq!(
             folder.given("desktop-b").as_deref(),
             Some("credits are integer milli-credits\n")
         );
-        assert_eq!(folder.sections(), ["desktop-a", "desktop-b"]);
+        assert!(folder.names(&told, "desktop-b"), "{told:?}");
 
         folder.hub.answering.store(true, Ordering::Release);
         folder.hub.expired.store(true, Ordering::Release);
         let started = Instant::now();
-        folder.launch(
-            "desktop-d",
-            true,
-            &["desktop-a", "desktop-b"],
-            Duration::from_millis(300),
-        );
+        folder.launch("desktop-d", true, Duration::from_millis(300));
         // The renewal keeps a deadline of its own, far past this bound and past this margin.
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -636,54 +581,63 @@ mod tests {
 
         folder.hub.expired.store(false, Ordering::Release);
         folder.repo().turn_uploads_off(true).unwrap();
-        folder.launch("desktop-c", true, &[], FETCH_WITHIN);
+        folder.launch("desktop-c", true, FETCH_WITHIN);
         assert_eq!(
             folder.given("desktop-c").as_deref(),
             Some("credits are integer milli-credits\n")
         );
     }
 
-    /// A start takes out of the runtime's index the sections of the repository's conversations
-    /// that are not running, and keeps a running one's. The mirror of one taken out stays as it
-    /// is, an edit not collected yet included, and when that conversation comes back its section
-    /// lists the mirror again. A section of another repository goes too: a session sees only its
-    /// own repository's team memory.
+    /// Every start takes the sections earlier versions of agit wrote out of the runtime's index,
+    /// another repository's and this one's alike, and writes none: each conversation is told only
+    /// of its own mirror. A mirror stays as it is, an edit not collected yet included, and a
+    /// conversation that comes back is told of it again. A start that kept a section would hand
+    /// that memory to every conversation started in the folder afterwards, whatever its repository.
     #[test]
-    fn a_start_takes_out_idle_conversations_sections_and_keeps_their_edits() {
+    fn every_start_takes_the_sections_out_and_tells_each_conversation_its_own() {
         if crate::rc::in_isolated_test(
-            "rc::team_memory::tests::a_start_takes_out_idle_conversations_sections_and_keeps_their_edits",
+            "rc::team_memory::tests::every_start_takes_the_sections_out_and_tells_each_conversation_its_own",
         ) {
             return;
         }
         let folder = Folder::new();
-        let other = "<!-- agit:memory:begin simco/other@main -->\n- [x](agit/simco/other/main/x.md)\n<!-- agit:memory:end -->\n";
+        let mine = "# Memory Index\n\n- [notes](notes.md) — my own notes\n";
+        let other = format!(
+            "{mine}\n<!-- agit:memory:begin simco/other@main -->\n- [x](agit/simco/other/main/x.md)\n<!-- agit:memory:end -->\n<!-- agit:memory:begin {}@desktop-z -->\n- [y](agit/y.md)\n<!-- agit:memory:end -->\n",
+            folder.repository.slug
+        );
         std::fs::create_dir_all(folder.memory()).unwrap();
         std::fs::write(folder.memory().join("MEMORY.md"), other).unwrap();
-        folder.launch("desktop-a", true, &[], FETCH_WITHIN);
-        folder.launch("desktop-b", true, &["desktop-a"], FETCH_WITHIN);
+        let told = folder.launch("desktop-a", true, FETCH_WITHIN);
+        assert_eq!(
+            std::fs::read_to_string(folder.memory().join("MEMORY.md")).unwrap(),
+            mine
+        );
+        assert!(
+            folder.names(&told, "desktop-a") && !told.as_deref().unwrap().contains("simco/other"),
+            "{told:?}"
+        );
         let edited = "credits are integer milli-credits; never floats\n";
         std::fs::write(folder.mirror("desktop-a").join("decisions.md"), edited).unwrap();
 
-        folder.launch("desktop-c", true, &["desktop-b"], FETCH_WITHIN);
-        assert_eq!(folder.sections(), ["desktop-b", "desktop-c"]);
-        assert_eq!(folder.given("desktop-a").as_deref(), Some(edited));
-        let index = std::fs::read_to_string(folder.memory().join("MEMORY.md")).unwrap();
-        assert!(!index.contains("simco/other@main"), "{index}");
-
-        folder.launch(
-            "desktop-a",
-            false,
-            &["desktop-b", "desktop-c"],
-            FETCH_WITHIN,
+        let told = folder.launch("desktop-c", true, FETCH_WITHIN);
+        assert!(
+            folder.names(&told, "desktop-c") && !folder.names(&told, "desktop-a"),
+            "{told:?}"
         );
-        assert_eq!(folder.sections(), ["desktop-b", "desktop-c", "desktop-a"]);
+        assert!(!folder.has_sections());
+        assert_eq!(folder.given("desktop-a").as_deref(), Some(edited));
+
+        let told = folder.launch("desktop-a", false, FETCH_WITHIN);
+        assert!(folder.names(&told, "desktop-a"), "{told:?}");
+        assert!(!folder.has_sections());
         assert_eq!(folder.given("desktop-a").as_deref(), Some(edited));
     }
 
     /// A start waiting on a Hub that doesn't answer holds up no other placing: the Hub is read
-    /// before the memory index is locked, so a resume in the same folder lists its mirror while
-    /// that start still waits. A placing that held the index across the Hub read, as one lock
-    /// around the whole step does, would keep the resume waiting for the Hub's whole bound.
+    /// before the memory directory is locked, so a resume in the same folder is told of its mirror
+    /// while that start still waits. A placing that held the directory across the Hub read, as one
+    /// lock around the whole step does, would keep the resume waiting for the Hub's whole bound.
     #[tokio::test]
     async fn a_start_waiting_on_the_hub_holds_up_no_other_placing() {
         if crate::rc::in_isolated_test(
@@ -692,10 +646,7 @@ mod tests {
             return;
         }
         let folder = Folder::new();
-        folder.launch("desktop-a", true, &[], FETCH_WITHIN);
-        // Take its section out, so a resume has something to list again.
-        folder.launch("desktop-b", true, &[], FETCH_WITHIN);
-        assert_eq!(folder.sections(), ["desktop-b"]);
+        folder.launch("desktop-a", true, FETCH_WITHIN);
 
         folder.hub.answering.store(false, Ordering::Release);
         let waiting = tokio::spawn(place_for_launch(
@@ -704,7 +655,6 @@ mod tests {
             folder.cwd.clone(),
             true,
             Duration::from_secs(60),
-            |_| async { BTreeSet::new() },
         ));
         let held = folder.hub.held.clone();
         tokio::task::spawn_blocking(move || {
@@ -714,17 +664,16 @@ mod tests {
         .unwrap()
         .expect("the start reaches the Hub");
 
-        place_for_launch(
+        let told = place_for_launch(
             folder.lineage("desktop-a"),
             "claude-code".into(),
             folder.cwd.clone(),
             false,
             FETCH_WITHIN,
-            |_| async { BTreeSet::from(["desktop-b".to_owned()]) },
         )
         .await;
         assert!(!waiting.is_finished(), "the start still waits on the Hub");
-        assert_eq!(folder.sections(), ["desktop-b", "desktop-a"]);
+        assert!(folder.names(&told, "desktop-a"), "{told:?}");
         waiting.abort();
     }
 }

@@ -596,6 +596,13 @@ impl Adapter for ClaudeCode {
         Some("claude".into())
     }
 
+    fn start_command_with(&self, _cwd: &Path, context: &str) -> Option<String> {
+        Some(format!(
+            "claude --append-system-prompt {}",
+            super::shell_arg(context)
+        ))
+    }
+
     fn resume_command(
         &self,
         id: &str,

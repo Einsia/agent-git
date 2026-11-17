@@ -336,7 +336,7 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
 
     // Old writers are settled before freezing the transaction. The new native instance must
     // never pass through ordinary settlement or resume materialization after activation.
-    let archive_launch = if let Some(runtime) = archive_runtime {
+    let mut archive_launch = if let Some(runtime) = archive_runtime {
         match super::resume::archive_launch_context(
             &repo,
             &slug,
@@ -365,7 +365,7 @@ fn start(cwd: &std::path::Path, src_ref: &str, args: &Args) -> CmdResult {
     );
     super::resume::require_merge_claims(&repo, &store, &slug, &target, &target_head, false)?;
 
-    if let Some(launch) = &archive_launch {
+    if let Some(launch) = &mut archive_launch {
         super::resume::require_archive_launch_state(&repo, &target, &target_head, launch)?;
         super::resume::prepare_archive_memory(&repo, &slug, &target, launch);
         let head = repo.git(&["rev-parse", &format!("refs/heads/{target}")])?;

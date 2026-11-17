@@ -687,6 +687,7 @@ impl Daemon {
                 attach_only: p.attach_only,
                 // A shared project resumes held to the repository, as it was started.
                 project_share: entry.project_share,
+                memory_context: None,
             };
             let named_mode = p.permission_mode.is_some();
             let mut spawn = self.prepare_spawn(
@@ -976,6 +977,7 @@ impl Daemon {
             attach_only: p.attach_only,
             // A conversation registered as a shared project stays one when taken over.
             project_share: prior.as_ref().is_some_and(|entry| entry.project_share),
+            memory_context: None,
         };
         let named_mode = p.permission_mode.is_some();
         let mut spawn = self.prepare_spawn(
@@ -1377,6 +1379,7 @@ impl Daemon {
             permission_mode: Some(mode),
             attach_only: false,
             project_share,
+            memory_context: None,
         };
 
         let Some(start_id) = start_id else {

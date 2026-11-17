@@ -707,6 +707,13 @@ pub trait Adapter {
         None
     }
 
+    /// [`Adapter::start_command`] with `context` given to the new conversation as it starts, the
+    /// way the runtime takes extra instructions on its command line. None when it takes none: the
+    /// caller then says what the conversation goes without.
+    fn start_command_with(&self, _cwd: &Path, _context: &str) -> Option<String> {
+        None
+    }
+
     /// Return a shell-safe native command; the caller adds cwd and AgentGit identity.
     fn resume_command(
         &self,

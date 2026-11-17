@@ -356,7 +356,7 @@ pub fn run(args: Args) -> CmdResult {
     // `.agents/skills`.
     materialize_shared(&repo, &from_head, &work_dir);
     let runtime_id = runtime_of(&args);
-    let placed = super::memory::start(&repo, &branch, &slug, &runtime_id, &work_dir);
+    let placed = super::memory::materialize(&repo, &branch, &slug, &runtime_id, &work_dir);
 
     // The start line names the repository and commit the session's memory comes from, and how
     // many of its files the session has as placing came out, none included. Codex keeps no project
@@ -386,10 +386,31 @@ pub fn run(args: Args) -> CmdResult {
         ),
     };
     ui::success(&format!("new session {slug} @ {branch} ({memory})"));
-    match placed {
-        Ok(Some(report)) => super::memory::report_materialize(&report),
-        Ok(None) => {}
-        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
+    let told = match placed {
+        Ok(Some(report)) => {
+            super::memory::report_materialize(&report);
+            report.context()
+        }
+        Ok(None) => None,
+        Err(error) => {
+            ui::warning(&format!("memory was not materialized: {error:#}"));
+            None
+        }
+    };
+    // The conversation is told of its team memory on its own command line: agit writes nothing
+    // into the folder's shared index, which every conversation started there reads.
+    let launch = match &told {
+        Some(context) => match runtime.start_command_with(&work_dir, context) {
+            Some(with) => with,
+            None => {
+                super::memory::say_untold(runtime.id());
+                launch
+            }
+        },
+        None => launch,
+    };
+    if runtime_id == "codex" {
+        super::memory::say_if_codex_untold();
     }
 
     // ── launch ──
@@ -423,7 +444,6 @@ pub fn run(args: Args) -> CmdResult {
     // Asked here, a yes still sets up the hooks this session's runtime is about to load.
     super::setup::presence::when_ready();
     if args.no_launch {
-        super::memory::unhold();
         println!("\n  {}", ui::accent(&cmd));
         println!(
             "{}",
@@ -439,9 +459,7 @@ pub fn run(args: Args) -> CmdResult {
         }
         return Ok(ExitCode::Ok);
     }
-    let status = super::resume::runtime_launch(&cmd).status();
-    super::memory::let_go();
-    let status = status?;
+    let status = super::resume::runtime_launch(&cmd).status()?;
     Ok(match status.code() {
         Some(0) | None => ExitCode::Ok,
         Some(_) => ExitCode::Precondition,

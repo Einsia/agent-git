@@ -7,7 +7,7 @@ description: Memory between the runtime directory, the session branch and main �
 
 ## Purpose
 
-Memory has three homes: the runtime's own memory directory (Claude Code: `~/.claude/projects/<project>/memory/`), the session branch's `memory/`, and `main`'s `memory/`. The first two sync by themselves — `new`/`resume` place the branch's files under `agit/<owner>/<name>/<branch>/` in the runtime directory and index them in `MEMORY.md`; every `agit commit` collects what changed **since that baseline** (new, edited or deleted top-level files, and edits or deletions in the mirror) back onto the branch — memory that was already there and untouched stays local. Only top-level `*.md` files are managed. `main` only moves when you distill; a file inherited from main and deleted on the branch distills as a deletion.
+Memory has three homes: the runtime's own memory directory (Claude Code: `~/.claude/projects/<project>/memory/`), the session branch's `memory/`, and `main`'s `memory/`. The first two sync by themselves — `new`/`resume` place the branch's files under `agit/<owner>/<name>/<branch>/` in the runtime directory, and the conversation is told of them when it starts (agit writes nothing into `MEMORY.md`); every `agit commit` collects what changed **since that baseline** (new, edited or deleted top-level files, and edits or deletions in the mirror) back onto the branch — memory that was already there and untouched stays local. Only top-level `*.md` files are managed. `main` only moves when you distill; a file inherited from main and deleted on the branch distills as a deletion.
 
 ## Synopsis
 

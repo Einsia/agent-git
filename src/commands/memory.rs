@@ -77,17 +77,21 @@ use sha2::Digest as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod plain_dir;
+use plain_dir::{Dir, Kind as Entry};
+
 /// The memory directory in the branch tree.
 pub const TREE_DIR: &str = "memory";
 /// The subdirectory of the runtime directory that holds branch memory.
 pub const MIRROR_DIR: &str = "agit";
 /// The runtime's own index file: Claude Code reads it at the start of every session and edits it
 /// when it writes memory. It describes **this machine's** directory (relative links to local
-/// files, plus the index section agit writes itself), so it is neither collected into the branch
-/// nor placed into the mirror — index lines for branch files are regenerated from each file's own
-/// frontmatter.
+/// files), so it is neither collected into the branch nor placed into the mirror. agit writes
+/// nothing into it: every conversation started in the folder reads it, whatever its repository,
+/// so a conversation is given its own repository's index instead ([`Report::context`]).
 pub const INDEX_FILE: &str = "MEMORY.md";
-/// Markers of the index section agit maintains inside the runtime `MEMORY.md`.
+/// Markers of the index sections earlier versions of agit wrote into the runtime `MEMORY.md`.
+/// agit writes none and takes out any it finds ([`take_out_sections`]).
 const INDEX_BEGIN: &str = "<!-- agit:memory:begin";
 const INDEX_END: &str = "<!-- agit:memory:end -->";
 const BASELINE_FILE: &str = "agit-memory-baseline.json";
@@ -194,6 +198,45 @@ pub struct Report {
     /// Files collection did not take (refused, pending or excluded by policy). Their baseline
     /// entries stay as collection left them, so the next collection considers them again.
     pub withheld: BTreeSet<String>,
+    /// `owner/repo@branch` of what was placed.
+    pub scope: String,
+    /// One line per file placed for the conversation, naming its copy by full path.
+    pub index: Vec<String>,
+}
+
+impl Report {
+    /// What the conversation is told of its team memory ([`context_of`]); None when nothing was
+    /// placed for it.
+    pub fn context(&self) -> Option<String> {
+        context_of(&self.scope, &self.index)
+    }
+}
+
+/// What a conversation of `scope` is told of its team memory, given as context when it starts: a
+/// line saying whose memory it is and how to use it, then the index, at most
+/// [`CODEX_INDEX_FILES`] lines. It is the conversation's own, so no other repository's memory is
+/// named in it. None with no line.
+fn context_of(scope: &str, index: &[String]) -> Option<String> {
+    if index.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = index
+        .iter()
+        .take(CODEX_INDEX_FILES)
+        .map(String::as_str)
+        .collect();
+    let more = index.len().saturating_sub(CODEX_INDEX_FILES);
+    let more = format!("- … {more} more files");
+    if index.len() > CODEX_INDEX_FILES {
+        lines.push(&more);
+    }
+    Some(format!(
+        "Team memory of {scope}, placed by agit for this conversation. Each line below names a \
+         copy of one shared memory file; read the ones that bear on the task before answering \
+         from them. Edits to these copies are collected back into {scope} when agit saves the \
+         conversation.\n{}",
+        lines.join("\n")
+    ))
 }
 
 /// How settlement treats a directory with no baseline.
@@ -636,67 +679,205 @@ fn index_line(file: &str, bytes: &[u8], relative: &str) -> String {
             }
         }
     }
+    // A name and a description are text whoever can push wrote: one that isn't printable text
+    // is left out, and a long one is cut.
     let title = name
-        .filter(|n| !n.is_empty())
+        .and_then(|n| index_text(&n, CODEX_NAME_CHARS, true))
         .unwrap_or_else(|| file.trim_end_matches(".md").to_string());
-    match description.filter(|d| !d.is_empty()) {
+    match description.and_then(|d| index_text(&d, DESCRIPTION_CHARS, true)) {
         Some(d) => format!("- [{title}]({relative}) — {d}"),
         None => format!("- [{title}]({relative})"),
     }
 }
 
-/// Replace agit's index section in `MEMORY.md` with `lines` (empty deletes the section). Nothing
-/// else moves, down to the word.
-fn upsert_index(existing: &str, scope: &str, lines: &[String]) -> String {
-    let begin_tag = format!("{INDEX_BEGIN} {scope} -->");
+/// `MEMORY.md` with every section agit fenced with its own markers taken out; nothing else moves,
+/// down to the word. A begin marker without its end marker is left as it is, with what follows:
+/// those lines may be the person's.
+fn strip_sections(existing: &str) -> String {
     let mut kept = String::new();
-    let mut skipping = false;
+    let mut section = String::new();
+    let mut separator = false;
+    let mut inside = false;
     for line in existing.split_inclusive('\n') {
         let trimmed = line.trim_end();
-        if trimmed == begin_tag {
-            // The blank line that set the section apart goes with it: otherwise each section
-            // replaced or removed between two others leaves one more blank line in an index the
-            // runtime reads only the head of.
-            if kept.ends_with("\n\n") {
+        if !inside && trimmed.starts_with(INDEX_BEGIN) && trimmed.ends_with("-->") {
+            // The blank line that set the section apart goes with it, so taking several out
+            // leaves no run of blank lines at the head of an index the runtime reads.
+            separator = kept.ends_with("\n\n");
+            if separator {
                 kept.pop();
             }
-            skipping = true;
+            inside = true;
+            section.push_str(line);
             continue;
         }
-        if skipping {
+        if inside {
+            section.push_str(line);
             if trimmed == INDEX_END {
-                skipping = false;
+                inside = false;
+                section.clear();
             }
             continue;
         }
         kept.push_str(line);
     }
-    if lines.is_empty() {
-        return kept;
+    if inside {
+        if separator {
+            kept.push('\n');
+        }
+        kept.push_str(&section);
     }
-    let mut out = if kept.trim().is_empty() {
-        "# Memory Index\n\n".to_string()
-    } else {
-        kept
+    kept
+}
+
+/// Takes every section earlier versions of agit wrote out of `mem_dir`'s `MEMORY.md`
+/// ([`strip_sections`]); true when it took one out. Every agit launch, every Claude Code hook,
+/// `agit setup` and each version's sweep ([`sweep_once_per_version`]) call it. A conversation
+/// whose index still held a section when it started can send it even when its own SessionStart
+/// hook cleans the file, so a hook's cleaning serves later starts in the folder.
+pub fn take_out_sections(mem_dir: &Path) -> crate::Result<bool> {
+    take_out_sections_with(mem_dir, &mut |_| {})
+}
+
+/// The folder of a memory folder holding each index agit took sections out of. agit doesn't
+/// collect or index what is in it; whether the runtime reads it on its own is not established,
+/// and any program running as the person can read it.
+const KEPT_DIR: &str = ".agit-kept";
+
+/// The moments of [`take_out_sections_in`] a test can act at, as a runtime writing its index
+/// would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeOut {
+    /// The index has been read and its cleaned copy written beside it.
+    Read,
+    /// The index has been moved aside and read again there; its name is free.
+    Checked,
+    /// A changed index has been linked back to its name.
+    Restored,
+}
+
+/// [`take_out_sections`], calling `between` at each [`TakeOut`] moment.
+fn take_out_sections_with(mem_dir: &Path, between: &mut dyn FnMut(TakeOut)) -> crate::Result<bool> {
+    let dir = match open_memory_dir(mem_dir) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot open {}", mem_dir.display()));
+        }
     };
-    if !out.ends_with('\n') {
-        out.push('\n');
+    take_out_sections_in(&dir, mem_dir, between)
+}
+
+/// `mem_dir` opened as a [`Dir`]. Below Claude Code's configuration folder (`CLAUDE_CONFIG_DIR`,
+/// else `~/.claude`, itself taken as configured) every folder is opened from its parent without
+/// following a link; a memory folder configured elsewhere is opened as configured.
+fn open_memory_dir(mem_dir: &Path) -> std::io::Result<Dir> {
+    let config = crate::infra::runtime_memory::claude_projects_dir()
+        .and_then(|projects| projects.parent().map(Path::to_path_buf));
+    let Some((config, below)) = config.as_ref().and_then(|config| {
+        mem_dir
+            .strip_prefix(config)
+            .ok()
+            .map(|below| (config, below))
+    }) else {
+        return Dir::open(mem_dir);
+    };
+    let mut dir = Dir::open(config)?;
+    for part in below.components() {
+        let std::path::Component::Normal(name) = part else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        dir = dir.child(name)?;
     }
-    if !out.ends_with("\n\n") {
-        out.push('\n');
+    Ok(dir)
+}
+
+/// Takes the sections out of the `MEMORY.md` of the open memory folder `dir` (shown as `shown`).
+///
+/// No step replaces a `MEMORY.md` that exists. The index is read, its cleaned copy written beside
+/// it, and the index moved into [`KEPT_DIR`] (made or checked to be this user's alone first, or
+/// nothing moves) under a name of its own and read again there; the cleaned copy then takes the
+/// name only through a hard link, which fails when the name is taken. The moved file keeps its
+/// name in [`KEPT_DIR`] whatever follows, and agit never removes it: a program that opened the
+/// index before it moved may still write to it, also after the name has been replaced again, and
+/// what it writes stays there to recover. It may hold the old sections and the person's own lines;
+/// it is a local copy, not a claim that anything was removed for good. A write that lands after
+/// the first read is found in the moved file, which is linked back to the name unless a new index
+/// took it meanwhile, and nothing is taken out. An index written while the name is free stays. For
+/// that moment the folder has no index, and a start reading then sees none.
+fn take_out_sections_in(
+    dir: &Dir,
+    shown: &Path,
+    between: &mut dyn FnMut(TakeOut),
+) -> crate::Result<bool> {
+    let index = std::ffi::OsStr::new(INDEX_FILE);
+    let path = shown.join(INDEX_FILE);
+    let cannot = || format!("cannot write {}", path.display());
+    let read = |dir: &Dir, name: &std::ffi::OsStr| {
+        plain_dir::read_bounded(dir, name, INDEX_READ_LIMIT)
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
+    let Some(existing) = read(dir, index) else {
+        return Ok(false);
+    };
+    let next = strip_sections(&existing);
+    if next == existing {
+        return Ok(false);
     }
-    out.push_str(&begin_tag);
-    out.push('\n');
-    out.push_str(&format!(
-        "Shared memory from the AgentGit session {scope}. Managed by agit; edits here are collected back on `agit commit`.\n"
-    ));
-    for l in lines {
-        out.push_str(l);
-        out.push('\n');
-    }
-    out.push_str(INDEX_END);
-    out.push('\n');
-    out
+    let stamp = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ"),
+        uuid::Uuid::new_v4().simple()
+    );
+    let fresh = std::ffi::OsString::from(format!(".{INDEX_FILE}.agit-{stamp}.new"));
+    let mode = dir.mode(index).with_context(cannot)?;
+    let placed = (|| -> crate::Result<bool> {
+        let mut file = dir.create(&fresh, mode).with_context(cannot)?;
+        std::io::Write::write_all(&mut file, next.as_bytes()).with_context(cannot)?;
+        drop(file);
+        let kept = dir
+            .private_child(std::ffi::OsStr::new(KEPT_DIR))
+            .with_context(|| {
+                format!(
+                    "{} isn't a folder only this user can open, so {} was left as it is",
+                    shown.join(KEPT_DIR).display(),
+                    path.display()
+                )
+            })?;
+        let kept_name = std::ffi::OsString::from(format!("{INDEX_FILE}.{stamp}"));
+        between(TakeOut::Read);
+        dir.rename(index, &kept, &kept_name).with_context(cannot)?;
+        let found = read(&kept, &kept_name);
+        between(TakeOut::Checked);
+        if found.as_deref() != Some(existing.as_str()) {
+            return match kept.link(&kept_name, dir, index) {
+                Ok(()) => {
+                    between(TakeOut::Restored);
+                    Ok(false)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error).with_context(|| {
+                    format!(
+                        "cannot put {} back; it is kept in {}",
+                        path.display(),
+                        shown.join(KEPT_DIR).display()
+                    )
+                }),
+            };
+        }
+        match dir.link(&fresh, dir, index) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => {
+                let _ = kept.link(&kept_name, dir, index);
+                Err(error).with_context(cannot)
+            }
+        }
+    })();
+    let _ = dir.remove(&fresh);
+    placed
 }
 
 /// Why a memory file stays off the branch this time.
@@ -864,6 +1045,8 @@ fn codex_branch_folder(branch: &str) -> String {
 const CODEX_HEADING_CHARS: usize = 80;
 const CODEX_NAME_CHARS: usize = 80;
 const CODEX_INDEX_FILES: usize = 64;
+/// How much of a memory file's frontmatter description its index line shows.
+const DESCRIPTION_CHARS: usize = 200;
 
 /// Codex keeps no memory per project, so before agit starts Codex it puts the branch's memory
 /// files, read-only, in a folder of its own and returns what Codex is told: the folder and, for
@@ -998,8 +1181,10 @@ pub fn forget_codex_mirrors() {
 
 // ──────────────────── The two directions ────────────────────
 
-/// Before start: branch `memory/` → the runtime directory, for a start that holds no lock for its
-/// section ([`start`] holds one). None means this runtime has no memory directory.
+/// Before a runtime starts on `slug@branch` from `cwd` (`agit new`, `agit resume`, a merge agent,
+/// the daemon): branch `memory/` → the runtime directory, with every section earlier versions of
+/// agit wrote taken out of its index. The launch gives the conversation [`Report::context`]. None
+/// means this runtime has no memory directory.
 pub fn materialize(
     primary: &Repo,
     branch: &str,
@@ -1010,7 +1195,6 @@ pub fn materialize(
     let Some(mem) = crate::infra::runtime_memory::locate(runtime, cwd) else {
         return Ok(None);
     };
-    unmark(&mem.dir, slug, branch);
     materialize_with(
         primary,
         branch,
@@ -1147,11 +1331,7 @@ fn place(
         keep.insert(name.clone());
         let current = mirrored.get(name);
         if current == Some(bytes) {
-            index.push(index_line(
-                name,
-                bytes,
-                &mirror_relative(slug, branch, name),
-            ));
+            index.push(index_line(name, bytes, &shown(&mirror, name)));
             placed_hashes.insert(name.clone(), sha(bytes));
             continue;
         }
@@ -1159,11 +1339,7 @@ fn place(
             && baseline.mirror.get(name) != Some(&sha(current))
         {
             report.conflicts.push(name.clone());
-            index.push(index_line(
-                name,
-                current,
-                &mirror_relative(slug, branch, name),
-            ));
+            index.push(index_line(name, current, &shown(&mirror, name)));
             if let Some(placed) = baseline.mirror.get(name) {
                 placed_hashes.insert(name.clone(), placed.clone());
             }
@@ -1173,11 +1349,7 @@ fn place(
         let dst = mirror.join(name);
         std::fs::write(&dst, bytes).with_context(|| format!("cannot write {}", dst.display()))?;
         report.placed += 1;
-        index.push(index_line(
-            name,
-            bytes,
-            &mirror_relative(slug, branch, name),
-        ));
+        index.push(index_line(name, bytes, &shown(&mirror, name)));
         placed_hashes.insert(name.clone(), sha(bytes));
     }
     // A mirrored file no longer on the branch is taken away — this subdirectory belongs to agit.
@@ -1188,11 +1360,7 @@ fn place(
         }
         if baseline.mirror.get(name) != Some(&sha(current)) {
             report.conflicts.push(name.clone());
-            index.push(index_line(
-                name,
-                current,
-                &mirror_relative(slug, branch, name),
-            ));
+            index.push(index_line(name, current, &shown(&mirror, name)));
             if let Some(placed) = baseline.mirror.get(name) {
                 placed_hashes.insert(name.clone(), placed.clone());
             }
@@ -1204,7 +1372,9 @@ fn place(
         let _ = std::fs::remove_dir(&mirror);
     }
 
-    write_index(mem_dir, slug, branch, &index)?;
+    take_out_sections(mem_dir)?;
+    report.scope = index_scope(slug, branch);
+    report.index = index;
 
     let mut next_baseline = Baseline::of(mem_dir, &md_files(mem_dir)?, &BTreeMap::new());
     next_baseline.mirror = placed_hashes;
@@ -1221,90 +1391,210 @@ fn place(
     Ok(next_baseline)
 }
 
-/// The index section of `slug@branch`: written only when there are mirrored files, otherwise the
-/// old section is deleted.
-fn write_index(mem_dir: &Path, slug: &str, branch: &str, index: &[String]) -> crate::Result<()> {
-    let index_path = mem_dir.join(INDEX_FILE);
-    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
-    let next = upsert_index(&existing, &index_scope(slug, branch), index);
-    if next != existing && (!next.trim().is_empty() || index_path.exists()) {
-        std::fs::create_dir_all(mem_dir)?;
-        std::fs::write(&index_path, next)?;
-    }
-    Ok(())
+/// The most of a `MEMORY.md` agit reads to take its sections out; a larger one is left as it is,
+/// and a sweep that met it is not complete.
+const INDEX_READ_LIMIT: u64 = 1 << 20;
+
+/// The most project folders one sweep walks; past it the sweep is not complete.
+const SWEEP_PROJECT_LIMIT: usize = 10_000;
+
+/// The file in `AGIT_HOME` holding the agit version whose sweep completed on this computer.
+const SWEPT_FILE: &str = "memory-swept";
+
+/// What one [`take_out_every_section`] did: how many indexes it cleaned, and whether it handled
+/// every index it walked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sweep {
+    pub cleaned: usize,
+    pub complete: bool,
 }
 
-/// Lists the mirror of `slug@branch` in its index section again, as it stands, placing and
-/// removing nothing: a conversation that comes back reads what it was given, and what it changed
-/// without collecting it yet.
-pub fn reindex(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
-    keep_to_repository(mem_dir, slug, &surely_running)?;
-    let index: Vec<String> = md_files(&mirror_dir(mem_dir, slug, branch))?
-        .iter()
-        .map(|(name, bytes)| index_line(name, bytes, &mirror_relative(slug, branch, name)))
-        .collect();
-    write_index(mem_dir, slug, branch, &index)
+/// Takes the sections earlier versions of agit wrote out of each Claude Code memory index on this
+/// computer: `projects/*/memory/MEMORY.md` under the Claude configuration folder agit knows
+/// (`CLAUDE_CONFIG_DIR`, else `~/.claude`, followed as configured), with only agit's own sections
+/// changed ([`take_out_sections`]). Below the configuration folder no link is followed. One sweep
+/// runs at a time.
+///
+/// A sweep that takes the lock first withdraws the version record, so only a complete sweep
+/// leaves one: one that handled every index it walked. A linked `projects`, project, memory
+/// folder or index, an index too large or unreadable, one that changed while it was cleaned, a
+/// failed write or the walk's limit each leave it incomplete, because a section may remain. A
+/// sweep that can't take the lock leaves everything, the record included, to the one that holds
+/// it. A complete sweep shows only that the indexes it handled were clean at that moment.
+pub fn take_out_every_section() -> Sweep {
+    take_out_every_section_within(SWEEP_PROJECT_LIMIT)
 }
 
-/// Takes the index sections of `slug`'s branches outside `keep` out of `mem_dir`'s index. Their
-/// mirror files stay where they are, with any edit not collected yet; [`reindex`] lists them
-/// again. The runtime reads only the head of its index, so sections nobody reads any more would
-/// push the current ones out of it.
-pub fn drop_sections(mem_dir: &Path, slug: &str, keep: &BTreeSet<String>) -> crate::Result<()> {
-    let index_path = mem_dir.join(INDEX_FILE);
-    let Ok(existing) = std::fs::read_to_string(&index_path) else {
-        return Ok(());
+/// [`take_out_every_section`] walking at most `limit` project folders.
+fn take_out_every_section_within(limit: usize) -> Sweep {
+    let incomplete = Sweep::default();
+    let Some(projects) = crate::infra::runtime_memory::claude_projects_dir() else {
+        return incomplete;
     };
-    let opening = format!("{INDEX_BEGIN} {slug}@");
-    let dropped: Vec<String> = existing
-        .lines()
-        .filter_map(|line| line.trim_end().strip_prefix(opening.as_str()))
-        .filter_map(|rest| rest.strip_suffix(" -->"))
-        .filter(|branch| !keep.contains(*branch))
-        .map(str::to_owned)
+    let Ok(home) = crate::infra::config::agit_home() else {
+        return incomplete;
+    };
+    if crate::infra::config::create_state_dir(&home).is_err() {
+        return incomplete;
+    }
+    let Ok(lock) = crate::infra::config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.join("memory-sweep.lock"))
+    else {
+        return incomplete;
+    };
+    if fs2::FileExt::try_lock_exclusive(&lock).is_err() {
+        return incomplete;
+    }
+    match std::fs::remove_file(home.join(SWEPT_FILE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return incomplete,
+    }
+    let Some(config) = projects.parent() else {
+        return incomplete;
+    };
+    let root = match Dir::open(config) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return record_sweep(&home, 0);
+        }
+        Err(_) => return incomplete,
+    };
+    let folder = std::ffi::OsStr::new("projects");
+    let projects_dir = match open_folder(&root, folder) {
+        Some(Ok(dir)) => dir,
+        Some(Err(())) => return incomplete,
+        None => return record_sweep(&home, 0),
+    };
+    let Ok(Some(names)) = projects_dir.names(limit) else {
+        return incomplete;
+    };
+    let mut cleaned = 0;
+    let mut complete = true;
+    for name in &names {
+        match sweep_project(&projects_dir, name, &projects) {
+            Some(true) => cleaned += 1,
+            Some(false) => {}
+            None => complete = false,
+        }
+    }
+    if complete {
+        record_sweep(&home, cleaned)
+    } else {
+        Sweep { cleaned, complete }
+    }
+}
+
+/// One project folder `name` of a sweep, reached from the open `projects` folder: Some(true) when
+/// it took a section out, Some(false) when its index holds none or it has no index, None when it
+/// could not tell.
+fn sweep_project(projects: &Dir, name: &std::ffi::OsStr, shown: &Path) -> Option<bool> {
+    let project = match open_folder(projects, name) {
+        None => return Some(false),
+        Some(Ok(dir)) => dir,
+        Some(Err(())) => return None,
+    };
+    let memory = match open_folder(&project, std::ffi::OsStr::new("memory")) {
+        None => return Some(false),
+        Some(Ok(dir)) => dir,
+        Some(Err(())) => return None,
+    };
+    let index = std::ffi::OsStr::new(INDEX_FILE);
+    let bytes = match plain_dir::read_bounded(&memory, index, INDEX_READ_LIMIT) {
+        Ok(Some(bytes)) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        // A link, something other than a file, too large or unreadable: a section may be there.
+        _ => return None,
+    };
+    if !bytes
+        .windows(INDEX_BEGIN.len())
+        .any(|window| window == INDEX_BEGIN.as_bytes())
+    {
+        return Some(false);
+    }
+    // The index held a section a moment ago: a take-out that changed nothing found it changed.
+    let shown = shown.join(name).join("memory");
+    take_out_sections_in(&memory, &shown, &mut |_| {})
+        .ok()
+        .filter(|taken| *taken)
+}
+
+/// The folder `name` in `parent`, opened without following a link. None when nothing there could
+/// hold an index (no such name, or a plain file); Some(Err) when it could and wasn't opened (a
+/// link, or an error), so a sweep can't count it handled.
+fn open_folder(parent: &Dir, name: &std::ffi::OsStr) -> Option<Result<Dir, ()>> {
+    match parent.child(name) {
+        Ok(dir) => Some(Ok(dir)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        // The open refused it; what it is only decides whether it could have held an index.
+        Err(_) => match parent.kind(name) {
+            Ok(None | Some(Entry::File | Entry::Other)) => None,
+            _ => Some(Err(())),
+        },
+    }
+}
+
+/// Record this agit's version as swept, for a complete sweep; a record that can't be written
+/// leaves the sweep incomplete, so the next process sweeps again.
+fn record_sweep(home: &Path, cleaned: usize) -> Sweep {
+    let complete =
+        std::fs::write(home.join(SWEPT_FILE), crate::infra::config::BUILD_VERSION).is_ok();
+    Sweep { cleaned, complete }
+}
+
+/// Once for each agit version on this computer, before the command it runs in: the first agit
+/// process of a version that prepares local state, a hook's included, sweeps every Claude Code
+/// memory index ([`take_out_every_section`]); later ones only read the record. A read-only
+/// command never calls it. An incomplete sweep records nothing, so the next such process sweeps
+/// again. It says nothing, whatever the command's output is for; `agit setup` reports what it
+/// cleaned.
+pub fn sweep_once_per_version() {
+    let Ok(home) = crate::infra::config::agit_home() else {
+        return;
+    };
+    if std::fs::read_to_string(home.join(SWEPT_FILE))
+        .is_ok_and(|version| version == crate::infra::config::BUILD_VERSION)
+    {
+        return;
+    }
+    take_out_every_section();
+}
+
+/// A file of the mirror `dir` as an index line names it: by its full path, since the context it is
+/// given in has no folder of its own to be relative to.
+fn shown(dir: &Path, name: &str) -> String {
+    dir.join(name).display().to_string()
+}
+
+/// What a conversation of `slug@branch` that comes back is told of its mirror, as it stands,
+/// placing and removing nothing: it reads what it was given, and what it changed without
+/// collecting it yet.
+pub fn reindex(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<Option<String>> {
+    keep_to_repository(mem_dir, slug, &surely_running)?;
+    let mirror = mirror_dir(mem_dir, slug, branch);
+    let index: Vec<String> = md_files(&mirror)?
+        .iter()
+        .map(|(name, bytes)| index_line(name, bytes, &shown(&mirror, name)))
         .collect();
-    let mut next = existing.clone();
-    for branch in &dropped {
-        next = upsert_index(&next, &index_scope(slug, branch), &[]);
-    }
-    if next != existing {
-        std::fs::write(&index_path, next)?;
-    }
-    Ok(())
+    Ok(context_of(&index_scope(slug, branch), &index))
 }
 
 /// Before a conversation of `slug` starts in `mem_dir`: a session sees only its own repository's
-/// team memory. Every other repository's index section is taken out, and its mirror files move to
-/// a folder of agit's own ([`parked_dir`]) unless `surely_running` says that conversation still
-/// runs; `slug`'s own files parked by an earlier start come back. Nothing is deleted: a file moved
-/// either way keeps any edit not collected yet, and collection reads a parked file where the
-/// runtime directory has none ([`mirror_files`]). Where both sides have a file, the runtime
-/// directory's copy is the newer one and wins.
-///
-/// The same repository's other branches are left to [`drop_sections`]: their readers are this
-/// repository's.
+/// team memory. The sections earlier versions of agit wrote into the index are taken out, and
+/// every other repository's mirror files move to a folder of agit's own ([`parked_dir`]) unless
+/// `surely_running` says that conversation still runs; `slug`'s own files parked by an earlier
+/// start come back. Nothing is deleted: a file moved either way keeps any edit not collected yet,
+/// and collection reads a parked file where the runtime directory has none ([`mirror_files`]).
+/// Where both sides have a file, the runtime directory's copy is the newer one and wins.
 pub fn keep_to_repository(
     mem_dir: &Path,
     slug: &str,
     surely_running: &dyn Fn(&str, &str) -> bool,
 ) -> crate::Result<()> {
-    let index_path = mem_dir.join(INDEX_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&index_path) {
-        let others: Vec<String> = existing
-            .lines()
-            .filter_map(|line| line.trim_end().strip_prefix(INDEX_BEGIN))
-            .filter_map(|rest| rest.strip_prefix(' ')?.strip_suffix(" -->"))
-            .filter(|scope| scope.split_once('@').is_none_or(|(other, _)| other != slug))
-            .map(str::to_owned)
-            .collect();
-        let mut next = existing.clone();
-        for scope in &others {
-            next = upsert_index(&next, scope, &[]);
-        }
-        if next != existing {
-            std::fs::write(&index_path, next)?;
-        }
-    }
+    take_out_sections(mem_dir)?;
     let parked = parked_dir(mem_dir)?;
     let mirrors = mem_dir.join(MIRROR_DIR);
     // Folders name a repository as `<owner>/<name>`, with `local` for a slug without an owner.
@@ -1359,189 +1649,6 @@ pub fn surely_running(slug: &str, branch: &str) -> bool {
             link.source == "claude-code"
                 && crate::rc::claude_inbox::session_is_live(&link.session_id)
         })
-}
-
-/// The sections this process's launches hold: a shared OS lock per runtime directory and branch,
-/// with a marker beside it saying a holding launch placed that section. A launch spends its life
-/// waiting for its runtime, and the OS releases the lock when the process ends, a crash included,
-/// so a marked section whose lock nobody holds belongs to a conversation that is surely gone. A
-/// lock that only exists as a file would read a crashed launch as running for ever.
-static HELD: std::sync::Mutex<Vec<(crate::infra::local_state::HeldLock, PathBuf)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// The lock file and the marker of `slug@branch` in `mem_dir`, under agit's home. Lock files stay
-/// once made: one removed while a launch holds it would let the next launch lock a new file
-/// beside the held one.
-fn held_paths(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<(PathBuf, PathBuf)> {
-    let dir = crate::infra::config::agit_home()?
-        .join("runtime-memory")
-        .join("held")
-        .join(sha(mem_dir.to_string_lossy().as_bytes()));
-    let key = sha(index_scope(slug, branch).as_bytes());
-    Ok((
-        dir.join(format!("{key}.lock")),
-        dir.join(format!("{key}.placed")),
-    ))
-}
-
-/// Before `agit new` or `agit resume` launches a runtime on `slug@branch` from `cwd`: holds its
-/// section for as long as this process runs, takes out the sections of the repository's other
-/// branches whose conversation is surely gone ([`drop_finished`]), and places the branch's
-/// memory as [`materialize`] does. None means this runtime has no memory directory.
-pub fn start(
-    primary: &Repo,
-    branch: &str,
-    slug: &str,
-    runtime: &str,
-    cwd: &Path,
-) -> crate::Result<Option<Report>> {
-    let Some(mem) = crate::infra::runtime_memory::locate(runtime, cwd) else {
-        return Ok(None);
-    };
-    start_with(
-        primary,
-        branch,
-        slug,
-        &mem.dir,
-        Policy::from_config(Scope::SinceBaseline),
-    )
-    .map(Some)
-}
-
-/// The body of [`start`], with the directory and the policy given explicitly.
-fn start_with(
-    primary: &Repo,
-    branch: &str,
-    slug: &str,
-    mem_dir: &Path,
-    policy: Policy,
-) -> crate::Result<Report> {
-    hold(mem_dir, slug, branch)?;
-    drop_finished(primary, mem_dir, slug, branch)?;
-    materialize_with(primary, branch, slug, mem_dir, policy)
-}
-
-fn hold(mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
-    use std::io::Write as _;
-    let (lock, marker) = held_paths(mem_dir, slug, branch)?;
-    if let Some(dir) = lock.parent() {
-        crate::infra::config::create_state_dir(dir)
-            .with_context(|| format!("cannot create {}", dir.display()))?;
-    }
-    let file = crate::infra::config::state_file_options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock)
-        .with_context(|| format!("cannot open {}", lock.display()))?;
-    let held = crate::infra::local_state::HeldLock::shared(file, &lock, "the memory section lock")?;
-    crate::infra::config::state_file_options()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&marker)
-        .and_then(|mut file| writeln!(file, "{}", index_scope(slug, branch)))
-        .with_context(|| format!("cannot write {}", marker.display()))?;
-    HELD.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push((held, marker));
-    Ok(())
-}
-
-/// Lets go of the sections this process's launches hold once their runtime has exited: their
-/// conversation is gone, and the next start in the folder may take their sections out.
-pub fn let_go() {
-    HELD.lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
-}
-
-/// Takes back the marks of this process's launches when it leaves the runtime for the person to
-/// start (`--no-launch`): that conversation may run long after this process, which holds nothing
-/// for it then, so its section is no longer known to be gone when the lock is free.
-pub fn unhold() {
-    for (_held, marker) in HELD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .drain(..)
-    {
-        let _ = std::fs::remove_file(marker);
-    }
-}
-
-/// Takes back the mark of `slug@branch` in `mem_dir`, for a placing that holds no lock for it, so
-/// that a mark left by an earlier launch does not read as gone while this one runs.
-pub fn unmark(mem_dir: &Path, slug: &str, branch: &str) {
-    if let Ok((_, marker)) = held_paths(mem_dir, slug, branch) {
-        let _ = std::fs::remove_file(marker);
-    }
-}
-
-/// Takes the sections of `slug`'s other branches out of `mem_dir`'s index when their
-/// conversation is surely gone: the branch no longer exists in `primary`, so nothing settles into
-/// it, or a launch marked the section and nobody holds its lock. Every other section stays, a
-/// section placed by an agit without marks or under `--no-launch` included: taking out the
-/// section of a conversation that still runs hides its memory from it at its next read of the
-/// index, while a stale one only costs a few lines. Mirror files stay either way, as in
-/// [`drop_sections`]. A gone section's lock is held until the index is written, so a launch of
-/// that branch starting meanwhile places its section after this, not before.
-fn drop_finished(primary: &Repo, mem_dir: &Path, slug: &str, branch: &str) -> crate::Result<()> {
-    let Ok(existing) = std::fs::read_to_string(mem_dir.join(INDEX_FILE)) else {
-        return Ok(());
-    };
-    let opening = format!("{INDEX_BEGIN} {slug}@");
-    let listed: Vec<String> = existing
-        .lines()
-        .filter_map(|line| line.trim_end().strip_prefix(opening.as_str()))
-        .filter_map(|rest| rest.strip_suffix(" -->"))
-        .map(str::to_owned)
-        .collect();
-    let mut keep: BTreeSet<String> = BTreeSet::from([branch.to_owned()]);
-    let mut probes = Vec::new();
-    let mut deleted = Vec::new();
-    for other in listed.into_iter().filter(|other| other != branch) {
-        if !primary.has_ref(&tree_ref(&other)) {
-            deleted.push(other);
-            continue;
-        }
-        match gone(mem_dir, slug, &other) {
-            Some(probe) => probes.push(probe),
-            None => {
-                keep.insert(other);
-            }
-        }
-    }
-    drop_sections(mem_dir, slug, &keep)?;
-    for (_probe, marker) in probes {
-        let _ = std::fs::remove_file(marker);
-    }
-    for other in &deleted {
-        unmark(mem_dir, slug, other);
-    }
-    Ok(())
-}
-
-/// The lock of a marked section nobody holds, taken, with its marker; None when the section is
-/// not marked, its lock is held, or either cannot be read.
-fn gone(
-    mem_dir: &Path,
-    slug: &str,
-    branch: &str,
-) -> Option<(crate::infra::local_state::HeldLock, PathBuf)> {
-    let (lock, marker) = held_paths(mem_dir, slug, branch).ok()?;
-    if !marker.is_file() {
-        return None;
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock)
-        .ok()?;
-    let probe =
-        crate::infra::local_state::HeldLock::try_exclusive(file, &lock, "the memory section lock")
-            .ok()?;
-    Some((probe, marker))
 }
 
 /// Where the mirror files [`keep_to_repository`] moved out of `mem_dir` wait, under agit's home:
@@ -3331,6 +3438,30 @@ pub fn report_collect(report: &Report, branch: &str) {
     }
 }
 
+/// Says that a conversation of `runtime` starts without being told of the team memory placed for
+/// it: the runtime takes no extra instructions on its command line, and agit writes nothing into
+/// the folder's shared index. The copies are in its memory folder all the same.
+pub fn say_untold(runtime: &str) {
+    ui::warning(&format!(
+        "{} takes nothing on its command line that would tell this conversation of its team memory, so it starts without it; the copies are in its memory folder",
+        crate::ui::session::runtime_label(runtime)
+    ));
+}
+
+/// A Codex conversation agit starts is told of its team memory by agit's session-start hook: as
+/// instructions on its command line, the index would replace the person's own. Says so when those
+/// hooks aren't installed or Codex has them turned off, and how to add them.
+pub fn say_if_codex_untold() {
+    if !(super::setup::runtime_hooks_installed("codex") && super::setup::codex_hooks_enabled()) {
+        ui::warning(
+            "Codex is told of its team memory by agit's hooks, which aren't set up here, so this conversation starts without it",
+        );
+        ui::hint(
+            "`agit setup --hooks` sets them up; a Codex conversation agit starts after that is told of its team memory",
+        );
+    }
+}
+
 /// The one-line report on the start path.
 pub fn report_materialize(report: &Report) {
     if report.placed > 0 {
@@ -3478,10 +3609,10 @@ mod tests {
         std::fs::write(mem.join("personal.md"), "my own notes\n").unwrap();
         let report = materialize_unborn(&primary, "s2", SLUG, &mem, "refs/heads/main").unwrap();
         assert_eq!(report.placed, 1);
-        let index = std::fs::read_to_string(mem.join(INDEX_FILE)).unwrap();
+        let context = report.context().unwrap();
         assert!(
-            index.contains(&mirror_relative(SLUG, "s2", "team.md")),
-            "{index}"
+            context.contains(&shown(&mirror_dir(&mem, SLUG, "s2"), "team.md")),
+            "{context}"
         );
 
         // The first landing births the branch with no memory of its own, as a device-local
@@ -3553,6 +3684,28 @@ mod tests {
         }
     }
 
+    /// `sweep` on a lock file made anew. A sweep takes its lock without waiting, and a child
+    /// process another test forks holds a copy of every open descriptor until it execs, so the
+    /// lock an earlier sweep released can still be held through such a copy when the next sweep
+    /// starts. A new file under the same name is another file, which no copy refers to. The sweep
+    /// must leave its lock file where this looks: if the lock moved, steps would share one again,
+    /// so that fails here.
+    fn on_a_new_lock(home: &Path, sweep: impl FnOnce() -> Sweep) -> Sweep {
+        let lock = home.join("memory-sweep.lock");
+        match std::fs::remove_file(&lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot remove the sweep's lock file: {error}"),
+        }
+        let swept = sweep();
+        assert!(
+            lock.exists(),
+            "the sweep no longer locks {}",
+            lock.display()
+        );
+        swept
+    }
+
     fn sections(mem: &Path) -> Vec<String> {
         std::fs::read_to_string(mem.join(INDEX_FILE))
             .unwrap_or_default()
@@ -3580,8 +3733,13 @@ mod tests {
         let edited = "uid, not user_id; ids are ULIDs\n";
         std::fs::write(mirror(&mem).join("team.md"), edited).unwrap();
 
-        materialize_unborn(&primary, "s2", OTHER, &mem, "refs/heads/main").unwrap();
-        assert_eq!(sections(&mem), ["you/lab@s2"]);
+        let other = materialize_unborn(&primary, "s2", OTHER, &mem, "refs/heads/main").unwrap();
+        assert!(sections(&mem).is_empty());
+        let told = other.context().unwrap();
+        assert!(
+            told.contains("you/lab@s2") && !told.contains(SLUG),
+            "{told}"
+        );
         assert!(!mem.join(MIRROR_DIR).join("me").exists());
         let parked = scope_dir(&parked_dir(&mem).unwrap(), SLUG, "s1").join("team.md");
         assert_eq!(std::fs::read_to_string(&parked).unwrap(), edited);
@@ -3602,7 +3760,7 @@ mod tests {
             file(&primary, "refs/heads/s1", "team.md").as_deref(),
             Some(edited)
         );
-        assert_eq!(sections(&mem), ["me/qa@s1"]);
+        assert!(sections(&mem).is_empty());
         assert!(!mem.join(MIRROR_DIR).join("you").exists());
         assert!(!parked.exists());
     }
@@ -3664,46 +3822,42 @@ mod tests {
         assert_eq!(file(&primary, "refs/heads/s1", "team.md"), None);
     }
 
-    /// A launch takes out the section of the repository's other branch whose conversation is
-    /// surely gone: its launch marked the section and nobody holds its lock, or its branch no
-    /// longer exists. It keeps the sections it cannot tell: one whose launch still holds its
-    /// lock, and one placed without a mark, as under `--no-launch` or by an agit that marks
-    /// nothing. A gone section's mirror files stay. Reading a free lock alone as gone takes the
-    /// section from a conversation still running under `--no-launch`; reading the mark alone
-    /// takes it from one whose launch still runs.
+    /// Every start takes out each section an earlier agit wrote into the runtime's index, this
+    /// repository's and another's alike, and leaves every other line as it was, the person's lines
+    /// between and after the sections included. It writes no section of its own: the conversation
+    /// is told of its memory through [`Report::context`], which names only its own repository.
+    /// Every conversation started in the folder reads a section, whatever its repository, so a
+    /// start that wrote or kept one would hand that memory to the next conversation of another
+    /// repository.
     #[test]
-    fn a_launch_takes_out_only_the_sections_of_conversations_surely_gone() {
+    fn a_start_takes_every_agit_section_out_and_tells_only_its_own_conversation() {
         let (d, primary, mem) = fixture();
         let _home = AgitHome::at(&d.path().join("agit"));
-        for branch in ["s2", "s3"] {
-            primary.git(&["branch", branch, "s1"]).unwrap();
-        }
-        let listed = |mem: &Path| sections(mem).into_iter().collect::<BTreeSet<_>>();
-        let scopes = |branches: &[&str]| {
-            branches
-                .iter()
-                .map(|branch| index_scope(SLUG, branch))
-                .collect::<BTreeSet<_>>()
-        };
-
-        start_with(&primary, "s3", SLUG, &mem, ON).unwrap();
-        unhold();
-        start_with(&primary, "s1", SLUG, &mem, ON).unwrap();
-        start_with(&primary, "s2", SLUG, &mem, ON).unwrap();
-        assert_eq!(listed(&mem), scopes(&["s1", "s2", "s3"]));
-        let_go();
-        let line = index_line(
-            "team.md",
-            b"x",
-            &mirror_relative(SLUG, "deleted", "team.md"),
+        let mine = "# Memory Index\n\n- [mine](mine.md) — my own notes\n";
+        let after = "- [after](after.md) — written after the sections\n";
+        std::fs::write(
+            mem.join(INDEX_FILE),
+            format!(
+                "{mine}\n{INDEX_BEGIN} you/lab@old -->\n- [codename](agit/you/lab/old/codename.md) — OLDOTTER\n{INDEX_END}\n\n{INDEX_BEGIN} me/qa@s0 -->\n- [team](agit/me/qa/s0/team.md)\n{INDEX_END}\n{after}"
+            ),
+        )
+        .unwrap();
+        let report = materialize_with(&primary, "s1", SLUG, &mem, ON).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mem.join(INDEX_FILE)).unwrap(),
+            format!("{mine}{after}")
         );
-        write_index(&mem, SLUG, "deleted", &[line]).unwrap();
-
-        start_with(&primary, "s1", SLUG, &mem, ON).unwrap();
-        assert_eq!(listed(&mem), scopes(&["s1", "s3"]));
-        assert!(mirror_dir(&mem, SLUG, "s2").join("team.md").is_file());
-        assert!(!held_paths(&mem, SLUG, "s2").unwrap().1.exists());
-        let_go();
+        let told = report.context().unwrap();
+        assert!(
+            told.starts_with("Team memory of me/qa@s1, placed by agit for this conversation.")
+                && told.contains(&format!(
+                    "- [team]({}) — how the team works",
+                    shown(&mirror(&mem), "team.md")
+                ))
+                && !told.contains("OLDOTTER")
+                && !told.contains(OTHER),
+            "{told}"
+        );
     }
 
     #[test]
@@ -3856,10 +4010,10 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"manually selected");
     }
 
-    /// Branch memory lands in the runtime directory's per-branch mirror subdirectory and
-    /// MEMORY.md gains one index section; the local top level does not move.
+    /// Branch memory lands in the runtime directory's per-branch mirror subdirectory, and the
+    /// conversation is told of it by full path; MEMORY.md and the local top level do not move.
     #[test]
-    fn materialize_places_branch_memory_under_the_mirror_dir_and_indexes_it() {
+    fn materialize_places_branch_memory_under_the_mirror_dir_and_tells_its_index() {
         let (_d, repo, mem) = fixture();
         std::fs::write(
             mem.join("MEMORY.md"),
@@ -3876,12 +4030,15 @@ mod tests {
             "---\nname: team\ndescription: how the team works\n---\nuid, not user_id\n"
         );
         let index = std::fs::read_to_string(mem.join("MEMORY.md")).unwrap();
-        assert!(index.contains("- [mine](mine.md) — local"), "{index}");
+        assert_eq!(index, "# Memory Index\n\n- [mine](mine.md) — local\n");
+        let told = r.context().unwrap();
         assert!(
-            index.contains("- [team](agit/me/qa/s1/team.md) — how the team works"),
-            "{index}"
+            told.contains(&format!(
+                "- [team]({}) — how the team works",
+                shown(&mirror(&mem), "team.md")
+            )),
+            "{told}"
         );
-        assert!(index.contains("<!-- agit:memory:begin me/qa@s1 -->") && index.contains(INDEX_END));
         assert_eq!(
             std::fs::read_to_string(mem.join("mine.md")).unwrap(),
             "local fact\n"
@@ -3890,6 +4047,7 @@ mod tests {
         // Again: nothing changes.
         let again = materialize_with(&repo, "s1", SLUG, &mem, ON).unwrap();
         assert_eq!(again.placed, 0);
+        assert_eq!(again.context(), r.context());
         assert_eq!(
             std::fs::read_to_string(mem.join("MEMORY.md")).unwrap(),
             index
@@ -3910,10 +4068,7 @@ mod tests {
         assert_eq!(r.placed, 0);
         assert_eq!(r.already_local, 1);
         assert!(!mem.join("agit").exists());
-        assert!(
-            !mem.join("MEMORY.md").exists(),
-            "no index section without mirrored files"
-        );
+        assert!(!mem.join("MEMORY.md").exists(), "agit writes no index");
     }
 
     /// Personal memory that was there before the start and untouched this session does not enter
@@ -4514,21 +4669,312 @@ mod tests {
         assert!(!plan.no_baseline);
     }
 
-    /// Replacing the index section touches only that section.
+    /// A sweep takes agit's sections out of every Claude Code memory index under the configuration
+    /// folder, every other line kept, and records its version only when it handled every index; a
+    /// project with no memory folder and a plain file count as handled. A linked project,
+    /// `projects` folder or index is never followed, and an index larger than the read limit is
+    /// never read: each keeps its section and leaves the sweep incomplete. A sweep
+    /// withdraws an earlier record first, so an incomplete one after a complete one leaves none
+    /// and the next process sweeps again. A sweep that followed a link, read past the limit,
+    /// recorded its version with an index unhandled, or kept a stale record fails here.
     #[test]
-    fn the_index_section_is_replaced_in_place() {
-        let before = "# Memory Index\n\n- [mine](mine.md)\n\n<!-- agit:memory:begin me/qa@s1 -->\nold\n<!-- agit:memory:end -->\n\n- [after](after.md)\n";
-        let next = upsert_index(
-            before,
-            "me/qa@s1",
-            &["- [team](agit/me/qa/s1/team.md)".into()],
+    fn a_sweep_cleans_every_index_and_records_only_a_complete_one() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("agit");
+        let _home = AgitHome::at(&home);
+        let config = d.path().join("claude");
+        let old = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let set_config = |dir: &Path| unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir) };
+        set_config(&config);
+        let mine = "# Memory Index\n\n- [mine](mine.md)\n";
+        let held = format!(
+            "{mine}\n{INDEX_BEGIN} other/repo@old -->\n- [x](agit/other/repo/old/x.md)\n{INDEX_END}\n"
         );
-        assert!(next.contains("- [mine](mine.md)"));
-        assert!(next.contains("- [after](after.md)"));
-        assert!(!next.contains("\nold\n"));
-        assert!(next.contains("- [team](agit/me/qa/s1/team.md)"));
-        let removed = upsert_index(&next, "me/qa@s1", &[]);
-        assert!(!removed.contains(INDEX_BEGIN));
-        assert!(removed.contains("- [after](after.md)"));
+        let oversized = format!("{}\n{held}", "x".repeat(INDEX_READ_LIMIT as usize));
+        let index = |project: &str| config.join("projects").join(project).join("memory");
+        for (project, text) in [("-work-a", held.as_str()), ("-work-b", mine)] {
+            std::fs::create_dir_all(index(project)).unwrap();
+            std::fs::write(index(project).join(INDEX_FILE), text).unwrap();
+        }
+        // Nothing here can hold an index, so neither keeps a sweep from completing.
+        std::fs::create_dir_all(config.join("projects/-no-memory")).unwrap();
+        std::fs::write(config.join("projects/notes.txt"), "notes").unwrap();
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(outside.join("-p").join("memory")).unwrap();
+        std::fs::write(outside.join("-p/memory").join(INDEX_FILE), &held).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("-p"), config.join("projects/-linked"))
+                .unwrap();
+            std::fs::create_dir_all(index("-work-c")).unwrap();
+            std::fs::write(outside.join("index.md"), &held).unwrap();
+            std::os::unix::fs::symlink(outside.join("index.md"), index("-work-c").join(INDEX_FILE))
+                .unwrap();
+        }
+        let record = || std::fs::read_to_string(home.join(SWEPT_FILE)).ok();
+        let mut steps = Vec::new();
+        steps.push((on_a_new_lock(&home, take_out_every_section), record()));
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(config.join("projects/-linked")).unwrap();
+            std::fs::remove_file(index("-work-c").join(INDEX_FILE)).unwrap();
+        }
+        steps.push((on_a_new_lock(&home, take_out_every_section), record()));
+        std::fs::write(index("-work-b").join(INDEX_FILE), &oversized).unwrap();
+        steps.push((on_a_new_lock(&home, take_out_every_section), record()));
+        let large_after = std::fs::read_to_string(index("-work-b").join(INDEX_FILE)).unwrap();
+        std::fs::write(index("-work-b").join(INDEX_FILE), mine).unwrap();
+        steps.push((on_a_new_lock(&home, take_out_every_section), record()));
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("memory-sweep.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&holder).unwrap();
+        let busy = (take_out_every_section(), record());
+        drop(holder);
+        // A configuration folder whose `projects` is a link to another tree.
+        let linked_root = d.path().join("linked-root");
+        std::fs::create_dir_all(&linked_root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, linked_root.join("projects")).unwrap();
+        set_config(&linked_root);
+        steps.push((on_a_new_lock(&home, take_out_every_section), record()));
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+        let version = Some(crate::infra::config::BUILD_VERSION.to_owned());
+        let at = |cleaned, complete| Sweep { cleaned, complete };
+        if cfg!(unix) {
+            assert_eq!(steps[0], (at(1, false), None));
+        } else {
+            assert_eq!(steps[0], (at(1, true), version.clone()));
+        }
+        assert_eq!(steps[1], (at(0, true), version.clone()));
+        assert_eq!(steps[2], (at(0, false), None));
+        assert_eq!(large_after, oversized);
+        assert_eq!(steps[3], (at(0, true), version.clone()));
+        // A sweep that finds the lock held leaves everything, the record included, to the one
+        // holding it.
+        assert_eq!(busy, (Sweep::default(), version.clone()));
+        if cfg!(unix) {
+            assert_eq!(steps[4], (at(0, false), None));
+        }
+        for project in ["-work-a", "-work-b"] {
+            assert_eq!(
+                std::fs::read_to_string(index(project).join(INDEX_FILE)).unwrap(),
+                mine
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(outside.join("-p/memory").join(INDEX_FILE)).unwrap(),
+            held
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("index.md")).unwrap(),
+            held
+        );
+    }
+
+    /// A sweep returns when an index is something that blocks an open (a FIFO), counting it
+    /// unhandled, and a listing with more project folders than its limit leaves the version
+    /// unrecorded. A sweep that opened the index blocking would wait here for a writer that never
+    /// comes; one that counted a listing past its limit as complete records the version here.
+    #[test]
+    fn a_sweep_neither_waits_on_a_fifo_nor_lists_past_its_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("agit");
+        let _home = AgitHome::at(&home);
+        let config = d.path().join("claude");
+        let old = std::env::var_os("CLAUDE_CONFIG_DIR");
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &config) };
+        let memory = |project: &str| config.join("projects").join(project).join("memory");
+        for project in ["-a", "-b", "-c"] {
+            std::fs::create_dir_all(memory(project)).unwrap();
+            std::fs::write(memory(project).join(INDEX_FILE), "- [mine](mine.md)\n").unwrap();
+        }
+        let record = || std::fs::read_to_string(home.join(SWEPT_FILE)).ok();
+        let mut steps = Vec::new();
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(memory("-fifo")).unwrap();
+            let fifo = std::ffi::CString::new(
+                memory("-fifo")
+                    .join(INDEX_FILE)
+                    .into_os_string()
+                    .into_encoded_bytes(),
+            )
+            .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            let (sent, received) = std::sync::mpsc::channel();
+            let at = home.clone();
+            std::thread::spawn(move || {
+                let swept = on_a_new_lock(&at, || take_out_every_section_within(10));
+                sent.send(swept).unwrap()
+            });
+            let swept = received.recv_timeout(std::time::Duration::from_secs(20));
+            steps.push((swept.ok(), record()));
+            std::fs::remove_dir_all(config.join("projects/-fifo")).unwrap();
+        }
+        steps.push((
+            Some(on_a_new_lock(&home, || take_out_every_section_within(2))),
+            record(),
+        ));
+        steps.push((
+            Some(on_a_new_lock(&home, || take_out_every_section_within(3))),
+            record(),
+        ));
+        unsafe {
+            match old {
+                Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+        let incomplete = (Some(Sweep::default()), None);
+        let complete = (
+            Some(Sweep {
+                cleaned: 0,
+                complete: true,
+            }),
+            Some(crate::infra::config::BUILD_VERSION.to_owned()),
+        );
+        let expected: Vec<_> = if cfg!(unix) {
+            vec![incomplete.clone(), incomplete, complete]
+        } else {
+            vec![incomplete, complete]
+        };
+        assert_eq!(steps, expected);
+    }
+
+    /// Taking the sections out loses nothing a runtime writes to the index meanwhile. A writer that
+    /// opened the index before agit moved it aside, and writes after agit checked it, writes into
+    /// the file agit keeps in `.agit-kept/`, which stays while the index is cleaned. A save that
+    /// lands after agit read the index is linked back to the name and nothing is taken out; the
+    /// kept name stays too, so when the name is then replaced and the earlier writer writes again,
+    /// that write is still kept. An index written while the name was free stays, with the moved
+    /// one kept. A `.agit-kept` others could open is closed to them first. A take-out that removed
+    /// a kept name, put its cleaned copy over the name, or moved the index into a folder others can
+    /// open, fails here.
+    #[test]
+    fn taking_sections_out_keeps_what_is_written_meanwhile() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        let index = dir.join(INDEX_FILE);
+        let mine = "# Memory Index\n\n- [mine](mine.md)\n";
+        let held = format!(
+            "{mine}\n{INDEX_BEGIN} other/repo@old -->\n- [x](agit/other/repo/old/x.md)\n{INDEX_END}\n"
+        );
+        let late = "- [late](late.md)\n";
+        let saved = format!("{held}- [new](new.md)\n");
+        let kept = || {
+            let mut kept: Vec<String> = std::fs::read_dir(dir.join(KEPT_DIR))
+                .map(|entries| {
+                    entries
+                        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                        .collect()
+                })
+                .unwrap_or_default();
+            kept.sort();
+            kept
+        };
+        let clear_kept = || {
+            for entry in std::fs::read_dir(dir.join(KEPT_DIR)).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        };
+        let append = |writer: &mut std::fs::File| {
+            std::io::Write::write_all(writer, late.as_bytes()).unwrap();
+        };
+
+        // A `.agit-kept` that others could open is closed to them before anything moves into it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir(dir.join(KEPT_DIR)).unwrap();
+            std::fs::set_permissions(dir.join(KEPT_DIR), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::write(&index, &held).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .unwrap();
+        let taken = take_out_sections_with(dir, &mut |step| {
+            if step == TakeOut::Checked {
+                append(&mut writer);
+            }
+        })
+        .unwrap();
+        assert!(taken);
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), mine);
+        assert_eq!(kept(), [format!("{held}{late}")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join(KEPT_DIR))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+
+        clear_kept();
+        std::fs::write(&index, &held).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&index)
+            .unwrap();
+        let replaced = "- [replaced](replaced.md)\n";
+        let taken = take_out_sections_with(dir, &mut |step| match step {
+            TakeOut::Read => std::fs::write(&index, &saved).unwrap(),
+            TakeOut::Restored => {
+                let swap = dir.join("swap");
+                std::fs::write(&swap, replaced).unwrap();
+                std::fs::rename(&swap, &index).unwrap();
+                append(&mut writer);
+            }
+            TakeOut::Checked => {}
+        })
+        .unwrap();
+        assert!(!taken);
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), replaced);
+        assert_eq!(kept(), [format!("{saved}{late}")]);
+
+        clear_kept();
+        std::fs::write(&index, &held).unwrap();
+        let fresh = "- [only](only.md)\n";
+        let taken = take_out_sections_with(dir, &mut |step| {
+            if step == TakeOut::Checked {
+                std::fs::write(&index, fresh).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(!taken);
+        assert_eq!(std::fs::read_to_string(&index).unwrap(), fresh);
+        assert_eq!(kept(), [held]);
+        let mut top: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top.sort();
+        assert_eq!(top, [KEPT_DIR, INDEX_FILE]);
+    }
+
+    /// Taking agit's sections out of an index touches nothing else. A begin marker whose end marker
+    /// never comes stays, with what follows it: those lines may be the person's.
+    #[test]
+    fn taking_the_sections_out_leaves_every_other_line() {
+        let before = "# Memory Index\n\n- [mine](mine.md)\n\n<!-- agit:memory:begin me/qa@s1 -->\nold\n<!-- agit:memory:end -->\n\n- [after](after.md)\n";
+        assert_eq!(
+            strip_sections(before),
+            "# Memory Index\n\n- [mine](mine.md)\n\n- [after](after.md)\n"
+        );
+        let open = "- [mine](mine.md)\n\n<!-- agit:memory:begin me/qa@s1 -->\n- [kept](kept.md)\n";
+        assert_eq!(strip_sections(open), open);
+        assert_eq!(strip_sections("- [mine](mine.md)\n"), "- [mine](mine.md)\n");
     }
 }
