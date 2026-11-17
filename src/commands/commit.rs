@@ -1551,10 +1551,10 @@ pub(crate) fn drop_target(lk: &Link) -> Option<String> {
 pub(crate) fn refused_record_hint(target: Option<&str>) -> String {
     match target {
         Some(target) => format!(
-            "this conversation stays on this computer; to stop recording it for good: `agit project drop {}` (this can't be undone, and a later `agit save` of the conversation saves it into a new branch)",
-            ui::session::shell_arg(target)
+            "this conversation stays on this computer; to stop recording it: `agit project drop {target}` (`agit project undrop {target}` brings it back, and a later `agit save` of the conversation saves it into a new branch instead)",
+            target = ui::session::shell_arg(target)
         ),
-        None => "this conversation stays on this computer; to stop recording it for good: `agit project drop` inside it (this can't be undone, and a later `agit save` of the conversation saves it into a new branch)".into(),
+        None => "this conversation stays on this computer; to stop recording it: `agit project drop` inside it (`agit project undrop OWNER/REPO@BRANCH` brings it back, and a later `agit save` of the conversation saves it into a new branch instead)".into(),
     }
 }
 

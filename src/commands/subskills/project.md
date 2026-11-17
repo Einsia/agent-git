@@ -66,9 +66,13 @@ project branch that breaks it whatever its claim says; agit drops such conversat
 own and says once which. `drop` stops uploading a conversation from this computer: the named
 one, or without a target the conversation it runs in. It stops recording into its branch and
 the project no longer captures it; its local history stays. A copy already on the Hub stays
-there. A drop can't be undone: a later `agit save` of the conversation saves it into a new
-branch, and the dropped branch stays as it was. Run `drop` only when the user asks for it, and
-say this before running it. A conversation the user dropped is uploaded again only when the user asks for it. Don't run the `agit save` a push names for a dropped conversation on your own.
+there. `undrop OWNER/REPO@BRANCH` undoes a drop of that branch: the conversation records into
+it again, the folders' exclusions the drop added are lifted, and nothing else changes. It
+refuses, changing nothing, when something took the branch's place since: the conversation was
+saved into another branch, another conversation records into it, or the branch moved without
+it. A later `agit save` of a dropped conversation saves it into a new branch instead, and the
+dropped branch stays as it was. Run `drop` and `undrop` only when the user asks for them, and
+say this before running `drop`. A conversation the user dropped is uploaded again only when the user asks for it. Don't run the `agit save` a push names for a dropped conversation on your own.
 
 `status` reads the local policy and last sync result. It does not claim Hub indexing is
 complete. `unbind` pauses project hook capture and automatic publication for the selected
