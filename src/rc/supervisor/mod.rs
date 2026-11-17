@@ -837,6 +837,8 @@ pub const SETTLE_MAX_MS: u64 = 1500;
 
 /// What answering a pending approval needs to know. See `Session::pending`.
 struct PendingApproval {
+    /// A late native receipt belongs to the turn that raised the request.
+    turn_id: String,
     /// A session-scoped Claude approval changes the global driver mode. Keep
     /// the machine-originated prediction beside the authorization evidence so
     /// the execution side can require a durable danger permit before echoing a
@@ -863,7 +865,7 @@ impl PendingApproval {
             DenialProof::Taken => {
                 self.handed_denial = None;
                 if denied {
-                    denials.record(self.target.clone());
+                    denials.record(&self.turn_id, self.target.clone());
                 }
             }
             // A new hand-over replaces the earlier one, which the runtime then never takes.
@@ -882,7 +884,7 @@ impl PendingApproval {
             .is_some_and(|taken| *taken.borrow())
         {
             self.handed_denial = None;
-            denials.record(self.target.clone());
+            denials.record(&self.turn_id, self.target.clone());
         }
     }
 }
@@ -959,16 +961,36 @@ impl DenialProof {
 
 /// The approvals denied in the running turn, overall and per target. A new request carries both
 /// counts so a reader can tell it repeats one already refused; the runtime asks one call at a time,
-/// so nothing here can say how many are still to come. Cleared when the turn ends.
+/// so nothing here can say how many are still to come. A new turn replaces the ledger even if
+/// the previous turn's completion never arrives; late receipts cannot join the new ledger.
 #[derive(Default)]
 struct Denials {
+    turn_id: Option<String>,
     total: u32,
     by_target: std::collections::HashMap<Target, u32>,
 }
 
 impl Denials {
+    fn enter(&mut self, turn_id: &str) {
+        if self.turn_id.as_deref() != Some(turn_id) {
+            *self = Self {
+                turn_id: Some(turn_id.into()),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn finish(&mut self, turn_id: &str) {
+        if self.turn_id.as_deref() == Some(turn_id) {
+            *self = Self::default();
+        }
+    }
+
     /// An approval for `target` was denied.
-    fn record(&mut self, target: Option<Target>) {
+    fn record(&mut self, turn_id: &str, target: Option<Target>) {
+        if self.turn_id.as_deref() != Some(turn_id) {
+            return;
+        }
         self.total = self.total.saturating_add(1);
         if let Some(target) = target {
             let count = self.by_target.entry(target).or_default();
@@ -977,7 +999,10 @@ impl Denials {
     }
 
     /// The denials so far in this turn, and those for `target`.
-    fn of(&self, target: &Option<Target>) -> (u32, u32) {
+    fn of(&self, turn_id: &str, target: &Option<Target>) -> (u32, u32) {
+        if self.turn_id.as_deref() != Some(turn_id) {
+            return (0, 0);
+        }
         (
             self.total,
             target
@@ -2437,6 +2462,7 @@ impl Session {
         if !self.remember_announced_turn(turn_id.clone())? {
             return Ok(None);
         }
+        self.denials.enter(&turn_id);
         let (attribution, command_prompt) =
             if let Some((attribution, prompt)) = resolved_attribution {
                 (attribution, Some(prompt))
@@ -3497,6 +3523,16 @@ impl Session {
                 cost_usd,
                 duration_ms,
             } => {
+                // An announced older turn cannot settle the newer turn's approvals or activity.
+                if self.announced_turn_ids.contains(&turn_id)
+                    && self
+                        .denials
+                        .turn_id
+                        .as_deref()
+                        .is_some_and(|active| active != turn_id)
+                {
+                    return None;
+                }
                 if let Err(message) = self
                     .announce_turn_started_once(turn_id.clone(), None, None, false)
                     .await
@@ -3520,7 +3556,7 @@ impl Session {
                 // do this). A turn boundary is authoritative: no approval from
                 // that turn can still be answered.
                 self.abandon_pending_approvals().await;
-                self.denials = Denials::default();
+                self.denials.finish(&turn_id);
                 // Nor can a message held for one of its tool steps still reach it.
                 self.held_turn_over(
                     steer_queue::TurnOver::Ended(&turn_id),
@@ -3668,7 +3704,8 @@ impl Session {
                 for pending in self.pending.values_mut() {
                     pending.count_taken_denial(&mut self.denials);
                 }
-                (req.denied_this_turn, req.denied_same_target) = self.denials.of(&target);
+                (req.denied_this_turn, req.denied_same_target) =
+                    self.denials.of(&req.turn_id, &target);
                 crate::rc::diagnostics::event(
                     "approval.requested",
                     serde_json::json!({
@@ -3679,6 +3716,7 @@ impl Session {
                     }),
                 );
                 let authority = PendingApproval {
+                    turn_id: req.turn_id.clone(),
                     suggested_permission_mode: req.suggested_permission_mode,
                     target,
                     handed_denial: None,
