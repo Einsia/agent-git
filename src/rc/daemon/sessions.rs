@@ -230,21 +230,59 @@ impl Daemon {
         }
         // Dormant roster identities must remain discoverable after a daemon restart.
         // Native rows stay available for read-only history and explicit resume.
+        let catalog = self
+            .roster
+            .sessions
+            .values()
+            .any(|entry| entry.workspace_id == caller.workspace_id && entry.native_source.is_some())
+            .then(crate::rc::runtime_catalog::Catalog::open)
+            .and_then(Result::ok);
         let mut dormant = Vec::new();
         for (id, entry) in &self.roster.sessions {
             if self.sessions.contains_key(id)
                 || entry.workspace_id != caller.workspace_id
-                || entry.native_source.is_some()
+                || policy::require_within(Path::new(&entry.cwd), roots).is_err()
             {
                 continue;
             }
-            let Some(row) = native.get(&(entry.runtime.as_str(), entry.thread_id.as_str())) else {
-                continue;
+            let (title, gist, modified_at) = if let Some(source) = &entry.native_source {
+                // A native thread ID alone cannot identify a conversation across source homes.
+                let Some(row) = catalog.as_ref().and_then(|catalog| {
+                    catalog
+                        .lookup(&source.session_ref(&entry.thread_id))
+                        .ok()
+                        .flatten()
+                }) else {
+                    continue;
+                };
+                let project = entry
+                    .project_id
+                    .as_deref()
+                    .and_then(|id| self.mirror.project_path(&entry.workspace_id, id));
+                if row.source_id != source.source_id
+                    || row.native_session_id != entry.thread_id
+                    || row.runtime != entry.runtime
+                    || row.cwd != Path::new(&entry.cwd)
+                    || !project.is_some_and(|root| row.cwd.starts_with(root))
+                {
+                    continue;
+                }
+                let modified_at = row
+                    .updated_at_ms
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .unwrap_or_default()
+                    .to_rfc3339();
+                (row.title, row.gist, modified_at)
+            } else {
+                let Some(row) = native.get(&(entry.runtime.as_str(), entry.thread_id.as_str()))
+                else {
+                    continue;
+                };
+                if row.cwd != entry.cwd {
+                    continue;
+                }
+                (row.title.clone(), row.gist.clone(), row.modified_at.clone())
             };
-            if row.cwd != entry.cwd || policy::require_within(Path::new(&entry.cwd), roots).is_err()
-            {
-                continue;
-            }
             let lineage = entry
                 .agit_session
                 .as_deref()
@@ -252,13 +290,17 @@ impl Daemon {
                 .and_then(|(route, identity)| {
                     crate::rc::lineage::AgitSession::parse(route, identity).ok()
                 });
+            let source_id = entry
+                .native_source
+                .as_ref()
+                .map(|source| source.source_id.as_str());
             dormant.push(self.stamped(SessionInfo {
                 interrupt_fenced: None,
                 interrupted: self.roster.interrupted.get(id).cloned(),
                 paused: self.roster.paused.get(id).cloned(),
                 lease: None,
                 publication: None,
-                native_source: None,
+                native_source: entry.native_source.clone(),
                 session_id: id.clone(),
                 runtime_session_id: Some(entry.thread_id.clone()),
                 workspace_id: entry.workspace_id.clone(),
@@ -268,18 +310,19 @@ impl Daemon {
                 branch: lineage.as_ref().map(|lineage| lineage.branch().into()),
                 status: SessionStatus::Ended,
                 last_seq: 0,
-                title: row.title.clone(),
+                title,
                 labels_withheld: None,
-                gist: row.gist.clone(),
-                dangerous: self.roster.transcript_ever_dangerous(
+                gist,
+                dangerous: self.roster.transcript_ever_dangerous_in(
                     &entry.runtime,
+                    source_id,
                     &entry.thread_id,
                     &entry.workspace_id,
                     &entry.cwd,
                 ),
                 permission_mode: entry.restart_permission_mode(),
-                created_at: row.modified_at.clone(),
-                updated_at: row.modified_at.clone(),
+                created_at: modified_at.clone(),
+                updated_at: modified_at,
             }));
         }
         let snapshot = self.local_session_scan(self.roots_for(&caller));

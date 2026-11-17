@@ -2956,13 +2956,14 @@ fn resumed_launch_does_not_replay_the_initial_model() {
     });
 }
 
-/// Restart catalogs retain logical identity without starting another native writer.
-#[tokio::test]
-async fn dormant_capture_is_discoverable_with_its_native_identity() {
+/// Dormant rows join project and logical identity to the exact native source, without a writer.
+#[test]
+fn dormant_capture_is_discoverable_with_its_native_identity() {
     let root = tempfile::tempdir().unwrap();
-    let cwd = root.path().canonicalize().unwrap();
-    let mut roster = Roster::default();
-    roster
+    crate::rc::with_agit_home(root.path(), || {
+        let cwd = root.path().canonicalize().unwrap();
+        let mut roster = Roster::default();
+        roster
         .record(
             "logical",
             serde_json::from_value(serde_json::json!({
@@ -2973,45 +2974,130 @@ async fn dormant_capture_is_discoverable_with_its_native_identity() {
             .unwrap(),
         )
         .unwrap();
-    let daemon = rpc_test_daemon(HashMap::new(), roster);
-    let mut state = daemon.lock().await;
-    state.opts.local_owner = true;
-    state.mirror.bind("ws-a", "project", &cwd).unwrap();
-    let frame = frame_with(
-        Some(claim("owner", "ws-a")),
-        serde_json::json!({"workspace_id":"ws-a"}),
-    );
-    let snapshot = state.prepare_session_list(&frame).unwrap();
-    let native = LocalSession {
-        runtime_session_id: "native".into(),
-        runtime: "claude-code".into(),
-        cwd: cwd.to_string_lossy().into(),
-        modified_at: "2026-09-26T00:00:00Z".into(),
-        gist: Some("History".into()),
-        title: None,
-        labels_withheld: None,
-        adopted: true,
-        agent: Some("alice/imported".into()),
-        likely_active: false,
-    };
-    let listed = state
-        .finish_session_list(&frame, &snapshot.roots, vec![native.clone()])
-        .unwrap();
-    assert_eq!(listed["sessions"][0]["session_id"], "logical");
-    assert_eq!(listed["sessions"][0]["runtime_session_id"], "native");
-    assert_eq!(listed["sessions"][0]["branch"], "work");
-    assert_eq!(listed["sessions"][0]["status"], "ended");
-    assert_eq!(
-        listed["sessions"][0]["publication"]["readiness"],
-        "checking"
-    );
-    assert!(state.sessions.is_empty());
-    let mut foreign = native;
-    foreign.cwd.push_str("/different");
-    let listed = state
-        .finish_session_list(&frame, &snapshot.roots, vec![foreign])
-        .unwrap();
-    assert!(listed["sessions"].as_array().unwrap().is_empty());
+        let daemon = rpc_test_daemon(HashMap::new(), roster);
+        let mut state = daemon.try_lock().unwrap();
+        state.opts.local_owner = true;
+        state.mirror.bind("ws-a", "project", &cwd).unwrap();
+        let frame = frame_with(
+            Some(claim("owner", "ws-a")),
+            serde_json::json!({"workspace_id":"ws-a"}),
+        );
+        let snapshot = state.prepare_session_list(&frame).unwrap();
+        let native = LocalSession {
+            runtime_session_id: "native".into(),
+            runtime: "claude-code".into(),
+            cwd: cwd.to_string_lossy().into(),
+            modified_at: "2026-09-26T00:00:00Z".into(),
+            gist: Some("History".into()),
+            title: None,
+            labels_withheld: None,
+            adopted: true,
+            agent: Some("alice/imported".into()),
+            likely_active: false,
+        };
+        let listed = state
+            .finish_session_list(&frame, &snapshot.roots, vec![native.clone()])
+            .unwrap();
+        assert_eq!(listed["sessions"][0]["session_id"], "logical");
+        assert_eq!(listed["sessions"][0]["runtime_session_id"], "native");
+        assert_eq!(listed["sessions"][0]["branch"], "work");
+        assert_eq!(listed["sessions"][0]["status"], "ended");
+        assert_eq!(
+            listed["sessions"][0]["publication"]["readiness"],
+            "checking"
+        );
+        assert!(state.sessions.is_empty());
+        let mut foreign = native;
+        foreign.cwd.push_str("/different");
+        let listed = state
+            .finish_session_list(&frame, &snapshot.roots, vec![foreign])
+            .unwrap();
+        assert!(listed["sessions"].as_array().unwrap().is_empty());
+
+        // Equal thread IDs in different enrolled homes must not borrow each other's project row.
+        let registry = crate::rc::runtime_sources::Registry::open().unwrap();
+        let catalog = crate::rc::runtime_catalog::Catalog::open().unwrap();
+        let mut sources = Vec::new();
+        for name in ["alpha", "beta"] {
+            let home = cwd.join(name);
+            std::fs::create_dir(&home).unwrap();
+            let db = rusqlite::Connection::open(home.join("state_1.sqlite")).unwrap();
+            db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, first_user_message TEXT, thread_source TEXT, updated_at_ms INTEGER, archived INTEGER)").unwrap();
+            db.execute(
+                "INSERT INTO threads VALUES ('same-native',?1,?2,?3,'cli',1,0)",
+                rusqlite::params![home.join("unopened.jsonl").to_str(), cwd.to_str(), name],
+            )
+            .unwrap();
+            let source = registry.register(&home, None, None, None).unwrap();
+            state.roster.record(name, serde_json::from_value(serde_json::json!({
+            "native_source":{"source_id":source.source_id,"generation":source.generation},
+            "runtime":"codex", "thread_id":"same-native", "cwd":cwd,
+            "workspace_id":"ws-a", "project_id":"project", "ever_dangerous":name == "alpha",
+        })).unwrap()).unwrap();
+            state.roster.observed.insert(name.into());
+            sources.push(source);
+        }
+        for _ in &sources {
+            catalog.reconcile(&snapshot.roots).unwrap();
+        }
+        let listed = state
+            .finish_session_list(&frame, &snapshot.roots, vec![])
+            .unwrap();
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), sources.len());
+        for (name, source) in ["alpha", "beta"].into_iter().zip(&sources) {
+            let row = listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["session_id"] == name)
+                .unwrap();
+            assert_eq!(row["project_id"], "project");
+            assert_eq!(row["runtime_session_id"], "same-native");
+            assert_eq!(row["native_source"]["source_id"], source.source_id);
+            assert_eq!(row["gist"], name);
+            assert_eq!(row["dangerous"], name == "alpha");
+            assert_eq!(row["status"], "ended");
+        }
+        assert!(state.sessions.is_empty() && state.opening_sessions.is_empty());
+
+        // Registry retirement, a changed folder, or a missing project must not expose a cached row.
+        registry.remove(&sources[0].source_id).unwrap();
+        let listed = state
+            .finish_session_list(&frame, &snapshot.roots, vec![])
+            .unwrap();
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["sessions"][0]["session_id"], "beta");
+        state.roster.sessions.get_mut("beta").unwrap().project_id = Some("unbound".into());
+        assert!(
+            state
+                .finish_session_list(&frame, &snapshot.roots, vec![])
+                .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        state.roster.sessions.get_mut("beta").unwrap().project_id = Some("project".into());
+        state.roster.sessions.get_mut("beta").unwrap().cwd =
+            cwd.join("different").to_string_lossy().into();
+        assert!(
+            state
+                .finish_session_list(&frame, &snapshot.roots, vec![])
+                .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        state.roster.sessions.get_mut("beta").unwrap().cwd = cwd.to_string_lossy().into();
+        state.roster.sessions.get_mut("beta").unwrap().workspace_id = "ws-b".into();
+        assert!(
+            state
+                .finish_session_list(&frame, &snapshot.roots, vec![])
+                .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    });
 }
 
 // Equivalent folder aliases must reconnect to the same writer and archive.
