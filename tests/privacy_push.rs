@@ -14625,3 +14625,562 @@ fn the_folder_answer_counts_the_turns_the_hub_has_not_received() {
         .unwrap();
     unknown("alice/app@talk:");
 }
+
+/// A folder bound to alice/app with automatic upload on, whose Claude Code conversations each
+/// settle onto a branch of their own and upload at their turn ends, for `agit project undrop`.
+struct UndropLab {
+    temp: tempfile::TempDir,
+    home: PathBuf,
+    work: PathBuf,
+    repo: Repo,
+    remote: PathBuf,
+    hub: Hub,
+}
+
+impl UndropLab {
+    fn new(seed: u8) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("agit");
+        startup_cache::seed(&home);
+        let remote_root = temp.path().join("remote");
+        let remote = remote_root.join("alice/app.git");
+        let hub = Hub::start(&remote_root, [seed; 32]);
+        save_at(
+            &home
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let work = work.canonicalize().unwrap();
+        let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+        for (key, value) in [
+            ("http.userAgent", TRANSPORT_USER_AGENT),
+            ("user.name", "Source Writer"),
+            ("user.email", "source@example.invalid"),
+            ("agit.autoPush", "true"),
+        ] {
+            repo.git(&["config", key, value]).unwrap();
+        }
+        meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+        fs::write(repo.root().join("README.md"), "Shared file").unwrap();
+        repo.add_all().unwrap();
+        repo.commit("File line").unwrap();
+        let lab = Self {
+            temp,
+            home,
+            work,
+            repo,
+            remote,
+            hub,
+        };
+        assert_success(&lab.run(&["--yes", "push", "alice/app@main"], None));
+        assert_success(&lab.run(
+            &[
+                "--yes",
+                "project",
+                "bind",
+                lab.work.to_str().unwrap(),
+                "--repo",
+                "alice/app",
+                "--history",
+                "none",
+            ],
+            None,
+        ));
+        lab.change_policy(&|policy| policy["auto_upload"] = json!(true));
+        lab
+    }
+
+    fn run(&self, args: &[&str], input: Option<String>) -> Output {
+        let mut child = self.spawn(args);
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(input.unwrap_or_default().as_bytes())
+            .unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    }
+
+    /// `agit args` started in the folder, its stdin, stdout and stderr piped.
+    fn spawn(&self, args: &[&str]) -> std::process::Child {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in git_command(self.temp.path()).get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(&self.work)
+            .env("AGIT_HOME", &self.home)
+            .env("AGIT_HUB_URL", &self.hub.base)
+            .env("CI", "1")
+            .env("AGIT_TUI", "0")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("AGIT_SECRETS_KEYSTORE", "file")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args(args)
+            .spawn()
+            .unwrap()
+    }
+
+    fn said(output: &Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    fn change_policy(&self, change: &dyn Fn(&mut serde_json::Value)) {
+        for entry in fs::read_dir(self.home.join("projects")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "json")
+                && path.file_stem().is_some_and(|stem| stem.len() == 24)
+            {
+                let mut policy: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                change(&mut policy);
+                fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// The folder's policy lock file, as a capture of the folder holds it.
+    fn folder_lock(&self) -> PathBuf {
+        fs::read_dir(self.home.join("projects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension().is_some_and(|e| e == "json")
+                    && path.file_stem().is_some_and(|stem| stem.len() == 24)
+            })
+            .unwrap()
+            .with_extension("lock")
+    }
+
+    fn excluded(&self) -> Vec<String> {
+        let mut excluded = Vec::new();
+        self.change_policy(&|_| {});
+        for entry in fs::read_dir(self.home.join("projects")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "json")
+                && path.file_stem().is_some_and(|stem| stem.len() == 24)
+            {
+                let policy: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                for key in policy["excluded"].as_array().unwrap() {
+                    excluded.push(key.as_str().unwrap().to_owned());
+                }
+            }
+        }
+        excluded
+    }
+
+    fn withheld(&self) -> Vec<serde_json::Value> {
+        fs::read(self.home.join("projects/withheld"))
+            .ok()
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_default()
+    }
+
+    fn drop_record(&self, branch: &str) -> Option<Vec<u8>> {
+        use sha2::Digest as _;
+        let name = &hex::encode(sha2::Sha256::digest(format!("alice/app@{branch}")))[..24];
+        fs::read(self.home.join(format!("projects/dropped/{name}.json"))).ok()
+    }
+
+    fn link(&self, session: &str) -> PathBuf {
+        self.home
+            .join("store/claude-code")
+            .join(format!("{session}.json"))
+    }
+
+    fn branches(&self) -> std::collections::BTreeSet<String> {
+        git(
+            self.repo.root(),
+            &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )
+        .lines()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn tip(&self, branch: &str) -> String {
+        git(
+            self.repo.root(),
+            &["rev-parse", &format!("refs/heads/{branch}")],
+        )
+    }
+
+    fn on_hub(&self, branch: &str) -> String {
+        git(
+            &self.remote,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+    }
+
+    /// Ends a turn of `session`'s transcript (one more prompt and answer) through its Stop hook,
+    /// and waits for `done`: the folder's worker runs detached from the hook.
+    fn turn(&self, session: &str, turn: u32, done: &dyn Fn() -> bool) {
+        let transcript = self
+            .temp
+            .path()
+            .join(".claude/projects")
+            .join(agit::domain::store::slug_for(&self.work))
+            .join(format!("{session}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let cwd = self.work.to_string_lossy();
+        let mut records = fs::read_to_string(&transcript).unwrap_or_default();
+        records.push_str(&format!(
+            "{}\n{}\n",
+            json!({"type":"user","sessionId":session,"cwd":cwd,"uuid":format!("u{turn}"),
+                "parentUuid":(turn > 1).then(|| format!("a{}", turn - 1)),
+                "timestamp":format!("2026-11-02T00:00:0{turn}.000Z"),
+                "message":{"role":"user","content":format!("step {turn}")}}),
+            json!({"type":"assistant","sessionId":session,"cwd":cwd,"uuid":format!("a{turn}"),
+                "parentUuid":format!("u{turn}"),
+                "timestamp":format!("2026-11-02T00:00:0{turn}.500Z"),
+                "message":{"role":"assistant","stop_reason":"end_turn",
+                    "content":[{"type":"text","text":"done"}]}}),
+        ));
+        fs::write(&transcript, records).unwrap();
+        assert_success(
+            &self.run(
+                &["hooks", "settle", "--runtime", "claude-code"],
+                Some(
+                    json!({"session_id":session,"cwd":self.work,"transcript_path":transcript,
+                    "hook_event_name":"Stop"})
+                    .to_string(),
+                ),
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !done() {
+            assert!(Instant::now() < deadline, "the turn's outcome never came");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The first turn of `session`: the folder captures it on a new branch and uploads it.
+    fn first_turn(&self, session: &str) -> String {
+        let before = self.branches();
+        let found = std::cell::RefCell::new(None);
+        self.turn(session, 1, &|| {
+            let new = self.branches().difference(&before).next().cloned();
+            let uploaded = new
+                .as_ref()
+                .is_some_and(|branch| !self.on_hub(branch).is_empty());
+            *found.borrow_mut() = new;
+            uploaded
+        });
+        found.into_inner().unwrap()
+    }
+}
+
+/// `agit project undrop` puts back exactly what `agit project drop` of a branch took: the same
+/// claim, byte for byte, on the same branch, and the folder's exclusion. A second drop keeps the
+/// record the first wrote, so after a whole drop, with no claim left, the undo still has it. The
+/// conversation's next turn settles onto its old branch and uploads by itself. An undo that wrote
+/// a fresh claim, a second drop that recorded what was left (nothing), or an undo that left the
+/// exclusion would each fail here.
+#[test]
+fn an_undropped_branch_records_and_uploads_its_conversation_again() {
+    const SESSION: &str = "a1a1a1a1-0000-4000-8000-000000000491";
+    let lab = UndropLab::new(37);
+    let branch = lab.first_turn(SESSION);
+    let target = format!("alice/app@{branch}");
+    let claim = fs::read(lab.link(SESSION)).unwrap();
+
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    assert!(!lab.link(SESSION).exists());
+    assert!(lab.excluded().contains(&format!("claude-code:{SESSION}")));
+    let record = lab.drop_record(&branch).expect("the drop is recorded");
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    assert_eq!(
+        lab.drop_record(&branch),
+        Some(record),
+        "a second drop keeps the record"
+    );
+
+    let undone = lab.run(&["project", "undrop", &target], None);
+    assert_success(&undone);
+    let said = UndropLab::said(&undone);
+    for expected in [
+        format!("{target} is back: the claude-code conversation {SESSION} records into it again."),
+        "Its turns upload by themselves again.".to_owned(),
+    ] {
+        assert!(said.contains(&expected), "{expected}\n---\n{said}");
+    }
+    assert_eq!(fs::read(lab.link(SESSION)).unwrap(), claim);
+    assert!(!lab.excluded().contains(&format!("claude-code:{SESSION}")));
+    assert!(lab.withheld().is_empty(), "{:?}", lab.withheld());
+    assert_eq!(lab.drop_record(&branch), None);
+
+    let before = (lab.branches(), lab.tip(&branch), lab.on_hub(&branch));
+    lab.turn(SESSION, 2, &|| lab.on_hub(&branch) != before.2);
+    assert_eq!(lab.branches(), before.0, "no new branch");
+    assert_ne!(lab.tip(&branch), before.1);
+}
+
+/// An undo changes nothing when something took the branch's place or still holds it, and finishes
+/// what an interrupted undo began:
+/// - its claims already written back, and a turn settled onto the branch since, a rerun finishes;
+/// - the conversation saved into a new branch since the drop: refused, the new claim untouched;
+/// - a branch held back because its conversation started outside the folder before the drop: the
+///   claim comes back, the hold stays and the output names it;
+/// - a drop made before agit kept a record: with a conversation, nothing changes; without one, only
+///   the drop is lifted.
+/// - signed out: the undo says the turns upload again after `agit login`, not that they do now;
+/// - the folder bound to another repository since the drop: a drop run again and the undo leave
+///   that repository's settings as they are, and say so.
+/// An undo that overwrote a newer claim, cleared another hold, or guessed at an old drop would
+/// fail here.
+#[test]
+fn undrop_finishes_its_own_work_and_changes_nothing_that_moved() {
+    const RESUMED: &str = "b2b2b2b2-0000-4000-8000-000000000491";
+    const MOVED: &str = "c3c3c3c3-0000-4000-8000-000000000491";
+    const OUTSIDE: &str = "d4d4d4d4-0000-4000-8000-000000000491";
+    let lab = UndropLab::new(39);
+
+    // Interrupted after writing the claim back; a turn settled before the rerun.
+    let branch = lab.first_turn(RESUMED);
+    let target = format!("alice/app@{branch}");
+    let claim = fs::read(lab.link(RESUMED)).unwrap();
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    fs::write(lab.link(RESUMED), &claim).unwrap();
+    let tip = lab.tip(&branch);
+    lab.turn(RESUMED, 2, &|| lab.tip(&branch) != tip);
+    assert_success(&lab.run(&["project", "undrop", &target], None));
+    assert!(!lab.excluded().contains(&format!("claude-code:{RESUMED}")));
+    assert!(lab.withheld().is_empty(), "{:?}", lab.withheld());
+    assert_eq!(lab.drop_record(&branch), None);
+
+    // Saved into another branch since the drop.
+    let branch = lab.first_turn(MOVED);
+    let target = format!("alice/app@{branch}");
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    assert_success(&lab.run(&["--json", "save", MOVED], None));
+    let newer = fs::read(lab.link(MOVED)).unwrap();
+    let held = lab.withheld();
+    let refused = lab.run(&["project", "undrop", &target], None);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        UndropLab::said(&refused).contains(&format!(
+            "can't bring {target} back: the claude-code conversation {MOVED} records somewhere else now; nothing changed"
+        )),
+        "{}",
+        UndropLab::said(&refused)
+    );
+    assert_eq!(fs::read(lab.link(MOVED)).unwrap(), newer);
+    assert_eq!(lab.withheld(), held);
+    assert!(lab.drop_record(&branch).is_some());
+
+    // Held back for another reason before the drop.
+    let branch = lab.first_turn(OUTSIDE);
+    let target = format!("alice/app@{branch}");
+    let mut held = lab.withheld();
+    held.push(json!({"repository":"alice/app","branch":branch,
+        "session":format!("claude-code:{OUTSIDE}"),"reason":"started_outside","announced":true}));
+    fs::write(
+        lab.home.join("projects/withheld"),
+        serde_json::to_vec(&held).unwrap(),
+    )
+    .unwrap();
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    let undone = lab.run(&["project", "undrop", &target], None);
+    assert_success(&undone);
+    assert!(
+        UndropLab::said(&undone)
+            .contains("It is still held back from upload because the conversation started outside the project folder."),
+        "{}",
+        UndropLab::said(&undone)
+    );
+    assert!(lab.link(OUTSIDE).exists());
+    assert!(
+        lab.withheld()
+            .iter()
+            .any(|r| r["branch"] == branch && r["reason"] == "started_outside")
+    );
+
+    // Dropped before agit kept a record.
+    let mut held = lab.withheld();
+    held.push(json!({"repository":"alice/app","branch":"old-with",
+        "session":"claude-code:e5e5e5e5-0000-4000-8000-000000000491","reason":"dropped","announced":true}));
+    held.push(json!({"repository":"alice/app","branch":"old-without",
+        "session":null,"reason":"dropped","announced":true}));
+    fs::write(
+        lab.home.join("projects/withheld"),
+        serde_json::to_vec(&held).unwrap(),
+    )
+    .unwrap();
+    let kept = lab.run(&["project", "undrop", "alice/app@old-with"], None);
+    assert!(!kept.status.success(), "{kept:?}");
+    assert!(
+        UndropLab::said(&kept).contains("was dropped before agit kept what it needs to bring the conversation back; nothing changed"),
+        "{}",
+        UndropLab::said(&kept)
+    );
+    assert_success(&lab.run(&["project", "undrop", "alice/app@old-without"], None));
+    let left: Vec<_> = lab
+        .withheld()
+        .iter()
+        .filter_map(|r| r["branch"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        left.contains(&"old-with".to_owned()) && !left.contains(&"old-without".to_owned()),
+        "{left:?}"
+    );
+
+    // Signed out: the undo says the turns upload again only after `agit login`, as the start
+    // notice does.
+    const SIGNED_OUT: &str = "f6f6f6f6-0000-4000-8000-000000000491";
+    let branch = lab.first_turn(SIGNED_OUT);
+    let target = format!("alice/app@{branch}");
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    let credential = lab.home.join("credentials").join(format!(
+        "{}.json",
+        config::hub_host_key(&lab.hub.base).unwrap()
+    ));
+    let saved = fs::read(&credential).unwrap();
+    fs::remove_file(&credential).unwrap();
+    let undone = lab.run(&["project", "undrop", &target], None);
+    assert_success(&undone);
+    let said = UndropLab::said(&undone);
+    assert!(
+        said.contains("agit isn't signed in: after `agit login` its turns are saved and upload to alice/app by themselves again.")
+            && !said.contains("Its turns upload by themselves again."),
+        "{said}"
+    );
+    fs::write(&credential, saved).unwrap();
+
+    // The folder bound to another repository after the drop: a drop run again after an
+    // interruption, and the undo, leave that repository's settings as they are, and say so.
+    const REBOUND: &str = "a7a7a7a7-0000-4000-8000-000000000491";
+    let branch = lab.first_turn(REBOUND);
+    let target = format!("alice/app@{branch}");
+    let claim = fs::read(lab.link(REBOUND)).unwrap();
+    let left_out = format!("claude-code:{REBOUND}");
+    assert_success(&lab.run(&["project", "drop", &target], None));
+    lab.change_policy(&|policy| {
+        policy["repository"] = json!("alice/other");
+        policy["excluded"] = json!([]);
+    });
+    let moved = "isn't bound to alice/app any more, so its settings were left as they are.";
+    fs::write(lab.link(REBOUND), &claim).unwrap();
+    let again = lab.run(&["project", "drop", &target], None);
+    assert_success(&again);
+    assert!(
+        UndropLab::said(&again).contains(moved),
+        "{}",
+        UndropLab::said(&again)
+    );
+    assert!(
+        !lab.excluded().contains(&left_out),
+        "a drop run again changed the other repository's folder"
+    );
+    lab.change_policy(&|policy| policy["excluded"] = json!([left_out.clone()]));
+    let undone = lab.run(&["project", "undrop", &target], None);
+    assert_success(&undone);
+    let said = UndropLab::said(&undone);
+    assert!(
+        said.contains(moved)
+            && said.contains(&format!(
+                "{target} is back: the claude-code conversation {REBOUND} records into it again."
+            )),
+        "{said}"
+    );
+    assert!(
+        lab.excluded().contains(&left_out),
+        "the undo changed the other repository's folder"
+    );
+    assert_eq!(fs::read(lab.link(REBOUND)).unwrap(), claim);
+}
+
+/// A drop takes its locks in the order every other path takes them: the folders' first, then the
+/// branch's, then each claim's. A capture holds its folder's lock while the import it waits on
+/// takes the branch's. So while a capture holds the folder, a drop waiting for it holds nothing
+/// that import needs, and both finish. A drop that took the branch's lock first and then waited
+/// for the folder's would leave the import, the capture and itself waiting for ever.
+#[test]
+fn a_drop_waiting_for_a_folder_holds_no_branch_lock() {
+    use std::io::BufRead as _;
+    const SESSION: &str = "f8f8f8f8-0000-4000-8000-000000000491";
+    let lab = UndropLab::new(43);
+    let branch = lab.first_turn(SESSION);
+    let target = format!("alice/app@{branch}");
+
+    // The capture: the folder's lock held.
+    let folder = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lab.folder_lock())
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&folder).unwrap();
+
+    // The drop starts, and says when it is waiting for the folder.
+    let mut dropping = lab.spawn(&["project", "drop", &target]);
+    std::mem::drop(dropping.stdin.take().unwrap());
+    let stderr = dropping.stderr.take().unwrap();
+    let (waiting, waits) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut said = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line
+                .contains("waiting for another agit process to release the project operation lock")
+            {
+                let _ = waiting.send(());
+            }
+            said.push_str(&line);
+            said.push('\n');
+        }
+        said
+    });
+    waits
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the drop waits for the folder's lock");
+
+    // The import the capture waits on takes the branch's lock.
+    let (store, repository, wanted) = (
+        agit::domain::store::Store::at(lab.home.join("store")),
+        "alice/app".to_owned(),
+        branch.clone(),
+    );
+    let (taken, takes) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let guard = agit::domain::link::lock_branch(&store, &repository, &wanted);
+        let _ = taken.send(guard.is_ok());
+    });
+    let took = takes.recv_timeout(std::time::Duration::from_secs(20));
+    fs2::FileExt::unlock(&folder).unwrap();
+    assert_eq!(
+        took,
+        Ok(true),
+        "the drop held the branch's lock while it waited for the folder's"
+    );
+    let status = dropping.wait().unwrap();
+    let said = reader.join().unwrap();
+    assert!(status.success(), "{said}");
+    assert!(!lab.link(SESSION).exists(), "{said}");
+}

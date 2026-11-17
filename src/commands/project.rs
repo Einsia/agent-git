@@ -69,6 +69,12 @@ pub enum Action {
         #[arg(value_name = "OWNER/REPO@BRANCH")]
         target: Option<String>,
     },
+    /// Undo `agit project drop` of a branch: the conversation records into it again.
+    Undrop {
+        /// The branch that was dropped.
+        #[arg(value_name = "OWNER/REPO@BRANCH")]
+        target: String,
+    },
     /// Publish the project's hook-reported sessions; the hook that starts it does not wait.
     #[command(hide = true)]
     Capture { path: PathBuf },
@@ -2386,6 +2392,7 @@ pub fn run(args: Args) -> CmdResult {
             Ok(ExitCode::Ok)
         }
         Action::Drop { target } => drop_command(target.as_deref()),
+        Action::Undrop { target } => undrop_command(&target),
         Action::Sync { path, dry_run } => {
             let root = root(&path)?;
             let mut project = read(&root)?.context("bind this directory first")?;
@@ -4182,7 +4189,7 @@ pub(crate) fn save_now(
         // `--all` and `--today` ask for earlier sessions, never for one the person dropped.
         if project.excluded.contains(&session_key) {
             saved.push(Saved::Refused(format!(
-                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`, which saves it into a new branch"
+                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`, which saves it into a new branch, or bring it back to its branch: `agit project undrop OWNER/REPO@BRANCH`"
             )));
             continue;
         }
@@ -5042,6 +5049,38 @@ fn release(
     reason: Withholding,
     announced: bool,
 ) -> Result<()> {
+    withhold(slug, branch, claims, reason, announced)?;
+    for claim in claims.iter().filter(|c| c.is_active()) {
+        let _guard = link::lock(store, &claim.source, &claim.session_id)?;
+        unclaim(store, slug, branch, claim)?;
+    }
+    Ok(())
+}
+
+/// [`release`], with every claim's link lock already held by the caller.
+fn release_locked(
+    store: &Store,
+    slug: &str,
+    branch: &str,
+    claims: &[link::Link],
+    reason: Withholding,
+    announced: bool,
+) -> Result<()> {
+    withhold(slug, branch, claims, reason, announced)?;
+    for claim in claims.iter().filter(|c| c.is_active()) {
+        unclaim(store, slug, branch, claim)?;
+    }
+    Ok(())
+}
+
+/// Records the branch as withheld for `reason`, unless a record for it is already there.
+fn withhold(
+    slug: &str,
+    branch: &str,
+    claims: &[link::Link],
+    reason: Withholding,
+    announced: bool,
+) -> Result<()> {
     let session = claims
         .iter()
         .find(|c| c.is_active())
@@ -5060,14 +5099,16 @@ fn release(
             });
         }
     })?;
+    Ok(())
+}
+
+/// Removes the claim's link when it still records into `slug@branch`; the caller holds its lock.
+fn unclaim(store: &Store, slug: &str, branch: &str, claim: &link::Link) -> Result<()> {
     let (owner, agent) = super::parse_slug(slug)?;
-    for claim in claims.iter().filter(|c| c.is_active()) {
-        let _guard = link::lock(store, &claim.source, &claim.session_id)?;
-        if link::get(store, &claim.source, &claim.session_id)
-            .is_some_and(|current| link::claims_branch(&current, &owner, &agent, branch))
-        {
-            link::remove(store, &claim.source, &claim.session_id)?;
-        }
+    if link::get(store, &claim.source, &claim.session_id)
+        .is_some_and(|current| link::claims_branch(&current, &owner, &agent, branch))
+    {
+        link::remove(store, &claim.source, &claim.session_id)?;
     }
     Ok(())
 }
@@ -5159,6 +5200,11 @@ fn announce_dropped() -> Result<()> {
 /// Keeps a project from capturing the session into a new branch.
 fn exclude(root: &Path, session: &str) -> Result<()> {
     let _guard = lock(root)?;
+    exclude_locked(root, session)
+}
+
+/// [`exclude`], with the folder's policy lock already held by the caller.
+fn exclude_locked(root: &Path, session: &str) -> Result<()> {
     if let Some(mut current) = read(root)?
         && current.excluded.insert(session.into())
     {
@@ -5209,30 +5255,101 @@ fn drop_command(target: Option<&str>) -> CmdResult {
             }
         },
     };
-    let (repository, branch) = target
-        .split_once('@')
-        .filter(|(_, branch)| !branch.is_empty())
-        .context("name the conversation as OWNER/REPO@BRANCH")?;
+    let (repository, branch) = split_target(&target)?;
     let (owner, agent) = super::parse_slug(repository)?;
-    let projects: Vec<_> = policies()?
-        .into_iter()
-        .filter(|p| p.repository == repository)
-        .collect();
     let store = Store::at(config::store_root()?);
-    let claims = link::active_for_branch(&store, &owner, &agent, branch);
+    let DropLocks {
+        folders,
+        _held,
+        _branch,
+        record: earlier,
+    } = lock_drop(&store, repository, branch)?;
+    let mut listed = link::active_for_branch(&store, &owner, &agent, branch);
+    listed.sort_by(|a, b| (&a.source, &a.session_id).cmp(&(&b.source, &b.session_id)));
+    let _links = listed
+        .iter()
+        .map(|claim| link::lock(&store, &claim.source, &claim.session_id))
+        .collect::<Result<Vec<_>>>()?;
+    // A claim listed before its lock was taken can have moved to another branch since (an import
+    // holds that branch's lock, not this one's): only what still claims this branch under its
+    // lock is recorded, left out and released.
+    let claims: Vec<_> = listed
+        .iter()
+        .filter_map(|claim| link::get(&store, &claim.source, &claim.session_id))
+        .filter(|claim| link::claims_branch(claim, &owner, &agent, branch))
+        .collect();
+    let mut roots = Vec::new();
+    for root in &folders {
+        if bound_to(root, repository)? {
+            roots.push(root.clone());
+        }
+    }
     // A conversation imported by hand records into its branch without any project, and dropping
     // it must still stop that; only a target that neither a project nor a conversation names is
     // a mistake.
     ensure!(
-        !projects.is_empty() || !claims.is_empty(),
+        !roots.is_empty() || !claims.is_empty(),
         "no project on this machine is bound to {repository}, and no conversation here records into {target}"
     );
+    // What the undo needs is on disk before anything changes, and a drop that finds a record
+    // from an earlier or interrupted drop of the branch only adds to it: after a whole drop no
+    // claim is left, and a record taken again would have nothing to bring back.
+    let mut record = earlier.unwrap_or_else(|| {
+        let (tip, session) = branch_tip(&owner, &agent, branch);
+        DropRecord {
+            repository: repository.to_owned(),
+            branch: branch.to_owned(),
+            tip,
+            session,
+            claims: Vec::new(),
+            excluded_in: Vec::new(),
+        }
+    });
+    let mut changed = !drop_record_path(repository, branch)?.exists();
     for claim in &claims {
-        for project in &projects {
-            exclude(&project.root, &key(&claim.source, &claim.session_id))?;
+        if !record
+            .claims
+            .iter()
+            .any(|c| c.runtime == claim.source && c.session_id == claim.session_id)
+        {
+            record.claims.push(DroppedClaim {
+                runtime: claim.source.clone(),
+                session_id: claim.session_id.clone(),
+                bytes: String::from_utf8(fs::read(link::link_path(
+                    &store,
+                    &claim.source,
+                    &claim.session_id,
+                ))?)?,
+            });
+            changed = true;
+        }
+        let session = key(&claim.source, &claim.session_id);
+        for root in &roots {
+            let left_out = read(root)?.is_some_and(|project| project.excluded.contains(&session));
+            if !left_out
+                && !record
+                    .excluded_in
+                    .contains(&(root.clone(), session.clone()))
+            {
+                record.excluded_in.push((root.clone(), session.clone()));
+                changed = true;
+            }
         }
     }
-    release(
+    if changed {
+        write_drop_record(&record)?;
+    }
+    // A folder bound to another repository since the first drop, or to none, keeps its settings:
+    // they are not this repository's to change.
+    let mut moved = BTreeSet::new();
+    for (root, session) in &record.excluded_in {
+        if roots.contains(root) {
+            exclude_locked(root, session)?;
+        } else {
+            moved.insert(root.clone());
+        }
+    }
+    release_locked(
         &store,
         repository,
         branch,
@@ -5242,8 +5359,428 @@ fn drop_command(target: Option<&str>) -> CmdResult {
     )?;
     super::upload_outcome::forget(repository, Some(branch))?;
     println!("{target} will not be uploaded from this computer; its local history stays.");
-    ui::hint("a copy already pushed to the Hub stays there until you remove it on the Hub");
+    say_moved(&moved, repository);
+    ui::hint(&format!(
+        "`agit project undrop {target}` brings the conversation back to this branch; a copy already pushed to the Hub stays there until you remove it on the Hub"
+    ));
     Ok(ExitCode::Ok)
+}
+
+/// `OWNER/REPO` and `BRANCH` of `OWNER/REPO@BRANCH`.
+fn split_target(target: &str) -> Result<(&str, &str)> {
+    target
+        .split_once('@')
+        .filter(|(_, branch)| !branch.is_empty())
+        .context("name the conversation as OWNER/REPO@BRANCH")
+}
+
+/// The locks a drop or an undrop of `repository@branch` holds, in the one order every path that
+/// takes them follows: the folders' ([`folders_to_lock`], sorted by path), then the branch's,
+/// then (by the caller) each claim's. A capture holds its folder's lock while the import it waits
+/// on takes the branch's, and settlement and import take the branch's before a claim's, so taking
+/// the branch's first and then waiting for a folder's could wait for ever. The drop record is read
+/// again under the branch's lock, where only a drop or an undrop of the branch changes it; a
+/// folder it names that wasn't locked (one changed it meanwhile) has every lock taken again.
+fn lock_drop(store: &Store, repository: &str, branch: &str) -> Result<DropLocks> {
+    loop {
+        let folders = folders_to_lock(repository, read_drop_record(repository, branch)?.as_ref())?;
+        let held = folders
+            .iter()
+            .map(|root| lock(root))
+            .collect::<Result<Vec<_>>>()?;
+        let guard = link::lock_branch(store, repository, branch)?;
+        let record = read_drop_record(repository, branch)?;
+        if folders_to_lock(repository, record.as_ref())?
+            .iter()
+            .all(|root| folders.contains(root))
+        {
+            return Ok(DropLocks {
+                folders,
+                _held: held,
+                _branch: guard,
+                record,
+            });
+        }
+    }
+}
+
+/// What [`lock_drop`] holds: the folders whose locks it took, those locks, the branch's lock, and
+/// the drop record as read under them.
+struct DropLocks {
+    folders: Vec<PathBuf>,
+    _held: Vec<fs::File>,
+    _branch: link::BranchLock,
+    record: Option<DropRecord>,
+}
+
+/// The folders a drop or an undrop of one of `repository`'s branches locks, in the order their
+/// locks are taken: those bound to it now, and those its drop record left the conversation out
+/// of, which a later bind may have given to another repository or to none.
+fn folders_to_lock(repository: &str, record: Option<&DropRecord>) -> Result<Vec<PathBuf>> {
+    let mut roots = bound_roots(repository)?;
+    roots.extend(
+        record
+            .iter()
+            .flat_map(|record| record.excluded_in.iter().map(|(root, _)| root.clone())),
+    );
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Whether the folder at `root` is bound to `repository`, read under its lock.
+fn bound_to(root: &Path, repository: &str) -> Result<bool> {
+    Ok(read(root)?.is_some_and(|project| project.repository == repository))
+}
+
+/// Says which folders a drop or an undrop left as they are because they aren't bound to
+/// `repository` any more. Only the repository the command names is named.
+fn say_moved(moved: &BTreeSet<PathBuf>, repository: &str) {
+    for root in moved {
+        println!(
+            "{} isn't bound to {repository} any more, so its settings were left as they are.",
+            ui::tilde(root)
+        );
+    }
+}
+
+/// The folders bound to `repository`, in the order their locks are taken.
+fn bound_roots(repository: &str) -> Result<Vec<PathBuf>> {
+    let mut roots: Vec<_> = policies()?
+        .into_iter()
+        .filter(|p| p.repository == repository)
+        .map(|p| p.root)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// The branch's tip and the session its metadata records, when the checkout can say.
+fn branch_tip(owner: &str, agent: &str, branch: &str) -> (Option<String>, Option<String>) {
+    let Some(repo) = config::repo_dir(owner, agent).ok().and_then(Repo::open) else {
+        return (None, None);
+    };
+    let reference = format!("refs/heads/{branch}");
+    let tip = repo
+        .git(&["rev-parse", "--verify", "--quiet", &reference])
+        .ok()
+        .map(|tip| tip.trim().to_owned());
+    let session = meta::read_at_ref_result(&repo, &reference)
+        .ok()
+        .flatten()
+        .map(|meta| meta.session);
+    (tip, session)
+}
+
+/// What a drop of one branch changed, written before it changes anything and kept until an undo
+/// has put it back: the branch as it stood, the claims it removed, and the folders it left the
+/// conversation out of.
+#[derive(Serialize, Deserialize)]
+struct DropRecord {
+    repository: String,
+    branch: String,
+    tip: Option<String>,
+    session: Option<String>,
+    claims: Vec<DroppedClaim>,
+    excluded_in: Vec<(PathBuf, String)>,
+}
+
+/// A claim a drop removed, as its file's exact bytes.
+#[derive(Serialize, Deserialize)]
+struct DroppedClaim {
+    runtime: String,
+    session_id: String,
+    bytes: String,
+}
+
+fn drop_record_path(repository: &str, branch: &str) -> Result<PathBuf> {
+    Ok(home()?
+        .join("dropped")
+        .join(format!("{}.json", hash(&format!("{repository}@{branch}")))))
+}
+
+fn read_drop_record(repository: &str, branch: &str) -> Result<Option<DropRecord>> {
+    match fs::read(drop_record_path(repository, branch)?) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("invalid drop record")?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn write_drop_record(record: &DropRecord) -> Result<()> {
+    let path = drop_record_path(&record.repository, &record.branch)?;
+    let dir = path.parent().context("drop record path")?;
+    config::create_state_dir(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(&serde_json::to_vec_pretty(record)?)?;
+    file.as_file().sync_all()?;
+    file.persist(&path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Puts back what `agit project drop` of the branch changed, and only that, when nothing since
+/// has taken its place: the claims as they were, the folders' exclusions it added, and its
+/// Dropped record. Under the locks a drop takes, so a settlement or import of the branch is
+/// before or after it. A rerun after an interruption finishes from the claims it already wrote.
+fn undrop_command(target: &str) -> CmdResult {
+    let (repository, branch) = split_target(target)?;
+    let (owner, agent) = super::parse_slug(repository)?;
+    let store = Store::at(config::store_root()?);
+    let DropLocks {
+        _held,
+        _branch,
+        record,
+        ..
+    } = lock_drop(&store, repository, branch)?;
+    let mut keys: Vec<(String, String)> = record
+        .iter()
+        .flat_map(|r| &r.claims)
+        .map(|c| (c.runtime.clone(), c.session_id.clone()))
+        .collect();
+    keys.sort();
+    let _links = keys
+        .iter()
+        .map(|(runtime, id)| link::lock(&store, runtime, id))
+        .collect::<Result<Vec<_>>>()?;
+    let withheld = withheld_records()?
+        .into_iter()
+        .find(|r| r.repository == repository && r.branch == branch);
+    let Some(record) = record else {
+        // Dropped before agit kept what an undo needs.
+        return Ok(match withheld {
+            None => {
+                println!("{target} wasn't dropped on this computer; nothing changed.");
+                ExitCode::Ok
+            }
+            Some(withheld) if withheld.reason != Withholding::Dropped => {
+                ui::error(&format!(
+                    "{target} is held back because {}, not by a drop; nothing changed",
+                    withheld.reason.describe()
+                ));
+                ExitCode::Precondition
+            }
+            Some(withheld) if withheld.session.is_none() => {
+                update_withheld(|records| {
+                    records.retain(|r| {
+                        !(r.repository == repository
+                            && r.branch == branch
+                            && r.reason == Withholding::Dropped)
+                    })
+                })?;
+                println!(
+                    "{target} is no longer held back as dropped. No conversation recorded into it when it was dropped, so none records into it now, and no folder's exclusion changed."
+                );
+                ExitCode::Ok
+            }
+            Some(withheld) => {
+                ui::error(&format!(
+                    "{target} was dropped before agit kept what it needs to bring the conversation back; nothing changed"
+                ));
+                if let Some((_, id)) = withheld.session.as_deref().and_then(|s| s.split_once(':')) {
+                    ui::hint(&format!(
+                        "`agit save {id}` in its folder saves the conversation again, into a new branch"
+                    ));
+                }
+                ExitCode::Precondition
+            }
+        });
+    };
+    let lift = || -> Result<()> {
+        update_withheld(|records| {
+            records.retain(|r| {
+                !(r.repository == repository
+                    && r.branch == branch
+                    && r.reason == Withholding::Dropped)
+            })
+        })
+    };
+    if record.claims.is_empty() {
+        lift()?;
+        fs::remove_file(drop_record_path(repository, branch)?)?;
+        println!(
+            "{target} is no longer held back as dropped. No conversation recorded into it when it was dropped, so none records into it now."
+        );
+        return Ok(ExitCode::Ok);
+    }
+    let refuse = |why: String| -> CmdResult {
+        ui::error(&format!(
+            "can't bring {target} back: {why}; nothing changed"
+        ));
+        Ok(ExitCode::Precondition)
+    };
+    let (tip, session) = branch_tip(&owner, &agent, branch);
+    let Some(tip) = tip else {
+        return refuse("the branch is gone".into());
+    };
+    if session != record.session {
+        return refuse("the branch now holds another conversation".into());
+    }
+    let repo = config::repo_dir(&owner, &agent).ok().and_then(Repo::open);
+    let descends = |older: &str, newer: &str| {
+        older == newer
+            || repo.as_ref().is_some_and(|repo| {
+                repo.git(&["merge-base", "--is-ancestor", older, newer])
+                    .is_ok()
+            })
+    };
+    let Some(recorded_tip) = record.tip.as_deref() else {
+        return refuse("the drop didn't record where the branch stood".into());
+    };
+    if !descends(recorded_tip, &tip) {
+        return refuse("the branch was rewritten since the drop".into());
+    }
+    let mut absent = Vec::new();
+    for claim in &record.claims {
+        let path = link::link_path(&store, &claim.runtime, &claim.session_id);
+        match fs::read(&path) {
+            Ok(bytes) if bytes == claim.bytes.as_bytes() => {}
+            Ok(_) => {
+                let continued = link::get(&store, &claim.runtime, &claim.session_id)
+                    .filter(|current| link::claims_branch(current, &owner, &agent, branch))
+                    .and_then(|current| current.native_checkpoint.map(|c| c.tip))
+                    .is_some_and(|checkpoint| descends(recorded_tip, &checkpoint));
+                if !continued {
+                    return refuse(format!(
+                        "the {} conversation {} records somewhere else now",
+                        claim.runtime, claim.session_id
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Without its claim nothing shows the recorded checkpoint is still current.
+                if tip != recorded_tip {
+                    return refuse(
+                        "the branch moved since the drop, so its recorded progress may be behind"
+                            .into(),
+                    );
+                }
+                absent.push((path, claim));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let others = link::active_for_branch(&store, &owner, &agent, branch)
+        .into_iter()
+        .filter(|link| {
+            !record
+                .claims
+                .iter()
+                .any(|c| c.runtime == link.source && c.session_id == link.session_id)
+        })
+        .count();
+    if others > 0 {
+        return refuse("another conversation records into the branch now".into());
+    }
+    for (path, claim) in &absent {
+        let dir = path.parent().context("claim path")?;
+        fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(claim.bytes.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(path).map_err(|e| e.error)?;
+    }
+    // Only a folder still bound to this repository gets its exclusion back out; one bound to
+    // another repository since, or to none, keeps its settings as they are now.
+    let mut moved = BTreeSet::new();
+    for (root, session) in &record.excluded_in {
+        match read(root)? {
+            Some(mut project) if project.repository == repository => {
+                if project.excluded.remove(session) {
+                    save(&project)?;
+                }
+            }
+            _ => {
+                moved.insert(root.clone());
+            }
+        }
+    }
+    if withheld.is_some_and(|w| w.reason == Withholding::Dropped) {
+        lift()?;
+    }
+    fs::remove_file(drop_record_path(repository, branch)?)?;
+    say_moved(&moved, repository);
+    for claim in &record.claims {
+        println!(
+            "{target} is back: the {} conversation {} records into it again.",
+            claim.runtime, claim.session_id
+        );
+        let origin = link::get(&store, &claim.runtime, &claim.session_id).and_then(|l| l.cwd);
+        say_what_holds_it(
+            target,
+            repository,
+            &claim.runtime,
+            &claim.session_id,
+            origin,
+        );
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// What a brought-back conversation's turns do now, from the existing settings only.
+fn say_what_holds_it(
+    target: &str,
+    repository: &str,
+    runtime: &str,
+    session: &str,
+    origin: Option<String>,
+) {
+    let push = format!("`agit push {target}` publishes it");
+    // Another reason the branch is held back stays, and push refuses it as before.
+    if let Some(held) = withheld_records().ok().and_then(|records| {
+        records
+            .into_iter()
+            .find(|r| target == format!("{}@{}", r.repository, r.branch))
+    }) {
+        println!(
+            "It is still held back from upload because {}.",
+            held.reason.describe()
+        );
+        return;
+    }
+    let saving = origin
+        .as_deref()
+        .and_then(|origin| automatic_capture(runtime, session, Path::new(origin)))
+        .filter(|save| save.repository == repository);
+    // The sign-in reads as the start notice reads it: a project signed out uploads nothing until
+    // `agit login`, whatever its automatic upload says.
+    match saving.map(|save| (save.sign_in, save.upload_off)) {
+        Some((SignIn::Current, true)) => println!(
+            "Automatic upload is off for {repository} on this computer, so its turns are saved here; {push}."
+        ),
+        Some((SignIn::Current, false)) => println!("Its turns upload by themselves again."),
+        Some((SignIn::Expired, false)) => println!(
+            "agit is signed out: its turns are saved on this computer, and after `agit login` they upload to {repository} by themselves again."
+        ),
+        Some((SignIn::Expired, true)) => println!(
+            "agit is signed out, and automatic upload is off for {repository} on this computer: its turns are saved here; after `agit login`, {push}."
+        ),
+        Some((SignIn::Absent, false)) => println!(
+            "agit isn't signed in: after `agit login` its turns are saved and upload to {repository} by themselves again."
+        ),
+        Some((SignIn::Absent, true)) => println!(
+            "agit isn't signed in: after `agit login` its turns are saved on this computer, and automatic upload is off for {repository} here, so {push}."
+        ),
+        None => {
+            let key = key(runtime, session);
+            let left_out: Vec<_> = policies()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|p| p.repository == repository && p.leaves_out(&key))
+                .map(|p| ui::tilde(&p.root))
+                .collect();
+            if left_out.is_empty() {
+                println!("Nothing uploads it by itself; {push}.");
+            } else {
+                println!(
+                    "{} still leaves this conversation out; {push}.",
+                    left_out.join(", ")
+                );
+            }
+        }
+    }
 }
 
 /// Where a project uploads a conversation by itself, and who can see that repository.

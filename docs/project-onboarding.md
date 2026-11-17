@@ -76,7 +76,7 @@ Every time a conversation in the folder starts or is resumed, it opens with one 
 shown to you and not to the agent; agit tells the agent nothing:
 
 ```text
-agit: this conversation is uploaded to team/app (private to team: every member of team can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it for good; this can't be undone, and a later `agit save` of the conversation saves it into a new branch.
+agit: this conversation is uploaded to team/app (private to team: every member of team can read it) at the end of each turn. Not this one? Run `agit project drop` (or ask your agent to run it) to stop recording it; `agit project undrop OWNER/REPO@BRANCH` brings it back, and a later `agit save` of the conversation saves it into a new branch instead.
 ```
 
 The line says who can read the repository: anyone for a public one; for a private one, every
@@ -134,9 +134,11 @@ its claim says. agit drops such conversations on its own and says once which one
 stop uploading a conversation yourself, run `agit project drop OWNER/REPO@BRANCH`, or
 `agit project drop` inside the conversation: it stops recording into that branch and the project
 no longer captures it; its local history stays, and the branch is never uploaded from this
-computer again. This can't be undone: a later `agit save` of the conversation saves it into a
-new branch, and the dropped branch stays as it was. A copy already on the Hub stays there until
-you remove it on the Hub.
+computer again. `agit project undrop OWNER/REPO@BRANCH` undoes it: the conversation records into
+that branch again and the exclusions the drop added are lifted, unless something took the
+branch's place since (then it changes nothing and says what). A later `agit save` of a dropped
+conversation saves it into a new branch instead, and the dropped branch stays as it was. A copy
+already on the Hub stays there until you remove it on the Hub.
 
 Unbind stops this project's hook capture and automatic pushing, without deleting existing
 history. It puts the repository's `push.auto` back to what it was before the folder was bound;

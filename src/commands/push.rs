@@ -629,7 +629,7 @@ fn publish(mut args: Args) -> CmdResult {
                     // here releases the branch; an opener whose start is lost has no such way.
                     if super::project::opener_here(&slug, &branch).unwrap_or(true) {
                         ui::hint(&format!(
-                            "to stop it from recording into this branch for good: `agit project drop {slug}@{branch}`; this can't be undone, and a later `agit save` of the conversation saves it into a new branch"
+                            "to stop it from recording into this branch: `agit project drop {slug}@{branch}`; `agit project undrop {slug}@{branch}` brings it back, and a later `agit save` of the conversation saves it into a new branch instead"
                         ));
                     } else {
                         ui::hint(&format!(
