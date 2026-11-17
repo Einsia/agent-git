@@ -15197,13 +15197,16 @@ fn synchronized_blocks_protect_new_capture_without_rewriting_or_gating_plain_pub
 
 /// A folder bound to alice/app with automatic upload on, whose Claude Code conversations each
 /// settle onto a branch of their own and upload at their turn ends, for `agit project undrop`.
+/// A turn's capture and upload run detached and may still be talking to the Hub when a test ends,
+/// so the Hub is declared first and stops before the home and its sign-in are removed: a request
+/// that late is refused, never sent without a token.
 struct UndropLab {
+    hub: Hub,
     temp: tempfile::TempDir,
     home: PathBuf,
     work: PathBuf,
     repo: Repo,
     remote: PathBuf,
-    hub: Hub,
 }
 
 impl UndropLab {
