@@ -233,6 +233,59 @@ fn session_files(chats: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// An explicit lookup matches the full UUID in a main session's header. Directory entries count
+/// against the lookup budget even when they contain no session, so unrelated files cannot make
+/// the search unbounded. Subagent files are outside the main-session layout.
+fn lookup_at(
+    home: &Path,
+    id: &str,
+    limits: super::native_snapshot::Limits,
+) -> super::native_snapshot::Result<super::native_snapshot::Source> {
+    use super::native_snapshot::Unavailable;
+    super::native_snapshot::validate_id(id, limits)?;
+    if validate_id(id).is_err() {
+        return Err(Unavailable::NotFound);
+    }
+    let root = home.join("tmp");
+    match std::fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Unavailable::NotFound);
+        }
+        _ => return Err(Unavailable::Read),
+    }
+    let mut selected = None;
+    for (visited, entry) in walkdir::WalkDir::new(&root)
+        .max_depth(3)
+        .into_iter()
+        .enumerate()
+    {
+        if visited >= limits.lookup_entries {
+            return Err(Unavailable::BudgetExceeded);
+        }
+        let entry = entry.map_err(|_| Unavailable::Read)?;
+        let path = entry.path();
+        let parts: Vec<_> = path
+            .strip_prefix(&root)
+            .map_err(|_| Unavailable::Read)?
+            .components()
+            .collect();
+        if entry.file_type().is_file()
+            && parts.len() == 3
+            && parts[1].as_os_str() == "chats"
+            && parts[0].as_os_str().to_str().is_some_and(valid_short_id)
+            && is_session_name(path)
+            && file_session_id(path).as_deref() == Some(id)
+        {
+            if selected.is_some() {
+                return Err(Unavailable::Ambiguous);
+            }
+            selected = Some(path.to_owned());
+        }
+    }
+    super::native_snapshot::source_at("gemini-cli", id, selected.ok_or(Unavailable::NotFound)?)
+}
+
 fn list_at(home: &Path, cwd: Option<&Path>) -> Result<Vec<SessionRef>> {
     let registry = projects(home);
     let roots: HashMap<&str, &str> = registry
@@ -872,6 +925,17 @@ impl Adapter for GeminiCli {
     fn native_files_root(&self) -> Result<PathBuf> {
         Ok(home()?.join("tmp"))
     }
+    fn lookup_native_readonly(
+        &self,
+        id: &str,
+        limits: super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source> {
+        lookup_at(
+            &home().map_err(|_| super::native_snapshot::Unavailable::Read)?,
+            id,
+            limits,
+        )
+    }
     fn record_identity(&self, value: &Value) -> Option<(String, Option<String>)> {
         Some((record_session_id(value)?.to_owned(), None))
     }
@@ -1256,13 +1320,20 @@ mod tests {
         assert_eq!(session.counts().edits, 2);
     }
 
-    /// Sessions are found through `projects.json` alone and named by their full uuid; a
-    /// subagent's session in the folder below is not one of them, and a path outside a project's
-    /// `chats` folder is never a session. A saved history installs only into a folder Gemini
-    /// already files, under the new id, and reads back as the same conversation.
+    /// Sessions are found through `projects.json` alone and named by their full uuid, an explicit
+    /// lookup included; a subagent's session in the folder below is not one of them, and a path
+    /// outside a project's `chats` folder is never a session. A saved history installs only into a
+    /// folder Gemini already files, under the new id, and reads back as the same conversation.
     #[test]
     fn sessions_are_found_through_the_registry_and_install_only_where_gemini_files_the_folder() {
+        if crate::rc::in_isolated_test(
+            "adapter::gemini_cli::tests::sessions_are_found_through_the_registry_and_install_only_where_gemini_files_the_folder",
+        ) {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
+        // SAFETY: `in_isolated_test` runs this test alone in a process of its own.
+        unsafe { std::env::set_var("GEMINI_CLI_HOME", root.path()) };
         let home = root.path().join(".gemini");
         let project = root.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -1288,6 +1359,35 @@ mod tests {
             Some(main.clone())
         );
         assert!(transcript_path_in(&home, &SESSION[..8], &project).is_err());
+        // An explicit lookup finds the session by the full uuid its file opens with, never the
+        // subagent's file named after it, and never by the eight characters in the name.
+        let limits = super::super::native_snapshot::Limits::default();
+        assert_eq!(
+            GeminiCli
+                .lookup_native_readonly(SESSION, limits)
+                .unwrap()
+                .path,
+            main
+        );
+        assert_eq!(
+            GeminiCli
+                .lookup_native_readonly(&SESSION[..8], limits)
+                .unwrap_err(),
+            super::super::native_snapshot::Unavailable::NotFound
+        );
+        // Counting only matched sessions would let an arbitrarily large directory pass.
+        assert_eq!(
+            GeminiCli
+                .lookup_native_readonly(
+                    SESSION,
+                    super::super::native_snapshot::Limits {
+                        lookup_entries: 1,
+                        ..limits
+                    },
+                )
+                .unwrap_err(),
+            super::super::native_snapshot::Unavailable::BudgetExceeded
+        );
         assert!(is_session_file(&home, &main));
         assert!(!is_session_file(&home, &sub));
         let outside = root.path().join("session-x.jsonl");
