@@ -194,7 +194,7 @@ pub struct Span {
 }
 
 pub(crate) fn raw_hits(text: &str, credential_field: bool) -> Vec<Span> {
-    let mut hits = raw_hits_capped(text, usize::MAX, Entropy::Include, |_, _| true).0;
+    let mut hits = raw_hits_capped(text, usize::MAX, Entropy::Include, |_, _| true, |_, _| true).0;
     if credential_field {
         let view = view_of(text);
         for (start, end) in entropy_candidate_spans(&view, true) {
@@ -254,17 +254,20 @@ pub enum Entropy {
     Exclude,
 }
 
+/// [`raw_hits_capped_in`] over `text`'s view, where a bare high-entropy value whose span `bare`
+/// turns down is also skipped, before it counts against `cap`.
 pub(crate) fn raw_hits_capped(
     text: &str,
     cap: usize,
     entropy: Entropy,
     keep: impl FnMut(&str, usize) -> bool,
+    bare: impl FnMut(usize, usize) -> bool,
 ) -> (Vec<Span>, bool) {
     let exempt = match entropy {
         Entropy::Include => entropy_exempt_regions(text),
         Entropy::Exclude => Vec::new(),
     };
-    raw_hits_capped_in(&view_of(text), cap, &exempt, entropy, keep)
+    capped_hits(&view_of(text), cap, &exempt, entropy, keep, bare)
 }
 
 pub(crate) fn entropy_exempt_regions(text: &str) -> Vec<(usize, usize)> {
@@ -294,7 +297,18 @@ pub(crate) fn raw_hits_capped_in(
     cap: usize,
     media: &[(usize, usize)],
     entropy: Entropy,
+    keep: impl FnMut(&str, usize) -> bool,
+) -> (Vec<Span>, bool) {
+    capped_hits(view, cap, media, entropy, keep, |_, _| true)
+}
+
+fn capped_hits(
+    view: &str,
+    cap: usize,
+    media: &[(usize, usize)],
+    entropy: Entropy,
     mut keep: impl FnMut(&str, usize) -> bool,
+    mut bare: impl FnMut(usize, usize) -> bool,
 ) -> (Vec<Span>, bool) {
     let mut out: Vec<Span> = vec![];
     if cap == 0 {
@@ -417,7 +431,7 @@ pub(crate) fn raw_hits_capped_in(
                     continue;
                 }
                 let secret = &view[start..end];
-                if rules::preset_allows(secret) || !keep(secret, start) {
+                if rules::preset_allows(secret) || !keep(secret, start) || !bare(start, end) {
                     continue;
                 }
                 if !budget.charge(start, end) {
@@ -889,6 +903,254 @@ fn typed_digest(text: &str, start: usize, end: usize) -> bool {
     })
 }
 
+/// Whether `text[start..end]` is a full Git object id where the text says it is one: exactly 40 or
+/// 64 lowercase hexadecimal characters (a sentence's period after it aside), named by an adjacent
+/// object word ("commit", "tree", "parent", "object", "blob", "oid", "object id", optionally
+/// followed by "id", "sha", "hash" or "oid") or given as an object argument of a recognised `git`
+/// command on the same line. Length alone is never enough, and no object is looked up. The
+/// privacy policy's replacement keeps such a value from the bare-entropy rule only
+/// ([`crate::domain::privacy::policy`]); the publish gate's verdict doesn't use it.
+pub(crate) fn git_object_id(text: &str, start: usize, end: usize) -> bool {
+    let candidate = text[start..end].trim_end_matches('.');
+    if !matches!(candidate.len(), 40 | 64)
+        || !candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    let before = &text[..start];
+    // On a line that runs `git`, only the command's own arguments decide: `git commit <name>`
+    // names a path whatever word comes before it.
+    if runs_git(before) {
+        git_object_argument(before)
+    } else {
+        named_object(before)
+    }
+}
+
+/// Whether the line a value is on runs `git` before it ([`is_git`]).
+fn runs_git(before: &str) -> bool {
+    before
+        .rsplit('\n')
+        .next()
+        .unwrap_or(before)
+        .split_whitespace()
+        .any(is_git)
+}
+
+/// Whether a word of a line is the `git` executable: bare, by a path (`/usr/bin/git`,
+/// `C:\Git\bin\git.exe`), or wrapped as inline code or in quotes or brackets (`` `git ``).
+fn is_git(word: &str) -> bool {
+    let word = word.trim_matches(|c| matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']'));
+    let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    matches!(name, "git" | "git.exe")
+}
+
+/// Whether the text right before a value names a Git object: an object word, optionally followed
+/// by a word that says it is its id, then only spaces, a colon, an equals sign, quotes or an
+/// opening parenthesis.
+fn named_object(before: &str) -> bool {
+    const OBJECTS: &[&str] = &[
+        "commit",
+        "tree",
+        "parent",
+        "object",
+        "blob",
+        "oid",
+        "object-id",
+        "object_id",
+        "objectid",
+        "commit-id",
+        "commit_id",
+        "commitid",
+    ];
+    const QUALIFIERS: &[&str] = &["id", "sha", "sha1", "sha-1", "hash", "oid"];
+    let mut rest = before.trim_end_matches(|c: char| {
+        c == ' ' || c == '\t' || matches!(c, ':' | '=' | '"' | '\'' | '`' | '(')
+    });
+    // The last run of ASCII letters, digits, '-' and '_', ending at a character boundary however
+    // wide the characters before it are.
+    let word = |rest: &mut &str| -> String {
+        let trimmed = rest.trim_end_matches([' ', '\t']);
+        let at = trimmed
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .last()
+            .map_or(trimmed.len(), |(at, _)| at);
+        let word = trimmed[at..].to_ascii_lowercase();
+        *rest = &trimmed[..at];
+        word
+    };
+    let last = word(&mut rest);
+    if OBJECTS.contains(&last.as_str()) {
+        return true;
+    }
+    QUALIFIERS.contains(&last.as_str()) && {
+        let object = word(&mut rest);
+        matches!(
+            object.as_str(),
+            "commit" | "tree" | "parent" | "object" | "blob"
+        )
+    }
+}
+
+/// One subcommand of [`OBJECT_ARGUMENTS`].
+struct ObjectArguments {
+    subcommand: &'static str,
+    /// Flags known to take no value that may come before the value.
+    flags: &'static [&'static str],
+    /// Flags of which one must come before the value to make it an object, when any are listed.
+    forcing: &'static [&'static str],
+    /// How many positional arguments are objects; `None` when every one is.
+    objects: Option<usize>,
+}
+
+/// The `git` subcommands that take only commits or objects at known positions: the flags known to
+/// take no value that may come before the value, the flags of which one must (when any are
+/// listed) to make the argument an object, and how many positional arguments are objects (`None`
+/// when every one is). A subcommand that also reads a bare path or a branch name where a commit
+/// could stand (`git show`, `git checkout`, `git reset`, `git rev-parse`, `git log`, `git diff`)
+/// is here only with the flag that rules the path out, or not at all; any other subcommand, flag
+/// or word leaves the value to the bare-entropy rule.
+const OBJECT_ARGUMENTS: &[ObjectArguments] = &[
+    ObjectArguments {
+        subcommand: "merge-base",
+        flags: &["--is-ancestor", "--all", "--octopus"],
+        forcing: &[],
+        objects: None,
+    },
+    ObjectArguments {
+        subcommand: "cherry-pick",
+        flags: &["-x", "-n", "--no-commit"],
+        forcing: &[],
+        objects: None,
+    },
+    ObjectArguments {
+        subcommand: "revert",
+        flags: &["-n", "--no-commit", "--no-edit"],
+        forcing: &[],
+        objects: None,
+    },
+    ObjectArguments {
+        subcommand: "describe",
+        flags: &["--tags", "--always", "--contains"],
+        forcing: &[],
+        objects: None,
+    },
+    ObjectArguments {
+        subcommand: "name-rev",
+        flags: &["--name-only"],
+        forcing: &[],
+        objects: None,
+    },
+    ObjectArguments {
+        subcommand: "cat-file",
+        flags: &["-p", "-t", "-s", "-e", "commit", "tree", "blob", "tag"],
+        forcing: &["-p", "-t", "-s", "-e", "commit", "tree", "blob", "tag"],
+        objects: Some(1),
+    },
+    ObjectArguments {
+        subcommand: "ls-tree",
+        flags: &["-r", "-t", "-l", "--name-only"],
+        forcing: &[],
+        objects: Some(1),
+    },
+    ObjectArguments {
+        subcommand: "checkout",
+        flags: &["--detach", "-q", "--quiet"],
+        forcing: &["--detach"],
+        objects: Some(1),
+    },
+    ObjectArguments {
+        subcommand: "switch",
+        flags: &["--detach", "-q", "--quiet"],
+        forcing: &["--detach"],
+        objects: Some(1),
+    },
+    ObjectArguments {
+        subcommand: "rev-parse",
+        flags: &["--verify", "-q", "--quiet"],
+        forcing: &["--verify"],
+        objects: Some(1),
+    },
+];
+
+/// Whether a value is an object argument of a recognised `git` command on its own line
+/// ([`OBJECT_ARGUMENTS`]): no word after `git`, the values of its options included, holds a shell
+/// separator, a substitution, a quote or an escape; after `git` come only the global options `-C <path>`,
+/// `-c <name=value>`, `--no-pager` and `-P`, then the subcommand, then only that subcommand's
+/// listed flags and other object ids, a flag that forces object semantics among them where the
+/// subcommand needs one; and the value stands at a position where the subcommand takes an object.
+/// Anything else leaves it to the bare-entropy rule.
+fn git_object_argument(before: &str) -> bool {
+    let line = before.rsplit('\n').next().unwrap_or(before);
+    if !(line.is_empty() || line.ends_with([' ', '\t'])) {
+        return false;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    // The command starts at the line's first `git`; a `git` inside its arguments (a quoted
+    // directory, a pattern) starts nothing, and a command naming it twice isn't read at all.
+    let Some(git) = words.iter().position(|word| is_git(word)) else {
+        return false;
+    };
+    // A quote or an escape can join words a split on whitespace keeps apart (`-C 'my dir'`), so a
+    // command holding one is not read at all.
+    let command = &words[git + 1..];
+    if command.iter().any(|word| is_git(word)) {
+        return false;
+    }
+    if command
+        .iter()
+        .any(|word| word.contains(['|', ';', '&', '`', '$', '>', '<', '(', ')', '\'', '"', '\\']))
+    {
+        return false;
+    }
+    let mut after = command.iter().copied();
+    let subcommand = loop {
+        match after.next() {
+            Some("-C" | "-c") => {
+                if after.next().is_none() {
+                    return false;
+                }
+            }
+            Some("--no-pager" | "-P") => {}
+            Some(word) => break word,
+            None => return false,
+        }
+    };
+    let Some(ObjectArguments {
+        flags,
+        forcing,
+        objects,
+        ..
+    }) = OBJECT_ARGUMENTS
+        .iter()
+        .find(|arguments| arguments.subcommand == subcommand)
+    else {
+        return false;
+    };
+    let object = |word: &str| {
+        matches!(word.len(), 40 | 64)
+            && word
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let mut position = 1;
+    let mut forced = forcing.is_empty();
+    for word in after {
+        if object(word) {
+            position += 1;
+        } else if flags.contains(&word) {
+            forced |= forcing.contains(&word);
+        } else {
+            return false;
+        }
+    }
+    forced && objects.is_none_or(|objects| position <= objects)
+}
+
 pub(crate) fn is_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"_-+/=.!@#$%^&*?~".contains(&byte)
 }
@@ -1069,22 +1331,25 @@ pub struct Batch {
 
 /// Every finding, including bare entropy, for explicit diagnostics.
 pub fn scan(text: &str, limit: usize) -> Batch {
-    scan_filtered(text, limit, Entropy::Include, |_, _| true)
+    scan_filtered(text, limit, Entropy::Include, |_, _| true, |_, _| true)
 }
 
 /// Provider signatures, private keys and credential assignments: the findings that are
 /// replaced automatically.
 pub fn scan_high_confidence(text: &str, limit: usize) -> Batch {
-    scan_filtered(text, limit, Entropy::Exclude, |_, _| true)
+    scan_filtered(text, limit, Entropy::Exclude, |_, _| true, |_, _| true)
 }
 
+/// Findings within `limit`, without the values `keep` turns down and the bare high-entropy
+/// values `bare` turns down by their span; neither kind counts against `limit`.
 pub(crate) fn scan_filtered(
     text: &str,
     limit: usize,
     entropy: Entropy,
     keep: impl FnMut(&str, usize) -> bool,
+    bare: impl FnMut(usize, usize) -> bool,
 ) -> Batch {
-    let (findings, incomplete) = raw_hits_capped(text, limit, entropy, keep);
+    let (findings, incomplete) = raw_hits_capped(text, limit, entropy, keep, bare);
     Batch {
         findings,
         complete: !incomplete,
@@ -1347,10 +1612,16 @@ mod tests {
             &input[batch.findings[0].start..batch.findings[0].end],
             "AKIA2E7YQXK4NMZ5VJ3T"
         );
-        let batch = scan_filtered(input, 32, Entropy::Include, |value, _| {
-            assert!(!value.starts_with("ghp_"), "synthetic rule failure");
-            true
-        });
+        let batch = scan_filtered(
+            input,
+            32,
+            Entropy::Include,
+            |value, _| {
+                assert!(!value.starts_with("ghp_"), "synthetic rule failure");
+                true
+            },
+            |_, _| true,
+        );
         assert!(!batch.complete);
         assert!(
             batch
