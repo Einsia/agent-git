@@ -1778,14 +1778,16 @@ impl ProjectedHistory {
             .map(|(name, oid)| format!("update {name} {oid}\n"))
             .collect::<String>();
         // Cached tags must not reintroduce names removed from the frozen source selection.
-        for name in repo
-            .git(&["for-each-ref", "--format=%(refname)", "refs/tags/"])?
-            .lines()
-        {
-            if !references.contains_key(name) {
-                refs.push_str(&format!("delete {name}\n"));
-            }
-        }
+        repo.inspection_records(
+            &["for-each-ref", "--format=%(refname)", "refs/tags/"],
+            |line| {
+                let name = std::str::from_utf8(line).context("tag name is not valid UTF-8")?;
+                if !references.contains_key(name) {
+                    refs.push_str(&format!("delete {name}\n"));
+                }
+                Ok(())
+            },
+        )?;
         input(
             &repo,
             &["-c", "core.hooksPath=", "update-ref", "--stdin"],
@@ -3302,28 +3304,41 @@ fn published_elsewhere(
     source: &Repo,
     references: &BTreeMap<String, String>,
 ) -> Result<Vec<crate::domain::privacy_receipt::PublishedTag>> {
-    let listing = source.git(&[
-        "for-each-ref",
-        "--format=%(objectname) %(refname)",
-        "refs/tags/",
-    ])?;
-    let local = listing
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .map(|(oid, name)| (name, oid))
-        .collect::<BTreeMap<_, _>>();
-    Ok(references
-        .iter()
-        .filter(|(name, _)| name.starts_with("refs/tags/") && !name.starts_with("refs/tags/agit-"))
-        .filter_map(|(name, public)| {
-            let here = *local.get(name.as_str())?;
-            (here != public).then(|| crate::domain::privacy_receipt::PublishedTag {
-                name: name.trim_start_matches("refs/tags/").to_owned(),
-                local: here.to_owned(),
-                public: public.clone(),
-            })
-        })
-        .collect())
+    let mut tags = Vec::new();
+    source.inspection_records(
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags/",
+        ],
+        |line| {
+            let (local, name) = tag_record(line)?;
+            if !name.starts_with("refs/tags/agit-")
+                && let Some(public) = references.get(name)
+                && local != public
+            {
+                tags.push(crate::domain::privacy_receipt::PublishedTag {
+                    name: name.trim_start_matches("refs/tags/").to_owned(),
+                    local: local.to_owned(),
+                    public: public.clone(),
+                });
+            }
+            Ok(())
+        },
+    )?;
+    Ok(tags)
+}
+
+fn tag_record(line: &[u8]) -> Result<(&str, &str)> {
+    let line = std::str::from_utf8(line).context("tag listing is not valid UTF-8")?;
+    let (oid, name) = line.split_once(' ').context("tag listing is malformed")?;
+    ensure!(
+        matches!(oid.len(), 40 | 64)
+            && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && name.starts_with("refs/tags/"),
+        "tag listing is malformed"
+    );
+    Ok((oid, name))
 }
 
 fn insert_tag(references: &mut BTreeMap<String, String>, name: &str, oid: &str) -> Result<()> {
@@ -3359,76 +3374,81 @@ fn place_unreached_tags(
         .flat_map(|candidate| candidate.mappings.values())
         .map(|entry| entry.public.as_str())
         .collect::<BTreeSet<_>>();
-    let listing = source.git(&[
-        "for-each-ref",
-        "--format=%(objectname) %(refname)",
-        "refs/tags/",
-    ])?;
-    for (oid, name) in listing.lines().filter_map(|line| line.split_once(' ')) {
-        if handled.contains(name)
-            || references.contains_key(name)
-            || name.starts_with("refs/tags/agit-")
-            || ledger.withheld().contains(name)
-            || remote.refs.get(name).is_some_and(|current| current == oid)
-        {
-            continue;
-        }
-        let Some(commit) =
-            source.git_opt(&["rev-parse", "--verify", "-q", &format!("{oid}^{{commit}}")])
-        else {
-            continue;
-        };
-        let commit = commit.trim().to_owned();
-        let on_session_line = matches!(
-            crate::domain::meta::read_at_ref_result(source, &commit),
-            Ok(Some(metadata)) if metadata.is_session_line()
-        );
-        if !on_session_line {
-            continue;
-        }
-        let accepted = ledger
-            .every_accepted_by_branch()
-            .filter(|(_, entry)| entry.plain && (entry.public == commit || entry.source == commit))
-            .collect::<Vec<_>>();
-        let publics = if sending.contains(commit.as_str()) {
-            BTreeSet::from([commit.as_str()])
-        } else {
-            accepted
-                .iter()
-                .map(|(_, entry)| entry.public.as_str())
-                .collect()
-        };
-        if publics.is_empty() {
-            left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent));
-            continue;
-        }
-        match session_tag_target(oid, &commit, &publics) {
-            Ok(public) if remote.refs.get(name) == Some(&public) => {
-                on_hub.insert(name.to_owned(), public);
+    source.inspection_records(
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/tags/",
+        ],
+        |line| {
+            let (oid, name) = tag_record(line)?;
+            if handled.contains(name)
+                || references.contains_key(name)
+                || name.starts_with("refs/tags/agit-")
+                || ledger.withheld().contains(name)
+                || remote.refs.get(name).is_some_and(|current| current == oid)
+            {
+                return Ok(());
             }
-            Ok(public) if sending.contains(public.as_str()) => {
-                insert_tag(references, name, &public)?;
-                carried.insert(name.to_owned());
+            let Some(commit) =
+                source.git_opt(&["rev-parse", "--verify", "-q", &format!("{oid}^{{commit}}")])
+            else {
+                return Ok(());
+            };
+            let commit = commit.trim().to_owned();
+            let on_session_line = matches!(
+                crate::domain::meta::read_at_ref_result(source, &commit),
+                Ok(Some(metadata)) if metadata.is_session_line()
+            );
+            if !on_session_line {
+                return Ok(());
             }
-            // An accepted turn's public commit is on the destination; whether this push's
-            // branches reach it, and so take the tag, the final plan decides.
-            Ok(public) => match accepted.iter().find(|(_, entry)| entry.public == public) {
-                Some(&(branch, entry)) => {
-                    let retained = entry.object_source(source, parent, branch)?;
-                    crate::commands::plumbing::import_commit_graph(
-                        destination,
-                        &retained,
-                        &public,
-                    )?;
+            let accepted = ledger
+                .every_accepted_by_branch()
+                .filter(|(_, entry)| {
+                    entry.plain && (entry.public == commit || entry.source == commit)
+                })
+                .collect::<Vec<_>>();
+            let publics = if sending.contains(commit.as_str()) {
+                BTreeSet::from([commit.as_str()])
+            } else {
+                accepted
+                    .iter()
+                    .map(|(_, entry)| entry.public.as_str())
+                    .collect()
+            };
+            if publics.is_empty() {
+                left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent));
+                return Ok(());
+            }
+            match session_tag_target(oid, &commit, &publics) {
+                Ok(public) if remote.refs.get(name) == Some(&public) => {
+                    on_hub.insert(name.to_owned(), public);
+                }
+                Ok(public) if sending.contains(public.as_str()) => {
                     insert_tag(references, name, &public)?;
                     carried.insert(name.to_owned());
                 }
-                None => left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent)),
-            },
-            Err(reason) => left_out.push(LeftOutTag::new(name, reason)),
-        }
-    }
-    Ok(())
+                // An accepted turn's public commit is on the destination; whether this push's
+                // branches reach it, and so take the tag, the final plan decides.
+                Ok(public) => match accepted.iter().find(|(_, entry)| entry.public == public) {
+                    Some(&(branch, entry)) => {
+                        let retained = entry.object_source(source, parent, branch)?;
+                        crate::commands::plumbing::import_commit_graph(
+                            destination,
+                            &retained,
+                            &public,
+                        )?;
+                        insert_tag(references, name, &public)?;
+                        carried.insert(name.to_owned());
+                    }
+                    None => left_out.push(LeftOutTag::new(name, TagLeftOut::NotSent)),
+                },
+                Err(reason) => left_out.push(LeftOutTag::new(name, reason)),
+            }
+            Ok(())
+        },
+    )
 }
 
 fn retain_session_mapping(
@@ -4342,6 +4362,106 @@ mod tests {
         assert!(redirected.join().unwrap(), "the source Hub was not asked");
         assert!(kept.is_empty(), "{kept:?}");
         assert!(!served.join().unwrap(), "the redirect was followed");
+    }
+
+    /// Generated tags must not crowd a custom session tag out of publication or its receipt.
+    /// The custom tag sorts after the generated inventory, so truncating that inventory loses it.
+    #[test]
+    fn large_tag_inventory_preserves_custom_tag_publication_and_receipts() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        let session = format!("agit-{}", "a".repeat(40));
+        meta::write(
+            &root,
+            &Meta::new(session.clone(), "claude-code".into(), String::new()),
+        )
+        .unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "session"]);
+        let local = git(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["commit", "-q", "--allow-empty", "-m", "public"]);
+        let public = git(&root, &["rev-parse", "HEAD"]);
+        let custom = "refs/tags/z-custom-session";
+        let mut packed =
+            std::io::BufWriter::new(std::fs::File::create(root.join(".git/packed-refs")).unwrap());
+        writeln!(packed, "# pack-refs with: sorted").unwrap();
+        let mut names_bytes = 0;
+        let mut generated = 0;
+        while names_bytes <= 1024 * 1024 {
+            let name = format!("refs/tags/agit-{generated:040x}");
+            writeln!(packed, "{local} {name}").unwrap();
+            names_bytes += name.len() + 1;
+            generated += 1;
+        }
+        writeln!(packed, "{local} {custom}").unwrap();
+        packed.flush().unwrap();
+        drop(packed);
+        assert!(names_bytes > 1024 * 1024);
+
+        let source = Repo::at(&root).local_objects_only();
+        let receipt = published_elsewhere(
+            &source,
+            &BTreeMap::from([(custom.to_owned(), public.clone())]),
+        )
+        .expect("the complete tag inventory must remain inspectable");
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].name, "z-custom-session");
+        assert_eq!(receipt[0].local, local);
+        assert_eq!(receipt[0].public, public);
+
+        let mapping = accepted::Mapping {
+            source: local.clone(),
+            public: local.clone(),
+            source_parents: Vec::new(),
+            public_parents: Vec::new(),
+            store: "c".repeat(64),
+            source_session: session.clone(),
+            public_session: session,
+            policy: crate::domain::privacy_envelope::digest_bytes(b"policy"),
+            recipient: None,
+            plain: true,
+            delivered: false,
+        };
+        let candidates = BTreeMap::from([(
+            "main".to_owned(),
+            accepted::Candidate {
+                source_head: local.clone(),
+                public_head: local.clone(),
+                mappings: BTreeMap::from([(local.clone(), mapping)]),
+            },
+        )]);
+        let identity = RemoteIdentity::new(
+            "https://hub.invalid",
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .unwrap();
+        let ledger = accepted::Ledger::open(&source, &identity).unwrap();
+        let mut references = BTreeMap::new();
+        let mut carried = BTreeSet::new();
+        let mut on_hub = BTreeMap::new();
+        let mut left_out = Vec::new();
+        place_unreached_tags(
+            &source,
+            &source,
+            &directory.path().join("publication"),
+            &ledger,
+            &candidates,
+            &RemoteRefs::default(),
+            &BTreeSet::new(),
+            &mut references,
+            &mut carried,
+            &mut on_hub,
+            &mut left_out,
+        )
+        .expect("the custom tag after the generated inventory must be placed");
+        assert_eq!(references, BTreeMap::from([(custom.to_owned(), local)]));
+        assert_eq!(carried, BTreeSet::from([custom.to_owned()]));
+        assert!(on_hub.is_empty());
+        assert!(left_out.is_empty());
     }
 
     /// A version tag is owed only for a turn the destination still holds. An accepted turn below
