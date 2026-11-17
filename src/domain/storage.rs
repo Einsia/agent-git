@@ -1088,6 +1088,10 @@ const VALIDATION_READ_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) struct SnapshotValidator {
     /// Checked event blobs and the event ID each one hashes to.
     validated: HashMap<String, String>,
+    /// The tree objects read so far. Successive snapshots of a conversation share most of their
+    /// event directories; looking every event up afresh for every snapshot costs time quadratic
+    /// in the length of the conversation.
+    trees: native::TreeCache,
 }
 
 #[cfg(feature = "cli")]
@@ -1114,7 +1118,7 @@ impl SnapshotValidator {
         // reuses decoded trees and reads sizes only for events not validated yet.
         let objects = match native::Snapshot::open(repo_root, commit) {
             Some(snapshot) => snapshot
-                .event_blob_ids(&unique)?
+                .event_blob_ids_cached(&unique, &mut self.trees)?
                 .into_iter()
                 .map(|blob| {
                     let size = if self.validated.contains_key(&blob) {
@@ -4248,6 +4252,110 @@ mod tests {
         );
         let error = validator.validate_local(dir.path(), &swapped).unwrap_err();
         assert!(error.to_string().contains("event id mismatch"), "{error:#}");
+    }
+
+    /// A validator that keeps the trees it read judges each later snapshot as a fresh validator
+    /// does: the same LOG and VIEW lengths for a conversation that grows turn by turn, for a LOG
+    /// rewritten in the middle, and for an event file no LOG names; the same refusal for a VIEW
+    /// naming an event outside its LOG, for an event file removed while the LOG still names it,
+    /// and for a symbolic link where an event's blob belongs. An unrelated raw Git filename does
+    /// not change the verdict. A validator that kept what it found
+    /// at a path rather than in a tree object would pass the removal, as the path still names the
+    /// event in the snapshot it read before; one that took any entry but a tree for the event
+    /// would pass the link.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn a_validator_keeping_read_trees_judges_each_snapshot_as_a_fresh_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::domain::repo::Repo::init(dir.path()).unwrap();
+        repo.git(&["config", "commit.gpgsign", "false"]).unwrap();
+        meta::write(
+            dir.path(),
+            &meta::Meta::new(SID_A.into(), "codex".into(), "/r".into()),
+        )
+        .unwrap();
+        let commit = |message: &str| {
+            repo.add_all().unwrap();
+            repo.commit(message).unwrap();
+            repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned()
+        };
+        let lines: Vec<String> = (1..=8).map(|turn| line(SID_A, turn)).collect();
+        let mut snapshots = Vec::new();
+        // A conversation growing turn by turn.
+        for turn in 1..=5 {
+            let log: String = lines[..turn].concat();
+            write_snapshot(dir.path(), &log, &log).unwrap();
+            snapshots.push(commit(&format!("turn {turn}")));
+        }
+        // A LOG rewritten in the middle: the second turn left out, a later one added.
+        let rewritten = format!("{}{}{}", lines[0], lines[2], lines[5]);
+        write_snapshot(dir.path(), &rewritten, &rewritten).unwrap();
+        snapshots.push(commit("rewritten"));
+        // An event file that no LOG names.
+        let stray = event_id(&lines[7]).unwrap();
+        let stray_path = dir.path().join(meta::event_path(&stray).unwrap());
+        std::fs::create_dir_all(stray_path.parent().unwrap()).unwrap();
+        std::fs::write(&stray_path, &lines[7]).unwrap();
+        snapshots.push(commit("stray event"));
+        // Raw Git path fixture: an unrelated name need not be UTF-8 for event lookup to work.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let path = dir
+                .path()
+                .join(std::ffi::OsString::from_vec(b"notes-\xff".to_vec()));
+            std::fs::write(&path, b"unrelated file\n").unwrap();
+            let snapshot = commit("raw filename");
+            SnapshotValidator::default()
+                .validate_local(dir.path(), &snapshot)
+                .expect("an unrelated raw Git filename does not change event validation");
+            snapshots.push(snapshot);
+            std::fs::remove_file(&path).unwrap();
+        }
+        // A VIEW naming an event its LOG doesn't.
+        let log = format!("{}{}", lines[0], lines[2]);
+        write_snapshot(dir.path(), &log, &log).unwrap();
+        let first = std::fs::read_to_string(dir.path().join(meta::LOG_FILE))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        std::fs::write(
+            dir.path().join(meta::VIEW_FILE),
+            format!("{first}\n{}\n", event_id(&lines[6]).unwrap()),
+        )
+        .unwrap();
+        snapshots.push(commit("view outside log"));
+        // Back to a valid snapshot, then one whose LOG names an event whose file is gone.
+        write_snapshot(dir.path(), &rewritten, &rewritten).unwrap();
+        snapshots.push(commit("valid again"));
+        let removed = event_id(&lines[2]).unwrap();
+        let removed_path = dir.path().join(meta::event_path(&removed).unwrap());
+        std::fs::remove_file(&removed_path).unwrap();
+        snapshots.push(commit("event removed"));
+        // An event path holding a symbolic link instead of a blob. Git stores a link as its target,
+        // and the target here is the event's own bytes, so the link's object hashes to the event
+        // id: only the entry's mode tells it from the event.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&lines[2], &removed_path).unwrap();
+            snapshots.push(commit("event linked"));
+        }
+
+        let mut keeping = SnapshotValidator::default();
+        let mut refused = 0;
+        for snapshot in &snapshots {
+            let fresh = SnapshotValidator::default().validate_local(dir.path(), snapshot);
+            let kept = keeping.validate_local(dir.path(), snapshot);
+            match (&fresh, &kept) {
+                (Ok(fresh), Ok(kept)) => assert_eq!(fresh, kept, "{snapshot}"),
+                (Err(_), Err(_)) => refused += 1,
+                _ => panic!("{snapshot}: fresh {fresh:?}, kept {kept:?}"),
+            }
+        }
+        assert_eq!(refused, if cfg!(unix) { 3 } else { 2 });
     }
 
     #[test]
