@@ -7,6 +7,39 @@ use crate::domain::{meta, repo::Repo};
 use anyhow::{Context, Result};
 use std::{cell::RefCell, path::Path};
 
+/// Tree objects already decoded, by their object ID: each entry's name, object and mode. Objects
+/// are read as stored, with no replacement applied (see [`Repo::native_commit_repository`]).
+#[derive(Default)]
+pub(crate) struct TreeCache(
+    std::collections::HashMap<gix::ObjectId, std::collections::HashMap<Vec<u8>, Entry>>,
+);
+
+/// One entry of a decoded tree: its object and mode.
+type Entry = (gix::ObjectId, gix::objs::tree::EntryMode);
+
+impl TreeCache {
+    fn entries(
+        &mut self,
+        objects: &gix::Repository,
+        tree: gix::ObjectId,
+    ) -> Result<&std::collections::HashMap<Vec<u8>, Entry>> {
+        use std::collections::hash_map::Entry as Slot;
+        match self.0.entry(tree) {
+            Slot::Occupied(entry) => Ok(entry.into_mut()),
+            Slot::Vacant(entry) => {
+                let decoded = objects
+                    .find_tree(tree)?
+                    .decode()?
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.filename.to_vec(), (entry.oid.to_owned(), entry.mode)))
+                    .collect();
+                Ok(entry.insert(decoded))
+            }
+        }
+    }
+}
+
 pub(super) struct Snapshot {
     objects: gix::Repository,
     tree: gix::ObjectId,
@@ -39,17 +72,36 @@ impl Snapshot {
         Ok((id, size))
     }
 
-    /// The blob each event path names, without reading the blobs.
-    pub(super) fn event_blob_ids(&self, ids: &[&str]) -> Result<Vec<String>> {
-        let tree = self.objects.find_tree(self.tree)?;
+    /// The blob each event path names, without reading the blobs, reading each tree object once for
+    /// every snapshot `trees` serves.
+    /// A tree object is named by its bytes, so what a decoded tree lists is what any snapshot that
+    /// holds that tree finds there: snapshots that share most of their event directories, as
+    /// successive turns of one conversation do, decode each of them once instead of once per
+    /// snapshot.
+    pub(super) fn event_blob_ids_cached(
+        &self,
+        ids: &[&str],
+        trees: &mut TreeCache,
+    ) -> Result<Vec<String>> {
         ids.iter()
             .map(|id| {
                 let path = meta::event_path(id)?;
-                let entry = tree
-                    .lookup_entry(path.split('/'))?
-                    .with_context(|| format!("event {id} is missing at {path}"))?;
-                anyhow::ensure!(entry.mode().is_blob(), "event {id} at {path} is not a blob");
-                Ok(entry.object_id().to_string())
+                let mut tree = self.tree;
+                let mut parts = path.split('/').peekable();
+                while let Some(part) = parts.next() {
+                    let (object, mode) = trees
+                        .entries(&self.objects, tree)?
+                        .get(part.as_bytes())
+                        .copied()
+                        .with_context(|| format!("event {id} is missing at {path}"))?;
+                    if parts.peek().is_none() {
+                        anyhow::ensure!(mode.is_blob(), "event {id} at {path} is not a blob");
+                        return Ok(object.to_string());
+                    }
+                    anyhow::ensure!(mode.is_tree(), "event {id} is missing at {path}");
+                    tree = object;
+                }
+                anyhow::bail!("event {id} is missing at {path}")
             })
             .collect()
     }
