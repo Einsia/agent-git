@@ -10539,6 +10539,322 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         branch
     };
 
+    // Explicit intent must return while an uploader holds both locks. Naming a dropped
+    // conversation admits only that one; a sweep still leaves the other dropped one out.
+    const QUEUED_NAMED: &str = "acacacac-0000-4000-8000-000000000001";
+    const QUEUED_SWEEP: &str = "acacacac-0000-4000-8000-000000000002";
+    const QUEUED_DROP: &str = "acacacac-0000-4000-8000-000000000003";
+    for (id, title) in [
+        (QUEUED_NAMED, "named request"),
+        (QUEUED_SWEEP, "swept request"),
+        (QUEUED_DROP, "left dropped"),
+    ] {
+        add_turn(id, title);
+    }
+    policy(&|policy| {
+        policy["excluded"] = json!([
+            format!("claude-code:{QUEUED_NAMED}"),
+            format!("claude-code:{QUEUED_DROP}")
+        ]);
+        policy["earlier"] = json!([format!("claude-code:{QUEUED_SWEEP}")]);
+    });
+    let project_state = home.join("projects").join(digest(&work.to_string_lossy()));
+    let hold = |extension: &str| {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(project_state.with_extension(extension))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&file).unwrap();
+        file
+    };
+    let requests = project_state.with_extension("save-requests");
+    let receipt = |id: &str| -> Option<serde_json::Value> {
+        let entries = fs::read_dir(&requests).ok()?;
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "result"))
+            .filter_map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(&fs::read(entry.path()).ok()?).ok()
+            })
+            .find(|value| value["session_id"] == id)
+    };
+    // A launch failure acknowledges durable acceptance honestly. The next folder command
+    // must recover it without another save or another completed turn.
+    const RECOVERED: &str = "acacacac-0000-4000-8000-000000000005";
+    add_turn(RECOVERED, "recover accepted intent");
+    let captured = hold("capture");
+    let accepted = agit(
+        &["--json", "save", RECOVERED],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    let value: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    let row = &value["result"]["value"]["sessions"][0];
+    assert_eq!(row["status"], "pending", "{value}");
+    assert_eq!(row["accepted_locally"], true, "{value}");
+    assert_eq!(row["worker_started"], false, "{value}");
+    assert!(receipt(RECOVERED).is_none());
+    drop(captured);
+    agit(&["status", "--json"], None, &[]);
+    wait("the restarted explicit request", &|| {
+        receipt(RECOVERED).is_some_and(|row| row["status"] == "uploaded")
+    });
+
+    let captured = hold("capture");
+    let policy_lock = hold("lock");
+    let (send, receive) = std::sync::mpsc::channel();
+    let queued = thread::scope(|scope| {
+        scope.spawn(|| {
+            let swept = agit(&["--json", "save", "--all"], None, &[]);
+            let named = agit(&["--json", "save", QUEUED_NAMED], None, &[]);
+            send.send((swept, named)).unwrap();
+        });
+        let returned = receive.recv_timeout(Duration::from_secs(15)).ok();
+        let before: serde_json::Value =
+            serde_json::from_slice(&fs::read(project_state.with_extension("json")).unwrap())
+                .unwrap();
+        assert!(
+            before["excluded"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(format!("claude-code:{QUEUED_NAMED}")))
+        );
+        drop(policy_lock);
+        drop(captured);
+        returned
+    })
+    .expect("ordinary save must return pending before either uploader lock is released");
+    for (output, expected) in [(&queued.0, QUEUED_SWEEP), (&queued.1, QUEUED_NAMED)] {
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let sessions = value["result"]["value"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{value}");
+        assert_eq!(sessions[0]["session_id"], expected);
+        assert_eq!(sessions[0]["status"], "pending");
+        assert_eq!(sessions[0]["accepted_locally"], true);
+        assert!(sessions[0]["branch"].is_null());
+        assert!(sessions[0]["link"].is_null());
+    }
+    for id in [QUEUED_NAMED, QUEUED_SWEEP] {
+        wait("the accepted request's upload", &|| {
+            receipt(id).is_some_and(|row| row["status"] == "uploaded")
+        });
+        let result = receipt(id).unwrap();
+        assert!(!on_hub(result["branch"].as_str().unwrap()).is_empty());
+    }
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(project_state.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(
+        after["excluded"],
+        json!([format!("claude-code:{QUEUED_DROP}")])
+    );
+    assert!(receipt(QUEUED_DROP).is_none());
+
+    // Off followed by a new binding must not revive a previously accepted named request.
+    const CANCELLED: &str = "acacacac-0000-4000-8000-000000000004";
+    add_turn(CANCELLED, "cancel this request");
+    let captured = hold("capture");
+    let accepted = agit(&["--json", "save", CANCELLED], None, &[]);
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(
+        accepted["result"]["value"]["sessions"][0]["accepted_locally"],
+        true
+    );
+    agit(&["off"], None, &[]);
+    agit(
+        &[
+            "--yes",
+            "project",
+            "bind",
+            work.to_str().unwrap(),
+            "--repo",
+            "alice/app",
+            "--history",
+            "none",
+        ],
+        None,
+        &[],
+    );
+    policy(&|policy| policy["auto_upload"] = json!(true));
+    drop(captured);
+    wait("the cancelled request's receipt", &|| {
+        receipt(CANCELLED).is_some_and(|row| row["status"] == "cancelled")
+    });
+    assert!(receipt(CANCELLED).unwrap()["branch"].is_null());
+
+    // A retry is still the accepted request after its worker exits at a persistence boundary.
+    // The captured tip and every request receipt survive; revoking consent outranks recovery.
+    let request_branch = |session: &str| -> Option<String> {
+        fs::read_dir(&requests)
+            .ok()?
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "request"))
+            .filter_map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(&fs::read(entry.path()).ok()?).ok()
+            })
+            .find(|request| request["intent"]["candidate"]["session_id"] == session)?["publication"]
+            ["branch"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    for (session, point, action) in [
+        (
+            "adadadad-0000-4000-8000-000000000004",
+            "between_origin_and_publication",
+            "recover",
+        ),
+        (
+            "adadadad-0000-4000-8000-000000000001",
+            "after_upload",
+            "revoke",
+        ),
+        (
+            "adadadad-0000-4000-8000-000000000002",
+            "after_retry_claim",
+            "recover",
+        ),
+        (
+            "adadadad-0000-4000-8000-000000000003",
+            "after_retry_upload",
+            "recover",
+        ),
+        (
+            "adadadad-0000-4000-8000-000000000005",
+            "between_origin_and_publication",
+            "revoke",
+        ),
+        (
+            "adadadad-0000-4000-8000-000000000006",
+            "after_upload",
+            "rewrite",
+        ),
+    ] {
+        let revoke = action == "revoke";
+        let rewrite = action == "rewrite";
+        let before_publication = point == "between_origin_and_publication";
+        let before = branches();
+        add_turn(session, "recover publication ownership");
+        let crash_clock = temp.path().join(format!("{session}-clock"));
+        fs::write(&crash_clock, START.to_string()).unwrap();
+        let crash_marker = temp.path().join(format!("{session}-exited"));
+        let captured = hold("capture");
+        if !before_publication {
+            hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+        }
+        let accepted = agit(
+            &["--json", "save", session],
+            None,
+            &[
+                ("AGIT_TEST_CLOCK_FILE", crash_clock.to_str().unwrap()),
+                ("AGIT_TEST_SAVE_REQUEST_CRASH", point),
+                (
+                    "AGIT_TEST_SAVE_REQUEST_CRASH_MARKER",
+                    crash_marker.to_str().unwrap(),
+                ),
+            ],
+        );
+        let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+        assert_eq!(
+            accepted["result"]["value"]["sessions"][0]["accepted_locally"],
+            true
+        );
+        drop(captured);
+        let (branch, due) = if before_publication {
+            wait("the origin's durable crash boundary", &|| {
+                crash_marker.exists()
+            });
+            assert!(
+                request_branch(session).is_none(),
+                "the fault must land before the request's publication write"
+            );
+            (
+                branches().difference(&before).next().cloned().unwrap(),
+                START,
+            )
+        } else {
+            wait("the queued upload's retry record", &|| {
+                request_branch(session).is_some_and(|branch| {
+                    record(&branch).is_some_and(|row| row["retry_after"].is_i64())
+                })
+            });
+            let branch = request_branch(session).unwrap();
+            let due = record(&branch).unwrap()["retry_after"].as_i64().unwrap();
+            (branch, due)
+        };
+        if point != "after_upload" {
+            fs::write(&crash_clock, (due + 1).to_string()).unwrap();
+        }
+        wait("the explicit worker's crash boundary", &|| {
+            crash_marker.exists()
+        });
+        let captured = hold("capture");
+        if revoke {
+            agit(
+                &[
+                    "--yes",
+                    "project",
+                    "bind",
+                    work.to_str().unwrap(),
+                    "--repo",
+                    "alice/app",
+                    "--history",
+                    "none",
+                ],
+                None,
+                &[],
+            );
+            policy(&|policy| policy["auto_upload"] = json!(true));
+            if !before_publication {
+                assert!(
+                    record(&branch).unwrap()["retry_after"].is_i64(),
+                    "the cancelled intent still has an executable retry to fence"
+                );
+            }
+        }
+        if rewrite {
+            // A branch rewrite actively cancels the old tip. Recovery must finish the request,
+            // even though its upload failure would otherwise qualify for another attempt.
+            let unrelated = git(repo.root(), &["rev-parse", "refs/heads/main"]);
+            git(
+                repo.root(),
+                &["update-ref", &format!("refs/heads/{branch}"), &unrelated],
+            );
+        }
+        let posts = hub.posts.load(Ordering::Acquire);
+        drop(captured);
+        let recovery_clock = temp.path().join(format!("{session}-recovery-clock"));
+        fs::write(&recovery_clock, (due + 1).to_string()).unwrap();
+        agit(
+            &["status", "--json"],
+            None,
+            &[("AGIT_TEST_CLOCK_FILE", recovery_clock.to_str().unwrap())],
+        );
+        let expected = if revoke || rewrite {
+            "cancelled"
+        } else {
+            "uploaded"
+        };
+        wait("the recovered request's terminal receipt", &|| {
+            receipt(session).is_some_and(|row| row["status"] == expected)
+        });
+        if revoke || rewrite {
+            assert!(on_hub(&branch).is_empty());
+            assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+        } else {
+            assert!(!on_hub(&branch).is_empty());
+            if point == "after_retry_upload" {
+                assert_eq!(
+                    hub.posts.load(Ordering::Acquire),
+                    posts,
+                    "receipt recovery must not publish again"
+                );
+            }
+        }
+        fs::write(&recovery_clock, START.to_string()).unwrap();
+    }
+
     // The Hub takes the push, and only its answer is lost: it is recorded as uploaded, once.
     hub.cut_receives.lock().unwrap().push(Cut::AfterApplying);
     let receives = hub.posts.load(Ordering::Acquire);

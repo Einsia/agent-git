@@ -891,6 +891,7 @@ pub(crate) fn turn_off_bound_folders(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut turned = Vec::new();
     for (folder, repo) in crate::rc::local_repository::covering(dir)? {
         if !repo.uploads_turned_off()? {
+            crate::commands::project::cancel_save_requests(&folder)?;
             repo.turn_uploads_off(true)?;
             turned.push(folder);
         }

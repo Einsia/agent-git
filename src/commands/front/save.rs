@@ -149,14 +149,10 @@ fn plan(args: &SaveArgs) -> Result<Plan> {
     // An explicit save brings a policy that never looked at OpenCode's store forward, once. One
     // that can't look keeps failing closed, so the save goes on either way.
     let opencode_look = if on {
-        crate::commands::project::look_for_earlier_opencode(&root).unwrap_or(None)
+        crate::commands::project::prepare_save(&root).unwrap_or(None)
     } else {
         None
     };
-    // And one bound before agit captured Pi, the same way.
-    if on {
-        let _ = crate::commands::project::look_for_earlier_pi(&root);
-    }
     let here = super::sessions_in(&root)?;
     let mut left_out = 0;
     let mut dropped = 0;
@@ -535,6 +531,7 @@ fn report(
                 let (status, branch, error) = match &r.outcome {
                     Saved::Uploaded(b, _) => ("uploaded", Some(b), None),
                     Saved::Pending(b) => ("pending", Some(b), None),
+                    Saved::Queued { .. } => ("pending", None, None),
                     Saved::Failed(e) | Saved::Refused(e) => ("failed", None, Some(e.clone())),
                     Saved::Elsewhere { .. } => ("elsewhere", None, None),
                     Saved::Rewritten { branch, .. } => {
@@ -558,11 +555,15 @@ fn report(
                     "link": match &r.outcome {
                         Saved::Uploaded(b, _) => Some(link(&r.repository, b)),
                         Saved::Pending(_) => Some(super::repository_link(&r.repository)),
-                        Saved::Failed(_)
+                        Saved::Queued { .. }
+                        | Saved::Failed(_)
                         | Saved::Refused(_)
                         | Saved::Elsewhere { .. }
                         | Saved::Rewritten { .. } => None,
                     },
+                    "request_id": match &r.outcome { Saved::Queued { request_id, .. } => Some(request_id), _ => None },
+                    "accepted_locally": matches!(r.outcome, Saved::Queued { .. }),
+                    "worker_started": match &r.outcome { Saved::Queued { worker_started, .. } => Some(worker_started), _ => None },
                     "branch": branch,
                     "error": error,
                     "saved_in": match &r.outcome {
@@ -612,7 +613,7 @@ fn report(
                         "command": "agit save",
                         "why": "retry what did not upload; what is already on the Hub is not sent again",
                     }))
-                } else if failed > 0 {
+                } else if failed > 0 || rows.iter().any(|row| matches!(row.outcome, Saved::Queued { .. })) {
                     None
                 } else {
                     this_conversation.then(|| serde_json::json!({
@@ -636,6 +637,17 @@ fn report(
                     for line in uploaded_lines(row, branch, once.as_deref()) {
                         println!("  {line}");
                     }
+                }
+                Saved::Queued { worker_started, .. } => {
+                    println!(
+                        "accepted locally: \"{}\"; {}",
+                        ui::truncate(&row.title, 60),
+                        if *worker_started {
+                            "waiting for the folder's uploader; `agit status` shows progress"
+                        } else {
+                            "worker not started; the next command in this folder will try again"
+                        }
+                    );
                 }
                 Saved::Pending(_) if this_conversation && automatic_off => {
                     ui::success(&format!(
@@ -701,7 +713,12 @@ fn report(
         report_dropped(dropped);
         if retry {
             ui::hint("run `agit save` again to retry; `agit` shows what is still waiting");
-        } else if this_conversation && failed == 0 {
+        } else if this_conversation
+            && failed == 0
+            && !rows
+                .iter()
+                .any(|row| matches!(row.outcome, Saved::Queued { .. }))
+        {
             println!("To send it to someone: {}", ui::accent("agit share"));
         }
     }

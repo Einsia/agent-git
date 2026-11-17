@@ -1,5 +1,7 @@
 //! Explicit project enrollment composes discovery, import and registered session publication.
 
+mod save_requests;
+
 use super::CmdResult;
 use crate::{
     ExitCode, adapter,
@@ -77,7 +79,11 @@ pub enum Action {
     },
     /// Publish the project's hook-reported sessions; the hook that starts it does not wait.
     #[command(hide = true)]
-    Capture { path: PathBuf },
+    Capture {
+        path: PathBuf,
+        #[arg(long, hide = true)]
+        wait: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum, PartialEq, Eq)]
@@ -287,7 +293,7 @@ fn restore_auto_push_for(project: &Project) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Candidate {
     runtime: String,
     session_id: String,
@@ -443,13 +449,7 @@ fn read(root: &Path) -> Result<Option<Project>> {
 }
 
 fn save(project: &Project) -> Result<()> {
-    config::create_state_dir(&home()?)?;
-    let mut file = tempfile::NamedTempFile::new_in(home()?)?;
-    file.write_all(&serde_json::to_vec_pretty(project)?)?;
-    file.as_file().sync_all()?;
-    file.persist(state_path(&project.root)?)
-        .map_err(|e| e.error)?;
-    Ok(())
+    save_requests::save_policy(project)
 }
 
 fn lock(root: &Path) -> Result<fs::File> {
@@ -1309,21 +1309,25 @@ pub(crate) fn look_for_earlier_pi(folder: &Path) -> Result<usize> {
     let Some(mut project) = read(&root)? else {
         return Ok(0);
     };
+    look_for_earlier_pi_locked(&mut project)
+}
+
+fn look_for_earlier_pi_locked(project: &mut Project) -> Result<usize> {
     if project.history != History::None || project.earlier_pi {
         return Ok(0);
     }
-    let (found, complete) = pi_history(&project);
+    let (found, complete) = pi_history(project);
     if !complete {
         return Ok(0);
     }
     let mut recorded = 0;
     for candidate in &found {
-        if !claimed_here(&project, "pi", &candidate.session_id) {
+        if !claimed_here(project, "pi", &candidate.session_id) {
             recorded += usize::from(project.earlier.insert(key("pi", &candidate.session_id)));
         }
     }
     project.earlier_pi = true;
-    save(&project)?;
+    save(project)?;
     Ok(recorded)
 }
 
@@ -1352,10 +1356,14 @@ pub(crate) fn look_for_earlier_opencode(folder: &Path) -> Result<Option<Opencode
     let Some(mut project) = read(&root)? else {
         return Ok(None);
     };
+    look_for_earlier_opencode_locked(&mut project)
+}
+
+fn look_for_earlier_opencode_locked(project: &mut Project) -> Result<Option<OpencodeLook>> {
     if project.history != History::None || project.earlier_opencode {
         return Ok(None);
     }
-    let (found, complete) = opencode_history(&project);
+    let (found, complete) = opencode_history(project);
     if !complete {
         return Ok(None);
     }
@@ -1363,7 +1371,7 @@ pub(crate) fn look_for_earlier_opencode(folder: &Path) -> Result<Option<Opencode
     // The reading holds the folder and the git worktrees its policy covers, wherever those are;
     // every conversation in it is the folder's history.
     for candidate in &found {
-        if claimed_here(&project, "opencode", &candidate.session_id) {
+        if claimed_here(project, "opencode", &candidate.session_id) {
             saved += 1;
         } else {
             project
@@ -1373,11 +1381,11 @@ pub(crate) fn look_for_earlier_opencode(folder: &Path) -> Result<Option<Opencode
         }
     }
     project.earlier_opencode = true;
-    save(&project)?;
+    save(project)?;
     Ok(Some(OpencodeLook {
         earlier,
         saved,
-        repository: project.repository,
+        repository: project.repository.clone(),
     }))
 }
 
@@ -2027,6 +2035,15 @@ struct Synced {
 }
 
 fn sync_one(project: &Project, candidate: &Candidate, automatic: bool) -> Result<Synced> {
+    sync_one_for_request(project, candidate, automatic, None)
+}
+
+fn sync_one_for_request(
+    project: &Project,
+    candidate: &Candidate,
+    automatic: bool,
+    request: Option<&save_requests::Owned>,
+) -> Result<Synced> {
     verify(project)?;
     let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
@@ -2073,6 +2090,17 @@ fn sync_one(project: &Project, candidate: &Candidate, automatic: bool) -> Result
     // The person's own push while the repository's automatic upload is off here: the save that
     // asked for it says where it went, from what the push read.
     let one_off = project.auto_upload && !uploads_automatically;
+    save_requests::before_upload(
+        project,
+        candidate,
+        &branch,
+        head.as_deref().context("captured branch has no tip")?,
+        uploads_automatically,
+        request,
+    )?;
+    if request.is_some() {
+        save_request_crash_point("after_origin");
+    }
     let pushed = if uploads_automatically {
         super::upload_outcome::recorded(
             super::upload_outcome::Place::of(&project.repository, &branch)
@@ -2346,7 +2374,12 @@ pub fn run(args: Args) -> CmdResult {
         Action::Status { path } => {
             let root = root(&path)?;
             let project = read(&root)?.context("directory has no project policy")?;
-            println!("{}", serde_json::to_string(&project)?);
+            let mut status = serde_json::to_value(&project)?;
+            let requests =
+                save_requests::report(save_requests::status(&root)?, Some(&project.repository))?;
+            status["save_requests"] = serde_json::to_value(requests.items)?;
+            status["save_requests_omitted"] = serde_json::to_value(requests.omitted)?;
+            println!("{}", serde_json::to_string(&status)?);
             // Codex captures this directory only through hooks it has approved.
             if project.enabled
                 && let Some(problem) = super::setup::codex_hooks(&root)
@@ -2416,8 +2449,14 @@ pub fn run(args: Args) -> CmdResult {
             ensure!(project.enabled, "project is paused");
             sync(&mut project)
         }
-        Action::Capture { path } => {
-            drain_and_retry(&root(&path)?)?;
+        Action::Capture { path, wait } => {
+            let root = root(&path)?;
+            if wait {
+                let worker = wait_for_worker(&root)?;
+                drain_owned(&root, true, worker)?;
+            } else {
+                drain_and_retry(&root)?;
+            }
             Ok(ExitCode::Ok)
         }
     }
@@ -2811,6 +2850,7 @@ impl Routing {
                 && ours(binding.as_deref(), self.binding.as_deref()),
             "the folder was set up again by another command meanwhile; its new setup was kept"
         );
+        save_requests::invalidate(root)?;
         for (path, bytes) in self.files {
             match bytes {
                 Some(bytes) => {
@@ -2853,6 +2893,7 @@ pub(crate) fn setup_lock(root: &Path) -> Result<fs::File> {
 /// repository that holds them.
 pub(crate) fn unbind_for_move(root: &Path) -> Result<Routing> {
     let _guard = lock(root)?;
+    save_requests::invalidate(root)?;
     let mut files = Vec::new();
     for path in Routing::paths(root)? {
         let bytes = match fs::read(&path) {
@@ -3071,6 +3112,7 @@ pub(crate) fn claim_unsaved_notice(root: &Path) -> Result<bool> {
 /// paused folder and its local saving stay as they were.
 pub(crate) fn record_automatic_upload_declined(root: &Path) -> Result<()> {
     let _guard = offer_lock(root)?;
+    cancel_save_requests(root)?;
     write_offer(root, "declined")
 }
 
@@ -3637,6 +3679,26 @@ pub(crate) fn sole_upload(
 /// runtime that ends its hook on timeout would end the upload with it. The hook therefore hands
 /// the project to a detached worker that holds no pipe of the hook, so the turn ends at once.
 fn spawn_capture(root: &Path) -> Result<()> {
+    spawn_capture_mode(root, false)
+}
+
+fn save_request_crash_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("AGIT_TEST_SAVE_REQUEST_CRASH").as_deref() == Ok(point) {
+        if let Some(path) = std::env::var_os("AGIT_TEST_SAVE_REQUEST_CRASH_MARKER") {
+            let _ = fs::write(path, point.as_bytes());
+        }
+        std::process::exit(86);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
+}
+
+fn spawn_capture_mode(root: &Path, wait: bool) -> Result<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("AGIT_TEST_CAPTURE_SPAWN_FAIL").as_deref() == Ok("1") {
+        anyhow::bail!("synthetic capture worker launch failure");
+    }
     let mut command = crate::infra::background::command(std::env::current_exe()?);
     command
         .args(["--quiet", "project", "capture"])
@@ -3647,6 +3709,9 @@ fn spawn_capture(root: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if wait {
+        command.arg("--wait");
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command.spawn()?;
@@ -3772,7 +3837,9 @@ pub(crate) fn capture_pending(runtime: &str, session: &str, cwd: &Path) -> bool 
         return false;
     };
     let name = hash(&key(runtime, session));
-    if pending_dir(&project.root).is_ok_and(|pending| pending.join(&name).exists()) {
+    if save_requests::contains(&project.root, runtime, session).unwrap_or(false)
+        || pending_dir(&project.root).is_ok_and(|pending| pending.join(&name).exists())
+    {
         return true;
     }
     Capturing::path(&project.root)
@@ -3818,53 +3885,102 @@ fn drain_and_retry(root: &Path) -> Result<()> {
 }
 
 fn drain_then(root: &Path, retrying: bool) -> Result<()> {
+    let Some(worker) = capture_worker(root)? else {
+        return Ok(());
+    };
+    drain_owned(root, retrying, worker)
+}
+
+fn queued_work(root: &Path) -> Result<bool> {
+    Ok(save_requests::pending(root)? || !markers(root)?.is_empty() || catch_up_requested(root)?)
+}
+
+/// Every owner releases and then checks arrivals. Explicit producers also start a waiting
+/// successor, so an arrival after this check still has a worker.
+fn finish_capture(root: &Path, worker: fs::File) -> Result<bool> {
+    fs2::FileExt::unlock(&worker)?;
+    drop(worker);
+    queued_work(root)
+}
+
+#[cfg(test)]
+static CAPTURE_HANDOFF: std::sync::Mutex<Option<fn(&Path)>> = std::sync::Mutex::new(None);
+
+/// A successor transfers the acquired file itself; releasing it before entry could let a
+/// competing worker take ownership and strand the request the successor promised to drain.
+fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> {
+    #[cfg(test)]
+    if let Some(observe) = CAPTURE_HANDOFF.lock().unwrap().take() {
+        observe(root);
+    }
     let mut waiting_since = None;
+    let mut recovered = false;
     loop {
-        let Some(worker) = capture_worker(root)? else {
-            return Ok(());
-        };
-        if take_catch_up(root)?
-            && let Some(project) = read(root)?
-        {
-            let caught = caught(root);
-            for candidate in candidates(&project)? {
-                if !before_covered(&project, &candidate, true).unwrap_or(true)
-                    && !unhooked(&project, &candidate)
-                    && behind(&project, &candidate, &caught)
-                {
-                    enqueue(root, &candidate)?;
+        let pass = (|| -> Result<Option<i64>> {
+            let requested_retry = save_requests::drain(root)?;
+            if take_catch_up(root)?
+                && let Some(project) = read(root)?
+            {
+                let caught = caught(root);
+                for candidate in candidates(&project)? {
+                    if !before_covered(&project, &candidate, true).unwrap_or(true)
+                        && !unhooked(&project, &candidate)
+                        && behind(&project, &candidate, &caught)
+                    {
+                        enqueue(root, &candidate)?;
+                    }
                 }
             }
-        }
-        while let Some((candidate, capturing)) = take_pending(root)? {
-            *CAPTURING
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
-            let Some(project) = read(root)? else {
+            while let Some((candidate, capturing)) = take_pending(root)? {
+                *CAPTURING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+                if let Some(project) = read(root)? {
+                    let _ = capture_candidate(project, candidate, false, true);
+                }
                 landed();
+            }
+            Ok(if retrying {
+                requested_retry
+                    .into_iter()
+                    .chain(run_due_retries(root)?)
+                    .min()
+            } else {
+                None
+            })
+        })();
+        landed();
+        let more = finish_capture(root, worker)?;
+        let next = match pass {
+            Ok(next) => next,
+            Err(error) => {
+                if more && !recovered {
+                    // Recovery waits without ownership. A persistent journal error keeps its
+                    // request for the next folder command instead of spawning without bound.
+                    recovered = true;
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Some(acquired) = capture_worker(root)? {
+                        worker = acquired;
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if !more {
+            let Some(at) = next else {
                 return Ok(());
             };
-            // A failure is recorded in the project's last result; the remaining sessions go on.
-            let _ = capture_candidate(project, candidate, false, true);
-            landed();
+            let since = *waiting_since.get_or_insert_with(super::upload_outcome::now);
+            if at > since + RETRY_WAIT {
+                return Ok(());
+            }
+            wait_until(at);
         }
-        let next = if retrying {
-            run_due_retries(root)
-        } else {
-            None
-        };
-        drop(worker);
-        if !markers(root)?.is_empty() || catch_up_requested(root)? {
-            continue;
-        }
-        let Some(at) = next else {
+        let Some(acquired) = capture_worker(root)? else {
             return Ok(());
         };
-        let since = *waiting_since.get_or_insert_with(super::upload_outcome::now);
-        if at > since + RETRY_WAIT {
-            return Ok(());
-        }
-        wait_until(at);
+        worker = acquired;
     }
 }
 
@@ -3872,6 +3988,10 @@ fn drain_then(root: &Path, retrying: bool) -> Result<()> {
 /// the folder: a worker that was stopped, or a computer that slept through the try, leaves it due
 /// until something runs in the folder. It only starts the worker, and returns at once.
 fn start_due_retries(project: &Project) {
+    if save_requests::pending(&project.root).unwrap_or(false) {
+        let _ = spawn_capture_mode(&project.root, true);
+        return;
+    }
     if !super::upload_outcome::has_records(&project.repository) {
         return;
     }
@@ -3885,18 +4005,52 @@ fn start_due_retries(project: &Project) {
     let due = super::upload_outcome::retries(&project.repository, &branches)
         .iter()
         .any(|due| due.at <= now);
-    if due && capture_worker(&project.root).is_ok_and(|worker| worker.is_some()) {
-        let _ = spawn_capture(&project.root);
+    if due {
+        let _ = spawn_capture_mode(&project.root, true);
     }
 }
 
 /// [`start_due_retries`] for the folder `cwd` is in, for the front door's commands run there.
 pub fn start_due_retries_here(cwd: &Path) {
-    if let Ok(cwd) = cwd.canonicalize()
-        && let Ok(Some((project, _))) = governing(&cwd)
+    let Ok(cwd) = cwd.canonicalize() else {
+        return;
+    };
+    let mut restarted = BTreeSet::new();
+    for root in cwd.ancestors() {
+        if save_requests::pending(root).unwrap_or(false) {
+            let _ = spawn_capture_mode(root, true);
+            restarted.insert(root.to_owned());
+        }
+    }
+    if let Ok(Some((project, _))) = governing(&cwd)
+        && !restarted.contains(&project.root)
     {
         start_due_retries(&project);
     }
+}
+
+#[derive(Default)]
+pub(crate) struct SaveRequestStatus {
+    pub items: Vec<serde_json::Value>,
+    pub omitted: usize,
+}
+
+/// Results outlive a policy, so status also reads requests left beside removed parent bindings.
+/// Only receipts belonging to the selected destination may name their sessions and branches.
+pub(crate) fn save_request_status(
+    cwd: &Path,
+    repository: Option<&str>,
+) -> Result<SaveRequestStatus> {
+    let cwd = cwd.canonicalize()?;
+    let mut roots: BTreeSet<PathBuf> = cwd.ancestors().map(Path::to_owned).collect();
+    if let Some((project, _)) = governing(&cwd)? {
+        roots.insert(project.root);
+    }
+    let mut rows = Vec::new();
+    for root in roots {
+        rows.extend(save_requests::status(&root)?);
+    }
+    save_requests::report(rows, repository)
 }
 
 fn local_branches(repo: &Repo) -> Option<Vec<String>> {
@@ -3914,21 +4068,35 @@ fn local_branches(repo: &Repo) -> Option<Vec<String>> {
 /// None runs while the signed-in account, its Hub or the repository is not the one the folder was
 /// bound to, as no first upload would: they stay due until the folder is bound again, and the
 /// next worker that finds them so runs them.
-fn run_due_retries(root: &Path) -> Option<i64> {
-    let project = read(root).ok()??;
-    let repo = verify(&project).ok()?;
-    let branches = local_branches(&repo)?;
+fn run_due_retries(root: &Path) -> Result<Option<i64>> {
+    let Some(project) = read(root)? else {
+        return Ok(None);
+    };
+    let Ok(repo) = verify(&project) else {
+        return Ok(None);
+    };
+    let Some(branches) = local_branches(&repo) else {
+        return Ok(None);
+    };
     let now = super::upload_outcome::now();
     for due in super::upload_outcome::retries(&project.repository, &branches) {
-        if due.at <= now {
-            retry_one(&project, &repo, &due);
+        if due.at <= now
+            && save_requests::retry_owner(&project.repository, &due)?
+                .is_none_or(|owner| owner == root)
+        {
+            retry_one(&project, &repo, &due)?;
         }
     }
-    super::upload_outcome::retries(&project.repository, &branches)
-        .into_iter()
-        .map(|due| due.at)
-        .filter(|at| *at > now)
-        .min()
+    let mut next = None;
+    for due in super::upload_outcome::retries(&project.repository, &branches) {
+        if due.at > now
+            && save_requests::retry_owner(&project.repository, &due)?
+                .is_none_or(|owner| owner == root)
+        {
+            next = Some(next.map_or(due.at, |before: i64| before.min(due.at)));
+        }
+    }
+    Ok(next)
 }
 
 /// Tries a failed upload of the folder again, up to the tip it was for. The retry runs the first
@@ -3937,7 +4105,12 @@ fn run_due_retries(root: &Path) -> Option<i64> {
 /// whose repository no longer uploads by itself, or whose tip no longer continues the branch, is
 /// cancelled instead, and its failure stands: with upload off nothing is attempted, recorded or
 /// said, and past a rewrite the branch's next turn uploads it.
-fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) {
+fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) -> Result<()> {
+    let _policy = lock(&project.root)?;
+    if !save_requests::retry_allowed(&project.root, &project.repository, due)? {
+        due.cancel(&project.repository)?;
+        return Ok(());
+    }
     let target = format!("{}@{}", project.repository, due.branch);
     let continues = super::auto_push::branch_tip(repo.root(), &due.branch).is_some_and(|head| {
         head == due.tip
@@ -3949,12 +4122,13 @@ fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) {
         && project.auto_upload
         && super::auto_push::publication_allowed(repo, &project.repository).unwrap_or(false);
     if !uploads || !continues {
-        due.cancel(&project.repository);
-        return;
+        due.cancel(&project.repository)?;
+        return Ok(());
     }
-    if !due.claim(&project.repository) {
-        return;
+    if !due.claim(&project.repository)? {
+        return Ok(());
     }
+    save_request_crash_point("after_retry_claim");
     let pushed = super::upload_outcome::recorded(
         super::upload_outcome::Place::of(&project.repository, &due.branch)
             .map(|place| place.retried(due.retry)),
@@ -3962,6 +4136,7 @@ fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) {
         || retry_stale(|| automatic_retry(&target, &due.tip, &project.root)),
         |pushed| pushed.as_ref().err().map(refusal),
     );
+    save_request_crash_point("after_retry_upload");
     if matches!(pushed, Ok(Ok(_))) {
         let _ = child(
             &["fetch".into(), project.repository.clone()],
@@ -3969,6 +4144,7 @@ fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) {
             false,
         );
     }
+    Ok(())
 }
 
 /// Waits until `at`, in Unix seconds, by the clock [`super::upload_outcome::now`] reads.
@@ -4010,6 +4186,19 @@ fn capture_candidate_into(
     automatic: bool,
     once: &mut Option<Option<String>>,
 ) -> Result<bool> {
+    let _guard = lock(&project.root)?;
+    project = read(&project.root)?.context("project policy disappeared")?;
+    capture_candidate_locked(project, candidate, let_in, automatic, once, None)
+}
+
+fn capture_candidate_locked(
+    mut project: Project,
+    candidate: Candidate,
+    let_in: bool,
+    automatic: bool,
+    once: &mut Option<Option<String>>,
+    request: Option<&save_requests::Owned>,
+) -> Result<bool> {
     // Automatic capture leaves foreign claims to their source repository's settlement.
     if !matches!(
         placement(&project, &candidate),
@@ -4029,11 +4218,6 @@ fn capture_candidate_into(
     if held(&project) {
         return Ok(true);
     }
-    let _guard = lock(&project.root)?;
-    project = read(&project.root)?.context("project policy disappeared")?;
-    if held(&project) {
-        return Ok(true);
-    }
     // A queued capture outlives its Stop: a directory bound on its own in between belongs to
     // that binding's history and upload choices, not to this project's.
     if !includes(&project, &candidate.cwd)? {
@@ -4041,7 +4225,7 @@ fn capture_candidate_into(
     }
     let modified = transcript_modified(&candidate);
     let length = transcript_length(&candidate);
-    let result = sync_one(&project, &candidate, automatic);
+    let result = sync_one_for_request(&project, &candidate, automatic, request);
     if result
         .as_ref()
         .is_err_and(|e| e.is::<NothingSettled>() || e.is::<LeftOut>() || e.is::<PublicationOff>())
@@ -4082,6 +4266,11 @@ pub(crate) enum Saved {
     /// Claimed on this branch; its first turn has not finished, and the Stop that finishes it
     /// uploads it.
     Pending(String),
+    /// Accepted durably on this computer; no branch or upload is promised yet.
+    Queued {
+        request_id: String,
+        worker_started: bool,
+    },
     /// Left where it was, with the reason; saving again may get it through.
     Failed(String),
     /// Left where it was for a reason saving again does not change; the reason says what does.
@@ -4165,60 +4354,160 @@ pub(crate) fn save_now(
     branch: Option<&str>,
 ) -> Result<Vec<Saved>> {
     let root = &policy_root(root);
-    let worker = wait_for_worker(root)?;
-    let mut saved = Vec::new();
-    for (runtime, session_id, cwd) in sessions {
-        let candidate = Candidate {
-            runtime: runtime.clone(),
-            session_id: session_id.clone(),
-            cwd: cwd.clone(),
-        };
-        let session_key = key(runtime, session_id);
-        if earlier || named {
-            let _guard = lock(root)?;
-            let mut project = read(root)?.context("folder is not set up")?;
-            let mut changed = project.earlier.remove(&session_key);
-            if named {
-                changed |= project.excluded.remove(&session_key);
+    let worker = match capture_worker(root)? {
+        Some(worker) => Some(worker),
+        None if branch.is_some() => {
+            eprintln!(
+                "waiting for this folder's uploader: --branch checks and claims its name synchronously"
+            );
+            Some(wait_for_worker(root)?)
+        }
+        None => None,
+    };
+    let Some(worker) = worker else {
+        let mut saved = Vec::new();
+        for (runtime, session_id, cwd) in sessions {
+            let candidate = Candidate {
+                runtime: runtime.clone(),
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+            };
+            saved.push(
+                match save_requests::enqueue(root, candidate, earlier, named) {
+                    Ok(request_id) => Saved::Queued {
+                        request_id,
+                        worker_started: false,
+                    },
+                    Err(error) => {
+                        Saved::Failed(format!("could not accept the save request: {error:#}"))
+                    }
+                },
+            );
+        }
+        if saved
+            .iter()
+            .any(|outcome| matches!(outcome, Saved::Queued { .. }))
+        {
+            let started = spawn_capture_mode(root, true).is_ok();
+            for outcome in &mut saved {
+                if let Saved::Queued { worker_started, .. } = outcome {
+                    *worker_started = started;
+                }
             }
-            if changed {
-                save(&project)?;
-            }
         }
-        let project = read(root)?.context("folder is not set up")?;
-        // `--all` and `--today` ask for earlier sessions, never for one the person dropped.
-        if project.excluded.contains(&session_key) {
-            saved.push(Saved::Refused(format!(
-                "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {session_id}`, which saves it into a new branch, or bring it back to its branch: `agit project undrop OWNER/REPO@BRANCH`"
-            )));
-            continue;
+        return Ok(saved);
+    };
+    let result = (|| -> Result<Vec<Saved>> {
+        let _ = look_for_earlier_opencode(root);
+        let _ = look_for_earlier_pi(root);
+        let mut saved = Vec::new();
+        for (runtime, session_id, cwd) in sessions {
+            let candidate = Candidate {
+                runtime: runtime.clone(),
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+            };
+            let _policy = lock(root)?;
+            let project = read(root)?.context("folder is not set up")?;
+            let outcome = save_selected(
+                project.clone(),
+                candidate.clone(),
+                earlier,
+                named,
+                branch,
+                None,
+            )
+            .unwrap_or_else(|error| {
+                Saved::upload_failed_for(&project, &candidate, format!("{error:#}"))
+            });
+            saved.push(outcome);
         }
-        // `--all` and `--today` sweep earlier sessions, and leave out a repository whose automatic
-        // upload is off: the person uploads one of those by naming it.
-        if earlier && !named && automatic_upload_off(&project)? {
-            saved.push(Saved::Refused(format!(
-                "automatic upload is off for {}; to upload this one, name it: `agit save {}`",
-                project.repository, session_id
-            )));
-            continue;
-        }
-        let outcome = match save_one(project.clone(), candidate.clone(), earlier || named, branch) {
-            Ok(outcome) => outcome,
-            Err(error) => Saved::upload_failed_for(&project, &candidate, format!("{error:#}")),
-        };
-        // A conversation the person saved themselves no longer stays out of the folder's uploads
-        // because it predates `agit rc start --here` (see `rc::folder_cutoff`).
-        if (earlier || named) && matches!(outcome, Saved::Uploaded(..) | Saved::Pending(_)) {
-            crate::rc::folder_cutoff::admit(cwd, runtime, session_id)?;
-        }
-        saved.push(outcome);
+        Ok(saved)
+    })();
+    if finish_capture(root, worker)? {
+        let _ = spawn_capture_mode(root, true);
     }
-    // A Stop that arrived meanwhile queued its session and left it to the lock holder.
-    drop(worker);
-    if !markers(root)?.is_empty() || catch_up_requested(root)? {
-        let _ = spawn_capture(root);
+    result
+}
+
+/// Cancels prior explicit consent independently of the folder policy's lifetime.
+pub(crate) fn cancel_save_requests(root: &Path) -> Result<()> {
+    save_requests::invalidate(root)
+}
+
+/// An idle folder can record its earlier history synchronously. A busy folder's producer only
+/// reads policy; the capture owner records history before admitting an explicit request.
+pub(crate) fn prepare_save(root: &Path) -> Result<Option<OpencodeLook>> {
+    let root = policy_root(root);
+    let Some(worker) = capture_worker(&root)? else {
+        return Ok(None);
+    };
+    let looked = look_for_earlier_opencode(&root);
+    let _ = look_for_earlier_pi(&root);
+    if finish_capture(&root, worker)? {
+        let _ = spawn_capture_mode(&root, true);
     }
-    Ok(saved)
+    looked
+}
+
+/// The caller holds capture and policy ownership through admission and publication, so an
+/// intervening off/on or drop cannot turn old queued intent into a new authorization.
+fn save_selected(
+    mut project: Project,
+    candidate: Candidate,
+    earlier: bool,
+    named: bool,
+    branch: Option<&str>,
+    request: Option<&save_requests::Owned>,
+) -> Result<Saved> {
+    ensure!(
+        project.enabled && project.auto_upload,
+        "folder is off; turn it on before saving"
+    );
+    if let Some(why) = bound_apart(&project, &candidate)? {
+        return Ok(Saved::Elsewhere {
+            saved_in: None,
+            why: Some(why),
+        });
+    }
+    if delegation_withheld(&project.repository, &candidate, Some(&project), false)? {
+        return Ok(Saved::Refused(
+            "the root conversation's capture policy keeps this delegated session out".into(),
+        ));
+    }
+    let session_key = key(&candidate.runtime, &candidate.session_id);
+    if !named && project.excluded.contains(&session_key) {
+        return Ok(Saved::Refused(format!(
+            "you stopped uploading it from this folder (`agit project drop`); to upload it anyway, name it: `agit save {}`",
+            candidate.session_id
+        )));
+    }
+    if earlier && !named && automatic_upload_off(&project)? {
+        return Ok(Saved::Refused(format!(
+            "automatic upload is off for {}; to upload this one, name it: `agit save {}`",
+            project.repository, candidate.session_id
+        )));
+    }
+    if earlier || named {
+        let mut changed = project.earlier.remove(&session_key);
+        if named {
+            changed |= project.excluded.remove(&session_key);
+        }
+        if changed {
+            save(&project)?;
+        }
+    }
+    let outcome = save_one(
+        project,
+        candidate.clone(),
+        earlier || named,
+        branch,
+        request,
+    )?;
+    if (earlier || named) && matches!(outcome, Saved::Uploaded(..) | Saved::Pending(_)) {
+        crate::rc::folder_cutoff::admit(&candidate.cwd, &candidate.runtime, &candidate.session_id)?;
+    }
+    Ok(outcome)
 }
 
 /// Whether automatic upload is off for the project's repository on this computer: in its checkout
@@ -4256,6 +4545,7 @@ fn save_one(
     candidate: Candidate,
     let_in: bool,
     branch: Option<&str>,
+    request: Option<&save_requests::Owned>,
 ) -> Result<Saved> {
     if delegation_withheld(&project.repository, &candidate, Some(&project), false)? {
         return Ok(Saved::Refused(
@@ -4282,7 +4572,6 @@ fn save_one(
         });
     }
     if let Some(named) = branch {
-        let _guard = lock(&project.root)?;
         let project = read(&project.root)?.context("folder is not set up")?;
         match placement(&project, &candidate)? {
             Placement::Claim(current) if current == named => {}
@@ -4354,7 +4643,6 @@ fn save_one(
         }
     }
     if !finished {
-        let _guard = lock(&project.root)?;
         // A folder below may have been set up on its own since the session was picked; the
         // claim must not take a session that binding now keeps.
         let project = read(&project.root)?.context("folder is not set up")?;
@@ -4377,7 +4665,14 @@ fn save_one(
         });
     }
     let mut once = None;
-    if !capture_candidate_into(project.clone(), candidate.clone(), let_in, false, &mut once)? {
+    if !capture_candidate_locked(
+        project.clone(),
+        candidate.clone(),
+        let_in,
+        false,
+        &mut once,
+        request,
+    )? {
         // The capture rechecked under the lock and left the session where it now belongs.
         let why = bound_apart(&read(&project.root)?.unwrap_or(project), &candidate)?;
         return Ok(Saved::Elsewhere {
@@ -5205,6 +5500,7 @@ fn exclude(root: &Path, session: &str) -> Result<()> {
 
 /// [`exclude`], with the folder's policy lock already held by the caller.
 fn exclude_locked(root: &Path, session: &str) -> Result<()> {
+    save_requests::invalidate_session(root, session)?;
     if let Some(mut current) = read(root)?
         && current.excluded.insert(session.into())
     {
@@ -7723,7 +8019,7 @@ mod tests {
         false
     }
 
-    fn project(root: &Path) -> Project {
+    pub(super) fn project(root: &Path) -> Project {
         Project {
             root: root.canonicalize().unwrap(),
             repository: "alice/app".into(),
