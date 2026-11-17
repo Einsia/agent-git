@@ -167,6 +167,9 @@ pub struct Report {
     pub placed: usize,
     /// Files skipped because the local top level already has the same name and content.
     pub already_local: usize,
+    /// The branch's files the conversation has after placing: placed now, already in the mirror,
+    /// kept there with an edit, or at the local top level with the same content.
+    pub available: usize,
     /// Files collected into the branch (added + changed + deleted).
     pub collected: usize,
     /// Files not collected because of a suspected secret.
@@ -270,16 +273,28 @@ fn is_memory_file(name: &str) -> bool {
     name.ends_with(".md") && name != INDEX_FILE && !name.starts_with('.')
 }
 
+/// The name of a managed memory file at `path` of a tree, if it is one.
+fn memory_name(path: &str) -> Option<&str> {
+    path.strip_prefix(&format!("{TREE_DIR}/"))
+        .filter(|name| !name.contains('/') && is_memory_file(name))
+}
+
+/// How many memory files the tree at `git_ref` carries: what a session started from it reads.
+pub fn count_files(repo: &Repo, git_ref: &str) -> crate::Result<usize> {
+    Ok(repo
+        .ls_tree_result(git_ref)?
+        .iter()
+        .filter(|path| memory_name(path).is_some())
+        .count())
+}
+
 /// The bytes of every `*.md` at the first level of `memory/` on one ref.
 fn branch_files(repo: &Repo, git_ref: &str) -> crate::Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
     for path in repo.ls_tree_result(git_ref)? {
-        let Some(name) = path.strip_prefix(&format!("{TREE_DIR}/")) else {
+        let Some(name) = memory_name(&path) else {
             continue;
         };
-        if name.contains('/') || !is_memory_file(name) {
-            continue;
-        }
         let bytes = repo
             .git_bytes_result(&["show", &format!("{git_ref}:{path}")])
             .with_context(|| format!("cannot read {path} at {git_ref}"))?;
@@ -1124,6 +1139,7 @@ fn place(
     let mut placed_hashes: BTreeMap<String, String> = BTreeMap::new();
 
     for (name, bytes) in &files {
+        report.available += 1;
         if top.get(name).is_some_and(|local| local == bytes) {
             report.already_local += 1;
             continue;

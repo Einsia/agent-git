@@ -324,6 +324,80 @@ fn a_branch_without_a_runtime_memory_dir_still_reports_and_distills() {
     assert!(status.contains("everything in sync"), "{status}");
 }
 
+/// `agit new`'s start line names the repository and commit its memory comes from and how many
+/// files the new session has as placing came out, 0 said out loud: a placing that fails is said to
+/// have failed, never counted as the source's files. A runtime agit gives no memory to is told it
+/// gets none (CLI #502).
+#[test]
+fn agit_new_names_the_commit_its_memory_comes_from_and_how_many_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, repo, claude, mem) = fixture(tmp.path());
+    let work = tmp.path().join("work");
+    let start = |args: &[&str]| {
+        ok(&Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env_remove("AGIT_SESSION")
+            .output()
+            .unwrap())
+    };
+    let short = |rev: &str| repo.git(&["rev-parse", rev]).unwrap().trim()[..9].to_string();
+    let main = short("main");
+
+    let claude_start = start(&["new", REPO, "-b", "fresh", "--no-launch"]);
+    assert!(
+        claude_start.contains(&format!(
+            "new session {REPO} @ fresh (memory: 1 file from {REPO}@{main}, main on this computer)"
+        )),
+        "{claude_start}"
+    );
+    assert!(claude_start.contains("memory: 1 file →"), "{claude_start}");
+
+    let codex_start = start(&["new", REPO, "-b", "cx", "--as", "codex", "--no-launch"]);
+    assert!(
+        codex_start.contains(&format!(
+            "new session {REPO} @ cx (memory: 1 file from {REPO}@{main}, main on this computer; \
+             given to Codex as an index when agit starts it)"
+        )),
+        "{codex_start}"
+    );
+
+    let opencode_start = start(&["new", REPO, "-b", "oc", "--as", "opencode", "--no-launch"]);
+    assert!(
+        opencode_start.contains(&format!(
+            "new session {REPO} @ oc (memory: none; OpenCode doesn't get agit's memory)"
+        )),
+        "{opencode_start}"
+    );
+
+    // A memory folder that can't be written: the line counts nothing placed.
+    fs::remove_dir_all(&mem).unwrap();
+    fs::write(&mem, "not a folder").unwrap();
+    let blocked = start(&["new", REPO, "-b", "blocked", "--no-launch"]);
+    assert!(
+        blocked.contains(&format!(
+            "new session {REPO} @ blocked (memory from {REPO}@{main}, main on this computer couldn't be placed in full; see the note below)"
+        )) && !blocked.contains("memory: 1 file"),
+        "{blocked}"
+    );
+    fs::remove_file(&mem).unwrap();
+    fs::create_dir_all(&mem).unwrap();
+
+    repo.git(&["rm", "-q", "memory/team.md"]).unwrap();
+    repo.commit("agit: no team memory").unwrap();
+    let emptied = short("main");
+    let empty_start = start(&["new", REPO, "-b", "empty", "--no-launch"]);
+    assert!(
+        empty_start.contains(&format!(
+            "new session {REPO} @ empty (memory: 0 files; {REPO}@{emptied}, main on this computer, has none)"
+        )),
+        "{empty_start}"
+    );
+    assert!(!empty_start.contains("memory: 1 file"), "{empty_start}");
+}
+
 /// A PEM private key in a runtime memory file reaches the branch only as one placeholder that
 /// covers the block from BEGIN through END, and a runtime directory that lacks the file gets the
 /// key back from that placeholder; a block without its END line keeps its file off the branch
