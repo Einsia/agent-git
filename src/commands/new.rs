@@ -348,15 +348,6 @@ pub fn run(args: Args) -> CmdResult {
     )?;
     super::plumbing::update_ref_cas(&repo, &format!("refs/heads/{branch}"), &commit, None)?;
 
-    // Codex keeps no project memory of its own: the branch's memory reaches it only as the index
-    // agit's session-start hook gives a Codex that agit itself starts.
-    let memory = if runtime_of(&args) == "codex" {
-        format!("memory from {from_ref} goes to Codex as an index when agit starts it")
-    } else {
-        format!("memory inherited from {from_ref}")
-    };
-    ui::success(&format!("new session {slug} @ {branch} ({memory})"));
-
     // ── materialize the shared files ──
     //
     // AGENTS.md lands at the project root (Codex / Cursor read it natively); memory goes through
@@ -364,7 +355,38 @@ pub fn run(args: Args) -> CmdResult {
     // longer materializes skills — they travel with the code repo's `.claude/skills` /
     // `.agents/skills`.
     materialize_shared(&repo, &from_head, &work_dir);
-    match super::memory::start(&repo, &branch, &slug, &runtime_of(&args), &work_dir) {
+    let runtime_id = runtime_of(&args);
+    let placed = super::memory::start(&repo, &branch, &slug, &runtime_id, &work_dir);
+
+    // The start line names the repository and commit the session's memory comes from, and how
+    // many of its files the session has as placing came out, none included. Codex keeps no project
+    // memory of its own: the branch's memory reaches it only as the index agit's session-start
+    // hook gives a Codex that agit itself starts, so its line counts the branch's files. Other
+    // runtimes get none.
+    let source = format!(
+        "{slug}@{}, {from_ref} on this computer",
+        &from_head[..9.min(from_head.len())]
+    );
+    let files = |n: usize| format!("{n} file{}", if n == 1 { "" } else { "s" });
+    let memory = match &placed {
+        Ok(Some(report)) if report.available == 0 => format!("memory: 0 files; {source}, has none"),
+        Ok(Some(report)) => format!("memory: {} from {source}", files(report.available)),
+        Err(_) => format!("memory from {source} couldn't be placed in full; see the note below"),
+        Ok(None) if runtime_id == "codex" => match super::memory::count_files(&repo, &commit) {
+            Ok(0) => format!("memory: 0 files; {source}, has none"),
+            Ok(n) => format!(
+                "memory: {} from {source}; given to Codex as an index when agit starts it",
+                files(n)
+            ),
+            Err(_) => format!("memory from {source}; its files couldn't be counted"),
+        },
+        Ok(None) => format!(
+            "memory: none; {} doesn't get agit's memory",
+            ui::session::runtime_label(&runtime_id)
+        ),
+    };
+    ui::success(&format!("new session {slug} @ {branch} ({memory})"));
+    match placed {
         Ok(Some(report)) => super::memory::report_materialize(&report),
         Ok(None) => {}
         Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
