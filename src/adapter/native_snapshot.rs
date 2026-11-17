@@ -214,6 +214,11 @@ pub(crate) fn codex_carrier_in(home: &Path, id: &str, limits: Limits) -> Result<
     selected.ok_or(Unavailable::NotFound)
 }
 
+/// The source of `runtime`'s session `id` at `path`, for a runtime whose own lookup found the file.
+pub(crate) fn source_at(runtime: &'static str, id: &str, path: PathBuf) -> Result<Source> {
+    file_source(runtime, id, path)
+}
+
 fn file_source(runtime: &'static str, id: &str, path: PathBuf) -> Result<Source> {
     let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -266,6 +271,12 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
                                 .any(|part| part.as_os_str() == "agent-transcripts")
                         })
                 }
+                // Pi names a session `<time>_<id>.jsonl`; the time holds no `_`.
+                "pi" => path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.split_once('_'))
+                    .is_some_and(|(time, named)| !time.is_empty() && named == id),
                 _ => path.file_stem().is_some_and(|stem| stem == id),
             };
         if matches {
@@ -957,5 +968,29 @@ mod tests {
             Unavailable::Ambiguous
         );
         assert_eq!(std::fs::read(path).unwrap(), b"invalid transcript");
+    }
+
+    /// A Pi session is found by the id after the time in its file name, `<time>_<id>.jsonl`, as
+    /// `agit import --from pi <id>` asks for it. A lookup that compared the whole file name with
+    /// the id never finds one, and an explicit import of a Pi conversation fails as not found.
+    #[test]
+    fn a_pi_session_is_found_by_the_id_after_its_time() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "01a1e173-e5ad-708a-8b59-54fe90ac5adb";
+        std::fs::create_dir(root.path().join("--work--")).unwrap();
+        let path = root
+            .path()
+            .join(format!("--work--/2026-11-15T07-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&path, b"{}\n").unwrap();
+        assert_eq!(
+            lookup_files_at("pi", id, root.path(), Limits::default())
+                .unwrap()
+                .path,
+            path
+        );
+        assert_eq!(
+            lookup_files_at("pi", &id[..8], root.path(), Limits::default()).unwrap_err(),
+            Unavailable::NotFound
+        );
     }
 }

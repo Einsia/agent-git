@@ -273,10 +273,16 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
     let mut report = Report::new(adapter.id(), id, &destination);
     let source = match adapter.lookup_native_readonly(id, native_snapshot::Limits::default()) {
         Ok(source) => source,
-        Err(
-            error @ (native_snapshot::Unavailable::NotFound
-            | native_snapshot::Unavailable::Ambiguous),
-        ) => {
+        // Said as the step that looked: the conversation may be listed as a candidate, and a bare
+        // "not found" sends the person looking for a session that is there.
+        Err(native_snapshot::Unavailable::NotFound) => {
+            ui::error(&format!(
+                "the check of what is already saved from this conversation looks it up by its full id among {}'s session files, and none of them holds {id}",
+                crate::commands::front::runtime_name(adapter.id())
+            ));
+            return Ok(None);
+        }
+        Err(error @ native_snapshot::Unavailable::Ambiguous) => {
             ui::error(&error.to_string());
             return Ok(None);
         }
