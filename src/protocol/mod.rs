@@ -616,6 +616,7 @@ pub mod method {
     /// request's own answer, with the outcome, follows.
     pub const TURN_ACCEPTED: &str = "turn.accepted";
     pub const TURN_STEERED: &str = "turn.steered";
+    pub const TURN_STEER_DELIVERED: &str = "turn.steer_delivered";
     pub const TURN_STEER_DROPPED: &str = "turn.steer_dropped";
     pub const TURN_COMPLETED: &str = "turn.completed";
     pub const SESSION_STATUS: &str = "session.status";
