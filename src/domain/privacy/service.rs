@@ -1731,6 +1731,12 @@ pub fn manage(
     repo: Option<&Path>,
     command: super::management::Command,
 ) -> crate::Result<serde_json::Value> {
+    if !command.global
+        && command.action == "add"
+        && let Some(repo) = repo
+    {
+        super::association::register(repo);
+    }
     let input = Zeroizing::new(serde_json::to_string(&command)?);
     let outcome = transform(repo, &input, Mode::Manage);
     ensure!(
@@ -1738,6 +1744,14 @@ pub fn manage(
         "privacy management is temporarily unavailable; recording and upload remain available"
     );
     Ok(serde_json::from_str(&outcome.content)?)
+}
+
+pub fn policy_sync_hint(status: &serde_json::Value) -> Option<String> {
+    let sync = &status["policy_sync"];
+    let unresolved = sync["unresolved_rules"].as_u64().unwrap_or(0);
+    let pending = sync["pending_uploads"].as_u64().unwrap_or(0);
+    (status["initialized"] == true && (sync["receipt_complete"] == false || unresolved > 0 || pending > 0))
+        .then(||format!("privacy rules are still synchronizing ({pending} local events pending, {unresolved} rules waiting for values); capture and upload continue with available rules"))
 }
 
 /// One line for each journal of rules this device registered under another account or Hub that
@@ -1755,7 +1769,7 @@ pub fn unreadable_rule_hints() -> crate::Result<Vec<String>> {
     let rows = status["unreadable_rules"]
         .as_array()
         .context("privacy status did not list unreadable rules")?;
-    Ok(rows
+    let mut hints: Vec<String> = rows
         .iter()
         .map(|row| match (row["hub"].as_str(), row["account"].as_str()) {
             (Some(hub), Some(account)) => format!(
@@ -1768,7 +1782,9 @@ pub fn unreadable_rule_hints() -> crate::Result<Vec<String>> {
                 row["path"].as_str().unwrap_or("an unreadable journal")
             ),
         })
-        .collect())
+        .collect();
+    hints.extend(policy_sync_hint(&status));
+    Ok(hints)
 }
 
 /// Ends this process's worker before the process exits, unless another thread is using it. No

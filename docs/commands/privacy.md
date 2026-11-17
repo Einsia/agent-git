@@ -31,6 +31,29 @@ mapped parents when their birth metadata declares encryption; event bytes and fi
 unchanged. Accepted history retains its exact commits. Custom tags targeting rewritten commits
 must be removed before publication or recreated on the accepted public commits.
 
+## Explicit blocks across devices
+
+`agit secrets add` registers an account-wide literal block. `agit secrets block add --repo`
+registers a repository block. Blocks and their removals synchronize as encrypted events;
+allows remain on this computer. Another device applies a block to future captures after
+it receives both the rule and its value. Synchronization never rewrites saved or published
+records, and unavailable synchronization does not stop capture or ordinary publication.
+
+A removal withdraws the additions that device has observed. A concurrent addition on another
+device remains active until a later removal observes it. Missing values remain pending while
+unrelated later removals can take effect. `agit secrets status` and `agit doctor` report pending
+synchronization without displaying values.
+
+Repository rules travel only after an authenticated lookup verifies the current account,
+Hub, selected remote and immutable repository identity. A rule registered without that
+association is labelled "this computer only" and stays local even if a later lookup succeeds.
+Changes to account, Hub or remote selection stop use of the old association. Same-name
+repository recreation is detected at the next successful synchronization, or earlier when
+another operation observes the new identity. A failed lookup preserves the last verified
+association while the local selector still matches. Linked worktrees retain separate associations
+so their remote selections do not overwrite each other. These rules do not promise live remote
+tracking.
+
 ## Deliver a bound repository to another Hub
 
 A repository first registered on one Hub remains bound to that Hub for ordinary pushes. During a

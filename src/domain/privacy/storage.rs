@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
 
+const SCHEMA_VERSION: i64 = 1;
+
 const MAX_STORE_BYTES: i64 = 512 * 1024 * 1024;
 const MAX_LOAD_BYTES: usize = 128 * 1024 * 1024;
 
@@ -195,36 +197,54 @@ impl Store {
             std::fs::symlink_metadata(&path)?.is_file(),
             "privacy journal is not a regular file"
         );
-        let db = Connection::open_with_flags(
+        let mut db = Connection::open_with_flags(
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
         db.busy_timeout(std::time::Duration::ZERO)?;
-        db.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS packages (
-                sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
-                dictionary_id TEXT NOT NULL, encrypted INTEGER NOT NULL,
-                payload BLOB NOT NULL, uploaded INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS retry (id TEXT PRIMARY KEY, version INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS policy (
-                scope TEXT NOT NULL, token TEXT NOT NULL, name TEXT NOT NULL,
-                block INTEGER, allow INTEGER, PRIMARY KEY(scope, token));
-            INSERT OR IGNORE INTO metadata VALUES ('policy_generation', '0');
-            INSERT OR IGNORE INTO metadata VALUES ('bytes', '0');
-            CREATE TRIGGER IF NOT EXISTS packages_insert AFTER INSERT ON packages BEGIN
-                UPDATE metadata SET value=CAST(value AS INTEGER)+length(NEW.payload) WHERE key='bytes'; END;
-            CREATE TRIGGER IF NOT EXISTS packages_update AFTER UPDATE OF payload ON packages BEGIN
-                UPDATE metadata SET value=CAST(value AS INTEGER)+length(NEW.payload)-length(OLD.payload) WHERE key='bytes'; END;",
-        )?;
-        let new_id = uuid::Uuid::new_v4().to_string();
-        db.execute(
-            "INSERT OR IGNORE INTO metadata VALUES ('dictionary', ?1)",
-            [&new_id],
-        )?;
+        db.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;")?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        ensure!(
+            (0..=SCHEMA_VERSION).contains(&version),
+            "unsupported privacy journal schema"
+        );
+        if version < SCHEMA_VERSION {
+            db.execute_batch("PRAGMA journal_mode=WAL")?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            ensure!(
+                (0..=SCHEMA_VERSION).contains(&version),
+                "unsupported privacy journal schema"
+            );
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS packages (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+                    dictionary_id TEXT NOT NULL, encrypted INTEGER NOT NULL,
+                    payload BLOB NOT NULL, uploaded INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS retry (id TEXT PRIMARY KEY, version INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS policy (
+                    scope TEXT NOT NULL, token TEXT NOT NULL, name TEXT NOT NULL,
+                    block INTEGER, allow INTEGER, PRIMARY KEY(scope, token));
+                INSERT OR IGNORE INTO metadata VALUES ('policy_generation', '0');
+                INSERT OR IGNORE INTO metadata VALUES ('bytes', '0');
+                CREATE TRIGGER IF NOT EXISTS packages_insert AFTER INSERT ON packages BEGIN
+                    UPDATE metadata SET value=CAST(value AS INTEGER)+length(NEW.payload) WHERE key='bytes'; END;
+                CREATE TRIGGER IF NOT EXISTS packages_update AFTER UPDATE OF payload ON packages BEGIN
+                    UPDATE metadata SET value=CAST(value AS INTEGER)+length(NEW.payload)-length(OLD.payload) WHERE key='bytes'; END;",
+            )?;
+            super::decisions::initialize(&tx)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO metadata VALUES ('dictionary', ?1)",
+                [uuid::Uuid::new_v4().to_string()],
+            )?;
+            // The marker commits with the complete schema, independent of enabled features.
+            // Reopening an initialized journal must not compete with writers for a read.
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        }
         let dictionary_id: String = db.query_row(
             "SELECT value FROM metadata WHERE key='dictionary'",
             [],
@@ -609,6 +629,10 @@ mod tests {
         );
         drop(projector);
 
+        // An unversioned journal retains its dictionary and offline mappings during upgrade.
+        let unversioned = Connection::open(first.path().join("privacy/journal.sqlite")).unwrap();
+        unversioned.pragma_update(None, "user_version", 0).unwrap();
+        drop(unversioned);
         let mut store = Store::open(&first.path().join("privacy"), None).unwrap();
         store.encrypt_pending(&key()).unwrap();
         let mut destination =
@@ -667,6 +691,26 @@ mod tests {
 
         let lock = Connection::open(second.path().join("privacy/journal.sqlite")).unwrap();
         lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut reopened = Store::open(&second.path().join("privacy"), Some(owner.clone()))
+            .expect("committed mappings remain readable while another connection writes");
+        let mut snapshot = Dictionary::default();
+        assert!(
+            reopened
+                .load_since(&mut snapshot, 0, |_| Ok(key()))
+                .unwrap()
+                .1
+        );
+        reopened.resolve_policy(&snapshot).unwrap();
+        assert_eq!(
+            snapshot.records().count(),
+            restored.dictionary.records().count()
+        );
+        assert_eq!(
+            restored
+                .transform(&protected.content, Mode::HydrateJsonl)
+                .content,
+            hydrated.content
+        );
         let unknown = "AKIA5RJ2NV7MQXP3TC6Z";
         let attempted = restored.transform(unknown, Mode::ProtectText);
         assert_eq!(attempted.content, unknown);

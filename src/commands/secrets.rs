@@ -21,7 +21,7 @@ pub struct Args {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Register a literal secret (hidden prompt; use --stdin for automation)
+    /// Register a literal secret for this account; other devices apply it after synchronization
     Add {
         /// Non-secret label shown by list/status.
         name: String,
@@ -73,7 +73,7 @@ enum Action {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Manage exact repository-local block rules
+    /// Manage repository block rules; verified repositories synchronize across devices
     Block {
         #[command(subcommand)]
         command: BlockAction,
@@ -251,13 +251,14 @@ pub fn run(args: Args) -> CmdResult {
                     })
                     .collect();
                 println!(
-                    "{}\t{}\tblocked={}\tallowed={}\tkind={}\tfrom={}",
+                    "{}\t{}\tblocked={}\tallowed={}\tkind={}\tfrom={}\tscope={}",
                     record["id"].as_str().unwrap_or(""),
                     record["name"].as_str().unwrap_or(""),
                     record["explicit_block"],
                     record["allowed"],
                     record["kind"].as_str().unwrap_or("unknown"),
-                    from.join(",")
+                    from.join(","),
+                    record["scope"].as_str().unwrap_or("this computer only")
                 );
             }
         }
@@ -272,9 +273,16 @@ pub fn run(args: Args) -> CmdResult {
                     "not cached yet"
                 }
             ));
+            if let Some(hint) = crate::domain::privacy::service::policy_sync_hint(&result) {
+                println!("{hint}");
+            }
         }
         Report::Status => println!("privacy vault is not initialized (0 records)"),
-        Report::Created(what) => ui::success_result(&format!("{what} {}", rule())),
+        Report::Created(what) => ui::success_result(&format!(
+            "{what} [{}] {}",
+            result["scope"].as_str().unwrap_or("this computer only"),
+            rule()
+        )),
         Report::Changed(what) => ui::success(&format!("{what} {}", rule())),
     }
     Ok(ExitCode::Ok)

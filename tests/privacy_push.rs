@@ -36,8 +36,76 @@ mod startup_cache;
 const AGENT_ID: &str = "9f2c3b53-7fe0-412f-b62a-bf68a6845ce7";
 const TRANSPORT_USER_AGENT: &str = "synthetic-publisher-transport";
 
+#[derive(Default)]
+struct RuleCloud {
+    dictionary: Vec<(String, serde_json::Value)>,
+    policy: Vec<(String, serde_json::Value)>,
+    unavailable: bool,
+    inventories: usize,
+}
+
+impl RuleCloud {
+    fn answer(&mut self, method: &str, path: &str, body: &[u8]) -> (u16, serde_json::Value) {
+        if path == "/api/me/privacy/key" {
+            return (
+                200,
+                json!({"account_id":"account-1","version":1,"key":STANDARD.encode([7;32])}),
+            );
+        }
+        let policy = path.starts_with("/api/me/privacy/policy/");
+        if policy && self.unavailable {
+            return (503, json!({"error":"policy unavailable"}));
+        }
+        let prefix = if policy {
+            "/api/me/privacy/policy/packages"
+        } else {
+            "/api/me/privacy/packages"
+        };
+        let packages = if policy {
+            &mut self.policy
+        } else {
+            &mut self.dictionary
+        };
+        if let Some(query) = path.strip_prefix(&format!("{prefix}?after=")) {
+            self.inventories += usize::from(policy);
+            let after: usize = query.split('&').next().unwrap().parse().unwrap();
+            return (
+                200,
+                json!({"packages":packages.iter().enumerate().filter(|(i,_)|(i+1)*3 > after).map(|(i,(id,envelope))|
+                json!({"package_id":id,"dictionary_id":envelope["dictionary_id"],"key_version":1,"sequence":(i+1)*3})).collect::<Vec<_>>(),"next_after":null}),
+            );
+        }
+        let id = path
+            .strip_prefix(&format!("{prefix}/"))
+            .expect("privacy package route");
+        if method == "PUT" {
+            let envelope: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let index = packages
+                .iter()
+                .position(|(saved, _)| saved == id)
+                .unwrap_or_else(|| {
+                    packages.push((id.into(), envelope.clone()));
+                    packages.len() - 1
+                });
+            assert_eq!(packages[index].1, envelope);
+            (200, json!({"package_id":id,"sequence":(index+1)*3}))
+        } else {
+            (
+                200,
+                packages
+                    .iter()
+                    .find(|(saved, _)| saved == id)
+                    .unwrap()
+                    .1
+                    .clone(),
+            )
+        }
+    }
+}
+
 struct Hub {
     base: String,
+    rules: Arc<Mutex<RuleCloud>>,
     posts: Arc<AtomicUsize>,
     manifests: Arc<Mutex<Vec<serde_json::Value>>>,
     registrations: Arc<AtomicUsize>,
@@ -187,6 +255,8 @@ impl Hub {
         let cutting = Arc::clone(&cut_receives);
         let publicize_when = Arc::new(Mutex::new(None::<String>));
         let publicizing = Arc::clone(&publicize_when);
+        let rules = Arc::new(Mutex::new(RuleCloud::default()));
+        let serving_rules = rules.clone();
         let resolver_hub = base.clone();
         let root = root.to_owned();
         let worker = thread::spawn(move || {
@@ -298,6 +368,17 @@ impl Hub {
                         .read_to_end(&mut decoded)
                         .unwrap();
                     body = decoded;
+                }
+                if target.starts_with("/api/me/privacy/") {
+                    let (status, value) =
+                        serving_rules.lock().unwrap().answer(method, target, &body);
+                    let body = value.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    continue;
                 }
                 if (target == "/api/agents/alice/app" && !root.join("alice/app.git").is_dir())
                     || target == "/api/agents/alice/notes"
@@ -783,6 +864,7 @@ impl Hub {
         });
         Self {
             base,
+            rules,
             posts,
             manifests,
             registrations,
@@ -14624,6 +14706,177 @@ fn the_folder_answer_counts_the_turns_the_hub_has_not_received() {
     repo.git(&["config", "--unset", "agit.remoteIdentity"])
         .unwrap();
     unknown("alice/app@talk:");
+}
+
+/// A rule imported from another device changes newly captured events, while accepted plain
+/// history stays byte-identical. A failed rule stream cannot turn ordinary publication into a gate.
+#[test]
+fn synchronized_blocks_protect_new_capture_without_rewriting_or_gating_plain_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote_root = temp.path().join("remote");
+    let remote = remote_root.join("alice/app.git");
+    let hub = Hub::start(&remote_root, [25; 32]);
+    let (source, home) = (temp.path().join("source"), temp.path().join("destination"));
+    for directory in [&source, &home] {
+        startup_cache::seed(directory);
+        save_at(
+            &directory
+                .join("credentials")
+                .join(format!("{}.json", config::hub_host_key(&hub.base).unwrap())),
+            &HubCredential {
+                account_id: Some("account-1".into()),
+                username: "alice".into(),
+                email: None,
+                hub: Some(hub.base.clone()),
+                access_token: "synthetic-access".into(),
+                refresh_token: "synthetic-refresh".into(),
+                access_expires_at: "2099-01-01T00:00:00Z".into(),
+                refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+    }
+    let command = |directory: &Path| {
+        let environment = git_command(temp.path());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
+        command.env_clear_local();
+        for (name, value) in environment.get_envs() {
+            if let Some(value) = value {
+                command.env(name, value);
+            }
+        }
+        command
+            .current_dir(temp.path())
+            .env("AGIT_HOME", directory)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("AGIT_SKIP_SETUP", "1")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("CI", "1")
+            .env("AGIT_TUI", "0");
+        command
+    };
+    let run = |directory: &Path, args: &[&str]| {
+        command(directory)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let value = "ordinary violet harbor phrase";
+    let mut registration = command(&source)
+        .args(["secrets", "add", "harbor", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    registration
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(value.as_bytes())
+        .unwrap();
+    assert_success(&registration.wait_with_output().unwrap());
+    assert_success(&run(&source, &["__privacy-sync-v1", &hub.base]));
+    hub.rules.lock().unwrap().unavailable = true;
+    assert_success(&run(&home, &["__privacy-sync-v1", &hub.base]));
+    let capture = |id: &str| {
+        let mut worker = command(&home)
+            .arg("__privacy-worker-v1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = json!({"type":"user","uuid":id,"message":{"role":"user","content":value}})
+            .to_string()
+            + "\n";
+        let request =
+            json!({"repo":null,"mode":"protect_jsonl","text":input,"context":""}).to_string();
+        let stdin = worker.stdin.as_mut().unwrap();
+        stdin
+            .write_all(&(request.len() as u32).to_be_bytes())
+            .unwrap();
+        stdin.write_all(request.as_bytes()).unwrap();
+        stdin.flush().unwrap();
+        let stdout = worker.stdout.as_mut().unwrap();
+        let mut size = [0; 4];
+        stdout.read_exact(&mut size).unwrap();
+        let length = u32::from_be_bytes(size) as usize;
+        assert!(length < 1024 * 1024);
+        let mut bytes = vec![0; length];
+        stdout.read_exact(&mut bytes).unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let _ = worker.kill();
+        let _ = worker.wait();
+        assert_eq!(result["status"], "complete");
+        result["content"].as_str().unwrap().to_owned()
+    };
+    let repo = Repo::init(&home.join("repos/alice/app")).unwrap();
+    repo.git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
+        .unwrap();
+    repo.git(&["config", "user.name", "Fixture Writer"])
+        .unwrap();
+    repo.git(&["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    meta::write(repo.root(), &meta::Meta::new_file_line()).unwrap();
+    fs::write(repo.root().join("README.md"), "Shared file\n").unwrap();
+    repo.add_all().unwrap();
+    repo.commit("File line").unwrap();
+    assert_success(&run(&home, &["--yes", "push", "alice/app@main"]));
+    repo.git(&["checkout", "-b", "work"]).unwrap();
+    let metadata = meta::Meta::new(
+        format!("agit-{}", "c".repeat(40)),
+        "claude-code".into(),
+        String::new(),
+    );
+    let save = |input: &str| {
+        let log = transcript::wrap_lines(input, "claude-code", &metadata.session);
+        write_snapshot(repo.root(), &log, &log).unwrap();
+        meta::write(repo.root(), &metadata).unwrap();
+        repo.add_all().unwrap();
+        repo.commit("Captured turn").unwrap();
+        git(repo.root(), &["rev-parse", "HEAD"])
+    };
+    let first = capture("first-capture");
+    assert!(first.contains(value));
+    let before = save(&first);
+    let tree_before = git(repo.root(), &["rev-parse", &format!("{before}^{{tree}}")]);
+    assert_success(&run(&home, &["--yes", "push", "alice/app@work"]));
+    let accepted = git(&remote, &["rev-parse", "refs/heads/work"]);
+    let accepted_tree = git(&remote, &["rev-parse", &format!("{accepted}^{{tree}}")]);
+    let accepted_events = git(
+        &remote,
+        &["ls-tree", "-r", "--name-only", &accepted, meta::EVENTS_DIR],
+    );
+    hub.rules.lock().unwrap().unavailable = false;
+    assert_success(&run(&home, &["__privacy-sync-v1", &hub.base]));
+    let next = capture("second-capture");
+    assert!(!next.contains(value));
+    let after = save(&(first.clone() + &next));
+    hub.rules.lock().unwrap().unavailable = true;
+    assert_success(&run(&home, &["__privacy-sync-v1", &hub.base]));
+    assert_success(&run(&home, &["--yes", "push", "alice/app@work"]));
+    assert_eq!(
+        git(repo.root(), &["rev-parse", &format!("{before}^{{tree}}")]),
+        tree_before
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", &format!("{accepted}^{{tree}}")]),
+        accepted_tree
+    );
+    assert_ne!(git(&remote, &["rev-parse", "refs/heads/work"]), accepted);
+    assert_eq!(git(repo.root(), &["rev-parse", "HEAD"]), after);
+    assert_eq!(
+        git(repo.root(), &["rev-parse", &format!("{after}^")]),
+        before
+    );
+    for path in accepted_events.lines() {
+        assert_eq!(
+            git(&remote, &["rev-parse", &format!("{accepted}:{path}")]),
+            git(&remote, &["rev-parse", &format!("refs/heads/work:{path}")]),
+            "accepted event bytes must be carried unchanged"
+        );
+    }
 }
 
 /// A folder bound to alice/app with automatic upload on, whose Claude Code conversations each

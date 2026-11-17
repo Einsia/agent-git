@@ -19,6 +19,13 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 struct Cloud {
     packages: Vec<(String, Value)>,
+    policies: Vec<(String, Value)>,
+    repositories: std::collections::BTreeMap<String, String>,
+    refuse_repository: bool,
+    refused_repository_lookups: usize,
+    refuse_policy: bool,
+    lose_policy_ack: bool,
+    withheld_dictionary: std::collections::BTreeSet<String>,
     /// Status, content type and body answered to every package upload.
     refuse_upload: Option<(u16, &'static str, &'static str)>,
     upload_attempts: usize,
@@ -39,6 +46,7 @@ impl Hub {
         let state = Arc::new(Mutex::new(Cloud::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let (cloud, stopping) = (state.clone(), stop.clone());
+        let response_base = url.clone();
         let thread = std::thread::spawn(move || {
             while !stopping.load(Ordering::Acquire) {
                 let (mut socket, _) = match listener.accept() {
@@ -91,6 +99,69 @@ impl Hub {
                         200,
                         json!({"account_id":"fixture-account","version":1,"key":STANDARD.encode([7;32])}),
                     )
+                } else if let Some(slug) = path.strip_prefix("/api/agents/") {
+                    if cloud.refuse_repository {
+                        cloud.refused_repository_lookups += 1;
+                        (503, json!({"error":"repository lookup unavailable"}))
+                    } else if let Some(id) = cloud.repositories.get(slug) {
+                        let (owner, name) = slug.split_once('/').unwrap();
+                        (
+                            200,
+                            json!({"agent_id":id,"owner":owner,"name":name,"clone_url":format!("{response_base}/{slug}.git")}),
+                        )
+                    } else {
+                        (404, json!({"error":"not found"}))
+                    }
+                } else if path.starts_with("/api/cli/version") {
+                    (404, Value::Null)
+                } else if path.starts_with("/api/me/privacy/policy/") && cloud.refuse_policy {
+                    (503, json!({"error":"unavailable"}))
+                } else if let Some(query) =
+                    path.strip_prefix("/api/me/privacy/policy/packages?after=")
+                {
+                    let after: usize = query.split('&').next().unwrap().parse().unwrap();
+                    // Gaps model the sequence shared with dictionary packages on the Hub.
+                    let entries: Vec<_> = cloud.policies.iter().enumerate().filter(|(index,_)|(index+1)*3 > after).map(|(index,(id,value))| {
+                        json!({"package_id":id,"dictionary_id":value["dictionary_id"],"key_version":1,"sequence":(index+1)*3})
+                    }).collect();
+                    (200, json!({"packages":entries,"next_after":null}))
+                } else if let Some(id) = path.strip_prefix("/api/me/privacy/policy/packages/") {
+                    if method == "PUT" {
+                        let envelope: Value = serde_json::from_slice(&body).unwrap();
+                        let index = cloud
+                            .policies
+                            .iter()
+                            .position(|(saved, _)| saved == id)
+                            .unwrap_or_else(|| {
+                                cloud.policies.push((id.to_owned(), envelope.clone()));
+                                cloud.policies.len() - 1
+                            });
+                        assert_eq!(
+                            cloud.policies[index].1, envelope,
+                            "retry must retain its ciphertext"
+                        );
+                        if cloud.lose_policy_ack {
+                            (503, json!({"error":"acknowledgement lost"}))
+                        } else {
+                            (200, json!({"package_id":id,"sequence":(index+1)*3}))
+                        }
+                    } else {
+                        (
+                            200,
+                            cloud
+                                .policies
+                                .iter()
+                                .find(|(saved, _)| saved == id)
+                                .unwrap()
+                                .1
+                                .clone(),
+                        )
+                    }
+                } else if path
+                    .strip_prefix("/api/me/privacy/packages/")
+                    .is_some_and(|id| method != "PUT" && cloud.withheld_dictionary.contains(id))
+                {
+                    (503, json!({"error":"dictionary unavailable"}))
                 } else if let Some(query) = path.strip_prefix("/api/me/privacy/packages?after=") {
                     let after: usize = query.split('&').next().unwrap().parse().unwrap();
                     let entries: Vec<_> = cloud.packages.iter().enumerate().skip(after).map(|(index,(id, value))| {
@@ -376,8 +447,12 @@ impl Worker {
     }
 
     fn call_context(&mut self, mode: &str, text: &str, context: &str) -> Value {
+        self.call_repo(mode, text, context, None)
+    }
+
+    fn call_repo(&mut self, mode: &str, text: &str, context: &str, repo: Option<&Path>) -> Value {
         let bytes =
-            serde_json::to_vec(&json!({"repo":null,"mode":mode,"text":text,"context":context}))
+            serde_json::to_vec(&json!({"repo":repo,"mode":mode,"text":text,"context":context}))
                 .unwrap();
         let input = self.0.stdin.as_mut().unwrap();
         input
@@ -975,4 +1050,601 @@ fn refused_dictionary_uploads_back_off_and_name_their_cause() {
     );
     assert!(report.contains("agit login`, then push"), "{report}");
     assert!(hub.state.lock().unwrap().packages.is_empty());
+}
+
+impl Device {
+    fn secrets(&self, args: &[&str], input: &str) {
+        let mut command = self
+            .command()
+            .arg("secrets")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        command
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = command.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    fn policy_status(&self) -> Value {
+        let output = self
+            .command()
+            .args(["secrets", "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let status = result
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .unwrap_or(&result);
+        assert!(status["policy_sync"].is_object(), "{result}");
+        status["policy_sync"].clone()
+    }
+}
+
+/// Policy synchronization changes future capture. Missing values must not stall unrelated
+/// revocations, and concurrent additions must survive removals that never observed them.
+#[test]
+fn explicit_blocks_converge_without_gating_capture_or_stalling_revocations() {
+    let hub = Hub::new();
+    let (a, b) = (Device::new(&hub.url), Device::new(&hub.url));
+    let value = "violet badger harbor ordinary phrase";
+    let missing = "amber falcon meadow ordinary phrase";
+    let mut reader = b.worker();
+    let before = reader.protect(value)["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        before, value,
+        "the built-in detector must leave the fixture unchanged"
+    );
+    a.secrets(&["add", "badger", "--stdin"], value);
+    hub.state.lock().unwrap().lose_policy_ack = true;
+    a.sync();
+    let packages = hub.state.lock().unwrap().policies.len();
+    assert_eq!(packages, 1);
+    hub.state.lock().unwrap().lose_policy_ack = false;
+    a.sync();
+    assert_eq!(
+        hub.state.lock().unwrap().policies.len(),
+        packages,
+        "lost acknowledgements cannot allocate packages"
+    );
+    hub.state.lock().unwrap().refuse_policy = true;
+    b.sync();
+    assert_eq!(reader.protect(value)["content"], value);
+    assert_eq!(b.policy_status()["receipt_complete"], false);
+    hub.state.lock().unwrap().refuse_policy = false;
+    b.sync();
+    assert!(
+        !reader.protect(value)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+
+    let records = reader.call(
+        "manage",
+        &json!({"action":"list","global":true,"id":null,"name":null,"secret":null}).to_string(),
+    );
+    let records: Value = serde_json::from_str(records["content"].as_str().unwrap()).unwrap();
+    let id = records[0]["id"].as_str().unwrap();
+    b.secrets(&["allow", id, "--global"], "");
+
+    a.secrets(&["remove", "badger", "--yes"], "");
+    b.secrets(&["add", "badger-again", "--stdin"], value);
+    a.sync();
+    b.sync();
+    a.sync();
+    assert!(
+        !a.worker().protect(value)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+    assert!(
+        !reader.protect(value)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+
+    let old_dictionary: std::collections::BTreeSet<_> = hub
+        .state
+        .lock()
+        .unwrap()
+        .packages
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect();
+    a.secrets(&["add", "falcon", "--stdin"], missing);
+    a.sync();
+    {
+        let mut cloud = hub.state.lock().unwrap();
+        cloud.withheld_dictionary = cloud
+            .packages
+            .iter()
+            .filter(|(id, _)| !old_dictionary.contains(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert!(!cloud.withheld_dictionary.is_empty());
+    }
+    b.sync();
+    let waiting = b.policy_status();
+    assert_eq!(waiting["unresolved_rules"], 1);
+    assert!(waiting["received"].as_i64().unwrap() > waiting["applied"].as_i64().unwrap());
+    assert_eq!(reader.protect(missing)["content"], missing);
+    a.secrets(&["remove", "badger-again", "--yes"], "");
+    a.sync();
+    b.sync();
+    assert_eq!(
+        reader.protect(value)["content"],
+        value,
+        "later unrelated revocation applies immediately"
+    );
+    assert_eq!(b.policy_status()["unresolved_rules"], 1);
+    hub.state.lock().unwrap().withheld_dictionary.clear();
+    b.sync();
+    let complete = b.policy_status();
+    assert_eq!(complete["received"], complete["applied"]);
+    assert_eq!(complete["unresolved_rules"], 0);
+    assert!(
+        !reader.protect(missing)["content"]
+            .as_str()
+            .unwrap()
+            .contains(missing)
+    );
+    assert!(
+        journals(&b.home).iter().any(|path| {
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.query_row("SELECT COUNT(*) FROM policy WHERE allow=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                > 0
+        }),
+        "remote derivation preserves local allows"
+    );
+    assert!(
+        journals(&a.home).iter().all(|path| {
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.query_row("SELECT COUNT(*) FROM policy WHERE allow=1", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                == 0
+        }),
+        "allows never travel"
+    );
+    a.secrets(
+        &["add", "backlog", "--stdin"],
+        "another pending ordinary literal",
+    );
+    hub.state.lock().unwrap().refuse_upload = Some((403, "text/html", "dictionary edge refusal"));
+    a.sync();
+    a.secrets(&["remove", "falcon", "--yes"], "");
+    a.sync();
+    b.sync();
+    assert_eq!(
+        reader.protect(missing)["content"],
+        missing,
+        "dictionary backoff cannot delay an observed removal"
+    );
+}
+
+/// A mutable remote selector, not an old pin, chooses portable rules. Cached associations stop
+/// applying before capture on selector changes. Sync and foreground identity observations both
+/// invalidate a recreated repository, even when the foreground command refuses the old pin.
+/// Lookup failures preserve verified protection, and linked worktrees retain independent selectors.
+#[test]
+fn repository_blocks_follow_verified_selectors_and_recreated_identities() {
+    use agit::{
+        domain::repo::Repo,
+        hub::identity::{self, RemoteIdentity},
+    };
+    let hub = Hub::new();
+    let (a, b) = (Device::new(&hub.url), Device::new(&hub.url));
+    for device in [&a, &b] {
+        device.sign_in(Some("fixture-account"));
+    }
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/one".into(), first.clone());
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/two".into(), second.clone());
+    let repositories: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|device| {
+            let repo = Repo::init(&device.home.join("repos/fixture/one")).unwrap();
+            repo.set_remote(&format!("{}/fixture/one.git", hub.url))
+                .unwrap();
+            identity::pin(&repo, &RemoteIdentity::new(&hub.url, &first).unwrap()).unwrap();
+            repo
+        })
+        .collect();
+    let value = "repository only ordinary meadow phrase";
+    a.secrets(
+        &[
+            "block",
+            "add",
+            "meadow",
+            "--stdin",
+            "--repo",
+            repositories[0].root().to_str().unwrap(),
+        ],
+        value,
+    );
+    a.sync();
+    let mut worker = b.worker();
+    let capture = |worker: &mut Worker| {
+        worker.call_repo("protect_text", value, "", Some(repositories[1].root()))
+    };
+    assert_eq!(capture(&mut worker)["content"], value);
+    b.sync();
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+    hub.state.lock().unwrap().refuse_repository = true;
+    b.sync();
+    assert!(hub.state.lock().unwrap().refused_repository_lookups > 0);
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value),
+        "unavailable synchronization preserves a verified repository block"
+    );
+    b.secrets(
+        &[
+            "block",
+            "add",
+            "rain",
+            "--stdin",
+            "--repo",
+            repositories[1].root().to_str().unwrap(),
+        ],
+        "additional ordinary rain phrase",
+    );
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value),
+        "unavailable registration preserves the existing verified scope"
+    );
+    hub.state.lock().unwrap().refuse_repository = false;
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/one".into(), "invalid-identity".into());
+    b.sync();
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value),
+        "an invalid identity response cannot withdraw verified protection"
+    );
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/one".into(), first.clone());
+
+    let linked_root = b._root.path().join("linked");
+    repositories[1]
+        .git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Create linked worktree fixture",
+        ])
+        .unwrap();
+    repositories[1]
+        .git(&[
+            "worktree",
+            "add",
+            "-b",
+            "linked",
+            linked_root.to_str().unwrap(),
+        ])
+        .unwrap();
+    let linked = Repo::at(&linked_root);
+    assert_eq!(
+        linked.common_dir().unwrap(),
+        repositories[1].common_dir().unwrap()
+    );
+    worker.call_repo("protect_text", value, "", Some(&linked_root));
+    b.sync();
+    for root in [
+        repositories[1].root(),
+        linked_root.as_path(),
+        repositories[1].root(),
+    ] {
+        assert!(
+            !worker.call_repo("protect_text", value, "", Some(root))["content"]
+                .as_str()
+                .unwrap()
+                .contains(value),
+            "linked worktrees retain protection when capture alternates between them"
+        );
+    }
+    repositories[1]
+        .git(&["config", "extensions.worktreeConfig", "true"])
+        .unwrap();
+    // Git accumulates remote URLs, so independent selectors must omit a shared first URL.
+    repositories[1]
+        .git(&["config", "--local", "--unset-all", "remote.origin.url"])
+        .unwrap();
+    repositories[1]
+        .git(&[
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            &format!("{}/fixture/one.git", hub.url),
+        ])
+        .unwrap();
+    linked
+        .git(&[
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            &format!("{}/fixture/two.git", hub.url),
+        ])
+        .unwrap();
+    assert_eq!(
+        linked.remote_url(),
+        Some(format!("{}/fixture/two.git", hub.url))
+    );
+    assert_eq!(
+        repositories[1].remote_url(),
+        Some(format!("{}/fixture/one.git", hub.url))
+    );
+    assert_eq!(
+        worker.call_repo("protect_text", value, "", Some(&linked_root))["content"],
+        value
+    );
+    b.sync();
+    assert_eq!(
+        worker.call_repo("protect_text", value, "", Some(&linked_root))["content"],
+        value
+    );
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value),
+        "a linked worktree's selector change does not revoke another worktree's association"
+    );
+    linked
+        .git(&[
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            &format!("{}/fixture/one.git", hub.url),
+        ])
+        .unwrap();
+    worker.call_repo("protect_text", value, "", Some(&linked_root));
+    b.sync();
+    assert!(
+        !worker.call_repo("protect_text", value, "", Some(&linked_root))["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+    repositories[1]
+        .set_remote(&format!("{}/fixture/two.git", hub.url))
+        .unwrap();
+    assert_eq!(
+        identity::read(&repositories[1]).unwrap().unwrap().agent_id,
+        first
+    );
+    assert_eq!(
+        capture(&mut worker)["content"],
+        value,
+        "old pin cannot preserve the old scope"
+    );
+    b.sync();
+    assert_eq!(capture(&mut worker)["content"], value);
+    repositories[1]
+        .set_remote(&format!("{}/fixture/one.git", hub.url))
+        .unwrap();
+    assert_eq!(capture(&mut worker)["content"], value);
+    b.sync();
+    assert!(
+        !capture(&mut worker)["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/one".into(), uuid::Uuid::new_v4().to_string());
+    b.sync();
+    assert_eq!(
+        capture(&mut worker)["content"],
+        value,
+        "successful synchronization observes a new immutable repository"
+    );
+
+    let repo = &repositories[1];
+    repo.git(&["config", "user.name", "Fixture"]).unwrap();
+    repo.git(&["config", "user.email", "fixture@example.invalid"])
+        .unwrap();
+    repo.git(&["checkout", "-b", "work"]).unwrap();
+    agit::domain::meta::write(
+        repo.root(),
+        &agit::domain::meta::Meta::new(
+            format!("agit-{}", "a".repeat(40)),
+            "claude-code".into(),
+            String::new(),
+        ),
+    )
+    .unwrap();
+    repo.add_all().unwrap();
+    repo.commit("Settled fixture session").unwrap();
+    for args in [
+        vec!["privacy", "mode", "fixture/one@work"],
+        vec!["config", "--repo", "fixture/one", "push.auto", "true"],
+    ] {
+        hub.state
+            .lock()
+            .unwrap()
+            .repositories
+            .insert("fixture/one".into(), first.clone());
+        b.sync();
+        assert!(
+            !capture(&mut worker)["content"]
+                .as_str()
+                .unwrap()
+                .contains(value)
+        );
+        hub.state
+            .lock()
+            .unwrap()
+            .repositories
+            .insert("fixture/one".into(), uuid::Uuid::new_v4().to_string());
+        let output = b
+            .command()
+            .current_dir(b._root.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        if args[0] == "privacy" {
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                error.contains("publication destination differs from the checkout identity"),
+                "{output:?}"
+            );
+        } else {
+            assert!(output.status.success(), "{output:?}");
+            assert!(error.contains("couldn't read who can see"), "{output:?}");
+        }
+        assert_eq!(
+            capture(&mut worker)["content"],
+            value,
+            "a foreground observation invalidates the old scope without synchronization: {args:?}"
+        );
+    }
+
+    // A supervised selector compares normalized identities only after validating the response.
+    let mut supervised = Worker(
+        b.command()
+            .env(identity::EXPECTED_AGENT_ID_ENV, &first)
+            .arg("__privacy-worker-v1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/one".into(), first.clone());
+    supervised.call_repo("protect_text", value, "", Some(repo.root()));
+    let synced = b
+        .command()
+        .env(identity::EXPECTED_AGENT_ID_ENV, &first)
+        .args(["__privacy-sync-v1", &b.hub])
+        .output()
+        .unwrap();
+    assert!(synced.status.success(), "{synced:?}");
+    assert!(
+        !supervised.call_repo("protect_text", value, "", Some(repo.root()))["content"]
+            .as_str()
+            .unwrap()
+            .contains(value)
+    );
+    for (observed, protects) in [
+        ("invalid-identity".to_owned(), true),
+        (first.to_ascii_uppercase(), true),
+        (uuid::Uuid::new_v4().to_string(), false),
+    ] {
+        hub.state
+            .lock()
+            .unwrap()
+            .repositories
+            .insert("fixture/one".into(), observed);
+        let output = b
+            .command()
+            .env(identity::EXPECTED_AGENT_ID_ENV, &first)
+            .current_dir(b._root.path())
+            .args(["config", "--repo", "fixture/one", "push.auto", "true"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("couldn't read who can see"),
+            "{output:?}"
+        );
+        let content = supervised.call_repo("protect_text", value, "", Some(repo.root()));
+        assert_eq!(
+            !content["content"].as_str().unwrap().contains(value),
+            protects,
+            "only a distinct valid foreground identity invalidates supervised protection"
+        );
+    }
+    drop(supervised);
+
+    let local = "offline repository ordinary valley phrase";
+    repositories[1]
+        .set_remote(&format!("{}/fixture/missing.git", hub.url))
+        .unwrap();
+    b.secrets(
+        &[
+            "block",
+            "add",
+            "valley",
+            "--stdin",
+            "--repo",
+            repositories[1].root().to_str().unwrap(),
+        ],
+        local,
+    );
+    hub.state
+        .lock()
+        .unwrap()
+        .repositories
+        .insert("fixture/missing".into(), uuid::Uuid::new_v4().to_string());
+    b.sync();
+    let outcome = worker.call_repo("protect_text", local, "", Some(repositories[1].root()));
+    assert!(!outcome["content"].as_str().unwrap().contains(local));
+    assert_eq!(
+        worker.protect(local)["content"],
+        local,
+        "path-local rules never become global"
+    );
+    assert!(journals(&b.home).iter().any(|path| {
+        let db=rusqlite::Connection::open(path).unwrap();
+        db.query_row("SELECT COUNT(*) FROM policy WHERE name='valley' AND scope NOT LIKE 'repo:%' AND scope!='global'",[],|row|row.get::<_,i64>(0)).unwrap()>0
+    }));
 }

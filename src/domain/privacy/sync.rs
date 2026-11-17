@@ -35,6 +35,15 @@ pub trait Transport {
     fn upload(&self, id: &str, envelope: &Envelope) -> crate::Result<Receipt>;
     fn inventory(&self, after: i64) -> crate::Result<Inventory>;
     fn download(&self, id: &str) -> crate::Result<Envelope>;
+    fn upload_policy(&self, _id: &str, _envelope: &Envelope) -> crate::Result<Receipt> {
+        anyhow::bail!("privacy policy synchronization is unavailable")
+    }
+    fn policy_inventory(&self, _after: i64) -> crate::Result<Inventory> {
+        anyhow::bail!("privacy policy synchronization is unavailable")
+    }
+    fn download_policy(&self, _id: &str) -> crate::Result<Envelope> {
+        anyhow::bail!("privacy policy synchronization is unavailable")
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -42,6 +51,12 @@ pub struct Report {
     pub uploaded: usize,
     pub downloaded: usize,
     pub deferred: usize,
+    #[serde(default)]
+    pub policy_uploaded: usize,
+    #[serde(default)]
+    pub policy_received: usize,
+    #[serde(default)]
+    pub policy_unresolved: usize,
 }
 
 /// Who refused an upload that an immediate retry would send into the same refusal.
@@ -177,109 +192,91 @@ impl Health {
     }
 }
 
-fn health_path(hub: &str) -> Option<PathBuf> {
+fn health_path(hub: &str, policy: bool) -> Option<PathBuf> {
     let label = crate::infra::hub_authority::HubAuthority::parse(hub)
         .ok()?
         .label();
-    Some(Health::path(&keys::root().ok()?, &label))
+    let root = keys::root().ok()?;
+    Some(Health::path(
+        &if policy {
+            root.join("policy-transport")
+        } else {
+            root
+        },
+        &label,
+    ))
 }
 
 /// The refusal recorded for `hub`, read without contacting it.
 pub fn recorded_refusal(hub: &str) -> Option<Health> {
-    Health::load(&health_path(hub)?)
+    Health::load(&health_path(hub, false)?)
+}
+
+pub fn recorded_policy_refusal(hub: &str) -> Option<Health> {
+    Health::load(&health_path(hub, true)?)
 }
 
 /// A new sign-in is the remedy an account refusal asks for, so it must not wait out the
 /// backoff that refusal started.
 pub fn forget_refusal(hub: &str) {
-    if let Some(path) = health_path(hub) {
-        let _ = Health::forget(&path);
+    for policy in [false, true] {
+        if let Some(path) = health_path(hub, policy) {
+            let _ = Health::forget(&path);
+        }
     }
 }
 
-pub fn run(
+fn receiving_key(
+    key: &UserKey,
+    version: i64,
+    root: &Path,
+    transport: &impl Transport,
+) -> crate::Result<UserKey> {
+    use base64::Engine;
+    if version == key.version {
+        return UserKey::new(
+            key.owner.clone(),
+            version,
+            base64::engine::general_purpose::STANDARD.decode(key.encoded().as_str())?,
+        );
+    }
+    keys::cached(root, &key.owner, Some(version)).or_else(|_| {
+        let document = transport.key(version)?;
+        ensure!(
+            document.account_id == key.owner.account && document.version == version,
+            "cloud privacy key identity changed"
+        );
+        let historical = UserKey::new(
+            key.owner.clone(),
+            version,
+            base64::engine::general_purpose::STANDARD.decode(&document.key)?,
+        )?;
+        let _ = keys::cache(root, &historical);
+        Ok(historical)
+    })
+}
+
+fn dictionary_receive(
     store: &mut Store,
     key: &UserKey,
-    cache_root: &Path,
+    root: &Path,
     transport: &impl Transport,
-    budget: Duration,
-) -> crate::Result<Report> {
-    let deadline = Instant::now() + budget;
-    let mut report = Report::default();
-    store.encrypt_pending(key)?;
-    let health_path = Health::path(cache_root, &key.owner.hub);
-    let previous = Health::load(&health_path);
-    let now = chrono::Utc::now().timestamp();
-    if previous
-        .as_ref()
-        .is_none_or(|health| health.retry_at <= now)
-    {
-        let mut refused = None;
-        for package in store.outbox(100)? {
-            if Instant::now() >= deadline {
-                report.deferred += 1;
-                break;
-            }
-            match transport.upload(&package.id, &package.envelope) {
-                Ok(receipt) if receipt.package_id == package.id && receipt.sequence > 0 => {
-                    store.acknowledge(&package.id)?;
-                    report.uploaded += 1;
-                }
-                Ok(_) => report.deferred += 1,
-                // Edge and package refusals can depend on the package, so later packages still
-                // get their attempt; an account refusal applies to every package.
-                Err(error) => {
-                    report.deferred += 1;
-                    let Some(refusal) = classify(&error) else {
-                        continue;
-                    };
-                    let account = refusal.0 == Refusal::Authorization;
-                    if account || refused.is_none() {
-                        refused = Some(refusal);
-                    }
-                    if account {
-                        break;
-                    }
-                }
-            }
-        }
-        // The record only paces uploads and explains them; failing to keep it must not cost
-        // this run its downloads.
-        let _ = Health::settle(&health_path, previous, refused, now);
-    } else {
-        report.deferred += 1;
-    }
+    deadline: Instant,
+    report: &mut Report,
+) -> crate::Result<()> {
     let receive = |store: &mut Store, id: &str, version: i64| -> crate::Result<()> {
-        let historical = if version == key.version {
-            None
-        } else {
-            Some(
-                keys::cached(cache_root, &key.owner, Some(version)).or_else(|_| {
-                    let document = transport.key(version)?;
-                    let historical = UserKey::new(key.owner.clone(), document.version, {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(&document.key)?
-                    })?;
-                    ensure!(
-                        document.account_id == key.owner.account && historical.version == version,
-                        "cloud privacy key identity changed"
-                    );
-                    let _ = keys::cache(cache_root, &historical);
-                    Ok::<_, anyhow::Error>(historical)
-                })?,
-            )
-        };
+        let historical = receiving_key(key, version, root, transport)?;
         let envelope = transport.download(id)?;
         ensure!(
             envelope.key_version == version,
             "privacy inventory disagrees with its envelope"
         );
-        store.import(id, &envelope, historical.as_ref().unwrap_or(key))
+        store.import(id, &envelope, &historical)
     };
     for (id, version) in store.retries()? {
         if Instant::now() >= deadline {
             report.deferred += 1;
-            return Ok(report);
+            return Ok(());
         }
         if receive(store, &id, version).is_ok() {
             store.clear_retry(&id)?;
@@ -289,18 +286,18 @@ pub fn run(
         }
     }
     let mut cursor = store.inventory_cursor()?;
-    while Instant::now() < deadline {
+    for _ in 0..8 {
+        if Instant::now() >= deadline {
+            report.deferred += 1;
+            return Ok(());
+        }
         let inventory = transport.inventory(cursor)?;
-        ensure!(
-            inventory.packages.len() <= 100,
-            "privacy inventory exceeds its item budget"
-        );
+        validate_inventory(&inventory, cursor)?;
         for entry in &inventory.packages {
             if Instant::now() >= deadline {
                 report.deferred += 1;
-                return Ok(report);
+                return Ok(());
             }
-            ensure!(entry.sequence > cursor, "privacy inventory is not ordered");
             if receive(store, &entry.package_id, entry.key_version).is_ok() {
                 report.downloaded += 1;
             } else {
@@ -311,12 +308,215 @@ pub fn run(
             store.save_inventory_cursor(cursor)?;
         }
         if inventory.next_after.is_none() {
-            break;
+            return Ok(());
         }
-        ensure!(
-            !inventory.packages.is_empty() && inventory.next_after == Some(cursor),
-            "invalid privacy inventory cursor"
-        );
     }
+    report.deferred += 1;
+    Ok(())
+}
+
+fn validate_inventory(inventory: &Inventory, mut after: i64) -> crate::Result<()> {
+    ensure!(
+        inventory.packages.len() <= 100,
+        "privacy inventory exceeds its item budget"
+    );
+    for entry in &inventory.packages {
+        ensure!(
+            entry.sequence > after
+                && entry.key_version > 0
+                && uuid::Uuid::parse_str(&entry.package_id).is_ok()
+                && uuid::Uuid::parse_str(&entry.dictionary_id).is_ok(),
+            "invalid privacy inventory entry"
+        );
+        after = entry.sequence;
+    }
+    ensure!(
+        inventory.next_after.is_none()
+            || (!inventory.packages.is_empty() && inventory.next_after == Some(after)),
+        "invalid privacy inventory cursor"
+    );
+    Ok(())
+}
+
+fn policy_receive(
+    store: &mut Store,
+    key: &UserKey,
+    root: &Path,
+    transport: &impl Transport,
+    deadline: Instant,
+    report: &mut Report,
+) -> crate::Result<()> {
+    store.db.execute(
+        "UPDATE metadata SET value='0' WHERE key='policy_receipt_complete'",
+        [],
+    )?;
+    let mut dictionary = super::dictionary::Dictionary::default();
+    // Loading uses cached keys only; dictionary failures cannot consume the policy receive budget.
+    store.load_since(&mut dictionary, 0, |version| {
+        if version == key.version {
+            use base64::Engine;
+            UserKey::new(
+                key.owner.clone(),
+                version,
+                base64::engine::general_purpose::STANDARD.decode(key.encoded().as_str())?,
+            )
+        } else {
+            keys::cached(root, &key.owner, Some(version))
+        }
+    })?;
+    store.resolve_policy(&dictionary)?;
+    let mut cursor = store.policy_progress()?.received;
+    for _ in 0..8 {
+        if Instant::now() >= deadline {
+            report.deferred += 1;
+            return Ok(());
+        }
+        let inventory = transport.policy_inventory(cursor)?;
+        validate_inventory(&inventory, cursor)?;
+        for entry in &inventory.packages {
+            if Instant::now() >= deadline {
+                report.deferred += 1;
+                return Ok(());
+            }
+            let historical = receiving_key(key, entry.key_version, root, transport)?;
+            let envelope = transport.download_policy(&entry.package_id)?;
+            ensure!(
+                envelope.dictionary_id == entry.dictionary_id
+                    && envelope.key_version == entry.key_version,
+                "privacy policy inventory disagrees with its envelope"
+            );
+            // Any failed offered package stops receipt at this position, never skipping a gap.
+            store.receive_policy(
+                &entry.package_id,
+                entry.sequence,
+                cursor,
+                &envelope,
+                &historical,
+                &dictionary,
+            )?;
+            cursor = entry.sequence;
+            report.policy_received += 1;
+        }
+        if inventory.next_after.is_none() {
+            store.db.execute(
+                "UPDATE metadata SET value='1' WHERE key='policy_receipt_complete'",
+                [],
+            )?;
+            return Ok(());
+        }
+    }
+    report.deferred += 1;
+    Ok(())
+}
+
+pub fn run(
+    store: &mut Store,
+    key: &UserKey,
+    cache_root: &Path,
+    transport: &impl Transport,
+    budget: Duration,
+) -> crate::Result<Report> {
+    let started = Instant::now();
+    let deadline = started + budget;
+    let mut report = Report::default();
+    store.encrypt_pending(key)?;
+    store.seed_policy()?;
+    let health_path = Health::path(cache_root, &key.owner.hub);
+    let previous = Health::load(&health_path);
+    let now = chrono::Utc::now().timestamp();
+    let mut account_refused = previous
+        .as_ref()
+        .is_some_and(|health| health.retry_at > now && health.refusal == Refusal::Authorization);
+    if previous
+        .as_ref()
+        .is_none_or(|health| health.retry_at <= now)
+    {
+        let mut refused = None;
+        for package in store.outbox(100)? {
+            if Instant::now() >= started + budget / 4 {
+                report.deferred += 1;
+                break;
+            }
+            match transport.upload(&package.id, &package.envelope) {
+                Ok(receipt) if receipt.package_id == package.id && receipt.sequence > 0 => {
+                    store.acknowledge(&package.id)?;
+                    report.uploaded += 1;
+                }
+                Ok(_) => report.deferred += 1,
+                Err(error) => {
+                    report.deferred += 1;
+                    if let Some(reason) = classify(&error) {
+                        account_refused = reason.0 == Refusal::Authorization;
+                        if account_refused || refused.is_none() {
+                            refused = Some(reason);
+                        }
+                        if account_refused {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = Health::settle(&health_path, previous, refused, now);
+    } else {
+        report.deferred += 1;
+    }
+    // A refusal specific to dictionary packages must not pace removal-only policy packages.
+    let policy_health = Health::path(&cache_root.join("policy-transport"), &key.owner.hub);
+    let previous = Health::load(&policy_health);
+    if !account_refused
+        && previous
+            .as_ref()
+            .is_none_or(|health| health.retry_at <= now)
+        && Instant::now() < started + budget / 2
+    {
+        let mut refused = None;
+        let additions = store.outbox(1)?.is_empty();
+        for package in store.policy_outbox(key, additions)? {
+            if Instant::now() >= started + budget / 2 {
+                report.deferred += 1;
+                break;
+            }
+            match transport.upload_policy(&package.id, &package.envelope) {
+                Ok(receipt) if receipt.package_id == package.id && receipt.sequence > 0 => {
+                    store.acknowledge_policy(&package.id, receipt.sequence)?;
+                    report.policy_uploaded += 1;
+                }
+                Ok(_) => report.deferred += 1,
+                Err(error) => {
+                    report.deferred += 1;
+                    if let Some(reason) = classify(&error) {
+                        let account = reason.0 == Refusal::Authorization;
+                        if account || refused.is_none() {
+                            refused = Some(reason);
+                        }
+                        if account {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = Health::settle(&policy_health, previous, refused, now);
+    } else {
+        report.deferred += 1;
+    }
+    // Each stream gets time even when the other stream fails or has an unbounded backlog.
+    if dictionary_receive(
+        store,
+        key,
+        cache_root,
+        transport,
+        started + budget * 3 / 4,
+        &mut report,
+    )
+    .is_err()
+    {
+        report.deferred += 1;
+    }
+    if policy_receive(store, key, cache_root, transport, deadline, &mut report).is_err() {
+        report.deferred += 1;
+    }
+    report.policy_unresolved = store.policy_progress()?.unresolved_rules;
     Ok(report)
 }

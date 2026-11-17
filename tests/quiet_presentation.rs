@@ -1064,6 +1064,14 @@ fn quiet_secret_creation_preserves_identifiers_and_followup_behavior() {
             assert!(output.stderr.is_empty(), "{output:?}");
             let text = std::str::from_utf8(&output.stdout).unwrap();
             assert!(text.contains("quiet-created"), "{text}");
+            assert!(
+                text.contains(if repository_rule {
+                    "[this computer only]"
+                } else {
+                    "[after synchronization]"
+                }),
+                "{text}"
+            );
             assert!(!text.contains("SYNTHETIC-QUIET-SECRET-FOR-TESTING"));
             let id = text
                 .trim()
