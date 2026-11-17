@@ -314,8 +314,22 @@ impl Session {
 
     /// The plugin handed a held message to the model; its record, already written, is what lets
     /// that step's context count as the owner's words.
-    pub(super) fn step_steer_delivered(&mut self, operation_id: String) {
-        self.steer_queue.held.remove(&operation_id);
+    pub(super) async fn step_steer_delivered(&mut self, operation_id: String) {
+        let Some(steer) = self.steer_queue.held.remove(&operation_id) else {
+            return;
+        };
+        if let Some(client_msg_id) = steer
+            .queued
+            .attribution
+            .client_msg_id
+            .filter(|id| !id.is_empty())
+        {
+            self.emit(
+                method::TURN_STEER_DELIVERED,
+                serde_json::json!({"client_msg_id": client_msg_id}),
+            )
+            .await;
+        }
     }
 
     /// A held message its turn ended without: its record goes, and it waits for the next turn,
@@ -1586,7 +1600,8 @@ mod tests {
     /// while the terminal's latest state already shows no turn running. That state doesn't make
     /// the message undelivered: it was delivered, and runs once. When that turn was stopped
     /// instead, the message is dropped as interrupted. A receipt read after its turn's end
-    /// decides the message as that end did.
+    /// decides the message as that end did. Only actual delivery names the browser's message
+    /// once, so restoring a waiting copy cannot mistake admission or a drop for consumption.
     #[tokio::test]
     async fn a_late_receipt_never_runs_a_delivered_message_twice() {
         let driver = crate::rc::harness::codex::CodexDriver::test_responder(Some("thread"), &[]);
@@ -1603,13 +1618,57 @@ mod tests {
 
         // Delivered in the same batch as its receipt and the turn's end.
         awaiting(&mut session, "delivered");
+        session
+            .steer_queue
+            .held
+            .get_mut("delivered")
+            .unwrap()
+            .queued
+            .attribution
+            .client_msg_id = Some("client-delivered".into());
         session.step_steer_resolved(true).await;
-        session.step_steer_delivered("delivered".into());
+        assert!(
+            out.try_recv().is_err(),
+            "admission does not confirm delivery"
+        );
+        for operation in ["delivered", "delivered", "unknown"] {
+            session
+                .on_harness_event(HarnessEvent::StepSteerDelivered {
+                    operation_id: operation.into(),
+                })
+                .await;
+        }
+        let delivered = out.try_recv().unwrap();
+        assert_eq!(delivered.method(), method::TURN_STEER_DELIVERED);
+        assert_eq!(
+            delivered.params,
+            Some(serde_json::json!({"client_msg_id": "client-delivered"}))
+        );
+        assert!(out.try_recv().is_err());
         session
             .held_turn_over(TurnOver::Ended("finishing"), false)
             .await;
         assert!(session.next_queued_turn().await.is_none(), "it ran once");
         assert!(dropped(&mut out).is_empty());
+
+        for client_msg_id in [None, Some(String::new())] {
+            hold(&mut session, "unidentified", "finishing");
+            session
+                .steer_queue
+                .held
+                .get_mut("unidentified")
+                .unwrap()
+                .queued
+                .attribution
+                .client_msg_id = client_msg_id;
+            session
+                .on_harness_event(HarnessEvent::StepSteerDelivered {
+                    operation_id: "unidentified".into(),
+                })
+                .await;
+            assert!(session.steer_queue.held.is_empty());
+            assert!(out.try_recv().is_err());
+        }
 
         // Stopped in the same batch as its receipt.
         awaiting(&mut session, "stopped");
@@ -1638,6 +1697,14 @@ mod tests {
             dropped(&mut out),
             [("after-stop".to_owned(), "interrupted".to_owned())]
         );
+        for operation in ["stopped", "after-end", "after-stop"] {
+            session
+                .on_harness_event(HarnessEvent::StepSteerDelivered {
+                    operation_id: operation.into(),
+                })
+                .await;
+        }
+        assert!(out.try_recv().is_err(), "unheld messages are not confirmed");
         session.driver.shutdown().await.unwrap();
     }
 

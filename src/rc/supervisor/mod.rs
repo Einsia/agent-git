@@ -3713,7 +3713,7 @@ impl Session {
                     .await;
             }
             HarnessEvent::StepSteerDelivered { operation_id } => {
-                self.step_steer_delivered(operation_id);
+                self.step_steer_delivered(operation_id).await;
             }
             HarnessEvent::StepSteerUndelivered {
                 operation_id,
