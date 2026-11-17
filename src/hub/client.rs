@@ -1583,6 +1583,7 @@ impl Client {
                     }
                     Err(error) => error,
                 })?;
+        self.observe_agent(owner, name, &agent);
         self.probes
             .borrow_mut()
             .agents
@@ -1600,7 +1601,7 @@ impl Client {
     /// the same name on another Hub stand in for this one.
     pub fn get_agent_unredirected(&self, owner: &str, name: &str) -> Result<RemoteAgent> {
         let path = format!("api/agents/{owner}/{name}");
-        self.with_retry(&path, |token| {
+        let agent = self.with_retry(&path, |token| {
             let mut request = self
                 .agent
                 .get(self.url(&path))
@@ -1612,7 +1613,15 @@ impl Client {
                 request = request.header("Authorization", &format!("Bearer {token}"));
             }
             request.call()
-        })
+        })?;
+        self.observe_agent(owner, name, &agent);
+        Ok(agent)
+    }
+
+    fn observe_agent(&self, owner: &str, name: &str, agent: &RemoteAgent) {
+        if agent.owner == owner && agent.name.eq_ignore_ascii_case(name) {
+            crate::domain::privacy::association::observe(self, owner, name, &agent.agent_id);
+        }
     }
 
     /// Whether the signed-in account writes `owner/name` only through its organization's base
@@ -2018,6 +2027,26 @@ impl crate::domain::privacy::sync::Transport for Client {
     fn download(&self, id: &str) -> Result<crate::domain::privacy::crypto::Envelope> {
         uuid::Uuid::parse_str(id)?;
         self.get(&format!("api/me/privacy/packages/{id}"))
+    }
+    fn upload_policy(
+        &self,
+        id: &str,
+        envelope: &crate::domain::privacy::crypto::Envelope,
+    ) -> Result<crate::domain::privacy::sync::Receipt> {
+        uuid::Uuid::parse_str(id)?;
+        self.put(&format!("api/me/privacy/policy/packages/{id}"), envelope)
+    }
+
+    fn policy_inventory(&self, after: i64) -> Result<crate::domain::privacy::sync::Inventory> {
+        self.get(&format!(
+            "api/me/privacy/policy/packages?after={}&limit=100",
+            after.max(0)
+        ))
+    }
+
+    fn download_policy(&self, id: &str) -> Result<crate::domain::privacy::crypto::Envelope> {
+        uuid::Uuid::parse_str(id)?;
+        self.get(&format!("api/me/privacy/policy/packages/{id}"))
     }
 }
 

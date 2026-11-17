@@ -47,6 +47,18 @@ pub fn scope(repo: Option<&Path>) -> crate::Result<String> {
     Ok(common.to_string_lossy().into_owned())
 }
 
+fn portable_scope(store: &Store, repo: Option<&Path>) -> Option<String> {
+    #[cfg(feature = "cli")]
+    {
+        repo.and_then(|repo| super::association::scope(store, repo))
+    }
+    #[cfg(not(feature = "cli"))]
+    {
+        let _ = (store, repo);
+        None
+    }
+}
+
 impl Store {
     pub fn policy_generation(&self) -> crate::Result<i64> {
         Ok(self.db.query_row(
@@ -88,42 +100,53 @@ impl Store {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let count: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM policy", [], |row| row.get(0))?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM policy WHERE scope=?1 AND token=?2)",
-            params![decision.scope, decision.token],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            exists || count < 16384,
-            "privacy policy exceeds its rule budget"
-        );
-        transaction.execute("INSERT INTO policy (scope,token,name,block,allow) VALUES (?1,?2,?3,?4,?5)
-            ON CONFLICT(scope,token) DO UPDATE SET name=excluded.name,block=excluded.block,allow=excluded.allow",
-            params![decision.scope, decision.token, decision.name, decision.block, decision.allow])?;
-        transaction.execute(
-            "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='policy_generation'",
-            [],
-        )?;
+        super::decisions::decide_in(&transaction, decision)?;
         transaction.commit()?;
         Ok(())
     }
 
     pub fn adopt_decision(&mut self, decision: &Decision) -> crate::Result<()> {
-        let exists: Option<i64> = self
+        let tx = self
             .db
-            .query_row(
-                "SELECT 1 FROM policy WHERE scope=?1 AND token=?2",
-                params![decision.scope, decision.token],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            self.decide(decision)?;
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM policy WHERE scope=?1 AND token=?2)",
+            params![decision.scope, decision.token],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            super::decisions::decide_in(&tx, decision)?;
         }
+        tx.commit()?;
         Ok(())
     }
+}
+
+pub(super) fn write_decision(db: &rusqlite::Connection, decision: &Decision) -> crate::Result<()> {
+    ensure!(
+        token_id(&decision.token).is_some()
+            && decision.name.len() <= 256
+            && decision.scope.len() <= 4096,
+        "invalid privacy policy decision"
+    );
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM policy", [], |row| row.get(0))?;
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM policy WHERE scope=?1 AND token=?2)",
+        params![decision.scope, decision.token],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        exists || count < 16384,
+        "privacy policy exceeds its rule budget"
+    );
+    db.execute("INSERT INTO policy (scope,token,name,block,allow) VALUES (?1,?2,?3,?4,?5)
+            ON CONFLICT(scope,token) DO UPDATE SET name=excluded.name,block=excluded.block,allow=excluded.allow",
+            params![decision.scope, decision.token, decision.name, decision.block, decision.allow])?;
+    db.execute(
+        "UPDATE metadata SET value=CAST(value AS INTEGER)+1 WHERE key='policy_generation'",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Explicit decisions override inherited policy within their own scope, independent of recovery.
@@ -134,10 +157,15 @@ pub fn compile(
     inherited_allows: &[&str],
 ) -> crate::Result<policy::Snapshot> {
     let repository = scope(repo)?;
+    let portable = portable_scope(&projector.store, repo);
     let decisions = projector.store.decisions()?;
     let rules: Vec<_> = decisions
         .iter()
-        .filter(|rule| rule.scope == "global" || rule.scope == repository)
+        .filter(|rule| {
+            rule.scope == "global"
+                || rule.scope == repository
+                || Some(&rule.scope) == portable.as_ref()
+        })
         .filter_map(|rule| {
             projector
                 .dictionary
@@ -191,7 +219,18 @@ pub fn execute(
     repo: Option<&Path>,
     command: Command,
 ) -> crate::Result<Value> {
-    let scope = scope(if command.global { None } else { repo })?;
+    let local = scope(if command.global { None } else { repo })?;
+    let portable = (!command.global)
+        .then(|| portable_scope(&projector.store, repo))
+        .flatten();
+    let scope = if matches!(
+        command.action.as_str(),
+        "add" | "remove" | "list" | "review"
+    ) {
+        portable.clone().unwrap_or_else(|| local.clone())
+    } else {
+        local.clone()
+    };
     let decisions = projector.store.decisions()?;
     if command.action == "status" {
         return Ok(
@@ -220,7 +259,11 @@ pub fn execute(
             let rules: Vec<_> = decisions
                 .iter()
                 .filter(|rule| rule.token == token)
-                .filter(|rule| rule.scope == "global" || rule.scope == repository)
+                .filter(|rule| {
+                    rule.scope == "global"
+                        || rule.scope == repository
+                        || Some(&rule.scope) == portable.as_ref()
+                })
                 .collect();
             rules.iter().any(|rule| rule.allow == Some(true))
                 && !rules.iter().any(|rule| rule.block == Some(true))
@@ -315,7 +358,8 @@ pub fn execute(
     }
     if command.action == "list" || command.action == "review" {
         let mut summaries: Vec<_> = projector.dictionary.records().filter_map(|record| {
-            let rule = decisions.iter().find(|rule| rule.scope == scope && rule.token == record.token);
+            let rule = decisions.iter().filter(|rule| (rule.scope == scope || rule.scope == local) && rule.token == record.token)
+                .max_by_key(|rule| (rule.block == Some(true), rule.allow == Some(true)));
             if command.action == "list" && rule.is_none_or(|rule| rule.block != Some(true)) { return None; }
             // What kind of value it is comes from its placeholder, never from the value.
             let kind = crate::domain::privacy::detector::placeholder::typed_parts(&record.token)
@@ -323,7 +367,8 @@ pub fn execute(
             Some(json!({"id":token_id(&record.token),"token":record.token,"kind":kind,
                 "name":rule.map(|rule|rule.name.as_str()).unwrap_or("detected secret"),
                 "origins":record.origins,"explicit_block":rule.is_some_and(|rule|rule.block == Some(true)),
-                "allowed":rule.is_some_and(|rule|rule.allow == Some(true))}))
+                "allowed":rule.is_some_and(|rule|rule.allow == Some(true)),
+                "scope":rule.map(|rule|if super::decisions::travels(&rule.scope) { "after synchronization" } else { "this computer only" })}))
         }).collect();
         summaries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         return Ok(Value::Array(summaries));
@@ -365,7 +410,9 @@ pub fn execute(
                 record.token == id
                     || token_id(&record.token) == Some(id)
                     || decisions.iter().any(|rule| {
-                        rule.scope == scope && rule.name == id && rule.token == record.token
+                        (rule.scope == scope || rule.scope == local)
+                            && rule.name == id
+                            && rule.token == record.token
                     })
             })
             .collect();
@@ -374,6 +421,15 @@ pub fn execute(
             "privacy identifier is missing or ambiguous"
         );
         matches[0].token.clone()
+    };
+    // Existing path-local rules stay on this computer even after an identity becomes available.
+    let scope = if decisions
+        .iter()
+        .any(|rule| rule.scope == local && rule.token == token && rule.block.is_some())
+    {
+        local
+    } else {
+        scope
     };
     let mut decision = decisions
         .into_iter()
@@ -399,6 +455,28 @@ pub fn execute(
         "unallow" => decision.allow = Some(false),
         _ => anyhow::bail!("unknown privacy management action"),
     }
-    projector.store.decide(&decision)?;
-    Ok(json!({"id":token_id(&decision.token),"name":decision.name}))
+    if matches!(command.action.as_str(), "allow" | "unallow") {
+        let tx = projector
+            .store
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: Option<(String, Option<bool>)> = tx
+            .query_row(
+                "SELECT name,block FROM policy WHERE scope=?1 AND token=?2",
+                params![decision.scope, decision.token],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((name, block)) = current {
+            decision.name = name;
+            decision.block = block;
+        }
+        write_decision(&tx, &decision)?;
+        tx.commit()?;
+    } else {
+        projector.store.decide(&decision)?;
+    }
+    Ok(
+        json!({"id":token_id(&decision.token),"name":decision.name,"scope":if super::decisions::travels(&decision.scope) { "after synchronization" } else { "this computer only" }}),
+    )
 }

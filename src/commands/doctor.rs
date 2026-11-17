@@ -552,6 +552,21 @@ pub fn run(args: Args) -> CmdResult {
         ));
     }
 
+    if let Some(refusal) = crate::domain::privacy::sync::recorded_policy_refusal(&hub) {
+        let cause = match refusal.refusal {
+            crate::domain::privacy::sync::Refusal::Edge => "network policy",
+            crate::domain::privacy::sync::Refusal::Authorization => "account authorization",
+            crate::domain::privacy::sync::Refusal::Rejected => "package rejection",
+        };
+        checks.push((
+            "privacy rule sync".into(),
+            Check::Warn(format!(
+                "rule upload is waiting after {cause} (HTTP {}); retries are automatic",
+                refusal.status
+            )),
+        ));
+    }
+
     // ── Backend ──
     if args.check_backend {
         let client = crate::hub::Client::for_hub(&hub);

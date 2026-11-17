@@ -1,11 +1,15 @@
 //! Optional local privacy processing. Business operations own their success criteria.
 
 #[cfg(feature = "cli")]
+pub mod association;
+#[cfg(feature = "cli")]
 pub mod bench;
 #[cfg(feature = "secret-vault")]
 pub mod continuity;
 #[cfg(feature = "secret-vault")]
 pub mod crypto;
+#[cfg(feature = "secret-vault")]
+pub mod decisions;
 pub mod detector;
 #[cfg(feature = "secret-vault")]
 pub mod dictionary;

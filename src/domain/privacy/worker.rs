@@ -96,6 +96,7 @@ struct Loaded {
     device: Option<DeviceStamp>,
     cursor: i64,
     policy_generation: i64,
+    portable_scope: Option<String>,
     projector: Projector,
 }
 
@@ -773,8 +774,10 @@ fn status() -> crate::Result<Outcome> {
         .is_some_and(|owner| keys::cached(&root, owner, None).is_ok());
     let initialized = directory.join("journal.sqlite").try_exists()?;
     let mut dictionary = Dictionary::default();
+    let mut policy_sync = super::decisions::Progress::default();
     if initialized {
         let store = storage::Store::read_only(&directory, owner.clone())?;
+        policy_sync = store.policy_progress()?;
         store.load_since(&mut dictionary, 0, |version| {
             keys::cached(
                 &root,
@@ -802,7 +805,7 @@ fn status() -> crate::Result<Outcome> {
     .collect();
     Ok(Outcome {
         content: serde_json::json!({"initialized":initialized,"encrypted":encrypted,
-        "records":dictionary.records().count(),"unreadable_rules":unreadable})
+        "records":dictionary.records().count(),"unreadable_rules":unreadable,"policy_sync":policy_sync})
         .to_string(),
         status: super::projector::Status::Complete,
         replacements: 0,
@@ -886,11 +889,19 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             && device.is_some()
             && loaded.device == device
             && loaded.projector.store.policy_generation().ok() == Some(loaded.policy_generation)
+            && loaded.portable_scope
+                == request
+                    .repo
+                    .as_deref()
+                    .and_then(|repo| super::association::scope(&loaded.projector.store, repo))
     }) {
         let key = owner
             .as_ref()
             .and_then(|owner| keys::cached(&root, owner, None).ok());
         let mut store = storage::Store::open(&route, owner.clone())?;
+        if let Some(repo) = request.repo.as_deref() {
+            let _ = super::association::remember(&mut store, repo);
+        }
         let mut dictionary = Dictionary::default();
         let (cursor, mut complete) = store.load_since(&mut dictionary, 0, |version| {
             keys::cached(
@@ -1017,6 +1028,11 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         lap("allowlist_ms", &mut phases);
         let mut allows: Vec<_> = global_allows.iter().map(String::as_str).collect();
         allows.extend(legacy.allows.iter().map(|value| value.as_str()));
+        store.resolve_policy(&dictionary)?;
+        let portable_scope = request
+            .repo
+            .as_deref()
+            .and_then(|repo| super::association::scope(&store, repo));
         let mut projector = Projector {
             store,
             dictionary,
@@ -1045,6 +1061,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             device,
             cursor,
             policy_generation,
+            portable_scope,
             projector,
         });
     }
@@ -1204,6 +1221,7 @@ fn synchronize(hub: &str) -> crate::Result<()> {
     )? {
         return Ok(());
     }
+    let _ = super::association::refresh(&mut store, &client, started + Duration::from_secs(4));
     let remaining = Duration::from_secs(20).saturating_sub(started.elapsed());
     let _ = sync::run(&mut store, &key, &root, &client, remaining)?;
     Ok(())

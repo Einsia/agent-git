@@ -51,7 +51,25 @@ pub struct Envelope {
     pub ciphertext: String,
 }
 
+/// What a package holds. The kind is bound into the associated data, so a policy package never
+/// opens as a dictionary package or the reverse, whatever stream it was listed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Dictionary,
+    Policy,
+}
+
+impl Kind {
+    fn domain(self) -> &'static str {
+        match self {
+            Self::Dictionary => "agentgit-private-dictionary",
+            Self::Policy => "agentgit-private-policy",
+        }
+    }
+}
+
 fn associated_data(
+    kind: Kind,
     owner: &Owner,
     dictionary: &str,
     package: &str,
@@ -60,7 +78,7 @@ fn associated_data(
     uuid::Uuid::parse_str(dictionary).context("invalid dictionary identity")?;
     uuid::Uuid::parse_str(package).context("invalid package identity")?;
     Ok(serde_json::to_vec(&(
-        "agentgit-private-dictionary",
+        kind.domain(),
         1u32,
         &owner.hub,
         &owner.account,
@@ -76,6 +94,16 @@ pub fn seal(
     package: &str,
     plaintext: &[u8],
 ) -> crate::Result<Envelope> {
+    seal_as(Kind::Dictionary, key, dictionary, package, plaintext)
+}
+
+pub fn seal_as(
+    kind: Kind,
+    key: &UserKey,
+    dictionary: &str,
+    package: &str,
+    plaintext: &[u8],
+) -> crate::Result<Envelope> {
     ensure!(
         plaintext.len() <= MAX_PLAINTEXT_BYTES,
         "privacy package exceeds its byte budget"
@@ -84,7 +112,7 @@ pub fn seal(
         .map_err(|_| anyhow::anyhow!("invalid privacy key"))?;
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
-    let aad = associated_data(&key.owner, dictionary, package, key.version)?;
+    let aad = associated_data(kind, &key.owner, dictionary, package, key.version)?;
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
@@ -108,6 +136,15 @@ pub fn open(
     package: &str,
     envelope: &Envelope,
 ) -> crate::Result<Zeroizing<Vec<u8>>> {
+    open_as(Kind::Dictionary, key, package, envelope)
+}
+
+pub fn open_as(
+    kind: Kind,
+    key: &UserKey,
+    package: &str,
+    envelope: &Envelope,
+) -> crate::Result<Zeroizing<Vec<u8>>> {
     ensure!(
         envelope.format == 1 && envelope.key_version == key.version,
         "unsupported privacy envelope"
@@ -125,7 +162,13 @@ pub fn open(
         .context("invalid privacy ciphertext")?;
     let cipher = Aes256Gcm::new_from_slice(key.bytes.as_slice())
         .map_err(|_| anyhow::anyhow!("invalid privacy key"))?;
-    let aad = associated_data(&key.owner, &envelope.dictionary_id, package, key.version)?;
+    let aad = associated_data(
+        kind,
+        &key.owner,
+        &envelope.dictionary_id,
+        package,
+        key.version,
+    )?;
     let plaintext = Zeroizing::new(
         cipher
             .decrypt(
