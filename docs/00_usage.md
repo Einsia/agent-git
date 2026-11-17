@@ -573,12 +573,63 @@ the session branch's memory/   this session's versioned snapshot                
 main's memory/                 shared by the team, inherited by agit new           ← moves only through agit distill / merge
 ```
 
-`new` / `resume` merge the branch's memory into the runtime directory before launching: into
-per-branch subdirectories `agit/<owner>/<name>/<branch>/`, with a marked index block in
-`MEMORY.md` pointing at them. A top-level local file with the same name and the same content is
-not placed again, and no file of your own is touched. `resume` the same branch on another machine
-and Claude reads that memory immediately. Both sides look only at first-level `*.md` (the shape of
-Claude memory); subdirectories and other extensions do not enter the branch.
+`new` / `resume` merge the branch's memory into the runtime directory before launching, into
+per-branch subdirectories `agit/<owner>/<name>/<branch>/`. A top-level local file with the same
+name and the same content is not placed again, and no file of your own is touched. The
+conversation is told of the copies when it starts, on the runtime's own command line, and agit
+writes nothing into `MEMORY.md`: every conversation started in the folder reads that file,
+whatever its repository. Claude Code gets the index through `--append-system-prompt` (from
+`agit new`, `agit resume`, a merge agent and a conversation started from the Hub alike). Codex gets
+it from agit's session-start hook, since instructions on its command line would replace your own;
+without those hooks it starts without its team memory, and `agit new` / `agit resume` say so.
+Other runtimes get no team memory. `resume` the same branch on another machine and Claude reads
+that memory immediately. Both sides look only at first-level `*.md` (the shape of Claude memory);
+subdirectories and other extensions do not enter the branch.
+
+Claude Code keeps the instructions a conversation was first given until it is compacted, so a
+conversation you resume keeps the index it started with; the copies it points at are the ones
+placed now. Older versions of agit wrote a marked index section into `MEMORY.md`; it may belong to
+another repository. agit takes such sections out, and nothing else in the file:
+
+- once per agit version: the first agit process of a new version on a startup path that prepares
+  local state cleans every `MEMORY.md` under Claude Code's `projects` folder, and records the
+  version only when it handled every one. That path is taken by most commands that write and by
+  the hooks; read-only commands such as `agit status`, `agit doctor` or `agit diff`, and the few
+  that check their own scope first (such as `agit project`), don't take it. Below Claude Code's
+  configuration folder it doesn't go through a link (on Windows it checks for one before each
+  step rather than opening through the folder it already holds), and it reads no index larger
+  than 1 MiB; either leaves the version unrecorded, so a later process cleans again;
+- in every `agit setup`, which says how many it cleaned;
+- before `agit new`, `agit resume` or a conversation started from the Hub starts Claude Code;
+- at each Claude Code session start and turn end, through agit's hooks.
+
+agit never writes over a `MEMORY.md` saved meanwhile. It moves the index into the memory folder's
+`.agit-kept/`, checks it is still what it read, and gives the cleaned one the name only where the
+name is free. The moved file stays in `.agit-kept/` and agit never removes it: a program that had
+the index open may still write to it, and those lines stay there to recover. It may hold the old
+sections and your own lines, for as long as you keep it; it is a local copy, not a sign that
+anything was removed for good. Delete it when you no longer need it. agit doesn't collect or index
+what is in `.agit-kept/`. Whether Claude Code reads it on its own hasn't been checked, and an
+agent or tool running as you can open it like any of your files. On macOS and Linux the folder is
+yours alone (mode 0700, checked before anything moves into it); on Windows it gets an access list
+for your account alone. Neither keeps out a program that runs as you. If Claude Code writes the
+index while agit has moved it aside, Claude Code's file stays. For that moment the folder has no
+index, so a conversation starting then reads none.
+
+A Claude Code conversation started without agit (`claude`, `claude -p`, an IDE) can still send such
+a section if its folder's `MEMORY.md` held one when it started, even when its own session-start
+hook cleans the file. That happens when its hook is the new version's first agit process on a
+path that prepares local state; when the once-per-version cleanup didn't finish or didn't reach
+that file (a link, a file too large or unreadable, another Claude configuration folder or
+`AGIT_HOME`); when the new version arrived without any such process running (a binary copied by
+hand, or npm with its install script turned off), no hooks are set up, and only read-only agit
+commands have run since; or when an older agit, still running or started again, wrote a section
+after the cleanup. What that conversation received stays with it: cleaning the file later doesn't
+take it back, and compaction isn't shown to remove it. The next conversation started in the
+folder reads the cleaned file. Without agit's hooks, the section stays until agit next starts or
+resumes a conversation there, or `agit setup` runs. Another repository's copies stay in the memory
+folder's `agit/` subfolder, where such a conversation can open them, until agit starts a
+conversation there and moves them aside.
 
 Memory is private by default: the repository's memory allowlist starts empty. Authorize each
 intended filename or pattern before collection, for example:

@@ -1222,18 +1222,16 @@ pub(crate) fn prepared_archive_resume(
 }
 
 /// Memory collection can advance the old branch and therefore precedes the frozen transaction.
+/// The merge agent is told of the memory placed for it on its command line, with any environment
+/// notice the launch already carries.
 pub(crate) fn prepare_archive_memory(
     repo: &Repo,
     slug: &str,
     branch: &str,
-    launch: &ArchiveLaunch,
+    launch: &mut ArchiveLaunch,
 ) {
-    // A merge agent's runtime is not one this process waits for, so the section is not held.
-    match super::memory::materialize(repo, branch, slug, &launch.runtime, &launch.cwd) {
-        Ok(Some(report)) => super::memory::report_materialize(&report),
-        Ok(None) => {}
-        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
-    }
+    let told = materialize_memory(repo, branch, slug, &launch.runtime, &launch.cwd);
+    launch.system_prompt = with_memory(launch.system_prompt.as_deref(), told.as_deref());
 }
 
 fn resume_branch_for(
@@ -1420,6 +1418,10 @@ fn resume_branch_for(
             )
             && claude_session_is_in_project(existing, &cwd)
             && prepared_recovery_is_loadable(existing)
+            && let told = recovered
+                .is_none()
+                .then(|| materialize_memory(repo, branch, slug, &existing.source, &cwd))
+                .flatten()
             && let Some(resumed) = prepared_resume(
                 &existing.source,
                 &existing.session_id,
@@ -1427,7 +1429,7 @@ fn resume_branch_for(
                 slug,
                 branch,
                 prompt,
-                system_prompt.as_deref(),
+                with_memory(system_prompt.as_deref(), told.as_deref()).as_deref(),
             )
         {
             say_opening(
@@ -1439,9 +1441,6 @@ fn resume_branch_for(
                 },
             );
             report_environment_notice(&existing.source, system_prompt.as_deref());
-            if recovered.is_none() {
-                materialize_memory(repo, branch, slug, &existing.source, &cwd);
-            }
             println!(
                 "{}",
                 ui::dim(&format!(
@@ -1480,6 +1479,7 @@ fn resume_branch_for(
                 )?,
                 transcript::Continuity::Append | transcript::Continuity::Noop
             )
+            && let told = materialize_memory(repo, branch, slug, from, &cwd)
             && let Some(cmd) = native_resume_cmd(
                 from,
                 &lk.session_id,
@@ -1487,7 +1487,7 @@ fn resume_branch_for(
                 slug,
                 branch,
                 prompt,
-                system_prompt.as_deref(),
+                with_memory(system_prompt.as_deref(), told.as_deref()).as_deref(),
             )
         {
             say_opening(
@@ -1499,7 +1499,6 @@ fn resume_branch_for(
                 },
             );
             report_environment_notice(from, system_prompt.as_deref());
-            materialize_memory(repo, branch, slug, from, &cwd);
             println!(
                 "{}",
                 ui::dim(&format!(
@@ -1592,14 +1591,15 @@ fn resume_branch_for(
             "the active runtime claim changed while preparing to resume; retry the command"
         );
     }
-    if let Some(snapshot) = &recovered {
+    let told = if let Some(snapshot) = &recovered {
         snapshot.verify(repo)?;
         ui::info(
             "Restoring private history using ordinary resume rules and the original private VIEW.",
         );
+        None
     } else {
-        materialize_memory(repo, branch, slug, to_runtime, &cwd);
-    }
+        materialize_memory(repo, branch, slug, to_runtime, &cwd)
+    };
 
     // ── Slow path: materialize from the head VIEW, mint a new id ──
     say_opening(
@@ -1621,7 +1621,7 @@ fn resume_branch_for(
         args,
         &cwd,
         prompt,
-        system_prompt.as_deref(),
+        with_memory(system_prompt.as_deref(), told.as_deref()).as_deref(),
         &committed_log,
         recovered.as_ref(),
         &store,
@@ -1863,11 +1863,41 @@ fn confirm_conversion(from: &str, to: &str, decided: Decided) -> crate::Result<(
     Ok(())
 }
 
-fn materialize_memory(repo: &Repo, branch: &str, slug: &str, runtime: &str, cwd: &Path) {
-    match super::memory::start(repo, branch, slug, runtime, cwd) {
-        Ok(Some(report)) => super::memory::report_materialize(&report),
-        Ok(None) => {}
-        Err(error) => ui::warning(&format!("memory was not materialized: {error:#}")),
+/// Places the branch's memory for a conversation of `runtime` about to start in `cwd`, and returns
+/// what the conversation is to be told of it ([`super::memory::Report::context`]). A Codex
+/// conversation is told by agit's session-start hook instead, which this says when it can't.
+fn materialize_memory(
+    repo: &Repo,
+    branch: &str,
+    slug: &str,
+    runtime: &str,
+    cwd: &Path,
+) -> Option<String> {
+    if runtime == "codex" {
+        super::memory::say_if_codex_untold();
+    }
+    match super::memory::materialize(repo, branch, slug, runtime, cwd) {
+        Ok(Some(report)) => {
+            super::memory::report_materialize(&report);
+            report.context()
+        }
+        Ok(None) => None,
+        Err(error) => {
+            ui::warning(&format!("memory was not materialized: {error:#}"));
+            None
+        }
+    }
+}
+
+/// The instructions a resumed conversation's command line carries: the environment notice, then
+/// what it is told of its team memory. Claude Code keeps the instructions its conversation was
+/// first given until the conversation is compacted, so a conversation resumed before that keeps
+/// the index it started with; the copies it points at are the ones this resume places.
+fn with_memory(notice: Option<&str>, told: Option<&str>) -> Option<String> {
+    match (notice, told) {
+        (Some(notice), Some(told)) => Some(format!("{notice}\n\n{told}")),
+        (Some(text), None) | (None, Some(text)) => Some(text.to_owned()),
+        (None, None) => None,
     }
 }
 
@@ -2922,7 +2952,6 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
     match res.cmd {
         Some(cmd) => {
             if no_launch {
-                super::memory::unhold();
                 println!("\n  {}", ui::accent(&cmd));
                 return Ok(ExitCode::Ok);
             }
@@ -2930,7 +2959,6 @@ pub fn finish_pub(res: Resumed, no_launch: bool) -> CmdResult {
             let launch = super::upload_outcome::launching(slug, branch);
             let started = std::time::Instant::now();
             let status = runtime_launch(&cmd).status();
-            super::memory::let_go();
             crate::telemetry::operation(
                 crate::telemetry::Operation::RuntimeLaunch,
                 status.as_ref().is_ok_and(std::process::ExitStatus::success),

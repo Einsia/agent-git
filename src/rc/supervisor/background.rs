@@ -231,6 +231,7 @@ mod tests {
                 permission_mode: Some(PermissionMode::Default),
                 attach_only: false,
                 project_share: false,
+                memory_context: None,
             },
             &source,
         )

@@ -1558,6 +1558,7 @@ mod tests {
                             permission_mode: None,
                             attach_only: false,
                             project_share: false,
+                            memory_context: None,
                         },
                     )
                     .unwrap();

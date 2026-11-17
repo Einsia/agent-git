@@ -44,6 +44,11 @@ pub fn locate(runtime: &str, cwd: &Path) -> Option<RuntimeMemory> {
     }
 }
 
+/// The folder Claude Code keeps each project's state in, its memory folder included.
+pub fn claude_projects_dir() -> Option<PathBuf> {
+    claude_config_dir().map(|config| config.join("projects"))
+}
+
 fn claude_config_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
         && !dir.trim().is_empty()

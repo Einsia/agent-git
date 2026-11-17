@@ -328,6 +328,12 @@ fn prepare_startup(
         }
         return Some(agit::ExitCode::Precondition.as_i32());
     }
+    // A conversation can send the memory index its folder held when it started, so the first
+    // process of a version that prepares local state, a hook's included, takes agit's old
+    // sections out of every index. A read-only command changes no local state, so it doesn't.
+    if matches!(startup, Startup::Migrate | Startup::Finish) {
+        commands::memory::sweep_once_per_version();
+    }
     None
 }
 

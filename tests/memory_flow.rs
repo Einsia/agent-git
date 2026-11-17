@@ -170,7 +170,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
     );
 
     // sync: the authorized local file enters the branch; the branch's team.md (inherited from main)
-    // enters the mirror subdirectory and is indexed.
+    // enters the mirror subdirectory. MEMORY.md stays the person's: agit writes no section into it.
     ok(&agit(&home, &claude, &["memory", "sync", "--into", &into]));
     assert!(repo.show("refs/heads/s1", "memory/mine.md").is_some());
     assert!(
@@ -183,7 +183,7 @@ fn memory_flows_runtime_to_branch_and_branch_to_main_only_on_distill() {
         index.contains("- [mine](mine.md)"),
         "local lines untouched: {index}"
     );
-    assert!(index.contains("(agit/drh/qa/s1/team.md)"), "{index}");
+    assert!(!index.contains("agit/drh/qa/s1/team.md"), "{index}");
     assert_eq!(
         fs::read_to_string(mem.join("mine.md")).unwrap(),
         "---\nname: mine\n---\nlocal fact\n"
@@ -396,6 +396,218 @@ fn agit_new_names_the_commit_its_memory_comes_from_and_how_many_files() {
         "{empty_start}"
     );
     assert!(!empty_start.contains("memory: 1 file"), "{empty_start}");
+}
+
+/// `agit new` tells its conversation of the team memory it placed on the runtime's own command
+/// line and writes nothing into `MEMORY.md`, which every conversation started in the folder reads,
+/// whatever its repository, and `agit resume` tells a saved conversation the same way. Sections an
+/// older agit wrote, another repository's included, are taken out by the start and by Claude
+/// Code's session-start hook, and every other line of the file stays as it was. A Codex start
+/// without agit's hooks says it starts without its team memory.
+#[test]
+fn a_conversation_is_told_its_own_memory_at_launch_and_memory_md_keeps_only_the_persons_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _repo, claude, mem) = fixture(tmp.path());
+    let work = tmp.path().join("work").canonicalize().unwrap();
+    let codex_home = tmp.path().join("codex");
+    fs::create_dir_all(&codex_home).unwrap();
+    // A saved sign-in: an import records who wrote the version. The Hub is never reached.
+    let hub = "http://127.0.0.1:1";
+    agit::infra::credentials::save_at(
+        &home.join("credentials").join(format!(
+            "{}.json",
+            agit::infra::config::hub_host_key(hub).unwrap()
+        )),
+        &agit::infra::credentials::HubCredential {
+            account_id: None,
+            username: "drh".into(),
+            email: None,
+            hub: Some(hub.into()),
+            access_token: "SYNTHETIC".into(),
+            refresh_token: "SYNTHETIC".into(),
+            access_expires_at: "2099-01-01T00:00:00Z".into(),
+            refresh_expires_at: "2099-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    let run = |args: &[&str], input: Option<&str>| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", hub)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", &codex_home)
+            .env_remove("AGIT_SESSION")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut child.stdin.take().unwrap(),
+            input.unwrap_or_default().as_bytes(),
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let mine = "# Memory Index\n\n- [mine](mine.md) — my own notes\n";
+    let old = format!(
+        "{mine}\n<!-- agit:memory:begin other/repo@old -->\n- [codename](agit/other/repo/old/codename.md) — OLDOTTER\n<!-- agit:memory:end -->\n\n<!-- agit:memory:begin {REPO}@s0 -->\n- [team](agit/drh/qa/s0/team.md)\n<!-- agit:memory:end -->\n"
+    );
+    fs::write(mem.join("MEMORY.md"), &old).unwrap();
+
+    let started = run(&["new", REPO, "-b", "told", "--no-launch"], None);
+    let copy = mem.join("agit/drh/qa/told/team.md");
+    assert!(copy.is_file());
+    assert!(
+        started.contains("claude --append-system-prompt")
+            && started
+                .contains("Team memory of drh/qa@told, placed by agit for this conversation.")
+            && started.contains(&copy.display().to_string())
+            && !started.contains("OLDOTTER")
+            && !started.contains("other/repo"),
+        "{started}"
+    );
+    assert_eq!(fs::read_to_string(mem.join("MEMORY.md")).unwrap(), mine);
+
+    // A section an older agit wrote after this version's sweep is taken out by the folder's next
+    // session-start hook, for the conversations started there after it.
+    fs::write(mem.join("MEMORY.md"), &old).unwrap();
+    let event = serde_json::json!({
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "cwd": work,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    })
+    .to_string();
+    run(&["hooks", "ingest"], Some(&event));
+    assert_eq!(fs::read_to_string(mem.join("MEMORY.md")).unwrap(), mine);
+
+    // `agit resume` of a conversation saved here tells it the same way.
+    let sid = "6f0c9a3e-1b2d-4c5e-8f70-a1b2c3d4e5f6";
+    let cwd = work.to_string_lossy();
+    let lines = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "type": "user", "sessionId": sid, "cwd": cwd, "uuid": format!("{sid}-u1"),
+            "timestamp": "2026-08-29T00:00:01.000Z",
+            "message": {"role": "user", "content": "What does the team call user ids?"}
+        }),
+        serde_json::json!({
+            "type": "assistant", "sessionId": sid, "cwd": cwd, "uuid": format!("{sid}-a1"),
+            "timestamp": "2026-08-29T00:00:01.500Z",
+            "message": {"role": "assistant", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "uid, not user_id."}]}
+        })
+    );
+    fs::write(mem.parent().unwrap().join(format!("{sid}.jsonl")), lines).unwrap();
+    let into = format!("{REPO}@imp");
+    run(
+        &[
+            "import",
+            sid,
+            "--from",
+            "claude-code",
+            "--into",
+            &into,
+            "--independent",
+        ],
+        None,
+    );
+    let resumed = run(&["resume", &into, "--no-launch"], None);
+    assert!(
+        resumed.contains("--append-system-prompt")
+            && resumed.contains("Team memory of drh/qa@imp, placed by agit for this conversation.")
+            && resumed.contains(&mem.join("agit/drh/qa/imp/team.md").display().to_string()),
+        "{resumed}"
+    );
+    assert_eq!(fs::read_to_string(mem.join("MEMORY.md")).unwrap(), mine);
+
+    let codex = run(
+        &["new", REPO, "-b", "cx", "--as", "codex", "--no-launch"],
+        None,
+    );
+    assert!(
+        codex.contains("Codex is told of its team memory by agit's hooks, which aren't set up here, so this conversation starts without it")
+            && codex.contains("`agit setup --hooks` sets them up"),
+        "{codex}"
+    );
+}
+
+/// The first agit process of a version, here a Claude Code session-start hook, takes agit's
+/// sections out of every Claude Code memory index under the configuration folder, the person's
+/// lines kept, not only its own folder's. It records the version only after handling every index:
+/// one too large to read leaves it unrecorded, and the next process that prepares local state
+/// sweeps again. Once the version is recorded, its later processes leave the indexes alone. A sweep that cleaned only the hook's
+/// folder, recorded the version past an index it skipped, or ran on every process fails here.
+#[test]
+fn a_versions_first_agit_process_sweeps_every_memory_index_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _repo, claude, mem) = fixture(tmp.path());
+    let work = tmp.path().join("work").canonicalize().unwrap();
+    let mine = "# Memory Index\n\n- [notes](notes.md) — personal notes\n";
+    let old = format!(
+        "{mine}\n<!-- agit:memory:begin other/repo@old -->\n- [codename](agit/other/repo/old/codename.md) — OLDOTTER\n<!-- agit:memory:end -->\n"
+    );
+    let elsewhere = claude.join("projects").join("-elsewhere").join("memory");
+    let large = claude.join("projects").join("-large").join("memory");
+    let oversized = format!("{}\n{old}", "x".repeat(1 << 20));
+    for (dir, text) in [(&mem, &old), (&elsewhere, &old), (&large, &oversized)] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("MEMORY.md"), text).unwrap();
+    }
+    let run = |args: &[&str], input: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agit"))
+            .args(args)
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", "http://127.0.0.1:1")
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env_remove("AGIT_SESSION")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let event = serde_json::json!({
+        "session_id": "11111111-2222-4333-8444-555555555555",
+        "cwd": work,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    })
+    .to_string();
+    let read = |dir: &Path| fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+    let swept = home.join("memory-swept");
+
+    run(&["hooks", "ingest"], &event);
+    assert_eq!(read(&mem), mine);
+    assert_eq!(read(&elsewhere), mine);
+    assert_eq!(read(&large), oversized);
+    assert!(!swept.exists());
+
+    fs::write(large.join("MEMORY.md"), mine).unwrap();
+    fs::write(elsewhere.join("MEMORY.md"), &old).unwrap();
+    run(&["config", "--list"], "");
+    assert_eq!(read(&elsewhere), mine);
+    let version = ok(&run(&["--version"], ""));
+    assert_eq!(
+        fs::read_to_string(&swept).unwrap(),
+        version.trim().strip_prefix("agit ").unwrap()
+    );
+
+    fs::write(elsewhere.join("MEMORY.md"), &old).unwrap();
+    run(&["config", "--list"], "");
+    assert_eq!(read(&elsewhere), old);
 }
 
 /// A PEM private key in a runtime memory file reaches the branch only as one placeholder that

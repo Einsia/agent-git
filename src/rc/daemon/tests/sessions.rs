@@ -418,6 +418,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                     permission_mode: Some(crate::protocol::PermissionMode::Bypass),
                     attach_only: false,
                     project_share: false,
+                    memory_context: None,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -510,6 +511,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     attach_only: false,
                     project_share: false,
+                    memory_context: None,
                 };
                 let (frames, _frames_rx) = mpsc::channel(4);
                 let error = state
@@ -582,6 +584,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
                     attach_only: false,
                     project_share: false,
+                    memory_context: None,
                 };
                 let watched = danger::judge(
                     &state.roster,
@@ -2548,6 +2551,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         permission_mode: Some(crate::protocol::PermissionMode::Plan),
         attach_only: false,
         project_share: false,
+        memory_context: None,
     };
     let (frames, _frames_rx) = mpsc::channel(4);
 

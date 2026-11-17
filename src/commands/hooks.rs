@@ -593,6 +593,7 @@ fn ingest_inner(runtime: Option<&str>) -> Option<serde_json::Value> {
     if side_conversation(rt, &ev) {
         return None;
     }
+    take_out_memory_sections(rt, &ev);
     let restored = restored_title(rt, &ev);
     let mut response = session_start(rt, &ev);
     if let Some(notice) = announce_terminal(rt, &ev) {
@@ -737,6 +738,21 @@ fn foreign_launch_env(rt: &str, store: Option<&Store>, session_id: &str) -> bool
                 || link::get(store, rt, session_id)
                     .is_some_and(|link| link.agent.is_none() || link.branch.is_none())
         })
+}
+
+/// Takes the sections earlier versions of agit wrote out of the Claude Code memory index of the
+/// conversation's folder ([`super::memory::take_out_sections`]), at a session start and after
+/// each turn. The conversation running the hook can still send a section its index held when it
+/// started; the cleaning keeps it from the next conversation started in the folder.
+fn take_out_memory_sections(rt: &str, ev: &Event) {
+    if rt != "claude-code" {
+        return;
+    }
+    if let Some(cwd) = ev.cwd.as_deref()
+        && let Some(memory) = crate::infra::runtime_memory::locate(rt, std::path::Path::new(cwd))
+    {
+        let _ = super::memory::take_out_sections(&memory.dir);
+    }
 }
 
 /// Record which session started and describe its state to the agent.
@@ -1393,6 +1409,9 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     let event = payload
         .as_deref()
         .and_then(|payload| event_from(runtime, payload));
+    if let Some(ev) = &event {
+        take_out_memory_sections(runtime_of(runtime, ev.transcript_path.as_deref()), ev);
+    }
     #[cfg(unix)]
     if let Some(ev) = &event
         && let Some(mode) = &ev.permission_mode

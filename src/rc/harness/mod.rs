@@ -294,6 +294,10 @@ pub struct LaunchSpec {
     pub attach_only: bool,
     /// A project the owner shared with a group (`rc::project_share`), recorded on its roster row.
     pub project_share: bool,
+    /// What the conversation is told of the team memory placed for it
+    /// ([`crate::commands::memory::Report::context`]), on the runtime's command line where it
+    /// takes extra instructions there.
+    pub memory_context: Option<String>,
 }
 
 impl LaunchSpec {

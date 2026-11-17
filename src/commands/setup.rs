@@ -282,6 +282,16 @@ fn run_setup(mut args: Args) -> CmdResult {
         args.mcp || all,
         args.agents_md,
     );
+    // Team memory reaches a conversation on its command line. A team-memory section in a Claude
+    // Code memory index would reach every conversation started in that folder, whatever its
+    // repository, so every setup takes out any it finds.
+    let cleaned = super::memory::take_out_every_section().cleaned;
+    if cleaned > 0 && !super::json::requested() {
+        ui::info(format!(
+            "took agit's team-memory sections out of {cleaned} Claude Code memory index{}; each conversation is now told of its own repository's team memory when it starts",
+            if cleaned == 1 { "" } else { "es" }
+        ));
+    }
 
     if let Some(value) = args.auto_push {
         super::config::apply("push.auto", Some(if value { "true" } else { "false" }))?;

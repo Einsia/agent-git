@@ -422,6 +422,10 @@ fn argv(spec: &LaunchSpec, session_id: &str, resume: bool) -> Vec<String> {
         args.push("--model".into());
         args.push(m.clone());
     }
+    if let Some(context) = &spec.memory_context {
+        args.push("--append-system-prompt".into());
+        args.push(context.clone());
+    }
     args.push("--settings".into());
     args.push(session_settings().to_string());
     args.push(if resume { "--resume" } else { "--session-id" }.into());
@@ -1616,6 +1620,39 @@ mod tests {
         assert!(request["request"].get("hooks").is_none(), "{request}");
     }
 
+    /// A conversation the daemon starts is told of its team memory on its command line, where a
+    /// print-mode Claude Code reads it before its first request; one with nothing placed is told
+    /// nothing there. agit writes no section into the folder's `MEMORY.md`, so this is the only way
+    /// the conversation learns of the copies.
+    #[test]
+    fn a_session_is_told_its_team_memory_on_its_command_line() {
+        let told =
+            "Team memory of simco/lumen-agents@desktop-a, placed by agit for this conversation.";
+        let spec = |memory_context: Option<&str>| LaunchSpec {
+            cwd: PathBuf::from("/tmp"),
+            resume_from: None,
+            agit_session: None,
+            model: None,
+            dangerous: false,
+            permission_mode: None,
+            attach_only: false,
+            project_share: false,
+            memory_context: memory_context.map(str::to_owned),
+        };
+        let args = argv(&spec(Some(told)), "sid", false);
+        let given: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--append-system-prompt")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(given, [told], "{args:?}");
+        let args = argv(&spec(None), "sid", false);
+        assert!(
+            !args.iter().any(|arg| arg == "--append-system-prompt"),
+            "{args:?}"
+        );
+    }
+
     /// Pins that every session agit drives runs with Claude Code's background tasks switched
     /// off, so no running call is moved to the background after a timeout, to deliver a queued
     /// message or on its own, and none can outlive its turn: in the environment, and on the
@@ -1631,6 +1668,7 @@ mod tests {
             permission_mode: None,
             attach_only: false,
             project_share: false,
+            memory_context: None,
         };
         let env = session_env(&spec);
         let args = argv(&spec, "sid", false);
@@ -1774,6 +1812,7 @@ mod tests {
             permission_mode: None,
             attach_only: false,
             project_share: false,
+            memory_context: None,
         };
         let args = argv(&spec, "sid", spec.resume_from.is_some());
         assert!(
@@ -1803,6 +1842,7 @@ mod tests {
             permission_mode: None,
             attach_only: false,
             project_share: false,
+            memory_context: None,
         };
         let mut fresh = spec(None);
         let refused = admit_mode(&mut fresh, true).err().unwrap();
@@ -1840,6 +1880,7 @@ mod tests {
                     permission_mode: Some(mode),
                     attach_only: false,
                     project_share: false,
+                    memory_context: None,
                 };
                 let args = argv(&spec, "sid", resume_from.is_some());
                 assert!(
@@ -1920,6 +1961,7 @@ mod tests {
             permission_mode: None,
             attach_only: false,
             project_share: false,
+            memory_context: None,
         };
         assert!(
             !reopen(&spec).unwrap(),
@@ -3092,6 +3134,7 @@ for line in sys.stdin:
             permission_mode,
             attach_only: false,
             project_share: false,
+            memory_context: None,
         };
         assert_eq!(spec(true, None).effective_mode(), PermissionMode::Bypass);
         assert_eq!(
