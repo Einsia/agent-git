@@ -635,6 +635,174 @@ pub(crate) fn bounded_inspection_output(
     bounded_inspection_output_from(command, std::process::Stdio::null(), limit)
 }
 
+/// Diagnostics identify an operation without exposing its arguments or configuration values.
+fn inspection_operation(command: &Command) -> &'static str {
+    let mut args = command.get_args();
+    // Only the private Git launcher's exact wrapper can be unwrapped; other shell input is opaque.
+    #[cfg(unix)]
+    if command.get_program() == std::ffi::OsStr::new("/bin/sh") {
+        for expected in ["-c", "umask 077; exec \"$@\"", "agit-git"] {
+            if args.next() != Some(std::ffi::OsStr::new(expected)) {
+                return "other";
+            }
+        }
+        if args.next().is_none() {
+            return "other";
+        }
+    }
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env") => {
+                args.next();
+            }
+            Some("--no-replace-objects" | "--no-pager" | "--literal-pathspecs" | "--bare") => {}
+            Some(value)
+                if [
+                    "-C",
+                    "-c",
+                    "--git-dir=",
+                    "--work-tree=",
+                    "--namespace=",
+                    "--config-env=",
+                ]
+                .iter()
+                .any(|prefix| value.starts_with(prefix)) => {}
+            Some("cat-file") => return "cat-file",
+            Some("check-ref-format") => return "check-ref-format",
+            Some("config") => return "config",
+            Some("count-objects") => return "count-objects",
+            Some("diff-tree") => return "diff-tree",
+            Some("for-each-ref") => return "for-each-ref",
+            Some("lfs") => return "lfs",
+            Some("ls-tree") => return "ls-tree",
+            Some("merge-base") => return "merge-base",
+            Some("rev-list") => return "rev-list",
+            Some("rev-parse") => return "rev-parse",
+            Some("show") => return "show",
+            Some("status") => return "status",
+            Some("symbolic-ref") => return "symbolic-ref",
+            Some("worktree") => return "worktree",
+            _ => return "other",
+        }
+    }
+    "other"
+}
+
+/// Records are bounded individually; success requires both complete framing and silent Git exit.
+#[cfg(any(feature = "cli", test))]
+fn inspection_records(
+    mut command: Command,
+    separator: u8,
+    limit: usize,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    use std::io::{BufRead as _, Read as _};
+    use std::process::Stdio;
+
+    enum Event {
+        Record(Vec<u8>),
+        Finished(Result<()>),
+    }
+    let operation = inspection_operation(&command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("local Git inspection could not start")?;
+    let stdout = child.stdout.take().expect("piped inspection stdout");
+    let stderr = child.stderr.take().expect("piped inspection stderr");
+    let result = std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        let records = send.clone();
+        let stdout = scope.spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            let result = (|| {
+                loop {
+                    let mut record = Vec::new();
+                    let count = (&mut reader)
+                        .take((limit as u64).saturating_add(1))
+                        .read_until(separator, &mut record)
+                        .context("local Git inspection output could not be read")?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    anyhow::ensure!(
+                        record.len() <= limit,
+                        "local Git inspection exceeds its output limit (operation: {operation}, stream: stdout, limit: {limit} bytes per record)"
+                    );
+                    anyhow::ensure!(
+                        record.pop() == Some(separator),
+                        "local Git inspection record is incomplete (operation: {operation})"
+                    );
+                    if records.send(Event::Record(record)).is_err() {
+                        return Ok(());
+                    }
+                }
+            })();
+            let _ = records.send(Event::Finished(result));
+        });
+        let stderr = scope.spawn(move || {
+            let mut diagnostics = Vec::new();
+            let result = stderr
+                .take(MAX_INSPECTION_DIAGNOSTIC_BYTES as u64 + 1)
+                .read_to_end(&mut diagnostics)
+                .context("local Git inspection diagnostics could not be read")
+                .and_then(|_| {
+                    anyhow::ensure!(
+                        diagnostics.len() <= MAX_INSPECTION_DIAGNOSTIC_BYTES,
+                        "local Git inspection exceeds its output limit (operation: {operation}, stream: stderr, limit: {MAX_INSPECTION_DIAGNOSTIC_BYTES} bytes)"
+                    );
+                    anyhow::ensure!(
+                        diagnostics.is_empty(),
+                        "local Git inspection reported diagnostics (operation: {operation})"
+                    );
+                    Ok(())
+                });
+            let _ = send.send(Event::Finished(result));
+        });
+        let result: Result<()> = (|| {
+            let mut finished = 0;
+            while finished < 2 {
+                match receive
+                    .recv()
+                    .context("local Git inspection reader stopped")?
+                {
+                    Event::Record(record) => consume(&record)?,
+                    Event::Finished(result) => {
+                        result?;
+                        finished += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        drop(receive);
+        stdout
+            .join()
+            .map_err(|_| anyhow::anyhow!("local Git inspection reader stopped"))?;
+        stderr
+            .join()
+            .map_err(|_| anyhow::anyhow!("local Git inspection reader stopped"))?;
+        result
+    });
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .context("local Git inspection could not be reaped")?;
+    result?;
+    anyhow::ensure!(
+        status.success(),
+        "local Git inspection did not complete (operation: {operation})"
+    );
+    Ok(())
+}
+
 /// [`bounded_inspection_output`] with `input` on stdin, so a revision list of any length stays off
 /// the command line.
 pub(crate) fn bounded_inspection_output_from(
@@ -645,6 +813,7 @@ pub(crate) fn bounded_inspection_output_from(
     use std::io::Read as _;
     use std::process::Stdio;
 
+    let operation = inspection_operation(&command);
     let mut child = command
         .stdin(input)
         .stdout(Stdio::piped())
@@ -664,9 +833,10 @@ pub(crate) fn bounded_inspection_output_from(
                 .read_to_end(&mut bytes)
                 .map_err(|_| anyhow::anyhow!("local Git inspection output could not be read"))
                 .and_then(|_| {
+                    let stream = if is_stdout { "stdout" } else { "stderr" };
                     anyhow::ensure!(
                         bytes.len() <= cap,
-                        "local Git inspection exceeds its output limit"
+                        "local Git inspection exceeds its output limit (operation: {operation}, stream: {stream}, limit: {cap} bytes)"
                     );
                     Ok(bytes)
                 });
@@ -796,6 +966,20 @@ impl Repo {
         limit: usize,
     ) -> Result<std::process::Output> {
         bounded_inspection_output(self.inspection_command(args), limit)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn inspection_records(
+        &self,
+        args: &[&str],
+        consume: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        inspection_records(
+            self.inspection_command(args),
+            b'\n',
+            MAX_INSPECTION_OUTPUT_BYTES,
+            consume,
+        )
     }
 
     pub(crate) fn inspection_command(&self, args: &[&str]) -> Command {
@@ -3499,6 +3683,24 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
     fn inspection_output_overflow_probe() {
         use std::io::Write as _;
 
+        if let Ok(tail) = std::env::var("AGIT_TEST_INSPECTION_TAIL") {
+            let marker = std::path::PathBuf::from(
+                std::env::var_os("AGIT_TEST_INSPECTION_CONSUMED").unwrap(),
+            );
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "synthetic-record").unwrap();
+            stdout.flush().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if tail == "stderr" {
+                eprintln!("synthetic diagnostic");
+                std::process::exit(0);
+            }
+            std::process::exit(1);
+        }
         let Ok(stream) = std::env::var("AGIT_TEST_INSPECTION_FLOOD") else {
             return;
         };
@@ -3515,7 +3717,7 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
         }
     }
 
-    /// Overflow on either pipe must interrupt the child instead of blocking the other reader.
+    /// Overflow on either pipe must reap the child and identify the bound without exposing input.
     #[test]
     fn inspection_output_overflow_kills_and_reaps_child() {
         for stream in ["stdout", "stderr"] {
@@ -3528,8 +3730,130 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
                 ])
                 .env("AGIT_TEST_INSPECTION_FLOOD", stream);
             let error = bounded_inspection_output(command, 1024).unwrap_err();
-            assert!(error.to_string().contains("output limit"), "{error:#}");
+            let limit = if stream == "stdout" {
+                1024
+            } else {
+                MAX_INSPECTION_DIAGNOSTIC_BYTES
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "local Git inspection exceeds its output limit (operation: other, stream: {stream}, limit: {limit} bytes)"
+                )
+            );
         }
+
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repo::init(&directory.path().join("private-checkout-name")).unwrap();
+        std::fs::write(repo.root().join("private-file-name"), vec![b'x'; 2048]).unwrap();
+        let object = repo
+            .git(&["hash-object", "-w", "private-file-name"])
+            .unwrap();
+        let error = repo
+            .inspection_output(
+                &[
+                    "-c",
+                    "test.private=private-value",
+                    "cat-file",
+                    "blob",
+                    object.trim(),
+                ],
+                1024,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "local Git inspection exceeds its output limit (operation: cat-file, stream: stdout, limit: 1024 bytes)"
+        );
+
+        for stream in ["stdout", "stderr"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "domain::repo::tests::inspection_output_overflow_probe",
+                    "--nocapture",
+                ])
+                .env("AGIT_TEST_INSPECTION_FLOOD", stream);
+            let error = inspection_records(command, b'\n', 1024, |_| Ok(())).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("stream: {stream}")),
+                "{error:#}"
+            );
+        }
+
+        // Consumed records do not establish completeness until both pipes and Git finish.
+        for (tail, expected) in [
+            ("stderr", "reported diagnostics"),
+            ("exit", "did not complete"),
+        ] {
+            let marker = directory.path().join(tail);
+            let mut consumed = false;
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "domain::repo::tests::inspection_output_overflow_probe",
+                    "--nocapture",
+                ])
+                .env("AGIT_TEST_INSPECTION_TAIL", tail)
+                .env("AGIT_TEST_INSPECTION_CONSUMED", &marker);
+            let error = inspection_records(command, b'\n', 1024, |record| {
+                if record == b"synthetic-record" {
+                    consumed = true;
+                    std::fs::write(&marker, b"consumed")?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(consumed);
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "domain::repo::tests::inspection_output_overflow_probe",
+                "--nocapture",
+            ])
+            .env("AGIT_TEST_INSPECTION_FLOOD", "stdout");
+        let error = inspection_records(command, b'x', 1024, |_| {
+            anyhow::bail!("synthetic consumer refusal")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "synthetic consumer refusal");
+
+        let error = inspection_records(
+            repo.inspection_command(&["rev-parse", "--verify", "missing-synthetic-ref"]),
+            b'\n',
+            1024,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("reported diagnostics"),
+            "{error:#}"
+        );
+        let error = inspection_records(
+            repo.inspection_command(&["rev-parse", "--verify", "--quiet", "missing-synthetic-ref"]),
+            b'\n',
+            1024,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("did not complete"), "{error:#}");
+        let error = inspection_records(
+            repo.inspection_command(&["cat-file", "blob", object.trim()]),
+            b'\n',
+            4096,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("record is incomplete"),
+            "{error:#}"
+        );
     }
 
     #[cfg(unix)]
