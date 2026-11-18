@@ -1510,6 +1510,10 @@ pub enum Commands {
     /// Merge driven by a merge agent (--manual drives the same plumbing by hand)
     Merge(merge::Args),
     /// Agent-free picking: lift turns/events from other branches into the target VIEW
+    ///
+    /// Copied events add context without creating new `agit activity` contributions. Original
+    /// contributions remain eligible in their source repository when available and selected by
+    /// the query.
     CherryPick(cherry_pick::Args),
     /// Drop events from the VIEW (the evidence log never moves)
     Revert(revert::Args),
