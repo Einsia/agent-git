@@ -1,5 +1,8 @@
 //! Explicit native sources can be inspected without installing a runtime export or a claim.
 
+#[cfg(feature = "cli")]
+pub(crate) mod continuation;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 

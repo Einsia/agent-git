@@ -44,6 +44,7 @@
 //! backfilled, so the check runs up front instead of failing halfway through.
 
 pub(crate) mod archive;
+mod continuation;
 mod native;
 
 use super::CmdResult;
@@ -1719,6 +1720,7 @@ fn completed_turn_chunks(
     ir: &Session,
     open: &[OpenCall],
     retained_user_turn: bool,
+    prior_timestamp: Option<i64>,
 ) -> Vec<Chunk> {
     let user_chunks = turn_chunks(region, ir, open);
     let mut offset = 0;
@@ -1754,7 +1756,7 @@ fn completed_turn_chunks(
                 .filter_map(native_time)
                 .max()
         };
-        latest(start).or_else(|| latest(0))
+        latest(start).or_else(|| latest(0).into_iter().chain(prior_timestamp).max())
     };
     let mut covered = 0;
     let mut completed = Vec::new();
@@ -2222,7 +2224,7 @@ fn settle_local_telemetry_inner(
     let _branch_guard = link::lock_branch(store, slug, branch)?;
     // Target resolution happens before the branch lock. Re-read this exact link after taking it:
     // a concurrent prepare may have superseded or re-routed the claim while commit was waiting.
-    // Keep this per-link guard alive through settle_bytes: a reroute may use another branch lock,
+    // Keep this per-link guard alive through settlement: a reroute may use another branch lock,
     // so releasing it after the check leaves a window in which the old transcript can still land
     // on the old branch.
     let _link_guard = link::lock(store, &lk.source, &lk.session_id)?;
@@ -2348,13 +2350,26 @@ fn settle_local_telemetry_inner(
         );
         return Ok(ExitCode::Policy);
     }
-    let bytes = lk.read_bytes().map_err(|e| {
-        if quiet {
-            anyhow::anyhow!("quiet: {e:#}")
-        } else {
-            e
-        }
-    })?;
+    // Source selection and settlement share one immutable branch parent.
+    let settlement_tip = optional_branch_commit(&repo, &format!("refs/heads/{branch}"))?;
+    let prepared = if lk.source == "claude-code" && opts.completed_only {
+        None
+    } else {
+        continuation::Prepared::read(&lk, &repo, settlement_tip.as_deref())
+    };
+    let whole;
+    let bytes = if let Some(prepared) = &prepared {
+        prepared.bytes.as_slice()
+    } else {
+        whole = lk.read_bytes().map_err(|e| {
+            if quiet {
+                anyhow::anyhow!("quiet: {e:#}")
+            } else {
+                e
+            }
+        })?;
+        whole.as_slice()
+    };
     #[cfg(unix)]
     let opts = {
         let mut opts = opts;
@@ -2365,21 +2380,35 @@ fn settle_local_telemetry_inner(
             opts.native_completions = crate::rc::native_claude::completion::boundaries(
                 lk.native_thread_id(),
                 &path,
-                &bytes,
+                bytes,
             )?;
         }
         opts
     };
     let mut opts = opts;
     if let Some(receipt) = opts.stop_receipt.take()
-        && receipt.proves(&bytes)
+        && prepared.as_ref().map_or_else(
+            || receipt.proves(bytes),
+            |prepared| prepared.proves(&receipt),
+        )
     {
         opts.native_completions.push(receipt.bytes);
     }
     let memory_link = lk.clone();
     let milestone = opts.milestone.is_some();
-    let code = settle_bytes(
-        store, &repo, slug, branch, lk, &bytes, owner, opts, fresh, quiet,
+    let code = settle_bytes_at(
+        store,
+        &repo,
+        slug,
+        branch,
+        lk,
+        bytes,
+        owner,
+        opts,
+        fresh,
+        quiet,
+        settlement_tip,
+        prepared.as_ref(),
     )?;
 
     // Memory: what changed in the runtime directory since the last sync is collected onto this
@@ -2681,8 +2710,28 @@ fn verified_checkpoint(lk: &Link, tip: Option<&str>, bytes: &[u8]) -> Option<usi
 
 /// The content half of a settlement (its own function so tests can build bytes directly and skip
 /// the runtime-directory lookup).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn settle_bytes(
+    store: &Store,
+    repo: &Repo,
+    slug: &str,
+    branch: &str,
+    lk: Link,
+    bytes: &[u8],
+    owner: &str,
+    opts: SettleOpts,
+    fresh: bool,
+    quiet: bool,
+) -> CmdResult {
+    let tip = optional_branch_commit(repo, &format!("refs/heads/{branch}"))?;
+    settle_bytes_at(
+        store, repo, slug, branch, lk, bytes, owner, opts, fresh, quiet, tip, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_bytes_at(
     store: &Store,
     repo: &Repo,
     slug: &str,
@@ -2693,6 +2742,8 @@ fn settle_bytes(
     opts: SettleOpts,
     fresh: bool,
     quiet: bool,
+    settlement_tip: Option<String>,
+    prepared: Option<&continuation::Prepared>,
 ) -> CmdResult {
     let materialized_mode = lk.baseline_bytes.is_some();
     // The transcript read as text borrows its bytes; only one that isn't valid UTF-8 gets a
@@ -2709,15 +2760,8 @@ fn settle_bytes(
     // holds the link lock for the entire settlement, so this remains the exact CAS value.
     let mut link_at_entry = lk.clone();
     let mut link_disk_at_entry = lk.to_json().ok().map(|j| format!("{j}\n").into_bytes());
-    // Freeze the target branch exactly once before reading any committed state. Every metadata,
-    // sequence, parent-tree and CAS decision below must refer to this immutable object id: if a
-    // concurrent settlement advances the branch after these reads, our final expected-old CAS
-    // fails instead of parenting the same runtime turn onto the newer tip a second time.
-    //
-    // `None` preserves the unborn-branch path used by a brand-new repository. `checkout_for_settlement`
-    // already selected the requested branch before entering this function.
-    let branch_ref = format!("refs/heads/{branch}");
-    let settlement_tip = optional_branch_commit(repo, &branch_ref)?;
+    let source_origin = prepared.map_or(0, |p| p.state.origin as usize);
+    let absolute_len = source_origin + bytes.len();
     let has_head = settlement_tip.is_some();
     // A milestone or tag named in this command replaces one waiting on the link. Without one, the
     // waiting request rides along and lands with the first turn that ends at or after the point
@@ -2804,7 +2848,7 @@ fn settle_bytes(
         service as privacy,
     };
     let mut native_prefix = (0usize, String::new());
-    let mut settled_prefix: Option<native::Settled> = None;
+    let mut settled_prefix: Option<std::borrow::Cow<'_, native::Settled>> = None;
 
     // ── Materialized baseline or native continuation ──
     let (region_start, region, head_turn_base) = if let Some(base) = lk.baseline_bytes {
@@ -2833,6 +2877,17 @@ fn settle_bytes(
         }
         let head_turn = head_meta.as_ref().and_then(|s| s.turn).unwrap_or(0);
         (base, &text[base..], head_turn)
+    } else if let Some(prepared) = prepared {
+        native_prefix = (prepared.context_len, String::new());
+        settled_prefix = Some(std::borrow::Cow::Borrowed(&prepared.settled));
+        (
+            0,
+            &text[..],
+            head_meta
+                .as_ref()
+                .and_then(|snapshot| snapshot.turn)
+                .expect("verified continuation has a turn ordinal"),
+        )
     } else if let Some(prefix) = verified_checkpoint(&lk, settlement_tip.as_deref(), bytes)
         .filter(|_| settles_incrementally())
         .zip(settlement_tip.as_deref())
@@ -2854,7 +2909,7 @@ fn settle_bytes(
             .as_ref()
             .and_then(|snapshot| snapshot.turn)
             .expect("a settled part is taken only with a turn ordinal");
-        settled_prefix = Some(prefix);
+        settled_prefix = Some(std::borrow::Cow::Owned(prefix));
         (0, &text[..], settled)
     } else {
         // Native continuation: the continuity check, against the committed envelope blob.
@@ -2982,7 +3037,11 @@ fn settle_bytes(
                     .to_string()
             })
     };
-    let ir = match crate::adapter::get(&runtime).and_then(|a| a.parse(region)) {
+    let parse = |text: &str| match prepared {
+        Some(prepared) => prepared.parse(text),
+        None => crate::adapter::get(&runtime).and_then(|adapter| adapter.parse(text)),
+    };
+    let ir = match parse(region) {
         Ok(ir) => ir,
         Err(e) => {
             if !quiet {
@@ -3020,10 +3079,15 @@ fn settle_bytes(
     let receipts: Vec<usize> = opts
         .native_completions
         .iter()
-        .filter_map(|end| end.checked_sub(region_start).filter(|end| *end > 0))
+        .filter_map(|end| {
+            end.checked_sub(source_origin + region_start)
+                .filter(|end| *end > 0)
+        })
         .collect();
-    let completion_cut =
-        opts.completed_only || !receipts.is_empty() || records_completions(&runtime, region, &ir);
+    let completion_cut = prepared.is_some()
+        || opts.completed_only
+        || !receipts.is_empty()
+        || records_completions(&runtime, region, &ir);
     let native_completions = completion_cut
         || ir
             .events
@@ -3038,13 +3102,14 @@ fn settle_bytes(
         }
         let completed = &region[..end];
         let adapter = crate::adapter::get(&runtime)?;
-        let mut completed_ir = adapter.parse(completed)?;
+        let mut completed_ir = parse(completed)?;
         annotate_completed_boundaries(completed, &mut completed_ir, &boundaries)?;
         completed_turn_chunks(
             completed,
             &completed_ir,
             &adapter.open_tool_calls(completed),
             materialized_mode && head_turn_base > 0,
+            prepared.and_then(|p| p.state.max_timestamp),
         )
     } else if native_completions {
         completed_turn_chunks(
@@ -3052,6 +3117,7 @@ fn settle_bytes(
             &ir,
             &open_calls,
             materialized_mode && head_turn_base > 0,
+            prepared.and_then(|p| p.state.max_timestamp),
         )
     } else {
         turn_chunks(region, &ir, &open_calls)
@@ -3094,9 +3160,11 @@ fn settle_bytes(
     // ending at or after it lands.
     let request_from = if explicit_request && opts.milestone_turn.is_none() {
         if turn_running {
-            Some(bytes.len())
+            Some(absolute_len)
         } else {
-            new_chunks.last().map(|c| region_start + c.end_byte)
+            new_chunks
+                .last()
+                .map(|c| source_origin + region_start + c.end_byte)
         }
     } else {
         pending_from
@@ -3141,7 +3209,7 @@ fn settle_bytes(
                     lk,
                     &link_disk_at_entry,
                     &opts,
-                    bytes.len(),
+                    absolute_len,
                     quiet,
                 ),
             };
@@ -3474,7 +3542,7 @@ fn settle_bytes(
             if materialized_mode {
                 head_turn_base + turn
             } else {
-                turn
+                prepared.map_or(0, |p| p.state.prompts_before) + turn
             }
         })
     };
@@ -3484,7 +3552,7 @@ fn settle_bytes(
     let milestone_index = match (opts.milestone_turn, request_from) {
         (None, Some(from)) => new_chunks
             .iter()
-            .position(|c| region_start + c.end_byte >= from),
+            .position(|c| source_origin + region_start + c.end_byte >= from),
         (None, None) => total.checked_sub(1),
         (Some(wanted), _) => {
             let found = new_chunks
@@ -3609,11 +3677,12 @@ fn settle_bytes(
     // A bound source whose home cannot be resolved records no title rather than one read from
     // this process's default home.
     observations.title = lk.native_home().ok().and_then(|home| {
-        crate::adapter::native_title::native_title(
+        crate::adapter::native_title::native_title_after(
             source,
             lk.native_thread_id(),
             &text,
             home.as_deref(),
+            prepared.map_or(&[], |p| p.titles.as_slice()),
         )
     });
     if let Err(pending) = privacy::protect_metadata(repo.root(), &mut observations) {
@@ -3634,7 +3703,7 @@ fn settle_bytes(
             source,
             &claim,
             new_chunks.last().expect("non-empty chunks").end_byte,
-            settled_prefix.as_ref(),
+            settled_prefix.as_deref(),
         )?)
     } else {
         None
@@ -3645,7 +3714,7 @@ fn settle_bytes(
     for (i, c) in new_chunks.iter().enumerate() {
         let turn_no = turn_number(i, c);
         let milestone_here = milestone_index == Some(i);
-        let absolute_end = region_start + c.end_byte;
+        let absolute_end = source_origin + region_start + c.end_byte;
         if !quiet && total > 1 {
             ui::progress(format_args!("  building turn {}/{}", i + 1, total));
         }
@@ -3926,10 +3995,16 @@ fn settle_bytes(
         use sha2::Digest as _;
         lk.native_checkpoint = Some(link::NativeCheckpoint {
             tip: last_sha.clone(),
-            bytes: new_baseline as u64,
-            sha256: hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])),
+            bytes: (source_origin + new_baseline) as u64,
+            sha256: match prepared {
+                Some(prepared) => prepared
+                    .hash(new_baseline)
+                    .context("published cut precedes its verified continuation")?,
+                None => hex::encode(sha2::Sha256::digest(&bytes[..new_baseline])),
+            },
         });
     }
+    lk.native_continuation = continuation::seed(&lk, repo, bytes, new_baseline, prepared);
     // The same lock (`link::lock`) as import's claim/rollback critical section, plus a CAS:
     // write only while the disk still holds what it held when settlement started — a claim
     // rerouted mid-settlement must not be flattened by a whole-file write of the old watermark.
@@ -6202,7 +6277,7 @@ mod tests {
             .parse(region)
             .unwrap();
         annotate_completed_boundaries(region, &mut ir, &boundaries).unwrap();
-        let chunks = completed_turn_chunks(region, &ir, &[], false);
+        let chunks = completed_turn_chunks(region, &ir, &[], false, None);
         let at = |text: &str| {
             chrono::DateTime::parse_from_rfc3339(text)
                 .unwrap()
@@ -6218,6 +6293,245 @@ mod tests {
                 (Some(1), Some(at("2026-09-28T11:00:00Z")))
             ]
         );
+    }
+
+    /// A real native carrier must resume to the same snapshots, prompts and absolute cuts as
+    /// whole-input settlement. Reusing ordinals without the actual current prompt, or treating
+    /// an invalid continuation as unchanged input, changes these observable results.
+    #[test]
+    fn native_source_replay_matches_whole_settlement() {
+        use sha2::Digest as _;
+        const CHILD: &str = "AGIT_TEST_NATIVE_SOURCE_REPLAY_CHILD";
+        const COMPLETE: &str = "native source replay contract complete";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "commands::commit::tests::native_source_replay_matches_whole_settlement",
+                    "--nocapture",
+                ])
+                .env_clear();
+            for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command
+                .env(CHILD, "1")
+                .env("HOME", isolated.path())
+                .env("USERPROFILE", isolated.path())
+                .env("AGIT_HOME", isolated.path().join("agit"))
+                .env("AGIT_HUB_URL", "https://hub.example.invalid")
+                .env("AGIT_SKIP_SETUP", "1")
+                .env("AGIT_TELEMETRY_DISABLED", "1")
+                .env("CODEX_HOME", isolated.path().join("codex"))
+                .env("CLAUDE_CONFIG_DIR", isolated.path().join("claude"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETE));
+            return;
+        }
+        let id = "11111111-1111-1111-1111-111111111111";
+        for runtime in ["codex", "claude-code"] {
+            let (_directory, store) = store();
+            let oracle_dir = tempfile::tempdir().unwrap();
+            let oracle_store = Store::at(oracle_dir.path().join("store"));
+            let (_repository, repo) = setup_repo();
+            let path = if runtime == "codex" {
+                std::path::PathBuf::from(std::env::var_os("CODEX_HOME").unwrap())
+                    .join("sessions")
+                    .join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"))
+            } else {
+                std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap())
+                    .join("projects/fixture")
+                    .join(format!("{id}.jsonl"))
+            };
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let record = |value: serde_json::Value| format!("{value}\n");
+            let prompt = |text: &str| {
+                if runtime == "codex" {
+                    codex_user(text)
+                } else {
+                    record(
+                        serde_json::json!({"type":"user","sessionId":id,"cwd":"/repo/one","message":{"content":text}}),
+                    )
+                }
+            };
+            let reply = |text: &str| {
+                if runtime == "codex" {
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&codex_asst(text)).unwrap();
+                    if text.starts_with("older output") {
+                        value["timestamp"] = "2025-12-31T00:00:00Z".into();
+                    }
+                    format!(
+                        "{}{}",
+                        record(value),
+                        record(
+                            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})
+                        )
+                    )
+                } else {
+                    let mut value = serde_json::json!({"type":"assistant","sessionId":id,"message":{"content":[{"type":"text","text":text}],"stop_reason":"end_turn"}});
+                    if text.starts_with("older output") {
+                        value["timestamp"] = "2025-12-31T00:00:00Z".into();
+                    }
+                    record(value)
+                }
+            };
+            let header = if runtime == "codex" {
+                format!("{}\n", META.replace("AB", id))
+            } else {
+                record(serde_json::json!({"type":"custom-title","customTitle":"A retained title"}))
+            };
+            let first = format!(
+                "{header}{}{}{}{}",
+                prompt("older request"),
+                reply(&"older output ".repeat(8192)),
+                prompt("current request"),
+                reply("first phase")
+            );
+            std::fs::write(&path, &first).unwrap();
+            let mut claim = Link::new(runtime, id, Some(Path::new("/repo/one")));
+            claim.owner = Some("alice".into());
+            claim.agent = Some("photo".into());
+            claim.branch = Some("main".into());
+            assert_eq!(
+                settle_bytes(
+                    &store,
+                    &repo,
+                    "alice/photo",
+                    "main",
+                    claim,
+                    first.as_bytes(),
+                    "alice",
+                    opts(),
+                    true,
+                    true
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+            let base = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+            repo.git(&["branch", "oracle", &base]).unwrap();
+            let mut oracle_claim = link::get(&store, runtime, id).unwrap();
+            oracle_claim.branch = Some("oracle".into());
+            oracle_claim.native_checkpoint = None;
+            oracle_claim.native_continuation = None;
+            link::write(&oracle_store, &oracle_claim).unwrap();
+            let compact = if runtime == "codex" {
+                record(
+                    serde_json::json!({"type":"compacted","timestamp":"2026-01-01T00:00:00Z","payload":{"replacement_history":[]}}),
+                )
+            } else {
+                record(
+                    serde_json::json!({"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:00Z"}),
+                )
+            };
+            let second = format!(
+                "{first}{}{compact}{}{}",
+                reply("continued phase"),
+                prompt("next request"),
+                reply("done")
+            );
+            let active = format!("{second}{}", prompt("still running"));
+            std::fs::write(&path, &active).unwrap();
+            let claim = link::get(&store, runtime, id).unwrap();
+            let prepared = continuation::Prepared::read(&claim, &repo, Some(&base))
+                .expect("native source continuation");
+            assert!(prepared.state.origin > 0);
+            assert!(prepared.bytes.len() < active.len());
+            assert!(prepared.proves(&StopReceipt {
+                bytes: second.len(),
+                sha256: hex::encode(sha2::Sha256::digest(second.as_bytes())),
+            }));
+            assert!(
+                prepared
+                    .bytes
+                    .starts_with(&first.as_bytes()[prepared.state.origin as usize..])
+            );
+            let mut invalid = claim.clone();
+            invalid.native_continuation.as_mut().unwrap().prompts_before += 1;
+            assert!(continuation::Prepared::read(&invalid, &repo, Some(&base)).is_none());
+            assert_eq!(invalid.read_bytes().unwrap(), active.as_bytes());
+            let mut options = opts();
+            options.historical = true;
+            assert_eq!(
+                settle_bytes_at(
+                    &store,
+                    &repo,
+                    "alice/photo",
+                    "main",
+                    claim,
+                    &prepared.bytes,
+                    "alice",
+                    options,
+                    false,
+                    true,
+                    Some(base),
+                    Some(&prepared)
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+            let mut options = opts();
+            options.historical = true;
+            assert_eq!(
+                settle_bytes(
+                    &oracle_store,
+                    &repo,
+                    "alice/photo",
+                    "oracle",
+                    oracle_claim,
+                    &invalid.read_bytes().unwrap(),
+                    "alice",
+                    options,
+                    false,
+                    true
+                )
+                .unwrap(),
+                ExitCode::Ok
+            );
+            for suffix in ["", "~1"] {
+                let resumed = format!("refs/heads/main{suffix}");
+                let whole = format!("refs/heads/oracle{suffix}");
+                for format in ["%T", "%B", "%at"] {
+                    assert_eq!(
+                        repo.git(&["show", "-s", &format!("--format={format}"), &resumed])
+                            .unwrap(),
+                        repo.git(&["show", "-s", &format!("--format={format}"), &whole])
+                            .unwrap()
+                    );
+                }
+            }
+            let current = link::get(&store, runtime, id).unwrap();
+            assert_eq!(
+                current.native_checkpoint.as_ref().unwrap().bytes,
+                second.len() as u64
+            );
+            assert_eq!(
+                current.native_checkpoint.as_ref().unwrap().sha256,
+                link::get(&oracle_store, runtime, id)
+                    .unwrap()
+                    .native_checkpoint
+                    .unwrap()
+                    .sha256
+            );
+            let tip = repo.git(&["rev-parse", "refs/heads/main"]).unwrap();
+            assert!(continuation::Prepared::read(&current, &repo, Some(tip.trim())).is_some());
+            let rewritten = active.replacen("older output", "other output", 1);
+            std::fs::write(&path, &rewritten).unwrap();
+            assert!(continuation::Prepared::read(&current, &repo, Some(tip.trim())).is_none());
+        }
+        println!("{COMPLETE}");
     }
 
     /// Codex closes a native execution with `task_complete`, but only after its Stop hooks
