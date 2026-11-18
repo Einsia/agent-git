@@ -124,15 +124,28 @@ through the Hub's account endpoint; it does not treat a public health response
 as evidence that the token is valid. Missing credentials return code `5`, after
 `--check` has tried to claim a recorded sign-in the human approved.
 
-`agit logout` attempts to revoke the current Hub session before deleting the
-local credentials. `agit logout --all` does this for every saved Hub. Both
-forget the waiting sign-in requests before reading the credentials, and revoke
-credentials a concurrent sign-in saved after that read when they remove them, so
-every session they delete is one they asked the Hub to revoke. If the server is
-unreachable, the command warns and still clears local credentials; it cannot
-guarantee that the server session was revoked. An unreadable legacy
-credential or one without a recoverable Hub address has the same limitation.
-Captured sessions and local Agent repositories remain available after logout.
+`agit logout` asks the Hub to revoke the current session, then deletes the local
+credentials that held it. `agit logout --all` does this for every saved Hub, one
+Hub at a time. Both forget the waiting sign-in requests before reading the
+credentials. Credentials are deleted only once the Hub has settled their
+session: it answered the revoke, or it refused both the access token and the
+refresh token that could renew it, each in its own answer. A refused access
+token is renewed first with the credential's own refresh token, even when it
+looks expired on this computer, since only the Hub can say it is; a sign-in
+saved meanwhile is never taken for that renewal. Anything less leaves the session possibly valid, so the credentials
+are kept for another try and the command fails: exit `6` when the Hub did not
+answer or answered with a server error, `5` when it refused without showing the
+session ended, `4` when the credentials cannot be read or name no Hub, and `1`
+from `--all` when Hubs fell short for different reasons. The deletion matches the
+tokens the Hub settled, so a sign-in saved while the sign-out runs is kept.
+
+`agit logout --local-only`, and `agit logout --all --local-only`, delete the
+credentials without contacting any Hub, and say the session was not revoked and
+may stay valid until it expires. With `--json`, `result.value.hubs` lists each
+Hub's `revocation` (`confirmed`, `already_invalid`, `unconfirmed` or
+`not_attempted`) and whether its `credentials_removed`; a record that names no
+Hub has `hub: null`. Captured sessions and local Agent repositories remain
+available after logout.
 
 ## Code locations
 

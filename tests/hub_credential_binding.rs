@@ -396,10 +396,16 @@ fn logout_all_never_routes_a_legacy_token_by_the_current_filename() {
     );
 }
 
-/// Global cleanup of unbound files cannot infer a revoke destination from the selected hub.
+/// Global logout signs out of each Hub it can settle and keeps every credential it cannot. A
+/// record that names no Hub, or cannot be read, has no revoke destination (the selected hub is
+/// never inferred for it), and a Hub that does not answer leaves its session possibly valid:
+/// both stay, the outcome says so per Hub, and the command fails. `--local-only` then deletes
+/// what is left without a single request. A global logout that deleted the kept records would
+/// leave sessions it never revoked, with nothing on this computer able to revoke them.
 #[test]
-fn logout_all_clears_unbound_legacy_files_without_sending_their_tokens() {
+fn logout_all_keeps_what_it_cannot_settle_until_a_local_only_logout() {
     let hub = FakeHub::new();
+    let unreachable = "http://127.0.0.1:1";
     for bytes in [
         serde_json::to_vec(&credential(None)).unwrap(),
         serde_json::to_vec(&credential(Some("not-a-hub"))).unwrap(),
@@ -407,17 +413,54 @@ fn logout_all_clears_unbound_legacy_files_without_sending_their_tokens() {
     ] {
         let lab = Lab::new();
         lab.write("HTTP_.json", &bytes);
-        let output = lab.run(&hub.uppercase(), &["logout", "--all"]);
-        let requests = hub.requests();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.target == "/api/cli/version"
-                    && request.authorization.is_none()),
-            "an unbound token was sent: {requests:?}"
+        for address in [hub.base.as_str(), unreachable] {
+            lab.write(
+                &format!(
+                    "{}.json",
+                    agit::infra::config::hub_host_key(address).unwrap()
+                ),
+                &serde_json::to_vec(&credential(Some(address))).unwrap(),
+            );
+        }
+        let output = lab.run(&hub.uppercase(), &["--json", "logout", "--all"]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut outcomes: Vec<_> = value["result"]["value"]["hubs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hub| {
+                (
+                    hub["revocation"].clone(),
+                    hub["credentials_removed"].clone(),
+                )
+            })
+            .collect();
+        outcomes.sort_by_key(|outcome| outcome.0.to_string());
+        assert_eq!(
+            outcomes,
+            [
+                (json!("confirmed"), json!(true)),
+                (json!("not_attempted"), json!(false)),
+                (json!("unconfirmed"), json!(false)),
+            ]
         );
+        let requests = hub.requests();
+        let sent: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.authorization.is_some() && request.target != "/api/cli/version"
+            })
+            .collect();
+        assert_eq!(sent.len(), 1, "{requests:?}");
+        assert_eq!(sent[0].target, "/api/auth/logout");
+        assert_eq!(lab.credentials().len(), 2);
+
+        let output = lab.run(&hub.uppercase(), &["logout", "--all", "--local-only"]);
         assert!(output.status.success(), "{output:?}");
         assert!(lab.credentials().is_empty());
+        assert_eq!(hub.requests().len(), requests.len());
+        hub.requests.lock().unwrap().clear();
     }
 }
 

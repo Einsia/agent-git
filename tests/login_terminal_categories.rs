@@ -1587,46 +1587,153 @@ fn signing_out_forgets_a_waiting_request_before_it_revokes() {
     }
 }
 
-/// A sign-out revokes every session it removes, including one another sign-in saved after the
-/// sign-out read the credentials it revokes: the removal returns what it removed, read under the
-/// lock every save takes. A sign-out that revokes only what it read first deletes such a session
-/// locally and leaves it alive on the Hub until it expires.
+/// A sign-in saved while a sign-out revokes holds a session the sign-out did not end, and stays:
+/// the removal matches the session the Hub settled, under the lock every save takes. That holds
+/// when the Hub refuses the revoke as well, and the sign-out renews its own pair with its own
+/// refresh token and revokes the renewed one, even when the sign-in is the same account's. When
+/// the Hub doesn't confirm that last revoke either, the sign-out fails and says no credentials
+/// are left here to try again, since the renewed pair could not be saved over the new sign-in. A
+/// sign-out that removed whatever the slot held after its revoke would delete the new session
+/// from this computer without revoking it; one that took a same-account sign-in found on disk for
+/// its own renewal would revoke and delete that sign-in; one that judged its success by the old
+/// pair being gone from disk would report a sign-out the Hub never confirmed. With the new
+/// sign-in still here, no run says it logged out or removed the credentials.
 #[test]
-fn signing_out_revokes_a_session_saved_while_it_revoked() {
+fn signing_out_keeps_a_session_saved_while_it_revoked() {
+    const RENEWED: &str = "SYNTHETIC-renewed-access";
     for args in [&["logout"][..], &["logout", "--all"][..]] {
-        let release = Arc::new(AtomicBool::new(false));
-        let hub = Hub::new(vec![
-            Reply::Aside(Arc::clone(&release), Box::new(Reply::Json(json!({})))),
-            Reply::Json(session()),
-            Reply::Json(json!({})),
-        ]);
-        let lab = Lab::new(&hub.base);
-        lab.seed(&hub.base);
-        let logout = lab.spawn(&hub.base, args);
-        hub.wait_for(1);
-        let signed_in = lab.run(
-            &hub.base,
-            &[],
-            &["login", "--complete", "SYNTHETIC-state"],
-            None,
-        );
-        assert_output(&signed_in, &[], 0);
-        release.store(true, Ordering::Release);
-        let logout = wait_bounded(logout);
-        assert_command_output(&logout, &[], "logout", 0);
-        assert!(!lab.credential_path(&hub.base).exists());
-        let requests = hub.finish();
-        assert_eq!(requests.len(), 3, "{args:?}: {requests:?}");
-        assert_request(
-            &requests[1],
-            "/api/auth/cli/poll",
-            json!({"state":"SYNTHETIC-state"}),
-        );
-        for (request, token) in [(&requests[0], OLD_ACCESS), (&requests[2], ACCESS)] {
-            assert_eq!(request.method, "POST");
-            assert_eq!(request.target, "/api/auth/logout");
-            assert_eq!(request.authorization, format!("Bearer {token}"), "{args:?}");
+        // The revoke answered; refused, then the renewed pair's revoke answered; refused, then
+        // the renewed pair's revoke failed.
+        for (refused, last, code) in [(false, None, 0), (true, Some(200), 0), (true, Some(500), 6)]
+        {
+            let release = Arc::new(AtomicBool::new(false));
+            let mut signed_in = session();
+            let replies = if refused {
+                signed_in["username"] = json!("old-owner");
+                vec![
+                    Reply::Aside(Arc::clone(&release), Box::new(Reply::Status(401))),
+                    Reply::Json(signed_in),
+                    Reply::Json(json!({"access_token":RENEWED,
+                        "refresh_token":"SYNTHETIC-renewed-refresh",
+                        "access_expires_at":"2099-01-01T00:00:00Z",
+                        "refresh_expires_at":"2099-01-02T00:00:00Z"})),
+                    match last {
+                        Some(200) => Reply::Json(json!({})),
+                        _ => Reply::Status(500),
+                    },
+                ]
+            } else {
+                vec![
+                    Reply::Aside(Arc::clone(&release), Box::new(Reply::Json(json!({})))),
+                    Reply::Json(signed_in),
+                ]
+            };
+            let hub = Hub::new(replies);
+            let lab = Lab::new(&hub.base);
+            lab.seed(&hub.base);
+            let logout = lab.spawn(&hub.base, args);
+            hub.wait_for(1);
+            let signed_in = lab.run(
+                &hub.base,
+                &[],
+                &["login", "--complete", "SYNTHETIC-state"],
+                None,
+            );
+            assert_output(&signed_in, &[], 0);
+            release.store(true, Ordering::Release);
+            let logout = wait_bounded(logout);
+            assert_command_output(&logout, &[], "logout", code);
+            let said = String::from_utf8_lossy(&logout.stdout).into_owned()
+                + &String::from_utf8_lossy(&logout.stderr);
+            let case = format!("{args:?} {last:?}");
+            // The sign-in saved meanwhile keeps this computer signed in, settled or not.
+            assert!(!said.contains("logged out"), "{case}: {said}");
+            assert!(!said.contains("removed credentials"), "{case}: {said}");
+            assert!(said.contains("still on this computer"), "{case}: {said}");
+            if code == 0 {
+                assert!(
+                    said.contains("revoked the server session"),
+                    "{case}: {said}"
+                );
+            } else {
+                assert!(!said.contains("were kept"), "{case}: {said}");
+                assert!(
+                    said.contains("no longer holds credentials"),
+                    "{case}: {said}"
+                );
+            }
+            let saved: Value =
+                serde_json::from_slice(&fs::read(lab.credential_path(&hub.base)).unwrap()).unwrap();
+            assert_eq!(saved["access_token"], ACCESS, "{case}");
+            let requests = hub.finish();
+            assert_eq!(
+                requests.len(),
+                if refused { 4 } else { 2 },
+                "{case}: {requests:?}"
+            );
+            assert_eq!(requests[0].method, "POST");
+            assert_eq!(requests[0].target, "/api/auth/logout");
+            assert_eq!(requests[0].authorization, format!("Bearer {OLD_ACCESS}"));
+            assert_request(
+                &requests[1],
+                "/api/auth/cli/poll",
+                json!({"state":"SYNTHETIC-state"}),
+            );
+            if refused {
+                assert_request(
+                    &requests[2],
+                    "/api/auth/refresh",
+                    json!({"refresh_token":OLD_REFRESH}),
+                );
+                assert_eq!(requests[3].target, "/api/auth/logout");
+                assert_eq!(requests[3].authorization, format!("Bearer {RENEWED}"));
+            }
         }
+    }
+    // Global sign-out also leaves a later Hub's new login alone while an earlier Hub waits.
+    // Selecting sessions only when each Hub's turn arrives would revoke the new login and miss
+    // the original session, even if the active Hub's concurrent login is preserved.
+    let release = Arc::new(AtomicBool::new(false));
+    let mut hubs = [
+        Hub::new(vec![Reply::Held(
+            Arc::clone(&release),
+            Box::new(Reply::Json(json!({}))),
+        )]),
+        Hub::new(vec![Reply::Held(
+            Arc::clone(&release),
+            Box::new(Reply::Json(json!({}))),
+        )]),
+    ];
+    hubs.sort_by_key(|hub| agit::infra::config::hub_host_key(&hub.base).unwrap());
+    let [first, later] = hubs;
+    let lab = Lab::new(&first.base);
+    lab.seed(&first.base);
+    lab.seed(&later.base);
+    let logout = lab.spawn(&first.base, &["logout", "--all"]);
+    first.wait_for(1);
+    assert_eq!(later.received.load(Ordering::Acquire), 0);
+    let path = lab.credential_path(&later.base);
+    let mut signed_in = agit::infra::credentials::load_at(&path).unwrap();
+    signed_in.access_token = ACCESS.into();
+    signed_in.refresh_token = REFRESH.into();
+    save_at(&path, &signed_in).unwrap();
+    release.store(true, Ordering::Release);
+    let output = wait_bounded(logout);
+    assert_command_output(&output, &[], "logout", 0);
+    let said = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("still on this computer"), "{said}");
+    assert!(!said.contains("removed credentials"), "{said}");
+    let saved = agit::infra::credentials::load_at(&path).unwrap();
+    assert_eq!(saved.access_token, ACCESS);
+    assert_eq!(saved.refresh_token, REFRESH);
+    assert!(!lab.credential_path(&first.base).exists());
+    for hub in [first, later] {
+        let requests = hub.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].target, "/api/auth/logout");
+        assert_eq!(requests[0].authorization, format!("Bearer {OLD_ACCESS}"));
     }
 }
 

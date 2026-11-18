@@ -389,13 +389,26 @@ fn quiet_auth_preserves_revoke_failure_and_interactive_recovery() {
         }]);
         let lab = Lab::new();
         lab.signed_in(&hub.base);
-        let output = success(lab.command(&hub.base, &["logout"], mode).output().unwrap());
+        let output = lab.command(&hub.base, &["logout"], mode).output().unwrap();
+        assert_eq!(output.status.code(), Some(6), "{output:?}");
         assert!(output.stdout.is_empty(), "{output:?}");
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(
-            error.contains("server-side revoke failed")
-                && error.contains("local credentials are still deleted"),
+            error.contains("didn’t confirm the sign-out")
+                && error.contains("credentials for it were kept")
+                && error.contains("agit logout --local-only"),
             "{error}"
+        );
+        assert!(lab.credential_path(&hub.base).exists());
+        let output = success(
+            lab.command(&hub.base, &["logout", "--local-only"], mode)
+                .output()
+                .unwrap(),
+        );
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("not asked to revoke"),
+            "{output:?}"
         );
         assert!(!lab.credential_path(&hub.base).exists());
         let refused = lab

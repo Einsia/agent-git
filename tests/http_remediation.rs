@@ -1898,22 +1898,44 @@ mod unix {
         }
     }
 
+    /// A revoke the Hub does not settle keeps the credential for another try and fails without
+    /// suggesting a new sign-in. The refused access token sends the sign-out to renew, with the
+    /// refresh token this computer counts as expired; a 401 for that which does not ask for a new
+    /// sign-in may come from something in front of the Hub, so the session may still be valid.
     #[test]
     fn failed_remote_revocation_does_not_suggest_logging_back_in() {
         for args in [vec!["--json", "logout"], vec!["--json", "logout", "--all"]] {
             let lab = Lab::new();
             let hub = Hub::new(|_| {
-                vec![Step::error(
-                    "POST",
-                    "/api/auth/logout",
-                    authentication_error("synthetic revoke refusal"),
-                )]
+                vec![
+                    Step::error(
+                        "POST",
+                        "/api/auth/logout",
+                        authentication_error("synthetic revoke refusal"),
+                    ),
+                    Step {
+                        bearer: None,
+                        ..Step::error(
+                            "POST",
+                            "/api/auth/refresh",
+                            json!({"error":"synthetic gateway refusal"}),
+                        )
+                    },
+                ]
             });
             lab.seed_credentials(&hub.base, false);
-            let value = lab.json(&hub.base, &args, 0);
+            let value = lab.json(&hub.base, &args, 5);
             assert_eq!(value["fix"], json!([]));
-            assert!(!lab.credential_path(&hub.base).exists());
-            assert_eq!(hub.finish().len(), 1);
+            assert_eq!(
+                value["result"]["value"]["hubs"][0]["revocation"],
+                "unconfirmed"
+            );
+            assert_eq!(
+                value["result"]["value"]["hubs"][0]["credentials_removed"],
+                false
+            );
+            assert!(lab.credential_path(&hub.base).exists());
+            assert_eq!(hub.finish().len(), 2);
         }
     }
 }
