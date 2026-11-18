@@ -20,6 +20,7 @@
 
 use super::CmdResult;
 use crate::domain::repo::Repo;
+use crate::hub::Client;
 use crate::hub::identity::{self, RemoteIdentity};
 use crate::{ExitCode, ui};
 use clap::Args as ClapArgs;
@@ -45,7 +46,30 @@ pub fn run(args: Args) -> CmdResult {
     }
 }
 
+/// The client this fetch asks the Hub with, which also resolves where its git transfer goes. A
+/// background child, as the folder's refresh after its upload is, gets none when that client
+/// holds no usable sign-in for the Hub: it then asks the Hub nothing, not even to look the
+/// repository up. A person's own fetch keeps asking anonymously, as a public repository needs no
+/// sign-in.
+fn hub_client() -> Option<Client> {
+    let client = Client::from_env();
+    let background = std::env::var_os(super::auto_push::AUTOMATIC_ENV).is_some();
+    (!background || matches!(client.checked_access_token(), Ok(Some(_)))).then_some(client)
+}
+
+/// What a background fetch without a sign-in says: it fetched nothing and asked nothing.
+fn asked_nothing() -> ExitCode {
+    ui::info(format_args!(
+        "not signed in to {}: nothing fetched, nothing asked",
+        crate::infra::config::hub_url()
+    ));
+    ExitCode::Ok
+}
+
 fn fetch_all() -> CmdResult {
+    let Some(client) = hub_client() else {
+        return Ok(asked_nothing());
+    };
     let root = crate::infra::config::repos_dir()?;
     let mut n = 0;
     if let Ok(owners) = std::fs::read_dir(&root) {
@@ -67,7 +91,7 @@ fn fetch_all() -> CmdResult {
                 );
                 let owner = o.file_name().to_string_lossy().to_string();
                 let name = r.file_name().to_string_lossy().to_string();
-                match do_fetch(&repo, &owner, &name) {
+                match do_fetch(&client, &repo, &owner, &name) {
                     Ok(()) => {
                         n += 1;
                         ui::info(format_args!("{slug} fetched"));
@@ -89,6 +113,9 @@ fn fetch_slug(slug: &str) -> CmdResult {
             return Ok(ExitCode::Usage);
         }
     };
+    let Some(client) = hub_client() else {
+        return Ok(asked_nothing());
+    };
     let dir = crate::infra::config::repo_dir(&owner, &name).unwrap_or_default();
     let existing = Repo::open(&dir);
     // Not on this machine yet: pull it down as a peer right now (objects and refs only).
@@ -104,7 +131,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
             );
             r
         }
-        None => match adopt_peer(&owner, &name, &dir) {
+        None => match adopt_peer(&client, &owner, &name, &dir) {
             Ok(r) => r,
             Err(e) => {
                 super::fix::register_terminal_api_error(&e);
@@ -121,7 +148,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
             }
         },
     };
-    match do_fetch(&repo, &owner, &name) {
+    match do_fetch(&client, &repo, &owner, &name) {
         Ok(()) => {
             ui::success(&format!(
                 "{slug} fetched (objects and remote refs; local branches untouched)"
@@ -159,10 +186,9 @@ fn fetch_slug(slug: &str) -> CmdResult {
 /// and remote refs only". After init + fetch there is no local branch at all and
 /// `refs/remotes/origin/*` is complete — the shape taking material needs, and what makes a
 /// repeated `agit fetch` idempotent.
-fn adopt_peer(owner: &str, name: &str, dir: &Path) -> crate::Result<Repo> {
+fn adopt_peer(client: &Client, owner: &str, name: &str, dir: &Path) -> crate::Result<Repo> {
     // Only the server knows `clone_url` (the hub address moves), so ask first. That ask is also
     // the read-permission check: without permission it fails here, while nothing is on disk yet.
-    let client = crate::hub::Client::from_env();
     let remote = client.get_agent(owner, name)?;
     super::echo::emit(
         "fetch",
@@ -233,7 +259,10 @@ fn fetch_context() -> CmdResult {
     // A read-only checkout (origin under someone else's name): anonymous / read-only fetching of
     // a read-only repo must still work — the server's upload-pack goes through authorize_read,
     // and a public repo needs no sign-in.
-    match do_fetch(&repo, &owner, &name) {
+    let Some(client) = hub_client() else {
+        return Ok(asked_nothing());
+    };
+    match do_fetch(&client, &repo, &owner, &name) {
         Ok(()) => {
             ui::success("fetched (objects and remote refs; local branches untouched)");
             Ok(ExitCode::Ok)
@@ -246,9 +275,8 @@ fn fetch_context() -> CmdResult {
     }
 }
 
-fn do_fetch(repo: &Repo, owner: &str, name: &str) -> crate::Result<()> {
-    let client = crate::hub::Client::from_env();
-    let identity = identity::resolve_transport_target(repo, &client, owner, name)?;
+fn do_fetch(client: &Client, repo: &Repo, owner: &str, name: &str) -> crate::Result<()> {
+    let identity = identity::resolve_transport_target(repo, client, owner, name)?;
     let fetch = crate::hub::git::TagFetch::prepare(repo, &["fetch", "origin", "--prune", "--tags"]);
     let out = crate::hub::git::run_for_remote(repo, &fetch.args(), &identity)?;
     fetch.report();

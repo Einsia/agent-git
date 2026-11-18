@@ -15287,6 +15287,18 @@ impl UndropLab {
 
     /// `agit args` started in the folder, its stdin, stdout and stderr piped.
     fn spawn(&self, args: &[&str]) -> std::process::Child {
+        self.spawn_with(args, &[])
+    }
+
+    /// `agit args` as a folder's worker starts a background child: marked so.
+    fn run_background(&self, args: &[&str]) -> Output {
+        self.spawn_with(args, &[("AGIT_AUTO_PUSH", "1")])
+            .wait_with_output()
+            .unwrap()
+    }
+
+    /// [`Self::spawn`] with `env` added.
+    fn spawn_with(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
         for (name, value) in git_command(self.temp.path()).get_envs() {
@@ -15302,6 +15314,7 @@ impl UndropLab {
             .env("AGIT_TUI", "0")
             .env("AGIT_USE_SYSTEM_GIT", "1")
             .env("AGIT_SECRETS_KEYSTORE", "file")
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -15511,6 +15524,32 @@ fn an_undropped_branch_records_and_uploads_its_conversation_again() {
     lab.turn(SESSION, 2, &|| lab.on_hub(&branch) != before.2);
     assert_eq!(lab.branches(), before.0, "no new branch");
     assert_ne!(lab.tip(&branch), before.1);
+}
+
+/// A folder's worker refreshes its view of the Hub's branches with a background `agit fetch`
+/// after each upload. Signed in, that fetch fetches. Without a usable sign-in it asks the Hub
+/// nothing, not even to look the repository up, and says so; the fixture Hub fails the test on any
+/// request without the account's token. A background fetch that looked the repository up
+/// anonymously first, as a person's own fetch of a public repository may, would fail here (#522).
+#[test]
+fn a_background_fetch_without_a_sign_in_asks_the_hub_nothing() {
+    let lab = UndropLab::new(53);
+    let fetched = lab.run_background(&["fetch", "alice/app"]);
+    assert_success(&fetched);
+    assert!(
+        UndropLab::said(&fetched).contains("alice/app fetched"),
+        "{}",
+        UndropLab::said(&fetched)
+    );
+
+    fs::remove_dir_all(lab.home.join("credentials")).unwrap();
+    let skipped = lab.run_background(&["fetch", "alice/app"]);
+    assert_success(&skipped);
+    assert!(
+        UndropLab::said(&skipped).contains("nothing fetched, nothing asked"),
+        "{}",
+        UndropLab::said(&skipped)
+    );
 }
 
 /// An undo changes nothing when something took the branch's place or still holds it, and finishes

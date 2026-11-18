@@ -2129,11 +2129,12 @@ fn sync_one_for_request(
         super::push::published_visibility(lines.filter_map(serde_json::Value::as_str))
     });
     // A publication does not move the local view of the Hub's branches; fetching does, so local
-    // status and links can tell that this branch is on the Hub.
+    // status and links can tell that this branch is on the Hub. It runs as a background child,
+    // which asks the Hub nothing without a sign-in.
     let _ = child(
         &["fetch".into(), project.repository.clone()],
         &candidate.cwd,
-        false,
+        true,
     );
     Ok(Synced { branch, head, once })
 }
@@ -4141,7 +4142,7 @@ fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) -
         let _ = child(
             &["fetch".into(), project.repository.clone()],
             &project.root,
-            false,
+            true,
         );
     }
     Ok(())
