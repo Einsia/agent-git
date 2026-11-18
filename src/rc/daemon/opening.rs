@@ -486,6 +486,9 @@ impl PreparedSpawn {
                 .get_or_insert_with(crate::protocol::SessionPublicationStatus::checking);
             status.target = Some(target);
         }
+        self.authority
+            .check()
+            .map_err(SpawnFailure::before_launch)?;
         let mut session = Session::launch(
             info, self.spec.clone(), out, self.notes.clone(),
             self.confinement.clone(), self.settlement.clone(), self.generation,

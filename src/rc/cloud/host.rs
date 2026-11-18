@@ -22,6 +22,7 @@ pub struct Authenticated {
     pub renewal: Option<Renewal>,
 }
 
+#[derive(Clone)]
 pub struct Renewal {
     pub api: Client,
     pub credential: DeviceCredential,

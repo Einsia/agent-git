@@ -16,6 +16,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "session-publication-status-v1",
     "session-permissions-v1",
     "session-permission-capabilities-v1",
+    agit_peer::personal_rc::FEATURE,
     "session-approvals-v1",
     "steer-stop-first-v1",
     #[cfg(unix)]

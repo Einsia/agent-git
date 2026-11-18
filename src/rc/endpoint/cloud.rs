@@ -163,7 +163,9 @@ pub(super) fn attach(
                     anyhow::bail!("cloud endpoint requires an RPC frame")
                 };
                 ensure!(text.len() <= MAX_FRAME, "cloud RPC frame exceeds its limit");
-                let frame = serde_json::from_str(&text)?;
+                let mut frame = serde_json::from_str(&text)?;
+                crate::rc::cloud::personal_rc::verify(&mut frame, renewal.as_ref(), &grant, &lease)
+                    .await?;
                 input
                     .send(Incoming::Request(client, Box::new(frame)))
                     .await?;
@@ -220,7 +222,7 @@ pub(super) fn attach(
             Ok::<_, anyhow::Error>(())
         };
         let (reason, failure) = tokio::select! {
-            result = renew_authority(renewal, grant, lease.clone(), log.as_ref()) => {
+            result = renew_authority(renewal.clone(), grant.clone(), lease.clone(), log.as_ref()) => {
                 if let (Some(log), Err(error)) = (&log, result) {
                     log.record("cloud.authorization_renewal_failed", serde_json::json!({"grant_id":accepted.grant.id,"reason":format!("{error:#}")}));
                 }

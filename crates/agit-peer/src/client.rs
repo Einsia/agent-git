@@ -417,6 +417,30 @@ impl Client {
         Ok(grant)
     }
 
+    pub async fn verify_personal_rc_start(
+        &self,
+        executor: &DeviceCredential,
+        token: &Secret,
+        grant: &ConnectionGrant,
+        scope: &crate::personal_rc::StartScope,
+    ) -> anyhow::Result<crate::personal_rc::StartAuthorization> {
+        self.validate_executor_grant(executor, grant)?;
+        let proof: crate::personal_rc::StartAuthorization = self
+            .request(
+                Method::POST,
+                crate::personal_rc::VERIFY_PATH,
+                &executor.token,
+                Some(serde_json::json!({"token": token, "scope": scope})),
+            )
+            .await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_millis()
+            .try_into()?;
+        proof.validate(grant, scope, now)?;
+        Ok(proof)
+    }
+
     pub async fn connect_project(
         &self,
         source: &DeviceCredential,

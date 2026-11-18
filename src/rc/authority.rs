@@ -33,6 +33,7 @@ pub(crate) trait Authority: Send + Sync {
 #[derive(Clone, Default)]
 pub(crate) struct Guard {
     authority: Option<Arc<dyn Authority>>,
+    pub(crate) personal_rc_start: Option<super::cloud::personal_rc::Proof>,
     /// Closes when the requester can no longer receive a response. Nothing is ever sent on it.
     requester: Option<tokio::sync::watch::Receiver<()>>,
 }
@@ -101,6 +102,7 @@ impl Guard {
     pub fn new(authority: impl Authority + 'static) -> Self {
         Self {
             authority: Some(Arc::new(authority)),
+            personal_rc_start: None,
             requester: None,
         }
     }
@@ -127,10 +129,27 @@ impl Guard {
     }
 
     pub fn admit(&self, mut accept: impl FnMut() -> bool) -> bool {
-        match &self.authority {
-            Some(authority) => authority.admit(&mut accept),
+        let mut scoped = || match &self.personal_rc_start {
+            Some(proof) => proof.admit(&mut accept),
             None => accept(),
+        };
+        match &self.authority {
+            Some(authority) => authority.admit(&mut scoped),
+            None => scoped(),
         }
+    }
+
+    pub fn permits_personal_rc_start(
+        &self,
+        start: &crate::protocol::SessionStart,
+        caller: &crate::protocol::CallerClaim,
+    ) -> bool {
+        self.authority.is_some()
+            && self.admit(|| {
+                self.personal_rc_start
+                    .as_ref()
+                    .is_some_and(|proof| proof.matches(start, caller))
+            })
     }
 
     pub fn watch_owner(&self) -> Option<String> {
@@ -156,6 +175,10 @@ impl Guard {
             .as_ref()
             .and_then(|authority| authority.project())
             .is_some_and(|(allowed_id, allowed_path)| allowed_id != id || allowed_path != path)
+            || self
+                .personal_rc_start
+                .as_ref()
+                .is_some_and(|proof| !proof.matches_project(id, path))
         {
             return Err(RpcError::new(
                 ErrorCode::Forbidden,
