@@ -1017,9 +1017,12 @@ rely on it indiscriminately in scripts.
 ~/.agit/keystore/                the vault key, only with `secrets.keystore = file` (0600)
 ```
 
-`AGIT_HOME` moves the whole thing elsewhere (default `~/.agit`). `AGIT_HUB_URL` switches hub, and
-**switching hub is switching identity**: credentials are stored per host, so switching back and
-forth needs no new sign-in.
+`AGIT_HOME` moves the whole thing elsewhere (default `~/.agit`). `AGIT_HUB_URL` switches hub for
+the commands run with it set, and **switching hub is switching identity**: credentials are stored
+per host, so switching back and forth needs no new sign-in. To keep using another hub, sign in to
+it once with `agit login --hub <url>`: that records it as `hub.url`, so later commands go there
+without `AGIT_HUB_URL`. `agit config hub.url <url>` switches back, and a hub you signed in to
+before keeps its sign-in.
 
 Config has six keys, and the same command reads and writes:
 
