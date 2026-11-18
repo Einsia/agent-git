@@ -72,9 +72,8 @@
 //!
 //! # The version ID is itself the integrity
 //!
-//! A snapshot ID is a commit SHA. Checking out `refs/tags/agit-<sha>` yields that content itself —
-//! git's content addressing makes the tag name and the content the same thing, so a pickup needs
-//! no second verification.
+//! A snapshot ID embeds its commit SHA. Resolving that object identifies the content even when
+//! no tag names it; a conflicting version tag must never redirect the pickup to another commit.
 //!
 //! # Fetch only, never run
 //!
@@ -534,22 +533,19 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
 
     // ── 5. Check out the version/branch that was asked for ──
     //
-    // A version is a tag (`refs/tags/agit-<hash>`), a branch is an ordinary ref. Checking out a
-    // version is checking out that tag — which is exactly "go back to that turn". A copy carries
-    // the source repo's every tag and branch, so the version named here can be any one the
-    // original author recorded.
+    // A version names immutable content. Branch ancestry carries its objects without a tag.
     match &want {
         Some(Ref::Version(v)) => {
-            if store
-                .git_opt(&["rev-parse", "--verify", &format!("refs/tags/{v}")])
-                .is_none()
-            {
-                ui::error(&format!("{slug} has no version {v}."));
-                ui::hint(&format!("see available versions with `agit log {slug}`"));
-                return Ok(ExitCode::Ref);
-            }
-            let target = format!("refs/tags/{v}");
-            checkout_target(&store, &target, None)?;
+            let target = match crate::domain::refs::resolve_version(&store, v) {
+                Ok(commit) => commit,
+                Err(error) if crate::domain::refs::is_not_found(&error) => {
+                    ui::error(&format!("{slug} has no version {v}."));
+                    ui::hint(&format!("see available versions with `agit log {slug}`"));
+                    return Ok(ExitCode::Ref);
+                }
+                Err(error) => return Err(error),
+            };
+            checkout_target(&store, &format!("{target}^{{commit}}"), None)?;
             progress.line(format_args!(
                 "  {} version {}",
                 ui::ok(s.check),
@@ -2423,7 +2419,7 @@ mod tests {
     /// `resume` / `run` / `push` all break and recovery means a manual `git branch X origin/X &&
     /// git checkout X`.
     #[test]
-    fn every_remote_branch_becomes_a_local_branch_with_an_upstream() {
+    fn fetched_branches_and_untagged_versions_remain_usable() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = upstream_with_three_branches(tmp.path());
         let dest = tmp.path().join("clone");
@@ -2455,6 +2451,17 @@ mod tests {
         }
         // Idempotent: a second run creates nothing again and does not error.
         assert!(super::track_all_remote_branches(&repo).is_empty());
+
+        // A branch fetch carries earlier versions even when the remote has no version tags.
+        let version = repo.git(&["rev-parse", "refs/heads/older"]).unwrap();
+        // A branch named after an object must not redirect a version checkout to its own tip.
+        repo.git(&["branch", &version, "refs/heads/newest"])
+            .unwrap();
+        let target =
+            crate::domain::refs::resolve_version(&repo, &format!("agit-{version}")).unwrap();
+        checkout_target(&repo, &format!("{target}^{{commit}}"), None).unwrap();
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), version);
+        assert!(repo.current_branch().is_none());
     }
 
     /// Re-cloning with an explicit session branch: main is not behind while that branch is, so it
