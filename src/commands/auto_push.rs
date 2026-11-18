@@ -6,7 +6,8 @@ use std::path::Path;
 use std::process::Stdio;
 
 /// Set on background children so a commit an automatic push started doesn't start another. It
-/// only ever holds a push back: no push reads it to decide that it is automatic.
+/// only ever holds a push back: no push reads it to decide that it is automatic. A background
+/// save or fetch reads it to ask the Hub nothing it has no reason or sign-in for.
 pub(super) const AUTOMATIC_ENV: &str = "AGIT_AUTO_PUSH";
 
 /// The internal entry point background spawners publish through; [`automatic_push`] is the only
