@@ -9,17 +9,20 @@ description: Sign out of the AgentGit Hub.
 
 Revoke the server session and remove local credentials. It does not delete `~/.agit/repos`, `~/.agit/store`, or workspace records.
 
+Credentials are deleted only after the Hub confirms the session is over. When it doesn't (unreachable, a server error, a refusal that doesn't show the session ended), they are kept for another try and the command exits non-zero (`6` network, `5` auth, `4` unreadable credentials or no Hub address, `1` for `--all` with mixed reasons). Tell the person the session may still be valid. Retry later, or run `--local-only` only when the person accepts that the session stays valid on the Hub until it expires.
+
 ## Synopsis
 
 ```bash
-agit logout [--all]
+agit logout [--all] [--local-only]
 ```
 
 ## Options
 
 | Option | Meaning |
 |---|---|
-| `--all` | Revoke the server session on every signed-in Hub, then delete all local credentials; one Hub failing to revoke does not stop the others |
+| `--all` | Sign out of every Hub a credential names, one at a time; one Hub failing does not stop the others, and its credentials are kept |
+| `--local-only` | Delete this computer's credentials without contacting the Hub; the session is not revoked and may stay valid until it expires |
 | `--json` | Emit the unified CLI JSON envelope |
 | `-y, --yes` | Skip confirmation |
 | `-q, --quiet` | Reduce output |
@@ -32,4 +35,7 @@ agit logout [--all]
 ```bash
 agit logout
 agit logout --all
+agit logout --local-only
 ```
+
+With `--json`, `result.value.hubs` holds one entry per Hub: `hub`, `revocation` (`confirmed`, `already_invalid`, `unconfirmed`, `not_attempted`) and `credentials_removed`.

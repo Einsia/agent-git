@@ -49,7 +49,7 @@
     "init": {"aliases":[],"args":{"auto_push":{"action":"Set","policy":"enum","values":["true","false"]},"name":{"action":"Set","policy":"presence"},"no_bind":{"action":"SetTrue","policy":"boolean"},"private":{"action":"SetTrue","policy":"boolean"},"rebind":{"action":"SetTrue","policy":"boolean"},"seed":{"action":"SetTrue","policy":"boolean"}}},
     "log": {"aliases":[],"args":{"branches":{"action":"SetTrue","policy":"boolean"},"graph":{"action":"SetTrue","policy":"boolean"},"grep":{"action":"Set","policy":"presence"},"kind":{"action":"Set","policy":"enum","values":["turn","merge","revert","cherry-pick","file","milestone"]},"limit":{"action":"Set","policy":"bucket"},"oneline":{"action":"SetTrue","policy":"boolean"},"paths":{"action":"Append","policy":"count"},"since":{"action":"Set","policy":"presence"},"target":{"action":"Set","policy":"presence"}}},
     "login": {"aliases":[],"args":{"complete":{"action":"Set","policy":"presence"},"continue_to":{"action":"Set","policy":"presence"},"device":{"action":"SetTrue","policy":"boolean"},"hub":{"action":"Set","policy":"presence"},"wait":{"action":"Set","policy":"bucket"},"with_token":{"action":"SetTrue","policy":"boolean"}}},
-    "logout": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"}}},
+    "logout": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"local_only":{"action":"SetTrue","policy":"boolean"}}},
     "mcp": {"aliases":[],"args":{}},
     "memory": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"}}},
     "memory diff": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"},"path":{"action":"Set","policy":"presence"}}},

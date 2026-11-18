@@ -245,6 +245,30 @@ const REFRESH_SETTLE_POLLS: usize = 20;
 /// renewal.
 const RENEWAL_DEADLINE: Duration = Duration::from_secs(30);
 
+/// What a sign-out's renewal of its own credential came to (see [`Client::renew_for_sign_out`]).
+pub(crate) enum SignOutRenewal {
+    /// The Hub answered the credential's refresh token with `pair`, the same session renewed, and
+    /// `saving` says where the pair went.
+    Renewed {
+        pair: credentials::HubCredential,
+        saving: Saving,
+    },
+    /// The Hub refused the refresh token, now or when it was offered before.
+    Refused,
+    /// Nothing that says either.
+    Failed(anyhow::Error),
+}
+
+/// Where a sign-out's renewed pair went.
+pub(crate) enum Saving {
+    /// It replaced the credential on disk.
+    Saved,
+    /// The disk no longer held the credential, so the pair was not saved over what it holds.
+    Replaced,
+    /// Saving it failed: the pair is held nowhere but in this process.
+    Failed(anyhow::Error),
+}
+
 /// What one renewal of a refresh token came to.
 enum Renewal {
     /// The Hub answered with a new pair.
@@ -741,6 +765,60 @@ impl Client {
     /// explicit entry point.
     pub fn refresh_access(&self) -> Result<bool> {
         self.try_refresh()
+    }
+
+    /// Renew this client's credential for a sign-out, which deletes a credential only once the
+    /// Hub has settled its session. Only the credential's own refresh token is offered, even when
+    /// this computer's clock counts it as expired, since only the Hub's refusal shows the session
+    /// is over; one the Hub refused before is not offered again. Unlike a request's renewal, no
+    /// pair is taken from disk in its place: a pair saved there meanwhile may be another sign-in
+    /// to the same account, and nothing shows it continues this session.
+    pub(crate) fn renew_for_sign_out(&self) -> SignOutRenewal {
+        let Some(cred) = self.cred.borrow().clone() else {
+            return SignOutRenewal::Failed(anyhow::anyhow!("no saved sign-in to renew"));
+        };
+        if let Err(error) = self.ensure_destination() {
+            return SignOutRenewal::Failed(error);
+        }
+        if cred.refused() {
+            return SignOutRenewal::Refused;
+        }
+        // Renewals take turns with every other client's (see [`Client::try_refresh`]).
+        let _gate = refresh_gate().lock().unwrap_or_else(|e| e.into_inner());
+        let _process_gate = match credentials::refresh_guard(&self.base) {
+            Ok(guard) => guard,
+            Err(error) => return SignOutRenewal::Failed(error),
+        };
+        match self.renew(&cred.refresh_token) {
+            Renewal::Renewed(pair) => {
+                let fresh = credentials::HubCredential {
+                    access_token: pair.access_token,
+                    access_expires_at: pair.access_expires_at,
+                    refresh_token: pair.refresh_token,
+                    refresh_expires_at: pair.refresh_expires_at,
+                    ..cred.clone()
+                };
+                match credentials::save_refreshed(&self.base, &cred, &fresh) {
+                    Ok(Some(saved)) => SignOutRenewal::Renewed {
+                        pair: saved,
+                        saving: Saving::Saved,
+                    },
+                    Ok(None) => SignOutRenewal::Renewed {
+                        pair: fresh,
+                        saving: Saving::Replaced,
+                    },
+                    Err(error) => SignOutRenewal::Renewed {
+                        pair: fresh,
+                        saving: Saving::Failed(error),
+                    },
+                }
+            }
+            Renewal::Refused(_) => {
+                let _ = credentials::record_refused(&self.base, &cred);
+                SignOutRenewal::Refused
+            }
+            Renewal::Unanswered(error) | Renewal::Failed(error) => SignOutRenewal::Failed(error),
+        }
     }
 
     /// Exchange the refresh token for a new pair and persist it. Returns whether it worked.

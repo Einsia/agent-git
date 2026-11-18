@@ -602,9 +602,7 @@ fn analytics_account_at(path: &Path) -> (Option<String>, &'static str) {
 pub struct Removed {
     /// How many credential records were removed.
     pub records: usize,
-    /// The removed credentials bound to a Hub. A sign-out reads and revokes credentials before it
-    /// removes them, so a sign-in that saves in between leaves a session only these name; the
-    /// sign-out revokes it with them.
+    /// The removed credentials bound to a Hub, which name the Hubs they were for.
     pub bound: Vec<HubCredential>,
 }
 
@@ -624,11 +622,11 @@ pub fn forget_request(hub: &str) -> Result<()> {
     Ok(())
 }
 
-/// Signing out clears the selected slot and all positively bound compatibility records, and
-/// forgets the Hub's sign-in request waiting for approval, which could otherwise sign the
-/// account back in when a later command claims it. The credentials are read under the lock
-/// every save takes, so the ones returned include any a sign-in saved after the caller read
-/// them.
+/// Clear the selected slot and all positively bound compatibility records, whatever sessions they
+/// hold, and forget the Hub's sign-in request waiting for approval, which could otherwise sign
+/// the account back in when a later command claims it. A sign-out that does not ask the Hub to
+/// revoke uses this; one that does removes only the sessions the Hub settled
+/// ([`remove_session`]).
 pub fn remove(hub: &str) -> Result<Removed> {
     let authority = HubAuthority::parse(hub)?;
     let dir = crate::infra::config::credentials_dir()?;
@@ -667,6 +665,55 @@ fn remove_from(dir: &Path, authority: &HubAuthority) -> Result<Removed> {
                 removed.records += 1;
                 removed.bound.push(cred);
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(anyhow!("cannot remove saved Hub credentials")),
+        }
+    }
+    Ok(removed)
+}
+
+/// Whether `left` and `right` hold the same Hub session: the same access and refresh tokens.
+/// Account details saved with a pair later leave it the same session.
+pub fn same_session(left: &HubCredential, right: &HubCredential) -> bool {
+    left.access_token == right.access_token && left.refresh_token == right.refresh_token
+}
+
+/// The credentials of every record bound to `hub`, one per session: first the one commands use
+/// (see [`load_checked`], whose errors this shares), then any it shadows. A sign-out revokes each
+/// before it removes it.
+pub fn bound_records(hub: &str) -> Result<Vec<HubCredential>> {
+    let authority = HubAuthority::parse(hub)?;
+    let dir = crate::infra::config::credentials_dir()?;
+    let mut records: Vec<_> = load_from(&dir, &authority)?.into_iter().collect();
+    for path in record_paths(&dir)? {
+        if let Some(cred) =
+            recognized_record(&path, false).filter(|cred| bound_to(cred, &authority))
+            && !records.iter().any(|known| same_session(known, &cred))
+        {
+            records.push(cred);
+        }
+    }
+    Ok(records)
+}
+
+/// Remove the records bound to `hub` that hold `session`, under the lock every save takes, and
+/// return how many went. A record holding another pair stays: a sign-in or a renewal that saved
+/// it holds a session the caller did not end.
+pub fn remove_session(hub: &str, session: &HubCredential) -> Result<usize> {
+    let authority = HubAuthority::parse(hub)?;
+    let dir = crate::infra::config::credentials_dir()?;
+    let _guard = mutation_guard(&dir)?;
+    let mut removed = 0;
+    for path in record_paths(&dir)? {
+        if !recognized_record(&path, false)
+            .is_some_and(|cred| bound_to(&cred, &authority) && same_session(&cred, session))
+        {
+            continue;
+        }
+        let _ = std::fs::remove_file(path.with_extension("identity"));
+        let _ = std::fs::remove_file(path.with_extension("refused"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(anyhow!("cannot remove saved Hub credentials")),
         }
@@ -719,8 +766,8 @@ pub fn forget_pending() -> Result<bool> {
     Ok(pending::discard_all(&dir) > 0)
 }
 
-/// Explicit global logout clears every local credential record, including unbound records, and
-/// returns what it removed as [`remove`] does.
+/// A global sign-out that does not ask the Hubs to revoke clears every local credential record,
+/// including unbound records, and returns what it removed as [`remove`] does.
 pub fn remove_all() -> Result<Removed> {
     let dir = crate::infra::config::credentials_dir()?;
     if !dir.is_dir() {
