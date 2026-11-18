@@ -1506,16 +1506,27 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     let unseen = (!await_reply && super::settle_failures::output_discarded(rt))
         .then(|| (ev.session_id.clone(), ev.cwd.clone(), ev.shows_notice));
     if failure.is_none() && unseen.is_none() {
-        return settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
-    }
-    if let Some(failure) = failure {
-        println!("{}", serde_json::json!({ "systemMessage": failure }));
+        let settled = settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
+        if !await_reply && let Some(line) = capture_recovery_line(&settled) {
+            println!("{}", serde_json::json!({ "systemMessage": line }));
+        }
+        return settled;
     }
     // Claude Code reads the hook's whole stdout as that one response, so the settlement's own
     // notices go to stderr.
     let settled = crate::ui::with_info_on_stderr(true, || {
         settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
     });
+    let lines: Vec<_> = [failure, capture_recovery_line(&settled)]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !lines.is_empty() {
+        println!(
+            "{}",
+            serde_json::json!({ "systemMessage": lines.join("\n") })
+        );
+    }
     if let Some((session, cwd, shown)) = unseen
         && let Some(notice) = super::settle_failures::settled(
             rt,
@@ -1534,6 +1545,14 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         );
     }
     settled
+}
+
+fn capture_recovery_line(settled: &crate::Result<()>) -> Option<String> {
+    settled
+        .as_ref()
+        .err()
+        .filter(|error| error.is::<super::project::CaptureRecoveryRequired>())
+        .map(|error| format!("agit: {error}"))
 }
 
 /// The line a Codex conversation an older agit linked to a held branch is told, the first time

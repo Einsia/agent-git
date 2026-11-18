@@ -10603,6 +10603,57 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         receipt(RECOVERED).is_some_and(|row| row["status"] == "uploaded")
     });
 
+    // A Stop whose worker cannot start must return before a policy lock is released. Its
+    // retained work has an explicit recovery path without a new turn or detached folder worker.
+    const STOP_RECOVERED: &str = "acacacac-0000-4000-8000-000000000006";
+    add_turn(STOP_RECOVERED, "recover stopped turn");
+    drop(hold("capture"));
+    let before = branches();
+    let policy_lock = hold("lock");
+    let (send, receive) = std::sync::mpsc::channel();
+    let stopped = thread::scope(|scope| {
+        scope.spawn(|| {
+            let output = agit(
+                &["hooks", "settle"],
+                Some(
+                    json!({
+                        "session_id": STOP_RECOVERED,
+                        "transcript_path": transcript(STOP_RECOVERED),
+                        "cwd": work,
+                        "hook_event_name": "Stop",
+                    })
+                    .to_string(),
+                ),
+                &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+            );
+            send.send(output).unwrap();
+        });
+        let returned = receive.recv_timeout(Duration::from_secs(15)).ok();
+        drop(policy_lock);
+        returned
+    })
+    .expect("Stop must not drain queued work when its worker cannot start");
+    let notice: serde_json::Value = serde_json::from_slice(&stopped.stdout).unwrap();
+    assert!(
+        notice["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("agit project recover .")
+    );
+    assert_eq!(branches(), before, "Stop only queues this turn");
+    let status = agit(&["project", "status", "."], None, &[]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["capture_recovery"]["state"], "recovery_required");
+    agit(
+        &["project", "recover", "."],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    assert_eq!(branches().difference(&before).count(), 1);
+    let status = agit(&["project", "status", "."], None, &[]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["capture_recovery"]["state"], "idle");
+
     let captured = hold("capture");
     let policy_lock = hold("lock");
     let (send, receive) = std::sync::mpsc::channel();
