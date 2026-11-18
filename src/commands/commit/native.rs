@@ -44,6 +44,7 @@ impl Projection {
 /// native checkpoint lets a settlement use it, because the checkpoint is what proves those
 /// transcript bytes unchanged since that commit; the continuity compare proves the same thing by
 /// reading every settled event.
+#[derive(Clone)]
 pub(super) struct Settled {
     ids: Vec<String>,
     /// The event files the ids name, all present in the base.
@@ -55,6 +56,7 @@ pub(super) struct Settled {
     end: usize,
     /// The number of events before each line of the settled part, and after its last line.
     counts: Vec<usize>,
+    view_start: Option<usize>,
 }
 
 impl Settled {
@@ -75,36 +77,7 @@ impl Settled {
         raw: &str,
         checkpoint: usize,
     ) -> Result<Option<Self>> {
-        let log =
-            repo.git_bytes_result(&["cat-file", "blob", &format!("{tip}:{}", meta::LOG_FILE)])?;
-        let ids = storage::parse_sequence(std::str::from_utf8(&log)?)?;
-        let mut sizes = BTreeMap::new();
-        let listing = repo.git(&["ls-tree", "-r", "-l", tip, "--", meta::EVENTS_DIR])?;
-        for entry in listing.lines() {
-            let (fields, path) = entry
-                .split_once('\t')
-                .context("ls-tree entry without a path")?;
-            let mut fields = fields.split_whitespace();
-            let (Some(_), Some("blob"), Some(_), Some(size)) =
-                (fields.next(), fields.next(), fields.next(), fields.next())
-            else {
-                return Ok(None);
-            };
-            sizes.insert(path.to_owned(), size.parse::<usize>()?);
-        }
-        let mut paths = std::collections::BTreeSet::new();
-        let mut bytes = 0usize;
-        for id in &ids {
-            let path = meta::event_path(id)?;
-            let Some(size) = sizes.get(&path) else {
-                return Ok(None);
-            };
-            bytes = bytes.checked_add(*size).context("LOG size overflow")?;
-            paths.insert(path);
-        }
-        if bytes > storage::MAX_MATERIALIZED_BYTES || ids.len() > storage::MAX_SEQUENCE_EVENTS {
-            return Ok(None);
-        }
+        let (ids, paths, bytes) = Self::load(repo, tip)?;
         // One event per line that parses, as wrapping and the continuity compare count them; the
         // part ends after the line of the last settled event.
         let mut counts = vec![0];
@@ -129,7 +102,89 @@ impl Settled {
             bytes,
             end,
             counts,
+            view_start: None,
         }))
+    }
+
+    fn load(
+        repo: &crate::domain::repo::Repo,
+        tip: &str,
+    ) -> Result<(Vec<String>, std::collections::BTreeSet<String>, usize)> {
+        let log =
+            repo.git_bytes_result(&["cat-file", "blob", &format!("{tip}:{}", meta::LOG_FILE)])?;
+        let ids = storage::parse_sequence(std::str::from_utf8(&log)?)?;
+        let mut sizes = BTreeMap::new();
+        let listing = repo.git(&["ls-tree", "-r", "-l", tip, "--", meta::EVENTS_DIR])?;
+        for entry in listing.lines() {
+            let (fields, path) = entry
+                .split_once('\t')
+                .context("ls-tree entry without a path")?;
+            let mut fields = fields.split_whitespace();
+            let (Some(_), Some("blob"), Some(_), Some(size)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                anyhow::bail!("invalid settled event tree");
+            };
+            sizes.insert(path.to_owned(), size.parse::<usize>()?);
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        let mut bytes = 0usize;
+        for id in &ids {
+            let path = meta::event_path(id)?;
+            let Some(size) = sizes.get(&path) else {
+                anyhow::bail!("invalid settled event tree");
+            };
+            bytes = bytes.checked_add(*size).context("LOG size overflow")?;
+            paths.insert(path);
+        }
+        if bytes > storage::MAX_MATERIALIZED_BYTES || ids.len() > storage::MAX_SEQUENCE_EVENTS {
+            anyhow::bail!("settled sequence exceeds its limits");
+        }
+        Ok((ids, paths, bytes))
+    }
+
+    pub(super) fn replay(
+        repo: &crate::domain::repo::Repo,
+        tip: &str,
+        context: &str,
+        events_before: usize,
+        view_start: usize,
+    ) -> Result<Self> {
+        let (ids, paths, bytes) = Self::load(repo, tip)?;
+        let mut counts = vec![events_before];
+        for line in context.split_inclusive('\n') {
+            let count = counts
+                .last()
+                .copied()
+                .unwrap_or(0)
+                .checked_add(usize::from(
+                    serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                ))
+                .context("settled event count overflow")?;
+            counts.push(count);
+        }
+        ensure!(
+            counts.last() == Some(&ids.len()),
+            "replay does not cover the settled sequence"
+        );
+        ensure!(view_start <= ids.len(), "replay view starts after its log");
+        let view =
+            repo.git_bytes_result(&["cat-file", "blob", &format!("{tip}:{}", meta::VIEW_FILE)])?;
+        let expected = ids[view_start..]
+            .iter()
+            .flat_map(|id| id.bytes().chain(std::iter::once(b'\n')));
+        ensure!(
+            view.into_iter().eq(expected),
+            "replay view differs from its frozen snapshot"
+        );
+        Ok(Self {
+            ids,
+            paths,
+            bytes,
+            end: context.len(),
+            counts,
+            view_start: Some(view_start),
+        })
     }
 
     /// Where the settled part ends in the transcript.
@@ -232,11 +287,13 @@ impl NativeSnapshots {
         compact_lines.sort_unstable();
         compact_lines.dedup();
         let settled_view_start = settled.map_or(0, |settled| {
-            compact_lines
-                .iter()
-                .rev()
-                .find(|line| **line < first_line)
-                .map_or(0, |line| settled.counts[*line])
+            settled.view_start.unwrap_or_else(|| {
+                compact_lines
+                    .iter()
+                    .rev()
+                    .find(|line| **line < first_line)
+                    .map_or(0, |line| settled.counts[*line])
+            })
         });
         Ok(Self {
             raw_ends,
@@ -301,7 +358,7 @@ impl NativeSnapshots {
             .compact_lines
             .partition_point(|line| *line < self.first_line + line_count);
         let view_start = match compact.checked_sub(1).map(|at| self.compact_lines[at]) {
-            None => 0,
+            None => self.settled_view_start,
             Some(line) if line >= self.first_line => self.event_counts[line - self.first_line],
             Some(_) => self.settled_view_start,
         };

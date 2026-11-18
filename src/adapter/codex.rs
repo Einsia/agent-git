@@ -1375,15 +1375,31 @@ impl Adapter for Codex {
 pub(crate) fn parse_records<T: std::borrow::Borrow<serde_json::Value>>(
     records: impl IntoIterator<Item = (usize, T)>,
 ) -> Session {
-    let mut id = String::new();
-    let mut cwd = None;
+    parse_records_after(records, None, false)
+}
+
+/// A replay starts at a native execution boundary; only header identity and the
+/// presence of earlier messages survive outside its bounded source context.
+pub(crate) fn parse_records_after<T: std::borrow::Borrow<serde_json::Value>>(
+    records: impl IntoIterator<Item = (usize, T)>,
+    header: Option<&serde_json::Value>,
+    seen_message: bool,
+) -> Session {
+    let mut id = header
+        .and_then(|v| v.pointer("/payload/id")?.as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let mut cwd = header
+        .and_then(|v| v.pointer("/payload/cwd")?.as_str())
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned);
     let mut events = vec![];
     // Whether any message has been seen before this point: it decides whether a compacted
     // record's replacement_history is "a duplicate" or "the only carrier" (see the
     // compacted arm).
-    let mut saw_message = false;
-    let mut agent_path = None;
-    let mut saw_header = false;
+    let mut saw_message = seen_message;
+    let mut agent_path = header.and_then(conversation_agent_path).map(str::to_owned);
+    let mut saw_header = header.is_some();
     let mut turn = NativeTurn::default();
 
     // The line number goes into every event ([`Event::line`]); the web transcript uses it to

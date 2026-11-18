@@ -53,6 +53,7 @@
 //! Not a single `links.json`: writes can fire concurrently (two sessions opened at once), one
 //! file per session drops the read-modify-write race, and file names cannot collide.
 
+pub mod continuation;
 pub mod launch;
 mod native_source;
 pub use native_source::NativeBinding;
@@ -108,6 +109,8 @@ pub struct Link {
     pub baseline_hash: Option<String>,
     /// Optional native-prefix evidence, independent of materialization and claim identity.
     pub native_checkpoint: Option<NativeCheckpoint>,
+    /// A bounded parser replay is usable only with its exact checkpoint and claim.
+    pub native_continuation: Option<continuation::State>,
     /// Earlier settled prefixes, newest first, each bound to the tip it settled. A tip published
     /// before the latest settlement can still be proven from its own evidence, so a reader that
     /// asks for history after it gets only what follows instead of the whole transcript.
@@ -173,7 +176,7 @@ pub struct NativeCheckpoint {
 
 /// The on-disk form. Empty optional fields are omitted rather than written as `null`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Body {
+struct Body<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_binding: Option<NativeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +195,13 @@ struct Body {
     baseline_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_checkpoint: Option<serde_json::Value>,
+    #[serde(
+        default,
+        borrow,
+        deserialize_with = "continuation::borrow_state",
+        skip_serializing_if = "Option::is_none"
+    )]
+    native_continuation: Option<std::borrow::Cow<'a, serde_json::value::RawValue>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     settled_prefixes: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +242,7 @@ impl Link {
             baseline_bytes: None,
             baseline_hash: None,
             native_checkpoint: None,
+            native_continuation: None,
             settled_prefixes: Vec::new(),
             materialized_from: None,
             privacy_recovery: None,
@@ -257,6 +268,7 @@ impl Link {
     /// about the new destination's history with evidence about the old one.
     pub fn clear_native_evidence(&mut self) {
         self.native_checkpoint = None;
+        self.native_continuation = None;
         self.settled_prefixes.clear();
         self.baseline_bytes = None;
         self.baseline_hash = None;
@@ -276,7 +288,7 @@ impl Link {
         Ok(link)
     }
 
-    fn body(&self) -> Body {
+    fn body(&self) -> Body<'static> {
         Body {
             native_binding: self.native_binding.clone(),
             cwd: self.cwd.clone(),
@@ -290,6 +302,11 @@ impl Link {
                 .native_checkpoint
                 .as_ref()
                 .and_then(|checkpoint| serde_json::to_value(checkpoint).ok()),
+            native_continuation: self
+                .native_continuation
+                .as_ref()
+                .and_then(continuation::State::encode)
+                .map(std::borrow::Cow::Owned),
             settled_prefixes: self
                 .settled_prefixes
                 .iter()
@@ -664,6 +681,10 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
         native_checkpoint: body
             .native_checkpoint
             .and_then(|value| serde_json::from_value(value).ok()),
+        native_continuation: body
+            .native_continuation
+            .as_deref()
+            .and_then(continuation::State::decode),
         settled_prefixes: body
             .settled_prefixes
             .into_iter()
@@ -687,7 +708,8 @@ fn from_body(source: String, session_id: String, body: Body) -> Link {
 /// `runtime` comes from the parent directory name and `session_id` from the file name, so the
 /// path is where those two fields come from.
 pub fn read(path: &Path) -> Option<Link> {
-    let body: Body = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let json = std::fs::read_to_string(path).ok()?;
+    let body: Body = serde_json::from_str(&json).ok()?;
     link_from_body(path, body)
 }
 

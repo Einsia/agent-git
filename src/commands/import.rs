@@ -2227,6 +2227,7 @@ fn attach(
     let claim_json = |link: &Link| {
         let mut claim = link.clone();
         claim.native_checkpoint = None;
+        claim.native_continuation = None;
         claim.settled_prefixes.clear();
         claim.settled_at = None;
         claim.to_json()

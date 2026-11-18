@@ -15,8 +15,23 @@ pub fn native_title(
     transcript: &str,
     home: Option<&std::path::Path>,
 ) -> Option<String> {
+    native_title_after(runtime, session_id, transcript, home, &[])
+}
+
+pub(crate) fn native_title_after(
+    runtime: &str,
+    session_id: &str,
+    transcript: &str,
+    home: Option<&std::path::Path>,
+    previous: &[String],
+) -> Option<String> {
     let title = match runtime {
-        "claude-code" => claude_title(transcript),
+        "claude-code" => claude_title(
+            previous
+                .iter()
+                .map(String::as_str)
+                .chain(transcript.lines()),
+        ),
         "codex" => {
             let home = match home {
                 Some(home) => home.to_path_buf(),
@@ -35,11 +50,12 @@ pub fn native_title(
 /// empty one when the name is cleared, so the last one is current. Without a name Claude Code
 /// shows the title it generated (`ai-title`, last one current); older transcripts carry only
 /// `summary` records. agit placeholders are skipped as if they had never been written.
-fn claude_title(transcript: &str) -> Option<String> {
+fn claude_title(lines: impl DoubleEndedIterator<Item = impl AsRef<str>>) -> Option<String> {
     let mut named = true;
     let mut generated = None;
     let mut summary = None;
-    for line in transcript.lines().rev() {
+    for line in lines.rev() {
+        let line = line.as_ref();
         if !line.contains("\"custom-title\"")
             && !line.contains("\"ai-title\"")
             && !line.contains("\"summary\"")
