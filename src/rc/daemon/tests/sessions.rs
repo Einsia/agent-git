@@ -690,7 +690,7 @@ fn session_start_idempotency_is_an_explicit_per_socket_feature() {
 }
 
 #[tokio::test]
-async fn start_session_replays_a_completed_start_after_a_display_name_change() {
+async fn start_session_replays_display_changes_but_requires_authority_for_a_saved_loose_mode() {
     let start_id = "018f47cb-60ff-7e31-aec9-02d2e39d3114";
     let session = SessionInfo {
         interrupt_fenced: None,
@@ -769,6 +769,50 @@ async fn start_session_replays_a_completed_start_after_a_display_name_change() {
         .await
         .expect("display-only drift must replay the completed launch");
 
+    assert_eq!(
+        serde_json::from_value::<SessionStartResult>(replayed).unwrap(),
+        expected
+    );
+    // A completed start is still the same permission decision; its durable result cannot be
+    // used by an operator to skip the narrowly scoped launch authorization.
+    let intent = state.roster.starts.get_mut(start_id).unwrap();
+    intent.spec.workspace_id = "local-owner".into();
+    intent.spec.permission_mode = crate::protocol::PermissionMode::Bypass;
+    let roster::StartState::Completed { result } = &mut intent.state else {
+        unreachable!()
+    };
+    result.session.workspace_id = "local-owner".into();
+    result.session.permission_mode = Some(crate::protocol::PermissionMode::Bypass);
+    result.session.dangerous = true;
+    let expected = result.clone();
+    let start: SessionStart = serde_json::from_value(serde_json::json!({
+        "start_id":start_id, "workspace_id":"local-owner", "project_id":"project-a",
+        "runtime":"codex", "permission_mode":"bypass", "prompt":"inspect",
+        "by":"renamed display name",
+    }))
+    .unwrap();
+    let caller = claim("operator", "local-owner");
+    assert!(
+        state
+            .prepare_start_session(start.clone(), &caller, &frames, &Default::default())
+            .is_err()
+    );
+    struct Current;
+    impl crate::rc::authority::Authority for Current {
+        fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
+            accept()
+        }
+    }
+    let mut authority = crate::rc::authority::Guard::new(Current);
+    authority.personal_rc_start = Some(crate::rc::cloud::personal_rc::Proof::fixture(
+        &start, &caller,
+    ));
+    let replayed = state
+        .prepare_start_session(start, &caller, &frames, &authority)
+        .unwrap()
+        .run_inline(&mut state)
+        .await
+        .unwrap();
     assert_eq!(
         serde_json::from_value::<SessionStartResult>(replayed).unwrap(),
         expected

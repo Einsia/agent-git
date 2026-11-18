@@ -1281,11 +1281,13 @@ impl Daemon {
         // Naming a mode is changing a setting, judged as a switch from the mode a start without one
         // runs in: the machine's own default. Without one, a colleague's session starts in that
         // default as the owner's does.
-        require_owner_to_loosen(
-            Some(caller),
-            mode,
-            Some(crate::protocol::PermissionMode::Default),
-        )?;
+        if !authority.permits_personal_rc_start(&p, caller) {
+            require_owner_to_loosen(
+                Some(caller),
+                mode,
+                Some(crate::protocol::PermissionMode::Default),
+            )?;
+        }
         let agit_session = lineage_from_params(
             self.settlement_feature(),
             p.agent.as_deref(),

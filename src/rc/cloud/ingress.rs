@@ -541,6 +541,7 @@ impl Client {
         {
             self.session_events.store(enabled, Ordering::Relaxed);
         }
+        let personal_rc_start = frame.authority.personal_rc_start.take();
         frame.authority = crate::rc::authority::Guard::new(ExecutionAuthority {
             grant: self.grant.clone(),
             controller: self.controller.clone(),
@@ -553,6 +554,7 @@ impl Client {
             request: id.clone(),
             log: self.log.clone(),
         });
+        frame.authority.personal_rc_start = personal_rc_start;
         permits.insert(
             id,
             Some(PendingPermit {

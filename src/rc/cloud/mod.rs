@@ -5,6 +5,7 @@ mod commands;
 mod delegation;
 pub mod host;
 pub mod ingress;
+pub(crate) mod personal_rc;
 mod publication;
 pub(crate) mod refusal;
 pub mod resources;
