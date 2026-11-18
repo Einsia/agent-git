@@ -469,6 +469,49 @@ fn object_by_prefix(repo: &crate::domain::repo::Repo, prefix: &str) -> Result<Op
     }
 }
 
+/// A version names a commit object even when no tag names it. Ref names cannot override the
+/// embedded object identity, and an ambiguous prefix never chooses a snapshot for the caller.
+pub fn resolve_version(repo: &crate::domain::repo::Repo, name: &str) -> Result<String> {
+    let prefix = crate::domain::meta::sha_from_id(name)
+        .filter(|hex| {
+            (7..=crate::domain::meta::ID_HEX_LEN).contains(&hex.len())
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| NotFound(name.to_owned()))?;
+    let repo = repo.clone().local_objects_only();
+    let objects = repo.git(&["rev-parse", &format!("--disambiguate={prefix}")])?;
+    let mut commits = Vec::new();
+    repo.git_cat_file_batch_check(
+        objects.lines().map(str::to_owned).collect(),
+        |oid, kind, _| {
+            if kind == "commit" && oid.starts_with(prefix) {
+                commits.push(oid.to_owned());
+            }
+            Ok(())
+        },
+    )?;
+    let commit = match commits.as_slice() {
+        [] => return Err(NotFound(name.to_owned()).into()),
+        [commit] => commit,
+        many => {
+            return Err(Ambiguous(format!(
+                "`{name}` matches {} versions; give more of it",
+                many.len()
+            ))
+            .into());
+        }
+    };
+    let canonical = format!("refs/tags/agit-{commit}");
+    if ref_exists(&repo, &canonical)? && peel_to_commit(&repo, &canonical)? != *commit {
+        anyhow::bail!(
+            "version tag `{canonical}` is corrupt or reused: it differs from its embedded commit"
+        );
+    }
+    Ok(commit.clone())
+}
+
 /// Resolve a branch name / tag / sha prefix to a full SHA; ambiguity errors and lists every
 /// hit. The two ids the web interface shows are both `agit-` + 40 hex: the session declaration
 /// (the `session` field of session/meta.json) and the version id (a commit sha). Branches and
@@ -1574,7 +1617,14 @@ mod version_id_tests {
             .trim()
             .to_string();
         let vid = format!("agit-{tip}");
+        assert_eq!(resolve_version(&r, &vid).unwrap(), tip);
+        assert_eq!(resolve_version(&r, &vid[..12]).unwrap(), tip);
+        let tree = r.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+        assert!(is_not_found(
+            &resolve_version(&r, &format!("agit-{tree}")).unwrap_err()
+        ));
         r.git(&["tag", &vid, &tip]).unwrap();
+        assert_eq!(resolve_version(&r, &vid).unwrap(), tip);
         assert_eq!(
             resolve_base(&r, &vid).unwrap().0,
             tip,
@@ -1582,6 +1632,8 @@ mod version_id_tests {
         );
         r.git(&["tag", "-d", &vid]).unwrap();
         r.git(&["tag", &vid, "refs/heads/s1"]).unwrap();
+        assert!(resolve_version(&r, &vid).is_err());
+        assert!(resolve_version(&r, &vid[..12]).is_err());
         let err = resolve_base(&r, &vid).unwrap_err();
         assert!(!err.is::<Ambiguous>());
         let err = err.to_string();
@@ -1589,6 +1641,46 @@ mod version_id_tests {
             err.contains("corrupt or reused"),
             "a tag on the wrong object must be reported as corrupt: {err}"
         );
+    }
+
+    /// An object prefix cannot select a version while distinct commits share it.
+    #[test]
+    fn version_prefixes_refuse_ambiguous_untagged_commits() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let (_d, r) = fixtures::forked_history();
+        for message in [270, 37211] {
+            let body = format!(
+                "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                 author Fixture <fixture@example.invalid> 0 +0000\n\
+                 committer Fixture <fixture@example.invalid> 0 +0000\n\nversion {message}\n"
+            );
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(r.root())
+                .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(body.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .starts_with("6ba1b96")
+            );
+        }
+        let error = resolve_version(&r, "agit-6ba1b96").unwrap_err();
+        assert!(error.is::<Ambiguous>());
+        assert!(error.to_string().contains("2 versions"));
     }
 
     /// After a fetch the local branch can be behind the remote: a latest tip the web interface
