@@ -8,6 +8,53 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.54] - 2026-11-19
+
+### Added
+
+- Pi conversations in a folder with automatic upload enabled are saved and uploaded as they continue. `agit status`
+  and `agit on` explain when conversations are waiting for the earlier-session scan.
+- `agit project undrop <owner>/<repo>@<branch>` restores the recording links and folder exclusions saved by a branch
+  drop, then says whether uploading can resume. It refuses when another conversation has taken their place.
+- Explicit text-blocking decisions can synchronize across your computers and apply to future captures.
+- Remote Control can stop a running turn and send the next message first.
+
+### Changed
+
+- `agit status` answers whether this folder's conversations have reached the Hub, including the turns still waiting.
+  In a bound folder, `agit status --json` reports that repository.
+- Agit-started Claude Code conversations receive team memory at launch; Codex continues to receive it through
+  agit's session-start hook when that hook is available. Agit no longer writes team-memory indexes into `MEMORY.md`;
+  setup and startup maintenance remove old agit-marked sections while keeping the original file.
+  `agit new` names the source commit and file count of the memory it supplies.
+- The agit skill has a short index and command references loaded when needed. Its guidance covers requests to save,
+  upload or share the current conversation.
+- `agit push` names each conversation it published and its page. Sharing explains which records are left out,
+  where a link created inside the current conversation ends, and how to select a conversation instead of `main`.
+- Help explains that `agit login --hub <url>` remembers that Hub, ordinary push does not apply replacement rules,
+  and cherry-picked context keeps its original activity attribution.
+
+### Fixed
+
+- Uploads from repositories with large tag inventories no longer fail at the Git inspection output limit.
+  If your pushes stopped with "local Git inspection exceeds its output limit", upgrade to 0.2.54.
+- A save request is retained while a folder upload is busy. Conversations continued in an eligible local folder
+  can upload even when they began elsewhere, and publication validation reuses decoded trees.
+- Explicit Pi and Gemini imports find conversations by their full IDs, and a rewound Gemini conversation follows
+  the history Gemini resumes. Running `agit on` in an already enabled folder installs the OpenCode capture plugin.
+- Claude Code's inbox relay starts with its native session, so queued input can arrive before a first turn
+  finishes and after switching to Bypass. Remote Control checks the current writer before restarting a session.
+- Remote Control distinguishes repeated command approval targets and keeps denials within their turn. Messages
+  delivered at Claude tool boundaries report their delivery to Hubs that support those confirmations.
+- Newly launched Remote Control conversations can show their current state before history is written. Dormant
+  captured conversations keep their project and native-session identity without appearing twice in the list.
+- Personal Feishu bot launches can use the owner's permission-mode setting on Hubs that support it.
+- `agit logout` keeps the relevant local sign-in when the Hub cannot confirm revocation and reports the failure.
+  A folder's background fetch makes no Hub request while signed out.
+- Text filtering keeps labeled Git object IDs intact and handles shared conversation links consistently.
+- A command that needs a conversation names this folder's saved conversations when its target is missing.
+  Publication receipt connections work without device discovery.
+
 ## [0.2.53] - 2026-11-16
 
 ### Added
