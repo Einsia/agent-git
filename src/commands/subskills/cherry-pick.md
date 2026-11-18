@@ -28,3 +28,5 @@ agit cherry-pick alice/other@fix#3..#6 --into szh/p1@review -m "Bring in the fix
 ```
 
 This selects AgentGit events, not code Git commits. Use `merge` when the two lines require full intent reconciliation.
+
+Copied events add context without creating new `agit activity` contributions. Original contributions remain eligible in their source repository when available and selected by the query. See `agit activity` for author, time and session filters.
