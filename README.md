@@ -177,17 +177,16 @@ The release branch collects those lines into the version's section. CI's
 `changelog:released` fails any other merge request that changes the file: a line it adds
 under `## [Unreleased]` can merge into a released section without a conflict.
 
-After the release merge request passes CI, merge it into GitLab `main` while its head
-contains `main`'s tip, and merge nothing else until the tag exists. Wait for that
-pipeline's `mirror:github`, then run its manual `release:github-tag` job. CI refuses a
-release commit whose tree is not the release merge request's head, verifies the
-recorded source-to-mirror mapping and creates `agit-v<version>` on the public mirror
-commit. Release tags are immutable; a stale pipeline cannot publish after either
-`main` moves.
+After the release merge request passes CI and review, merge it cleanly into GitLab
+`main`. Wait for the actual release commit's pipeline, including `dev:windows-x64`
+packaging and `mirror:github`, then run its manual `release:github-tag` job. The tag
+job requires that commit's Linux, macOS and Windows builds and its verified
+source-to-mirror receipt. It creates `agit-v<version>` on the recorded public
+projection, even if a later commit has advanced either main branch. It never
+substitutes a newer branch tip. Release tags are immutable.
 
-`mirror:github` does not wait for the `main` pipeline's Windows build. Windows is
-checked by every merge request's `rust:test:windows`, which for the release ran on
-exactly the tree being released, and again by the GitHub Release workflow before npm.
+`mirror:github` does not wait for the Windows build; the release tag job does.
+The GitHub Release workflow builds and checks Windows again before npm publication.
 
 The mirror rewrites commit IDs, so the source SHA is not the release SHA. Do not
 push release tags directly to GitHub. The CI-created tag starts the GitHub Release
