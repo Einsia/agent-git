@@ -1122,6 +1122,7 @@ pub struct Session {
     stopped_in_turn: bool,
     background_poll_at: tokio::time::Instant,
     transcript_readable: bool,
+    initial_history: super::local_history::initial::Launch,
     tailer: Option<Tailer>,
     /// When the heartbeat next re-resolves the transcript to follow a Codex segment rollover.
     rollover_check_at: tokio::time::Instant,
@@ -1701,6 +1702,8 @@ impl Session {
         settlement: tokio::sync::watch::Receiver<SettlementState>,
         generation: u64,
     ) -> Result<Session, crate::rc::harness::proc::LaunchError> {
+        super::local_history::initial::retire(&info.session_id);
+        let new_history = spec.resume_from.is_none() && !spec.attach_only;
         let agit_session = spec.agit_session.clone();
         let cwd = spec.cwd.clone();
         // The session is the owner's own, shown live to them or to colleagues in their
@@ -1800,6 +1803,11 @@ impl Session {
         if driver.has_active_turn() {
             info.status = SessionStatus::Running;
         }
+        let initial_history = if new_history {
+            super::local_history::initial::Launch::new(&info, &cwd, generation, confinement.clone())
+        } else {
+            Default::default()
+        };
         let mut s = Session {
             agit_session,
             cwd,
@@ -1808,6 +1816,7 @@ impl Session {
             stopped_in_turn: false,
             background_poll_at: tokio::time::Instant::now(),
             transcript_readable: false,
+            initial_history,
             tailer: None,
             rollover_check_at: tokio::time::Instant::now(),
             native_records: native_records::NativeRecords::default(),
@@ -1890,6 +1899,10 @@ impl Session {
     /// **Only callable once out of the daemon's global lock** — on a full channel it waits for
     /// room, see [`Session::announce_binding_without_waiting`].
     async fn announce_binding(&mut self) {
+        self.initial_history.bind(
+            self.driver.runtime_thread_id(),
+            self.driver.transcript_path(),
+        );
         let Some(note) = self.binding_note() else {
             return;
         };
@@ -1899,6 +1912,10 @@ impl Session {
     /// Launch does not wait for note delivery: the generation may not be registered yet.
     /// The supervisor repeats the binding before landing and every settlement.
     async fn announce_binding_without_waiting(&mut self) {
+        self.initial_history.bind(
+            self.driver.runtime_thread_id(),
+            self.driver.transcript_path(),
+        );
         let Some(note) = self.binding_note() else {
             return;
         };
@@ -2186,6 +2203,19 @@ impl Session {
                 message: message.clone(),
             };
         }
+        // A concurrent refusal belongs to another command, while the original dispatch
+        // still owns the transition out of Submitting.
+        if self.pending_turn_command.is_none() {
+            match &outcome {
+                TurnStartOutcome::Accepted { still_running, .. } => {
+                    self.initial_history.accepted(*still_running);
+                }
+                TurnStartOutcome::RetryableNotAccepted { .. }
+                | TurnStartOutcome::ConcurrentNotAccepted { .. }
+                | TurnStartOutcome::ExplicitRefusal { .. } => self.initial_history.not_accepted(),
+                _ => self.initial_history.finish(),
+            }
+        }
         let ends_session = matches!(
             &outcome,
             TurnStartOutcome::Unknown { .. } | TurnStartOutcome::FatalNotAccepted { .. }
@@ -2314,6 +2344,7 @@ impl Session {
         if let Some(prompt) = &pending.attribution.native_prompt_id {
             self.started_prompt(prompt.clone());
         }
+        self.initial_history.submitting();
         let dispatch = self
             .driver
             .start_turn(
@@ -2463,6 +2494,7 @@ impl Session {
             return Ok(None);
         }
         self.denials.enter(&turn_id);
+        self.initial_history.accepted(mark_running);
         let (attribution, command_prompt) =
             if let Some((attribution, prompt)) = resolved_attribution {
                 (attribution, Some(prompt))
@@ -2535,6 +2567,9 @@ impl Session {
     }
 
     async fn set_status(&mut self, status: SessionStatus) {
+        if status == SessionStatus::Ended {
+            self.initial_history.finish();
+        }
         if self.info.status == status {
             return;
         }
@@ -2791,6 +2826,7 @@ impl Session {
                     // authority; a turn it asks for then waits behind them.
                     let cmd = match cmd {
                         Some(Command::DaemonExiting) => {
+                            self.initial_history.finish();
                             self.steer_queue.daemon_leaving = true;
                             continue;
                         }
@@ -2812,6 +2848,7 @@ impl Session {
                         }
                     match cmd {
                         None | Some(Command::Shutdown | Command::ShutdownUnattended) => {
+                            self.initial_history.finish();
                             // What waits for the next turn stays only when the daemon itself is
                             // going away with this session. A stop that arrives on its own — a
                             // person's, or one that restarts the process to change its mode —
@@ -3211,6 +3248,7 @@ impl Session {
                             return;
                         }
                         Some(HarnessEvent::Exited { code }) => {
+                            self.initial_history.finish();
                             crate::rc::diagnostics::event(
                                 "runtime.exited",
                                 serde_json::json!({
@@ -3405,6 +3443,8 @@ impl Session {
                 runtime_thread_id,
                 transcript_path,
             } => {
+                self.initial_history
+                    .bind(Some(runtime_thread_id.clone()), transcript_path.clone());
                 // The native id stays here. Viewers address the session by its
                 // logical agit id, which is what makes "continue on another
                 // machine" and "continue in another harness" invisible to them.
@@ -3533,6 +3573,7 @@ impl Session {
                 {
                     return None;
                 }
+                self.initial_history.finish();
                 if let Err(message) = self
                     .announce_turn_started_once(turn_id.clone(), None, None, false)
                     .await
@@ -4393,7 +4434,13 @@ impl Session {
     /// `Event::line` coordinate is a physical line number: a line's events do
     /// not depend on the lines before it.
     async fn drain_transcript(&mut self) {
+        if let Some(path) = self.driver.transcript_path() {
+            self.initial_history.observe(&path);
+        }
         if let Some(snapshot) = self.driver.take_native_snapshot() {
+            if snapshot.bytes.is_ok() {
+                self.initial_history.finish();
+            }
             let projection = snapshot
                 .bytes
                 .map_err(anyhow::Error::msg)

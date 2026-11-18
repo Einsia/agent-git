@@ -436,6 +436,25 @@ pub(super) fn find_reply(
 }
 
 fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
+    match capture_existing(target, cache) {
+        Err(error) if super::is_missing(&error) => match super::initial::missing(target) {
+            Some(super::initial::Missing::Empty) => Ok(Snapshot {
+                archive: None,
+                floor: 0,
+                _budget: cache.reserve(0)?,
+                parts: vec![],
+                native_items: Some(vec![]),
+                bytes: 0,
+            }),
+            Some(super::initial::Missing::Submitting) => Err(Failure::Busy.into()),
+            Some(super::initial::Missing::Initializing) => Err(Failure::Initializing.into()),
+            None => Err(error),
+        },
+        result => result,
+    }
+}
+
+fn capture_existing(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
     let Target {
         runtime,
         native,
@@ -450,14 +469,6 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
         native_items: None,
         bytes: 0,
     };
-    #[cfg(unix)]
-    if *runtime == "claude-code"
-        && crate::rc::native_claude::Client::unwritten_transcript(native, std::path::Path::new(cwd))
-            .is_some()
-    {
-        snapshot.native_items = Some(vec![]);
-        return Ok(snapshot);
-    }
     if *runtime == "opencode" {
         snapshot._budget.merge(cache.reserve(MAX_BYTES as u32)?);
         use crate::adapter::{Adapter, native_snapshot::Limits, opencode::OpenCode};
@@ -466,6 +477,7 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
             &source,
             std::path::Path::new(cwd),
         )?;
+        super::initial::seen(target);
         snapshot.bytes = bytes.len() as u64;
         let items = super::super::supervisor::native_records::NativeRecords::default()
             .project(&bytes, false)?;
@@ -489,6 +501,7 @@ fn capture(target: &Target<'_>, cache: &Cache) -> crate::Result<Snapshot> {
                 .resolve(native, Some(std::path::Path::new(cwd)))
                 .ok_or(Failure::Missing)?
         };
+        target.observe_path(&path);
         // Each carrier is pinned by its open handle: appends during and after the walk stay
         // outside the snapshot, and no transcript bytes are copied.
         snapshot.parts = if target.context.is_some() {

@@ -1,5 +1,6 @@
 //! Read-only pages addressed by native transcript byte boundaries.
 mod archive;
+pub(crate) mod initial;
 pub(crate) mod session_image;
 mod snapshot;
 mod transfer;
@@ -147,16 +148,23 @@ fn with_target<T>(
         })
         .transpose()?;
     let target = Target {
+        session,
         runtime,
         native,
         cwd,
+        source: source.as_ref(),
         context,
         entry,
     };
-    if target.context.is_some() {
-        target.source_path(native)?;
-    }
-    let result = read(&target)?;
+    let result = (|| {
+        if target.context.is_some()
+            && let Err(error) = target.source_path(native)
+            && !(is_missing(&error) && initial::missing(&target).is_some())
+        {
+            return Err(error);
+        }
+        read(&target)
+    })();
     if let Some(context) = &target.context {
         context.validate()?;
     }
@@ -164,13 +172,15 @@ fn with_target<T>(
         let roots = super::mirror::Mirror::load().roots(super::endpoint::WORKSPACE);
         super::policy::require_within(std::path::Path::new(cwd), &roots)?;
     }
-    Ok(result)
+    result
 }
 
 struct Target<'a> {
+    session: &'a str,
     runtime: &'a str,
     native: &'a str,
     cwd: &'a str,
+    source: Option<&'a crate::protocol::NativeSourceRef>,
     context: Option<super::runtime_context::RuntimeContext>,
     entry: Option<&'a super::roster::Entry>,
 }
@@ -185,11 +195,18 @@ impl Target<'_> {
         let context = self.context.as_ref().context(Failure::Missing)?;
         let roots = self.roots();
         let thread = context.locate(native, &roots)?;
+        self.observe_path(&thread.transcript);
         if native == self.native {
             ensure!(Some(&thread.cwd) == roots.first(), Failure::Changed);
         }
         super::local_goal::validate_history_header(&thread.transcript, native, &thread.cwd)?;
         Ok(thread.transcript)
+    }
+
+    fn observe_path(&self, path: &std::path::Path) {
+        if !matches!(path.try_exists(), Ok(false)) {
+            initial::seen(self);
+        }
     }
 
     fn parent_path(&self, native: &str) -> crate::Result<std::path::PathBuf> {
@@ -213,6 +230,8 @@ pub(crate) enum Failure {
     Unsupported,
     #[error("History reader is busy; retry shortly")]
     Busy,
+    #[error("This conversation is starting to write its history; retry when it is ready")]
+    Initializing,
     #[error("History snapshot expired; reload history")]
     Expired,
     #[error("Invalid history cursor; reload history")]
@@ -241,6 +260,10 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
         Some(Failure::Incomplete) => ("incomplete_record", true, false),
         Some(Failure::Unsupported) => ("unsupported", false, false),
         Some(Failure::Busy) => ("busy", true, false),
+        Some(Failure::Initializing) => {
+            reason = Some("history_initializing");
+            ("busy", true, false)
+        }
         Some(Failure::Expired | Failure::InvalidCursor) => ("cursor_expired", false, true),
         Some(Failure::Limit) => ("resource_limit", false, false),
         // The snapshot no longer holds the history it pinned; only a fresh read helps.
@@ -292,9 +315,23 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     let mut data = json!({"kind":kind,"retryable":retryable,"restart":restart});
     if let Some(reason) = reason {
         data["reason"] = json!(reason);
+        if reason == "history_initializing" {
+            data["retry_after_ms"] = json!(1000);
+        }
     }
     result.data = Some(data);
     result
+}
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    matches!(error.downcast_ref::<Failure>(), Some(Failure::Missing))
+        || matches!(
+            error.downcast_ref::<crate::adapter::native_snapshot::Unavailable>(),
+            Some(crate::adapter::native_snapshot::Unavailable::NotFound)
+        )
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 pub(crate) fn validate_records(
@@ -894,7 +931,78 @@ mod tests {
                 assert!(page.to_string().contains("alpha-child"));
             }
             std::fs::rename(&moved, &project).unwrap();
+            // A live launch may precede its runtime's catalog entry, but cannot outlive source
+            // or folder authorization. Matching native IDs in another source share no proof.
+            let starting = uuid::Uuid::new_v4().to_string();
+            let mut launches = Vec::new();
+            let mut confinements = Vec::new();
+            for (index, source) in sources.iter().chain([&sources[1]]).enumerate() {
+                let logical = format!("starting-{index}");
+                let workspace = format!("launch-workspace-{index}");
+                roster.record(&logical, serde_json::from_value(json!({
+                    "native_source":{"source_id":source.source_id,"generation":source.generation},
+                    "runtime":"codex","thread_id":starting,"cwd":project,"workspace_id":workspace
+                })).unwrap()).unwrap();
+                let params = json!({"session_id":logical});
+                assert!(
+                    read_with_roster(params.clone(), &roster, &mut Timings::default()).is_err()
+                );
+                let info = serde_json::from_value(json!({
+                    "session_id":logical,"workspace_id":workspace,"runtime":"codex",
+                    "native_source":{"source_id":source.source_id,"generation":source.generation},
+                    "status":"idle","last_seq":0,"created_at":"now","updated_at":"now"
+                }))
+                .unwrap();
+                let (tx, rx) = tokio::sync::watch::channel(crate::rc::Confinement {
+                    roots: roots.clone(),
+                    ..Default::default()
+                });
+                let launch = initial::Launch::new(&info, &project, 1, rx);
+                launch.bind(Some(starting.clone()), None);
+                assert_eq!(
+                    read_with_roster(params, &roster, &mut Timings::default()).unwrap()["items"],
+                    json!([])
+                );
+                launches.push(launch);
+                confinements.push(tx);
+            }
             registry.remove(&sources[0].source_id).unwrap();
+            assert!(
+                read_with_roster(
+                    json!({"session_id":"starting-0"}),
+                    &roster,
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
+            initial::confine("launch-workspace-1", &Default::default());
+            initial::confine("launch-workspace-1", &roots);
+            assert!(
+                read_with_roster(
+                    json!({"session_id":"starting-1"}),
+                    &roster,
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
+            std::fs::rename(&project, &moved).unwrap();
+            assert!(
+                read_with_roster(
+                    json!({"session_id":"starting-2"}),
+                    &roster,
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
+            std::fs::rename(&moved, &project).unwrap();
+            assert!(
+                read_with_roster(
+                    json!({"session_id":"starting-2"}),
+                    &roster,
+                    &mut Timings::default()
+                )
+                .is_err()
+            );
             assert!(
                 read_with_roster(
                     json!({"session_id":sources[0].session_ref(native)}),
@@ -944,6 +1052,14 @@ mod tests {
         assert_eq!(
             flags(Failure::Refreshing.into()),
             busy("catalog_refreshing")
+        );
+        assert_eq!(
+            flags(Failure::Initializing.into()),
+            busy("history_initializing")
+        );
+        assert_eq!(
+            rpc_error(Failure::Initializing.into()).data.unwrap()["retry_after_ms"],
+            1000
         );
         assert_eq!(
             flags(crate::adapter::codex_rollout::Restoring.into()),
@@ -1084,13 +1200,15 @@ mod tests {
         }
     }
 
+    /// Only a live new launch can distinguish an unwritten transcript from lost history.
+    /// Once native history has been seen, deleting it cannot restore the empty state.
     #[test]
-    fn completed_launch_reports_history_removed_after_restart() {
+    fn new_launch_history_stays_missing_after_it_was_seen_or_restarted() {
         const CHILD: &str = "AGIT_TEST_REMOVED_NATIVE_HISTORY";
         let Some(root) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
             let directory = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "rc::local_history::tests::completed_launch_reports_history_removed_after_restart", "--nocapture"])
+                .args(["--exact", "rc::local_history::tests::new_launch_history_stays_missing_after_it_was_seen_or_restarted", "--nocapture"])
                 .env(CHILD, directory.path())
                 .env("AGIT_HOME", directory.path().join("agit"))
                 .env("CLAUDE_CONFIG_DIR", directory.path().join("claude"))
@@ -1105,6 +1223,45 @@ mod tests {
             .join(crate::adapter::claude_code::slug_for(&root));
         std::fs::create_dir_all(&project).unwrap();
         let path = project.join(format!("{native}.jsonl"));
+        let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"claude-code","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});
+        let roster: super::super::roster::Roster = serde_json::from_value(json!({
+            "sessions":{"logical":{"runtime":"claude-code","thread_id":native,"cwd":root,"workspace_id":"local-owner"}},
+            "starts":{"launch":{"spec":{"workspace_id":"local-owner","project_id":"project","runtime":"claude-code","cwd":root,"permission_mode":"default"},"state":{"state":"completed","result":{"session":session}}}}
+        })).unwrap();
+        let params = json!({"session_id":"logical"});
+        let missing = || {
+            rpc_error(
+                read_with_roster(params.clone(), &roster, &mut Timings::default()).unwrap_err(),
+            )
+            .data
+            .unwrap()
+        };
+        assert_eq!(missing()["kind"], "source_missing");
+        let (confinement_tx, confinement) = tokio::sync::watch::channel(crate::rc::Confinement {
+            roots: crate::rc::policy::CanonicalRoots::from_untrusted([root.clone()]),
+            ..Default::default()
+        });
+        let launch = initial::Launch::new(
+            &serde_json::from_value(session).unwrap(),
+            &root,
+            1,
+            confinement,
+        );
+        launch.bind(Some(native), Some(path.clone()));
+        let empty = || {
+            let history = read_with_roster(params.clone(), &roster, &mut Timings::default())
+                .expect("the live new launch has accepted no input");
+            assert_eq!(history["items"], json!([]));
+            assert_eq!(history["has_more"], false);
+        };
+        empty();
+        launch.submitting();
+        assert_eq!(missing()["kind"], "busy");
+        launch.not_accepted();
+        empty();
+        launch.submitting();
+        launch.accepted(true);
+        assert_eq!(missing()["reason"], "history_initializing");
         std::fs::write(
             &path,
             format!(
@@ -1113,22 +1270,21 @@ mod tests {
             ),
         )
         .unwrap();
-        let session = json!({"session_id":"logical","workspace_id":"local-owner","runtime":"claude-code","status":"idle","last_seq":0,"created_at":"now","updated_at":"now"});
-        let roster: super::super::roster::Roster = serde_json::from_value(json!({
-            "sessions":{"logical":{"runtime":"claude-code","thread_id":native,"cwd":root,"workspace_id":"local-owner"}},
-            "starts":{"launch":{"spec":{"workspace_id":"local-owner","project_id":"project","runtime":"claude-code","cwd":root,"permission_mode":"default"},"state":{"state":"completed","result":{"session":session}}}}
-        })).unwrap();
-        let params = json!({"session_id":"logical"});
         let history = read_with_roster(params.clone(), &roster, &mut Timings::default()).unwrap();
         assert!(history["items"].as_array().unwrap().iter().any(|item| {
             item["event"]["text"]
                 .as_str()
                 .is_some_and(|text| text.starts_with("Existing native history "))
         }));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(missing()["kind"], "source_missing");
+        launch.accepted(true);
+        assert_eq!(missing()["kind"], "source_missing");
         roster.save().unwrap();
+        drop(launch);
+        drop(confinement_tx);
         drop(roster);
         let restarted = super::super::roster::Roster::try_load().unwrap();
-        std::fs::remove_file(path).unwrap();
         assert_eq!(
             read_with_roster(params, &restarted, &mut Timings::default())
                 .unwrap_err()
