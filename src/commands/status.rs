@@ -312,6 +312,16 @@ pub fn run(args: Args) -> CmdResult {
     }
     print_upload_waits(&scope);
     print_save_waits(&scope);
+    match capture_recovery_status(&cwd, &scope) {
+        Ok(state) if state["state"] == "recovery_required" => ui::warning(
+            "this folder has queued saves without a worker; run `agit project recover .` here",
+        ),
+        Ok(state) if state["state"] == "unavailable" => {
+            ui::warning("this folder's queued save state could not be read");
+        }
+        Err(_) => ui::warning("this folder's queued save state could not be read"),
+        _ => {}
+    }
     match save_request_status(&cwd, &scope) {
         Ok(report) => {
             if report.omitted > 0 {
@@ -876,6 +886,19 @@ fn save_request_status(
     )
 }
 
+fn capture_recovery_status(
+    cwd: &std::path::Path,
+    scope: &Scope,
+) -> anyhow::Result<serde_json::Value> {
+    super::project::capture_recovery_here(
+        cwd,
+        match scope {
+            Scope::Machine => None,
+            Scope::Repository(repository) => Some(repository),
+        },
+    )
+}
+
 /// The local checkouts `scope` covers.
 fn in_scope_of(
     agents: Vec<(String, String, std::path::PathBuf)>,
@@ -1238,6 +1261,8 @@ fn structured(args: &Args, scope: &Scope, narrowed: bool) -> CmdResult {
         })),
         "upload_waits": upload_waits_json(scope),
         "save_waits": save_waits_json(scope),
+        "capture_recovery": capture_recovery_status(&cwd, scope)
+            .unwrap_or_else(|_| serde_json::json!({"state": "unavailable"})),
         "save_requests": match save_request_status(&cwd, scope) {
             Ok(report) => serde_json::json!({"items": report.items, "omitted": report.omitted, "error": null}),
             Err(_) => serde_json::json!({"items": null, "omitted": null, "error": "accepted save requests could not be read"}),

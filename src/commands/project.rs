@@ -61,6 +61,8 @@ pub enum Action {
     },
     /// Inspect the local project policy and the last sync result, without network access.
     Status { path: PathBuf },
+    /// Process this folder's queued saves in the foreground under their existing rules.
+    Recover { path: PathBuf },
     /// List every enrolled or bound folder with its state and recent conversations, offline.
     List,
     /// Stop project hook capture; retain local and remote session history.
@@ -2048,7 +2050,7 @@ fn sync_one_for_request(
     let (branch, opens) = publication(project, candidate)?;
     let target = format!("{}@{branch}", project.repository);
     import_capture(project, candidate, &branch, opens)?;
-    landed();
+    landed()?;
     // The session is claimed, but no turn of it is complete yet; the Stop that completes one
     // uploads it.
     if !has_turns(&checkout(project)?, &branch) {
@@ -2115,7 +2117,18 @@ fn sync_one_for_request(
             },
         )
         .map_err(anyhow::Error::new)
-        .and_then(|pushed| pushed)
+        .and_then(|pushed| {
+            if pushed.is_err()
+                && let Some(capture) = CAPTURING
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                && matches!(capture.progress, CaptureProgress::Acknowledged)
+            {
+                capture.progress = CaptureProgress::PublicationFailed;
+            }
+            pushed
+        })
     } else {
         // The person asked for this save: their push, which tells them how it went. Nothing here
         // answers its questions for them, creating the repository or making it public among them:
@@ -2380,6 +2393,7 @@ pub fn run(args: Args) -> CmdResult {
                 save_requests::report(save_requests::status(&root)?, Some(&project.repository))?;
             status["save_requests"] = serde_json::to_value(requests.items)?;
             status["save_requests_omitted"] = serde_json::to_value(requests.omitted)?;
+            status["capture_recovery"] = capture_recovery(&root)?;
             println!("{}", serde_json::to_string(&status)?);
             // Codex captures this directory only through hooks it has approved.
             if project.enabled
@@ -2389,6 +2403,22 @@ pub fn run(args: Args) -> CmdResult {
             {
                 ui::warning(&problem);
             }
+            Ok(ExitCode::Ok)
+        }
+        Action::Recover { path } => {
+            let directory = root(&path)?;
+            let root = governing(&directory)?
+                .map(|(project, _)| project.root)
+                .unwrap_or(directory);
+            if !drain(&root)? {
+                ui::info(format_args!(
+                    "this folder's saving worker already owns its queued work"
+                ));
+                return Ok(ExitCode::Ok);
+            }
+            ui::info(format_args!(
+                "queued saves were processed; `agit status` shows their state"
+            ));
             Ok(ExitCode::Ok)
         }
         Action::Unbind { path } => {
@@ -3420,10 +3450,16 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
     // The probe lock is released before spawning, so the new worker can take it.
     let idle = capture_worker(&project.root)?.is_some();
     if idle && spawn_capture(&project.root).is_err() {
-        drain(&project.root)?;
+        return Err(CaptureRecoveryRequired.into());
     }
     Ok(true)
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "automatic saving is waiting because its worker could not start; run `agit project recover .` in this folder"
+)]
+pub(crate) struct CaptureRecoveryRequired;
 
 /// A captured header remains local evidence after its native file is removed. Ordinary legacy
 /// claims without a header keep their existing behavior; a known delegate still needs its parent.
@@ -3730,13 +3766,18 @@ fn enqueue(root: &Path, candidate: &Candidate) -> Result<()> {
     config::create_state_dir(&pending)?;
     let mut file = tempfile::NamedTempFile::new_in(&pending)?;
     file.write_all(&serde_json::to_vec(candidate)?)?;
+    file.as_file().sync_all()?;
     file.persist(pending.join(hash(&key(&candidate.runtime, &candidate.session_id))))
         .map_err(|e| e.error)?;
-    Ok(())
+    sync_capture_queue(root)
 }
 
 /// The queued markers; a temporary file of an interrupted enqueue is not one.
 fn markers(root: &Path) -> Result<Vec<PathBuf>> {
+    capture_markers(root, false)
+}
+
+fn capture_markers(root: &Path, running: bool) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(pending_dir(root)?) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -3745,34 +3786,72 @@ fn markers(root: &Path) -> Result<Vec<PathBuf>> {
     let mut markers = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.len() == 24 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-        {
+        let name = if running {
+            path.extension()
+                .filter(|extension| *extension == "running")
+                .and_then(|_| path.file_stem())
+        } else {
+            path.file_name()
+        };
+        if name.and_then(|name| name.to_str()).is_some_and(|name| {
+            name.len() == 24 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
             markers.push(path);
         }
     }
     Ok(markers)
 }
 
-/// Removes one marker before its capture, so a Stop during that capture queues the session again.
-/// The session is marked as being captured before its marker goes, so it shows as still to save
-/// at every moment until its capture ends.
-fn take_pending(root: &Path) -> Result<Option<(Candidate, Capturing)>> {
-    for path in markers(root)? {
-        let bytes = fs::read(&path)?;
-        let Ok(candidate) = serde_json::from_slice::<Candidate>(&bytes) else {
-            fs::remove_file(&path)?;
-            continue;
-        };
-        let capturing = Capturing::mark(root, &candidate);
-        fs::remove_file(&path)?;
-        return Ok(Some((candidate, capturing)));
+fn sync_capture_queue(root: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pending = pending_dir(root)?;
+        fs::File::open(&pending)?.sync_all()?;
+        if let Some(parent) = pending.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
     }
-    Ok(None)
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("a queued capture could not be claimed or decoded; its evidence is retained for recovery")]
+struct CaptureClaimFailure {
+    claimed: PathBuf,
+}
+
+/// Ownership retains the claimed marker until local settlement or a policy decision completes.
+/// A Stop arriving during capture writes a separate pending marker; an interrupted owner leaves
+/// its claimed marker for the next owner without replacing that newer work.
+fn take_pending(
+    root: &Path,
+    blocked: &BTreeSet<PathBuf>,
+) -> Result<Option<(Candidate, Capturing)>> {
+    let (path, pending) = if let Some(path) = capture_markers(root, true)?
+        .into_iter()
+        .find(|path| !blocked.contains(path))
+    {
+        (path, None)
+    } else if let Some(path) = markers(root)?
+        .into_iter()
+        .find(|path| !blocked.contains(&path.with_extension("running")))
+    {
+        (path.with_extension("running"), Some(path))
+    } else {
+        return Ok(None);
+    };
+    let claim = || -> Result<Option<(Candidate, Capturing)>> {
+        if let Some(pending) = pending {
+            fs::rename(pending, &path)?;
+            sync_capture_queue(root)?;
+        }
+        let candidate = serde_json::from_slice::<Candidate>(&fs::read(&path)?)?;
+        let capturing = Capturing::mark(root, &candidate, path.clone());
+        Ok(Some((candidate, capturing)))
+    };
+    claim().map_err(|_| CaptureClaimFailure { claimed: path }.into())
 }
 
 /// The session a project's worker is capturing, and that worker's process id, so a record left by
@@ -3784,20 +3863,65 @@ struct CapturingRecord {
 }
 
 /// Marks a session as being captured until its turn lands on its branch here, or until dropped.
-struct Capturing(Option<PathBuf>);
+struct Capturing {
+    record: Option<PathBuf>,
+    root: PathBuf,
+    claimed: PathBuf,
+    progress: CaptureProgress,
+}
 
-/// The mark of the capture this process runs now. It is released as soon as the capture's turn
-/// is on its branch, before the upload: the upload may take long, and the end of a session that
-/// waited for it would call a saved turn still being saved.
+#[derive(Clone, Copy)]
+enum CaptureProgress {
+    Pending,
+    Acknowledged,
+    AcknowledgementFailed(CaptureAcknowledgementFailure),
+    PublicationFailed,
+    RecordingFailed,
+}
+
+/// The attempt retains its completion phase after the pending marker and process notice go.
+/// An empty notice cannot establish whether local acknowledgement or publication failed.
 static CAPTURING: std::sync::Mutex<Option<Capturing>> = std::sync::Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+enum CaptureAcknowledgementFailure {
+    #[error("local capture completed, but its queue acknowledgement could not be persisted")]
+    Saved,
+    #[error("capture policy was applied, but its queue acknowledgement could not be persisted")]
+    PolicyApplied,
+}
+
 /// Releases the mark of this process's running capture, its turn being on its branch now.
-fn landed() {
-    let mark = CAPTURING
+fn landed() -> Result<()> {
+    acknowledge_capture(CaptureAcknowledgementFailure::Saved)
+}
+
+fn acknowledge_capture(failure: CaptureAcknowledgementFailure) -> Result<()> {
+    let mut attempt = CAPTURING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(mark) = attempt.as_mut() else {
+        return Ok(());
+    };
+    match mark.progress {
+        CaptureProgress::Pending => {}
+        CaptureProgress::AcknowledgementFailed(failure) => return Err(failure.into()),
+        _ => return Ok(()),
+    }
+    mark.progress = CaptureProgress::AcknowledgementFailed(failure);
+    fs::remove_file(&mark.claimed).map_err(|_| failure)?;
+    sync_capture_queue(&mark.root).map_err(|_| failure)?;
+    mark.progress = CaptureProgress::Acknowledged;
+    mark.clear_notice();
+    Ok(())
+}
+
+/// Releasing process ownership does not acknowledge unfinished local work.
+fn release_capture() -> Option<Capturing> {
+    CAPTURING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    drop(mark);
+        .take()
 }
 
 impl Capturing {
@@ -3805,7 +3929,7 @@ impl Capturing {
         Ok(state_path(root)?.with_extension("capturing"))
     }
 
-    fn mark(root: &Path, candidate: &Candidate) -> Self {
+    fn mark(root: &Path, candidate: &Candidate, claimed: PathBuf) -> Self {
         let record = CapturingRecord {
             session: hash(&key(&candidate.runtime, &candidate.session_id)),
             pid: std::process::id(),
@@ -3817,15 +3941,24 @@ impl Capturing {
                     .is_ok_and(|file| file.persist(path).is_ok())
             })
         });
-        Self(written)
+        Self {
+            record: written,
+            root: root.to_owned(),
+            claimed,
+            progress: CaptureProgress::Pending,
+        }
+    }
+
+    fn clear_notice(&mut self) {
+        if let Some(path) = self.record.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
 impl Drop for Capturing {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
-        }
+        self.clear_notice();
     }
 }
 
@@ -3839,7 +3972,9 @@ pub(crate) fn capture_pending(runtime: &str, session: &str, cwd: &Path) -> bool 
     };
     let name = hash(&key(runtime, session));
     if save_requests::contains(&project.root, runtime, session).unwrap_or(false)
-        || pending_dir(&project.root).is_ok_and(|pending| pending.join(&name).exists())
+        || pending_dir(&project.root).is_ok_and(|pending| {
+            pending.join(&name).exists() || pending.join(&name).with_extension("running").exists()
+        })
     {
         return true;
     }
@@ -3867,20 +4002,55 @@ fn capture_worker(root: &Path) -> Result<Option<fs::File>> {
     }
 }
 
+fn capture_recovery(root: &Path) -> Result<serde_json::Value> {
+    if markers(root)?.is_empty() && capture_markers(root, true)?.is_empty() {
+        return Ok(serde_json::json!({"state": "idle"}));
+    }
+    let state = match fs::File::open(state_path(root)?.with_extension("capture")) {
+        Ok(file) => match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => "recovery_required",
+            Err(error) if crate::infra::local_state::is_contended(&error) => "owned",
+            Err(_) => "unavailable",
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "recovery_required",
+        Err(_) => "unavailable",
+    };
+    Ok(serde_json::json!({
+        "state": state,
+        "command": {"program": "agit", "args": ["project", "recover", root]},
+    }))
+}
+
+pub(crate) fn capture_recovery_here(
+    cwd: &Path,
+    repository: Option<&str>,
+) -> Result<serde_json::Value> {
+    match governing(cwd)? {
+        Some((project, _)) if repository.is_none_or(|slug| slug == project.repository) => {
+            capture_recovery(&project.root)
+        }
+        _ => Ok(serde_json::Value::Null),
+    }
+}
+
 /// How long a worker keeps waiting for its folder's retries, from its first wait on.
 const RETRY_WAIT: i64 = 2 * 60 * 60;
 
 /// Publishes queued sessions one at a time. After letting the worker lock go it looks once more,
 /// so a marker written while it was finishing is not left for the next turn.
-fn drain(root: &Path) -> Result<()> {
-    drain_then(root, false)
+fn drain(root: &Path) -> Result<bool> {
+    let Some(worker) = capture_worker(root)? else {
+        return Ok(false);
+    };
+    drain_owned(root, false, worker)?;
+    Ok(true)
 }
 
 /// [`drain`] in the folder's detached worker, which then runs the folder's uploads that are due to
 /// be tried again. While a retry is still to come it waits for it without the lock, so a Stop
 /// meanwhile starts a worker of its own, and runs it once it takes the lock again; a worker that
-/// finds the lock taken leaves the due retries to its holder. A drain in the hook's own process
-/// never waits, so the turn ends at once.
+/// finds the lock taken leaves the due retries to its holder. Explicit recovery processes
+/// accepted work without waiting for future retry times.
 fn drain_and_retry(root: &Path) -> Result<()> {
     drain_then(root, true)
 }
@@ -3893,7 +4063,10 @@ fn drain_then(root: &Path, retrying: bool) -> Result<()> {
 }
 
 fn queued_work(root: &Path) -> Result<bool> {
-    Ok(save_requests::pending(root)? || !markers(root)?.is_empty() || catch_up_requested(root)?)
+    Ok(save_requests::pending(root)?
+        || !markers(root)?.is_empty()
+        || !capture_markers(root, true)?.is_empty()
+        || catch_up_requested(root)?)
 }
 
 /// Every owner releases and then checks arrivals. Explicit producers also start a waiting
@@ -3902,6 +4075,53 @@ fn finish_capture(root: &Path, worker: fs::File) -> Result<bool> {
     fs2::FileExt::unlock(&worker)?;
     drop(worker);
     queued_work(root)
+}
+
+fn exclude_capture(
+    claimed: PathBuf,
+    error: anyhow::Error,
+    blocked: &mut BTreeSet<PathBuf>,
+    first_failure: &mut Option<anyhow::Error>,
+) {
+    blocked.insert(claimed);
+    let message = if let Some(failure) = error.downcast_ref::<CaptureAcknowledgementFailure>() {
+        failure.to_string()
+    } else if error.is::<CaptureClaimFailure>() {
+        "a queued capture could not be claimed or decoded; its evidence is retained for recovery"
+            .into()
+    } else {
+        "a queued capture failed; inspect its recorded outcome before recovery".into()
+    };
+    ui::warning(&message);
+    first_failure.get_or_insert(error);
+}
+
+/// Only the publication boundary can classify an error as an upload failure. Queue completion
+/// and outcome-recording failures remain errors even after local capture has completed.
+fn finish_capture_attempt(
+    result: Result<bool>,
+    claimed: PathBuf,
+    blocked: &mut BTreeSet<PathBuf>,
+    first_failure: &mut Option<anyhow::Error>,
+) {
+    let result =
+        result.and_then(|_| acknowledge_capture(CaptureAcknowledgementFailure::PolicyApplied));
+    let capture = release_capture();
+    if let Err(mut error) = result {
+        match capture.as_ref().map(|capture| capture.progress) {
+            Some(CaptureProgress::AcknowledgementFailed(failure)) => {
+                if !error.is::<CaptureAcknowledgementFailure>() {
+                    error = error.context(failure);
+                }
+            }
+            Some(CaptureProgress::PublicationFailed) => {
+                // The publication attempt uses its existing outcome and retry path.
+                return;
+            }
+            _ => {}
+        }
+        exclude_capture(claimed, error, blocked, first_failure);
+    }
 }
 
 #[cfg(test)]
@@ -3916,6 +4136,8 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
     }
     let mut waiting_since = None;
     let mut recovered = false;
+    let mut blocked = BTreeSet::new();
+    let mut capture_failure = None;
     loop {
         let pass = (|| -> Result<Option<i64>> {
             let requested_retry = save_requests::drain(root)?;
@@ -3932,14 +4154,34 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
                     }
                 }
             }
-            while let Some((candidate, capturing)) = take_pending(root)? {
+            loop {
+                let next = match take_pending(root, &blocked) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        if let Some(failure) = error.downcast_ref::<CaptureClaimFailure>() {
+                            exclude_capture(
+                                failure.claimed.clone(),
+                                error,
+                                &mut blocked,
+                                &mut capture_failure,
+                            );
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                };
+                let Some((candidate, capturing)) = next else {
+                    break;
+                };
+                let claimed = capturing.claimed.clone();
                 *CAPTURING
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
-                if let Some(project) = read(root)? {
-                    let _ = capture_candidate(project, candidate, false, true);
-                }
-                landed();
+                let result = match read(root)? {
+                    Some(project) => capture_candidate(project, candidate, false, true),
+                    None => Ok(false),
+                };
+                finish_capture_attempt(result, claimed, &mut blocked, &mut capture_failure);
             }
             Ok(if retrying {
                 requested_retry
@@ -3950,8 +4192,11 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
                 None
             })
         })();
-        landed();
+        drop(release_capture());
         let more = finish_capture(root, worker)?;
+        if let Some(error) = capture_failure.take() {
+            return Err(error);
+        }
         let next = match pass {
             Ok(next) => next,
             Err(error) => {
@@ -4254,7 +4499,17 @@ fn capture_candidate_locked(
         "reason": reason,
         "head": result.as_ref().ok().and_then(|synced| synced.head.as_deref()),
     }));
-    save(&project)?;
+    if let Err(error) = save(&project) {
+        if let Some(capture) = CAPTURING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            && !matches!(capture.progress, CaptureProgress::AcknowledgementFailed(_))
+        {
+            capture.progress = CaptureProgress::RecordingFailed;
+        }
+        return Err(error);
+    }
     *once = result?.once;
     Ok(true)
 }
@@ -10350,7 +10605,8 @@ mod tests {
 
     /// Stops that arrive while a worker holds the project coalesce into one marker per session,
     /// and another drainer leaves them to that worker. A worker per Stop would pile up waiting
-    /// processes that each import, inspect and upload the same session again.
+    /// processes that each import, inspect and upload the same session again. An unreadable
+    /// claim retains its evidence without preventing independent candidates from being handled.
     #[test]
     fn busy_capture_worker_coalesces_stops_into_one_worker() {
         if !isolated("busy_capture_worker_coalesces_stops_into_one_worker") {
@@ -10381,9 +10637,23 @@ mod tests {
         assert!(capture_worker(&project.root).unwrap().is_none());
         drain(&project.root).unwrap();
         assert_eq!(markers(&project.root).unwrap().len(), 2);
+        let corrupt = pending_dir(&project.root)
+            .unwrap()
+            .join(hash("invalid-queued-capture"))
+            .with_extension("running");
+        let evidence = b"\"synthetic malformed capture\"";
+        fs::write(&corrupt, evidence).unwrap();
         drop(worker);
-        drain(&project.root).unwrap();
+        let error = drain(&project.root).unwrap_err();
+        assert!(error.is::<CaptureClaimFailure>());
+        assert!(!format!("{error:#}").contains("synthetic malformed capture"));
+        assert_eq!(fs::read(corrupt).unwrap(), evidence.to_vec());
         assert!(markers(&project.root).unwrap().is_empty());
+        assert_eq!(capture_markers(&project.root, true).unwrap().len(), 3);
+        assert_eq!(
+            capture_recovery(&project.root).unwrap()["state"],
+            "recovery_required"
+        );
         assert!(read(&project.root).unwrap().unwrap().last_result.is_some());
     }
 
@@ -10525,7 +10795,9 @@ mod tests {
     /// it: queued, then marked while captured, with no moment between the two where it shows as
     /// saved. The end of a launched session reads this to say its last turn is still being saved;
     /// a check of the branch lock alone would miss a turn waiting behind another session's upload.
-    /// A mark left by a worker that ended mid-capture does not count.
+    /// Interrupted ownership retains its work, and completing it cannot erase a newer Stop.
+    /// A process notice without a durable pending or claimed marker does not count.
+    /// Failed acknowledgement is reported and excluded even when local capture already ended.
     #[test]
     fn a_turn_handed_to_the_project_worker_is_pending_until_captured() {
         if !isolated("a_turn_handed_to_the_project_worker_is_pending_until_captured") {
@@ -10543,18 +10815,111 @@ mod tests {
         assert!(!pending());
         enqueue(&folder.root, &candidate).unwrap();
         assert!(pending(), "a queued turn is pending");
-        let (taken, capturing) = take_pending(&folder.root).unwrap().unwrap();
+        let (taken, capturing) = take_pending(&folder.root, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
         assert_eq!(taken.session_id, candidate.session_id);
         assert!(markers(&folder.root).unwrap().is_empty());
         assert!(pending(), "a turn being captured is pending");
+        drop(capturing);
+        assert!(pending(), "interrupted capture retains its work");
+        let (_, capturing) = take_pending(&folder.root, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        enqueue(&folder.root, &candidate).unwrap();
         *CAPTURING
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
-        landed();
+        landed().unwrap();
+        assert!(pending(), "a newer Stop survives the earlier capture");
+        let (_, capturing) = take_pending(&folder.root, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        *CAPTURING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+        landed().unwrap();
         assert!(
             !pending(),
             "a turn on its branch is not, whatever its upload still does"
         );
+        drop(release_capture());
+
+        enqueue(&folder.root, &candidate).unwrap();
+        let (_, capturing) = take_pending(&folder.root, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        let claimed = capturing.claimed.clone();
+        let evidence = fs::read(&claimed).unwrap();
+        fs::remove_file(&claimed).unwrap();
+        fs::create_dir(&claimed).unwrap();
+        *CAPTURING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+        assert!(landed().unwrap_err().is::<CaptureAcknowledgementFailure>());
+        let mut blocked = BTreeSet::new();
+        let mut failure = None;
+        finish_capture_attempt(
+            Err(anyhow::anyhow!("synthetic outcome-recording failure")),
+            claimed.clone(),
+            &mut blocked,
+            &mut failure,
+        );
+        assert!(failure.unwrap().is::<CaptureAcknowledgementFailure>());
+        assert!(
+            claimed.is_dir(),
+            "failed acknowledgement retains its evidence"
+        );
+        assert!(take_pending(&folder.root, &blocked).unwrap().is_none());
+        fs::remove_dir(&claimed).unwrap();
+        fs::write(&claimed, evidence).unwrap();
+        let (_, capturing) = take_pending(&folder.root, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        *CAPTURING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+        landed().unwrap();
+        drop(release_capture());
+
+        #[cfg(unix)]
+        {
+            enqueue(&folder.root, &candidate).unwrap();
+            let (_, mut capturing) = take_pending(&folder.root, &BTreeSet::new())
+                .unwrap()
+                .unwrap();
+            let claimed = capturing.claimed.clone();
+            capturing.root = folder.root.join("unavailable-queue-directory");
+            *CAPTURING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+            let acknowledgement = landed();
+            assert!(acknowledgement.is_err());
+            assert!(
+                !claimed.exists(),
+                "directory synchronization follows removal"
+            );
+            enqueue(&folder.root, &candidate).unwrap();
+            let mut blocked = BTreeSet::new();
+            let mut failure = None;
+            finish_capture_attempt(
+                acknowledgement.map(|()| true),
+                claimed,
+                &mut blocked,
+                &mut failure,
+            );
+            assert!(failure.unwrap().is::<CaptureAcknowledgementFailure>());
+            assert!(take_pending(&folder.root, &blocked).unwrap().is_none());
+            assert!(pending(), "a newer Stop survives uncertain acknowledgement");
+            let (_, capturing) = take_pending(&folder.root, &BTreeSet::new())
+                .unwrap()
+                .unwrap();
+            *CAPTURING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capturing);
+            landed().unwrap();
+            drop(release_capture());
+        }
 
         let mut ended = std::process::Command::new("true").spawn().unwrap();
         let pid = ended.id();
