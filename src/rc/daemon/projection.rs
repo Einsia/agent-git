@@ -810,6 +810,7 @@ impl Daemon {
             roots: self.mirror.roots(workspace_id),
             operator_heads: self.grants.for_workspace(workspace_id),
         };
+        crate::rc::local_history::initial::confine(workspace_id, &now.roots);
         match self.confinement.get(workspace_id) {
             Some(tx) => {
                 // **`send_replace`, not `send`.**
@@ -908,10 +909,12 @@ impl Daemon {
         for (ws, tx) in &self.confinement {
             // As above: with no receiver `send` writes no value, and this is
             // exactly where the value must be updated.
-            tx.send_replace(crate::rc::Confinement {
+            let now = crate::rc::Confinement {
                 roots: self.mirror.roots(ws),
                 operator_heads: self.grants.for_workspace(ws),
-            });
+            };
+            crate::rc::local_history::initial::confine(ws, &now.roots);
+            tx.send_replace(now);
         }
     }
 }

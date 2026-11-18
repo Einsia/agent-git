@@ -1537,13 +1537,19 @@ mod tests {
                     .unwrap();
                     endpoint.hub.poll(snapshot).unwrap();
                     assert_eq!(Client::registered_sessions(), vec![registration.clone()]);
-                    let empty_history = crate::rc::local_history::read(json!({
+                    // A native registration alone cannot distinguish an unwritten file from
+                    // deleted history; capture and attachment still accept the registration.
+                    let missing_history = crate::rc::local_history::read(json!({
                         "runtime":"claude-code", "session_id":session, "cwd":cwd,
                         "view":"conversation"
                     }))
-                    .unwrap();
-                    assert_eq!(empty_history["items"], json!([]));
-                    assert_eq!(empty_history["has_more"], false);
+                    .unwrap_err();
+                    assert_eq!(
+                        crate::rc::local_history::rpc_error(missing_history)
+                            .data
+                            .unwrap()["kind"],
+                        "source_missing"
+                    );
                     assert_eq!(
                         resolve_capture().unwrap().unwrap().to_string(),
                         lineage.to_string()

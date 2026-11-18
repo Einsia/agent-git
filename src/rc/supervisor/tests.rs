@@ -104,6 +104,7 @@ pub(super) fn harness_test_session_with_channels(
         stopped_in_turn: false,
         background_poll_at: tokio::time::Instant::now(),
         transcript_readable: false,
+        initial_history: Default::default(),
         tailer: None,
         rollover_check_at: tokio::time::Instant::now(),
         native_records: native_records::NativeRecords::default(),
@@ -414,6 +415,17 @@ async fn a_pre_ready_retry_restores_the_initial_slot_and_ready_runs_it_once() {
 
 #[tokio::test]
 async fn a_completed_turn_stays_idle_when_its_acceptance_response_arrives_late() {
+    if crate::rc::in_isolated_test(
+        "rc::supervisor::tests::a_completed_turn_stays_idle_when_its_acceptance_response_arrives_late",
+    ) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    // This isolated process owns the runtime and history fixture directories.
+    unsafe {
+        std::env::set_var("AGIT_HOME", root.path().join("agit"));
+        std::env::set_var("CODEX_HOME", root.path().join("codex"));
+    }
     let driver = AnyDriver::Codex(Box::new(
         crate::rc::harness::codex::CodexDriver::test_responder(
             Some("thread-1"),
@@ -432,6 +444,30 @@ async fn a_completed_turn_stays_idle_when_its_acceptance_response_arrives_late()
     ));
     let (mut session, _out, _notes) =
         harness_test_session_with_channels(driver, "codex", SessionStatus::Idle);
+    session.cwd = root.path().canonicalize().unwrap();
+    let (_confinement_tx, confinement) = tokio::sync::watch::channel(crate::rc::Confinement {
+        roots: crate::rc::policy::CanonicalRoots::from_untrusted([session.cwd.clone()]),
+        ..Default::default()
+    });
+    session.confinement = confinement.clone();
+    session.initial_history = crate::rc::local_history::initial::Launch::new(
+        &session.info,
+        &session.cwd,
+        session.generation,
+        confinement,
+    );
+    session.announce_binding_without_waiting().await;
+    let read = || {
+        crate::rc::local_history::read(serde_json::json!({
+            "session_id":"thread-1", "runtime":"codex", "cwd":root.path()
+        }))
+    };
+    assert_eq!(read().unwrap()["items"], serde_json::json!([]));
+    let missing = || {
+        crate::rc::local_history::rpc_error(read().unwrap_err())
+            .data
+            .unwrap()
+    };
     let (ticket, mut receipt) = crate::rc::ticket::ticket();
     assert!(ticket.accept());
     session
@@ -446,10 +482,19 @@ async fn a_completed_turn_stays_idle_when_its_acceptance_response_arrives_late()
             guard_attempt: None,
         })
         .await;
-
-    for _ in 0..3 {
+    assert_eq!(missing()["kind"], "busy");
+    // Accepted input retires the empty state; completion retires initialization even if the
+    // runtime never writes a file. A delayed acceptance must not revive either state.
+    for reason in ["history_initializing", "source_missing", "source_missing"] {
         let event = session.driver.next_event().await.unwrap();
         session.on_harness_event(event).await;
+        let error = missing();
+        assert_eq!(
+            error["reason"]
+                .as_str()
+                .unwrap_or(error["kind"].as_str().unwrap()),
+            reason
+        );
     }
     let outcome = receipt
         .wait(std::time::Duration::from_secs(1))
