@@ -104,6 +104,19 @@ fn queue_lock() -> Result<fs::File> {
     )
 }
 
+pub(super) fn try_queue_lock() -> Result<fs::File> {
+    config::create_state_dir(&home()?)?;
+    let file = config::state_file_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home()?.join("save-requests.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .context("project Stop authorization is busy; this request was not accepted")?;
+    Ok(file)
+}
+
 fn authorization_path(root: &Path) -> Result<PathBuf> {
     Ok(state_path(root)?.with_extension("save-authorization"))
 }
@@ -202,6 +215,26 @@ fn revisions(root: &Path, candidate: &Candidate) -> Result<BTreeMap<PathBuf, (u6
         .cwd
         .ancestors()
         .chain(std::iter::once(root))
+        .map(|path| {
+            let auth = authorization(path)?;
+            Ok((
+                path.to_owned(),
+                (
+                    auth.generation,
+                    auth.sessions.get(&session).copied().unwrap_or(0),
+                ),
+            ))
+        })
+        .collect()
+}
+
+pub(crate) fn stop_revisions(
+    cwd: &Path,
+    runtime: &str,
+    session: &str,
+) -> Result<BTreeMap<PathBuf, (u64, u64)>> {
+    let session = key(runtime, session);
+    cwd.ancestors()
         .map(|path| {
             let auth = authorization(path)?;
             Ok((

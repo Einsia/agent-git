@@ -272,6 +272,23 @@ pub(super) fn locate(
     Ok(thread)
 }
 
+/// Stop admission leaves cold files for explicit preparation rather than restoring them.
+#[cfg(feature = "cli")]
+pub(super) fn locate_for_stop(
+    home: &Path,
+    native: &str,
+    limits: crate::adapter::native_snapshot::Limits,
+) -> crate::Result<crate::adapter::codex_index::Thread> {
+    let path = crate::adapter::native_snapshot::codex_carrier_in(home, native, limits)?;
+    let source = crate::adapter::codex::plain_stop_source(native, path)?;
+    let thread = header(home, &source.path)?;
+    ensure!(
+        thread.id == native,
+        "native transcript identifies another conversation"
+    );
+    Ok(thread)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

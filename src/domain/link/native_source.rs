@@ -157,13 +157,65 @@ impl Link {
         &self,
         full: bool,
     ) -> crate::Result<(Vec<u8>, Vec<crate::adapter::codex::CaptureSpan>)> {
-        use crate::adapter::native_snapshot::{Limits, Source};
+        let (bytes, spans, _) = self.capture_with_limits(
+            full,
+            crate::adapter::native_snapshot::Limits::capture(),
+            false,
+            None,
+        )?;
+        Ok((bytes, spans))
+    }
+
+    #[cfg(all(feature = "rc", feature = "cli"))]
+    pub(super) fn read_source_stop_bytes(
+        &self,
+        limits: crate::adapter::native_snapshot::Limits,
+        deadline: std::time::Instant,
+    ) -> crate::Result<(PathBuf, Vec<u8>)> {
+        let (bytes, _, path) = self.capture_with_limits(true, limits, true, Some(deadline))?;
+        Ok((path, bytes))
+    }
+
+    #[cfg(feature = "rc")]
+    fn capture_with_limits(
+        &self,
+        full: bool,
+        limits: crate::adapter::native_snapshot::Limits,
+        stop: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> crate::Result<(Vec<u8>, Vec<crate::adapter::codex::CaptureSpan>, PathBuf)> {
+        use crate::adapter::native_snapshot::Source;
+        crate::adapter::native_snapshot::check_deadline(deadline)?;
         let (context, roots) = self.source_context()?;
+        #[cfg(feature = "cli")]
+        let path = if stop {
+            let thread = context.locate_for_stop(self.native_thread_id(), &roots, limits)?;
+            ensure!(
+                Some(thread.cwd.as_path())
+                    == self
+                        .cwd
+                        .as_deref()
+                        .map(Path::new)
+                        .map(Path::canonicalize)
+                        .transpose()?
+                        .as_deref(),
+                "native source directory changed"
+            );
+            crate::rc::local_goal::validate_header(
+                &thread.transcript,
+                self.native_thread_id(),
+                &thread.cwd,
+            )?;
+            thread.transcript
+        } else {
+            self.resolve_source()?
+        };
+        #[cfg(not(feature = "cli"))]
         let path = self.resolve_source()?;
         let source = Source {
             runtime: "codex",
             session_id: self.native_thread_id().into(),
-            path,
+            path: path.clone(),
             database: false,
         };
         // A fork carries history its parent recorded in another bound project; a directory
@@ -175,26 +227,36 @@ impl Link {
                 .chain(crate::rc::mirror::Mirror::load().all_roots()),
         );
         let failure = std::cell::RefCell::new(None);
-        let captured = crate::adapter::codex::capture_lineage_with_lookup(
-            &source,
-            Limits::capture(),
-            full,
-            |id, limits| {
-                let path = context
-                    .history_parent(id, &parent_roots, limits)
-                    .map_err(|error| {
-                        let kind = parent_failure(&error);
-                        *failure.borrow_mut() = Some(error);
-                        kind
-                    })?;
-                Ok(Source {
-                    runtime: "codex",
-                    session_id: id.into(),
-                    path,
-                    database: false,
-                })
-            },
-        );
+        let lookup = |id: &str, limits| {
+            crate::adapter::native_snapshot::check_deadline(deadline)?;
+            let parent = if stop {
+                context.history_parent_carrier(id, &parent_roots, limits)
+            } else {
+                context.history_parent(id, &parent_roots, limits)
+            };
+            let path = parent.map_err(|error| {
+                let kind = parent_failure(&error);
+                *failure.borrow_mut() = Some(error);
+                kind
+            })?;
+            #[cfg(feature = "cli")]
+            if stop {
+                return crate::adapter::codex::plain_stop_source(id, path);
+            }
+            Ok(Source {
+                runtime: "codex",
+                session_id: id.into(),
+                path,
+                database: false,
+            })
+        };
+        let captured = if deadline.is_some() {
+            crate::adapter::codex::capture_lineage_with_lookup_until(
+                &source, limits, full, lookup, deadline,
+            )
+        } else {
+            crate::adapter::codex::capture_lineage_with_lookup(&source, limits, full, lookup)
+        };
         let captured = match captured {
             Ok(captured) => captured,
             Err(kind) => {
@@ -208,7 +270,8 @@ impl Link {
             }
         };
         context.validate()?;
-        Ok(captured)
+        crate::adapter::native_snapshot::check_deadline(deadline)?;
+        Ok((captured.0, captured.1, path))
     }
 
     #[cfg(not(feature = "rc"))]
@@ -227,6 +290,15 @@ impl Link {
 
     #[cfg(not(feature = "rc"))]
     pub(super) fn read_source_bytes(&self) -> crate::Result<Vec<u8>> {
+        anyhow::bail!("native source reads require runtime support")
+    }
+
+    #[cfg(all(not(feature = "rc"), feature = "cli"))]
+    pub(super) fn read_source_stop_bytes(
+        &self,
+        _limits: crate::adapter::native_snapshot::Limits,
+        _deadline: std::time::Instant,
+    ) -> crate::Result<(PathBuf, Vec<u8>)> {
         anyhow::bail!("native source reads require runtime support")
     }
 }
@@ -325,7 +397,34 @@ mod tests {
             mirror.save().unwrap();
             let bytes = String::from_utf8(link.read_bytes().unwrap()).unwrap();
             assert!(bytes.contains("parent-turn") && bytes.contains("child-turn"));
+            let limits = crate::adapter::native_snapshot::Limits::default();
+            let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let (path, stopped) = link.read_codex_stop_bytes(limits, deadline()).unwrap();
+            assert_eq!(path, child_path.canonicalize().unwrap());
+            assert_eq!(stopped, bytes.as_bytes());
+            assert!(
+                link.read_codex_stop_bytes(
+                    crate::adapter::native_snapshot::Limits { bytes: 1, ..limits },
+                    deadline()
+                )
+                .is_err()
+            );
+            let cold = parent_path.with_extension("jsonl.zst");
+            std::fs::write(
+                &cold,
+                ruzstd::encoding::compress_to_vec(
+                    std::fs::read(&parent_path).unwrap().as_slice(),
+                    ruzstd::encoding::CompressionLevel::Fastest,
+                ),
+            )
+            .unwrap();
             std::fs::remove_file(&parent_path).unwrap();
+            assert!(link.read_codex_stop_bytes(limits, deadline()).is_err());
+            assert!(
+                !parent_path.exists(),
+                "Stop admission restored a cold parent"
+            );
+            std::fs::remove_file(cold).unwrap();
             assert_eq!(kind(&link), Unavailable::NotFound);
         });
     }

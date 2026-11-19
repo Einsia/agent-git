@@ -495,9 +495,64 @@ fn startup_migration_complete(home: &Path) -> Result<bool> {
         "refusing non-regular or symlinked migration marker {}",
         path.display()
     );
-    let bytes = std::fs::read(&path)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "migration marker is not a regular file");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        anyhow::ensure!(
+            metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                == 0,
+            "migration marker is a redirect"
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(STARTUP_MIGRATION_VERSION.len() as u64 + 1)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read migration marker {}", path.display()))?;
     Ok(bytes == STARTUP_MIGRATION_VERSION)
+}
+
+/// A direct Stop only reads prepared storage; workers perform migration and recovery.
+pub(crate) fn stop_admission_ready() -> Result<bool> {
+    let home = crate::infra::config::agit_home()?;
+    if !startup_migration_complete(&home)? {
+        return Ok(false);
+    }
+    let directory = home.join(STARTUP_RECOVERY_DIR);
+    if !crate::domain::merge_archive::authority_directory_exists(&directory)? {
+        return Ok(true);
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
+    for (count, entry) in entries.enumerate() {
+        if count >= 1024
+            || entry?
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STARTUP_RECOVERY_PREFIX)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn startup_recovery_evidence(home: &Path) -> Result<Vec<PathBuf>> {

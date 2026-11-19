@@ -31,6 +31,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StopPublication {
+    pub(crate) queue: String,
+    pub(crate) request: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum Outcome {
     /// `attempt` tells this start from another upload of the same tip, which can overlap it.
@@ -40,6 +47,8 @@ enum Outcome {
         attempt: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         retry: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<StopPublication>,
     },
     Uploaded {
         tip: String,
@@ -58,10 +67,33 @@ enum Outcome {
         retry: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after: Option<i64>,
+        // Older readers must not schedule retries that require the original Stop authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_retry_after: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop: Option<StopPublication>,
     },
 }
 
 impl Outcome {
+    fn retry_at(&self) -> Option<i64> {
+        match self {
+            Self::Failed {
+                retry_after,
+                stop_retry_after,
+                stop,
+                ..
+            } => {
+                if stop.is_some() {
+                    *stop_retry_after
+                } else {
+                    *retry_after
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn tip(&self) -> &str {
         match self {
             Self::Started { tip, .. } | Self::Uploaded { tip } | Self::Failed { tip, .. } => tip,
@@ -180,6 +212,7 @@ pub(crate) struct Place {
     /// For an upload the folder's worker retries by itself when it fails, how many tries came
     /// before it; `None` for one nothing retries.
     retry: Option<u32>,
+    stop: Option<StopPublication>,
 }
 
 impl Place {
@@ -191,6 +224,7 @@ impl Place {
                 .with_extension("json"),
             target: format!("{repository}@{branch}"),
             retry: None,
+            stop: None,
         })
     }
 
@@ -203,6 +237,16 @@ impl Place {
         }
     }
 
+    pub(crate) fn for_stop(self, queue: &str, request: &str) -> Self {
+        Self {
+            stop: Some(StopPublication {
+                queue: queue.into(),
+                request: request.into(),
+            }),
+            ..self
+        }
+    }
+
     /// A place outside agit's home, for tests that must not write to it.
     #[cfg(test)]
     pub(crate) fn at(records: &Path, skipped: &Path) -> Self {
@@ -211,6 +255,7 @@ impl Place {
             skipped: skipped.join("skipped.json"),
             target: "test/repository@branch".to_owned(),
             retry: None,
+            stop: None,
         }
     }
 
@@ -313,7 +358,7 @@ impl Refusal {
     /// The one place a recorded upload's failure is classed. A policy exit counts as a privacy
     /// wait only when a wait is recorded for the conversation or for `target`; otherwise the turn
     /// would tell of a wait that `agit status` can't show.
-    fn class(&self, target: &str) -> UploadFailure {
+    pub(super) fn class(&self, target: &str) -> UploadFailure {
         UploadFailure::reported(self.exit_code, &self.message)
             .waiting_on(self.session.as_deref(), Some(target))
     }
@@ -408,6 +453,7 @@ struct Upload {
     tip: String,
     attempt: String,
     retry: Option<u32>,
+    stop: Option<StopPublication>,
     running: std::fs::File,
 }
 
@@ -416,7 +462,7 @@ impl Place {
     /// not. A start that can't be recorded leaves the note instead; one that can removes it.
     fn start(self, tip: &str) -> crate::Result<Upload> {
         let lock = self.note_lock();
-        match self.paths.start(tip, self.retry) {
+        match self.paths.start(tip, self.retry, self.stop.clone()) {
             Ok(upload) => {
                 let remove = || std::fs::remove_file(&self.skipped);
                 let _ = under_write_lock(&lock, remove).unwrap_or_else(remove);
@@ -477,6 +523,7 @@ impl Place {
         let outcome: Outcome =
             serde_json::from_slice(&bytes).context("the upload record can't be read")?;
         let told = self.paths.told.clone();
+        let retry_at = outcome.retry_at();
         Ok(match outcome {
             // An agit that still attempted uploads with `push.auto` off saved its refusal in this
             // class. With it off nothing is attempted, so this failure says nothing now. Reading
@@ -487,11 +534,10 @@ impl Place {
                 ..
             } if self.automatic_upload_off() => None,
             Outcome::Failed {
-                reason,
-                attempt,
-                retry_after: Some(at),
-                ..
-            } => Some((Undone::Retrying(reason, at), attempt, told)),
+                reason, attempt, ..
+            } if retry_at.is_some() => {
+                Some((Undone::Retrying(reason, retry_at.unwrap()), attempt, told))
+            }
             Outcome::Failed {
                 reason,
                 attempt,
@@ -581,7 +627,12 @@ impl Place {
 }
 
 impl Paths {
-    fn start(self, tip: &str, retry: Option<u32>) -> crate::Result<Upload> {
+    fn start(
+        self,
+        tip: &str,
+        retry: Option<u32>,
+        stop: Option<StopPublication>,
+    ) -> crate::Result<Upload> {
         let directory = self
             .record
             .parent()
@@ -601,6 +652,7 @@ impl Paths {
             tip: tip.to_owned(),
             attempt: attempt.clone(),
             retry: retry.unwrap_or(0),
+            stop: stop.clone(),
         };
         under_write_lock(&self.writing, || write(&self.record, &started))
             .context("the upload record's lock can't be taken")?
@@ -610,6 +662,7 @@ impl Paths {
             tip: tip.to_owned(),
             attempt,
             retry,
+            stop,
             running,
         })
     }
@@ -625,28 +678,35 @@ impl Upload {
             tip,
             attempt,
             retry,
+            stop,
             running,
         } = self;
         let started = Outcome::Started {
             tip: tip.clone(),
             attempt: attempt.clone(),
             retry: retry.unwrap_or(0),
+            stop: stop.clone(),
         };
         under_write_lock(&paths.writing, || {
             if read(&paths.record).as_ref() == Some(&started) {
                 let outcome = match result {
                     Ok(()) => Outcome::Uploaded { tip },
-                    Err((reason, said)) => Outcome::Failed {
-                        tip,
-                        retry_after: retry
+                    Err((reason, said)) => {
+                        let at = retry
                             .filter(|_| reason.retried())
                             .and_then(|retry| RETRY_DELAYS.get(retry as usize))
-                            .map(|delay| now() + delay),
-                        reason,
-                        attempt,
-                        said,
-                        retry: retry.unwrap_or(0),
-                    },
+                            .map(|delay| now() + delay);
+                        Outcome::Failed {
+                            tip,
+                            retry_after: at.filter(|_| stop.is_none()),
+                            stop_retry_after: at.filter(|_| stop.is_some()),
+                            reason,
+                            attempt,
+                            said,
+                            retry: retry.unwrap_or(0),
+                            stop,
+                        }
+                    }
                 };
                 let _ = write(&paths.record, &outcome);
             }
@@ -798,6 +858,7 @@ pub(crate) struct Due {
     pub(crate) retry: u32,
     /// When it is due, in Unix seconds.
     pub(crate) at: i64,
+    pub(crate) stop: Option<StopPublication>,
     /// The failed attempt it retries, so a retry another worker took is not run twice.
     attempt: String,
 }
@@ -809,12 +870,14 @@ pub(crate) fn retries(repository: &str, branches: &[String]) -> Vec<Due> {
         .iter()
         .filter_map(|branch| {
             let place = Place::of(repository, branch).ok()?;
-            match read(&place.paths.record)? {
+            let outcome = read(&place.paths.record)?;
+            let at = outcome.retry_at()?;
+            match outcome {
                 Outcome::Failed {
                     tip,
                     attempt,
                     retry,
-                    retry_after: Some(at),
+                    stop,
                     ..
                 } if !marked(&place.paths.cancelled, &attempt).unwrap_or(true) => Some(Due {
                     branch: branch.clone(),
@@ -822,6 +885,7 @@ pub(crate) fn retries(repository: &str, branches: &[String]) -> Vec<Due> {
                     retry: retry + 1,
                     at,
                     attempt,
+                    stop,
                 }),
                 _ => None,
             }
@@ -838,6 +902,47 @@ pub(crate) fn publication_tip(repository: &str, branch: &str) -> crate::Result<O
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Retirement cancels only its original Stop's retry before removing the request it references.
+pub(crate) fn cancel_stop_retry(
+    repository: &str,
+    branch: &str,
+    tip: &str,
+    stop: &StopPublication,
+) -> crate::Result<()> {
+    let paths = paths(repository, branch)?;
+    if !paths.record.try_exists()? {
+        return Ok(());
+    }
+    under_write_lock(&paths.writing, || -> crate::Result<()> {
+        let bytes = match std::fs::read(&paths.record) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut outcome: Outcome = serde_json::from_slice(&bytes)?;
+        if let Outcome::Failed {
+            tip: saved,
+            attempt,
+            stop: Some(owner),
+            retry_after,
+            stop_retry_after,
+            ..
+        } = &mut outcome
+            && saved.as_str() == tip
+            && &*owner == stop
+        {
+            replace(&paths.cancelled, attempt.as_bytes())?;
+            sync_record(&paths.cancelled)?;
+            *retry_after = None;
+            *stop_retry_after = None;
+            write(&paths.record, &outcome)?;
+            sync_record(&paths.record)?;
+        }
+        Ok(())
+    })
+    .context("could not lock upload result")?
 }
 
 pub(crate) enum RequestPublication {
@@ -898,6 +1003,8 @@ pub(crate) fn request_publication(
                     said,
                     retry,
                     retry_after,
+                    stop_retry_after,
+                    stop,
                 }) => {
                     if seen != tip {
                         return Ok(RequestPublication::Superseded);
@@ -905,7 +1012,11 @@ pub(crate) fn request_publication(
                     if marked(&place.paths.cancelled, &attempt)? {
                         return Ok(RequestPublication::Cancelled);
                     }
-                    if let Some(at) = retry_after {
+                    if let Some(at) = if stop.is_some() {
+                        stop_retry_after
+                    } else {
+                        retry_after
+                    } {
                         config::state_file_options()
                             .read(true)
                             .write(true)
@@ -927,13 +1038,16 @@ pub(crate) fn request_publication(
                         attempt,
                         said,
                         retry,
-                        retry_after: Some(now()),
+                        retry_after: stop.is_none().then_some(now()),
+                        stop_retry_after: stop.is_some().then_some(now()),
+                        stop,
                     }
                 }
                 Some(Outcome::Started {
                     tip: seen,
                     attempt,
                     retry,
+                    stop,
                 }) => {
                     if seen != tip {
                         return Ok(RequestPublication::Superseded);
@@ -950,7 +1064,9 @@ pub(crate) fn request_publication(
                         attempt,
                         said: None,
                         retry,
-                        retry_after: Some(now()),
+                        retry_after: stop.is_none().then_some(now()),
+                        stop_retry_after: stop.is_some().then_some(now()),
+                        stop,
                     }
                 }
                 None => {
@@ -964,6 +1080,8 @@ pub(crate) fn request_publication(
                         said: None,
                         retry: 0,
                         retry_after: Some(now()),
+                        stop_retry_after: None,
+                        stop: None,
                     }
                 }
             };
@@ -987,15 +1105,20 @@ impl Due {
     fn settle(&self, repository: &str, run: bool) -> crate::Result<bool> {
         let place = Place::of(repository, &self.branch)?;
         under_write_lock(&place.paths.writing, || -> crate::Result<bool> {
-            match read(&place.paths.record) {
+            let outcome = read(&place.paths.record);
+            let due = outcome
+                .as_ref()
+                .is_some_and(|value| value.retry_at().is_some());
+            match outcome {
                 Some(Outcome::Failed {
                     tip,
                     reason,
                     attempt,
                     said,
                     retry,
-                    retry_after: Some(_),
-                }) if attempt == self.attempt => {
+                    stop,
+                    ..
+                }) if due && attempt == self.attempt && stop == self.stop => {
                     if run && marked(&place.paths.cancelled, &attempt)? {
                         return Ok(false);
                     }
@@ -1013,6 +1136,8 @@ impl Due {
                         said,
                         retry,
                         retry_after: None,
+                        stop_retry_after: None,
+                        stop,
                     };
                     write(&place.paths.record, &settled)?;
                     sync_record(&place.paths.record)?;
@@ -1293,6 +1418,7 @@ impl Launch {
     pub(crate) fn ended(&self) -> Option<String> {
         let repo = Repo::open(&self.directory)?;
         let saving = self.saving();
+        let queued = self.queued();
         let now = super::auto_push::branch_tip(&self.directory, &self.branch);
         let turns =
             |tip: Option<&str>| tip.map_or(Some(0), |tip| refs::count_turns(&repo, tip).ok());
@@ -1302,6 +1428,9 @@ impl Launch {
             turns(now.as_deref())?.saturating_sub(turns(self.tip.as_deref())?)
         };
         if saved == 0 {
+            if queued {
+                return Some("agit: a save for this conversation is pending; `agit status` shows its progress.".into());
+            }
             return saving
                 .then(|| "agit: the last turn of this conversation is still being saved.".into());
         }
@@ -1328,11 +1457,23 @@ impl Launch {
             ),
             Status::Unknown => format!("agit: saved {turns} of this conversation"),
         };
-        Some(if saving {
+        Some(if queued {
+            format!("{line}; a save is still pending; `agit status` shows its progress.")
+        } else if saving {
             format!("{line}; the last turn is still being saved.")
         } else {
             format!("{line}.")
         })
+    }
+
+    fn queued(&self) -> bool {
+        let Ok(root) = config::store_root() else {
+            return false;
+        };
+        let store = Store::at(root);
+        link::active_for_branch(&store, &self.owner, &self.name, &self.branch)
+            .iter()
+            .any(|claim| super::stop_requests::save_pending(&store, claim))
     }
 
     /// Whether a turn of the branch is being written now, waits apart from the runtime for its
@@ -1485,6 +1626,53 @@ mod tests {
             ),
             "a real nonretryable refusal must not inherit an older claim"
         );
+        let stop = StopPublication {
+            queue: "project-queue".into(),
+            request: "original-stop".into(),
+        };
+        recorded(
+            Place::of(repository, branch)
+                .map(|place| place.retried(0).for_stop(&stop.queue, &stop.request)),
+            &tip,
+            || (),
+            |_| {
+                Some(Refusal::child(
+                    Some(crate::ExitCode::Network.as_i32()),
+                    "synthetic network failure".into(),
+                ))
+            },
+        )
+        .unwrap();
+        let pending = std::fs::read(&paths.record).unwrap();
+        for (saved, owner) in [
+            ("2".repeat(40), stop.clone()),
+            (
+                tip.clone(),
+                StopPublication {
+                    request: "another-stop".into(),
+                    ..stop.clone()
+                },
+            ),
+            (
+                tip.clone(),
+                StopPublication {
+                    queue: "another-project".into(),
+                    ..stop.clone()
+                },
+            ),
+        ] {
+            cancel_stop_retry(repository, branch, &saved, &owner).unwrap();
+            assert_eq!(std::fs::read(&paths.record).unwrap(), pending);
+            assert_eq!(retries(repository, &[branch.into()]).len(), 1);
+        }
+        cancel_stop_retry(repository, branch, &tip, &stop).unwrap();
+        assert!(retries(repository, &[branch.into()]).is_empty());
+        replace(&paths.record, &pending).unwrap();
+        assert!(retries(repository, &[branch.into()]).is_empty());
+        assert!(matches!(
+            request_publication(repository, branch, &tip, true, None).unwrap(),
+            RequestPublication::Cancelled
+        ));
     }
 
     fn at(directory: &Path) -> Paths {
@@ -1536,6 +1724,8 @@ mod tests {
                 said: None,
                 retry: 0,
                 retry_after: None,
+                stop_retry_after: None,
+                stop: None,
             };
             write(&place.paths.record, &failed).unwrap();
         };
@@ -1580,8 +1770,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let record = || read(&at(directory.path()).record);
 
-        let failing = at(directory.path()).start("tip-1", None).unwrap();
-        let succeeding = at(directory.path()).start("tip-1", None).unwrap();
+        let failing = at(directory.path()).start("tip-1", None, None).unwrap();
+        let succeeding = at(directory.path()).start("tip-1", None, None).unwrap();
         failing.finish(Err((UploadFailure::Hub, None)));
         succeeding.finish(Ok(()));
         assert_eq!(
@@ -1591,8 +1781,8 @@ mod tests {
             })
         );
 
-        let older = at(directory.path()).start("tip-2", None).unwrap();
-        let newer = at(directory.path()).start("tip-3", None).unwrap();
+        let older = at(directory.path()).start("tip-2", None, None).unwrap();
+        let newer = at(directory.path()).start("tip-3", None, None).unwrap();
         older.finish(Err((UploadFailure::Hub, None)));
         assert!(
             matches!(record(), Some(Outcome::Started { tip, .. }) if tip == "tip-3"),

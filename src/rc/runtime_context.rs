@@ -125,7 +125,7 @@ impl RuntimeContext {
     }
 
     pub fn locate(&self, native: &str, roots: &CanonicalRoots) -> crate::Result<LocatedThread> {
-        self.locate_with(native, roots, true)
+        self.locate_with(native, roots, true, None)
     }
 
     /// For callers holding a lock other conversations need: a cold transcript is restored in the
@@ -136,7 +136,17 @@ impl RuntimeContext {
         native: &str,
         roots: &CanonicalRoots,
     ) -> crate::Result<LocatedThread> {
-        self.locate_with(native, roots, false)
+        self.locate_with(native, roots, false, None)
+    }
+
+    #[cfg(feature = "cli")]
+    pub(crate) fn locate_for_stop(
+        &self,
+        native: &str,
+        roots: &CanonicalRoots,
+        limits: crate::adapter::native_snapshot::Limits,
+    ) -> crate::Result<LocatedThread> {
+        self.locate_with(native, roots, true, Some(limits))
     }
 
     fn locate_with(
@@ -144,11 +154,22 @@ impl RuntimeContext {
         native: &str,
         roots: &CanonicalRoots,
         wait: bool,
+        stop_limits: Option<crate::adapter::native_snapshot::Limits>,
     ) -> crate::Result<LocatedThread> {
         self.validate()?;
         let thread = crate::adapter::codex_index::thread_by_id_in(&self.source.home, native)
             .map(Ok)
-            .unwrap_or_else(|| super::runtime_files::locate(&self.source.home, native))?;
+            .unwrap_or_else(|| {
+                #[cfg(feature = "cli")]
+                if let Some(limits) = stop_limits {
+                    return super::runtime_files::locate_for_stop(
+                        &self.source.home,
+                        native,
+                        limits,
+                    );
+                }
+                super::runtime_files::locate(&self.source.home, native)
+            })?;
         ensure!(
             thread.id == native,
             "native index returned a different conversation"
@@ -168,9 +189,20 @@ impl RuntimeContext {
         {
             return Err(crate::adapter::codex_rollout::Restoring.into());
         }
-        let transcript = crate::adapter::codex_rollout::restore(&thread.rollout_path)
-            .and_then(|path| path.canonicalize())
-            .context("native conversation transcript is unavailable")?;
+        let transcript = if stop_limits.is_some() {
+            ensure!(
+                !crate::adapter::codex_rollout::is_compressed(&thread.rollout_path)
+                    && std::fs::symlink_metadata(&thread.rollout_path)?
+                        .file_type()
+                        .is_file(),
+                "native conversation requires transcript preparation"
+            );
+            thread.rollout_path.canonicalize()?
+        } else {
+            crate::adapter::codex_rollout::restore(&thread.rollout_path)
+                .and_then(|path| path.canonicalize())
+                .context("native conversation transcript is unavailable")?
+        };
         ensure!(
             transcript.starts_with(&self.source.home),
             "native conversation points outside its runtime source"

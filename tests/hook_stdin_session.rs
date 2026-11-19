@@ -6,6 +6,9 @@
 //! points at the old branch. The hook must follow stdin: a session not yet adopted gets nothing,
 //! and the old session's hook settles its own branch as usual.
 
+#[path = "support/stop_requests.rs"]
+mod stop_requests;
+
 use agit::domain::repo::Repo;
 use std::process::{Command, Stdio};
 use std::{fs, io::Write as _};
@@ -15,6 +18,92 @@ mod local_state;
 
 const A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
 const B: &str = "bbbbbbbb-0000-4000-8000-000000000002";
+
+/// A complete JSON prefix is not a Stop until EOF. Open, oversized or malformed input cannot
+/// enqueue work, expose payload text, or move the branch; the next complete event still saves.
+#[test]
+fn stop_input_requires_eof_within_its_limits_before_queueing() {
+    use agit::domain::{stop_requests as journal, store::Store};
+    use std::time::{Duration, Instant};
+
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "initial prompt", "initial reply"));
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let store = Store::at(lab.agit_home.join("store"));
+    let repo = Repo::at(lab.agit_home.join("repos/me/qa"));
+    let tip = || repo.git(&["rev-parse", "refs/heads/s1"]).unwrap();
+    let before = tip();
+    lab.append(
+        A,
+        &lab.turn(A, 2, "input boundary prompt", "input boundary reply"),
+    );
+    let payload = serde_json::json!({
+        "session_id": A, "cwd": lab.work, "transcript_path": lab.transcript(A),
+        "hook_event_name": "Stop", "unused": "synthetic-input-not-for-output"
+    })
+    .to_string()
+    .into_bytes();
+    let mut large = payload.clone();
+    large.resize(1024 * 1024 + 1, b' ');
+    for (input, close) in [
+        (payload, false),
+        (large, true),
+        (b"{unfinished".to_vec(), true),
+    ] {
+        let mut child = lab
+            .agit(&["hooks", "settle", "--runtime", "claude-code"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut pipe = child.stdin.take().unwrap();
+        let _ = pipe.write_all(&input);
+        let retained_pipe = (!close).then_some(pipe);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut exceeded = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                exceeded = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(retained_pipe);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !exceeded,
+            "Stop waited for an input pipe that remained open"
+        );
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("this Stop was not queued"),
+            "{output:?}"
+        );
+        assert!(!diagnostic.contains("synthetic-input-not-for-output"));
+        assert_eq!(tip(), before);
+        assert!(
+            journal::for_session(&store, "claude-code", A)
+                .pending()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    lab.hook(&["hooks", "settle", "--runtime", "claude-code"], A, None);
+    assert_ne!(tip(), before);
+}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum State {
@@ -160,6 +249,12 @@ impl Lab {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+        stop_requests::finish(
+            &mut self.agit(&[]),
+            &self.agit_home,
+            "claude-code",
+            session_id,
+        );
     }
 
     /// A snapshot of local agit state under `AGIT_HOME` and the runtime memory directory: the
@@ -232,6 +327,451 @@ impl Lab {
 }
 
 const HUB: &str = "http://127.0.0.1:1";
+
+/// Stop admission never waits for a branch writer and refuses a busy claim. Recovery saves its
+/// original prefix, and a restarted worker cannot revive intent revoked while automatic saving
+/// was off. Admission refuses unfinished storage preparation and leaves memory cleanup to the worker.
+/// Complete local saves retain evidence without occupying pending capacity when publication is unbound.
+#[test]
+fn queued_stop_recovers_its_original_execution_without_blocking_the_runtime() {
+    use agit::domain::{
+        link,
+        stop_requests::{self as journal, BlockedBy, MemoryOutcome, Phase},
+        storage,
+        store::Store,
+    };
+    use std::time::{Duration, Instant};
+    let lab = Lab::new();
+    lab.append(A, &lab.turn(A, 1, "first prompt", "first reply"));
+    let memory = lab.transcript(A).parent().unwrap().join("memory");
+    fs::create_dir_all(&memory).unwrap();
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "claude-code",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let store = Store::at(lab.agit_home.join("store"));
+    let repo = Repo::at(lab.agit_home.join("repos/me/qa"));
+    let mut policy = agit::domain::privacy::PrivacyPolicy::default();
+    policy.memory_allow.push("preferences.md".into());
+    policy.save(&repo).unwrap();
+    let head = || {
+        repo.git(&["rev-parse", "refs/heads/s1"])
+            .unwrap()
+            .trim()
+            .to_owned()
+    };
+    let queue = journal::for_session(&store, "claude-code", A);
+    let key = queue.directory().file_name().unwrap().to_str().unwrap();
+    let invoke_stop = |fail: bool| {
+        let mut child = lab
+            .agit(&["hooks", "settle", "--runtime", "claude-code"])
+            .env("AGIT_TEST_STOP_SPAWN_FAIL", if fail { "1" } else { "0" })
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(serde_json::json!({
+            "session_id": A, "cwd": lab.work, "transcript_path": lab.transcript(A), "hook_event_name": "Stop"
+        }).to_string().as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let stop = |fail: bool| {
+        let output = invoke_stop(fail);
+        assert!(output.status.success(), "{output:?}");
+        output
+    };
+    let original = head();
+    lab.append(A, &lab.turn(A, 2, "queued prompt", "queued reply"));
+    let marker = lab.agit_home.join("layout-v1.complete");
+    let ready = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    let refused = invoke_stop(true);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("this Stop was not queued"));
+    assert!(!marker.exists(), "the hook performed startup migration");
+    assert!(queue.pending().unwrap().is_empty());
+    fs::write(&marker, ready).unwrap();
+    let recovery = lab
+        .agit_home
+        .join("layout-v1-recovery/pending-stop-fixture");
+    fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+    fs::write(&recovery, b"synthetic interrupted preparation").unwrap();
+    let refused = invoke_stop(true);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(recovery.exists(), "the hook removed recovery evidence");
+    assert!(queue.pending().unwrap().is_empty());
+    fs::remove_file(recovery).unwrap();
+    assert_eq!(head(), original);
+
+    let claim = link::lock(&store, "claude-code", A).unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let refused = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            send.send(invoke_stop(true)).unwrap();
+        });
+        let returned = receive.recv_timeout(Duration::from_secs(15)).ok();
+        drop(claim);
+        returned
+    })
+    .expect("the hook waited for the native claim lock");
+    assert!(refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("could not queue this Stop"));
+    assert!(queue.pending().unwrap().is_empty());
+    assert_eq!(head(), original);
+
+    let own_notes = "# Memory\n\nPersonal notes.\n";
+    let old_index = format!(
+        "{own_notes}\n<!-- agit:memory:begin me/qa@s1 -->\nshared notes\n<!-- agit:memory:end -->\n"
+    );
+    let elsewhere = lab.home.join(".claude/projects/-elsewhere/memory");
+    fs::create_dir_all(&elsewhere).unwrap();
+    for dir in [&memory, &elsewhere] {
+        fs::write(dir.join("MEMORY.md"), &old_index).unwrap();
+    }
+    let swept = lab.agit_home.join("memory-swept");
+    let _ = fs::remove_file(&swept);
+    let branch = link::lock_branch(&store, "me/qa", "s1").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let accepted = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            send.send(stop(true)).unwrap();
+        });
+        let returned = receive.recv_timeout(Duration::from_secs(15)).ok();
+        drop(branch);
+        returned
+    })
+    .expect("the hook waited for a branch lock after worker launch failed");
+    assert!(String::from_utf8_lossy(&accepted.stdout).contains("worker could not start"));
+    assert!(
+        !swept.exists(),
+        "the hook performed the version memory sweep"
+    );
+    for dir in [&memory, &elsewhere] {
+        assert_eq!(
+            fs::read_to_string(dir.join("MEMORY.md")).unwrap(),
+            old_index
+        );
+    }
+    assert_eq!(head(), original);
+    let first = queue.pending().unwrap().pop().unwrap();
+    assert_eq!(
+        queue.read::<serde_json::Value>(&first).unwrap().phase,
+        Phase::Accepted
+    );
+    let status = lab.run(&["status", "--json"]);
+    assert!(status.contains(first.as_str()), "{status}");
+
+    lab.append(A, &lab.turn(A, 3, "later prompt", "later reply"));
+    let recovered = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    let saved = head();
+    assert!(
+        swept.exists(),
+        "the worker omitted startup memory preparation"
+    );
+    for dir in [&memory, &elsewhere] {
+        assert_eq!(
+            fs::read_to_string(dir.join("MEMORY.md")).unwrap(),
+            own_notes
+        );
+    }
+    let (_, view) = storage::materialize_pair_at(repo.root(), &saved).unwrap();
+    assert!(view.contains("queued reply"));
+    assert!(!view.contains("later reply"));
+    assert_eq!(
+        queue
+            .read_completed::<serde_json::Value>(&first)
+            .unwrap()
+            .phase,
+        Phase::Blocked {
+            reason: BlockedBy::RepositoryIdentityUnavailable,
+            tip: Some(saved.clone()),
+            memory: Some(MemoryOutcome::Collected {
+                changed: false,
+                withheld: false,
+                warnings: false
+            }),
+        }
+    );
+    assert!(queue.pending().unwrap().is_empty());
+    assert!(
+        repo.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/agit/stop-requests/"
+        ])
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+
+    stop(false);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let pending = queue.pending().unwrap();
+        if pending.is_empty() && !queue.owned().unwrap() && head() != saved {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached Stop worker did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let third = head();
+    assert_ne!(third, saved);
+    assert!(
+        storage::materialize_pair_at(repo.root(), &third)
+            .unwrap()
+            .1
+            .contains("later reply")
+    );
+
+    fs::write(
+        memory.join("preferences.md"),
+        "Use the narrowest relevant check.\n",
+    )
+    .unwrap();
+    stop(true);
+    let memory_request = queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            matches!(
+                queue.read::<serde_json::Value>(id).unwrap().phase,
+                Phase::Accepted
+            )
+        })
+        .unwrap();
+    // A transcript checkpoint survives a crash before memory collection, but proves no memory result.
+    {
+        let owner = queue.try_own().unwrap().unwrap();
+        let request = queue.read::<serde_json::Value>(&memory_request).unwrap();
+        owner
+            .transition(
+                &request,
+                Phase::Saving {
+                    parent: Some(third.clone()),
+                },
+            )
+            .unwrap();
+    }
+    let checkout = Repo::open(lab.agit_home.join("worktrees/me/qa/s1")).unwrap();
+    let baseline = checkout.git_path("agit-memory-baseline.json").unwrap();
+    let baseline_bytes = fs::read(&baseline).unwrap();
+    fs::write(&baseline, b"invalid synthetic baseline").unwrap();
+    let failed = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    assert_eq!(
+        failed.status.code(),
+        Some(agit::ExitCode::Precondition as i32)
+    );
+    assert_eq!(head(), third);
+    assert!(
+        matches!(queue.read::<serde_json::Value>(&memory_request).unwrap().phase,
+        Phase::Blocked { reason: BlockedBy::MemoryIncomplete, tip: Some(tip), memory: Some(MemoryOutcome::Failed) } if tip == third)
+    );
+    fs::write(&baseline, baseline_bytes).unwrap();
+    let recovered = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    assert!(recovered.status.success(), "{recovered:?}");
+    let with_memory = head();
+    assert_ne!(with_memory, third);
+    assert_eq!(
+        repo.git(&["show", "refs/heads/s1:memory/preferences.md"])
+            .unwrap()
+            .trim(),
+        "Use the narrowest relevant check."
+    );
+    assert_eq!(
+        storage::materialize_pair_at(repo.root(), &third).unwrap().1,
+        storage::materialize_pair_at(repo.root(), &with_memory)
+            .unwrap()
+            .1
+    );
+    assert!(
+        matches!(queue.read_completed::<serde_json::Value>(&memory_request).unwrap().phase,
+        Phase::Blocked { tip: Some(tip), memory: Some(MemoryOutcome::Collected { changed: true, withheld: false, warnings: false }), .. } if tip == with_memory)
+    );
+
+    stop(true);
+    let rewind_request = queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            matches!(
+                queue.read::<serde_json::Value>(id).unwrap().phase,
+                Phase::Accepted
+            )
+        })
+        .unwrap();
+    let unchanged_link = link::get(&store, "claude-code", A).unwrap();
+    repo.git(&["update-ref", "refs/heads/s1", &saved, &with_memory])
+        .unwrap();
+    let refused = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    assert_eq!(
+        refused.status.code(),
+        Some(agit::ExitCode::Precondition as i32)
+    );
+    assert_eq!(head(), saved);
+    assert_eq!(
+        serde_json::to_value(
+            link::get(&store, "claude-code", A)
+                .unwrap()
+                .native_checkpoint
+        )
+        .unwrap(),
+        serde_json::to_value(unchanged_link.native_checkpoint).unwrap()
+    );
+    assert!(matches!(
+        queue
+            .read::<serde_json::Value>(&rewind_request)
+            .unwrap()
+            .phase,
+        Phase::Blocked {
+            reason: BlockedBy::SaveFailed,
+            tip: None,
+            ..
+        }
+    ));
+    repo.git(&["update-ref", "refs/heads/s1", &with_memory, &saved])
+        .unwrap();
+
+    lab.append(A, &lab.turn(A, 4, "revoked prompt", "revoked reply"));
+    stop(true);
+    lab.run(&["config", "commit.auto", "false"]);
+    lab.run(&["config", "commit.auto", "true"]);
+    let recovered = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    assert_eq!(
+        recovered.status.code(),
+        Some(agit::ExitCode::Precondition as i32)
+    );
+    assert_eq!(head(), with_memory);
+    assert!(queue.pending().unwrap().iter().any(|id| matches!(
+        queue.read::<serde_json::Value>(id).unwrap().phase,
+        Phase::Blocked {
+            reason: BlockedBy::AuthorityChanged,
+            tip: None,
+            ..
+        }
+    )));
+}
+
+/// A Codex Stop freezes its own execution before native output resumes. Oversized input cannot
+/// be mistaken for an ordinary receipt-free save, and cold input is left for explicit preparation.
+#[test]
+fn codex_stop_admission_pins_its_prefix_and_refuses_incomplete_inspection() {
+    use agit::domain::{stop_requests as journal, storage, store::Store};
+    use sha2::{Digest as _, Sha256};
+    let lab = Lab::new();
+    let directory = lab.home.join(".codex/sessions/2026/11/19");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("rollout-2026-11-19T00-00-00-{A}.jsonl"));
+    let record = |value: serde_json::Value| format!("{value}\n");
+    let user = |text| {
+        record(
+            serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}}),
+        )
+    };
+    let reply = |text| {
+        record(
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}}),
+        )
+    };
+    let end = record(serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}));
+    let first = format!(
+        "{}{}{}{end}",
+        record(
+            serde_json::json!({"type":"session_meta","payload":{"id":A,"cwd":lab.work,"source":"cli"}})
+        ),
+        user("first prompt"),
+        reply("first reply")
+    );
+    fs::write(&path, &first).unwrap();
+    lab.run(&["init", "qa"]);
+    lab.run(&[
+        "import",
+        A,
+        "--from",
+        "codex",
+        "--into",
+        "me/qa@s1",
+        "--independent",
+    ]);
+    let store = Store::at(lab.agit_home.join("store"));
+    let queue = journal::for_session(&store, "codex", A);
+    let key = queue.directory().file_name().unwrap().to_str().unwrap();
+    let stop = || {
+        let mut child = lab
+            .agit(&["hooks", "settle", "--runtime", "codex"])
+            .env("AGIT_TEST_STOP_SPAWN_FAIL", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(record(serde_json::json!({"session_id":A,"cwd":lab.work,"transcript_path":path,"hook_event_name":"Stop"})).as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(16 * 1024 * 1024 + 1)
+        .unwrap();
+    let refused = stop();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stdout).contains("this Stop was not queued"));
+    assert!(queue.pending().unwrap().is_empty());
+    fs::write(&path, &first).unwrap();
+    let cold = path.with_extension("jsonl.zst");
+    fs::write(
+        &cold,
+        ruzstd::encoding::compress_to_vec(
+            first.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        ),
+    )
+    .unwrap();
+    fs::remove_file(&path).unwrap();
+    let refused = stop();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(queue.pending().unwrap().is_empty());
+    assert!(!path.exists(), "Stop admission restored a cold transcript");
+    fs::remove_file(cold).unwrap();
+    let stopped = format!("{first}{}{}", user("second prompt"), reply("stopped reply"));
+    fs::write(&path, &stopped).unwrap();
+    let accepted = stop();
+    assert!(accepted.status.success(), "{accepted:?}");
+    let request = queue.pending().unwrap().pop().unwrap();
+    let input = queue.read::<serde_json::Value>(&request).unwrap().payload["input"].clone();
+    assert_eq!(input["bytes"], stopped.len());
+    assert_eq!(input["receipt"]["bytes"], stopped.len());
+    assert_eq!(
+        input["sha256"],
+        hex::encode(Sha256::digest(stopped.as_bytes()))
+    );
+    assert_eq!(input["sha256"], input["receipt"]["sha256"]);
+    fs::write(
+        &path,
+        format!("{stopped}{end}{}", reply("later unfinished reply")),
+    )
+    .unwrap();
+    let recovered = lab.agit(&["hooks", "recover", key]).output().unwrap();
+    let repo = Repo::at(lab.agit_home.join("repos/me/qa"));
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert!(queue.pending().unwrap().is_empty());
+    let (_, view) = storage::materialize_pair_at(repo.root(), "refs/heads/s1").unwrap();
+    assert!(view.contains("stopped reply"));
+    assert!(!view.contains("later unfinished reply"));
+}
 
 /// A session start tells the model nothing, not even for a conversation agit manages: no binding,
 /// no commands and no saved environment, since anything there invites the agent to run agit in

@@ -312,6 +312,27 @@ pub fn run(args: Args) -> CmdResult {
     }
     print_upload_waits(&scope);
     print_save_waits(&scope);
+    match stop_request_status(&cwd, &scope) {
+        Ok(report) => {
+            for item in report["items"].as_array().into_iter().flatten() {
+                let state = item["description"]
+                    .as_str()
+                    .unwrap_or("outcome unavailable");
+                let recovery = stop_recovery_command(&item["recovery"])
+                    .filter(|_| item["worker_owned"] != true)
+                    .map(|command| format!("; recover with `{command}`"))
+                    .unwrap_or_default();
+                ui::warning(&format!("automatic save: {state}{recovery}"));
+            }
+            if report["unavailable"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+            {
+                ui::warning("some Stop request evidence could not be read; it has been retained");
+            }
+        }
+        Err(_) => ui::warning("queued Stop outcomes could not be read"),
+    }
     match capture_recovery_status(&cwd, &scope) {
         Ok(state) if state["state"] == "recovery_required" => ui::warning(
             "this folder has queued saves without a worker; run `agit project recover .` here",
@@ -899,6 +920,16 @@ fn capture_recovery_status(
     )
 }
 
+fn stop_request_status(cwd: &std::path::Path, scope: &Scope) -> anyhow::Result<serde_json::Value> {
+    super::stop_requests::status(
+        cwd,
+        match scope {
+            Scope::Machine => None,
+            Scope::Repository(repository) => Some(repository),
+        },
+    )
+}
+
 /// The local checkouts `scope` covers.
 fn in_scope_of(
     agents: Vec<(String, String, std::path::PathBuf)>,
@@ -1263,6 +1294,8 @@ fn structured(args: &Args, scope: &Scope, narrowed: bool) -> CmdResult {
         "save_waits": save_waits_json(scope),
         "capture_recovery": capture_recovery_status(&cwd, scope)
             .unwrap_or_else(|_| serde_json::json!({"state": "unavailable"})),
+        "stop_requests": stop_request_status(&cwd, scope)
+            .unwrap_or_else(|_| serde_json::json!({"items": null, "error": "queued Stop outcomes could not be read"})),
         "save_requests": match save_request_status(&cwd, scope) {
             Ok(report) => serde_json::json!({"items": report.items, "omitted": report.omitted, "error": null}),
             Err(_) => serde_json::json!({"items": null, "omitted": null, "error": "accepted save requests could not be read"}),
@@ -1800,6 +1833,20 @@ fn step_for<'a>(
 ) -> Option<&'a (String, String)> {
     let (slug, branch) = target.split_once('@')?;
     steps.get(&(slug.to_owned(), branch.to_owned()))
+}
+
+fn stop_recovery_command(recovery: &serde_json::Value) -> Option<String> {
+    #[cfg(windows)]
+    use crate::ui::quote_powershell_argument as quote_arg;
+    #[cfg(not(windows))]
+    use crate::ui::session::shell_arg as quote_arg;
+    let program = recovery["program"].as_str()?;
+    let args = recovery["args"].as_array()?;
+    std::iter::once(Some(program))
+        .chain(args.iter().map(serde_json::Value::as_str))
+        .map(|value| value.map(quote_arg))
+        .collect::<Option<Vec<_>>>()
+        .map(|words| words.join(" "))
 }
 
 fn inspect_command(target: &str) -> String {

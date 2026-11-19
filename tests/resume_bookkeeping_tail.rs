@@ -9,6 +9,9 @@
 #[path = "support/lab_env.rs"]
 mod lab_env;
 
+#[path = "support/stop_requests.rs"]
+mod stop_requests;
+
 use lab_env::LabEnv;
 use serde_json::json;
 use std::{
@@ -826,6 +829,15 @@ fn a_codex_turn_on_a_second_computer_is_saved_as_it_ends() {
             .unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success(), "{}", combined(&out));
+        stop_requests::finish(
+            lab.command()
+                .current_dir(&other)
+                .env("HOME", &home_b)
+                .env("AGIT_HOME", &store_b),
+            &store_b,
+            "codex",
+            session,
+        );
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let said = stop(&session, &transcript);
@@ -935,6 +947,15 @@ fn a_codex_turn_on_a_second_computer_is_saved_as_it_ends() {
         !String::from_utf8_lossy(&out.stdout).contains("isn't saved"),
         "{}",
         combined(&out)
+    );
+    stop_requests::finish(
+        lab.command()
+            .current_dir(&other)
+            .env("HOME", &home_b)
+            .env("AGIT_HOME", &store_b),
+        &store_b,
+        "codex",
+        &session,
     );
     assert!(landed(7));
     let head = tip();

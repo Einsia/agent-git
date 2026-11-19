@@ -1097,7 +1097,7 @@ pub(crate) fn authority_directory_exists(path: &Path) -> Result<bool> {
     Ok(checked_carrier(path, true, false)?.is_some())
 }
 
-fn open_file(path: &Path, write: bool, create: bool) -> Result<File> {
+pub(crate) fn open_file(path: &Path, write: bool, create: bool) -> Result<File> {
     open_carrier(path, write, create, true)
 }
 
@@ -1682,7 +1682,7 @@ impl ArchiveJournalGuard {
     }
 }
 
-fn create_namespace(directory: &Path) -> Result<()> {
+pub(crate) fn create_namespace(directory: &Path) -> Result<()> {
     checked_carrier(
         directory
             .parent()

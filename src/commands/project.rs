@@ -1,6 +1,7 @@
 //! Explicit project enrollment composes discovery, import and registered session publication.
 
 mod save_requests;
+pub(super) mod stops;
 
 use super::CmdResult;
 use crate::{
@@ -454,6 +455,8 @@ fn save(project: &Project) -> Result<()> {
     save_requests::save_policy(project)
 }
 
+pub(crate) use save_requests::stop_revisions;
+
 fn lock(root: &Path) -> Result<fs::File> {
     lock_at(
         state_path(root)?.with_extension("lock"),
@@ -573,6 +576,11 @@ fn coverage_at(root: &Path, path: &Path) -> Result<Option<Via>> {
 
 fn includes(project: &Project, path: &Path) -> Result<bool> {
     Ok(coverage(project, path)?.is_some())
+}
+
+/// A governed folder keeps project capture's preparation even when its policy is paused.
+pub(crate) fn has_governing_project(path: &Path) -> Result<bool> {
+    Ok(governing(path)?.is_some())
 }
 
 /// The project policy that covers `path`, paused or not, and how it covers it.
@@ -1904,12 +1912,16 @@ fn placement(project: &Project, candidate: &Candidate) -> Result<Placement> {
 /// hash of its identity so two sessions that open alike still get different branches. A request
 /// without Latin letters falls back to the runtime and the date.
 fn new_branch(project: &Project, candidate: &Candidate) -> String {
-    let identity = hash(&key(&candidate.runtime, &candidate.session_id));
     let gist = adapter::get(&candidate.runtime).ok().and_then(|adapter| {
         let path = adapter.resolve(&candidate.session_id, Some(&candidate.cwd))?;
         adapter.parse_at(&path).ok()?.gist(200)
     });
-    let words = gist.as_deref().map(branch_words).unwrap_or_default();
+    new_branch_from_gist(project, candidate, gist.as_deref())
+}
+
+fn new_branch_from_gist(project: &Project, candidate: &Candidate, gist: Option<&str>) -> String {
+    let identity = hash(&key(&candidate.runtime, &candidate.session_id));
+    let words = gist.map(branch_words).unwrap_or_default();
     let runtime = match candidate.runtime.as_str() {
         "claude-code" => "claude",
         other => other,
@@ -3392,7 +3404,7 @@ pub(crate) fn earlier_count(root: &Path) -> usize {
 }
 
 /// Whether a project captures this conversation by itself: Claude Code's and Codex's, whose hooks
-/// call [`capture`], OpenCode's once agit's plugin ran for it ([`opencode_capture_allowed`]), and
+/// call [`capture_stop`], OpenCode's once agit's plugin ran for it ([`opencode_capture_allowed`]), and
 /// Pi's once agit's extension ran for it ([`pi_capture_allowed`]).
 /// Any other conversation is saved only when someone imports it, so telling its agent the project
 /// saves it would leave it unsaved.
@@ -3406,15 +3418,36 @@ fn captured_runtime(runtime: &str, session: &str) -> bool {
 }
 
 /// Exact hook identity remains authoritative; a project policy never overrides another claim.
+pub(crate) enum StopCapture {
+    Unhandled,
+    Withheld,
+    Queued,
+}
+
+pub(crate) fn capture_stop(runtime: &str, session: &str, cwd: Option<&str>) -> Result<StopCapture> {
+    capture_inner(runtime, session, cwd, true)
+}
+
+#[cfg(test)]
 pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result<bool> {
+    capture_inner(runtime, session, cwd, false)
+        .map(|result| !matches!(result, StopCapture::Unhandled))
+}
+
+fn capture_inner(
+    runtime: &str,
+    session: &str,
+    cwd: Option<&str>,
+    stop: bool,
+) -> Result<StopCapture> {
     let Some(cwd) = cwd.and_then(|p| Path::new(p).canonicalize().ok()) else {
-        return Ok(false);
+        return Ok(StopCapture::Unhandled);
     };
     if !matches!(runtime, "codex" | "claude-code" | "opencode" | "pi") {
-        return Ok(false);
+        return Ok(StopCapture::Unhandled);
     }
     let Some((project, _)) = governing(&cwd)? else {
-        return Ok(false);
+        return Ok(StopCapture::Unhandled);
     };
     start_due_retries(&project);
     match runtime {
@@ -3424,7 +3457,7 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         _ => {}
     }
     if !captured_runtime(runtime, session) {
-        return Ok(false);
+        return Ok(StopCapture::Unhandled);
     }
     let candidate = Candidate {
         runtime: runtime.into(),
@@ -3432,27 +3465,39 @@ pub(crate) fn capture(runtime: &str, session: &str, cwd: Option<&str>) -> Result
         cwd,
     };
     if delegation_withheld(&project.repository, &candidate, Some(&project), true).unwrap_or(true) {
-        return Ok(true);
+        return Ok(StopCapture::Withheld);
     }
     // A session claimed elsewhere is left to its source repository.
     let branch = match placement(&project, &candidate) {
         Ok(Placement::Claim(branch)) => Some(branch),
         Ok(Placement::New) => None,
-        _ => return Ok(false),
+        _ => return Ok(StopCapture::Unhandled),
     };
     if withholds(&project, &candidate, true) {
         // Pausing the project stops passive capture only. A session claimed on another branch
         // (`agit run`, `resume --as`, an import) is settled from its link; a paused project
         // still blocks its automatic push. A session no project has claimed has nothing to settle.
-        return Ok(branch.is_none_or(|branch| branch == capture_branch(runtime, session)));
+        return Ok(
+            if branch.is_none_or(|branch| branch == capture_branch(runtime, session)) {
+                StopCapture::Withheld
+            } else {
+                StopCapture::Unhandled
+            },
+        );
     }
-    enqueue(&project.root, &candidate)?;
+    if stop {
+        super::hooks::require_stop_admission_ready()?;
+        stops::enqueue(&project, &candidate)
+            .map_err(|error| error.context(super::stop_requests::AdmissionFailed))?;
+    } else {
+        enqueue(&project.root, &candidate)?;
+    }
     // The probe lock is released before spawning, so the new worker can take it.
     let idle = capture_worker(&project.root)?.is_some();
     if idle && spawn_capture(&project.root).is_err() {
         return Err(CaptureRecoveryRequired.into());
     }
-    Ok(true)
+    Ok(StopCapture::Queued)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3972,6 +4017,7 @@ pub(crate) fn capture_pending(runtime: &str, session: &str, cwd: &Path) -> bool 
     };
     let name = hash(&key(runtime, session));
     if save_requests::contains(&project.root, runtime, session).unwrap_or(false)
+        || stops::contains(&project.root, runtime, session).unwrap_or(false)
         || pending_dir(&project.root).is_ok_and(|pending| {
             pending.join(&name).exists() || pending.join(&name).with_extension("running").exists()
         })
@@ -4003,7 +4049,10 @@ fn capture_worker(root: &Path) -> Result<Option<fs::File>> {
 }
 
 fn capture_recovery(root: &Path) -> Result<serde_json::Value> {
-    if markers(root)?.is_empty() && capture_markers(root, true)?.is_empty() {
+    if markers(root)?.is_empty()
+        && capture_markers(root, true)?.is_empty()
+        && !stops::pending(root)?
+    {
         return Ok(serde_json::json!({"state": "idle"}));
     }
     let state = match fs::File::open(state_path(root)?.with_extension("capture")) {
@@ -4062,8 +4111,9 @@ fn drain_then(root: &Path, retrying: bool) -> Result<()> {
     drain_owned(root, retrying, worker)
 }
 
-fn queued_work(root: &Path) -> Result<bool> {
+fn queued_work(root: &Path, stopped: &BTreeSet<String>) -> Result<bool> {
     Ok(save_requests::pending(root)?
+        || stops::unseen(root, stopped)?
         || !markers(root)?.is_empty()
         || !capture_markers(root, true)?.is_empty()
         || catch_up_requested(root)?)
@@ -4071,10 +4121,10 @@ fn queued_work(root: &Path) -> Result<bool> {
 
 /// Every owner releases and then checks arrivals. Explicit producers also start a waiting
 /// successor, so an arrival after this check still has a worker.
-fn finish_capture(root: &Path, worker: fs::File) -> Result<bool> {
+fn finish_capture(root: &Path, worker: fs::File, stopped: &BTreeSet<String>) -> Result<bool> {
     fs2::FileExt::unlock(&worker)?;
     drop(worker);
-    queued_work(root)
+    queued_work(root, stopped)
 }
 
 fn exclude_capture(
@@ -4138,8 +4188,10 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
     let mut recovered = false;
     let mut blocked = BTreeSet::new();
     let mut capture_failure = None;
+    let mut stopped = BTreeSet::new();
     loop {
         let pass = (|| -> Result<Option<i64>> {
+            stops::drain(root, &mut stopped, retrying)?;
             let requested_retry = save_requests::drain(root)?;
             if take_catch_up(root)?
                 && let Some(project) = read(root)?
@@ -4193,7 +4245,7 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
             })
         })();
         drop(release_capture());
-        let more = finish_capture(root, worker)?;
+        let more = finish_capture(root, worker, &stopped)?;
         if let Some(error) = capture_failure.take() {
             return Err(error);
         }
@@ -4234,7 +4286,9 @@ fn drain_owned(root: &Path, retrying: bool, mut worker: fs::File) -> Result<()> 
 /// the folder: a worker that was stopped, or a computer that slept through the try, leaves it due
 /// until something runs in the folder. It only starts the worker, and returns at once.
 fn start_due_retries(project: &Project) {
-    if save_requests::pending(&project.root).unwrap_or(false) {
+    if save_requests::pending(&project.root).unwrap_or(false)
+        || stops::unseen(&project.root, &BTreeSet::new()).unwrap_or(false)
+    {
         let _ = spawn_capture_mode(&project.root, true);
         return;
     }
@@ -4263,7 +4317,9 @@ pub fn start_due_retries_here(cwd: &Path) {
     };
     let mut restarted = BTreeSet::new();
     for root in cwd.ancestors() {
-        if save_requests::pending(root).unwrap_or(false) {
+        if save_requests::pending(root).unwrap_or(false)
+            || stops::unseen(root, &BTreeSet::new()).unwrap_or(false)
+        {
             let _ = spawn_capture_mode(root, true);
             restarted.insert(root.to_owned());
         }
@@ -4327,8 +4383,10 @@ fn run_due_retries(root: &Path) -> Result<Option<i64>> {
     let now = super::upload_outcome::now();
     for due in super::upload_outcome::retries(&project.repository, &branches) {
         if due.at <= now
-            && save_requests::retry_owner(&project.repository, &due)?
+            && stops::retry_owner(&due)?
+                .or(save_requests::retry_owner(&project.repository, &due)?)
                 .is_none_or(|owner| owner == root)
+            && !stops::retry(root, &project.repository, &due)?
         {
             retry_one(&project, &repo, &due)?;
         }
@@ -4336,7 +4394,8 @@ fn run_due_retries(root: &Path) -> Result<Option<i64>> {
     let mut next = None;
     for due in super::upload_outcome::retries(&project.repository, &branches) {
         if due.at > now
-            && save_requests::retry_owner(&project.repository, &due)?
+            && stops::retry_owner(&due)?
+                .or(save_requests::retry_owner(&project.repository, &due)?)
                 .is_none_or(|owner| owner == root)
         {
             next = Some(next.map_or(due.at, |before: i64| before.min(due.at)));
@@ -4680,7 +4739,7 @@ pub(crate) fn save_now(
         }
         Ok(saved)
     })();
-    if finish_capture(root, worker)? {
+    if finish_capture(root, worker, &BTreeSet::new())? {
         let _ = spawn_capture_mode(root, true);
     }
     result
@@ -4700,7 +4759,7 @@ pub(crate) fn prepare_save(root: &Path) -> Result<Option<OpencodeLook>> {
     };
     let looked = look_for_earlier_opencode(&root);
     let _ = look_for_earlier_pi(&root);
-    if finish_capture(&root, worker)? {
+    if finish_capture(&root, worker, &BTreeSet::new())? {
         let _ = spawn_capture_mode(&root, true);
     }
     looked

@@ -668,7 +668,7 @@ fn written_for_branch(lk: &Link) -> bool {
 /// Why a Codex conversation's turns don't settle onto `slug`@`branch`, whichever way the
 /// settlement is asked for: its link names the branch without a writer that answers for the
 /// folder, and it runs outside the folder the branch's line records.
-fn outside_folder(repo: &Repo, slug: &str, branch: &str, lk: &Link) -> Option<String> {
+pub(super) fn outside_folder(repo: &Repo, slug: &str, branch: &str, lk: &Link) -> Option<String> {
     let meta = crate::domain::meta::read_at_ref(repo, &format!("refs/heads/{branch}"))?;
     (lk.source == "codex"
         && !written_for_branch(lk)
@@ -706,10 +706,71 @@ pub(crate) fn signed_out(lk: &Link) -> Option<&'static str> {
 }
 
 pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
+    settle_link_request(store, lk, None)
+}
+
+/// A queued Stop records its result while settlement still holds the branch and Link locks.
+pub(crate) trait QueuedStop {
+    fn project_capture(&self) -> bool {
+        false
+    }
+    fn receipt(&self) -> Option<StopReceipt>;
+    fn input_boundary(&self) -> (usize, &str);
+    fn admits(&self, current: &Link) -> crate::Result<bool>;
+    fn withheld(&mut self, reason: StopWithheld) -> crate::Result<()>;
+    fn saving(&mut self, parent: Option<&str>, covered: bool) -> crate::Result<()>;
+    fn settled(
+        &mut self,
+        repo: &Repo,
+        current: &Link,
+        tip: Option<&str>,
+        covered: bool,
+        memory: crate::domain::stop_requests::MemoryOutcome,
+    ) -> crate::Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopWithheld {
+    AutomaticSavingOff,
+    Delegated,
+    MissingLink,
+    AuthorityChanged,
+    MergePaused,
+    Sealed,
+    SaveFailed,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("the queued Stop input changed or is unavailable; its request is retained")]
+pub(crate) struct QueuedInputUnavailable;
+
+pub(crate) fn settle_queued_link(
+    store: &Store,
+    lk: Link,
+    request: &mut dyn QueuedStop,
+) -> CmdResult {
+    anyhow::ensure!(
+        lk.merge_archive.is_none(),
+        "Archive settlement cannot enter a Stop worker"
+    );
+    settle_link_request(store, lk, Some(request))
+}
+
+fn settle_link_request(
+    store: &Store,
+    lk: Link,
+    mut request: Option<&mut dyn QueuedStop>,
+) -> CmdResult {
     if let Some(code) = delegated_settlement(true)? {
+        if let Some(request) = request.as_mut() {
+            request.withheld(StopWithheld::Delegated)?;
+        }
         return Ok(code);
     }
     if super::config::get("commit.auto").as_deref() == Some("false") {
+        if let Some(request) = request.as_mut() {
+            request.withheld(StopWithheld::AutomaticSavingOff)?;
+        }
         return Ok(ExitCode::Ok);
     }
     archive::require_selected_role(Some(&lk))?;
@@ -754,29 +815,46 @@ pub(crate) fn settle_from_link(store: &Store, lk: Link) -> CmdResult {
     // branch never lands here, and one agit continued on another computer, in a folder of its
     // own, does.
 
-    let stop_receipt = observe_stop(&lk);
-    settle(
-        store,
-        &dir,
-        &slug,
-        &branch,
-        lk,
-        &owner,
-        SettleOpts {
-            milestone: None,
-            milestone_turn: None,
-            tag: None,
-            code: false,
-            completed_only: false,
-            native_completions: Vec::new(),
-            stop_receipt,
-            historical: false,
-            message: None,
-            paths: Vec::new(),
-            quiet: true,
-            capture: false,
-        },
-    )
+    let stop_receipt = match &request {
+        Some(request) => request.receipt(),
+        None => observe_stop(&lk),
+    };
+    let opts = SettleOpts {
+        milestone: None,
+        milestone_turn: None,
+        tag: None,
+        code: false,
+        completed_only: request.is_some() && lk.source == "codex",
+        native_completions: Vec::new(),
+        stop_receipt,
+        historical: false,
+        message: None,
+        paths: Vec::new(),
+        quiet: true,
+        capture: request
+            .as_ref()
+            .is_some_and(|request| request.project_capture()),
+    };
+    if let Some(request) = request {
+        if let Some(repo) = Repo::open(&dir)
+            && let Some(refusal) = outside_folder(&repo, &slug, &branch, &lk)
+        {
+            anyhow::bail!("{refusal}");
+        }
+        return crate::telemetry::measure_command(crate::telemetry::Operation::Settlement, || {
+            settle_local_telemetry_inner(
+                store,
+                &dir,
+                &slug,
+                &branch,
+                lk,
+                &owner,
+                opts,
+                Some(request),
+            )
+        });
+    }
+    settle(store, &dir, &slug, &branch, lk, &owner, opts)
 }
 
 /// How long a Claude Code Stop waits for the stopped execution's last record to reach the file.
@@ -790,9 +868,11 @@ const STOP_RECORD_POLL: std::time::Duration = std::time::Duration::from_millis(5
 /// receipt, a continuation that runs without a new prompt (a goal turn, say) settles only at
 /// some later Stop, and the last one never does. The receipt names the bytes the hook read, and
 /// settlement uses it only while they are still, byte for byte, the transcript's prefix.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StopReceipt {
-    bytes: usize,
-    sha256: String,
+    pub(super) bytes: usize,
+    pub(super) sha256: String,
 }
 
 impl StopReceipt {
@@ -801,6 +881,11 @@ impl StopReceipt {
         transcript
             .get(..self.bytes)
             .is_some_and(|prefix| hex::encode(sha2::Sha256::digest(prefix)) == self.sha256)
+    }
+
+    fn prefix<'a>(&self, transcript: &'a [u8]) -> crate::Result<&'a [u8]> {
+        anyhow::ensure!(self.proves(transcript), QueuedInputUnavailable);
+        Ok(&transcript[..self.bytes])
     }
 }
 
@@ -811,7 +896,7 @@ impl StopReceipt {
 /// disk, and then needs no receipt. Codex is blocked until the hook returns, so the bytes it
 /// has written are exactly the finished execution; it gets a receipt unless the execution after
 /// its last completion record still has a call without output, or holds nothing but bookkeeping.
-fn observe_stop(lk: &Link) -> Option<StopReceipt> {
+pub(crate) fn observe_stop(lk: &Link) -> Option<StopReceipt> {
     match lk.source.as_str() {
         "claude-code" => {
             let deadline = std::time::Instant::now() + STOP_RECORD_GRACE;
@@ -832,10 +917,74 @@ fn observe_stop(lk: &Link) -> Option<StopReceipt> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "automatic saving could not read this Stop within its input allowance; this Stop was not queued; run `agit save` to save it explicitly"
+)]
+pub(crate) struct StopInputUnavailable;
+
+/// The queued receipt and digest describe one foreground read of the complete logical stream.
+pub(crate) fn observe_queued_stop(
+    lk: &Link,
+) -> crate::Result<(std::path::PathBuf, Vec<u8>, Option<StopReceipt>)> {
+    if lk.source != "codex" {
+        let receipt = observe_stop(lk);
+        let path = lk
+            .resolve()
+            .context("the Stop's native source is unavailable")?
+            .canonicalize()?;
+        return Ok((path, lk.read_bytes()?, receipt));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let limits = crate::adapter::native_snapshot::Limits {
+        bytes: 16 * 1024 * 1024,
+        records: 32_768,
+        working_bytes: 64 * 1024 * 1024,
+        lookup_entries: 16_384,
+    };
+    let (path, bytes) = lk
+        .read_codex_stop_bytes(limits, deadline)
+        .map_err(|_| StopInputUnavailable)?;
+    let receipt = queued_codex_receipt(&bytes, limits, deadline)?;
+    Ok((path, bytes, receipt))
+}
+
+/// An expired or oversized observation is a refusal, never a receipt-free successful admission.
+fn queued_codex_receipt(
+    bytes: &[u8],
+    limits: crate::adapter::native_snapshot::Limits,
+    deadline: std::time::Instant,
+) -> crate::Result<Option<StopReceipt>> {
+    anyhow::ensure!(std::time::Instant::now() < deadline, StopInputUnavailable);
+    anyhow::ensure!(
+        bytes.len() <= limits.bytes
+            && bytes
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .take(limits.records + 1)
+                .count()
+                <= limits.records,
+        StopInputUnavailable
+    );
+    let receipt = codex_stop_receipt(bytes);
+    // Parsing and ordinary filesystem reads cannot be interrupted portably; late results refuse.
+    anyhow::ensure!(std::time::Instant::now() < deadline, StopInputUnavailable);
+    Ok(receipt)
+}
+
 /// A Codex Stop's receipt for the bytes its hook read, if they hold a finished execution.
 fn codex_stop_receipt(bytes: &[u8]) -> Option<StopReceipt> {
     let end = bytes.iter().rposition(|byte| *byte == b'\n')? + 1;
     let text = std::str::from_utf8(&bytes[..end]).ok()?;
+    // A delegated task's terminal record proves completion; a hook cannot stop its writer.
+    if text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .is_some_and(|header| crate::adapter::codex::delegated_header(&header))
+    {
+        return None;
+    }
     let adapter = crate::adapter::get("codex").ok()?;
     let ir = adapter.parse(text).ok()?;
     let completed = ir
@@ -1897,6 +2046,99 @@ fn completion_boundaries(
     Ok((end, boundaries))
 }
 
+/// A queued Stop covers conversation through its completed execution, excluding bookkeeping.
+fn queued_completion_boundary(
+    runtime: &str,
+    bytes: &[u8],
+    opts: &SettleOpts,
+    origin: usize,
+) -> crate::Result<Option<usize>> {
+    let text = std::str::from_utf8(bytes)?;
+    let adapter = crate::adapter::get(runtime)?;
+    let ir = adapter.parse(text)?;
+    let receipts = opts
+        .native_completions
+        .iter()
+        .filter_map(|end| end.checked_sub(origin))
+        .collect::<Vec<_>>();
+    let end =
+        if opts.completed_only || !receipts.is_empty() || records_completions(runtime, text, &ir) {
+            completion_boundaries(runtime, text, receipts, opts.completed_only)?.0
+        } else {
+            turn_chunks(text, &ir, &adapter.open_tool_calls(text))
+                .last()
+                .map_or(0, |chunk| chunk.end_byte)
+        };
+    if substantive_from(text, &ir, end) {
+        return Ok(None);
+    }
+    let starts = line_starts(text);
+    Ok(ir
+        .events
+        .iter()
+        .filter(|event| crate::adapter::is_conversation(event.kind))
+        .filter_map(|event| event.line)
+        .filter_map(|line| {
+            starts
+                .get(line)
+                .map(|start| (*start, starts.get(line + 1).copied().unwrap_or(text.len())))
+        })
+        .filter(|(start, _)| *start < end)
+        .map(|(_, next)| origin + next.min(end))
+        .max())
+}
+
+/// Coverage must prove the same input prefix; offsets alone cannot certify a rewritten source.
+fn queued_covered_tip<'a>(
+    link: &'a Link,
+    required: Option<usize>,
+    bytes: &[u8],
+    prepared: Option<&continuation::Prepared>,
+    limit: usize,
+) -> Option<&'a str> {
+    let required = required? as u64;
+    let proves = |end: u64, hash: &str| {
+        if end < required || end > limit as u64 {
+            return false;
+        }
+        let receipt = StopReceipt {
+            bytes: end as usize,
+            sha256: hash.to_owned(),
+        };
+        prepared.map_or_else(
+            || receipt.proves(bytes),
+            |prepared| prepared.proves(&receipt),
+        )
+    };
+    if let (Some(end), Some(hash), Some(tip)) = (
+        link.baseline_bytes,
+        link.baseline_hash.as_deref(),
+        link.materialized_from.as_deref(),
+    ) && proves(end, hash)
+    {
+        return Some(tip);
+    }
+    link.native_checkpoint
+        .iter()
+        .chain(link.settled_prefixes.iter())
+        .filter(|checkpoint| proves(checkpoint.bytes, &checkpoint.sha256))
+        .min_by_key(|checkpoint| checkpoint.bytes)
+        .map(|checkpoint| checkpoint.tip.as_str())
+}
+
+fn verify_queued_coverage(
+    repo: &Repo,
+    checkpoint: Option<&str>,
+    branch_tip: Option<&str>,
+) -> crate::Result<()> {
+    if let Some(checkpoint) = checkpoint {
+        let branch_tip = branch_tip.context("the queued Stop's covered branch is missing")?;
+        repo.git(&["merge-base", "--is-ancestor", checkpoint, branch_tip])
+            .context("the queued Stop's covered execution is absent from its branch")?;
+    }
+    Ok(())
+}
+
 /// The byte offset at which each line of `region` starts.
 fn line_starts(region: &str) -> Vec<usize> {
     let mut offset = 0;
@@ -2187,10 +2429,11 @@ fn settle_local(
     opts: SettleOpts,
 ) -> CmdResult {
     crate::telemetry::measure_command(crate::telemetry::Operation::Settlement, || {
-        settle_local_telemetry_inner(store, repo_dir, slug, branch, lk, owner, opts)
+        settle_local_telemetry_inner(store, repo_dir, slug, branch, lk, owner, opts, None)
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_local_telemetry_inner(
     store: &Store,
     repo_dir: &Path,
@@ -2199,6 +2442,7 @@ fn settle_local_telemetry_inner(
     mut lk: Link,
     owner: &str,
     opts: SettleOpts,
+    mut requested: Option<&mut dyn QueuedStop>,
 ) -> CmdResult {
     let quiet = opts.quiet;
     if branch == "main" {
@@ -2230,6 +2474,9 @@ fn settle_local_telemetry_inner(
     let _link_guard = link::lock(store, &lk.source, &lk.session_id)?;
     // Missing or unreadable metadata cannot prove that the resolved claim remains active.
     let Some(current) = link::get(store, &lk.source, &lk.session_id) else {
+        if let Some(request) = requested.as_mut() {
+            request.withheld(StopWithheld::MissingLink)?;
+        }
         if quiet {
             return Ok(ExitCode::Ok);
         }
@@ -2242,6 +2489,12 @@ fn settle_local_telemetry_inner(
         return archive::checked(Err(anyhow::anyhow!(
             "ordinary settlement Link changed to an archive role; retry with its exact native identity"
         )));
+    }
+    if let Some(request) = requested.as_mut()
+        && !request.admits(&current)?
+    {
+        request.withheld(StopWithheld::AuthorityChanged)?;
+        return Ok(ExitCode::Policy);
     }
     // A hook's selection cannot authorize a routing identity changed while it waits for locks.
     if quiet
@@ -2311,6 +2564,9 @@ fn settle_local_telemetry_inner(
     // repository stops for the duration of the transaction".
     if quiet {
         if mergetx::hook_suspended(repo.root(), branch) {
+            if let Some(request) = requested.as_mut() {
+                request.withheld(StopWithheld::MergePaused)?;
+            }
             return Ok(ExitCode::Ok);
         }
     } else if let Some(tx) = mergetx::locking(repo.root(), branch) {
@@ -2323,6 +2579,9 @@ fn settle_local_telemetry_inner(
     }
     // A sealed branch is not writable.
     if super::branch::is_sealed(&repo, branch) {
+        if let Some(request) = requested.as_mut() {
+            request.withheld(StopWithheld::Sealed)?;
+        }
         ui::error(&format!("`{branch}` is sealed — read-only."));
         ui::hint(&format!(
             "fork it to keep working: `agit fork {branch} -b <new> --resume`"
@@ -2352,23 +2611,51 @@ fn settle_local_telemetry_inner(
     }
     // Source selection and settlement share one immutable branch parent.
     let settlement_tip = optional_branch_commit(&repo, &format!("refs/heads/{branch}"))?;
-    let prepared = if lk.source == "claude-code" && opts.completed_only {
+    let queued_prefix = requested.as_ref().map(|request| {
+        let (bytes, sha256) = request.input_boundary();
+        StopReceipt {
+            bytes,
+            sha256: sha256.to_owned(),
+        }
+    });
+    let prepared = if requested.is_some() || lk.source == "claude-code" && opts.completed_only {
         None
     } else {
-        continuation::Prepared::read(&lk, &repo, settlement_tip.as_deref())
+        continuation::Prepared::read(&lk, &repo, settlement_tip.as_deref()).filter(|prepared| {
+            requested.is_none()
+                || queued_prefix
+                    .as_ref()
+                    .is_none_or(|receipt| prepared.proves(receipt))
+        })
     };
     let whole;
     let bytes = if let Some(prepared) = &prepared {
         prepared.bytes.as_slice()
     } else {
         whole = lk.read_bytes().map_err(|e| {
-            if quiet {
+            if requested.is_some() {
+                e.context(QueuedInputUnavailable)
+            } else if quiet {
                 anyhow::anyhow!("quiet: {e:#}")
             } else {
                 e
             }
         })?;
         whole.as_slice()
+    };
+    let bytes = if let Some(receipt) = &queued_prefix {
+        if let Some(prepared) = &prepared {
+            anyhow::ensure!(prepared.proves(receipt), QueuedInputUnavailable);
+            let end = receipt
+                .bytes
+                .checked_sub(prepared.state.origin as usize)
+                .context(QueuedInputUnavailable)?;
+            bytes.get(..end).context(QueuedInputUnavailable)?
+        } else {
+            receipt.prefix(bytes)?
+        }
+    } else {
+        bytes
     };
     #[cfg(unix)]
     let opts = {
@@ -2386,30 +2673,80 @@ fn settle_local_telemetry_inner(
         opts
     };
     let mut opts = opts;
-    if let Some(receipt) = opts.stop_receipt.take()
-        && prepared.as_ref().map_or_else(
+    if let Some(receipt) = opts.stop_receipt.take() {
+        let proved = prepared.as_ref().map_or_else(
             || receipt.proves(bytes),
             |prepared| prepared.proves(&receipt),
-        )
+        );
+        anyhow::ensure!(proved || requested.is_none(), QueuedInputUnavailable);
+        if proved {
+            opts.native_completions.push(receipt.bytes);
+        }
+    }
+    let origin = prepared
+        .as_ref()
+        .map_or(0, |prepared| prepared.state.origin as usize);
+    let required = if requested.is_some() {
+        queued_completion_boundary(&lk.source, bytes, &opts, origin)?
+    } else {
+        None
+    };
+    let covered_tip = requested
+        .as_ref()
+        .and_then(|_| {
+            queued_covered_tip(
+                &lk,
+                required,
+                bytes,
+                prepared.as_ref(),
+                origin + bytes.len(),
+            )
+        })
+        .map(str::to_owned);
+    verify_queued_coverage(&primary, covered_tip.as_deref(), settlement_tip.as_deref())?;
+    if let Some(tip) = &covered_tip
+        && (lk
+            .native_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.bytes > (origin + bytes.len()) as u64)
+            || lk
+                .baseline_bytes
+                .is_some_and(|end| end > (origin + bytes.len()) as u64))
+        && let Some(request) = requested.as_mut()
     {
-        opts.native_completions.push(receipt.bytes);
+        // Current memory cannot be attributed to an older execution once a later prefix lands.
+        request.settled(
+            &primary,
+            &lk,
+            Some(tip),
+            true,
+            crate::domain::stop_requests::MemoryOutcome::Superseded,
+        )?;
+        return Ok(ExitCode::Ok);
+    }
+    if let Some(request) = requested.as_mut() {
+        request.saving(settlement_tip.as_deref(), covered_tip.is_some())?;
     }
     let memory_link = lk.clone();
     let milestone = opts.milestone.is_some();
-    let code = settle_bytes_at(
-        store,
-        &repo,
-        slug,
-        branch,
-        lk,
-        bytes,
-        owner,
-        opts,
-        fresh,
-        quiet,
-        settlement_tip,
-        prepared.as_ref(),
-    )?;
+    let code = if covered_tip.is_some() {
+        ExitCode::Ok
+    } else {
+        settle_bytes_at(
+            store,
+            &repo,
+            slug,
+            branch,
+            lk,
+            bytes,
+            owner,
+            opts,
+            fresh,
+            quiet,
+            settlement_tip,
+            prepared.as_ref(),
+        )?
+    };
 
     // Memory: what changed in the runtime directory since the last sync is collected onto this
     // branch as one file commit. Collect it even when the transcript has no new turn — memory can
@@ -2420,11 +2757,28 @@ fn settle_local_telemetry_inner(
     // compares it against the post-settlement watermark, and since the memory commit lands after
     // the transcript commits, the receipt moves forward with it; when there is only memory and no
     // new turn, the receipt is written here too.
+    use crate::domain::stop_requests::MemoryOutcome;
+    let mut memory = MemoryOutcome::NotApplicable;
     if code == ExitCode::Ok
         && let Some(cwd) = memory_link.cwd.as_deref()
     {
+        if requested.is_some() {
+            super::hooks::clean_runtime_memory(&memory_link.source, Some(Path::new(cwd)));
+        }
         match super::memory::collect(&primary, branch, slug, &memory_link.source, Path::new(cwd)) {
             Ok(Some(report)) => {
+                memory = if report.tracking_off {
+                    MemoryOutcome::TrackingOff
+                } else {
+                    MemoryOutcome::Collected {
+                        changed: report.commit.is_some(),
+                        withheld: !report.refused.is_empty()
+                            || !report.pending.is_empty()
+                            || !report.not_text.is_empty()
+                            || !report.privacy_excluded.is_empty(),
+                        warnings: !report.warnings.is_empty(),
+                    }
+                };
                 // Record the receipt before reporting: the commit is a fact, and a warning in
                 // the report (the baseline was not written) does not change it.
                 if let Some(commit) = &report.commit {
@@ -2436,6 +2790,7 @@ fn settle_local_telemetry_inner(
             }
             Ok(None) => {}
             Err(error) => {
+                memory = MemoryOutcome::Failed;
                 if !quiet {
                     ui::warning(&format!("memory was not collected: {error:#}"));
                 }
@@ -2462,6 +2817,30 @@ fn settle_local_telemetry_inner(
         let candidate = primary.git(&["rev-parse", &format!("refs/heads/{branch}")])?;
         if advance_materialized_tip(&primary, &mut current, candidate.trim())? {
             link::write(store, &current)?;
+        }
+    }
+    if let Some(request) = requested {
+        if code == ExitCode::Ok {
+            let current = link::get_checked(store, &memory_link.source, &memory_link.session_id)?
+                .context("the queued Stop's Link is unavailable after settlement")?;
+            let tip = optional_branch_commit(&primary, &format!("refs/heads/{branch}"))?;
+            let checkpoint = queued_covered_tip(
+                &current,
+                required,
+                bytes,
+                prepared.as_ref(),
+                origin + bytes.len(),
+            );
+            verify_queued_coverage(&primary, checkpoint, tip.as_deref())?;
+            request.settled(
+                &primary,
+                &current,
+                tip.as_deref(),
+                checkpoint.is_some(),
+                memory,
+            )?;
+        } else {
+            request.withheld(StopWithheld::SaveFailed)?;
         }
     }
     Ok(code)
@@ -3266,7 +3645,7 @@ fn settle_bytes_at(
                 let current =
                     std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
                 if current.is_none() || current == link_disk_at_entry {
-                    link::write(store, &lk)?;
+                    link::write_settled(store, &lk)?;
                 }
             }
             record_supervisor_result(&commit)?;
@@ -4030,7 +4409,7 @@ fn settle_bytes_at(
     let link_disk_now = std::fs::read(link::link_path(store, &lk.source, &lk.session_id)).ok();
     // No link on disk = no claim to flatten, so a first settlement persists as usual.
     if link_disk_now.is_none() || link_disk_now == link_disk_at_entry {
-        link::write(store, &lk)?;
+        link::write_settled(store, &lk)?;
     } else if !quiet {
         ui::warning(
             "the session link was re-routed while this settlement ran — leaving the new claim in place",
@@ -6547,7 +6926,7 @@ mod tests {
     /// own commit. A resumed rollout keeps the same cut although its rendered prefix carries no
     /// completion records.
     #[test]
-    fn native_completions_settle_each_execution_once_and_never_a_partial_turn() {
+    fn native_completions_and_queued_stops_settle_each_execution_once_and_never_a_partial_turn() {
         let (_directory, store) = store();
         let (_repository, repo) = setup_repo();
         let end = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
@@ -6579,9 +6958,46 @@ mod tests {
             |text: &str, completed_only, fresh| settle_with(text, completed_only, &[], fresh);
         // What the Stop hook passes: the receipt is refused or names the bytes the hook read.
         let stop = |text: &str| {
-            let receipt = codex_stop_receipt(text.as_bytes()).expect("a finished execution");
+            use crate::adapter::native_snapshot::Limits;
+            let limits = Limits {
+                bytes: text.len(),
+                records: text.lines().count(),
+                ..Limits::default()
+            };
+            let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let receipt = queued_codex_receipt(text.as_bytes(), limits, deadline())
+                .unwrap()
+                .expect("a finished execution");
+            assert_eq!(Some(receipt.clone()), codex_stop_receipt(text.as_bytes()));
+            for exceeded in [
+                Limits {
+                    bytes: limits.bytes - 1,
+                    ..limits
+                },
+                Limits {
+                    records: limits.records - 1,
+                    ..limits
+                },
+            ] {
+                assert!(queued_codex_receipt(text.as_bytes(), exceeded, deadline()).is_err());
+            }
+            assert!(
+                queued_codex_receipt(text.as_bytes(), limits, std::time::Instant::now()).is_err()
+            );
             assert_eq!(receipt.bytes, text.len());
-            settle_with(text, false, &[receipt.bytes], false);
+            let persisted = serde_json::to_vec(&receipt).unwrap();
+            let receipt: StopReceipt = serde_json::from_slice(&persisted).unwrap();
+            // A delayed worker uses the admitted execution even after the runtime starts another.
+            let resumed = format!("{text}{end}{}", codex_asst("later unfinished execution"));
+            let frozen = receipt.prefix(resumed.as_bytes()).unwrap();
+            settle_with(
+                std::str::from_utf8(frozen).unwrap(),
+                false,
+                &[receipt.bytes],
+                false,
+            );
+            let rewritten = resumed.replacen("session_meta", "session_Meta", 1);
+            assert!(receipt.prefix(rewritten.as_bytes()).is_err());
         };
         let head = || repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
         settle(&active, true, true);
@@ -6615,6 +7031,34 @@ mod tests {
         assert!(view.contains("final reply"));
         let tip = head();
         let finished = format!("{answered}{end}");
+        let mut queued = opts();
+        queued.completed_only = true;
+        assert_eq!(
+            queued_completion_boundary("codex", finished.as_bytes(), &queued, 0).unwrap(),
+            Some(answered.len())
+        );
+        let saved_claim = link::get(&store, "codex", "AB").unwrap();
+        assert_eq!(
+            queued_covered_tip(
+                &saved_claim,
+                Some(answered.len()),
+                finished.as_bytes(),
+                None,
+                finished.len()
+            ),
+            Some(tip.as_str())
+        );
+        let rewritten = finished.replace("final reply", "other reply");
+        assert!(
+            queued_covered_tip(
+                &saved_claim,
+                Some(answered.len()),
+                rewritten.as_bytes(),
+                None,
+                rewritten.len()
+            )
+            .is_none()
+        );
         assert!(codex_stop_receipt(finished.as_bytes()).is_none());
         for completed_only in [false, true] {
             settle(&finished, completed_only, false);

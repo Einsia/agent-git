@@ -423,6 +423,24 @@ impl Link {
         adapter.read_native_bytes_at(&self.session_id, &p)
     }
 
+    /// Stop admission reads a bounded logical stream while the native execution is stopped.
+    #[cfg(feature = "cli")]
+    pub(crate) fn read_codex_stop_bytes(
+        &self,
+        limits: adapter::native_snapshot::Limits,
+        deadline: std::time::Instant,
+    ) -> Result<(PathBuf, Vec<u8>)> {
+        anyhow::ensure!(
+            self.source == "codex",
+            "a Codex Stop requires a Codex claim"
+        );
+        if self.native_binding.is_some() {
+            self.read_source_stop_bytes(limits, deadline)
+        } else {
+            adapter::codex::read_stop_bytes(&self.session_id, limits, deadline)
+        }
+    }
+
     /// Read the transcript.
     pub fn read(&self) -> Result<String> {
         let bytes = self.read_bytes()?;
@@ -464,6 +482,17 @@ pub fn lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::Fi
     Ok(f)
 }
 
+/// Stop admission must refuse contention instead of waiting for a settlement's native claim.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn try_lock(store: &Store, source: &str, session_id: &str) -> Result<std::fs::File> {
+    let dir = store.root().join(source);
+    let path = dir.join(format!("{session_id}.json.lock"));
+    let file = open_lock_file(&dir, &path)?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .context("the Stop's native claim is busy; this request was not accepted")?;
+    Ok(file)
+}
+
 /// Create and open one of the link, branch or repository lock files. A refused write is reported
 /// as agit's home not being writable rather than as a problem with the lock itself.
 fn open_lock_file(dir: &Path, path: &Path) -> Result<std::fs::File> {
@@ -480,12 +509,40 @@ fn open_lock_file(dir: &Path, path: &Path) -> Result<std::fs::File> {
 }
 
 pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
+    write_inner(store, link, false)
+}
+
+/// Settlement may learn the native cwd while retaining the same locked claim.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn write_settled(store: &Store, link: &Link) -> Result<PathBuf> {
+    write_inner(store, link, true)
+}
+
+fn write_inner(store: &Store, link: &Link, settlement: bool) -> Result<PathBuf> {
     link.validate()?;
     let dir = store.root().join(&link.source);
     crate::infra::config::create_state_dir(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     let lp = link_path(store, &link.source, &link.session_id);
-    if read(&lp).is_some_and(|before| launch::unsettles(&before, link)) {
+    let previous = read(&lp);
+    #[cfg(any(feature = "cli", test))]
+    if !(settlement
+        && previous.as_ref().is_some_and(|previous| {
+            super::stop_requests::Authority::of(previous)
+                .admits_settlement(&super::stop_requests::Authority::of(link))
+        }))
+    {
+        super::stop_requests::changing_authority(
+            store,
+            &link.source,
+            &link.session_id,
+            previous.as_ref(),
+            Some(link),
+        )?;
+    }
+    #[cfg(not(any(feature = "cli", test)))]
+    let _ = settlement;
+    if previous.is_some_and(|before| launch::unsettles(&before, link)) {
         launch::record_holds(store)?;
     }
     let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
@@ -501,6 +558,14 @@ pub fn write(store: &Store, link: &Link) -> Result<PathBuf> {
 /// Removes a link, keeping any hold the store calls for now.
 pub fn remove(store: &Store, source: &str, session_id: &str) -> Result<()> {
     launch::record_holds(store)?;
+    #[cfg(any(feature = "cli", test))]
+    super::stop_requests::changing_authority(
+        store,
+        source,
+        session_id,
+        get(store, source, session_id).as_ref(),
+        None,
+    )?;
     std::fs::remove_file(link_path(store, source, session_id))?;
     Ok(())
 }
@@ -658,6 +723,18 @@ pub fn publish_archive_transition_locked(
     );
     launch::record_holds(store)?;
     let path = link_path(store, source, session_id);
+    #[cfg(any(feature = "cli", test))]
+    super::stop_requests::changing_authority(
+        store,
+        source,
+        session_id,
+        current.as_ref().map(|snapshot| &snapshot.link),
+        Some(&from_body(
+            source.to_owned(),
+            session_id.to_owned(),
+            planned,
+        )),
+    )?;
     crate::domain::merge_archive::durable_publish_transition_bytes(
         &path,
         planned_json.as_bytes(),
