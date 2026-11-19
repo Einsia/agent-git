@@ -430,6 +430,7 @@ mod tests {
                 "--repair-permissions",
                 "/private-canary/state",
             ],
+            vec!["agit", "doctor", "--storage", "/private-canary/state"],
         ] {
             let output = capture(&argv).to_string();
             for canary in [
@@ -461,6 +462,11 @@ mod tests {
         assert_eq!(
             capture(&["agit", "doctor"])["arg_repair_permissions"],
             false
+        );
+        assert!(
+            capture(&["agit", "doctor", "--storage", "/private-canary/state"])
+                .get("arg_storage")
+                .is_none()
         );
     }
 
