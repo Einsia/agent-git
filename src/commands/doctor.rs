@@ -23,6 +23,7 @@ mod history;
 mod objects;
 #[cfg(unix)]
 mod permissions;
+mod storage;
 mod transaction;
 mod worktrees;
 
@@ -42,6 +43,14 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 pub struct Args {
+    /// Report storage under this explicit Agit home using filesystem metadata only
+    #[arg(
+        long,
+        value_name = "AGIT_HOME",
+        conflicts_with_all = ["repo", "deep", "check_backend", "repair_permissions", "repair_objects", "repair_worktrees"]
+    )]
+    pub storage: Option<PathBuf>,
+
     /// Repair permissions of one named Agit state carrier and its managed ancestors (Unix only)
     #[arg(long, value_name = "PATH", conflicts_with_all = ["repo", "check_backend", "deep"])]
     pub repair_permissions: Option<PathBuf>,
@@ -104,6 +113,9 @@ enum Check {
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if let Some(root) = args.storage.as_deref() {
+        return storage::run(root);
+    }
     if let Some(slug) = args.repair_objects.as_deref() {
         return objects::repair(slug);
     }

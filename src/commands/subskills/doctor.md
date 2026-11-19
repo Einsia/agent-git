@@ -10,6 +10,7 @@ description: Diagnose AgentGit local storage, runtime integrations, and optional
 ```bash
 agit doctor [--repo <owner/repo>] [--check-backend] [--deep]
 agit doctor --repair-worktrees <owner/repo>
+agit doctor --storage <AGIT_HOME>
 ```
 
 ## Options
@@ -20,6 +21,7 @@ agit doctor --repair-worktrees <owner/repo>
 | `--check-backend` | Also check Hub/backend reachability and configuration |
 | `--deep` | Also read every session branch's saved LOG and VIEW to check that the VIEW references only events the LOG has, and inspect committed session integrity throughout locally reachable history. Without it doctor reads each branch's metadata and the live transcripts on this computer, compares no VIEW with its LOG, walks no committed history, and says so |
 | `--repair-worktrees <owner/repo>` | Move this repository's worktrees that sit in another repository's place into its own, relinked |
+| `--storage <AGIT_HOME>` | Count filesystem metadata under this explicitly named Agit home; cannot be combined with other doctor modes |
 | `-y/--yes`, `-q/--quiet`, `-C/--directory`, `--no-color` | Common options; global `--json` emits the unified CLI JSON envelope |
 
 ## Examples
@@ -32,6 +34,27 @@ agit doctor --repo alice/research --deep
 ```
 
 The report diagnoses problems; it does not automatically create branches or rewrite history. Follow its suggested `setup`, `login`, or explicit `new`/`import` actions.
+
+For disk attribution, use `agit doctor --storage "$HOME/.agit"`, or name a different
+Agit home explicitly. This mode does not infer its scope from configuration. It reads directory
+entries and filesystem metadata only: no transcript, key, payload, Git configuration or `.git`
+pointer contents, and no Git process, telemetry, setup, migration, recovery or update check.
+It reports separate categories for original objects, checkouts, publication stores, recovered
+originals, LFS, runtime caches and other state. Unrecognized paths are `unclassified`.
+
+Logical bytes count unique regular files. Allocated bytes also include directories and are
+unknown on platforms where the scanner cannot obtain allocation information. Hardlinks count
+once in `shared_hardlinks`; filesystem clones and shared extents can still overlap. Neither metric
+is an estimate of reclaimable space. Nested publication stores are counted in their own category,
+not again as original Git objects. Category names describe paths, not whether data is disposable.
+
+The scan refuses symlink or reparse-point ancestors and does not follow links or cross volumes.
+Use the real local directory path. External LFS storage and native runtime homes are excluded;
+they are not discovered by reading configuration or links. Unreadable entries, skipped links,
+special files, concurrent directory replacements or traversal limits make the result incomplete
+and return a precondition exit. Byte counts are observed subtotals, not a consistent filesystem
+snapshot. `--json` includes `complete`, `gaps`, category counters and nullable allocation values
+inside the standard CLI envelope. A missing root is incomplete, not an empty installation.
 
 Checkouts pinned to another Hub are reported with both addresses and an explicit cross-Hub
 delivery command. The command selects the recorded source Hub and retains the Agit home, so

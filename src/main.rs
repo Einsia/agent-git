@@ -47,6 +47,24 @@ fn main() {
     if let Some(code) = agit::domain::privacy_git::compaction_entry(&raw_args) {
         exit(code);
     }
+    // Metadata inspection must enter before Git extraction or telemetry touches local state.
+    // Parse failures carrying this option must be equally inert; a literal operand on another
+    // valid command does not select the inspection path.
+    if raw_args.iter().any(|arg| {
+        arg == "--storage"
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--storage="))
+    }) {
+        match <Cli as clap::Parser>::try_parse_from(&raw_args) {
+            Ok(Cli {
+                command: Some(Commands::Doctor(args)),
+                ..
+            }) if args.storage.is_some() => exit(run(raw_args)),
+            Err(_) => exit(run(raw_args)),
+            _ => {}
+        }
+    }
     // The private transport worker forwards packets without local Git or store state.
     let transport_worker = raw_args.len() == 3 && raw_args[1] == "rc" && raw_args[2] == "tunnel";
     if !transport_worker && let Err(error) = agit::infra::git_runtime::initialize() {
@@ -499,7 +517,8 @@ fn startup_for(command: &Commands) -> Startup {
         // Moving a worktree back is how a repository the read-only check can't inspect is
         // repaired, so that check never stands in front of it.
         Commands::Doctor(args)
-            if args.repo.is_some()
+            if args.storage.is_some()
+                || args.repo.is_some()
                 || args.repair_permissions.is_some()
                 || args.repair_worktrees.is_some() =>
         {
@@ -589,11 +608,14 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// The dispatch table. Deliberately too boring to get wrong — every change lives in the file
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
-    if !matches!(cmd, Commands::Hooks(_) | Commands::Setup(_)) {
+    let metadata_only = matches!(&cmd, Commands::Doctor(args) if args.storage.is_some());
+    if !metadata_only && !matches!(cmd, Commands::Hooks(_) | Commands::Setup(_)) {
         commands::setup::refresh_claude_relay();
     }
     agit::telemetry::observe(agit::telemetry::Observation::Stage("dispatch"));
-    recheck_project_claims(&cmd);
+    if !metadata_only {
+        recheck_project_claims(&cmd);
+    }
     // A folder's upload that is due to be tried again starts its worker from the front door's
     // commands there, for a worker that was stopped or a computer that slept through the try.
     if matches!(
@@ -603,7 +625,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
     {
         commands::project::start_due_retries_here(&cwd);
     }
-    let _echo = commands::echo::Invocation::enter(&cmd, json);
+    let _echo = (!metadata_only).then(|| commands::echo::Invocation::enter(&cmd, json));
     let result = match cmd {
         Commands::On(a) => commands::front::on::on(a),
         Commands::Off(a) => commands::front::on::off(a),

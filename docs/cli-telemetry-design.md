@@ -279,7 +279,7 @@ The root canonical `command` remains the actual top-level command.
 | `secrets add`, `list`, `remove`, `status`, `review`, `allow`, `unallow`; `block add`, `block remove` | Stdin/allow-short/yes/json, repository scope presence, action and result; no secret lengths, labels, record IDs, key material, or secret-derived statistics |
 | `setup` | Runtime/integration/shell enums, auto-push requested/effective, installer source, telemetry decision source; installed/unchanged/unsupported/failed per integration |
 | `upgrade` | Check/apply; release channel, validated from/to version, available/applied/unavailable/failed; no arbitrary download URL |
-| `doctor` | Deep/check-backend, scoped/unscoped; fixed check IDs, passed/warned/failed categories; no rendered findings |
+| `doctor` | Deep/check-backend, scoped/unscoped; fixed check IDs, passed/warned/failed categories; no rendered findings. Explicit `--storage` inspection runs without telemetry; its argument is omitted from the registry's emitted properties |
 | `hooks` default/`ingest`/`settle` | Known runtime and hook action, accepted/ignored/unmanaged/deferred/failed; aggregate normal high-frequency activity |
 | `mcp` | Server lifecycle; per-tool execution as described below; no request/response bodies |
 | `rc start`, `status`, `stop`, `list`, `revoke`, `cloud`, hidden `land`, `grant`, `ungrant`, `grants` | Detach, known runtime, ownership/actor category, lifecycle/enrollment/authorization outcomes; connection and workspace count buckets; never machine name, enrollment credentials, connection/workspace IDs, or the external command named in a grant |
