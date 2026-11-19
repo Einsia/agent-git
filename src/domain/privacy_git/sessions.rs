@@ -1692,12 +1692,6 @@ impl ProjectedHistory {
                 projector.finish(&source)?;
                 let public_head = mapped[head.oid()].public.clone();
                 references.insert(head.name().to_owned(), public_head.clone());
-                for entry in mapped.values() {
-                    let name = format!("refs/tags/agit-{}", entry.public);
-                    if !ledger.withheld().contains(&name) {
-                        references.insert(name, entry.public.clone());
-                    }
-                }
                 candidates.insert(
                     branch.to_owned(),
                     accepted::Candidate {
@@ -1777,12 +1771,20 @@ impl ProjectedHistory {
             .iter()
             .map(|(name, oid)| format!("update {name} {oid}\n"))
             .collect::<String>();
-        // Cached tags must not reintroduce names removed from the frozen source selection.
+        // Custom tags follow the frozen selection. Historical version tags remain retention
+        // roots in storage and are excluded from the publication plan.
         repo.inspection_records(
-            &["for-each-ref", "--format=%(refname)", "refs/tags/"],
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/tags/",
+            ],
             |line| {
-                let name = std::str::from_utf8(line).context("tag name is not valid UTF-8")?;
-                if !references.contains_key(name) {
+                let line = std::str::from_utf8(line).context("tag record is not valid UTF-8")?;
+                let (oid, name) = line.split_once(' ').context("tag record is malformed")?;
+                if name.strip_prefix("refs/tags/agit-") != Some(oid)
+                    && !references.contains_key(name)
+                {
                     refs.push_str(&format!("delete {name}\n"));
                 }
                 Ok(())
@@ -1798,7 +1800,8 @@ impl ProjectedHistory {
             branches,
             &public_boundary,
             &carried,
-        )?;
+        )?
+        .without_version_tags();
         // The plan keeps a carried tag only when a branch it sends reaches it: a tag on a
         // published turn of a branch outside this push is named here, so nothing claims it went.
         let planned = plan
@@ -3047,7 +3050,7 @@ fn retain_tags(
         .iter()
         .filter(|tag| !withheld.contains(tag.name()))
     {
-        // Canonical version tags follow generated public IDs; their names cannot expose source IDs.
+        // Source version names encode source identities, which may differ from public commits.
         if tag.name() == format!("refs/tags/agit-{}", tag.oid())
             && plan.commit_objects().iter().any(|oid| oid == tag.oid())
         {
@@ -3130,14 +3133,10 @@ fn candidate_cache(bytes: &[u8]) -> Cache {
 }
 
 /// Tags the branches reach below the boundary that the destination does not have as they are
-/// here, added to `references`, with the names returned for the public plan to carry. A plan takes
-/// only its own commits' tags, so without this a tag added to an earlier, published commit, and a
-/// version tag of a published turn whose tags phase failed after its heads landed, never reach the
-/// Hub; a plan that captured their history instead would meet the commit bound once the published
-/// history outgrows it. Each points to a commit in `held`, which the destination holds under that
-/// id, so no history is sent for it. A turn whose commit the destination no longer holds (erased,
-/// withdrawn, its branch gone) owes no tag, and neither does a rewritten turn, whose public commit
-/// `held` cannot contain, nor a tag the Hub refused as withdrawn (see `Ledger::withheld`).
+/// here, added to `references`, with the names returned for the public plan to carry. A custom tag
+/// added to a published ancestor must arrive even when the plan stops above it. Accepted mappings
+/// locate rewritten public commits; no new history is declared for a tag the destination holds.
+/// Tags the Hub refused as withdrawn stay withheld (see `Ledger::withheld`).
 #[allow(clippy::too_many_arguments)]
 fn carry_tags(
     source: &Repo,
@@ -3157,22 +3156,6 @@ fn carry_tags(
             && remote.refs.get(name).is_none_or(|current| current != oid)
     };
     let mut carried = BTreeSet::new();
-    for branch in branches {
-        for entry in ledger.accepted(branch) {
-            let name = format!("refs/tags/agit-{}", entry.public);
-            if plan.commit_objects().binary_search(&entry.source).is_ok()
-                || !held.contains(&entry.public)
-                || references.contains_key(&name)
-                || !lacks(&name, &entry.public)
-            {
-                continue;
-            }
-            let retained = entry.object_source(source, parent, branch)?;
-            crate::commands::plumbing::import_commit_graph(destination, &retained, &entry.public)?;
-            references.insert(name.clone(), entry.public.clone());
-            carried.insert(name);
-        }
-    }
     for (tag, commit, objects) in plan.tags_below_boundary(source, |name, oid| !lacks(name, oid))? {
         if !held.contains(&commit) {
             // A turn plain publication rewrote: its tag goes on the public commit the
@@ -4462,131 +4445,6 @@ mod tests {
         assert_eq!(carried, BTreeSet::from([custom.to_owned()]));
         assert!(on_hub.is_empty());
         assert!(left_out.is_empty());
-    }
-
-    /// A version tag is owed only for a turn the destination still holds. An accepted turn below
-    /// the boundary whose tag the advertisement lacks is carried while its commit is in the held
-    /// history, and skipped once the destination no longer holds it (an erased or withdrawn turn,
-    /// a branch gone), since the tag would then name history the Hub no longer has. A turn the plan
-    /// captures takes its tag from the plan itself. A tag the Hub refused as withdrawn stays out,
-    /// across ledger reopens, until it is released. An implementation that carried every accepted
-    /// turn's missing tag pushes the erased turn's tag here, and one that forgot the refusal would
-    /// plan the tag on every push and meet the same refusal.
-    #[test]
-    fn only_turns_the_destination_still_holds_owe_their_version_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("source");
-        std::fs::create_dir(&root).unwrap();
-        git(&root, &["init", "-q"]);
-        let commit = |message: &str| {
-            git(&root, &["commit", "-q", "--allow-empty", "-m", message]);
-            git(&root, &["rev-parse", "HEAD"])
-        };
-        let first = commit("first");
-        let second = commit("second");
-        commit("third");
-        let source = Repo::at(&root).local_objects_only();
-        let identity = RemoteIdentity::new(
-            "https://hub.invalid",
-            "00000000-0000-0000-0000-000000000001",
-        )
-        .unwrap();
-        let session = format!("agit-{}", "a".repeat(40));
-        let mapping = |oid: &str, parent: Option<&str>| accepted::Mapping {
-            source: oid.into(),
-            public: oid.into(),
-            source_parents: parent.map(str::to_owned).into_iter().collect(),
-            public_parents: parent.map(str::to_owned).into_iter().collect(),
-            store: "c".repeat(64),
-            source_session: session.clone(),
-            public_session: session.clone(),
-            policy: crate::domain::privacy_envelope::digest_bytes(b"policy"),
-            recipient: None,
-            plain: false,
-            delivered: false,
-        };
-        let mut ledger = accepted::Ledger::open(&source, &identity).unwrap();
-        ledger
-            .prepare(
-                &BTreeMap::from([(
-                    "main".to_owned(),
-                    accepted::Candidate {
-                        source_head: second.clone(),
-                        public_head: second.clone(),
-                        mappings: BTreeMap::from([
-                            (first.clone(), mapping(&first, None)),
-                            (second.clone(), mapping(&second, Some(&first))),
-                        ]),
-                    },
-                )]),
-                &BTreeSet::new(),
-            )
-            .unwrap();
-        let remote = RemoteRefs {
-            refs: BTreeMap::from([("refs/heads/main".to_owned(), second.clone())]),
-            ..Default::default()
-        };
-        ledger.reconcile(&remote).unwrap();
-        let plan = PublicationPlan::freeze_selected_after(
-            &source,
-            &["main".into()],
-            &BTreeSet::from([second.clone()]),
-        )
-        .unwrap();
-        let stores = std::cell::Cell::new(0);
-        let carry = |ledger: &accepted::Ledger, held: BTreeSet<String>| {
-            stores.set(stores.get() + 1);
-            let store = dir.path().join(format!("store-{}", stores.get()));
-            std::fs::create_dir(&store).unwrap();
-            git(&store, &["init", "-q"]);
-            let destination = Repo::at(&store);
-            let mut references = BTreeMap::new();
-            let mut left_out = Vec::new();
-            let carried = carry_tags(
-                &source,
-                &plan,
-                &destination,
-                &dir.path().join("publication"),
-                ledger,
-                &["main".into()],
-                &remote,
-                &held,
-                &mut references,
-                &mut BTreeMap::new(),
-                &mut left_out,
-            )
-            .unwrap();
-            assert!(left_out.is_empty(), "{left_out:?}");
-            (carried, references, destination)
-        };
-
-        let version = format!("refs/tags/agit-{first}");
-        let both = BTreeSet::from([first.clone(), second.clone()]);
-        let (carried, references, destination) = carry(&ledger, both.clone());
-        assert_eq!(carried, BTreeSet::from([version.clone()]));
-        assert_eq!(
-            references,
-            BTreeMap::from([(version.clone(), first.clone())])
-        );
-        destination
-            .git(&["cat-file", "-e", &format!("{first}^{{commit}}")])
-            .unwrap();
-        let (carried, references, _) = carry(&ledger, BTreeSet::from([second.clone()]));
-        assert!(carried.is_empty());
-        assert!(references.is_empty());
-
-        super::super::withhold_refs(&source, &identity, std::slice::from_ref(&version)).unwrap();
-        assert_eq!(
-            super::super::withheld_refs(&source, &identity).unwrap(),
-            BTreeSet::from([version.clone()])
-        );
-        let ledger = accepted::Ledger::open(&source, &identity).unwrap();
-        let (carried, references, _) = carry(&ledger, both.clone());
-        assert!(carried.is_empty());
-        assert!(references.is_empty());
-        super::super::release_refs(&source, &identity, std::slice::from_ref(&version)).unwrap();
-        let ledger = accepted::Ledger::open(&source, &identity).unwrap();
-        assert_eq!(carry(&ledger, both).0, BTreeSet::from([version]));
     }
 
     /// A session that continues as plain is told in plain words, naming only the session; the
