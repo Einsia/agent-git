@@ -3841,23 +3841,22 @@ fn cross_hub_delivery_publishes_target_objects_and_continues_with_ordinary_push(
 
 /// A plain session that continues its published history declares only what it adds: the next
 /// push preserves just the heads the Hub already holds and snapshots just the new turns, so its
-/// size follows the push, not the session. Its tip and the new turns' version tags go in one
-/// receive under one receipt; sending the tags after the branch costs a second preview,
-/// confirmation and receive on every push. A walk of the whole history declares every earlier turn
-/// again. If a branch head of the advertisement that history was read from moves before a receipt
-/// binds it, the declaration may leave out commits the Hub no longer holds, so the publication is
-/// refused before anything is sent. Another branch moving takes nothing this push relies on, also
+/// size follows the push, not the session. Its tip carries the new turns without generated tags.
+/// A walk of the whole history declares every earlier turn again. If a branch head of the
+/// advertisement that history was read from moves before a receipt binds it, the declaration may
+/// leave out commits the Hub no longer holds, so the publication is refused before anything is
+/// sent. Another branch moving takes nothing this push relies on, also
 /// when the branch's head on the Hub is a public commit only the projection's store holds, as a
 /// replaced credential makes it; a check that read that history from the checkout alone would
 /// find the head missing and refuse.
 ///
 /// The bound applies to commits, not to tags: a tag the branch reaches below the boundary that the
-/// Hub lacks still arrives, both one added to an earlier turn after it was published and a version
-/// tag of a published turn the Hub lost, as when a tags phase fails after the heads land, and the
-/// push that carries them still declares only the new turn. A plan that takes only its own
-/// commits' tags leaves both off the Hub on every later push; one that publishes them by capturing
-/// the whole history again declares every turn, and past the commit bound cannot push at all. The
-/// added tag arrives without a new turn too: a push that skips a branch because its tip is still
+/// Hub lacks still arrives, including one added after its turn was published and one whose tag
+/// phase failed after its branch landed. The push still declares only the new turn. A plan that
+/// takes only its own commits' tags leaves both off the Hub on every later push; one that publishes
+/// them by capturing the whole history again declares every turn, and past the commit bound cannot
+/// push at all. The added tag arrives without a new turn too: a push that skips a branch because
+/// its tip is still
 /// the one its receipt acknowledged, without checking the tags, reports it up to date and never
 /// sends the tag. Once the tag is acknowledged the branch is skipped again; a tag listing that is
 /// recorded differently from how the skip reads it would never skip anything.
@@ -3949,17 +3948,34 @@ fn continued_plain_session_declares_only_what_it_adds() {
     let published = git(repo.root(), &["rev-parse", "HEAD"]);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), published);
 
+    // A retained cache ref must survive preparation without becoming an upload obligation.
+    let stores = fs::read_dir(repo.root().join(".git/agit/privacy-publication"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.join(".git/session-candidates").is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(stores.len(), 1);
+    let retained = format!("refs/tags/agit-{}", first[0]);
+    git(&stores[0], &["update-ref", &retained, &first[0]]);
+    git(&stores[0], &["tag", "agit-custom-milestone", &first[0]]);
+
     let earlier = hub.previews.lock().unwrap().len();
     let receives = hub.posts.load(Ordering::Acquire);
     let added = std::collections::BTreeSet::from([turn("turn 3"), turn("turn 4")]);
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
     let head = git(repo.root(), &["rev-parse", "HEAD"]);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/talk"]), head);
+    assert!(git(&remote, &["for-each-ref", "refs/tags/agit-*"]).is_empty());
+    assert_eq!(git(&stores[0], &["rev-parse", &retained]), first[0]);
+    assert!(
+        git(
+            &stores[0],
+            &["for-each-ref", "refs/tags/agit-custom-milestone"]
+        )
+        .is_empty()
+    );
     for turn in &added {
-        assert_eq!(
-            git(&remote, &["rev-parse", &format!("refs/tags/agit-{turn}")]),
-            *turn
-        );
+        git(&remote, &["merge-base", "--is-ancestor", turn, &head]);
     }
     assert_eq!(hub.posts.load(Ordering::Acquire) - receives, 1);
     let previews = hub.previews.lock().unwrap()[earlier..].to_vec();
@@ -4023,8 +4039,8 @@ fn continued_plain_session_declares_only_what_it_adds() {
     }
     repo.git(&["checkout", "talk"]).unwrap();
 
-    let version = format!("refs/tags/agit-{}", first[1]);
-    assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);
+    let version = "refs/tags/recovered".to_owned();
+    git(repo.root(), &["tag", "recovered", &first[1]]);
     // As after `agit fetch`: a push decides from local records alone only while the checkout's
     // main is the one it last fetched.
     git(
@@ -4034,6 +4050,7 @@ fn continued_plain_session_declares_only_what_it_adds() {
     git(repo.root(), &["tag", "reviewed", &first[0]]);
     assert_success(&run(&["--yes", "push", "alice/app@talk"]));
     assert_eq!(git(&remote, &["rev-parse", "refs/tags/reviewed"]), first[0]);
+    assert_eq!(git(&remote, &["rev-parse", &version]), first[1]);
     let unchanged = run(&["--yes", "push", "alice/app@talk"]);
     assert_success(&unchanged);
     assert!(
@@ -5875,8 +5892,8 @@ fn a_pull_brings_the_hubs_main_into_a_main_started_here() {
 
 /// A session whose new history is more than one publication to this Hub can carry is published in
 /// parts within one push: each part declares no more new turns than the Hub admits per request,
-/// the parts together declare every new turn once, and the branch and every turn's version tag
-/// end up on the Hub. A selected branch with no new history still delivers the tag it owes. A
+/// the parts together declare every new turn once, and the branch reaches them all on the Hub.
+/// A selected branch with no new history still delivers the tag it owes. A
 /// push that sent the whole history at once exceeds the published limit in its one manifest; one
 /// that stopped after the first part leaves the branch behind the session; one that skipped the
 /// branches with no new history leaves their tags off the Hub. A part refused before it sends
@@ -6036,11 +6053,9 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
         );
     }
     assert_eq!(declared, turns.iter().cloned().collect());
+    assert!(git(&remote, &["for-each-ref", "refs/tags/agit-*"]).is_empty());
     for turn in &turns {
-        assert_eq!(
-            git(&remote, &["rev-parse", &format!("refs/tags/agit-{turn}")]),
-            *turn
-        );
+        git(&remote, &["merge-base", "--is-ancestor", turn, &turns[8]]);
     }
     assert_eq!(
         git(&remote, &["rev-parse", "refs/tags/reviewed-main"]),
@@ -6266,8 +6281,9 @@ fn every_part_goes_out_under_a_confirmation_that_covers_it() {
     }
     hub.max_new_commits.store(4, Ordering::Release);
 
-    // The last tag of the first part marks it as landed.
-    *hub.publicize_when.lock().unwrap() = Some(format!("refs/tags/agit-{}", plain_turns[3]));
+    // A milestone in the first part makes its completed receive observable to the fixture.
+    git(repo.root(), &["tag", "first-part", &plain_turns[3]]);
+    *hub.publicize_when.lock().unwrap() = Some("refs/tags/first-part".to_owned());
     let moved = run(&["--yes", "push", "alice/app@talk"]);
     assert!(!moved.status.success(), "{moved:?}");
     assert!(
@@ -8212,7 +8228,7 @@ fn records_from_an_encrypted_session_go_up_as_published_or_are_refused() {
 /// it. The next push publishes the other branches and leaves the withdrawn one out. An automatic
 /// push names its branch but does not ask again, and fails without a request rather than report a
 /// push it did not make. A push that names the branch asks again and publishes it once the
-/// withdrawal is restored, and so are version tags refused after their branch was already
+/// withdrawal is restored, and so are user tags refused after their branch was already
 /// published, even once a later push published the branch without them and local records show it
 /// unchanged. Only the Hub accepting a named ref lets it go: a named push whose preview fails
 /// leaves it set aside. A client that forgets the refusal, or lets go on being asked, meets it on
@@ -8383,11 +8399,12 @@ fn a_branch_the_hub_withdrew_waits_until_it_is_named_again() {
     assert!(planned(earlier).contains(&json!("refs/heads/pulled")));
     assert_eq!(set_aside(), json!({"branches": [], "error": null}));
 
-    // Only a version tag is refused: its branch publishes, the tag waits for a named push. The tag
+    // Only a user tag is refused: its branch publishes, the tag waits for a named push. The tag
     // shares its branch's receive, so a client that does not send the branch alone after that
     // receive is refused keeps the branch off the Hub with it.
     let tagged = turn("kept", 'b', "kept turn 2");
-    let version = format!("refs/tags/agit-{tagged}");
+    git(repo.root(), &["tag", "kept-milestone", &tagged]);
+    let version = "refs/tags/kept-milestone".to_owned();
     *hub.withdrawn.lock().unwrap() = Some(version.clone());
     let refused = run(&["--yes", "push", "alice/app@kept"], false);
     assert!(!refused.status.success(), "{refused:?}");
@@ -13155,26 +13172,8 @@ fn main_push_after_a_distill(tagged: bool) {
         }
     }
     assert!(git(&remote, &["for-each-ref", "refs/heads/talk"]).is_empty());
-    // The only tags on the Hub are agit's own version tags of main's commits: `agit-<oid>` naming
-    // the commit it points at. None of the person's tags of the unpushed turn went up.
-    for line in git(
-        &remote,
-        &[
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/tags",
-        ],
-    )
-    .lines()
-    {
-        let (name, oid) = line.split_once(' ').unwrap();
-        assert_eq!(
-            name.strip_prefix("refs/tags/agit-"),
-            Some(oid),
-            "{line}: {said}"
-        );
-        git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
-    }
+    // The person's tags of an unpushed turn remain local.
+    assert!(git(&remote, &["for-each-ref", "refs/tags"]).is_empty());
     assert_success(&pushed);
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/main"]),
@@ -13428,10 +13427,9 @@ fn a_distill_against_a_main_the_hub_moved_past_stops_until_pulled() {
 }
 
 /// A main push after a distill in a repository of many sessions sends only main: one session
-/// branch published and fetched back (so its Hub version tags and remote-tracking ref are here)
-/// with a later turn never pushed, and one session branch never pushed, each turn carrying a local
-/// `agit-<oid>` version tag. Nothing of the unpushed turns, and no tag the person didn't push,
-/// reaches the Hub; every new commit is main's; the only new tags are main's own version tags.
+/// branch published and fetched back, with a later turn never pushed, and one session branch
+/// never pushed, each turn carrying a retained local version tag. Nothing of the unpushed turns,
+/// and no tag the person did not push, reaches the Hub; every new commit belongs to main.
 #[test]
 fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
     const PUBLISHED: &str = "published-turn-marker-1c2d";
@@ -13536,7 +13534,7 @@ fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
         oid
     };
 
-    // A session published and fetched back: its Hub version tags and remote-tracking ref are here.
+    // The fetched session has a remote-tracking ref alongside its retained local version tags.
     repo.git(&["checkout", "-b", "pub1"]).unwrap();
     turn("pub1", 'e', &[PUBLISHED], None);
     repo.git(&["checkout", "main"]).unwrap();
@@ -13695,12 +13693,7 @@ fn a_main_push_in_a_repository_of_many_sessions_sends_only_main() {
             assert_eq!(oid, main, "{pushed_said}");
             continue;
         }
-        assert_eq!(
-            name.strip_prefix("refs/tags/agit-"),
-            Some(oid),
-            "{line}: {pushed_said}"
-        );
-        git(repo.root(), &["merge-base", "--is-ancestor", oid, &main]);
+        panic!("unexpected publication ref {line}: {pushed_said}");
     }
     for line in refs_before.difference(&refs_after) {
         let name = line.split_once(' ').unwrap().0;

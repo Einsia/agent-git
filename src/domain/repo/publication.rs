@@ -75,6 +75,8 @@ pub struct PublicationPlan {
     /// [`PublicationPlan::freeze_selected_after_at`]).
     #[serde(skip)]
     pinned: bool,
+    #[serde(skip)]
+    omit_version_tags: bool,
 }
 
 /// Inspection selection is independent of the complete publication and verification plan.
@@ -184,7 +186,7 @@ impl PublicationPlan {
 
     /// Tags whose commits the heads reach below the boundary, which the plan leaves out: it takes
     /// only the tags of its own commits. Each comes with its commit and the tag objects on the way
-    /// to it. Version tags are not listed; the caller knows which turns it published. A tag
+    /// to it. Canonical version tags are retention roots, not custom publication obligations. A tag
     /// `published` says the destination already has as it is here is skipped, and only when one
     /// remains are the heads' ancestors listed.
     #[cfg(any(feature = "cli", test))]
@@ -267,6 +269,14 @@ impl PublicationPlan {
     /// Every annotated tag object in the selected chains, including unreferenced inner tags.
     pub fn tag_objects(&self) -> &[String] {
         &self.tag_objects
+    }
+
+    /// Generated names duplicate the selected commit identities. Retained compatibility refs
+    /// stay in storage but do not become publication obligations for this plan.
+    pub fn without_version_tags(mut self) -> Self {
+        self.tags.retain(|tag| !version_tag(tag.name(), tag.oid()));
+        self.omit_version_tags = true;
+        self
     }
 
     /// Capture explicit branch names and their locally available publication metadata.
@@ -470,6 +480,7 @@ impl PublicationPlan {
             boundary: boundary.into_iter().collect(),
             carried: carried.iter().cloned().collect(),
             pinned: !pins.is_empty(),
+            omit_version_tags: false,
         })
     }
 
@@ -490,15 +501,21 @@ impl PublicationPlan {
         } else {
             BTreeMap::new()
         };
+        let observed = Self::freeze_roots(
+            repo,
+            branches,
+            self.include_main,
+            Depth::Until(&held),
+            &self.carried.iter().cloned().collect(),
+            &pins,
+        )?;
+        let observed = if self.omit_version_tags {
+            observed.without_version_tags()
+        } else {
+            observed
+        };
         ensure!(
-            Self::freeze_roots(
-                repo,
-                branches,
-                self.include_main,
-                Depth::Until(&held),
-                &self.carried.iter().cloned().collect(),
-                &pins,
-            )? == *self,
+            observed == *self,
             "publication refs changed during audit; rerun the audit before publishing"
         );
         Ok(())
@@ -1276,7 +1293,7 @@ impl Reader {
     }
 }
 
-/// Whether `name` is the lightweight version tag agit gives a published commit: it is named by the
+/// Whether `name` is a retained lightweight version tag: it is named by the
 /// object it points at. An annotated tag, or one moved to another object, is not one.
 fn version_tag(name: &str, oid: &str) -> bool {
     name.strip_prefix("refs/tags/agit-") == Some(oid)
@@ -1644,6 +1661,11 @@ mod tests {
         );
         assert_eq!(plan.tags[0].refspec(), format!("{tag}:refs/tags/reviewed"));
         plan.verify(&repo, &branches).unwrap();
+        let custom_only = plan.clone().without_version_tags();
+        git(root, &["tag", &format!("agit-{base}"), &base]);
+        custom_only.verify(&repo, &branches).unwrap();
+        assert!(plan.verify(&repo, &branches).is_err());
+        git(root, &["tag", "-d", &format!("agit-{base}")]);
         let next = git(root, &["rev-parse", "HEAD"]);
         git(root, &["update-ref", "refs/heads/main", &next, &base]);
         selected.verify(&repo, &branches).unwrap();
@@ -1658,6 +1680,7 @@ mod tests {
         git(root, &["update-ref", "refs/heads/selected", &base, &next]);
         git(root, &["update-ref", "refs/tags/reviewed", &base, &tag]);
         assert!(plan.verify(&repo, &branches).is_err());
+        assert!(custom_only.verify(&repo, &branches).is_err());
     }
 
     /// A topology overlay cannot hide raw ancestry or make a local fork remotely accepted.

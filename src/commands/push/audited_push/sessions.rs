@@ -272,7 +272,7 @@ pub(super) fn run(
     .map_err(|cause| crate::commands::push::branch_list_unread(&repository, cause))?;
     // A branch the Hub refused as withdrawn stays in this checkout and out of later
     // publications, or every push would meet the same refusal. Naming it asks again, since the
-    // withdrawal may have been restored, and so asks again for every refused version tag, even
+    // withdrawal may have been restored, and so asks again for every refused user tag, even
     // when only tags were refused after the branch itself was published. Asking plans them in
     // this publication only: the record lets a ref go once the Hub has accepted it, so whatever
     // is still withdrawn, or was never answered for, stays set aside. An automatic push names its
@@ -477,8 +477,8 @@ pub(super) fn run(
         0
     };
     let mut cuts = plans.get(branch_index).cloned().unwrap_or_default();
-    // Branches with no new history may still owe tags (one added to an earlier commit, or a
-    // version tag the Hub lacks); they go together after the branches sent in parts.
+    // Branches with no new history may still owe custom tags on published commits; they go
+    // together after the branches sent in parts.
     let mut idle: Vec<String> = if in_parts {
         selected_branches
             .iter()
