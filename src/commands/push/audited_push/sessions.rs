@@ -1256,7 +1256,7 @@ pub(super) fn run(
         }
         recording.finish();
         published += 1;
-        if !in_parts {
+        if !in_parts || finishing {
             break;
         }
         // The next part is planned from what the Hub now holds, not from the first plan.
@@ -1280,9 +1280,6 @@ pub(super) fn run(
                 "{published} of {total} parts are published, and the Hub's copy of the branch moved since; rerun `{retry_command}` to continue"
             );
             continue;
-        }
-        if finishing {
-            break;
         }
         // This branch is done; the next one with anything left to publish follows.
         loop {
