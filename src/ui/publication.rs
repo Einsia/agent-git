@@ -34,10 +34,9 @@ impl Progress {
         let enabled = !super::quiet() && !crate::commands::json::is_capturing();
         let (sender, worker) = if enabled {
             let (sender, receiver) = mpsc::channel();
-            let tty = super::is_tty();
             match std::thread::Builder::new()
                 .name("push-progress".into())
-                .spawn(move || render(receiver, tty))
+                .spawn(move || render(receiver))
             {
                 Ok(worker) => (Some(sender), Some(worker)),
                 Err(_) => (None, None),
@@ -148,17 +147,19 @@ impl Active {
     }
 }
 
-fn render(receiver: Receiver<Event>, tty: bool) {
-    let spinner = if tty {
-        let bar = indicatif::ProgressBar::new_spinner();
+fn render(receiver: Receiver<Event>) {
+    let bar = indicatif::ProgressBar::new_spinner();
+    // The draw target owns visibility; stdout may have a different terminal than stderr.
+    let spinner = if bar.is_hidden() {
+        None
+    } else {
         bar.set_style(
             indicatif::ProgressStyle::with_template("{spinner} {msg} [{elapsed_precise}]")
                 .expect("valid progress template"),
         );
         Some(bar)
-    } else {
-        None
     };
+    let tty = spinner.is_some();
     let interval = if tty {
         Duration::from_millis(100)
     } else {
@@ -252,4 +253,103 @@ fn render(receiver: Receiver<Event>, tty: bool) {
         "Publication processing time: {:.1}s",
         elapsed.as_secs_f64()
     ));
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::IsTerminal;
+    use std::os::fd::FromRawFd;
+    use std::process::{Child, Command, Stdio};
+
+    struct OwnedChild(Child);
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Redirecting stderr must expose an active phase even while stdout remains a terminal.
+    /// The parent releases the phase only after observing its start, so final output cannot
+    /// satisfy the visibility assertion.
+    #[test]
+    fn redirected_progress_is_visible_before_the_phase_finishes() {
+        const SIGNAL: &str = "AGIT_PROGRESS_TEST_RELEASE";
+        const LABEL: &str = "Checking synthetic publication";
+        const LIMIT: Duration = Duration::from_secs(10);
+        if let Some(release) = std::env::var_os(SIGNAL) {
+            assert!(std::io::stdout().is_terminal());
+            assert!(!std::io::stderr().is_terminal());
+            let _progress = Progress::start();
+            let phase = stage(LABEL);
+            let deadline = Instant::now() + LIMIT;
+            while !std::path::Path::new(&release).exists() {
+                assert!(Instant::now() < deadline, "phase was never observed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            phase.finish();
+            return;
+        }
+
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let stderr = directory.path().join("stderr");
+        let mut child = OwnedChild(
+            Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("TERM", "xterm")
+                .env(SIGNAL, &release)
+                .args([
+                    "--exact",
+                    "ui::publication::tests::redirected_progress_is_visible_before_the_phase_finishes",
+                    "--nocapture",
+                ])
+                .stdin(Stdio::null())
+                .stdout(slave)
+                .stderr(File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + LIMIT;
+        loop {
+            let output = fs::read_to_string(&stderr).unwrap();
+            assert!(child.0.try_wait().unwrap().is_none(), "{output}");
+            if output.contains(&format!("{LABEL}…")) {
+                assert!(!output.contains("done"), "{output}");
+                fs::write(&release, b"").unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "no active progress: {output}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                let output = fs::read_to_string(&stderr).unwrap();
+                assert!(status.success(), "{output}");
+                assert!(output.contains(&format!("{LABEL} — done")), "{output}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "phase did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
