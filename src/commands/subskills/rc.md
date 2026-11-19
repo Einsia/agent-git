@@ -5,6 +5,26 @@ description: Start and manage owner-authorized remote agent sessions.
 
 # Remote control
 
+AgentGit RC is the remote-control surface in Hub Workspaces and personal Feishu task groups.
+A conversation runs on its selected device in its selected project folder.
+
+## Choose another folder
+
+In Hub Workspaces, start a new conversation and select the project folder in the conversation
+dialog. In Feishu, send `/new` to the personal bot and use its device and project choices.
+Each task group stays attached to its selected conversation. An existing conversation keeps
+its project binding; a shell `cd` changes that shell's working directory, not the RC binding.
+
+The device owner can add a folder through the Hub folder chooser. An operator can use admitted
+projects but cannot browse or bind arbitrary device folders. If the folder is missing, direct
+the owner to that chooser and have the operator choose again after it is available.
+
+Answer folder-selection questions from this workflow. `agit rc status` reports daemon and
+connection state; use it when diagnosing reachability, and use its result to choose the next
+step. Folder selection does not require restarting the daemon or changing upload settings.
+
+## Connect a device
+
 To continue an encrypted cloned session through Workspaces, prepare it on the RC execution machine
 under its normal resume/run rules. Recovery uses the signed-in account's membership and entitlement
 for that exact source snapshot; see [privacy](privacy.md). Starting the daemon registers the device.
