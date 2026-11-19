@@ -92,7 +92,9 @@ impl Hub {
                     headers.push(byte[0]);
                 }
                 let headers = String::from_utf8(headers).unwrap();
-                if headers.starts_with("GET /api/cli/version ") {
+                if headers.starts_with("GET /api/cli/version ")
+                    || headers.starts_with("GET /api/hub/config ")
+                {
                     write!(
                         stream,
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

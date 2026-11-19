@@ -195,6 +195,7 @@ mod frozen_publication_http {
             repo.git(&["config", "boundary.command", value]).unwrap();
         }
         let transport = TransportIdentity {
+            fetch_scope: None,
             client: None,
             urls: Vec::new(),
             agent_id: None,
