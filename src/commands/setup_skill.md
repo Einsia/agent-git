@@ -98,6 +98,8 @@ To upload a running conversation, adopt it with `agit import` (`import.md`):
 | Take an upload down | rotate exposed secrets, withdraw on its Hub page | `push.md` |
 | Find how something was done before | `agit search "<words>" --scope org --json` | `search.md` |
 | Sign in | `agit login --json` | `login.md` |
+| Use another project folder in Hub Workspaces or Feishu RC | Start a new conversation and choose the folder | `rc.md` |
+| Connect a device for remote control | `agit rc start --detach` | `rc.md` |
 | Encryption, privacy policy, secrets | `agit privacy`, `agit secrets` | `privacy.md`, `secrets.md` |
 | Targets, `AGIT_SESSION`, folder state | `agit status --json` | `status.md` |
 | Memory between sessions | `agit memory status`, `agit distill` | `memory.md` |
