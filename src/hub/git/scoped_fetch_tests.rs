@@ -99,45 +99,7 @@ fn scoped_branch_pickup_binds_discovery_and_git_retries_to_one_reader() {
                 Some("Bearer fake-alice-fresh-access")
             );
             assert_eq!(request.header("Git-Protocol"), None);
-            let advertise = request.method == "GET";
-            let mut command = crate::infra::git_runtime::command();
-            command.arg("upload-pack").arg("--stateless-rpc");
-            if advertise {
-                command.arg("--advertise-refs");
-            }
-            let mut child = command
-                .arg(&source_path)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(&request.body)
-                .unwrap();
-            let output = child.wait_with_output().unwrap();
-            assert!(output.status.success(), "synthetic Git server failed");
-            let mut body = Vec::new();
-            if advertise {
-                let service = "# service=git-upload-pack\n";
-                body.extend_from_slice(
-                    format!("{:04x}{service}0000", service.len() + 4).as_bytes(),
-                );
-            }
-            body.extend(output.stdout);
-            Reply {
-                status: 200,
-                content_type: if advertise {
-                    "application/x-git-upload-pack-advertisement"
-                } else {
-                    "application/x-git-upload-pack-result"
-                },
-                body,
-                headers: Vec::new(),
-            }
+            scoped_git_reply(&source_path, request)
         },
     );
     config::set_global("hub.url", Some(&hub.base)).unwrap();
@@ -203,4 +165,205 @@ fn scoped_branch_pickup_binds_discovery_and_git_retries_to_one_reader() {
         1
     );
     assert!(requests.last().unwrap().path.ends_with("/agit-refs"));
+}
+
+/// A version retry keeps its resolved commit, and successful Git cannot substitute an unrelated
+/// fetched root merely because the requested commit already exists in the local object store.
+#[test]
+fn scoped_version_pickup_pins_retry_identity_and_requires_fetched_root_reachability() {
+    use crate::domain::repo::Repo;
+    use base64::Engine;
+    let home = IsolatedHome::new();
+    let source = Repo::init(&home.workspace().join("version-source")).unwrap();
+    source
+        .git(&["config", "user.name", "Synthetic Reader"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "reader@example.invalid"])
+        .unwrap();
+    source
+        .git(&["symbolic-ref", "HEAD", "refs/heads/main"])
+        .unwrap();
+    source
+        .git(&["commit", "--allow-empty", "-m", "requested version"])
+        .unwrap();
+    let old = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let tree = source.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+    let other = source
+        .git(&["commit-tree", &tree, "-m", "unrelated version"])
+        .unwrap();
+    let tag = format!("refs/tags/agit-{old}");
+    source.git(&["update-ref", &tag, &old]).unwrap();
+    source
+        .git(&["update-ref", "refs/tags/unselected", &other])
+        .unwrap();
+    source
+        .git(&["update-ref", "-d", "refs/heads/main"])
+        .unwrap();
+    let phase = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server_phase = Arc::clone(&phase);
+    let server_path = source.root().to_owned();
+    let server_old = old.clone();
+    let server_tag = tag.clone();
+    let mut lookups = 0;
+    let mut denied_git = false;
+    let hub = FakeHub::with_config(
+        serde_json::json!({"capabilities":{"git_fetch_scope":[1],"git_fetch_version":[1]}}),
+        move |request| {
+            if request.path == "/api/auth/refresh" {
+                return refreshed();
+            }
+            assert_eq!(
+                request.header("X-AgentGit-Expected-Agent-Id"),
+                Some(AGENT_ID)
+            );
+            let phase = server_phase.load(Ordering::SeqCst);
+            let context = if request.header("Authorization") == Some("Bearer fake-alice-access") {
+                "a".repeat(64)
+            } else {
+                "b".repeat(64)
+            };
+            let reference = if phase == 0 {
+                server_tag.as_str()
+            } else {
+                "refs/heads/selected"
+            };
+            if request.path.ends_with("/agit-version") {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                if phase == 0 {
+                    let expected = if lookups == 0 {
+                        &server_old[..7]
+                    } else {
+                        server_old.as_str()
+                    };
+                    assert_eq!(
+                        body["prefix"], expected,
+                        "retry must use the resolved full ID"
+                    );
+                    lookups += 1;
+                }
+                return Reply {
+                    status: 200,
+                    content_type: "application/json",
+                    headers: Vec::new(),
+                    body: serde_json::to_vec(
+                        &serde_json::json!({"version":1,"repository_id":AGENT_ID,
+                        "reader_context":context,"prefix":body["prefix"],
+                        "selection":{"commit":server_old,"reference":reference}}),
+                    )
+                    .unwrap(),
+                };
+            }
+            if request.path.ends_with("/agit-refs") {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["refs"], serde_json::json!([reference]));
+                return Reply { status:200, content_type:"application/json", headers:Vec::new(),
+                    body:serde_json::to_vec(&serde_json::json!({
+                        "scope":{"version":1,"repository_id":AGENT_ID,"reader_context":context,"refs":body["refs"]},
+                        "refs":[{"name":reference,"oid":server_old}]})).unwrap() };
+            }
+            let scope: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(request.header(super::scoped_fetch::HEADER).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(scope["refs"], serde_json::json!([reference]));
+            assert_eq!(scope["reader_context"], context);
+            if !denied_git {
+                denied_git = true;
+                return denied();
+            }
+            if phase == 0 {
+                assert!(lookups >= 3)
+            }
+            if phase == 1 && request.method == "GET" {
+                Repo::at(&server_path)
+                    .git(&["update-ref", "refs/heads/selected", &other])
+                    .unwrap();
+            }
+            scoped_git_reply(&server_path, request)
+        },
+    );
+    config::set_global("hub.url", Some(&hub.base)).unwrap();
+    credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+    let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+    let url = format!("{}/alice/example.git", hub.base);
+    let dest = home.workspace().join("version-clone");
+    let transfer = super::clone_version(&url, &dest, &identity, &format!("agit-{}", &old[..7]))
+        .unwrap()
+        .unwrap();
+    assert!(transfer.outcome.ok(), "{}", transfer.outcome.stderr);
+    assert_eq!(transfer.commit.as_deref(), Some(old.as_str()));
+    let repo = Repo::at(&dest);
+    assert_eq!(repo.git(&["tag", "--list"]).unwrap(), format!("agit-{old}"));
+    assert_eq!(
+        repo.git(&["config", "--get-all", "remote.origin.fetch"])
+            .unwrap(),
+        "+refs/heads/*:refs/remotes/origin/*",
+        "later branch updates must not depend on the version tag"
+    );
+    assert!(
+        repo.remote_branches().is_empty(),
+        "a tag-only version needs no main branch"
+    );
+    source.git(&["update-ref", "-d", &tag]).unwrap();
+    source
+        .git(&["update-ref", "refs/heads/selected", &old])
+        .unwrap();
+    phase.store(1, Ordering::SeqCst);
+    let error = match super::fetch_version(&repo, &identity, &format!("agit-{old}")) {
+        Err(error) => error,
+        Ok(_) => panic!("an unrelated fetched root must not authorize the old local object"),
+    };
+    assert!(error.to_string().contains("no longer contains"));
+    assert_eq!(repo.git(&["cat-file", "-t", &old]).unwrap(), "commit");
+    let requests = hub.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/api/auth/refresh")
+            .count(),
+        1
+    );
+}
+
+fn scoped_git_reply(source_path: &Path, request: &WireRequest) -> Reply {
+    let advertise = request.method == "GET";
+    let mut command = crate::infra::git_runtime::command();
+    command.arg("upload-pack").arg("--stateless-rpc");
+    if advertise {
+        command.arg("--advertise-refs");
+    }
+    let mut child = command
+        .arg(source_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&request.body)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "synthetic Git server failed");
+    let mut body = Vec::new();
+    if advertise {
+        let service = "# service=git-upload-pack\n";
+        body.extend_from_slice(format!("{:04x}{service}0000", service.len() + 4).as_bytes());
+    }
+    body.extend(output.stdout);
+    Reply {
+        status: 200,
+        content_type: if advertise {
+            "application/x-git-upload-pack-advertisement"
+        } else {
+            "application/x-git-upload-pack-result"
+        },
+        body,
+        headers: Vec::new(),
+    }
 }

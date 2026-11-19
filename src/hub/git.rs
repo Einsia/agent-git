@@ -396,6 +396,39 @@ impl TransportIdentity {
         Ok(true)
     }
 
+    fn select_version(&mut self, version: &str) -> Result<bool> {
+        let Some(client) = &self.client else {
+            return Ok(false);
+        };
+        let config = match client.hub_config() {
+            Ok(config) => config,
+            Err(error)
+                if error
+                    .downcast_ref::<super::client::ApiError>()
+                    .is_some_and(|api| api.status == 404) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if !config.accepts_fetch_version() {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.urls.len() == 1 && self.agent_id.is_some(),
+            "scoped fetch requires one immutable Hub destination"
+        );
+        self.fetch_scope = Some(scoped_fetch::Selection::version(
+            client,
+            &self.urls[0],
+            self.agent_id
+                .as_deref()
+                .expect("validated repository identity"),
+            version,
+        )?);
+        Ok(true)
+    }
+
     fn token(&self) -> Result<Option<String>> {
         self.client
             .as_ref()
@@ -974,6 +1007,39 @@ pub(crate) fn fetch_branch(
     Ok(Some(outcome))
 }
 
+pub(crate) struct VersionTransfer {
+    pub outcome: Outcome,
+    pub commit: Option<String>,
+}
+
+pub(crate) fn fetch_version(
+    repo: &Repo,
+    identity: &super::identity::RemoteIdentity,
+    version: &str,
+) -> Result<Option<VersionTransfer>> {
+    super::identity::verify_transport_target(repo, identity)?;
+    let mut transport = TransportIdentity::new(Some(repo.root()), &["fetch", "origin"], identity)?;
+    if !transport.select_version(version)? {
+        return Ok(None);
+    }
+    let selection = transport
+        .fetch_scope
+        .as_ref()
+        .expect("selected version scope");
+    let refspec = selection.refspec();
+    let fetch = ["fetch", "--no-tags", "--no-prune", "origin", &refspec];
+    let args = without_maintenance(&fetch);
+    let outcome = run_transport(Some(repo.root()), &args, &transport)?;
+    let commit = if outcome.ok() {
+        let commit = selection.verify_version(repo)?;
+        crate::domain::privacy_git::schedule_compaction(repo.root());
+        Some(commit)
+    } else {
+        None
+    };
+    Ok(Some(VersionTransfer { outcome, commit }))
+}
+
 /// [`run_for_remote`] for a read that must finish within `timeout`, taking its stdout, with why
 /// it did not in a fixed sentence that names no secret: the same causes a branch-list read
 /// reports.
@@ -1434,6 +1500,71 @@ pub(crate) fn clone_selected(
     branch: Option<&str>,
 ) -> Result<Outcome> {
     require_transport_url(url, identity)?;
+    prepare_clone_destination(dest)?;
+    let dest_s = dest.to_string_lossy().to_string();
+    let mut transport = TransportIdentity::new(None, &["clone", url, &dest_s], identity)?;
+    let scoped = branch
+        .map(|branch| transport.select_branch(branch))
+        .transpose()?
+        .unwrap_or(false);
+    let mut args = vec!["clone", "--quiet"];
+    if scoped {
+        args.extend([
+            "--no-tags",
+            "--branch",
+            branch.expect("scoped clone selects a branch"),
+        ]);
+    }
+    args.extend([url, &dest_s]);
+    let out = run_transport(None, &args, &transport)?;
+    if out.ok() {
+        super::identity::pin(&Repo::at(dest), identity)?;
+    }
+    Ok(out)
+}
+
+pub(crate) fn clone_version(
+    url: &str,
+    dest: &Path,
+    identity: &super::identity::RemoteIdentity,
+    version: &str,
+) -> Result<Option<VersionTransfer>> {
+    require_transport_url(url, identity)?;
+    let dest_s = dest.to_string_lossy().to_string();
+    let mut transport = TransportIdentity::new(None, &["clone", url, &dest_s], identity)?;
+    if !transport.select_version(version)? {
+        return Ok(None);
+    }
+    prepare_clone_destination(dest)?;
+    let selection = transport
+        .fetch_scope
+        .as_ref()
+        .expect("selected version scope");
+    let fetch_config = format!("remote.origin.fetch={}", selection.refspec());
+    let args = [
+        "-c",
+        &fetch_config,
+        "clone",
+        "--quiet",
+        "--no-tags",
+        "--branch",
+        selection.clone_name(),
+        url,
+        &dest_s,
+    ];
+    let outcome = run_transport(None, &args, &transport)?;
+    let commit = if outcome.ok() {
+        let repo = Repo::at(dest);
+        let commit = selection.verify_version(&repo)?;
+        super::identity::pin(&repo, identity)?;
+        Some(commit)
+    } else {
+        None
+    };
+    Ok(Some(VersionTransfer { outcome, commit }))
+}
+
+fn prepare_clone_destination(dest: &Path) -> Result<()> {
     match std::fs::symlink_metadata(dest) {
         Ok(metadata) => {
             anyhow::ensure!(
@@ -1459,26 +1590,7 @@ pub(crate) fn clone_selected(
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).with_context(|| format!("cannot create {}", p.display()))?;
     }
-    let dest_s = dest.to_string_lossy().to_string();
-    let mut transport = TransportIdentity::new(None, &["clone", url, &dest_s], identity)?;
-    let scoped = branch
-        .map(|branch| transport.select_branch(branch))
-        .transpose()?
-        .unwrap_or(false);
-    let mut args = vec!["clone", "--quiet"];
-    if scoped {
-        args.extend([
-            "--no-tags",
-            "--branch",
-            branch.expect("scoped clone selects a branch"),
-        ]);
-    }
-    args.extend([url, &dest_s]);
-    let out = run_transport(None, &args, &transport)?;
-    if out.ok() {
-        super::identity::pin(&Repo::at(dest), identity)?;
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// Presentation flags belong beside the known command, never beside a matching operand.
