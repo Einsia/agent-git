@@ -420,17 +420,50 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
         // Fast-forward only. Divergence does no text merge — that interleaves two sessions' lines
         // and breaks the message chain, producing a syntactically valid but semantically corrupt
         // transcript.
-        let fetch = crate::hub::git::TagFetch::prepare(&store, &["fetch", "origin", "--tags"]);
-        let fetched = crate::hub::git::run_for_remote(&store, &fetch.args(), &plan.identity);
-        fetch.report();
+        let scoped = match &want {
+            Some(Ref::Branch(branch)) => {
+                crate::hub::git::fetch_branch(&store, &plan.identity, branch)
+            }
+            _ => Ok(None),
+        };
+        let selected_only = matches!(&scoped, Ok(Some(_)));
+        let fetched = match scoped {
+            Ok(Some(outcome)) => {
+                if !outcome.ok() {
+                    ui::error("the selected branch could not be fetched from the Hub");
+                    return Ok(
+                        if crate::hub::git::looks_like_auth_failure(&outcome.stderr) {
+                            ExitCode::Auth
+                        } else {
+                            ExitCode::Network
+                        },
+                    );
+                }
+                Ok(outcome)
+            }
+            Ok(None) => {
+                let fetch =
+                    crate::hub::git::TagFetch::prepare(&store, &["fetch", "origin", "--tags"]);
+                let fetched =
+                    crate::hub::git::run_for_remote(&store, &fetch.args(), &plan.identity);
+                fetch.report();
+                fetched
+            }
+            Err(error) => return local_transport_failure(error),
+        };
         let out = match fetched {
             Ok(out) => out,
             Err(error) => return local_transport_failure(error),
         };
+        let updates_current = !selected_only
+            || matches!(
+                &want,
+                Some(Ref::Branch(branch)) if store.current_branch().as_deref() == Some(branch.as_str())
+            );
         if !out.ok() {
             remote_current = false;
             ui::warning("fetch failed — continuing with the local copy.");
-        } else if let Some((ahead, behind)) = store.ahead_behind() {
+        } else if updates_current && let Some((ahead, behind)) = store.ahead_behind() {
             if ahead > 0 && behind > 0 {
                 ui::warning(&format!(
                     "local and remote have diverged (ahead {ahead}, behind {behind}); leaving local untouched."
@@ -452,13 +485,18 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             ui::bold(&slug),
             ui::accent(client.base())
         ));
-        let outcome = match crate::hub::git::clone(&clone_url, &dest, &plan.identity) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                abandon_failed_clone(history_update, &dest)?;
-                return local_transport_failure(error);
-            }
+        let selected = match &want {
+            Some(Ref::Branch(branch)) => Some(branch.as_str()),
+            _ => None,
         };
+        let outcome =
+            match crate::hub::git::clone_selected(&clone_url, &dest, &plan.identity, selected) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    abandon_failed_clone(history_update, &dest)?;
+                    return local_transport_failure(error);
+                }
+            };
         if !outcome.ok() {
             abandon_failed_clone(history_update, &dest)?;
             // The hint names the cause the exit code reports: a grant hint after a transfer that
@@ -995,6 +1033,9 @@ fn mode_of(me: Option<&str>, src_owner: &str, mine: bool) -> Mode {
 fn local_transport_failure(error: anyhow::Error) -> CmdResult {
     super::fix::register_terminal_api_error(&error);
     ui::error(&format!("{error:#}"));
+    if error.is::<crate::hub::git::ScopedRefUnavailable>() {
+        return Ok(ExitCode::Ref);
+    }
     Ok(super::terminal_error_code(&error, ExitCode::Precondition))
 }
 

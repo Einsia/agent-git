@@ -51,9 +51,11 @@ use std::process::{Command, Stdio};
 mod frozen;
 pub mod inspection_summary;
 mod ref_read;
+mod scoped_fetch;
 mod tag_fetch;
 pub use crate::domain::secrets::publication::InspectionFailure;
 pub(crate) use frozen::HISTORY_CHANGED;
+pub(crate) use scoped_fetch::Unavailable as ScopedRefUnavailable;
 
 /// The kind of the Hub's refusal of a push that met another write to the same repository: its
 /// lock or write lease stayed held for the whole wait. The Hub sends it before any ref moves, so
@@ -279,6 +281,7 @@ struct TransportIdentity {
     execution: Option<frozen::Execution>,
     lfs: Option<(String, String)>,
     accept_secret_findings: bool,
+    fetch_scope: Option<scoped_fetch::Selection>,
 }
 
 impl TransportIdentity {
@@ -363,7 +366,34 @@ impl TransportIdentity {
             execution: None,
             lfs,
             accept_secret_findings: false,
+            fetch_scope: None,
         })
+    }
+
+    fn select_branch(&mut self, branch: &str) -> Result<bool> {
+        let Some(client) = &self.client else {
+            return Ok(false);
+        };
+        let config = match client.hub_config() {
+            Ok(config) => config,
+            Err(error)
+                if error
+                    .downcast_ref::<super::client::ApiError>()
+                    .is_some_and(|api| api.status == 404) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if !config.accepts_fetch_scope() {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.urls.len() == 1 && self.agent_id.is_some(),
+            "scoped fetch requires one immutable Hub destination"
+        );
+        self.fetch_scope = Some(scoped_fetch::Selection::branch(branch)?);
+        Ok(true)
     }
 
     fn token(&self) -> Result<Option<String>> {
@@ -391,6 +421,21 @@ impl TransportIdentity {
         execution: Option<&frozen::Execution>,
         lfs: bool,
     ) -> Result<Vec<(String, OsString)>> {
+        let scope = self
+            .fetch_scope
+            .as_ref()
+            .map(|selection| {
+                selection.header(
+                    self.client
+                        .as_ref()
+                        .context("scoped fetch has no Hub identity")?,
+                    &self.urls[0],
+                    self.agent_id
+                        .as_deref()
+                        .context("scoped fetch has no repository identity")?,
+                )
+            })
+            .transpose()?;
         // LFS action headers carry transfer authority. Injecting the batch identity at the
         // repository prefix duplicates the receiver fence on upload and verification requests.
         let lfs_urls;
@@ -423,6 +468,20 @@ impl TransportIdentity {
                 self.accept_secret_findings,
             )
         };
+        if let Some(scope) = scope {
+            let parameters = &mut environment[0].1;
+            parameters.push(" ");
+            parameters.push(quote_git_parameter(&format!(
+                "http.{}.extraHeader",
+                self.urls[0]
+            )));
+            parameters.push("=");
+            parameters.push(quote_git_parameter(&format!(
+                "{}: {scope}",
+                scoped_fetch::HEADER
+            )));
+            parameters.push(" 'protocol.version'='0'");
+        }
         if lfs {
             let parameters = &mut environment[0].1;
             for url in &self.urls {
@@ -894,6 +953,27 @@ pub fn run_for_remote(
     run_for_identity(Some(repo.root()), args, identity)
 }
 
+/// An explicitly selected branch cannot fall back to a stale local ref after scoped refusal.
+pub(crate) fn fetch_branch(
+    repo: &Repo,
+    identity: &super::identity::RemoteIdentity,
+    branch: &str,
+) -> Result<Option<Outcome>> {
+    super::identity::verify_transport_target(repo, identity)?;
+    let mut transport = TransportIdentity::new(Some(repo.root()), &["fetch", "origin"], identity)?;
+    if !transport.select_branch(branch)? {
+        return Ok(None);
+    }
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let fetch = ["fetch", "--no-tags", "--no-prune", "origin", &refspec];
+    let args = without_maintenance(&fetch);
+    let outcome = run_transport(Some(repo.root()), &args, &transport)?;
+    if outcome.ok() {
+        crate::domain::privacy_git::schedule_compaction(repo.root());
+    }
+    Ok(Some(outcome))
+}
+
 /// [`run_for_remote`] for a read that must finish within `timeout`, taking its stdout, with why
 /// it did not in a fixed sentence that names no secret: the same causes a branch-list read
 /// reports.
@@ -1344,6 +1424,15 @@ pub fn clone(
     dest: &Path,
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
+    clone_selected(url, dest, identity, None)
+}
+
+pub(crate) fn clone_selected(
+    url: &str,
+    dest: &Path,
+    identity: &super::identity::RemoteIdentity,
+    branch: Option<&str>,
+) -> Result<Outcome> {
     require_transport_url(url, identity)?;
     match std::fs::symlink_metadata(dest) {
         Ok(metadata) => {
@@ -1371,7 +1460,21 @@ pub fn clone(
         std::fs::create_dir_all(p).with_context(|| format!("cannot create {}", p.display()))?;
     }
     let dest_s = dest.to_string_lossy().to_string();
-    let out = run_for_identity(None, &["clone", "--quiet", url, &dest_s], identity)?;
+    let mut transport = TransportIdentity::new(None, &["clone", url, &dest_s], identity)?;
+    let scoped = branch
+        .map(|branch| transport.select_branch(branch))
+        .transpose()?
+        .unwrap_or(false);
+    let mut args = vec!["clone", "--quiet"];
+    if scoped {
+        args.extend([
+            "--no-tags",
+            "--branch",
+            branch.expect("scoped clone selects a branch"),
+        ]);
+    }
+    args.extend([url, &dest_s]);
+    let out = run_transport(None, &args, &transport)?;
     if out.ok() {
         super::identity::pin(&Repo::at(dest), identity)?;
     }
@@ -2172,6 +2275,10 @@ mod probe_timeout_tests {
 mod git_credential_lifecycle_tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
+        "/src/hub/git/scoped_fetch_tests.rs"
+    ));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
         "/src/hub/git/frozen_http_tests.rs"
     ));
 
@@ -2476,6 +2583,21 @@ mod git_credential_lifecycle_tests {
 
         fn with_timeout(
             timeout: Duration,
+            respond: impl FnMut(&WireRequest) -> Reply + Send + 'static,
+        ) -> Self {
+            Self::serve(timeout, None, respond)
+        }
+
+        fn with_config(
+            config: serde_json::Value,
+            respond: impl FnMut(&WireRequest) -> Reply + Send + 'static,
+        ) -> Self {
+            Self::serve(Duration::from_secs(20), Some(config), respond)
+        }
+
+        fn serve(
+            timeout: Duration,
+            config: Option<serde_json::Value>,
             mut respond: impl FnMut(&WireRequest) -> Reply + Send + 'static,
         ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2495,9 +2617,19 @@ mod git_credential_lifecycle_tests {
                             // A Hub that publishes no push limits; the fixtures pin the requests
                             // a publication makes beyond reading them.
                             if request.path == "/api/hub/config" {
-                                stream.write_all(
-                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                                )?;
+                                if let Some(config) = &config {
+                                    let body = serde_json::to_vec(config)?;
+                                    write!(
+                                        stream,
+                                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        body.len()
+                                    )?;
+                                    stream.write_all(&body)?;
+                                } else {
+                                    stream.write_all(
+                                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                    )?;
+                                }
                                 continue;
                             }
                             let response = respond(&request);

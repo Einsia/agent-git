@@ -376,6 +376,7 @@ impl FrozenPublication {
             .map(|_| vec![url.to_owned()])
             .unwrap_or_default();
         let transport = TransportIdentity {
+            fetch_scope: None,
             client,
             urls,
             agent_id: Some(identity.agent_id.clone()),
