@@ -61,6 +61,8 @@ use crate::domain::{link, link::Link, store::Store, workspace};
 use clap::{Args as ClapArgs, Subcommand};
 use std::io::Read as _;
 
+mod stop_input;
+
 #[derive(ClapArgs)]
 pub struct Args {
     #[command(subcommand)]
@@ -81,6 +83,11 @@ pub enum Action {
         #[arg(long, hide = true)]
         await_reply: bool,
     },
+    /// Recover the pending ordinary Stops in a queue named by `agit status`.
+    Recover { queue: String },
+    /// Process ordinary Stop requests without holding the native hook open.
+    #[command(hide = true)]
+    DrainStops { queue: String },
     /// Deliver a Claude Code session's queued workspace messages while that session runs.
     #[command(hide = true)]
     Relay {
@@ -152,6 +159,14 @@ pub fn run(args: Args) -> CmdResult {
     match args.action.unwrap_or(Action::Ingest) {
         Action::Ingest => ingest(runtime.as_deref()),
         Action::Settle { await_reply } => settle(runtime.as_deref(), await_reply),
+        Action::Recover { queue } | Action::DrainStops { queue } => {
+            let finished = super::stop_requests::drain(&queue)?;
+            Ok(if finished {
+                ExitCode::Ok
+            } else {
+                ExitCode::Precondition
+            })
+        }
         // The binary handles this before telemetry, Git setup or helper processes start.
         Action::Relay { .. } => Ok(ExitCode::Ok),
         #[cfg(unix)]
@@ -745,11 +760,15 @@ fn foreign_launch_env(rt: &str, store: Option<&Store>, session_id: &str) -> bool
 /// each turn. The conversation running the hook can still send a section its index held when it
 /// started; the cleaning keeps it from the next conversation started in the folder.
 fn take_out_memory_sections(rt: &str, ev: &Event) {
+    clean_runtime_memory(rt, ev.cwd.as_deref().map(std::path::Path::new));
+}
+
+pub(super) fn clean_runtime_memory(rt: &str, cwd: Option<&std::path::Path>) {
     if rt != "claude-code" {
         return;
     }
-    if let Some(cwd) = ev.cwd.as_deref()
-        && let Some(memory) = crate::infra::runtime_memory::locate(rt, std::path::Path::new(cwd))
+    if let Some(cwd) = cwd
+        && let Some(memory) = crate::infra::runtime_memory::locate(rt, cwd)
     {
         let _ = super::memory::take_out_sections(&memory.dir);
     }
@@ -1381,6 +1400,14 @@ fn settle(runtime: Option<&str>, await_reply: bool) -> CmdResult {
     let settled = settle_inner(runtime, await_reply);
     super::upload_outcome::landed();
     match settled {
+        Err(error)
+            if error.is::<stop_input::Unavailable>()
+                || error.is::<StopPreparationRequired>()
+                || error.is::<super::commit::StopInputUnavailable>() =>
+        {
+            crate::ui::error(&error.to_string());
+            Ok(ExitCode::Precondition)
+        }
         Err(error) if super::commit::archive::is_failure(&error) => {
             crate::ui::error(&format!("{error:#}"));
             Ok(super::terminal_error_code(&error, ExitCode::Failure))
@@ -1401,15 +1428,30 @@ pub(crate) fn stop_seen_path(runtime: &str) -> Option<std::path::PathBuf> {
 }
 
 fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
+    let automatic_saving_off = super::config::get("commit.auto").as_deref() == Some("false");
+    let payload = match stop_input::read() {
+        Ok(payload) => payload,
+        Err(_) if automatic_saving_off => return Ok(()),
+        Err(error) => {
+            super::commit::archive::require_hook_identity(false)?;
+            return Err(error.into());
+        }
+    };
     if let Some(path) = runtime.and_then(stop_seen_path) {
         let _ = crate::infra::config::create_state_dir(path.parent().unwrap_or(&path))
             .and_then(|()| std::fs::write(&path, b""));
     }
-    let payload = read_payload();
     let event = payload
         .as_deref()
         .and_then(|payload| event_from(runtime, payload));
-    if let Some(ev) = &event {
+    let preparation = if !await_reply {
+        prepare_stop(runtime, event.as_ref(), automatic_saving_off)?
+    } else {
+        StopPreparation::Inline
+    };
+    if preparation == StopPreparation::Inline
+        && let Some(ev) = &event
+    {
         take_out_memory_sections(runtime_of(runtime, ev.transcript_path.as_deref()), ev);
     }
     #[cfg(unix)]
@@ -1419,7 +1461,7 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
     {
         crate::rc::native_claude::permission::report_mode(&ev.session_id, mode);
     }
-    if super::config::get("commit.auto").as_deref() == Some("false") {
+    if automatic_saving_off {
         return Ok(());
     }
     let Some(ev) = event else {
@@ -1493,7 +1535,7 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
                 serde_json::json!({ "systemMessage": lines.join("\n") })
             );
         }
-        return settled;
+        return settled.map(|_| ());
     }
     let lines: Vec<String> = [failure, superseded, unsaved]
         .into_iter()
@@ -1507,17 +1549,17 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         .then(|| (ev.session_id.clone(), ev.cwd.clone(), ev.shows_notice));
     if failure.is_none() && unseen.is_none() {
         let settled = settle_event(runtime, await_reply, payload.as_deref(), ev, rt);
-        if !await_reply && let Some(line) = capture_recovery_line(&settled) {
+        if !await_reply && let Some(line) = capture_recovery_line(rt, &settled) {
             println!("{}", serde_json::json!({ "systemMessage": line }));
         }
-        return settled;
+        return settled.map(|_| ());
     }
     // Claude Code reads the hook's whole stdout as that one response, so the settlement's own
     // notices go to stderr.
     let settled = crate::ui::with_info_on_stderr(true, || {
         settle_event(runtime, await_reply, payload.as_deref(), ev, rt)
     });
-    let lines: Vec<_> = [failure, capture_recovery_line(&settled)]
+    let lines: Vec<_> = [failure, capture_recovery_line(rt, &settled)]
         .into_iter()
         .flatten()
         .collect();
@@ -1528,6 +1570,7 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
         );
     }
     if let Some((session, cwd, shown)) = unseen
+        && !matches!(&settled, Ok(StopDisposition::Queued))
         && let Some(notice) = super::settle_failures::settled(
             rt,
             &session,
@@ -1544,14 +1587,107 @@ fn settle_inner(runtime: Option<&str>, await_reply: bool) -> crate::Result<()> {
             serde_json::json!({ "notice": notice })
         );
     }
-    settled
+    settled.map(|_| ())
 }
 
-fn capture_recovery_line(settled: &crate::Result<()>) -> Option<String> {
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "automatic saving needs local storage preparation; this Stop was not queued; run `agit config --list` to prepare it, then `agit save` to save this turn"
+)]
+struct StopPreparationRequired;
+
+/// Admission requires prepared storage even when the hook can already explain a refusal.
+pub(super) fn require_stop_admission_ready() -> crate::Result<()> {
+    if !super::migration::stop_admission_ready().unwrap_or(false) {
+        return Err(StopPreparationRequired.into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopPreparation {
+    Inline,
+    ProjectWorker,
+    DirectWorker,
+}
+
+/// Ordinary workers prepare compatible storage; Archive keeps its synchronous preparation.
+fn prepare_stop(
+    runtime: Option<&str>,
+    event: Option<&Event>,
+    saving_off: bool,
+) -> crate::Result<StopPreparation> {
+    let preparation = (|| -> crate::Result<StopPreparation> {
+        let Some(event) = event else {
+            return Ok(StopPreparation::Inline);
+        };
+        if saving_off || super::commit::archive::process_store()?.is_some() {
+            return Ok(StopPreparation::Inline);
+        }
+        let rt = runtime_of(runtime, event.transcript_path.as_deref());
+        let Some(store) = Store::open()? else {
+            return Ok(StopPreparation::Inline);
+        };
+        let claim = super::commit::archive::native_link(
+            &store,
+            &crate::domain::merge_archive::RuntimeLinkKey {
+                runtime: rt.into(),
+                session_id: event.session_id.clone(),
+            },
+        )?;
+        if claim
+            .as_ref()
+            .is_some_and(|claim| claim.merge_archive.is_some())
+        {
+            return Ok(StopPreparation::Inline);
+        }
+        let Some(origin) = session_origin(event) else {
+            return Ok(StopPreparation::Inline);
+        };
+        if matches!(rt, "claude-code" | "codex" | "opencode" | "pi")
+            && super::project::has_governing_project(std::path::Path::new(&origin))?
+        {
+            return Ok(StopPreparation::ProjectWorker);
+        }
+        Ok(
+            if claim.is_some_and(|claim| claim.agent.is_some() && claim.branch.is_some()) {
+                StopPreparation::DirectWorker
+            } else {
+                StopPreparation::Inline
+            },
+        )
+    })()
+    .map_err(|error| {
+        if super::commit::archive::is_failure(&error) {
+            error
+        } else {
+            error.context(StopPreparationRequired)
+        }
+    })?;
+    if preparation != StopPreparation::Inline {
+        return Ok(preparation);
+    }
+    super::migration::migrate_startup().map_err(|error| error.context(StopPreparationRequired))?;
+    super::memory::sweep_once_per_version();
+    super::project::recheck_claims(false);
+    Ok(StopPreparation::Inline)
+}
+
+fn capture_recovery_line(
+    runtime: &str,
+    settled: &crate::Result<StopDisposition>,
+) -> Option<String> {
+    if super::settle_failures::output_discarded(runtime) {
+        return None;
+    }
     settled
         .as_ref()
         .err()
-        .filter(|error| error.is::<super::project::CaptureRecoveryRequired>())
+        .filter(|error| {
+            error.is::<super::project::CaptureRecoveryRequired>()
+                || error.is::<super::stop_requests::WorkerUnavailable>()
+                || error.is::<super::stop_requests::AdmissionFailed>()
+        })
         .map(|error| format!("agit: {error}"))
 }
 
@@ -1578,16 +1714,21 @@ fn older_line(session_id: &str) -> Option<String> {
     Some(link::launch::explain(&hold))
 }
 
+enum StopDisposition {
+    Complete,
+    Queued,
+}
+
 fn settle_event(
     runtime: Option<&str>,
     await_reply: bool,
     payload: Option<&str>,
     ev: Event,
     rt: &'static str,
-) -> crate::Result<()> {
+) -> crate::Result<StopDisposition> {
     let archive_store = super::commit::archive::process_store()?;
     if archive_store.is_none() && side_conversation(rt, &ev) {
-        return Ok(());
+        return Ok(StopDisposition::Complete);
     }
     if await_reply {
         super::upload_outcome::settling_from_environment(rt, &ev.session_id);
@@ -1611,7 +1752,7 @@ fn settle_event(
     // A Codex session holding no branch of its own, under another launch's variables: nothing of
     // it is recorded here.
     if !archive_required && foreign_launch_env(rt, Some(&store), &ev.session_id) {
-        return Ok(());
+        return Ok(StopDisposition::Complete);
     }
     // Archive settlement reports its failure to the hook's caller, so it never detaches.
     if !archive_required
@@ -1626,13 +1767,15 @@ fn settle_event(
             && let Some(payload) = payload
             && spawn_awaiting_settlement(runtime, payload, (rt, &ev.session_id)).is_ok()
         {
-            return Ok(());
+            return Ok(StopDisposition::Complete);
         }
     }
-    if !archive_required
-        && super::project::capture(rt, &ev.session_id, session_origin(&ev).as_deref())?
-    {
-        return Ok(());
+    if !archive_required {
+        match super::project::capture_stop(rt, &ev.session_id, session_origin(&ev).as_deref())? {
+            super::project::StopCapture::Queued => return Ok(StopDisposition::Queued),
+            super::project::StopCapture::Withheld => return Ok(StopDisposition::Complete),
+            super::project::StopCapture::Unhandled => {}
+        }
     }
     let Some(lk) = super::commit::archive::native_link(
         &store,
@@ -1647,12 +1790,21 @@ fn settle_event(
                 "the selected Archive hook native Link is missing"
             )));
         }
-        return Ok(());
+        return Ok(StopDisposition::Complete);
     };
     // A save refused by its rules comes back as an exit status, after saying why. An archive
     // settlement answers for itself, as the hook exits. What a refusal says goes into the turn's
     // message, so no settlement error names a record's text or a value protection matched.
     let archive = lk.merge_archive.is_some();
+    if !archive_required && !archive {
+        return super::stop_requests::enqueue(&store, &lk).map(|queued| {
+            if queued {
+                StopDisposition::Queued
+            } else {
+                StopDisposition::Complete
+            }
+        });
+    }
     let (code, said) = crate::ui::recording_errors(|| super::commit::settle_from_link(&store, lk));
     if code? != crate::ExitCode::Ok && !archive {
         return Err(super::settle_failures::NotSaved(
@@ -1662,7 +1814,7 @@ fn settle_event(
         )
         .into());
     }
-    Ok(())
+    Ok(StopDisposition::Complete)
 }
 
 /// How long a detached settlement waits for Claude Code to write the stopped turn's reply. Past

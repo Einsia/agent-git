@@ -400,6 +400,10 @@ pub fn set_global(key: &str, value: Option<&str>) -> Result<()> {
         }
         _ => Default::default(),
     };
+    #[cfg(any(feature = "cli", test))]
+    if matches!(key, "commit.auto" | "push.auto") && map.get(key).map(String::as_str) != value {
+        crate::domain::stop_requests::revoke_policy(key)?;
+    }
     match value {
         Some(v) => {
             map.insert(key.to_string(), v.to_string());

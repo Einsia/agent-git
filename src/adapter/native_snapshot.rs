@@ -328,6 +328,15 @@ pub(crate) fn read_file(source: &Source, limits: Limits) -> Result<Snapshot> {
 
 /// Byte inspection pins a regular carrier; record completeness belongs to the caller.
 pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
+    read_file_bytes_until(path, limits, None)
+}
+
+pub(crate) fn read_file_bytes_until(
+    path: &Path,
+    limits: Limits,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>> {
+    check_deadline(deadline)?;
     let (file, opened) = open_unchanged(path, |len| {
         if len > limits.bytes || len > limits.working_bytes {
             return Err(Unavailable::BudgetExceeded);
@@ -339,9 +348,17 @@ pub(crate) fn read_file_bytes(path: &Path, limits: Limits) -> Result<Vec<u8>> {
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| Unavailable::BudgetExceeded)?;
-    read_bounded(&file, &mut bytes, limits)?;
+    read_bounded_until(&file, &mut bytes, limits, deadline)?;
     finish_unchanged(&file, path, &opened, bytes.len())?;
+    check_deadline(deadline)?;
     Ok(bytes)
+}
+
+pub(crate) fn check_deadline(deadline: Option<std::time::Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err(Unavailable::BudgetExceeded);
+    }
+    Ok(())
 }
 
 /// The longest first line [`read_file_after`] keeps.
@@ -422,7 +439,7 @@ pub(crate) fn read_file_after(
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| Unavailable::BudgetExceeded)?;
-    read_bounded(&file, &mut bytes, limits)?;
+    read_bounded_until(&file, &mut bytes, limits, None)?;
     let total = usize::try_from(start)
         .ok()
         .and_then(|start| start.checked_add(bytes.len()))
@@ -485,7 +502,12 @@ fn open_unchanged(
 }
 
 /// Appends the rest of `file` to `bytes`, refusing to grow past `limits`.
-fn read_bounded(file: &std::fs::File, bytes: &mut Vec<u8>, limits: Limits) -> Result<()> {
+fn read_bounded_until(
+    file: &std::fs::File,
+    bytes: &mut Vec<u8>,
+    limits: Limits,
+    deadline: Option<std::time::Instant>,
+) -> Result<()> {
     let cap = limits
         .bytes
         .checked_add(1)
@@ -495,6 +517,7 @@ fn read_bounded(file: &std::fs::File, bytes: &mut Vec<u8>, limits: Limits) -> Re
     let mut reader = file.take(u64::try_from(allowed).map_err(|_| Unavailable::BudgetExceeded)?);
     let mut chunk = [0; 8192];
     loop {
+        check_deadline(deadline)?;
         let read = reader.read(&mut chunk).map_err(|_| Unavailable::Read)?;
         if read == 0 {
             return Ok(());
@@ -867,6 +890,10 @@ mod tests {
             ..Limits::default()
         };
         let snapshot = read_file(&source, exact).unwrap();
+        assert_eq!(
+            read_file_bytes_until(&path, exact, Some(std::time::Instant::now())).unwrap_err(),
+            Unavailable::BudgetExceeded
+        );
         assert_eq!(snapshot.bytes, original);
         assert_eq!(snapshot.records, 1);
         assert_eq!(std::fs::read(&path).unwrap(), original);

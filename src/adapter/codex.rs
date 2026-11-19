@@ -417,11 +417,32 @@ pub(crate) fn lineage_bytes_with_lookup(
     source: &super::native_snapshot::Source,
     limits: super::native_snapshot::Limits,
     allow_unrecognized_leaf: bool,
+    parent_records_left: Option<usize>,
+    lookup: impl Fn(
+        &str,
+        super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
+) -> super::native_snapshot::Result<Vec<u8>> {
+    lineage_bytes_with_lookup_until(
+        source,
+        limits,
+        allow_unrecognized_leaf,
+        parent_records_left,
+        lookup,
+        None,
+    )
+}
+
+fn lineage_bytes_with_lookup_until(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+    allow_unrecognized_leaf: bool,
     mut parent_records_left: Option<usize>,
     lookup: impl Fn(
         &str,
         super::native_snapshot::Limits,
     ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
+    deadline: Option<std::time::Instant>,
 ) -> super::native_snapshot::Result<Vec<u8>> {
     use super::native_snapshot::Unavailable;
 
@@ -434,7 +455,7 @@ pub(crate) fn lineage_bytes_with_lookup(
         if nodes.len() >= MAX_FORK_DEPTH || !visited.insert(rollout_id) {
             return Err(Unavailable::Incomplete);
         }
-        let bytes = super::native_snapshot::read_file_bytes(&current.path, limits)?;
+        let bytes = super::native_snapshot::read_file_bytes_until(&current.path, limits, deadline)?;
         retained = retained
             .checked_add(bytes.len())
             .ok_or(Unavailable::BudgetExceeded)?;
@@ -479,6 +500,7 @@ pub(crate) fn lineage_bytes_with_lookup(
     let mut bytes = Vec::new();
     append_bounded(&mut bytes, &nodes[0].parts.header, output_limits)?;
     for index in (1..nodes.len()).rev() {
+        super::native_snapshot::check_deadline(deadline)?;
         let history = nodes[index - 1]
             .history
             .as_ref()
@@ -545,6 +567,20 @@ pub(crate) fn capture_lineage_with_lookup(
         super::native_snapshot::Limits,
     ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
 ) -> super::native_snapshot::Result<(Vec<u8>, Vec<CaptureSpan>)> {
+    capture_lineage_with_lookup_until(source, limits, full, lookup, None)
+}
+
+#[cfg(feature = "rc")]
+pub(crate) fn capture_lineage_with_lookup_until(
+    source: &super::native_snapshot::Source,
+    limits: super::native_snapshot::Limits,
+    full: bool,
+    lookup: impl Fn(
+        &str,
+        super::native_snapshot::Limits,
+    ) -> super::native_snapshot::Result<super::native_snapshot::Source>,
+    deadline: Option<std::time::Instant>,
+) -> super::native_snapshot::Result<(Vec<u8>, Vec<CaptureSpan>)> {
     use super::native_snapshot::Unavailable;
 
     let mut visited = HashSet::new();
@@ -557,7 +593,8 @@ pub(crate) fn capture_lineage_with_lookup(
             return Err(Unavailable::Incomplete);
         }
         let (bytes, file_len) = if full {
-            let bytes = super::native_snapshot::read_file_bytes(&current.path, limits)?;
+            let bytes =
+                super::native_snapshot::read_file_bytes_until(&current.path, limits, deadline)?;
             let len = bytes.len();
             (bytes, len)
         } else {
@@ -614,6 +651,7 @@ pub(crate) fn capture_lineage_with_lookup(
     // (node, header or body, kept body length)
     let mut pieces = vec![(first, true, nodes[first].parts.header.len())];
     for index in (0..nodes.len()).rev() {
+        super::native_snapshot::check_deadline(deadline)?;
         let node = &nodes[index];
         let kept = if index == 0 {
             node.body_len
@@ -751,6 +789,51 @@ pub(crate) fn read_pending_bytes(
         return Err(super::native_snapshot::Unavailable::Unsupported);
     }
     lineage_bytes(source, limits, false, Some(limits.records))
+}
+
+/// A Stop reads the same logical stream as capture without restoring cold carriers.
+#[cfg(feature = "cli")]
+pub(crate) fn read_stop_bytes(
+    session: &str,
+    limits: super::native_snapshot::Limits,
+    deadline: std::time::Instant,
+) -> Result<(PathBuf, Vec<u8>)> {
+    super::native_snapshot::check_deadline(Some(deadline))?;
+    let home = codex_home()?;
+    let path = match super::codex_index::native_path_readonly(session, limits)? {
+        Some(path) => path,
+        None => super::native_snapshot::codex_carrier_in(&home, session, limits)?,
+    };
+    let source = plain_stop_source(session, path)?;
+    let bytes = lineage_bytes_with_lookup_until(
+        &source,
+        limits,
+        true,
+        Some(limits.records),
+        |id, limits| {
+            super::native_snapshot::check_deadline(Some(deadline))?;
+            let path = super::native_snapshot::codex_carrier_in(&home, id, limits)?;
+            plain_stop_source(id, path)
+        },
+        Some(deadline),
+    )?;
+    super::native_snapshot::check_deadline(Some(deadline))?;
+    Ok((source.path, bytes))
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn plain_stop_source(
+    session: &str,
+    path: PathBuf,
+) -> super::native_snapshot::Result<super::native_snapshot::Source> {
+    use super::native_snapshot::Unavailable;
+    if super::codex_rollout::is_compressed(&path) {
+        return Err(Unavailable::Read);
+    }
+    // Check before canonicalizing so a redirect is not hidden from the regular-file reader.
+    let source = super::native_snapshot::source_at("codex", session, path)?;
+    let path = source.path.canonicalize().map_err(|_| Unavailable::Read)?;
+    super::native_snapshot::source_at("codex", session, path)
 }
 
 fn lineage_snapshot(
@@ -2439,10 +2522,32 @@ mod tests {
                 path: path.clone(),
                 database: false,
             };
-            capture_lineage_with_lookup(&source, Limits::default(), full, |id, limits| {
-                lookup_codex_rollout_in(home.path(), id, limits)
-            })
-            .unwrap()
+            let captured =
+                capture_lineage_with_lookup(&source, Limits::default(), full, |id, limits| {
+                    lookup_codex_rollout_in(home.path(), id, limits)
+                })
+                .unwrap();
+            if full {
+                let stopped = capture_lineage_with_lookup_until(
+                    &source,
+                    Limits::default(),
+                    true,
+                    |id, limits| {
+                        plain_stop_source(
+                            id,
+                            super::super::native_snapshot::codex_carrier_in(
+                                home.path(),
+                                id,
+                                limits,
+                            )?,
+                        )
+                    },
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+                )
+                .unwrap();
+                assert_eq!(stopped, captured);
+            }
+            captured
         };
         let (bytes, spans) = capture(thread, &segment_path, true);
         assert_eq!(

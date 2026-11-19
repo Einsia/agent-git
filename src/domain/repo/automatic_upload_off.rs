@@ -129,6 +129,10 @@ pub fn set(owner: &str, name: &str, off: bool) -> Result<()> {
         body.off.remove(&key)
     };
     if changed {
+        #[cfg(any(feature = "cli", test))]
+        super::super::stop_requests::revoke_policy(
+            &super::super::stop_requests::destination_policy(owner, name)?,
+        )?;
         crate::domain::privacy::storage::write_private(&record, &serde_json::to_vec(&body)?)?;
     }
     Ok(())

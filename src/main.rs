@@ -315,7 +315,9 @@ fn prepare_startup(
     }
     let prepared = match startup {
         Startup::Inspect => commands::migration::check_readonly_startup(reads),
-        Startup::Migrate => commands::migration::migrate_startup().map(|_| ()),
+        Startup::Migrate | Startup::CaptureWorker => {
+            commands::migration::migrate_startup().map(|_| ())
+        }
         Startup::Finish => commands::migration::finish_interrupted(),
         Startup::ScopedDoctor
         | Startup::ScopedDiff
@@ -325,6 +327,7 @@ fn prepare_startup(
         | Startup::LocalSearch
         | Startup::ScopedActivity
         | Startup::OfflineListing
+        | Startup::StopAdmission
         | Startup::ToolDispatcher => Ok(()),
     };
     if let Err(e) = prepared {
@@ -342,7 +345,10 @@ fn prepare_startup(
     // A conversation can send the memory index its folder held when it started, so the first
     // process of a version that prepares local state, a hook's included, takes agit's old
     // sections out of every index. A read-only command changes no local state, so it doesn't.
-    if matches!(startup, Startup::Migrate | Startup::Finish) {
+    if matches!(
+        startup,
+        Startup::Migrate | Startup::CaptureWorker | Startup::Finish
+    ) {
         commands::memory::sweep_once_per_version();
     }
     None
@@ -369,6 +375,7 @@ fn reads(command: &Commands) -> commands::migration::Reads {
 /// one notice of what it dropped, away from the user.
 fn recheck_project_claims(command: &Commands) {
     match command {
+        Commands::Hooks(_) if startup_for(command) == Startup::StopAdmission => {}
         Commands::Project(commands::project::Args {
             action: commands::project::Action::List,
         }) => {}
@@ -385,7 +392,11 @@ fn recheck_project_claims(command: &Commands) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Startup {
     Migrate,
+    /// A project worker prepares deferred hook state without asking the version service.
+    CaptureWorker,
     Inspect,
+    /// The hook selects Archive, project capture or a direct claim before preparing storage.
+    StopAdmission,
     /// The command validates its explicit local scope before inspecting recovery evidence.
     ScopedDoctor,
     ScopedDiff,
@@ -444,12 +455,22 @@ impl Startup {
                 | Self::ScopedActivity
                 | Self::OfflineListing
                 | Self::ToolDispatcher
+                | Self::StopAdmission
+                | Self::CaptureWorker
         )
     }
 }
 
 fn startup_for(command: &Commands) -> Startup {
     match command {
+        Commands::Hooks(args)
+            if matches!(
+                args.action,
+                Some(commands::hooks::Action::Settle { await_reply: false })
+            ) =>
+        {
+            Startup::StopAdmission
+        }
         Commands::Rc(args) if matches!(args.action, commands::rc::Action::Tunnel) => {
             Startup::ToolDispatcher
         }
@@ -458,6 +479,10 @@ fn startup_for(command: &Commands) -> Startup {
         }
         Commands::Status(_) | Commands::Overview => Startup::Inspect,
         Commands::On(_) | Commands::Off(_) | Commands::Save(_) => Startup::Finish,
+        Commands::Project(commands::project::Args {
+            action:
+                commands::project::Action::Capture { .. } | commands::project::Action::Recover { .. },
+        }) => Startup::CaptureWorker,
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,

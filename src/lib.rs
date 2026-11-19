@@ -174,6 +174,8 @@ pub mod domain {
     /// Compatibility layer for reading legacy snapshot.json; the commit path uses
     /// `meta`/`storage`.
     pub mod snapshot;
+    #[cfg(any(feature = "cli", test))]
+    pub mod stop_requests;
     /// v0/v1 session storage: content-addressed events, sequencing and materialization.
     pub mod storage;
     /// The local store: a plain directory holding links.

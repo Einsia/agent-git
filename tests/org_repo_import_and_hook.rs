@@ -11,6 +11,9 @@
 //! A folder set up to upload into the org repo automatically is entered the same way, through
 //! the hooks and the project's own worker.
 
+#[path = "support/stop_requests.rs"]
+mod stop_requests;
+
 use agit::domain::repo::Repo;
 use std::io::{Read as _, Write as _};
 use std::process::{Command, Stdio};
@@ -325,7 +328,16 @@ impl Lab {
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        if action == "settle" {
+            stop_requests::finish(
+                &mut self.agit(&[]),
+                &self.agit_home,
+                "claude-code",
+                session_id,
+            );
+        }
+        output
     }
 
     /// Everything the stand-in Hub was asked so far, version probes included.

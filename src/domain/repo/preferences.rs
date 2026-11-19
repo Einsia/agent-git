@@ -47,6 +47,13 @@ impl Repo {
     }
 
     pub fn set_auto_push(&self, value: Option<bool>) -> Result<()> {
+        #[cfg(any(feature = "cli", test))]
+        if self.auto_push_override()? != value {
+            super::super::stop_requests::revoke_policy(&format!(
+                "repository:{}",
+                self.common_dir()?.canonicalize()?.display()
+            ))?;
+        }
         if let Some(value) = value {
             self.git(&[
                 "config",

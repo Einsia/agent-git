@@ -5,6 +5,9 @@
 #[path = "support/lab_env.rs"]
 mod lab_env;
 
+#[path = "support/stop_requests.rs"]
+mod stop_requests;
+
 use agit::domain::{meta, privacy_envelope::PrivacyEnvelope, repo::Repo, storage, transcript};
 use agit::infra::{
     config,
@@ -8708,7 +8711,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     let next = temp.path().join("next-turn");
     fs::write(
         bin.join("claude"),
-        "#!/bin/sh\nif [ -s \"$AGIT_TEST_NEXT\" ]; then\n  cat \"$AGIT_TEST_NEXT\" >> \"$AGIT_TEST_TRANSCRIPT\"\n  : > \"$AGIT_TEST_NEXT\"\n  printf '%s' \"$AGIT_TEST_STOP\" | \"$AGIT_TEST_BIN\" hooks settle --runtime claude-code\nfi\n",
+        "#!/bin/sh\nif [ -s \"$AGIT_TEST_NEXT\" ]; then\n  cat \"$AGIT_TEST_NEXT\" >> \"$AGIT_TEST_TRANSCRIPT\"\n  : > \"$AGIT_TEST_NEXT\"\n  printf '%s' \"$AGIT_TEST_STOP\" | \"$AGIT_TEST_BIN\" hooks settle --runtime claude-code\nfi\nif [ -n \"$AGIT_TEST_EXIT_GATE\" ]; then\n  : > \"$AGIT_TEST_STOPPED\"\n  while [ -e \"$AGIT_TEST_EXIT_GATE\" ]; do sleep 0.05; done\nfi\n",
     )
     .unwrap();
     fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -8719,7 +8722,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     let path = std::env::join_paths(path).unwrap();
     let stop =
         json!({"session_id":SID,"cwd":work,"transcript_path":transcript,"hook_event_name":"Stop"});
-    let agit = |args: &[&str]| {
+    let command = |args: &[&str]| {
         let environment = git_command(temp.path());
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
@@ -8728,7 +8731,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
                 command.env(name, value);
             }
         }
-        let output = command
+        command
             .current_dir(&work)
             .env("PATH", &path)
             .env("AGIT_HOME", &home)
@@ -8743,9 +8746,11 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
             .env("AGIT_TEST_STOP", stop.to_string())
             .env("AGIT_TEST_BIN", env!("CARGO_BIN_EXE_agit"))
             .stdin(Stdio::null())
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        command
+    };
+    let agit = |args: &[&str]| {
+        let output = command(args).output().unwrap();
         assert_success(&output);
         format!(
             "{}{}",
@@ -8778,9 +8783,40 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     ]);
     // Each launch adds what it is handed, at most one turn; its end line is the one line agit
     // writes after it.
-    let launch = |added: String| {
+    let launch = |added: String, finish_before_exit: bool| {
         fs::write(&next, added).unwrap();
-        let output = agit(&["resume", "alice/app@work"]);
+        let output = if finish_before_exit {
+            let gate = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
+            let stopped = temp.path().join("runtime-stopped");
+            let _ = fs::remove_file(&stopped);
+            let mut child = command(&["resume", "alice/app@work"])
+                .env("AGIT_TEST_EXIT_GATE", gate.path())
+                .env("AGIT_TEST_STOPPED", &stopped)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !stopped.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "runtime ended before Stop"
+                );
+                assert!(Instant::now() < deadline, "runtime did not reach Stop");
+                thread::sleep(Duration::from_millis(25));
+            }
+            stop_requests::finish(&mut command(&[]), &home, "claude-code", SID);
+            drop(gate);
+            let output = child.wait_with_output().unwrap();
+            assert_success(&output);
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        } else {
+            agit(&["resume", "alice/app@work"])
+        };
         let lines: Vec<_> = output
             .lines()
             .filter(|line| line.starts_with("agit: "))
@@ -8791,7 +8827,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     };
 
     assert_eq!(
-        launch(turn(3)).as_deref(),
+        launch(turn(3), true).as_deref(),
         Some("agit: saved 1 turn of this conversation and uploaded it to alice/app.")
     );
     assert_eq!(
@@ -8802,7 +8838,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
             &git(repo.root(), &["rev-parse", "refs/heads/work"])
         )
     );
-    assert_eq!(launch(String::new()), None);
+    assert_eq!(launch(String::new(), false), None);
 
     // The Hub refuses the upload as one past its event-entry limit.
     *hub.refuse_moved.lock().unwrap() = vec![("refs/heads/main".into(), main, None)];
@@ -8810,26 +8846,36 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
         "ERR HTTP 422 provenance_rejected: refs/heads/publication: session/meta.json unreadable (reserved event topology exceeds the per-push limit of 4 entries)\n",
     );
     assert_eq!(
-        launch(turn(4)).as_deref(),
+        launch(turn(4), true).as_deref(),
         Some(
             "agit: saved 1 turn of this conversation on this computer; the upload to alice/app failed: the session is larger than the Hub accepts, so later turns of it stay on this computer; `agit push alice/app@work` asks the Hub again."
         )
     );
     let previews = hub.previews.lock().unwrap().len();
     assert_eq!(
-        launch(turn(5)).as_deref(),
+        launch(turn(5), true).as_deref(),
         Some(
             "agit: saved 1 turn of this conversation on this computer; not uploaded: the session is larger than the Hub accepts, so later turns of it stay on this computer; pushing it yourself asks the Hub again."
         )
     );
     assert_eq!(hub.previews.lock().unwrap().len(), previews);
 
+    let store = agit::domain::store::Store::at(home.join("store"));
+    let queue = agit::domain::stop_requests::for_session(&store, "claude-code", SID);
+    let failed_publications = queue.pending().unwrap();
     agit(&["config", "--repo", "alice/app", "push.auto", "false"]);
     assert_eq!(
-        launch(turn(6)).as_deref(),
+        launch(turn(6), true).as_deref(),
         Some(
             "agit: saved 1 turn of this conversation on this computer; not uploaded: automatic upload is off for this repository."
         )
+    );
+    assert!(
+        queue
+            .pending()
+            .unwrap()
+            .iter()
+            .all(|id| failed_publications.contains(id))
     );
 
     // The last turn's reply is written after its Stop, so its settlement waits for the reply apart
@@ -8839,7 +8885,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     let (prompt, reply) = last.split_once('\n').unwrap();
     let before = git(repo.root(), &["rev-parse", "refs/heads/work"]);
     assert_eq!(
-        launch(format!("{prompt}\n")).as_deref(),
+        launch(format!("{prompt}\n"), false).as_deref(),
         Some("agit: the last turn of this conversation is still being saved.")
     );
     let settling: Vec<_> = fs::read_dir(home.join("projects/uploads/settling"))
@@ -8861,6 +8907,7 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(!marker.exists(), "the settlement kept its marker");
+    stop_requests::finish(&mut command(&[]), &home, "claude-code", SID);
     assert_ne!(git(repo.root(), &["rev-parse", "refs/heads/work"]), before);
 
     // A settlement that ended without removing its marker, as one that crashed does, leaves the
@@ -8869,8 +8916,20 @@ fn the_end_of_a_launched_session_says_what_became_of_its_turns() {
     let pid = ended.id();
     ended.wait().unwrap();
     fs::write(marker, json!({ "pid": pid }).to_string()).unwrap();
-    assert_eq!(launch(String::new()), None);
+    assert_eq!(launch(String::new(), false), None);
     assert!(!marker.exists());
+
+    // A queued Stop remains visible before a worker can acquire it; admission is not a save.
+    let owner = queue.try_own().unwrap().unwrap();
+    let before = git(repo.root(), &["rev-parse", "refs/heads/work"]);
+    assert_eq!(
+        launch(turn(8), false).as_deref(),
+        Some("agit: a save for this conversation is pending; `agit status` shows its progress.")
+    );
+    assert_eq!(git(repo.root(), &["rev-parse", "refs/heads/work"]), before);
+    drop(owner);
+    stop_requests::finish(&mut command(&[]), &home, "claude-code", SID);
+    assert_ne!(git(repo.root(), &["rev-parse", "refs/heads/work"]), before);
 }
 
 /// A conversation from a folder that doesn't upload by itself is not uploaded by an automatic
@@ -10203,6 +10262,21 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
                 .to_string(),
             ),
         );
+        let mut recovery = Command::new(env!("CARGO_BIN_EXE_agit"));
+        recovery.env_clear_local();
+        for (name, value) in git_command(temp.path()).get_envs() {
+            if let Some(value) = value {
+                recovery.env(name, value);
+            }
+        }
+        recovery
+            .current_dir(&work)
+            .env("AGIT_HOME", &home)
+            .env("AGIT_HUB_URL", &hub.base)
+            .env("CI", "1")
+            .env("AGIT_USE_SYSTEM_GIT", "1")
+            .env("AGIT_SECRETS_KEYSTORE", "file");
+        stop_requests::finish(&mut recovery, &home, "claude-code", session);
         String::from_utf8(output.stdout).unwrap()
     };
 
@@ -10333,6 +10407,331 @@ fn an_upload_refused_as_diverged_is_told_at_the_turns_end_and_in_status() {
     );
 }
 
+// Failure observations project metadata only; a concurrent worker can change it between reads.
+fn project_stop_timeout_snapshot(home: &Path, work: &Path, session: &str) -> String {
+    use agit::domain::stop_requests::Phase;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const RECORD_LIMIT: u64 = 64 * 1024;
+    const ENTRY_LIMIT: usize = 1024;
+    const OUTPUT_LIMIT: usize = 8 * 1024;
+    type Record = Result<(Vec<u8>, serde_json::Value), &'static str>;
+
+    fn canonical_id(id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
+    }
+
+    fn io_status(error: std::io::Error) -> &'static str {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "missing"
+        } else {
+            "unreadable"
+        }
+    }
+
+    fn read(path: &Path) -> Record {
+        let metadata = fs::symlink_metadata(path).map_err(io_status)?;
+        if !metadata.file_type().is_file() {
+            return Err("wrong_type");
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let file = options.open(path).map_err(io_status)?;
+        let opened = file.metadata().map_err(io_status)?;
+        if !opened.is_file() {
+            return Err("wrong_type");
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if opened.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err("wrong_type");
+            }
+        }
+        if metadata.len() > RECORD_LIMIT || opened.len() > RECORD_LIMIT {
+            return Err("oversized");
+        }
+        let mut bytes = Vec::new();
+        file.take(RECORD_LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_status)?;
+        if bytes.len() as u64 > RECORD_LIMIT {
+            return Err("oversized");
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "malformed")?;
+        if !value.is_object() {
+            return Err("malformed");
+        }
+        Ok((bytes, value))
+    }
+
+    fn envelope(path: &Path, id: &str) -> Record {
+        let record = read(path)?;
+        let value = &record.1;
+        if value["version"] != 1 {
+            return Err("unsupported_version");
+        }
+        if value["id"].as_str().is_none() {
+            return Err("malformed");
+        }
+        if value["id"] != id {
+            return Err("identity_mismatch");
+        }
+        if value["payload"]["authority"]["runtime"].as_str().is_none()
+            || value["payload"]["authority"]["session"].as_str().is_none()
+        {
+            return Err("malformed");
+        }
+        Ok(record)
+    }
+
+    fn status(record: &Record) -> &'static str {
+        match record {
+            Ok(_) => "present",
+            Err(reason) => reason,
+        }
+    }
+
+    let queue = home.join("store.stop-requests").join(format!(
+        "project-{}",
+        hex::encode(Sha256::digest(work.as_os_str().as_encoded_bytes()))
+    ));
+    let mut directory_status = "complete";
+    let mut ids = BTreeSet::new();
+    let entries = match fs::symlink_metadata(&queue) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::read_dir(&queue),
+        Ok(_) => {
+            directory_status = "wrong_type";
+            Err(std::io::ErrorKind::InvalidInput.into())
+        }
+        Err(error) => Err(error),
+    };
+    match entries {
+        Ok(entries) => {
+            for (index, entry) in entries.take(ENTRY_LIMIT + 1).enumerate() {
+                if index == ENTRY_LIMIT {
+                    directory_status = "entry_limit";
+                    break;
+                }
+                let Ok(entry) = entry else {
+                    directory_status = "unreadable";
+                    continue;
+                };
+                let path = entry.path();
+                if !matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("json" | "done")
+                ) {
+                    continue;
+                }
+                if let Some(id) = path.file_stem().and_then(|s| s.to_str())
+                    && canonical_id(id)
+                {
+                    ids.insert(id.to_owned());
+                } else {
+                    directory_status = "invalid_name";
+                }
+            }
+        }
+        Err(error) if directory_status == "complete" => {
+            directory_status = if error.kind() == std::io::ErrorKind::NotFound {
+                "missing"
+            } else {
+                "unreadable"
+            };
+        }
+        Err(_) => {}
+    }
+
+    let claim = read(
+        &home
+            .join("store/claude-code")
+            .join(format!("{session}.json")),
+    );
+    let branch = match &claim {
+        Err(_) => "unobserved",
+        Ok((_, value)) => match value.get("branch") {
+            None | Some(serde_json::Value::Null) => "absent",
+            Some(serde_json::Value::String(branch))
+                if gix::refs::FullName::try_from(format!("refs/heads/{branch}")).is_ok() =>
+            {
+                "present_valid"
+            }
+            Some(_) => "present_invalid",
+        },
+    };
+    let mut output = format!(
+        "non_atomic=true; directory={directory_status}; claim={}; branch={branch}",
+        status(&claim)
+    );
+    let mut unclassified = BTreeMap::<&str, usize>::new();
+    let mut matched = 0;
+    let mut output_limited = false;
+    let mut adoptions = BTreeMap::<String, Record>::new();
+    for id in ids {
+        let records = [
+            envelope(&queue.join(format!("{id}.json")), &id),
+            envelope(&queue.join(format!("{id}.done")), &id),
+        ];
+        let matches = |record: &Record| {
+            record.as_ref().is_ok_and(|(_, value)| {
+                value["payload"]["authority"]["runtime"] == "claude-code"
+                    && value["payload"]["authority"]["session"] == session
+            })
+        };
+        for record in &records {
+            if let Err(reason) = record
+                && *reason != "missing"
+            {
+                *unclassified.entry(reason).or_default() += 1;
+            }
+        }
+        if !records.iter().any(&matches) {
+            continue;
+        }
+        let pair = match (&records[0], &records[1]) {
+            (Ok((left, _)), Ok((right, _))) if left == right => "equal",
+            (Ok(_), Ok(_)) => "conflicting",
+            _ => "incomplete",
+        };
+        let state = read(&queue.join(format!("{id}.state")));
+        let mut row = format!(
+            "; request={id} json={} done={} pair={pair} state={}",
+            status(&records[0]),
+            status(&records[1]),
+            status(&state)
+        );
+        match &state {
+            Err("missing") => row.push_str(" phase=unobserved reader_default=accepted"),
+            Ok((_, value)) => {
+                let phase = serde_json::from_value::<Phase>(value["phase"].clone());
+                let digest = value["request_sha256"].as_str();
+                let tip = match phase.as_ref() {
+                    Ok(Phase::Saving { parent }) => parent.as_deref(),
+                    Ok(
+                        Phase::Saved { tip, .. }
+                        | Phase::Publishing { tip, .. }
+                        | Phase::Published { tip, .. },
+                    ) => Some(tip.as_str()),
+                    Ok(Phase::Blocked { tip, .. }) => tip.as_deref(),
+                    _ => None,
+                };
+                if value.as_object().is_none_or(|fields| fields.len() != 3)
+                    || digest
+                        .is_none_or(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
+                    || phase.is_err()
+                    || tip.is_some_and(|s| {
+                        !matches!(s.len(), 40 | 64) || !s.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                {
+                    row.push_str(" progress=malformed");
+                } else if value["version"] != 1 {
+                    row.push_str(" progress=unsupported_version");
+                } else if let Ok(phase) = phase {
+                    let (tag, reason) = match phase {
+                        Phase::Accepted => ("accepted", None),
+                        Phase::Saving { .. } => ("saving", None),
+                        Phase::Saved { .. } => ("saved", None),
+                        Phase::Publishing { .. } => ("publishing", None),
+                        Phase::Published { .. } => ("published", None),
+                        Phase::Blocked { reason, .. } => ("blocked", Some(reason)),
+                    };
+                    row.push_str(&format!(" phase={tag}"));
+                    if let Some(reason) = reason
+                        && let Ok(reason) = serde_json::to_string(&reason)
+                    {
+                        row.push_str(&format!(" reason={reason}"));
+                    }
+                }
+                for (name, record) in ["json", "done"].into_iter().zip(&records) {
+                    if let Ok((bytes, _)) = record {
+                        row.push_str(&format!(
+                            " {name}_digest_match={}",
+                            digest == Some(hex::encode(Sha256::digest(bytes)).as_str())
+                        ));
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        for (name, record) in ["json", "done"].into_iter().zip(&records) {
+            if !matches(record) {
+                continue;
+            }
+            let Ok((_, value)) = record else { continue };
+            let project = &value["payload"]["project"];
+            row.push_str(&format!(
+                " {name}_root_match={}",
+                project["root"]
+                    .as_str()
+                    .is_some_and(|root| Path::new(root) == work)
+            ));
+            let Some(generation) = project["generation"].as_str().filter(|id| canonical_id(id))
+            else {
+                let category = if project["generation"].is_null() {
+                    "missing"
+                } else {
+                    "malformed"
+                };
+                row.push_str(&format!(" {name}_generation={category}"));
+                continue;
+            };
+            let adoption = adoptions
+                .entry(generation.to_owned())
+                .or_insert_with(|| read(&queue.join(format!("{generation}.adoption"))));
+            row.push_str(&format!(" {name}_adoption={}", status(adoption)));
+            if let Ok((_, value)) = adoption {
+                let tag = value["state"]["state"].as_str();
+                let request = value["state"]["request"].as_str();
+                row.push_str(&format!(
+                    " adoption_version_supported={} adoption_id_match={}",
+                    value["version"] == 1,
+                    value["id"] == generation
+                ));
+                if !matches!(tag, Some("accepting" | "planned" | "adopted"))
+                    || (tag != Some("accepting") && request.is_none_or(|id| !canonical_id(id)))
+                {
+                    row.push_str(" adoption_fields=malformed");
+                } else if let Some(tag) = tag {
+                    row.push_str(&format!(" adoption_state={tag}"));
+                    if tag != "accepting" {
+                        row.push_str(&format!(
+                            " adoption_request_match={}",
+                            request == Some(id.as_str())
+                        ));
+                    }
+                }
+            }
+        }
+        if output.len() + row.len() + 512 > OUTPUT_LIMIT {
+            output_limited = true;
+            break;
+        }
+        output.push_str(&row);
+        matched += 1;
+    }
+    output.push_str(&format!(
+        "; matched_observed={matched}; unclassified={unclassified:?}; output_limited={output_limited}; absence_is_not_nonadmission=true"
+    ));
+    output
+}
+
 /// An automatic upload the Hub didn't answer is settled by what the Hub holds, and one that did
 /// not land is tried again by the folder's own worker at its time, by the same entry and gates as
 /// its first try, up to the tip it failed at:
@@ -10393,7 +10792,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     // The clock every agit process here reads, the folder's detached worker included.
     let clock = temp.path().join("clock");
     fs::write(&clock, START.to_string()).unwrap();
-    let work = temp.path().join("work");
+    let work = temp.path().join("work with spaces");
     fs::create_dir_all(&work).unwrap();
     let work = work.canonicalize().unwrap();
     let projects = temp
@@ -10416,7 +10815,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         );
         fs::write(transcript(session), records).unwrap();
     };
-    let agit = |args: &[&str], input: Option<String>, envs: &[(&str, &str)]| {
+    let invoke = |args: &[&str], input: Option<String>, envs: &[(&str, &str)]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agit"));
         command.env_clear_local();
         for (name, value) in git_command(temp.path()).get_envs() {
@@ -10427,6 +10826,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         let mut child = command
             .current_dir(&work)
             .env("AGIT_HOME", &home)
+            .env("CODEX_HOME", temp.path().join(".codex"))
             .env("AGIT_HUB_URL", &hub.base)
             .env("AGIT_TEST_CLOCK_FILE", &clock)
             .env("CI", "1")
@@ -10445,7 +10845,10 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
             .write_all(input.unwrap_or_default().as_bytes())
             .unwrap();
         drop(stdin);
-        let output = child.wait_with_output().unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let agit = |args: &[&str], input: Option<String>, envs: &[(&str, &str)]| {
+        let output = invoke(args, input, envs);
         assert_success(&output);
         output
     };
@@ -10523,19 +10926,25 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     };
     // The folder's worker runs detached from the Stop hook that starts it, so its outcome is
     // waited for, within a bound.
-    let wait = |what: &str, done: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(90);
-        while !done() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            thread::sleep(Duration::from_millis(50));
-        }
-    };
+    let wait_with_diagnostic =
+        |what: &str, done: &dyn Fn() -> bool, diagnostic: &dyn Fn() -> String| {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}{}",
+                    diagnostic()
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        };
+    let wait = |what: &str, done: &dyn Fn() -> bool| wait_with_diagnostic(what, done, &String::new);
     // A conversation's first turn ends: its Stop hook hands it to the folder's worker, which
     // captures it on a branch of its own and uploads it.
     let upload = |session: &str, prompt: &str, envs: &[(&str, &str)]| -> String {
         let before = branches();
         add_turn(session, prompt);
-        agit(
+        let stopped = agit(
             &["hooks", "settle", "--runtime", "claude-code"],
             Some(
                 json!({"session_id":session,"cwd":work,"transcript_path":transcript(session),
@@ -10545,14 +10954,29 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
             envs,
         );
         let found = std::cell::RefCell::new(None);
-        wait("the conversation's branch", &|| {
-            *found.borrow_mut() = branches().difference(&before).next().cloned();
-            found.borrow().is_some()
-        });
+        let branch_wait = format!(
+            "the conversation's branch for Stop {session}; hook stdout: {}; hook stderr: {}",
+            String::from_utf8_lossy(&stopped.stdout),
+            String::from_utf8_lossy(&stopped.stderr),
+        );
+        wait_with_diagnostic(
+            &branch_wait,
+            &|| {
+                *found.borrow_mut() = branches().difference(&before).next().cloned();
+                found.borrow().is_some()
+            },
+            &|| {
+                format!(
+                    "; Stop metadata: {}",
+                    project_stop_timeout_snapshot(&home, &work, session)
+                )
+            },
+        );
         let branch = found.into_inner().unwrap();
-        wait("its upload's outcome", &|| {
-            record(&branch).is_some_and(|record| record["state"] != "started")
-        });
+        wait(
+            &format!("the upload outcome for Stop {session} on {branch}"),
+            &|| record(&branch).is_some_and(|record| record["state"] != "started"),
+        );
         branch
     };
 
@@ -10598,33 +11022,47 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
             })
             .find(|value| value["session_id"] == id)
     };
-    // A launch failure acknowledges durable acceptance honestly. The next folder command
-    // must recover it without another save or another completed turn.
-    const RECOVERED: &str = "acacacac-0000-4000-8000-000000000005";
-    add_turn(RECOVERED, "recover accepted intent");
-    let captured = hold("capture");
-    let accepted = agit(
-        &["--json", "save", RECOVERED],
-        None,
-        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
-    );
-    let value: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
-    let row = &value["result"]["value"]["sessions"][0];
-    assert_eq!(row["status"], "pending", "{value}");
-    assert_eq!(row["accepted_locally"], true, "{value}");
-    assert_eq!(row["worker_started"], false, "{value}");
-    assert!(receipt(RECOVERED).is_none());
-    drop(captured);
-    agit(&["status", "--json"], None, &[]);
-    wait("the restarted explicit request", &|| {
-        receipt(RECOVERED).is_some_and(|row| row["status"] == "uploaded")
-    });
-
     // A Stop whose worker cannot start must return before a policy lock is released. Its
     // retained work has an explicit recovery path without a new turn or detached folder worker.
     const STOP_RECOVERED: &str = "acacacac-0000-4000-8000-000000000006";
     add_turn(STOP_RECOVERED, "recover stopped turn");
     drop(hold("capture"));
+    let marker = home.join("layout-v1.complete");
+    let prepared = fs::read(&marker).unwrap();
+    fs::remove_file(&marker).unwrap();
+    let refused = invoke(
+        &["hooks", "settle", "--runtime", "claude-code"],
+        Some(
+            json!({"session_id": STOP_RECOVERED, "cwd": work,
+            "transcript_path": transcript(STOP_RECOVERED), "hook_event_name": "Stop"})
+            .to_string(),
+        ),
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("this Stop was not queued"));
+    assert!(!marker.exists(), "the project hook prepared storage inline");
+    assert!(
+        !project_state
+            .with_extension("pending")
+            .join(digest(&format!("claude-code:{STOP_RECOVERED}")))
+            .exists()
+    );
+    fs::write(&marker, prepared).unwrap();
+    let unrelated_index = temp
+        .path()
+        .join(".claude/projects/-elsewhere/memory/MEMORY.md");
+    fs::create_dir_all(unrelated_index.parent().unwrap()).unwrap();
+    let personal_memory = "# Memory\n\nPersonal notes.\n";
+    let legacy_memory = format!(
+        "{personal_memory}\n<!-- agit:memory:begin alice/app@old -->\nshared notes\n<!-- agit:memory:end -->\n"
+    );
+    let own_index = projects.join("memory/MEMORY.md");
+    fs::create_dir_all(own_index.parent().unwrap()).unwrap();
+    fs::write(&own_index, &legacy_memory).unwrap();
+    fs::write(&unrelated_index, &legacy_memory).unwrap();
+    let swept = home.join("memory-swept");
+    let _ = fs::remove_file(&swept);
     let before = branches();
     let policy_lock = hold("lock");
     let (send, receive) = std::sync::mpsc::channel();
@@ -10658,18 +11096,445 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
             .contains("agit project recover .")
     );
     assert_eq!(branches(), before, "Stop only queues this turn");
-    let status = agit(&["project", "status", "."], None, &[]);
+    assert!(
+        !swept.exists(),
+        "the project hook performed the global memory sweep"
+    );
+    assert_eq!(fs::read_to_string(&unrelated_index).unwrap(), legacy_memory);
+    assert_eq!(fs::read_to_string(&own_index).unwrap(), legacy_memory);
+    let status = agit(
+        &["project", "status", "."],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["capture_recovery"]["state"], "recovery_required");
+    let status_text = agit(&["status"], None, &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")]);
+    let status_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status_text.stdout),
+        String::from_utf8_lossy(&status_text.stderr)
+    );
+    let recovery = status_text
+        .lines()
+        .find_map(|line| line.split_once("; recover with `"))
+        .and_then(|(_, command)| command.split_once('`'))
+        .map(|(command, _)| shlex::split(command).unwrap())
+        .expect("status must show an executable recovery command for the queued project Stop");
+    assert_eq!(
+        recovery,
+        vec!["agit", "project", "recover", work.to_str().unwrap()]
+    );
+    agit(&["status", "--json"], None, &[]);
+    // Upload success precedes request retirement; recovery also waits for the folder to be idle.
+    wait(
+        "the original Stop restarted by an ordinary folder command",
+        &|| {
+            let uploaded = branches()
+                .difference(&before)
+                .next()
+                .is_some_and(|branch| record(branch).is_some_and(|row| row["state"] == "uploaded"));
+            if !uploaded {
+                return false;
+            }
+            let status = agit(&["project", "status", "."], None, &[]);
+            let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+            status["capture_recovery"]["state"] == "idle"
+        },
+    );
+    assert_eq!(branches().difference(&before).count(), 1);
+    assert!(
+        swept.exists(),
+        "project recovery omitted deferred preparation"
+    );
+    assert_eq!(fs::read_to_string(&own_index).unwrap(), personal_memory);
+    assert_eq!(
+        fs::read_to_string(&unrelated_index).unwrap(),
+        personal_memory
+    );
+    let status = agit(&["project", "status", "."], None, &[]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["capture_recovery"]["state"], "idle");
+
+    // Consecutive Stops share only their own first adoption. Each publishes its original
+    // completed prefix even when the native completion marker and later output arrive afterward.
+    const ORIGINAL_STOPS: &str = "dededede-0000-4000-8000-000000000001";
+    const INTERRUPTED_STOP: &str = "dededede-0000-4000-8000-000000000002";
+    let codex_sessions = temp.path().join(".codex/sessions/2026/11/19");
+    fs::create_dir_all(&codex_sessions).unwrap();
+    let rollout =
+        |session: &str| codex_sessions.join(format!("rollout-2026-11-19T00-00-00-{session}.jsonl"));
+    let open_rollout = |session: &str| {
+        fs::write(rollout(session), format!("{}\n", json!({"type":"session_meta","payload":{"id":session,"cwd":work,"timestamp":"2026-11-19T00:00:00Z"}}))).unwrap();
+    };
+    let append_codex = |session: &str, record: serde_json::Value| {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(rollout(session))
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+    };
+    let user_record = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}});
+    let reply_record = |text: &str| json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}});
+    let native_complete = || json!({"type":"event_msg","payload":{"type":"task_complete"}});
+    let codex_stop = |session: &str| {
+        agit(
+        &["hooks", "settle", "--runtime", "codex"],
+        Some(json!({"session_id":session,"cwd":work,"transcript_path":rollout(session),"hook_event_name":"Stop"}).to_string()),
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    )
+    };
+    let project_queue = {
+        use sha2::Digest as _;
+        agit::domain::stop_requests::Journal::at(home.join("store.stop-requests").join(format!(
+            "project-{}",
+            hex::encode(sha2::Sha256::digest(work.as_os_str().as_encoded_bytes()))
+        )))
+    };
+    open_rollout(ORIGINAL_STOPS);
+    append_codex(ORIGINAL_STOPS, user_record("Keep each accepted execution"));
+    append_codex(ORIGINAL_STOPS, reply_record("First admitted execution"));
+    codex_stop(ORIGINAL_STOPS);
+    append_codex(ORIGINAL_STOPS, native_complete());
+    append_codex(ORIGINAL_STOPS, reply_record("Second admitted execution"));
+    codex_stop(ORIGINAL_STOPS);
+    let mut original_requests = project_queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .map(|id| project_queue.read::<serde_json::Value>(&id).unwrap())
+        .filter(|request| request.payload["authority"]["session"] == ORIGINAL_STOPS)
+        .collect::<Vec<_>>();
+    original_requests.sort_by_key(|request| request.payload["input"]["bytes"].as_u64().unwrap());
+    assert_eq!(original_requests.len(), 2);
+    assert_ne!(original_requests[0].id, original_requests[1].id);
+    assert_eq!(
+        original_requests[0].payload["project"]["generation"],
+        original_requests[1].payload["project"]["generation"]
+    );
+    assert!(
+        original_requests
+            .iter()
+            .all(|request| request.payload["input"]["receipt"].is_object())
+    );
+    let native_store = agit::domain::store::Store::at(home.join("store"));
+    assert!(
+        agit::domain::link::get_checked(&native_store, "codex", ORIGINAL_STOPS)
+            .unwrap()
+            .is_none()
+    );
+    append_codex(ORIGINAL_STOPS, native_complete());
+    append_codex(ORIGINAL_STOPS, reply_record("Later unadmitted execution"));
     agit(
         &["project", "recover", "."],
         None,
         &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
     );
-    assert_eq!(branches().difference(&before).count(), 1);
-    let status = agit(&["project", "status", "."], None, &[]);
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["capture_recovery"]["state"], "idle");
+    let mut saved_tips = Vec::new();
+    for request in &original_requests {
+        let outcome: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                project_queue
+                    .directory()
+                    .join(format!("{}.state", request.id.as_str())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(outcome["phase"]["state"], "published", "{outcome}");
+        assert!(
+            project_queue
+                .directory()
+                .join(format!("{}.done", request.id.as_str()))
+                .exists()
+        );
+        saved_tips.push(outcome["phase"]["tip"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(saved_tips[0], saved_tips[1]);
+    let first_view = agit::domain::storage::materialize_pair_at(repo.root(), &saved_tips[0])
+        .unwrap()
+        .1;
+    let second_view = agit::domain::storage::materialize_pair_at(repo.root(), &saved_tips[1])
+        .unwrap()
+        .1;
+    assert!(first_view.contains("First admitted execution"));
+    assert!(!first_view.contains("Second admitted execution"));
+    assert!(second_view.contains("Second admitted execution"));
+    assert!(!second_view.contains("Later unadmitted execution"));
+
+    // Parent withdrawal history survives restoration even when the child and its folder do
+    // not change. Route replacement and session exclusion have independent cancellation proofs.
+    const PARENT: &str = "dededede-0000-4000-8000-000000000004";
+    open_rollout(PARENT);
+    append_codex(PARENT, user_record("Authorize a delegated conversation"));
+    for (child, change_route) in [
+        ("dededede-0000-4000-8000-000000000005", false),
+        ("dededede-0000-4000-8000-000000000006", true),
+    ] {
+        fs::write(
+            rollout(child),
+            format!(
+                "{}\n",
+                json!({"type":"session_meta","payload":{
+                    "id":child,"cwd":work,"timestamp":"2026-11-19T00:00:00Z",
+                    "source":{"subagent":{"thread_spawn":{"parent_thread_id":PARENT}}}
+                }})
+            ),
+        )
+        .unwrap();
+        append_codex(child, user_record("Retain delegated authority"));
+        append_codex(child, reply_record("An accepted delegated reply"));
+        codex_stop(child);
+        let request = project_queue
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|id| {
+                project_queue.read::<serde_json::Value>(id).unwrap().payload["authority"]["session"]
+                    == child
+            })
+            .unwrap();
+        if change_route {
+            let registration = agit::domain::link::Link::new("codex", PARENT, Some(&work));
+            let mut foreign = registration.clone();
+            foreign.owner = Some("alice".into());
+            foreign.agent = Some("app".into());
+            foreign.branch = Some("foreign-parent-claim".into());
+            agit::domain::link::write(&native_store, &foreign).unwrap();
+            agit::domain::link::remove(&native_store, "codex", PARENT).unwrap();
+        } else {
+            agit(
+                &["project", "drop"],
+                None,
+                &[
+                    ("CODEX_THREAD_ID", PARENT),
+                    ("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1"),
+                ],
+            );
+            policy(&|policy| {
+                policy["excluded"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|value| value != &json!(format!("codex:{PARENT}")));
+            });
+        }
+        let before = branches();
+        agit(
+            &["project", "recover", "."],
+            None,
+            &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+        );
+        assert_eq!(branches(), before);
+        assert!(matches!(
+            project_queue
+                .read::<serde_json::Value>(&request)
+                .unwrap()
+                .phase,
+            agit::domain::stop_requests::Phase::Blocked { tip: None, .. }
+        ));
+        assert!(
+            agit::domain::link::get_checked(&native_store, "codex", child)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(rollout(child)).unwrap();
+    }
+    fs::remove_file(rollout(PARENT)).unwrap();
+
+    // Restoring the registration after a foreign writer cannot revive the accepted generation.
+    const REVOKED_STOP: &str = "dededede-0000-4000-8000-000000000003";
+    open_rollout(REVOKED_STOP);
+    append_codex(
+        REVOKED_STOP,
+        user_record("Keep withdrawn adoption separate"),
+    );
+    append_codex(REVOKED_STOP, reply_record("Withdrawn execution"));
+    let registration = agit::domain::link::Link::new("codex", REVOKED_STOP, Some(&work));
+    agit::domain::link::write(&native_store, &registration).unwrap();
+    codex_stop(REVOKED_STOP);
+    let revoked = project_queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            project_queue.read::<serde_json::Value>(id).unwrap().payload["authority"]["session"]
+                == REVOKED_STOP
+        })
+        .unwrap();
+    let mut foreign = registration.clone();
+    foreign.owner = Some("alice".into());
+    foreign.agent = Some("app".into());
+    foreign.branch = Some("independent-claim".into());
+    agit::domain::link::write(&native_store, &foreign).unwrap();
+    agit::domain::link::write(&native_store, &registration).unwrap();
+    let before_revoked = branches();
+    agit(
+        &["project", "recover", "."],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    assert_eq!(branches(), before_revoked);
+    assert!(
+        agit::domain::link::get_checked(&native_store, "codex", REVOKED_STOP)
+            .unwrap()
+            .unwrap()
+            .branch
+            .is_none()
+    );
+    assert!(matches!(
+        project_queue
+            .read::<serde_json::Value>(&revoked)
+            .unwrap()
+            .phase,
+        agit::domain::stop_requests::Phase::Blocked { tip: None, .. }
+    ));
+
+    // A registered session is still awaiting first adoption. A claim written before its durable
+    // completion receipt cannot be treated as proof that this request owns the new branch.
+    open_rollout(INTERRUPTED_STOP);
+    append_codex(
+        INTERRUPTED_STOP,
+        user_record("Retain an interrupted first claim"),
+    );
+    append_codex(
+        INTERRUPTED_STOP,
+        reply_record("Interrupted admission output"),
+    );
+    agit::domain::link::write(
+        &native_store,
+        &agit::domain::link::Link::new("codex", INTERRUPTED_STOP, Some(&work)),
+    )
+    .unwrap();
+    codex_stop(INTERRUPTED_STOP);
+    let interrupted = project_queue
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|id| {
+            project_queue.read::<serde_json::Value>(id).unwrap().payload["authority"]["session"]
+                == INTERRUPTED_STOP
+        })
+        .unwrap();
+    let crashed = invoke(
+        &["project", "recover", "."],
+        None,
+        &[("AGIT_TEST_SAVE_REQUEST_CRASH", "project_stop_after_claim")],
+    );
+    assert_eq!(crashed.status.code(), Some(86), "{crashed:?}");
+    let claim = agit::domain::link::get_checked(&native_store, "codex", INTERRUPTED_STOP)
+        .unwrap()
+        .unwrap();
+    let claimed_branch = claim.branch.unwrap();
+    let before_recovery = repo
+        .git(&["rev-parse", &format!("refs/heads/{claimed_branch}")])
+        .unwrap();
+    agit(
+        &["project", "recover", "."],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    assert!(matches!(
+        project_queue
+            .read::<serde_json::Value>(&interrupted)
+            .unwrap()
+            .phase,
+        agit::domain::stop_requests::Phase::Blocked {
+            reason: agit::domain::stop_requests::BlockedBy::InterruptedAdoption,
+            tip: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        repo.git(&["rev-parse", &format!("refs/heads/{claimed_branch}")])
+            .unwrap(),
+        before_recovery
+    );
+    assert!(on_hub(&claimed_branch).is_empty());
+    for session in [ORIGINAL_STOPS, REVOKED_STOP, INTERRUPTED_STOP] {
+        fs::remove_file(rollout(session)).unwrap();
+    }
+
+    // A synchronous save owns capture while another Stop arrives. Releasing that owner must
+    // start the Stop's successor without another turn or command to wake it.
+    const SYNC_SAVE: &str = "dededede-0000-4000-8000-000000000007";
+    const HANDOFF_STOP: &str = "dededede-0000-4000-8000-000000000008";
+    add_turn(SYNC_SAVE, "Hold synchronous capture ownership");
+    open_rollout(HANDOFF_STOP);
+    append_codex(HANDOFF_STOP, user_record("Keep the arriving Stop"));
+    append_codex(
+        HANDOFF_STOP,
+        reply_record("Publish after synchronous save exits"),
+    );
+    let publication_lock = repo.root().join(".git/agit/privacy-publication/lock");
+    let held = agit::infra::local_state::HeldLock::try_exclusive(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&publication_lock)
+            .unwrap(),
+        &publication_lock,
+        "held",
+    )
+    .unwrap();
+    thread::scope(|scope| {
+        let saving = scope.spawn(|| {
+            agit(
+                &[
+                    "--json",
+                    "save",
+                    SYNC_SAVE,
+                    "--branch",
+                    "synchronous-handoff",
+                ],
+                None,
+                &[],
+            )
+        });
+        wait("the synchronous save to claim its branch", &|| {
+            agit::domain::link::get_checked(&native_store, "claude-code", SYNC_SAVE)
+                .unwrap()
+                .is_some_and(|claim| claim.branch.as_deref() == Some("synchronous-handoff"))
+        });
+        codex_stop(HANDOFF_STOP);
+        assert!(
+            agit::domain::link::get_checked(&native_store, "codex", HANDOFF_STOP)
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        saving.join().unwrap();
+    });
+    wait("the Stop's capture-owner handoff", &|| {
+        agit::domain::link::get_checked(&native_store, "codex", HANDOFF_STOP)
+            .unwrap()
+            .and_then(|claim| claim.branch)
+            .is_some_and(|branch| record(&branch).is_some_and(|row| row["state"] == "uploaded"))
+    });
+    fs::remove_file(rollout(HANDOFF_STOP)).unwrap();
+
+    // A launch failure acknowledges durable acceptance honestly. The next folder command
+    // must recover it without another save or another completed turn.
+    const RECOVERED: &str = "acacacac-0000-4000-8000-000000000005";
+    add_turn(RECOVERED, "recover accepted intent");
+    let captured = hold("capture");
+    let accepted = agit(
+        &["--json", "save", RECOVERED],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    let value: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    let row = &value["result"]["value"]["sessions"][0];
+    assert_eq!(row["status"], "pending", "{value}");
+    assert_eq!(row["accepted_locally"], true, "{value}");
+    assert_eq!(row["worker_started"], false, "{value}");
+    assert!(receipt(RECOVERED).is_none());
+    drop(captured);
+    agit(&["status", "--json"], None, &[]);
+    wait("the restarted explicit request", &|| {
+        receipt(RECOVERED).is_some_and(|row| row["status"] == "uploaded")
+    });
 
     let captured = hold("capture");
     let policy_lock = hold("lock");
@@ -10923,6 +11788,15 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         fs::write(&recovery_clock, START.to_string()).unwrap();
     }
 
+    let stop_retry_at = |record: &serde_json::Value| {
+        assert!(
+            record.get("retry_after").is_none(),
+            "legacy retry readers must not accept a Stop: {record}"
+        );
+        assert!(record["stop"].is_object(), "{record}");
+        record["stop_retry_after"].as_i64().unwrap()
+    };
+
     // The Hub takes the push, and only its answer is lost: it is recorded as uploaded, once.
     hub.cut_receives.lock().unwrap().push(Cut::AfterApplying);
     let receives = hub.posts.load(Ordering::Acquire);
@@ -10940,7 +11814,11 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let failed_at = git(repo.root(), &["rev-parse", &retried]);
     let failed = record(&retried).unwrap();
     assert_eq!(
-        (&failed["state"], &failed["reason"], &failed["retry_after"]),
+        (
+            &failed["state"],
+            &failed["reason"],
+            &json!(stop_retry_at(&failed))
+        ),
         (&json!("failed"), &json!("hub"), &json!(START + 60)),
         "{failed}"
     );
@@ -10970,11 +11848,12 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let refusal = record(&refused).unwrap();
     assert_eq!(refusal["state"], "failed", "{refusal}");
     assert!(refusal.get("retry_after").is_none(), "{refusal}");
+    assert!(refusal.get("stop_retry_after").is_none(), "{refusal}");
 
     // Cut off too, and then dropped from the folder before its next try.
     hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
     let dropped = upload(DROPPED, "delta dropped", &[]);
-    assert_eq!(record(&dropped).unwrap()["retry_after"], json!(START + 60));
+    assert_eq!(stop_retry_at(&record(&dropped).unwrap()), START + 60);
     agit(
         &["project", "drop", &format!("alice/app@{dropped}")],
         None,
@@ -11010,7 +11889,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     drop(preparing);
     let busy = record(&waited).unwrap();
     assert_eq!(
-        (&busy["reason"], &busy["retry_after"]),
+        (&busy["reason"], &json!(stop_retry_at(&busy))),
         (&json!("another_upload"), &json!(START + 60)),
         "{busy}"
     );
@@ -11023,7 +11902,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let contended_at = git(repo.root(), &["rev-parse", &contended]);
     let lost = record(&contended).unwrap();
     assert_eq!(
-        (&lost["reason"], &lost["retry_after"]),
+        (&lost["reason"], &json!(stop_retry_at(&lost))),
         (&json!("another_writer"), &json!(START + 60)),
         "{lost}"
     );
@@ -11209,6 +12088,54 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         String::from_utf8_lossy(&listed.stdout)
     );
 
+    // A local-only recovery cancels its scheduled upload before retiring the request, so a
+    // later retry cannot follow a dangling request or block another conversation's upload.
+    const LOCAL_ONLY: &str = "acacacac-0000-4000-8000-000000000009";
+    hub.cut_receives.lock().unwrap().push(Cut::BeforeApplying);
+    let local_only = upload(LOCAL_ONLY, "keep the recovered save local", &[]);
+    let failure = record(&local_only).unwrap();
+    let local_retry_at = stop_retry_at(&failure);
+    let local_request =
+        agit::domain::stop_requests::RequestId::parse(failure["stop"]["request"].as_str().unwrap())
+            .unwrap();
+    let captured = hold("capture");
+    agit(
+        &["config", "--repo", "alice/app", "push.auto", "false"],
+        None,
+        &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+    );
+    drop(captured);
+    let posts = hub.posts.load(Ordering::Acquire);
+    wait_with_diagnostic(
+        "the local-only Stop's retirement before its retry is due",
+        &|| {
+            agit(
+                &["project", "recover", "."],
+                None,
+                &[("AGIT_TEST_CAPTURE_SPAWN_FAIL", "1")],
+            );
+            project_queue
+                .read_completed::<serde_json::Value>(&local_request)
+                .is_ok()
+        },
+        &|| {
+            format!(
+                "; retained phase: {:?}",
+                project_queue
+                    .read::<serde_json::Value>(&local_request)
+                    .map(|request| request.phase)
+            )
+        },
+    );
+    assert!(record(&local_only).unwrap()["stop_retry_after"].is_null());
+    assert!(on_hub(&local_only).is_empty());
+    assert_eq!(hub.posts.load(Ordering::Acquire), posts);
+    agit(
+        &["config", "--repo", "alice/app", "push.auto", "true"],
+        None,
+        &[],
+    );
+
     // Cut off, and the computer off before the folder's next try: its worker is gone. The worker
     // here reads a clock that stands still before the try, so it never acts, as one a shutdown
     // ended. Once the try is due, the folder's next agit command starts a worker of its own, which
@@ -11224,9 +12151,9 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let asleep_at = git(repo.root(), &["rev-parse", &asleep]);
     let pending = record(&asleep).unwrap();
     assert_eq!(pending["reason"], "hub", "{pending}");
-    let due = pending["retry_after"].as_i64().unwrap();
+    let due = stop_retry_at(&pending);
     let restarted = temp.path().join("restarted-clock");
-    fs::write(&restarted, (due + 1).to_string()).unwrap();
+    fs::write(&restarted, (due.max(local_retry_at) + 1).to_string()).unwrap();
     agit(
         &["status"],
         None,
@@ -11236,6 +12163,8 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
         record(&asleep).is_some_and(|record| record["state"] == "uploaded")
     });
     assert_eq!(on_hub(&asleep), published_form(&repo, &asleep, &asleep_at));
+    assert!(on_hub(&local_only).is_empty());
+    assert!(record(&local_only).unwrap()["stop_retry_after"].is_null());
     fs::write(&restarted, START.to_string()).unwrap();
 
     // Cut off, and the folder turned off before its next try: its record goes with the folder,
@@ -11244,7 +12173,7 @@ fn an_automatic_upload_the_hub_did_not_answer_is_tried_again_by_its_folder() {
     let turned_off = upload(TURNED_OFF, "golf turned off", &[]);
     let pending = record(&turned_off).unwrap();
     assert_eq!(pending["reason"], "hub", "{pending}");
-    let retry_at = pending["retry_after"].as_i64().unwrap();
+    let retry_at = stop_retry_at(&pending);
     let posts = hub.posts.load(Ordering::Acquire);
     let previews = hub.previews.lock().unwrap().len();
     agit(&["off"], None, &[]);

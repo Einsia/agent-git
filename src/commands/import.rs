@@ -704,10 +704,18 @@ impl Landing {
                     if std::fs::read(&self.claimed_path)
                         .is_ok_and(|current| current == self.claimed_bytes)
                     {
-                        let restored = match previous {
-                            Some(bytes) => std::fs::write(&self.claimed_path, bytes),
-                            None => std::fs::remove_file(&self.claimed_path),
-                        };
+                        let restored = (|| -> crate::Result<()> {
+                            crate::domain::stop_requests::invalidate_authority(
+                                &self.store,
+                                &self.claim_source,
+                                &self.claim_session,
+                            )?;
+                            match previous {
+                                Some(bytes) => std::fs::write(&self.claimed_path, bytes)?,
+                                None => std::fs::remove_file(&self.claimed_path)?,
+                            }
+                            Ok(())
+                        })();
                         if let Err(error) = restored {
                             ui::warning(&format!(
                                 "could not restore the previous import claim: {error}"
@@ -1208,6 +1216,7 @@ fn place_resolved_branch(
         onto_commit,
         accepted,
         prepared,
+        None,
     )
 }
 
@@ -1228,6 +1237,7 @@ fn birth_session_branch(
     onto_commit: Option<String>,
     accepted: Option<&lineage::Accepted>,
     prepared: Option<&PreparedTarget>,
+    mut project_stop: Option<&mut dyn ProjectStopAdoption>,
 ) -> crate::Result<Placed> {
     let creates_repo =
         (accepted.is_some() || prepared.is_some()) && !repo_dir.join(".git").exists();
@@ -1261,10 +1271,12 @@ fn birth_session_branch(
     }
     let prev_link = if let Some(selected) = accepted {
         selected.initial_link()
+    } else if project_stop.is_some() {
+        link::get_checked(store, &lk.source, &lk.session_id)?
     } else {
         link::get(store, &lk.source, &lk.session_id)
     };
-    if accepted.is_none() {
+    if accepted.is_none() && project_stop.is_none() {
         let Some(current) = prev_link.as_ref() else {
             ui::error(
                 "the attached session link is missing or unreadable; inspect its metadata before retrying the import",
@@ -1320,6 +1332,20 @@ fn birth_session_branch(
             "choose a new destination branch to attach at that commit; the existing branch is unchanged",
         );
         return Ok(Placed::Refused(ExitCode::Policy));
+    }
+
+    if let Some(adoption) = project_stop.as_mut() {
+        anyhow::ensure!(
+            !repo.has_ref(&format!("refs/heads/{branch}"))
+                && link::active_for_branch(store, owner, agent, &branch).is_empty(),
+            "the planned project Stop branch is already claimed"
+        );
+        let mut intended = lk.clone();
+        intended.clear_native_evidence();
+        intended.owner = Some(owner.to_owned());
+        intended.agent = Some(agent.to_owned());
+        intended.branch = Some(branch.clone());
+        adoption.begin(store, prev_link.as_ref(), &intended)?;
     }
 
     // A repo with no `main` collapses the whole chain, at every link: a server-side bare repo's
@@ -1427,6 +1453,9 @@ fn birth_session_branch(
         lk.superseded_by = None;
     }
     persist_branch_claim(store, lk, owner, agent, &branch)?;
+    if let Some(adoption) = project_stop.as_mut() {
+        adoption.completed(store, lk)?;
+    }
     let claimed_path = link::link_path(store, &lk.source, &lk.session_id);
     let claimed_bytes = std::fs::read(&claimed_path).unwrap_or_default();
     Ok(Placed::Ready(Box::new(Landing {
@@ -1444,6 +1473,69 @@ fn birth_session_branch(
         claimed_bytes,
         previous_image: accepted.map(|selected| selected.previous_image()),
     })))
+}
+
+/// A project Stop binds the ordinary claim writer to its durable planned adoption.
+pub(super) trait ProjectStopAdoption {
+    fn begin(&mut self, store: &Store, before: Option<&Link>, after: &Link) -> crate::Result<()>;
+    fn completed(&mut self, store: &Store, claim: &Link) -> crate::Result<()>;
+}
+
+/// First adoption uses the branch transaction without persisting an intermediate registration.
+pub(super) fn adopt_project_stop(
+    store: &Store,
+    mut claim: Link,
+    repository: &str,
+    branch: &str,
+    author: &str,
+    adoption: &mut dyn ProjectStopAdoption,
+) -> crate::Result<Link> {
+    let (owner, agent) = super::parse_slug(repository)?;
+    anyhow::ensure!(branch != "main", MAIN_BRANCH_REASON);
+    repo::valid_branch_name(branch)?;
+    anyhow::ensure!(
+        claim.native_binding.is_none()
+            && claim.branch.is_none()
+            && claim.merge_archive.is_none()
+            && claim.is_active()
+            && claim.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty()),
+        "project Stop first adoption requires a verified unclaimed native session"
+    );
+    let repo_dir = config::repo_dir(&owner, &agent)?;
+    let repo = Repo::open(&repo_dir).context("project Stop repository is unavailable")?;
+    let target = PreparedTarget {
+        namespace: owner.clone(),
+        repo_dir: repo_dir.clone(),
+        branch: branch.to_owned(),
+        onto_commit: None,
+        repository: Some((
+            lineage::PathIdentity::capture(&repo_dir, true)?,
+            lineage::PathIdentity::capture(
+                &repo.common_dir_with_policy(repo::ReadPolicy::LocalOnly)?,
+                true,
+            )?,
+        )),
+    };
+    target.verify()?;
+    let placed = birth_session_branch(
+        &mut claim,
+        store,
+        &agent,
+        &owner,
+        author,
+        repo_dir,
+        repo,
+        branch.to_owned(),
+        None,
+        None,
+        Some(&target),
+        Some(adoption),
+    )?;
+    anyhow::ensure!(
+        matches!(placed, Placed::Ready(_)),
+        "project Stop first adoption was refused"
+    );
+    Ok(claim)
 }
 
 /// Repeating an attachment may reuse its descendant, but a merged side branch is not its base.
@@ -2357,10 +2449,18 @@ impl AttachedLink {
         if !std::fs::read(&self.path).is_ok_and(|current| current == self.written) {
             return;
         }
-        let restored = match &self.previous {
-            Some(bytes) => std::fs::write(&self.path, bytes),
-            None => std::fs::remove_file(&self.path),
-        };
+        let restored = (|| -> crate::Result<()> {
+            crate::domain::stop_requests::invalidate_authority(
+                store,
+                &self.source,
+                &self.session_id,
+            )?;
+            match &self.previous {
+                Some(bytes) => std::fs::write(&self.path, bytes)?,
+                None => std::fs::remove_file(&self.path)?,
+            }
+            Ok(())
+        })();
         if let Err(error) = restored {
             ui::warning(&format!(
                 "could not restore the session link this import changed: {error}"
@@ -2901,6 +3001,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             );
             assert!(matches!(result.unwrap(), Placed::Refused(ExitCode::Policy)));
             if malformed {
@@ -3212,6 +3313,7 @@ mod tests {
             Some(side),
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(placed, Placed::Refused(ExitCode::Policy)));
@@ -3295,6 +3397,7 @@ mod tests {
             repo,
             "replay".into(),
             Some(frozen.clone()),
+            None,
             None,
             None,
         )

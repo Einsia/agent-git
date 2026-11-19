@@ -21,6 +21,9 @@
 //! link to the person and reruns the same command. One that only says "run agit login" leaves
 //! the agent a second, different command to discover.
 
+#[path = "support/stop_requests.rs"]
+mod stop_requests;
+
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::process::Command;
@@ -377,6 +380,7 @@ impl Lab {
             .write_all(event.to_string().as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
+        stop_requests::finish(&mut self.command(cwd, &[]), &self.agit_home, runtime, id);
         serde_json::from_slice::<serde_json::Value>(&out.stdout)
             .ok()
             .and_then(|response| response["systemMessage"].as_str().map(str::to_owned))

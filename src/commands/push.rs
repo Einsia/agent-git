@@ -245,6 +245,7 @@ pub fn check_audit_environment() -> crate::Result<()> {
 /// [`super::auto_push::automatic_push`]: the one place that marks a publication automatic.
 pub fn run_automatic(args: Args) -> CmdResult {
     super::auto_push::mark_automatic();
+    super::stop_requests::verify_publication(args.agent.as_deref(), args.up_to.as_deref())?;
     if args.up_to.is_some() {
         ensure!(
             args.agent
