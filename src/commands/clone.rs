@@ -411,6 +411,7 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
 
     // Whether the refs under `origin/` are what the Hub holds now rather than a stale copy.
     let mut remote_current = true;
+    let mut resolved_version = None;
     if existed {
         progress.notice(format_args!("updating {}…", ui::bold(&slug)));
         let store = Repo::at(&dest);
@@ -424,13 +425,21 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Some(Ref::Branch(branch)) => {
                 crate::hub::git::fetch_branch(&store, &plan.identity, branch)
             }
+            Some(Ref::Version(version)) => {
+                crate::hub::git::fetch_version(&store, &plan.identity, version).map(|transfer| {
+                    transfer.map(|transfer| {
+                        resolved_version = transfer.commit;
+                        transfer.outcome
+                    })
+                })
+            }
             _ => Ok(None),
         };
         let selected_only = matches!(&scoped, Ok(Some(_)));
         let fetched = match scoped {
             Ok(Some(outcome)) => {
                 if !outcome.ok() {
-                    ui::error("the selected branch could not be fetched from the Hub");
+                    ui::error("the selected branch or version could not be fetched from the Hub");
                     return Ok(
                         if crate::hub::git::looks_like_auth_failure(&outcome.stderr) {
                             ExitCode::Auth
@@ -489,14 +498,26 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Some(Ref::Branch(branch)) => Some(branch.as_str()),
             _ => None,
         };
-        let outcome =
-            match crate::hub::git::clone_selected(&clone_url, &dest, &plan.identity, selected) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    abandon_failed_clone(history_update, &dest)?;
-                    return local_transport_failure(error);
-                }
-            };
+        let scoped_version = match &want {
+            Some(Ref::Version(version)) => {
+                crate::hub::git::clone_version(&clone_url, &dest, &plan.identity, version)
+            }
+            _ => Ok(None),
+        };
+        let transfer = scoped_version.and_then(|transfer| match transfer {
+            Some(transfer) => {
+                resolved_version = transfer.commit;
+                Ok(transfer.outcome)
+            }
+            None => crate::hub::git::clone_selected(&clone_url, &dest, &plan.identity, selected),
+        });
+        let outcome = match transfer {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                abandon_failed_clone(history_update, &dest)?;
+                return local_transport_failure(error);
+            }
+        };
         if !outcome.ok() {
             abandon_failed_clone(history_update, &dest)?;
             // The hint names the cause the exit code reports: a grant hint after a transfer that
@@ -574,7 +595,10 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // A version names immutable content. Branch ancestry carries its objects without a tag.
     match &want {
         Some(Ref::Version(v)) => {
-            let target = match crate::domain::refs::resolve_version(&store, v) {
+            let target = match resolved_version
+                .map(Ok)
+                .unwrap_or_else(|| crate::domain::refs::resolve_version(&store, v))
+            {
                 Ok(commit) => commit,
                 Err(error) if crate::domain::refs::is_not_found(&error) => {
                     ui::error(&format!("{slug} has no version {v}."));

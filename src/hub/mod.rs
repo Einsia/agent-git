@@ -649,6 +649,8 @@ struct PublishedCapabilities {
     #[serde(default)]
     git_fetch_scope: Vec<u32>,
     #[serde(default)]
+    git_fetch_version: Vec<u32>,
+    #[serde(default)]
     publication_planned_refs: bool,
     /// Versions of the carried-record proof the Hub accepts a declaration of.
     #[serde(default)]
@@ -674,6 +676,14 @@ struct PublishedPushLimits {
 }
 
 impl HubConfig {
+    pub(crate) fn accepts_fetch_version(&self) -> bool {
+        self.accepts_fetch_scope()
+            && self
+                .capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.git_fetch_version.contains(&1))
+    }
+
     pub(crate) fn accepts_fetch_scope(&self) -> bool {
         self.capabilities
             .as_ref()
