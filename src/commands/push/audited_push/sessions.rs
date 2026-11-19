@@ -1259,6 +1259,7 @@ pub(super) fn run(
         if !in_parts || finishing {
             break;
         }
+        let refreshing = ui::publication::stage("Checking the Hub before the next part");
         // The next part is planned from what the Hub now holds, not from the first plan.
         let previous = cuts.first().cloned();
         remote = crate::hub::git::FrozenPublication::read_advertised_refs(
@@ -1279,6 +1280,7 @@ pub(super) fn run(
                     }),
                 "{published} of {total} parts are published, and the Hub's copy of the branch moved since; rerun `{retry_command}` to continue"
             );
+            refreshing.finish();
             continue;
         }
         // This branch is done; the next one with anything left to publish follows.
@@ -1296,6 +1298,7 @@ pub(super) fn run(
                 idle.push(branch.clone());
             }
         }
+        refreshing.finish();
         if branch_index == selected_branches.len() {
             if idle.is_empty() {
                 break;

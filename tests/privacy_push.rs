@@ -5905,6 +5905,8 @@ fn a_pull_brings_the_hubs_main_into_a_main_started_here() {
 /// which goes out under the first part's answer without its own summary, still says how many
 /// records it adds with parts the privacy check left out; said only in a shown summary, a record
 /// first carried by a later part would go up unsaid, and no later upload says it again.
+/// Reading and planning between parts stays a visible phase; finishing the prior acknowledgement
+/// must not leave the command without progress while it checks the Hub for the next part.
 #[test]
 fn a_session_longer_than_one_publication_is_published_in_parts() {
     use agit::domain::session_privacy::SessionPublicationManifest;
@@ -6027,6 +6029,15 @@ fn a_session_longer_than_one_publication_is_published_in_parts() {
     *hub.strategy_budget.lock().unwrap() = None;
     let pushed = run(&["--yes", "push", "alice/app@talk"]);
     assert_success(&pushed);
+    let progress = String::from_utf8_lossy(&pushed.stderr);
+    let refresh = "Checking the Hub before the next part";
+    let refresh_start = progress.find(&format!("{refresh}…")).unwrap();
+    let refresh_done = progress.find(&format!("{refresh} — done")).unwrap();
+    let next_part = progress.find("Preparing part 2 of 2").unwrap();
+    assert!(
+        refresh_start < refresh_done && refresh_done < next_part,
+        "{progress}"
+    );
     assert!(
         format!(
             "{}{}",
