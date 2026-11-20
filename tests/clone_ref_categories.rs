@@ -28,6 +28,7 @@ struct Hub {
     git_status: Option<u16>,
     authenticated: Arc<AtomicBool>,
     access_requests: Arc<AtomicUsize>,
+    metadata_budget: Arc<AtomicUsize>,
 }
 
 impl Hub {
@@ -41,7 +42,7 @@ impl Hub {
         let base = format!("http://{}", listener.local_addr().unwrap());
         // Successful acquisition uses an owned source; HTTP rejections still invoke real Git.
         let clone_url = git_status.map_or_else(
-            || json!(source),
+            || json!(url::Url::from_file_path(source).unwrap().as_str()),
             |_| json!(format!("{base}/alice/paper.git")),
         );
         let response = if status == 200 {
@@ -57,6 +58,8 @@ impl Hub {
         let expected_auth = Arc::clone(&authenticated);
         let access_requests = Arc::new(AtomicUsize::new(0));
         let observed_access = Arc::clone(&access_requests);
+        let metadata_budget = Arc::new(AtomicUsize::new(1));
+        let allowed_metadata = Arc::clone(&metadata_budget);
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
             let mut count = 0;
@@ -120,7 +123,10 @@ impl Hub {
                 }
                 if headers.starts_with("GET /api/agents/alice/paper HTTP/1.1\r\n") {
                     count += 1;
-                    assert_eq!(count, 1, "the metadata request was replayed");
+                    assert!(
+                        count <= allowed_metadata.load(Ordering::Acquire),
+                        "the metadata request was replayed"
+                    );
                     if status != 0 {
                         write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
                     }
@@ -174,11 +180,15 @@ impl Hub {
             git_status,
             authenticated,
             access_requests,
+            metadata_budget,
         }
     }
 
     fn finish(&mut self) {
-        self.finish_counts((1, usize::from(self.git_status.is_some())));
+        self.finish_counts((
+            self.metadata_budget.load(Ordering::Acquire),
+            usize::from(self.git_status.is_some()),
+        ));
     }
 
     fn finish_counts(&mut self, counts: (usize, usize)) {
@@ -427,6 +437,23 @@ fn exact_clone_targets_and_authentication_keep_their_own_categories() {
     for mode in ["human", "quiet", "json1", "json2"] {
         for version in [false, true] {
             let mut lab = Lab::new(200);
+            if version {
+                // A legacy Hub may expose a requested version only through its historical tag.
+                let tree = lab.git(&lab.source, &["rev-parse", "HEAD^{tree}"]);
+                lab.head = lab.git(
+                    &lab.source,
+                    &[
+                        "commit-tree",
+                        &tree,
+                        "-p",
+                        &lab.head,
+                        "-m",
+                        "tag-only version",
+                    ],
+                );
+                lab.version = meta::id_from_sha(&lab.head);
+                lab.git(&lab.source, &["tag", &lab.version, &lab.head]);
+            }
             let selected = if version {
                 lab.version.clone()
             } else {
@@ -673,6 +700,8 @@ fn me_alias_preserves_authenticated_remote_failures_without_anonymous_fallback()
     }
 }
 
+/// Explicit session pickup works after a default-only clone on a Hub without scoped fetching;
+/// the selected line and its continuation hint must not depend on the initial fetch mapping.
 #[test]
 fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
     for frozen in [false, true] {
@@ -695,6 +724,29 @@ fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
         let session_sha = lab.git(&lab.source, &["rev-parse", "HEAD"]);
         let version = meta::id_from_sha(&session_sha);
         lab.git(&lab.source, &["tag", &version]);
+        if !frozen {
+            lab.git(&lab.source, &["checkout", "-q", "main"]);
+            let output = lab
+                .clone_target_command("me/paper", "human")
+                .output()
+                .unwrap();
+            assert_output(&output, "human", 0, None);
+            let repo = Repo::at(lab.destination());
+            assert!(!repo.has_ref("refs/remotes/origin/topic"));
+            assert!(repo.git_opt(&["cat-file", "-e", &session_sha]).is_none());
+            assert_eq!(
+                lab.git(
+                    &lab.destination(),
+                    &["config", "--get-all", "remote.origin.fetch"]
+                ),
+                "+refs/heads/main:refs/remotes/origin/main"
+            );
+            let rejected = lab.clone_ref("*", "json2");
+            assert_output(&rejected, "json2", 2, Some("invalid branch name"));
+            assert!(!repo.has_ref("refs/remotes/origin/topic"));
+            assert!(repo.git_opt(&["cat-file", "-e", &session_sha]).is_none());
+            lab.hub.metadata_budget.store(2, Ordering::Release);
+        }
         let target = if frozen { &version } else { "topic" };
         let output = lab
             .clone_target_command(&format!("me/paper@{target}"), "human")
@@ -716,6 +768,19 @@ fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
             lab.git(&lab.destination(), &["rev-parse", "HEAD"]),
             if frozen { &session_sha } else { &lab.head }.as_str()
         );
+        if !frozen {
+            assert_eq!(
+                lab.git(
+                    &lab.destination(),
+                    &["config", "--get-all", "remote.origin.fetch"]
+                ),
+                "+refs/heads/main:refs/remotes/origin/main"
+            );
+            assert_eq!(
+                lab.git(&lab.destination(), &["rev-parse", "topic^"]),
+                lab.head
+            );
+        }
         lab.hub.finish();
         assert!(!lab.home.join("store").exists());
         assert!(!lab.home.join("workspaces").exists());

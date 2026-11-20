@@ -2763,11 +2763,17 @@ fn bind(
     confirm(
         "Bind this directory, accept independent histories for unclaimed sessions, and publish the selected project content?",
     )?;
-    child(
-        &["clone".into(), repository.into(), "--no-bind".into()],
-        &root,
-        false,
-    )?;
+    {
+        let _progress =
+            ui::publication::Progress::start_with_summary("Repository acquisition time");
+        let phase = ui::publication::stage("Preparing repository history");
+        child(
+            &["clone".into(), repository.into(), "--no-bind".into()],
+            &root,
+            false,
+        )?;
+        phase.finish();
+    }
     let repo = verify(&project)?;
     let mut repository_guard = None;
     if automatic {

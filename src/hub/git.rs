@@ -1483,14 +1483,14 @@ fn require_transport_hub(url: &str, hub: &str) -> Result<Option<String>> {
     Ok(Some(destination))
 }
 
-/// Clone a repo on the hub, and pin the same remote identity into the new checkout as soon as it
-/// succeeds.
+/// Clone complete history for callers that resolve their branch only after acquisition, and pin
+/// the same remote identity into the new checkout as soon as it succeeds.
 pub fn clone(
     url: &str,
     dest: &Path,
     identity: &super::identity::RemoteIdentity,
 ) -> Result<Outcome> {
-    clone_selected(url, dest, identity, None)
+    clone_history(url, dest, identity, None, true)
 }
 
 pub(crate) fn clone_selected(
@@ -1498,6 +1498,16 @@ pub(crate) fn clone_selected(
     dest: &Path,
     identity: &super::identity::RemoteIdentity,
     branch: Option<&str>,
+) -> Result<Outcome> {
+    clone_history(url, dest, identity, branch, false)
+}
+
+fn clone_history(
+    url: &str,
+    dest: &Path,
+    identity: &super::identity::RemoteIdentity,
+    branch: Option<&str>,
+    all_refs: bool,
 ) -> Result<Outcome> {
     require_transport_url(url, identity)?;
     prepare_clone_destination(dest)?;
@@ -1508,7 +1518,10 @@ pub(crate) fn clone_selected(
         .transpose()?
         .unwrap_or(false);
     let mut args = vec!["clone", "--quiet"];
-    if scoped {
+    if branch.is_none() && !all_refs {
+        // Remote HEAD selects the default line; shallow history cannot support publication audit.
+        args.extend(["--single-branch", "--no-tags"]);
+    } else if scoped {
         args.extend([
             "--no-tags",
             "--branch",

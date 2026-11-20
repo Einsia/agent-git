@@ -46,15 +46,16 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   for (const [name, pin] of Object.entries({ git: runtime.windows, bundledLfs: runtime.lfs['windows-amd64'] })) {
     tools[name] = { ...pin, archive: pin.url.split('/').at(-1), cacheDirectory: '.cache/test-lfs' };
   }
+  tools.git.mirrorPackage = 'git-runtime-archives';
   const root = resolve(process.argv[2] || '.');
   const requested = process.argv[3];
   if (requested && !tools[requested]) throw new Error(`Unknown Windows tool: ${requested}`);
   const selected = requested ? [tools[requested]] : [...new Map(Object.values(tools).map(tool => [tool.sha256, tool])).values()];
   const mirror = process.env.CI_JOB_TOKEN && process.env.CI_API_V4_URL && process.env.CI_PROJECT_ID
-    ? `${process.env.CI_API_V4_URL}/projects/${process.env.CI_PROJECT_ID}/packages/generic/windows-ci-tools`
+    ? `${process.env.CI_API_V4_URL}/projects/${process.env.CI_PROJECT_ID}/packages/generic`
     : null;
   await Promise.all(selected.map(async (tool) => {
-    const source = mirror ? { ...tool, url: `${mirror}/${tool.sha256}/${tool.archive}` } : tool;
+    const source = mirror ? { ...tool, url: `${mirror}/${tool.mirrorPackage ?? 'windows-ci-tools'}/${tool.sha256}/${tool.archive}` } : tool;
     const download = mirror
       ? (url, options) => fetch(url, { ...options, headers: { 'JOB-TOKEN': process.env.CI_JOB_TOKEN } })
       : fetchArchiveWithCurl;

@@ -686,10 +686,8 @@ fn an_inferred_destination_is_never_public() {
     );
 }
 
-/// The first folder turned on for a repository downloads the repository's whole history to this
-/// computer, which takes minutes for a long one. `agit on` says so before the download starts, so
-/// neither the person nor an agent waiting on the command takes the wait for a hang. An `agit on`
-/// that started the download without a word would leave both looking at nothing until it ends.
+/// The foreground reports first acquisition even though its binding children return captured JSON.
+/// A rejected child must stop that phase rather than report a completed download.
 #[test]
 fn turning_a_folder_on_says_it_downloads_the_repository_first() {
     let lab = Lab::new();
@@ -706,6 +704,20 @@ fn turning_a_folder_on_says_it_downloads_the_repository_first() {
         ),
         "{out:?}"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Preparing repository for first save…"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Preparing repository for first save — stopped"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Preparing repository for first save — done"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Repository setup time:"), "{stderr}");
 }
 
 /// `agit status` names a runtime whose conversations this computer doesn't capture, with the one
