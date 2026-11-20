@@ -8,6 +8,43 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.55] - 2026-11-21
+
+### Added
+
+- Explicit branch pickup uses scoped transfers on supporting Hubs to avoid unrelated historical tags.
+- `agit doctor --storage` reports storage categories, logical and allocated sizes, and incomplete measurements
+  for an explicitly selected Agit home without reading conversation contents.
+- `agit org invite` lets an organization owner invite an existing account as a member using the selected Hub login.
+- Remote Control devices can verify and stage attachments for authorized turns on Hubs that support turn input
+  attachments. Feishu attachment delivery also requires the corresponding Hub support.
+
+### Changed
+
+- Guidance explains how to publish a saved conversation to another repository with `push --to` while keeping
+  its folder binding and future upload destination.
+- Automatic conversation saves run in recoverable background workers. `agit status` reports pending saves and
+  upload outcomes, and queued saves remain recoverable with an explicit command if their worker cannot start.
+- Eligible native Codex and Claude saves can retain only the source context needed for the next saved turn.
+- New session versions use commit history without creating automatic version tags. Selecting a new version by ID
+  requires an updated CLI reader.
+- Explicit version downloads fetch the authorized branch or retained version tag on supporting Hubs and reject
+  transfers that no longer contain the requested version.
+- Setup explains installed runtime hooks, their configuration locations, and how to inspect or control them.
+- Remote Control guidance explains how to choose another project folder in Hub and Feishu.
+
+### Fixed
+
+- Privacy checks recover after a local dictionary becomes readable, and persistent incomplete checks show
+  diagnostic next steps.
+- First clones fetch only the default branch's complete history and show progress while preparing the repository
+  for its first save.
+- Refreshing a successfully uploaded folder branch avoids fetching unrelated session histories and tags. An
+  explicit repository refresh still fetches all remote branches after a default-only clone.
+- A recorded version can be cloned by its commit ID even when no generated version tag exists.
+- Push progress stays visible when output streams use different destinations and while preparing the next part.
+- Completed multipart uploads finish without an unnecessary final repository check.
+
 ## [0.2.54] - 2026-11-19
 
 ### Added
