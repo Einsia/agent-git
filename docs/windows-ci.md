@@ -46,6 +46,5 @@ JUnit report to diagnose a failing test.
 `scripts/package-windows-cli.ps1` builds the release executable and creates the
 archive. It checks the executable, embedded version, and npm installation path
 against that release artifact. It does not install test tools, run Rust test
-suites, or compile the library without default features. The same packaging
-script serves dev and staging; the staging child pipeline is reached through
-the parent pipeline's validation stage.
+suites, or compile the library without default features. This packaging script
+serves the dev channel.

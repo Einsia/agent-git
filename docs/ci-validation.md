@@ -11,15 +11,17 @@ or documentation formatting when they repeat existing coverage.
 
 Linux runs workspace unit tests, product Clippy, and every integration test target
 of every workspace member, so a new file under `tests/` is in the merge gate without
-a list to update. Native Windows tests cover Windows
+a list to update. Default-feature test targets compile together in one Cargo
+invocation, and validation prepares its own tools without downloading Windows
+preparation artifacts. Native Windows tests cover Windows
 security, paths, process ownership, pipes, startup, and installation. macOS runs
 product Clippy and process/signal regressions. Neither platform repeats the full
 Linux business matrix. Packaging builds artifacts and verifies their identity;
 it does not rerun the complete test suite under release optimization.
 
 CI omits disposable debug symbols. Dev CLI packages use parallel code generation
-without LTO; staging and public release optimization remain defined by their
-release configuration. Validation caches downloaded Rust sources by platform,
+without LTO; public release optimization remains defined by its release
+configuration. Validation caches downloaded Rust sources by platform,
 branch, and lockfile and saves them after successful jobs, so MR commits reuse
 their new dependencies without writing another branch's source cache. Build
 outputs stay outside those caches. Process and deployed-cloud acceptance scripts stay

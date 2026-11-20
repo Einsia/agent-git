@@ -115,14 +115,14 @@ the binary to `~/.local/bin/agit`. Common flags:
 ./setup.sh --help
 ```
 
-To build a binary whose built-in hub is the staging deployment, set the build-time default
+To build a binary whose built-in hub is the development deployment, set the build-time default
 explicitly. Runtime `AGIT_HUB_URL` and `agit config hub.url ...` still take precedence:
 
 ```sh
-AGIT_DEFAULT_HUB_URL=https://staging.agent-git.com cargo build --release --locked
+AGIT_DEFAULT_HUB_URL=https://dev.agent-git.com cargo build --release --locked
 ```
 
-Internal GitLab pipelines package commit-addressed `dev` and `staging` builds with this setting
+Internal GitLab pipelines package commit-addressed `dev` builds with this setting
 embedded. Their `agit --version` output includes the channel and source commit, and `agit upgrade`
 is disabled for them so an acceptance-test binary cannot silently turn into the public release.
 Only an existing GitHub `agit-v*` tag produces the `prod` channel. The tag push runs the Release

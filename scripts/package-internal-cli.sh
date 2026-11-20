@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${AGIT_RELEASE_CHANNEL:?set AGIT_RELEASE_CHANNEL to dev or staging}"
+: "${AGIT_RELEASE_CHANNEL:?set AGIT_RELEASE_CHANNEL to dev}"
 : "${AGIT_DEFAULT_HUB_URL:?set AGIT_DEFAULT_HUB_URL}"
 : "${AGIT_BUILD_SHA:?set AGIT_BUILD_SHA to the source commit}"
 : "${AGIT_ARTIFACT_TARGET:?set AGIT_ARTIFACT_TARGET to the runner target triple}"
 
 case "$AGIT_RELEASE_CHANNEL" in
-  dev|staging) ;;
-  *) echo "internal packages only support dev or staging" >&2; exit 2 ;;
+  dev) ;;
+  *) echo "internal packages only support dev" >&2; exit 2 ;;
 esac
 
 base_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
@@ -62,7 +62,7 @@ esac
   printf '  agit setup\n'
   printf '  agit --version\n'
   if [ -n "$quarantine_command" ]; then
-    printf '\nThe quarantine workaround is only for trusted internal dev/staging artifacts.\n'
+    printf '\nThe quarantine workaround is only for trusted internal dev artifacts.\n'
     printf 'Production macOS releases should use Developer ID signing and Apple notarization.\n'
   fi
 } > "$package_dir/INSTALL.txt"
