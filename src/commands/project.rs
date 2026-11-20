@@ -3552,7 +3552,7 @@ fn delegation_header(session: &str) -> Result<Option<serde_json::Value>> {
     else {
         return Ok(None);
     };
-    let header = crate::domain::storage::parse_envelope_line(&line)?.content;
+    let header = crate::domain::storage::parse_envelope_line(&format!("{line}\n"))?.content;
     Ok((header["type"] == "session_meta" && header["payload"]["id"] == session).then_some(header))
 }
 
@@ -3564,8 +3564,41 @@ fn delegation_withheld(
     fallback: Option<&Project>,
     adopt: bool,
 ) -> Result<bool> {
+    Ok(delegation_block(repository, candidate, fallback, adopt)?.is_some())
+}
+
+/// The parent's existing restriction determines which recovery action can change it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DelegationBlock {
+    Recorded {
+        repository: String,
+        branch: String,
+        reason: Withholding,
+    },
+    FolderOff {
+        folder: PathBuf,
+    },
+    History {
+        folder: PathBuf,
+        session: String,
+    },
+    OutsideFolder {
+        folder: PathBuf,
+    },
+    Repository {
+        repository: String,
+        session: String,
+    },
+}
+
+fn delegation_block(
+    repository: &str,
+    candidate: &Candidate,
+    fallback: Option<&Project>,
+    adopt: bool,
+) -> Result<Option<DelegationBlock>> {
     if candidate.runtime != "codex" {
-        return Ok(false);
+        return Ok(None);
     }
     let mut session = candidate.session_id.clone();
     let mut seen = BTreeSet::new();
@@ -3577,12 +3610,12 @@ fn delegation_withheld(
         );
         let Some(header) = delegation_header(&session)? else {
             ensure!(seen.len() == 1, "delegated ancestry is unavailable");
-            return Ok(false);
+            return Ok(None);
         };
         let payload = &header["payload"];
         let spawn = &payload["source"]["subagent"]["thread_spawn"];
         if !crate::adapter::codex::delegated_header(&header) {
-            return Ok(false);
+            return Ok(None);
         }
         ensure!(payload["id"] == session, "delegated identity changed");
         let parents: Vec<_> = [
@@ -3602,11 +3635,15 @@ fn delegation_withheld(
             "ambiguous delegated parent"
         );
         let parent_key = key("codex", parent);
-        if records
+        if let Some(record) = records
             .iter()
-            .any(|record| record.session.as_deref() == Some(&parent_key))
+            .find(|record| record.session.as_deref() == Some(&parent_key))
         {
-            return Ok(true);
+            return Ok(Some(DelegationBlock::Recorded {
+                repository: record.repository.clone(),
+                branch: record.branch.clone(),
+                reason: record.reason,
+            }));
         }
         let parent_header =
             delegation_header(parent)?.context("delegated parent is unavailable")?;
@@ -3629,18 +3666,34 @@ fn delegation_withheld(
         let governing = governing(&ancestor.cwd)?.map(|(project, _)| project);
         let policy = governing.as_ref().or(fallback);
         if let Some(policy) = policy {
-            if policy.repository != repository
-                || !policy.enabled
-                || !policy.auto_upload
-                || !includes(policy, &ancestor.cwd)?
-                || policy.leaves_out(&parent_key)
-                || before_covered(policy, &ancestor, adopt)?
-                || !matches!(
-                    placement(policy, &ancestor),
-                    Ok(Placement::New | Placement::Claim(_))
-                )
-            {
-                return Ok(true);
+            if policy.repository != repository {
+                return Ok(Some(DelegationBlock::Repository {
+                    repository: policy.repository.clone(),
+                    session: candidate.session_id.clone(),
+                }));
+            }
+            if !policy.enabled || !policy.auto_upload {
+                return Ok(Some(DelegationBlock::FolderOff {
+                    folder: policy.root.clone(),
+                }));
+            }
+            if !includes(policy, &ancestor.cwd)? {
+                return Ok(Some(DelegationBlock::OutsideFolder {
+                    folder: ancestor.cwd.clone(),
+                }));
+            }
+            if policy.leaves_out(&parent_key) || before_covered(policy, &ancestor, adopt)? {
+                return Ok(Some(DelegationBlock::History {
+                    folder: ancestor.cwd.clone(),
+                    session: parent.into(),
+                }));
+            }
+            if let Placement::Foreign(target) = placement(policy, &ancestor)? {
+                let (repository, _) = split_target(&target)?;
+                return Ok(Some(DelegationBlock::Repository {
+                    repository: repository.into(),
+                    session: candidate.session_id.clone(),
+                }));
             }
         } else if let Some(claim) =
             link::get_checked(&Store::at(config::store_root()?), "codex", parent)?
@@ -3650,7 +3703,10 @@ fn delegation_withheld(
                 .zip(claim.agent.as_deref())
                 .is_some_and(|(owner, name)| format!("{owner}/{name}") != repository)
         {
-            return Ok(true);
+            return Ok(Some(DelegationBlock::Repository {
+                repository: format!("{}/{}", claim.owner.unwrap(), claim.agent.unwrap()),
+                session: candidate.session_id.clone(),
+            }));
         }
         session = parent.into();
     }
@@ -5582,7 +5638,9 @@ pub(crate) enum Exclusion {
     /// The person stopped uploading the session from `folder`.
     Dropped { folder: PathBuf, session: String },
     /// The conversation that started this delegated session keeps it out.
-    Delegated,
+    Delegated(DelegationBlock),
+    /// The local evidence could not establish the session's upload permissions.
+    Unverified,
 }
 
 /// What [`Withholding::Excluded`] stands for on `slug@branch`, read the way [`withheld_all`]
@@ -5592,15 +5650,21 @@ pub(crate) fn exclusion(slug: &str, branch: &str) -> Result<Option<Exclusion>> {
     let (owner, agent) = super::parse_slug(slug)?;
     let links = link::list(&Store::at(config::store_root()?));
     let claims = recording_into(&links, &owner, &agent, branch);
-    if claims.iter().any(|claim| {
+    let mut unverified = false;
+    for claim in &claims {
         let candidate = Candidate {
             runtime: claim.source.clone(),
             session_id: claim.session_id.clone(),
             cwd: claim.cwd.as_deref().map(PathBuf::from).unwrap_or_default(),
         };
-        delegation_withheld(slug, &candidate, None, false).unwrap_or(true)
-    }) {
-        return Ok(Some(Exclusion::Delegated));
+        match delegation_block(slug, &candidate, None, false) {
+            Ok(Some(block)) => return Ok(Some(Exclusion::Delegated(block))),
+            Ok(None) => {}
+            Err(_) => unverified = true,
+        }
+    }
+    if unverified {
+        return Ok(Some(Exclusion::Unverified));
     }
     let mut sessions: Vec<String> = claims
         .iter()
@@ -9542,6 +9606,7 @@ mod tests {
 
     /// Siblings and nested delegates share the root's exclusion, history cutoff and repository
     /// authority. A child's own claim cannot override a later change to the root's policy.
+    /// Missing or unreadable evidence still blocks publication without inventing a parent rule.
     #[test]
     fn delegated_tree_inherits_root_capture_authority() {
         if !isolated("delegated_tree_inherits_root_capture_authority") {
@@ -9571,6 +9636,10 @@ mod tests {
                 header["payload"]["thread_source"] = "subagent".into();
                 header["payload"]["source"] =
                     serde_json::json!({"subagent":{"thread_spawn":{"parent_thread_id":parent}}});
+                if id == child {
+                    // A user marker cannot erase an explicit subagent source.
+                    header["payload"]["thread_source"] = "user".into();
+                }
             }
             fs::write(
                 native.join(format!("rollout-2026-11-01T00-00-00-{id}.jsonl")),
@@ -9592,6 +9661,13 @@ mod tests {
         };
         cover("2025-01-01T00:00:00Z");
         let store = Store::at(config::store_root().unwrap());
+        let root_candidate = Candidate {
+            runtime: "codex".into(),
+            session_id: root.into(),
+            cwd: tree.clone(),
+        };
+        // The ordinary header has neither thread_source nor source. Absence is not delegation.
+        assert!(!delegation_withheld("alice/app", &root_candidate, None, false).unwrap());
         let candidates: Vec<_> = [child, sibling, grandchild]
             .iter()
             .enumerate()
@@ -9623,6 +9699,13 @@ mod tests {
                     withheld("alice/app", &format!("child-{index}")).unwrap(),
                     Some(Withholding::Excluded)
                 );
+                assert_eq!(
+                    exclusion("alice/app", &format!("child-{index}")).unwrap(),
+                    Some(Exclusion::Delegated(DelegationBlock::History {
+                        folder: tree.clone(),
+                        session: root.into(),
+                    }))
+                );
             }
             assert!(read(&policy.root).unwrap().unwrap().last_result.is_none());
             policy.earlier.clear();
@@ -9632,12 +9715,36 @@ mod tests {
         cover("2027-01-01T00:00:00Z");
         assert!(candidates.iter().all(|c| withholds(&policy, c, false)));
         cover("2025-01-01T00:00:00Z");
+        let mut incomplete = link::Link::new("codex", root, Some(&tree));
+        incomplete.branch = Some("root".into());
+        let parent_claim = link::write(&store, &incomplete).unwrap();
+        assert!(placement(&policy, &root_candidate).is_err());
+        let original_claim = fs::read(&parent_claim).unwrap();
+        assert!(delegation_withheld("alice/app", &candidates[0], None, false).is_err());
+        assert!(withholds(&policy, &candidates[0], false));
+        assert_eq!(
+            withheld("alice/app", "child-0").unwrap(),
+            Some(Withholding::Excluded)
+        );
+        assert_eq!(
+            exclusion("alice/app", "child-0").unwrap(),
+            Some(Exclusion::Unverified)
+        );
+        assert_eq!(fs::read(&parent_claim).unwrap(), original_claim);
+        fs::remove_file(parent_claim).unwrap();
         let mut foreign = link::Link::new("codex", root, Some(&tree));
         foreign.owner = Some("bob".into());
         foreign.agent = Some("other".into());
         foreign.branch = Some("root".into());
         link::write(&store, &foreign).unwrap();
         assert!(candidates.iter().all(|c| withholds(&policy, c, false)));
+        assert_eq!(
+            exclusion("alice/app", "child-0").unwrap(),
+            Some(Exclusion::Delegated(DelegationBlock::Repository {
+                repository: "bob/other".into(),
+                session: child.into(),
+            }))
+        );
         // A recorded drop remains authoritative after its native claim is released.
         fs::remove_file(link::link_path(&store, "codex", root)).unwrap();
         update_withheld(|records| {
@@ -9670,12 +9777,45 @@ mod tests {
         .unwrap();
         repo.add_all().unwrap();
         repo.commit("Capture delegated header").unwrap();
-        fs::remove_file(child_path).unwrap();
+        fs::remove_file(&child_path).unwrap();
         fs::remove_file(native.join(format!("rollout-2026-11-01T00-00-00-{root}.jsonl"))).unwrap();
+        assert_eq!(
+            delegation_header(child).unwrap().unwrap(),
+            serde_json::from_str::<serde_json::Value>(&raw).unwrap()
+        );
         assert_eq!(
             withheld("alice/app", "child-0").unwrap(),
             Some(Withholding::Excluded)
         );
+        assert_eq!(
+            exclusion("alice/app", "child-0").unwrap(),
+            Some(Exclusion::Delegated(DelegationBlock::Recorded {
+                repository: "alice/app".into(),
+                branch: "root".into(),
+                reason: Withholding::Dropped,
+            }))
+        );
+        update_withheld(|records| records.clear()).unwrap();
+        // The captured child remains known, but its unavailable parent cannot establish a rule.
+        assert_eq!(
+            withheld("alice/app", "child-0").unwrap(),
+            Some(Withholding::Excluded)
+        );
+        assert_eq!(
+            exclusion("alice/app", "child-0").unwrap(),
+            Some(Exclusion::Unverified)
+        );
+        // A malformed native header cannot establish even whether the session is delegated.
+        fs::write(&child_path, "{\n").unwrap();
+        assert_eq!(
+            withheld("alice/app", "child-0").unwrap(),
+            Some(Withholding::Excluded)
+        );
+        assert_eq!(
+            exclusion("alice/app", "child-0").unwrap(),
+            Some(Exclusion::Unverified)
+        );
+        assert_eq!(fs::read_to_string(&child_path).unwrap(), "{\n");
     }
 
     /// A foreign claim cannot become a new import or silently change publication authority.

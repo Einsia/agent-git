@@ -600,8 +600,7 @@ fn publish(mut args: Args) -> CmdResult {
                 // An exclusion says which one, and how to let the session in where naming it does.
                 let exclusion = if reason == super::project::Withholding::Excluded {
                     super::project::exclusion(&checkout.slug(), &branch)
-                        .ok()
-                        .flatten()
+                        .unwrap_or(Some(super::project::Exclusion::Unverified))
                 } else {
                     None
                 };
@@ -614,8 +613,11 @@ fn publish(mut args: Args) -> CmdResult {
                         "you stopped uploading it from {} (`agit project drop`). To upload it anyway: `agit save {session}` in that folder; it saves into a new branch, and this one stays as it is",
                         ui::tilde(folder)
                     ),
-                    Some(super::project::Exclusion::Delegated) => {
+                    Some(super::project::Exclusion::Delegated(_)) => {
                         "it is a delegated session, and the conversation that started it keeps those out".to_owned()
+                    }
+                    Some(super::project::Exclusion::Unverified) => {
+                        "agit could not verify this session's upload permissions".to_owned()
                     }
                     None => reason.describe().to_owned(),
                 };
@@ -624,6 +626,25 @@ fn publish(mut args: Args) -> CmdResult {
                     checkout.slug(),
                 ));
                 ui::hint("its local history stays; nothing was sent to the Hub");
+                let target = format!("{}@{branch}", checkout.slug());
+                match &exclusion {
+                    Some(super::project::Exclusion::Unverified) => {
+                        ui::hint(
+                            "restore readable original session records, any missing parent conversations, and local project settings on the computer that holds them",
+                        );
+                        ui::hint(
+                            "if only an incomplete export remains, this version has no command to reconstruct missing source facts or override this check; use the original native conversation for import",
+                        );
+                        ui::hint(&format!(
+                            "after restoring those records, retry `agit push {}`; `agit import --help` describes importing an original conversation",
+                            ui::session::shell_arg(&target),
+                        ));
+                    }
+                    Some(super::project::Exclusion::Delegated(block)) => {
+                        say_delegation_recovery(block, &target);
+                    }
+                    _ => {}
+                }
                 if reason == super::project::Withholding::UnknownStart {
                     let slug = checkout.slug();
                     // An opener this computer holds no claim of began elsewhere, and continuing it
@@ -870,6 +891,67 @@ fn acknowledged_unchanged(
             .cloned()
             .collect(),
     )
+}
+
+fn say_delegation_recovery(block: &super::project::DelegationBlock, target: &str) {
+    use super::project::{DelegationBlock, Withholding};
+
+    match block {
+        DelegationBlock::Recorded {
+            repository,
+            branch,
+            reason: Withholding::Dropped,
+        } => {
+            let parent = ui::session::shell_arg(&format!("{repository}@{branch}"));
+            ui::hint(&format!(
+                "if you want the parent conversation to record and upload again: `agit project undrop {parent}`; it refuses if the original parent branch can no longer be restored",
+            ));
+        }
+        DelegationBlock::Recorded {
+            repository,
+            branch,
+            reason,
+        } => {
+            let parent = ui::session::shell_arg(&format!("{repository}@{branch}"));
+            ui::hint(&format!(
+                "the parent is held because {}; `agit push {parent} --dry-run` shows its own refusal and available recovery; this child stays blocked while that hold remains",
+                reason.describe(),
+            ));
+        }
+        DelegationBlock::FolderOff { folder } => {
+            let folder = ui::session::shell_arg(&folder.to_string_lossy());
+            ui::hint(&format!(
+                "the parent's folder is off; `agit on {folder}` enables automatic saving and uploading for that folder, so use it only if you want those conversations uploaded",
+            ));
+        }
+        DelegationBlock::History { folder, session } => {
+            ui::hint(&format!(
+                "the parent's history is not included; if you want to upload that conversation too, run `agit save {}` in {}; it may save the parent into a new branch",
+                ui::session::shell_arg(session),
+                ui::tilde(folder),
+            ));
+        }
+        DelegationBlock::OutsideFolder { folder } => {
+            ui::hint(&format!(
+                "the parent's folder is outside the allowed capture scope; inspect it with `agit project status {}` and explicitly include it before uploading this child; there is no child-only override",
+                ui::session::shell_arg(&folder.to_string_lossy()),
+            ));
+        }
+        DelegationBlock::Repository {
+            repository,
+            session,
+        } => {
+            ui::hint(&format!(
+                "the parent belongs to {repository}; this branch cannot override that destination. On the computer holding verifiable original records, choose a new branch and inspect `agit import {} --from codex --repo {} -b <new-branch> --propose-lineage --json`; follow its actual returned choices",
+                ui::session::shell_arg(session),
+                ui::session::shell_arg(repository),
+            ));
+        }
+    }
+    ui::hint(&format!(
+        "after the parent's restrictions are resolved, retry `agit push {}`; the same parent checks still apply",
+        ui::session::shell_arg(target),
+    ));
 }
 
 /// How a push says that a session branch is larger than the Hub accepts. Project capture reads it
