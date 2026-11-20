@@ -295,6 +295,16 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn permits_turn_files(&self, session: &str) -> bool {
+        self.role == "operator"
+            && self.permit.is_controlled_turn_for(session)
+            && self.grant.as_ref().is_some_and(|grant| {
+                grant.session_controller.is_none()
+                    && grant.project_controller.is_none()
+                    && grant.caller == grant.target.owner
+                    && grant.source.owner == grant.target.owner
+            })
+    }
     fn owned_machine_grant(&self) -> Option<agit_peer::cloud::ConnectionGrant> {
         if self.permit.method != crate::protocol::method::PROJECT_PUBLICATION_BIND {
             return None;
@@ -1020,6 +1030,37 @@ mod tests {
         );
         let client = registry.admitted(grant.clone()).await.unwrap();
         let frame = client.authorize(request()).unwrap();
+        registry.state.write().unwrap().resources.observe(
+            "session.list",
+            &json!({"local":[{"runtime_session_id":"visible","runtime":"codex","cwd":"/trusted"}]}),
+        );
+        let turn = || {
+            Frame::request(
+                "turn.start",
+                json!({"session_id":"visible","access_ceiling":"control"}),
+            )
+        };
+        let input = client.authorize(turn()).unwrap();
+        assert_eq!(input.caller.as_ref().unwrap().role, "operator");
+        assert!(input.authority.permits_turn_files("visible"));
+        assert!(!input.authority.permits_turn_files("another"));
+        let scoped = client
+            .authorize(Frame::request(
+                "turn.steer",
+                json!({"session_id":"visible","access_ceiling":"control"}),
+            ))
+            .unwrap();
+        assert_eq!(scoped.caller.as_ref().unwrap().role, "operator");
+        assert!(scoped.authority.permits_turn_files("visible"));
+        assert!(!scoped.authority.permits_turn_files("another"));
+        assert!(
+            !unbound
+                .authorize(turn())
+                .unwrap()
+                .authority
+                .permits_turn_files("visible")
+        );
+        assert!(!frame.authority.permits_turn_files("visible"));
         assert_eq!(
             frame.authority.owned_machine_grant().unwrap().id,
             "owner-grant"

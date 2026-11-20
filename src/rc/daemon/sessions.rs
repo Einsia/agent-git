@@ -723,6 +723,7 @@ impl Daemon {
                 resume_from: Some(entry.thread_id.clone()),
                 agit_session: lineage,
                 // Native resume owns the current model; start receipts are immutable history.
+                effort: None,
                 model: None,
                 dangerous: false,
                 // Resume brings back the guard it ran under, unless it named another.
@@ -1011,6 +1012,7 @@ impl Daemon {
             // This line is "keep talking where it left off": hand the harness back its own id.
             resume_from: Some(p.session_id.clone()),
             agit_session,
+            effort: None,
             model: None,
             dangerous: false,
             // It runs in the permission mode it last ran in. `None` (= Default) here means a
@@ -1231,6 +1233,19 @@ impl Daemon {
         // A shared project is started for a group member, never for the owner, and only in Claude
         // Code.
         let project_share = crate::rc::project_share::origin(p.origin.as_deref())?;
+        if let Some(effort) = &p.effort
+            && (!matches!(p.runtime.as_str(), "codex" | "claude-code")
+                || effort.is_empty()
+                || effort.len() > 64
+                || !effort
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+        {
+            return Err(RpcError::new(
+                ErrorCode::MalformedFrame,
+                "unsupported launch effort",
+            ));
+        }
         if project_share && caller.is_owner() {
             return Err(crate::rc::project_share::refused(
                 "a shared project's session is started for someone else, not the owner; nothing was started",
@@ -1304,6 +1319,7 @@ impl Daemon {
             && let Some(intent) = self.roster.starts.get(start_id).cloned()
         {
             let retry_spec = roster::StartSpec {
+                effort: p.effort.clone(),
                 model: p.model.clone(),
                 workspace_id: p.workspace_id.clone(),
                 project_id: p.project_id.clone(),
@@ -1419,6 +1435,7 @@ impl Daemon {
             cwd: cwd.clone(),
             resume_from: None,
             agit_session: agit_session.clone(),
+            effort: p.effort.clone(),
             model: p.model.clone(),
             dangerous: mode.is_dangerous(),
             permission_mode: Some(mode),
@@ -1443,6 +1460,7 @@ impl Daemon {
         };
 
         let start_spec = roster::StartSpec {
+            effort: p.effort.clone(),
             model: p.model.clone(),
             workspace_id: p.workspace_id.clone(),
             project_id: p.project_id.clone(),

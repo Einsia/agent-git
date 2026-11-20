@@ -468,7 +468,7 @@ impl CodexDriver {
             cwd: spec.cwd.clone(),
             resume_from: spec.resume_from.clone(),
             model: spec.model.clone(),
-            effort: None,
+            effort: spec.effort.clone(),
             pending_model: None,
             model_catalog: vec![],
             default_model: None,
@@ -557,6 +557,11 @@ impl CodexDriver {
             });
         } else if let Some(model) = &self.model {
             params["model"] = json!(model);
+        }
+        if self.resume_from.is_none()
+            && let Some(effort) = &self.effort
+        {
+            params["config"] = json!({"model_reasoning_effort":effort});
         }
         self.send(&json!({"id": id, "method": method, "params": params}))
             .await?;
@@ -1641,7 +1646,11 @@ impl CodexDriver {
                     .and_then(|t| t.get("id"))
                     .and_then(|x| x.as_str())
                 {
-                    self.effort = res["reasoningEffort"].as_str().map(String::from);
+                    if let Some(effort) = res["reasoningEffort"].as_str() {
+                        self.effort = Some(effort.into());
+                    } else if self.resume_from.is_some() {
+                        self.effort = None;
+                    }
                     self.model = res["model"]
                         .as_str()
                         .map(String::from)
@@ -2687,6 +2696,7 @@ mod tests {
                 let mut driver = probe();
                 driver.resume_from = resume.map(String::from);
                 driver.model = model.map(String::from);
+                driver.effort = Some("high".into());
                 driver.open_thread().await.unwrap();
                 let queued =
                     tokio::time::timeout(std::time::Duration::from_secs(1), driver.proc.next())
@@ -2707,6 +2717,26 @@ mod tests {
                 assert_eq!(request["params"]["model"].as_str(), model);
                 assert_eq!(request["params"].get("model").is_some(), model.is_some());
                 assert_eq!(request["params"]["threadId"].as_str(), resume);
+                assert_eq!(
+                    request["params"]["config"]["model_reasoning_effort"].as_str(),
+                    resume.is_none().then_some("high")
+                );
+                if resume.is_none() {
+                    driver
+                        .classify(
+                            json!({"id":request["id"],"result":{"thread":{"id":"new-thread"}}}),
+                        )
+                        .await;
+                    assert!(matches!(
+                        driver.start_turn("first task", false, None).await,
+                        TurnStartDispatch::Awaiting
+                    ));
+                    let queued = driver.proc.next().await.unwrap();
+                    let Line::Json(turn) = queued.line() else {
+                        panic!("expected first turn")
+                    };
+                    assert_eq!(turn["params"]["effort"], "high");
+                }
                 if resume.is_some() && model.is_none() {
                     driver.classify(json!({"id":request["id"],"result":{"thread":{"id":"existing-thread"},"model":"current-native-model-b"}})).await;
                     assert_eq!(driver.model.as_deref(), Some("current-native-model-b"));

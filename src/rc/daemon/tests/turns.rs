@@ -1,6 +1,155 @@
 use super::*;
 
 #[test]
+fn an_operator_can_deliver_files_only_to_the_admitted_session() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct TurnFiles(Arc<AtomicBool>);
+    impl crate::rc::authority::Authority for TurnFiles {
+        fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool {
+            self.0.load(Ordering::Acquire) && accept()
+        }
+        fn permits_turn_files(&self, session: &str) -> bool {
+            session == "session-a"
+        }
+    }
+    if crate::rc::in_isolated_test(
+        "rc::daemon::tests::turns::an_operator_can_deliver_files_only_to_the_admitted_session",
+    ) {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    // The blocking worker must resolve the same private home as the isolated test process.
+    unsafe {
+        std::env::set_var("AGIT_HOME", home.path());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (tx, mut rx) = mpsc::channel(2);
+        let (_stop_tx, mut stop) = tokio::sync::watch::channel(false);
+        let sessions = ["session-a", "session-b"].into_iter().map(|id| {
+            let live = rpc_test_live(id, 1, tx.clone(), crate::protocol::PermissionMode::Default);
+            (id.into(), live)
+        });
+        let daemon = rpc_test_daemon(sessions.collect(), Roster::default());
+        let mut state = daemon.lock().await;
+        let mut frame = rpc_turn_frame("session-b");
+        frame.caller = Some(claim("operator", "ws-a"));
+        let authorized = Arc::new(AtomicBool::new(true));
+        frame.authority = crate::rc::authority::Guard::new(TurnFiles(authorized.clone()));
+        let input = uuid::Uuid::new_v4().to_string();
+        let params = frame.params.as_mut().unwrap();
+        params["client_msg_id"] = serde_json::json!(input);
+        params["input_attachments"] = serde_json::json!([{
+            "name": "notes.txt", "data": "T0s=",
+            "sha256": "565339bc4d33d72817b583024112eb7f5cdf3e5eef0252d6ec1b9c9a94e12bb3"
+        }]);
+        let denied = state.prepare_session_rpc(&frame).err().unwrap();
+        assert_eq!(denied.code, ErrorCode::Forbidden as i32);
+        let root = crate::rc::rc_dir().unwrap().join("task-attachments");
+        assert!(!root.exists());
+
+        frame.params.as_mut().unwrap()["session_id"] = serde_json::json!("session-a");
+        let prepared = state.prepare_session_rpc(&frame).unwrap();
+        assert!(
+            !root.exists(),
+            "preparing a turn under the daemon lock must not stage files"
+        );
+        drop(state);
+        let (executed, ()) = tokio::join!(prepared.execute(daemon.clone(), &mut stop), async {
+            let Some(Command::Turn { message, reply, .. }) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                    .await
+                    .expect("attachment delivery timed out")
+            else {
+                panic!("expected an attachment turn")
+            };
+            assert!(message.contains("notes.txt"));
+            assert!(reply.accept());
+            reply.finish(Ok(TurnStartOutcome::Accepted {
+                turn_id: "turn-a".into(),
+                still_running: false,
+                consumed_mode: None,
+                confirmation: TurnStartConfirmation::Exact,
+            }));
+        });
+        executed.response.unwrap();
+        let session = std::fs::read_dir(root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let file = std::fs::read_dir(session.join(input))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(file).unwrap(), b"OK");
+
+        let mut steer = frame.clone();
+        steer.method = Some(method::TURN_STEER.into());
+        let steer_input = uuid::Uuid::new_v4().to_string();
+        steer.params.as_mut().unwrap()["client_msg_id"] = serde_json::json!(steer_input);
+        let prepared = daemon.lock().await.prepare_session_rpc(&steer).unwrap();
+        let (steered, ()) = tokio::join!(prepared.execute(daemon.clone(), &mut stop), async {
+            let Some(Command::Steer { message, reply, .. }) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected supplemental attachments")
+            };
+            assert!(message.contains("notes.txt"));
+            assert!(message.contains("Attached files on this device"));
+            assert!(reply.accept());
+            reply.finish(Ok(crate::protocol::Delivery::AtToolBoundary));
+        });
+        assert_eq!(steered.response.unwrap()["delivery"], "at_tool_boundary");
+        let next_input = uuid::Uuid::new_v4().to_string();
+        frame.params.as_mut().unwrap()["client_msg_id"] = serde_json::json!(next_input);
+        let mut state = daemon.lock().await;
+        let revoked = state.prepare_session_rpc(&frame).unwrap();
+        let (result, ()) = tokio::join!(revoked.execute(daemon.clone(), &mut stop), async {
+            let published = session.join(next_input);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !published.is_dir() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("files must be published even while another request holds the daemon lock");
+            authorized.store(false, Ordering::Release);
+            drop(state);
+        });
+        let error = result.response.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Forbidden as i32);
+        assert_eq!(error.data.unwrap()["outcome"], "not_sent");
+        authorized.store(true, Ordering::Release);
+
+        let stale = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
+        daemon
+            .lock()
+            .await
+            .sessions
+            .get_mut("session-a")
+            .unwrap()
+            .generation += 1;
+        let error = stale.execute(daemon, &mut stop).await.response.unwrap_err();
+        assert_eq!(error.code, ErrorCode::SessionNotFound as i32);
+        assert_eq!(error.data.unwrap()["outcome"], "not_sent");
+        assert!(
+            rx.try_recv().is_err(),
+            "neither rejected turn may reach the supervisor"
+        );
+    });
+}
+
+#[test]
 fn shared_permission_receipts_do_not_reapply_stale_defaults_or_claim_a_stopped_task() {
     for outcome in [
         PermissionModeOutcome::SharedApplied {

@@ -128,6 +128,8 @@ impl Entry {
 /// first turn it receives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Explicit model selection is part of the immutable launch intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -152,7 +154,8 @@ pub struct StartSpec {
 
 impl StartSpec {
     pub(crate) fn same_launch_as(&self, other: &Self) -> bool {
-        self.model == other.model
+        self.effort == other.effort
+            && self.model == other.model
             && self.workspace_id == other.workspace_id
             && self.project_id == other.project_id
             && self.runtime == other.runtime
@@ -1599,6 +1602,7 @@ mod tests {
 
     fn start_spec() -> StartSpec {
         StartSpec {
+            effort: None,
             model: None,
             workspace_id: "ws-1".into(),
             project_id: "project-1".into(),

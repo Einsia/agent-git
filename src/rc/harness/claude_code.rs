@@ -427,7 +427,11 @@ fn argv(spec: &LaunchSpec, session_id: &str, resume: bool) -> Vec<String> {
         args.push(context.clone());
     }
     args.push("--settings".into());
-    args.push(session_settings().to_string());
+    let mut settings = session_settings();
+    if let Some(effort) = &spec.effort {
+        settings["effortLevel"] = json!(effort);
+    }
+    args.push(settings.to_string());
     args.push(if resume { "--resume" } else { "--session-id" }.into());
     args.push(session_id.to_string());
     args
@@ -576,8 +580,8 @@ impl ClaudeCodeDriver {
             mode,
             launched_unchecked: mode.is_dangerous(),
             model: spec.model,
-            effort: None,
-            effort_known: false,
+            effort_known: spec.effort.is_some(),
+            effort: spec.effort,
             model_choice,
             model_catalog: vec![],
             pending_model_request: None,
@@ -1632,6 +1636,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: None,
@@ -1647,6 +1652,17 @@ mod tests {
             .collect();
         assert_eq!(given, [told], "{args:?}");
         let args = argv(&spec(None), "sid", false);
+        let mut selected = spec(None);
+        selected.effort = Some("high".into());
+        let selected_args = argv(&selected, "sid", false);
+        let settings = selected_args
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&settings[1]).unwrap()["effortLevel"],
+            "high"
+        );
         assert!(
             !args.iter().any(|arg| arg == "--append-system-prompt"),
             "{args:?}"
@@ -1663,6 +1679,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: None,
@@ -1807,6 +1824,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: None,
@@ -1837,6 +1855,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             resume_from: resume_from.map(Into::into),
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: true,
             permission_mode: None,
@@ -1875,6 +1894,7 @@ mod tests {
                     cwd: PathBuf::from("/tmp"),
                     resume_from: resume_from.map(Into::into),
                     agit_session: None,
+                    effort: None,
                     model: None,
                     dangerous: false,
                     permission_mode: Some(mode),
@@ -1956,6 +1976,7 @@ mod tests {
             cwd: cwd.clone(),
             resume_from: Some(id.into()),
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: None,
@@ -3129,6 +3150,7 @@ for line in sys.stdin:
             cwd: PathBuf::from("/tmp"),
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous,
             permission_mode,

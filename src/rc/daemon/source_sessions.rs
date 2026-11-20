@@ -240,6 +240,7 @@ impl Daemon {
             cwd: thread.cwd,
             resume_from: Some(native.into()),
             agit_session: lineage,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: mode,

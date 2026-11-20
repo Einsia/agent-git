@@ -532,6 +532,8 @@ pub struct TerminalExited {
 /// launches the harness headless under `agitd`'s supervision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Explicit model selection is part of the immutable launch intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

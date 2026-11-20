@@ -682,6 +682,23 @@ impl Daemon {
         require_role(&caller, frame.method())?;
         let mut opening = match frame.method() {
             method::SESSION_START => {
+                if let Some(params) = frame
+                    .params
+                    .as_ref()
+                    .filter(|p| p.get("lookup_only").is_some())
+                {
+                    let existing = params["lookup_only"] == true
+                        && self.start_idempotency_feature()
+                        && params["start_id"]
+                            .as_str()
+                            .is_some_and(|id| self.roster.starts.contains_key(id));
+                    if !existing {
+                        return Err(RpcError::new(
+                            ErrorCode::SessionBusy,
+                            "no recorded launch outcome",
+                        ));
+                    }
+                }
                 self.prepare_start_session(frame.params_as()?, &caller, frames, &frame.authority)
             }
             method::SESSION_RESUME => {
@@ -1033,6 +1050,14 @@ mod tests {
         daemon.mirror.bind("local-owner", "project", &new).unwrap();
         request.authority.check().unwrap();
         let (frames, _) = mpsc::channel(1);
+        let mut lookup = request.clone();
+        lookup.params.as_mut().unwrap()["lookup_only"] = serde_json::json!(true);
+        let missing = daemon
+            .prepare_opening(&lookup, &frames)
+            .err()
+            .expect("lookup must not launch an unknown id");
+        assert_eq!(missing.code, ErrorCode::SessionBusy as i32);
+        assert!(daemon.roster.starts.is_empty());
         let error = match daemon.prepare_opening(&request, &frames) {
             Err(error) => error,
             Ok(_) => panic!("stale project authority admitted a launch"),
@@ -1077,6 +1102,7 @@ mod tests {
             cwd,
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: info.permission_mode,

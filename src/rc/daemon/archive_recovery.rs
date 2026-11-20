@@ -938,6 +938,7 @@ mod tests {
             cwd: job.cwd.clone(),
             resume_from: Some(job.native.clone()),
             agit_session: Some(job.session().unwrap()),
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: None,
