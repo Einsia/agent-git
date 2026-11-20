@@ -21,7 +21,7 @@
     "distill": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"},"paths":{"action":"Append","policy":"count"},"take_mine":{"action":"Append","policy":"count"}}},
     "doctor": {"aliases":[],"args":{"check_backend":{"action":"SetTrue","policy":"boolean"},"deep":{"action":"SetTrue","policy":"boolean"},"repair_objects":{"action":"Set","policy":"presence"},"repair_permissions":{"action":"Set","policy":"presence"},"repair_worktrees":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"},"storage":{"action":"Set","policy":"omitted"}}},
     "export": {"aliases":[],"args":{"format":{"action":"Set","policy":"enum","values":["jsonl","ir","markdown","claude-code","codex"]},"out":{"action":"Set","policy":"presence"},"privacy":{"action":"SetTrue","policy":"boolean"},"redact":{"action":"SetTrue","policy":"boolean"},"target":{"action":"Set","policy":"presence"},"view_only":{"action":"SetTrue","policy":"boolean"}}},
-    "fetch": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"repo":{"action":"Set","policy":"presence"}}},
+    "fetch": {"aliases":[],"args":{"all":{"action":"SetTrue","policy":"boolean"},"branch":{"action":"Set","policy":"presence"},"repo":{"action":"Set","policy":"presence"}}},
     "file": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"}}},
     "file add": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"},"lfs":{"action":"SetTrue","policy":"boolean"},"paths":{"action":"Append","policy":"count"},"to":{"action":"Set","policy":"presence"}}},
     "file commit": {"aliases":[],"args":{"into":{"action":"Set","policy":"presence"},"message":{"action":"Set","policy":"presence"}}},

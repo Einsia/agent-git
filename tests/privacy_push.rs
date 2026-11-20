@@ -16509,24 +16509,93 @@ fn an_undropped_branch_records_and_uploads_its_conversation_again() {
     assert_ne!(lab.tip(&branch), before.1);
 }
 
-/// A folder's worker refreshes its view of the Hub's branches with a background `agit fetch`
-/// after each upload. Signed in, that fetch fetches. Without a usable sign-in it asks the Hub
-/// nothing, not even to look the repository up, and says so; the fixture Hub fails the test on any
-/// request without the account's token. A background fetch that looked the repository up
-/// anonymously first, as a person's own fetch of a public repository may, would fail here (#522).
+/// A background refresh updates only the published branch, even when local fetch settings request
+/// tags and pruning. It preserves other refs and asks nothing after the account signs out.
 #[test]
-fn a_background_fetch_without_a_sign_in_asks_the_hub_nothing() {
+fn a_background_fetch_refreshes_only_its_branch_and_requires_sign_in() {
     let lab = UndropLab::new(53);
-    let fetched = lab.run_background(&["fetch", "alice/app"]);
-    assert_success(&fetched);
-    assert!(
-        UndropLab::said(&fetched).contains("alice/app fetched"),
-        "{}",
-        UndropLab::said(&fetched)
+    let local_main = git(lab.repo.root(), &["rev-parse", "refs/heads/main"]);
+    for (key, value) in [
+        ("user.name", "Synthetic"),
+        ("user.email", "synthetic@example.invalid"),
+    ] {
+        git(&lab.remote, &["config", key, value]);
+    }
+    let remote_main = git(&lab.remote, &["rev-parse", "refs/heads/main"]);
+    let tree = git(&lab.remote, &["rev-parse", "refs/heads/main^{tree}"]);
+    let advanced = git(
+        &lab.remote,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &remote_main,
+            "-m",
+            "Published branch advances",
+        ],
     );
+    let unrelated = git(
+        &lab.remote,
+        &["commit-tree", &tree, "-m", "Unrelated remote history"],
+    );
+    git(
+        &lab.remote,
+        &["update-ref", "refs/heads/unrelated", &unrelated],
+    );
+    git(
+        &lab.remote,
+        &["update-ref", "refs/tags/unrelated", &unrelated],
+    );
+    for reference in ["refs/remotes/origin/retained", "refs/tags/retained"] {
+        git(lab.repo.root(), &["update-ref", reference, &local_main]);
+    }
+    for (key, value) in [
+        ("remote.origin.tagopt", "--tags"),
+        ("fetch.prune", "true"),
+        ("fetch.pruneTags", "true"),
+    ] {
+        git(lab.repo.root(), &["config", key, value]);
+    }
+    let before = lab.branches();
+    lab.turn("e3e3e3e3-0000-4000-8000-000000000360", 1, &|| {
+        lab.branches().difference(&before).any(|branch| {
+            let published = lab.on_hub(branch);
+            !published.is_empty()
+                && lab
+                    .repo
+                    .git_opt(&["rev-parse", &format!("refs/remotes/origin/{branch}")])
+                    == Some(published)
+        })
+    });
+    assert!(!lab.repo.has_ref("refs/tags/unrelated"));
+    assert!(lab.repo.git_opt(&["cat-file", "-e", &unrelated]).is_none());
+
+    git(&lab.remote, &["update-ref", "refs/heads/main", &advanced]);
+    let args = ["fetch", "alice/app", "--branch", "main"];
+    let fetched = lab.run_background(&args);
+    assert_success(&fetched);
+    assert_eq!(
+        git(lab.repo.root(), &["rev-parse", "refs/remotes/origin/main"]),
+        advanced
+    );
+    assert_eq!(
+        git(lab.repo.root(), &["rev-parse", "refs/heads/main"]),
+        local_main
+    );
+    for reference in ["refs/remotes/origin/retained", "refs/tags/retained"] {
+        assert_eq!(git(lab.repo.root(), &["rev-parse", reference]), local_main);
+    }
+    assert!(!lab.repo.has_ref("refs/remotes/origin/unrelated"));
+    assert!(!lab.repo.has_ref("refs/tags/unrelated"));
+    assert!(lab.repo.git_opt(&["cat-file", "-e", &unrelated]).is_none());
+    assert!(UndropLab::said(&fetched).contains("alice/app fetched"));
+
+    let invalid = lab.run_background(&["fetch", "alice/app", "--branch", "*"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(!lab.repo.has_ref("refs/remotes/origin/unrelated"));
 
     fs::remove_dir_all(lab.home.join("credentials")).unwrap();
-    let skipped = lab.run_background(&["fetch", "alice/app"]);
+    let skipped = lab.run_background(&args);
     assert_success(&skipped);
     assert!(
         UndropLab::said(&skipped).contains("nothing fetched, nothing asked"),

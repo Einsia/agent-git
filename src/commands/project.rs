@@ -1478,6 +1478,20 @@ fn child(arguments: &[String], cwd: &Path, automatic: bool) -> Result<serde_json
     run_child(command, arguments, cwd)
 }
 
+/// Refresh only the acknowledged branch; a failed refresh cannot undo its publication.
+pub(super) fn refresh_published_branch(repository: &str, branch: &str, cwd: &Path) {
+    let _ = child(
+        &[
+            "fetch".into(),
+            repository.into(),
+            "--branch".into(),
+            branch.into(),
+        ],
+        cwd,
+        true,
+    );
+}
+
 /// The folder's own automatic upload of `target`.
 fn automatic_push(target: &str, cwd: &Path) -> Result<serde_json::Value> {
     let mut command = crate::infra::background::command(std::env::current_exe()?);
@@ -2153,14 +2167,7 @@ fn sync_one_for_request(
         let lines = pushed["result"]["lines"].as_array().into_iter().flatten();
         super::push::published_visibility(lines.filter_map(serde_json::Value::as_str))
     });
-    // A publication does not move the local view of the Hub's branches; fetching does, so local
-    // status and links can tell that this branch is on the Hub. It runs as a background child,
-    // which asks the Hub nothing without a sign-in.
-    let _ = child(
-        &["fetch".into(), project.repository.clone()],
-        &candidate.cwd,
-        true,
-    );
+    refresh_published_branch(&project.repository, &branch, &candidate.cwd);
     Ok(Synced { branch, head, once })
 }
 
@@ -4449,11 +4456,7 @@ fn retry_one(project: &Project, repo: &Repo, due: &super::upload_outcome::Due) -
     );
     save_request_crash_point("after_retry_upload");
     if matches!(pushed, Ok(Ok(_))) {
-        let _ = child(
-            &["fetch".into(), project.repository.clone()],
-            &project.root,
-            true,
-        );
+        refresh_published_branch(&project.repository, &due.branch, &project.root);
     }
     Ok(())
 }
