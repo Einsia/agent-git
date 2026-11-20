@@ -57,7 +57,7 @@ agit push [owner/repo@branch] [options]
 | `--keep-going` | With several branches, publish each on its own when publishing them together fails |
 | `--keep-both` | When the branch has diverged from the Hub's copy, publish this checkout's line as `<branch>-local` (or the next free name) beside it; the Hub's branch stays as it is. It publishes a new branch, so run it only when the user chooses to keep both |
 | `--private`, `--public` | Select visibility for a new repository; an existing audience is retained |
-| `--to <owner/repo>` | Publish to another repository the account can write to; the checkout keeps its own repository as the default. For a device-local RC repository, selects its retained Hub destination |
+| `--to <owner/repo>` | Publish to another writable repository on the same Hub for this invocation; an ordinary checkout keeps its default and folder binding. Device-local RC can select its initial destination, but cannot replace a confirmed one |
 | `--allow-secrets` | Compatibility flag for servers that require secret-findings acceptance |
 | `--audit` | Review frozen outgoing content with an interactive agent, then confirm publication separately |
 | `--dry-run` | Inspect registered sessions without creating a repository, registering sessions, or uploading history |
@@ -201,6 +201,33 @@ questions and interruption stop an audited push. LFS payloads are excluded from 
 full terminal previews can still show captured LFS text. Model findings are advisory. The reviewer
 does not edit content or publish it. `--audit --dry-run` runs review without publication and requires
 an existing registered destination and sessions. Audited push cannot run with `--json`.
+
+## Publish one saved conversation to another repository
+
+```bash
+agit push alice/payments@ratelimit --to team/research
+```
+
+`alice/payments@ratelimit` selects the actual saved source session. `team/research` is this
+publication's destination, on the same Hub. Use the recorded source identity, not a repository
+guessed from the current folder. This publishes saved history; settle any pending turns into
+the explicit source first when needed. The same branch name is published at the destination.
+
+For an ordinary checkout, this command keeps the source claim, checkout origin, folder binding
+and future default/automatic destination. You do not need `agit on --repo`, `save --repo`,
+`--rebind` or another import to choose this publication's destination. `import --independent`
+chooses session lineage and can move a native claim; it is not a one-time address change.
+There is no persistent per-session `-u` or `--set-upstream` setting. A Git remote named
+`upstream` records clone provenance, not that setting.
+
+The account must be allowed to write the destination; source ownership, parent permissions,
+privacy, immutable destination identity and audience checks still apply. Existing visibility
+is retained. `--private` only chooses visibility for a new repository; confirm an existing
+public destination with the user before supplying `--yes`.
+
+A device-local RC repository has a different rule: `--to` can establish its initial Hub
+destination, but a different destination is refused after confirmation. Changing the folder
+binding does not replace that confirmed destination.
 
 ## Automatic publication and local RC
 

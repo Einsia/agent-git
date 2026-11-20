@@ -20,9 +20,8 @@ for review or editing does not activate its session-management workflow.
 
 ## Save, upload and check a conversation (start here)
 
-For Claude Code and Codex conversations these commands cover what users ask for. Each one finds
-the conversation, its folder's destination and the account by itself, so do not build `import`,
-`commit` or `push` commands for these requests.
+For ordinary Claude Code and Codex uploads, `save` finds the conversation, its folder's
+destination and the account. A requested publication elsewhere uses an explicit saved source.
 
 | The user asks to… | Run |
 |---|---|
@@ -33,6 +32,13 @@ the conversation, its folder's destination and the account by itself, so do not 
 | stop that for this folder | `agit off --json` |
 | see what is saved here | `agit --json` |
 | share a read-only copy of this conversation | `agit share --yes` |
+| publish an already saved ordinary session to another repository once | `agit push SOURCE_OWNER/SOURCE_REPO@SESSION_BRANCH --to DEST_OWNER/DEST_REPO --private --yes` |
+
+For `push --to`, read `references/commands/push.md`: name the actual saved source and a destination
+on the same Hub. This keeps an ordinary checkout's folder binding and future upload destination;
+it is not persistent upstream. Device-local RC cannot replace a confirmed destination. Existing
+public destinations require explicit public consent even with `--private`. Do not rebind or
+reimport merely to choose this publication's destination.
 
 - `agit save` run inside a conversation saves that conversation and turns its folder on, so later
   turns upload after each turn without any command. Send the user `result.value.sessions[].link`.
@@ -59,7 +65,8 @@ the conversation, its folder's destination and the account by itself, so do not 
   `--repo OWNER/NAME --public`.
 - Create a session link, invite link or read-only copy only when the person asks for one; never
   create one on your own to finish a task.
-- In a folder that is on, never run `agit commit` or `agit push` for its conversations.
+- In a folder that is on, hooks handle normal settlement and publication. An explicitly requested
+  publication of a saved ordinary session to another repository uses the `push --to` path above.
 
 Everything else is in `references/commands/<command>.md`; the table at the end says which to read.
 To upload a running conversation, adopt it with `agit import` (`import.md`):

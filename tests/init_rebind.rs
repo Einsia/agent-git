@@ -53,6 +53,12 @@ fn init_refuses_before_creating_anything_when_the_directory_is_bound_elsewhere()
         "{stderr}"
     );
     assert!(
+        stderr.contains("SOURCE_OWNER/SOURCE_REPO@SESSION_BRANCH --to 'local/qa'")
+            && stderr.contains("same Hub")
+            && stderr.contains("device-local RC"),
+        "{stderr}"
+    );
+    assert!(
         !home.join("repos/local/qa").exists(),
         "a refused init leaves no repository behind"
     );

@@ -20,7 +20,8 @@ pub struct SaveArgs {
     /// Every session active today, in every folder.
     #[arg(long, conflicts_with = "session")]
     pub today: bool,
-    /// Save to this repository when the folder is not on yet.
+    /// Use this repository for the folder's future saving and uploads. To publish an already
+    /// saved ordinary session elsewhere once, use `agit push SOURCE@BRANCH --to OWNER/NAME`.
     #[arg(long, value_name = "OWNER/NAME", conflicts_with = "today")]
     pub repo: Option<String>,
     /// Allow the repository named with --repo to be public.

@@ -32,6 +32,17 @@ use crate::{ExitCode, ui};
 use anyhow::{Context, ensure};
 use clap::Args as ClapArgs;
 
+/// Folder routing and an ordinary saved session's publication destination are separate choices.
+pub(crate) fn one_time_destination_hint(destination: &str) -> String {
+    let destination = ui::quote_posix_argument(destination);
+    format!(
+        "to publish an already saved session from an ordinary checkout once on the same Hub, use \
+         `agit push SOURCE_OWNER/SOURCE_REPO@SESSION_BRANCH --to {destination}` with its actual \
+         saved source identity; this keeps the folder binding and future upload destination. \
+         A device-local RC repository cannot replace its confirmed destination this way"
+    )
+}
+
 #[derive(ClapArgs, Clone)]
 pub struct Args {
     /// Target: `owner/repo@branch` (or legacy bare repo / `-b branch`). Omittable when the context resolves.
@@ -42,9 +53,9 @@ pub struct Args {
     #[arg(value_name = "owner/repo@branch")]
     pub agent: Option<String>,
 
-    /// Publish to another repository the account can write to (`owner/repo`); the checkout keeps
-    /// its own repository as the default destination. For a device-local RC repository, select its
-    /// retained Hub publication target.
+    /// Publish to another writable repository on the same Hub for this invocation, keeping the
+    /// ordinary checkout's default and folder binding. For a device-local RC repository, select
+    /// its initial Hub destination; an already confirmed destination cannot be replaced.
     #[arg(long, value_name = "owner/repo")]
     pub to: Option<String>,
 

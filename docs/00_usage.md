@@ -528,6 +528,27 @@ agit push alice/payments@ratelimit --dry-run # inspect an already registered des
   newly introduced encrypted snapshots publish a sanitized projection and an authenticated original.
 - **There is no `--force`.** History only grows.
 
+**Publish one saved conversation to another repository**:
+
+```sh
+agit push alice/payments@ratelimit --to team/research
+```
+
+The positional target is the actual saved source session; `--to` chooses a writable destination
+on the same Hub for this invocation. It publishes already saved history under the same branch
+name. Settle any pending turns into the explicit source first when needed. For an ordinary
+checkout it preserves the source claim, checkout origin, folder binding and future default or
+automatic upload destination. All source, parent, privacy and destination permission checks
+still apply, and existing repository visibility is retained.
+
+`agit on --repo`, `agit save --repo` and project `--rebind` affect the folder's future saving and
+uploads. They are not needed for this one publication. `import --independent` chooses session
+lineage and can move a native claim; it is not a destination switch. There is no persistent
+per-session `-u` or `--set-upstream` option; a Git remote named `upstream` is clone provenance.
+
+A device-local RC repository can use `--to` to select its initial Hub destination, but cannot
+replace an already confirmed destination. A folder rebind does not replace that destination.
+
 **Pick up someone else's**:
 
 ```sh

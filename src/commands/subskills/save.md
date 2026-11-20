@@ -9,8 +9,17 @@ description: Upload now - this conversation, this folder's unsaved sessions, all
 
 Upload sessions now and get their links. It signs in, finds the conversation and its
 destination by itself, and turns the folder on, so later turns upload after each turn without
-any command. Use it for every "save / upload / back up this conversation" request from a Claude
-Code or Codex conversation; do not build `import`, `commit` or `push` commands for it.
+any command. Use it for ordinary "save / upload / back up this conversation" requests from a
+Claude Code or Codex conversation.
+
+`--repo` selects the folder's future saving and upload destination, including when the folder
+already has one. To publish an already saved ordinary session to another repository once, use
+`agit push SOURCE_OWNER/SOURCE_REPO@SESSION_BRANCH --to DEST_OWNER/DEST_REPO` instead. Name the
+actual saved source session; the destination must be writable on the same Hub. This publishes
+saved history without moving the source claim or changing the folder's future destination.
+See `push.md` for publication consent, privacy checks and the device-local RC restriction:
+`--to` cannot replace an RC repository's already confirmed destination. It is not a persistent
+per-session upstream setting, and `import --independent` is not a destination switch.
 
 - Inside an agent, with no argument: the conversation the command runs in.
 - In a terminal, with no argument: this folder's sessions the Hub does not have yet.
