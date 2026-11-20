@@ -4,6 +4,9 @@ use crate::protocol::{ErrorCode, RpcError};
 use std::sync::Arc;
 
 pub(crate) trait Authority: Send + Sync {
+    fn permits_turn_files(&self, _session: &str) -> bool {
+        false
+    }
     /// Hold the authority's read lease while invoking the nonblocking acceptance step.
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool;
 
@@ -49,6 +52,39 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
+    #[cfg(test)]
+    pub(crate) fn permits_turn_files(&self, session: &str) -> bool {
+        self.admit_turn_files(false, session, || ()).is_ok()
+    }
+
+    pub(crate) fn admit_turn_files(
+        &self,
+        owner: bool,
+        session: &str,
+        accept: impl FnOnce(),
+    ) -> Result<(), RpcError> {
+        let mut accept = Some(accept);
+        if self.admit(|| {
+            if (owner
+                || self
+                    .authority
+                    .as_ref()
+                    .is_some_and(|a| a.permits_turn_files(session)))
+                && let Some(accept) = accept.take()
+            {
+                accept();
+                return true;
+            }
+            false
+        }) {
+            Ok(())
+        } else {
+            Err(RpcError::new(
+                ErrorCode::Forbidden,
+                "turn attachments require device-owner authority for this session",
+            ))
+        }
+    }
     /// See [`Authority::folder_bind_owner`].
     pub fn folder_bind_owner(&self) -> Option<agit_peer::access::Principal> {
         let mut owner = None;

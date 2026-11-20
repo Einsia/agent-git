@@ -429,6 +429,7 @@ mod tests {
             cwd: project.clone(),
             resume_from: None,
             agit_session: None,
+            effort: None,
             model: None,
             dangerous: false,
             permission_mode: Some(PermissionMode::Default),

@@ -1559,6 +1559,7 @@ mod tests {
                             cwd,
                             resume_from: Some(session.clone()),
                             agit_session: None,
+                            effort: None,
                             model: None,
                             dangerous: false,
                             permission_mode: None,

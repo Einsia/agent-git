@@ -36,3 +36,8 @@ The Hub keeps an unresolved start until an exact executor result confirms the
 session. Recording that first confirmed Bypass result and its audit entry is one
 transaction; replaying the same result creates no second transition. The audit
 contains identifiers, mode, time and outcome, never prompts, titles or credentials.
+
+
+## Attachment scope
+
+Personal bot turns and supplemental inputs retain scoped input attachments. Result attachment export is not supported: the daemon does not prepare output directories, collect generated files, or advertise a result attachment capability. Session commands use their ordinary authorization requirements.

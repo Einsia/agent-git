@@ -86,6 +86,7 @@ mod session_rpc;
 mod sessions;
 mod source_sessions;
 mod source_watch;
+mod turn_attachments;
 mod watch_rpc;
 
 /// How many adoptable local sessions to list per project at most.
@@ -713,12 +714,14 @@ enum SessionRpcOperation {
     Turn {
         tx: mpsc::Sender<Command>,
         command: Command,
+        attachments: Option<Box<turn_attachments::TurnAttachments>>,
         reply: SessionReceipt<TurnStartOutcome>,
         guard_attempt: Option<crate::rc::harness::TurnGuardAttempt>,
     },
     Steer {
         tx: mpsc::Sender<Command>,
         command: Command,
+        attachments: Option<Box<turn_attachments::TurnAttachments>>,
         reply: SessionReceipt<crate::protocol::Delivery>,
     },
     SetPermissionMode {
@@ -1930,7 +1933,16 @@ async fn enqueue_within(
     within: std::time::Duration,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), RpcError> {
-    // Reserve first so cancellation retains ownership of `cmd`: dropping a
+    reserve_within(tx, within, stop).await?.send(cmd);
+    Ok(())
+}
+
+async fn reserve_within<'a>(
+    tx: &'a mpsc::Sender<Command>,
+    within: std::time::Duration,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<mpsc::Permit<'a, Command>, RpcError> {
+    // Reserve first so cancellation retains ownership of the command: dropping a
     // `send(cmd)` future can hide whether the message crossed into the queue.
     // With a permit the stop branch proves it did not, and SessionReceipt's
     // QUEUED -> ABANDONED transition prevents later execution.
@@ -1945,10 +1957,7 @@ async fn enqueue_within(
             RpcError::new(ErrorCode::SessionBusy, "this daemon is stopping")
                 .with_hint("nothing was queued, so the instruction did not run"),
         ),
-        Some(Ok(Ok(permit))) => {
-            permit.send(cmd);
-            Ok(())
-        }
+        Some(Ok(Ok(permit))) => Ok(permit),
         // The channel is closed: the session is gone.
         Some(Ok(Err(_))) => Err(RpcError::new(
             ErrorCode::SessionNotFound,

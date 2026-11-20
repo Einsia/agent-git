@@ -1,6 +1,25 @@
 use super::*;
 
 impl Daemon {
+    fn turn_files(
+        &self,
+        f: &Frame,
+        caller: &crate::protocol::CallerClaim,
+        session: &str,
+    ) -> Result<Option<Box<turn_attachments::TurnAttachments>>, RpcError> {
+        let files = f.params.as_ref().and_then(|p| p.get("input_attachments"));
+        let Some(files) = files else {
+            return Ok(None);
+        };
+        f.authority
+            .admit_turn_files(caller.is_owner(), session, || ())?;
+        Ok(Some(Box::new(turn_attachments::TurnAttachments {
+            files: files.clone(),
+            caller: caller.clone(),
+            authority: f.authority.clone(),
+            epoch: self.settlement.borrow().epoch,
+        })))
+    }
     fn acquire_session_rpc_lease(&mut self, f: &Frame) -> Result<SessionRpcLease, RpcError> {
         let caller = caller_scope(f)?;
         require_role(&caller, f.method())?;
@@ -272,6 +291,7 @@ impl Daemon {
                 let p: TurnStart = f.params_as()?;
                 // `Drive`: adding model input spends the session's capability.
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                let attachments = self.turn_files(f, &caller, &p.session_id)?;
                 // Arm before the command can enter the supervisor queue. From
                 // this point through native write, notification inference, and
                 // a late exact response, every crash restarts as Plan until
@@ -281,6 +301,7 @@ impl Daemon {
                 (
                     SessionRpcOperation::Turn {
                         tx: d.tx,
+                        attachments,
                         command: Command::Turn {
                             message: p.message,
                             attribution: MessageAttribution::from_caller(
@@ -300,6 +321,7 @@ impl Daemon {
             method::TURN_STEER => {
                 let p: TurnSteer = f.params_as()?;
                 let d = self.session_channel(&p.session_id, &caller, Need::Drive)?;
+                let attachments = self.turn_files(f, &caller, &p.session_id)?;
                 let (ticket, reply) = crate::rc::ticket::ticket_authorized(f.authority.clone());
                 let attribution = MessageAttribution::from_caller(&caller, p.by, p.client_msg_id);
                 let reply_ticket = ticket.with_control_ceiling(caller_is_owner);
@@ -320,6 +342,7 @@ impl Daemon {
                     SessionRpcOperation::Steer {
                         tx: d.tx,
                         command,
+                        attachments,
                         reply: SessionReceipt(reply),
                     },
                     false,
@@ -1319,6 +1342,7 @@ impl PreparedSessionRpc {
             SessionRpcOperation::Turn {
                 tx,
                 command,
+                attachments,
                 mut reply,
                 guard_attempt,
             } => {
@@ -1341,8 +1365,14 @@ impl PreparedSessionRpc {
                 turn("turn.start_received", serde_json::json!({}));
                 let client_msg_id = command.client_msg_id().map(str::to_owned);
                 let taken = reply.get_mut().taken();
-                if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
-                {
+                let queued = match attachments {
+                    Some(files) => files
+                        .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
+                        .await
+                        .map_err(instruction_not_sent),
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
+                };
+                if let Err(error) = queued {
                     turn(
                         "turn.start_resolved",
                         serde_json::json!({"outcome": "not_queued"}),
@@ -1532,12 +1562,19 @@ impl PreparedSessionRpc {
             SessionRpcOperation::Steer {
                 tx,
                 command,
+                attachments,
                 mut reply,
             } => {
                 let client_msg_id = command.client_msg_id().map(str::to_owned);
                 let taken = reply.get_mut().taken();
-                if let Err(error) = enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await
-                {
+                let queued = match attachments {
+                    Some(files) => files
+                        .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
+                        .await
+                        .map_err(instruction_not_sent),
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
+                };
+                if let Err(error) = queued {
                     return finish_prepared_session_rpc(
                         daemon,
                         session_id,

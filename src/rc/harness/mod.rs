@@ -282,6 +282,7 @@ pub struct LaunchSpec {
     /// "validate at landing" arrangement on this side can catch it. The test
     /// belongs where the value is born, see [`crate::rc::lineage`].
     pub agit_session: Option<crate::rc::lineage::AgitSession>,
+    pub effort: Option<String>,
     /// Model override, if the caller asked for one.
     pub model: Option<String>,
     /// The session was requested with permission checks disabled. Recorded so

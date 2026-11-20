@@ -413,6 +413,7 @@ fn a_dangerous_start_is_durable_before_the_harness_launches() {
                     cwd: home.path().to_path_buf(),
                     resume_from: None,
                     agit_session: None,
+                    effort: None,
                     model: None,
                     dangerous: true,
                     permission_mode: Some(crate::protocol::PermissionMode::Bypass),
@@ -506,6 +507,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     // A real harness transcript is loaded in...
                     resume_from: Some("native-1".into()),
                     agit_session: None,
+                    effort: None,
                     model: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
@@ -579,6 +581,7 @@ fn a_launch_that_resumes_a_transcript_it_never_cleared_is_refused() {
                     cwd: home.path().to_path_buf(),
                     resume_from: Some("native-1".into()),
                     agit_session: None,
+                    effort: None,
                     model: None,
                     dangerous: false,
                     permission_mode: Some(crate::protocol::PermissionMode::Default),
@@ -725,6 +728,7 @@ async fn start_session_replays_display_changes_but_requires_authority_for_a_save
         start_id.into(),
         roster::StartIntent {
             spec: roster::StartSpec {
+                effort: None,
                 model: None,
                 workspace_id: "ws-a".into(),
                 project_id: "project-a".into(),
@@ -750,6 +754,7 @@ async fn start_session_replays_display_changes_but_requires_authority_for_a_save
     let replayed = state
         .start_session(
             SessionStart {
+                effort: None,
                 model: None,
                 start_id: Some(start_id.into()),
                 workspace_id: "ws-a".into(),
@@ -850,6 +855,7 @@ fn a_prewrite_failure_before_launch_releases_the_start_reservation() {
                 let error = state
                     .start_session(
                         SessionStart {
+                            effort: None,
                             model: None,
                             start_id: Some(start_id.into()),
                             workspace_id: "ws-a".into(),
@@ -958,6 +964,7 @@ fn a_missing_harness_binary_releases_the_start_reservation_for_a_retry() {
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    effort: None,
                     model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
@@ -1082,6 +1089,7 @@ fn a_harness_binary_without_an_execute_bit_releases_the_start_reservation_for_a_
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    effort: None,
                     model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
@@ -1262,6 +1270,7 @@ fn a_launch_that_crossed_os_spawn_keeps_the_start_pending_for_inspection() {
                 set_connection_features(&state.settlement, 1, false, true);
 
                 let params = || SessionStart {
+                    effort: None,
                     model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),
@@ -2590,6 +2599,7 @@ async fn failed_launch_does_not_advance_the_materialized_generation_tombstone() 
         cwd: std::path::PathBuf::from("/"),
         resume_from: None,
         agit_session: None,
+        effort: None,
         model: None,
         dangerous: false,
         permission_mode: Some(crate::protocol::PermissionMode::Plan),
@@ -3444,6 +3454,7 @@ fn a_colleague_starts_in_the_default_and_resumes_in_the_owners_mode() {
                             .all(|mode| modes.contains(mode))
                     );
                     let start = |mode: Option<M>| SessionStart {
+                        effort: None,
                         model: None,
                         start_id: None,
                         origin: None,
@@ -3529,10 +3540,12 @@ fn a_resume_names_its_mode_as_a_switch_would() {
     const BYPASSED: &str = "bbbbbbbb-0000-4000-8000-000000000295";
     const GUARDED: &str = "cccccccc-0000-4000-8000-000000000295";
     let home = tempfile::tempdir().unwrap();
+    let agit_home = home.path().join("agit");
+    std::fs::create_dir(&agit_home).unwrap();
     // SAFETY: this test runs alone in its own process.
     unsafe {
         std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join("claude"));
-        std::env::set_var("AGIT_HOME", home.path().join("agit"));
+        std::env::set_var("AGIT_HOME", &agit_home);
     }
     let cwd = home.path().canonicalize().unwrap();
     // Transcripts that record the mode each ran in, so only what the resume names makes one
@@ -3676,6 +3689,7 @@ fn a_shared_project_starts_only_a_group_members_claude_code_session() {
                 state.mirror.bind("ws-a", "project-a", &cwd).unwrap();
                 let (frames, _frames_rx) = mpsc::channel(1);
                 let start = |runtime: &str, origin: Option<&str>| SessionStart {
+                    effort: None,
                     model: None,
                     start_id: None,
                     workspace_id: "ws-a".into(),
@@ -3823,6 +3837,7 @@ async fn a_start_key_retried_with_another_origin_conflicts() {
             start_id.into(),
             roster::StartIntent {
                 spec: roster::StartSpec {
+                    effort: None,
                     model: None,
                     workspace_id: "ws-a".into(),
                     project_id: "project-a".into(),
@@ -3855,6 +3870,7 @@ async fn a_start_key_retried_with_another_origin_conflicts() {
         for retried in [false, true] {
             let outcome = state.prepare_start_session(
                 SessionStart {
+                    effort: None,
                     model: None,
                     start_id: Some(start_id.into()),
                     workspace_id: "ws-a".into(),

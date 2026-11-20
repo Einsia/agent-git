@@ -866,6 +866,8 @@ mod tests {
     fn with_home<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
         let home = tempfile::tempdir().unwrap();
         crate::rc::with_agit_home(home.path(), || {
+            // The running daemon owns its namespace before the waiting-message store opens.
+            crate::rc::rc_dir().unwrap();
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

@@ -37,6 +37,13 @@ fn denied() -> RpcError {
 }
 
 impl Permit {
+    pub(super) fn is_controlled_turn_for(&self, id: &str) -> bool {
+        matches!(
+            self.method.as_str(),
+            "turn.start" | "turn.steer" | "session.command"
+        ) && self.ceiling == Access::Control
+            && matches!(&self.target, Target::Session(session) if session.id == id)
+    }
     pub fn authority_matches(
         &self,
         resources: &Resources,

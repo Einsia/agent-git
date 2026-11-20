@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         cwd: dir.clone(),
         resume_from: None,
         agit_session: None,
+        effort: None,
         model: std::env::var("AGIT_SMOKE_MODEL").ok(),
         dangerous: false,
         permission_mode,

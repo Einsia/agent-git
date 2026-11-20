@@ -1650,6 +1650,7 @@ mod tests {
                         cwd: project.clone(),
                         resume_from: Some("native".into()),
                         agit_session: None,
+                        effort: None,
                         model: None,
                         dangerous: false,
                         permission_mode: None,
