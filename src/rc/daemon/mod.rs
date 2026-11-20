@@ -681,27 +681,41 @@ struct PreparedSessionRpc {
 /// QUEUED -> ABANDONED CAS as an ordinary timeout. A command that was never
 /// accepted therefore cannot run later without a response. Already-taken
 /// commands remain taken.
-struct SessionReceipt<T>(crate::rc::ticket::Receipt<T>);
+struct SessionReceipt<T> {
+    receipt: crate::rc::ticket::Receipt<T>,
+    attachment: Option<crate::rc::input_attachments::Attempt>,
+}
 
 impl<T> SessionReceipt<T> {
+    fn new(receipt: crate::rc::ticket::Receipt<T>) -> Self {
+        Self {
+            receipt,
+            attachment: None,
+        }
+    }
+
     fn get_mut(&mut self) -> &mut crate::rc::ticket::Receipt<T> {
-        &mut self.0
+        &mut self.receipt
     }
 
     async fn wait_until_closed(
         &mut self,
     ) -> Result<crate::Result<T>, tokio::sync::oneshot::error::RecvError> {
-        self.0.wait_until_closed().await
+        self.receipt.wait_until_closed().await
     }
 
     fn abandon(&self) -> crate::rc::ticket::Abandon {
-        self.0.abandon()
+        self.receipt.abandon()
     }
 }
 
 impl<T> Drop for SessionReceipt<T> {
     fn drop(&mut self) {
-        let _ = self.0.abandon();
+        if self.receipt.abandon() == crate::rc::ticket::Abandon::NeverRan
+            && let Some(attachment) = self.attachment.take()
+        {
+            attachment.never_ran();
+        }
     }
 }
 

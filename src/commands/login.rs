@@ -328,24 +328,45 @@ struct Claim {
 fn save_obtained(hub: &str, signed_in: &mut SignedIn) -> crate::Result<Option<Withdrawal>> {
     let claim = signed_in.claim.take();
     let credential = &signed_in.credential;
-    // What was kept on this device under another account (records of delivered messages,
-    // Codex's copies of memory) leaves it when this one signs in in its place.
-    if crate::infra::credentials::load(hub)
+    let attachments = crate::infra::credentials::load(hub)
         .and_then(|previous| previous.account_id)
-        .is_some_and(|previous| credential.account_id.as_deref() != Some(previous.as_str()))
+        .filter(|previous| credential.account_id.as_deref() != Some(previous.as_str()))
+        .map(|previous| {
+            let snapshot = crate::rc::input_attachments::snapshot_account(hub, &previous);
+            (previous, snapshot)
+        });
+    let mut withdrawal = None;
+    let mut previous = None;
+    crate::telemetry::acquisition::save_login_with(hub, credential, || match &claim {
+        Some(claim) => {
+            (withdrawal, previous) = pending::commit_with_previous_account(
+                hub,
+                &claim.request,
+                claim.recorded,
+                credential,
+            )?;
+            Ok(withdrawal.is_none())
+        }
+        None => {
+            previous = crate::infra::credentials::save_with_previous_account(hub, credential)?;
+            Ok(true)
+        }
+    })?;
+    if withdrawal.is_none()
+        && let Some((account, snapshot)) = attachments
+        && previous.as_deref() == Some(account.as_str())
+    {
+        snapshot.finish();
+    }
+    if withdrawal.is_none()
+        && previous
+            .as_ref()
+            .is_some_and(|previous| credential.account_id.as_deref() != Some(previous.as_str()))
     {
         crate::rc::step_delivery::forget_all();
         crate::rc::waiting_messages::forget_all();
         crate::commands::memory::forget_codex_mirrors();
     }
-    let mut withdrawal = None;
-    crate::telemetry::acquisition::save_login_with(hub, credential, || match &claim {
-        Some(claim) => {
-            withdrawal = pending::commit(hub, &claim.request, claim.recorded, credential)?;
-            Ok(withdrawal.is_none())
-        }
-        None => crate::infra::credentials::save(hub, credential).map(|()| true),
-    })?;
     Ok(withdrawal)
 }
 

@@ -4,7 +4,35 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{io::Write, path::Path};
+use std::path::Path;
+
+mod custody;
+pub(super) use custody::{
+    Attempt, forget_unowned_waiting, migrate_legacy_waiting, protect_waiting, release_generation,
+    retain_generation, sweep, update_waiting,
+};
+pub(crate) use custody::{Owner, Reference, retire_device, snapshot_account};
+
+pub(super) struct Staged {
+    pub message: String,
+    pub attempt: Attempt,
+}
+
+#[derive(Debug)]
+pub(super) enum Unavailable {
+    Legacy,
+    Expired,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Legacy => "this input has unmanaged legacy attachments; send a new input",
+            Self::Expired => "this input's attachments have expired or retired; send a new input",
+        })
+    }
+}
+impl std::error::Error for Unavailable {}
 
 const MAX_BYTES: usize = 512 * 1024;
 
@@ -18,11 +46,13 @@ struct Input {
 
 pub(super) fn stage(
     root: &Path,
+    owner: Owner,
     session: &str,
     input: &str,
+    generation: u64,
     parts: &Value,
     text: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Staged> {
     let files: Vec<Input> = serde_json::from_value(parts.clone())?;
     ensure!(
         !files.is_empty() && files.len() <= 4,
@@ -31,8 +61,6 @@ pub(super) fn stage(
     let input = uuid::Uuid::parse_str(input)
         .context("attachments require an input id")?
         .to_string();
-    let directory = root.join(hex::encode(Sha256::digest(session.as_bytes())));
-    crate::infra::config::create_state_dir(&directory)?;
     let mut total = 0;
     let mut prepared = Vec::new();
     for file in files {
@@ -62,81 +90,76 @@ pub(super) fn stage(
         let filename = format!("{}-{digest}.{extension}", prepared.len());
         prepared.push((file.name, filename, bytes));
     }
-    let target = directory.join(input);
+    let (attempt, target) = custody::publish(root, owner, session, &input, generation, &prepared)?;
     let mut references = Vec::new();
-    let temporary = tempfile::Builder::new()
-        .prefix(".incoming-")
-        .tempdir_in(&directory)?;
-    for (name, filename, bytes) in &prepared {
-        let mut output = crate::infra::config::state_file_options()
-            .create_new(true)
-            .write(true)
-            .open(temporary.path().join(filename))?;
-        output.write_all(bytes)?;
-        output.sync_all()?;
+    for (name, filename, _) in &prepared {
         references.push(serde_json::json!({"name":name,"path":target.join(filename)}));
     }
-    // Publish the entire set together. A retry may reuse it only if every object still matches.
-    if let Err(error) = std::fs::rename(temporary.path(), &target) {
-        ensure!(
-            std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()),
-            "could not publish input attachments: {error}"
-        );
-        ensure!(
-            std::fs::read_dir(&target)?.count() == prepared.len(),
-            "input id already has different attachments"
-        );
-        for (_, filename, bytes) in &prepared {
-            let path = target.join(filename);
-            let metadata = std::fs::symlink_metadata(&path).context("attachment set changed")?;
-            ensure!(
-                metadata.is_file()
-                    && metadata.len() == bytes.len() as u64
-                    && std::fs::read(path)? == *bytes,
-                "attachment content changed"
-            );
-        }
-    }
-    Ok(format!(
+    let message = format!(
         "{text}\n\nAttached files on this device:\n{}",
         serde_json::to_string(&references)?
-    ))
+    );
+    Ok(Staged { message, attempt })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(bytes: &[u8]) -> Value {
+        serde_json::json!({"name":"../../report.txt", "data":STANDARD.encode(bytes),
+            "sha256":hex::encode(Sha256::digest(bytes))})
+    }
+
+    fn path(staged: &Staged) -> std::path::PathBuf {
+        let refs: Value = serde_json::from_str(staged.message.lines().last().unwrap()).unwrap();
+        refs[0]["path"].as_str().unwrap().into()
+    }
+
     #[test]
     fn invalid_second_file_leaves_no_partial_set_and_sessions_are_isolated() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let id = uuid::Uuid::new_v4().to_string();
-        let file = |value: &[u8]| {
-            serde_json::json!({
-                "name": "report.txt", "data": STANDARD.encode(value), "sha256":hex::encode(Sha256::digest(value))
-            })
-        };
         let mut invalid = file(b"second");
         invalid["sha256"] = serde_json::json!("invalid");
-        let broken = serde_json::json!([file(b"first"), invalid]);
-        assert!(stage(root.path(), "alice", &id, &broken, "read").is_err());
-        let session_dir = root.path().join(hex::encode(Sha256::digest(b"alice")));
-        assert!(!session_dir.join(&id).exists());
-        let path_for = |session: &str, value: &[u8]| -> anyhow::Result<std::path::PathBuf> {
-            let message = stage(
+        assert!(
+            stage(
                 root.path(),
-                session,
+                Owner::Local,
+                "alice",
                 &id,
-                &serde_json::json!([file(value)]),
-                "read",
-            )?;
-            let refs: Value = serde_json::from_str(message.lines().last().unwrap())?;
-            Ok(refs[0]["path"].as_str().unwrap().into())
-        };
-        let alice = path_for("alice", b"first")?;
-        let bob = path_for("bob", b"other")?;
-        assert_ne!(alice.parent(), bob.parent());
-        assert_eq!(std::fs::read(alice)?, b"first");
-        assert_eq!(std::fs::read(bob)?, b"other");
+                1,
+                &serde_json::json!([file(b"first"), invalid]),
+                "read"
+            )
+            .is_err()
+        );
+        assert!(!root.path().join("owned-v1").exists());
+        let alice = stage(
+            root.path(),
+            Owner::Local,
+            "alice",
+            &id,
+            1,
+            &serde_json::json!([file(b"first")]),
+            "read",
+        )?;
+        let bob = stage(
+            root.path(),
+            Owner::Local,
+            "bob",
+            &id,
+            1,
+            &serde_json::json!([file(b"other")]),
+            "read",
+        )?;
+        assert_ne!(path(&alice).parent(), path(&bob).parent());
+        assert_eq!(std::fs::read(path(&alice))?, b"first");
+        assert_eq!(std::fs::read(path(&bob))?, b"other");
+        let refused = path(&alice);
+        drop(alice);
+        assert!(!refused.exists(), "an unqueued set has no consumer");
+        assert!(path(&bob).is_file());
         Ok(())
     }
 
@@ -144,18 +167,55 @@ mod tests {
     fn retries_reuse_verified_files_and_display_names_cannot_choose_paths() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let id = uuid::Uuid::new_v4().to_string();
-        let data = |bytes: &[u8]| serde_json::json!([{"name":"../../other.txt","data":STANDARD.encode(bytes),"sha256":hex::encode(Sha256::digest(bytes))}]);
-        let first = stage(root.path(), "session", &id, &data(b"abc"), "read")?;
-        assert_eq!(
-            stage(root.path(), "session", &id, &data(b"abc"), "read")?,
-            first
+        let data = serde_json::json!([file(b"abc")]);
+        let mut first = stage(root.path(), Owner::Local, "session", &id, 1, &data, "read")?;
+        first.attempt.prepare_delivery()?;
+        first.attempt.queued();
+        let retry = stage(root.path(), Owner::Local, "session", &id, 1, &data, "read")?;
+        assert_eq!(first.message, retry.message);
+        drop(retry);
+        assert!(
+            stage(
+                root.path(),
+                Owner::Local,
+                "session",
+                &id,
+                1,
+                &serde_json::json!([file(b"different")]),
+                "read"
+            )
+            .is_err()
         );
-        assert!(stage(root.path(), "session", &id, &data(b"different"), "read").is_err());
-        assert!(stage(root.path(), "session", "../escape", &data(b"abc"), "read").is_err());
-        let refs: Value = serde_json::from_str(first.lines().last().unwrap())?;
-        let path = Path::new(refs[0]["path"].as_str().unwrap());
-        assert!(path.starts_with(root.path()));
-        assert_eq!(std::fs::read(path)?, b"abc");
+        assert!(
+            stage(
+                root.path(),
+                Owner::Local,
+                "session",
+                "../escape",
+                1,
+                &data,
+                "read"
+            )
+            .is_err()
+        );
+        let payload = path(&first);
+        assert!(payload.starts_with(root.path()));
+        assert_eq!(std::fs::read(&payload)?, b"abc");
+        release_generation(root.path(), "session", 1, 1)?;
+        assert!(
+            payload.is_file(),
+            "a delivered set keeps its retry interval"
+        );
+        assert!(
+            stage(root.path(), Owner::Local, "session", &id, 1, &data, "read").is_err(),
+            "an elapsed inactive deadline refuses reuse before maintenance runs"
+        );
+        sweep(root.path(), 1 + crate::rc::waiting_messages::MAX_AGE_MS)?;
+        assert!(!payload.exists());
+        assert!(
+            stage(root.path(), Owner::Local, "session", &id, 1, &data, "read").is_err(),
+            "retrying an expired input must not recreate its historical path"
+        );
         Ok(())
     }
 }

@@ -44,6 +44,7 @@ const ABANDONED: u8 = 2;
 /// The executor's half of the receipt; it travels into the queue with the `Command`.
 pub struct Ticket<T> {
     authority: super::authority::Guard,
+    attachments: Vec<super::input_attachments::Reference>,
     owner_control: bool,
     state: Arc<AtomicU8>,
     taken: Arc<Notify>,
@@ -101,6 +102,7 @@ pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticke
     (
         Ticket {
             authority,
+            attachments: Vec::new(),
             owner_control: true,
             state: state.clone(),
             taken: taken.clone(),
@@ -115,6 +117,21 @@ pub(crate) fn ticket_authorized<T>(authority: super::authority::Guard) -> (Ticke
 }
 
 impl<T> Ticket<T> {
+    pub(crate) fn with_attachments(
+        mut self,
+        references: Vec<super::input_attachments::Reference>,
+    ) -> Self {
+        self.attachments = references;
+        self
+    }
+
+    pub(crate) fn attachments(&self) -> &[super::input_attachments::Reference] {
+        &self.attachments
+    }
+
+    pub(crate) fn set_attachments(&mut self, references: Vec<super::input_attachments::Reference>) {
+        self.attachments = references;
+    }
     pub(crate) fn with_control_ceiling(mut self, owner: bool) -> Self {
         self.owner_control = owner;
         self

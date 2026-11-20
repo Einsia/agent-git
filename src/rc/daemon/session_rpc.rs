@@ -228,7 +228,7 @@ impl Daemon {
                             },
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },
-                        reply: SessionReceipt(receipt),
+                        reply: SessionReceipt::new(receipt),
                     },
                     false,
                 )
@@ -260,7 +260,7 @@ impl Daemon {
                             arguments,
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                     },
                     false,
                 )
@@ -282,7 +282,7 @@ impl Daemon {
                             model,
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                     },
                     false,
                 )
@@ -312,7 +312,7 @@ impl Daemon {
                             guard_attempt: guard_attempt.clone(),
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                         guard_attempt: guard_attempt.clone(),
                     },
                     guard_attempt.is_some(),
@@ -343,7 +343,7 @@ impl Daemon {
                         tx: d.tx,
                         command,
                         attachments,
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                     },
                     false,
                 )
@@ -415,7 +415,7 @@ impl Daemon {
                                 armed,
                                 reply: ticket.with_control_ceiling(caller_is_owner),
                             },
-                            reply: SessionReceipt(reply),
+                            reply: SessionReceipt::new(reply),
                             mode: p.mode,
                             armed,
                             recovery_token,
@@ -437,7 +437,7 @@ impl Daemon {
                             expected_turn_id: p.expected_turn_id,
                             reply: ticket,
                         },
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                     },
                     false,
                 )
@@ -521,7 +521,7 @@ impl Daemon {
                             danger,
                             reply: ticket.with_control_ceiling(caller_is_owner),
                         },
-                        reply: SessionReceipt(reply),
+                        reply: SessionReceipt::new(reply),
                         approval_id,
                         danger,
                         session_mode: suggested_mode,
@@ -1370,7 +1370,9 @@ impl PreparedSessionRpc {
                         .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
                         .await
                         .map_err(instruction_not_sent),
-                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop)
+                        .await
+                        .map(|()| None),
                 };
                 if let Err(error) = queued {
                     turn(
@@ -1393,6 +1395,7 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
+                reply.attachment = queued.ok().flatten();
                 match acknowledging_take(
                     reply_within_state(reply.get_mut(), stop),
                     taken,
@@ -1572,7 +1575,9 @@ impl PreparedSessionRpc {
                         .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
                         .await
                         .map_err(instruction_not_sent),
-                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop)
+                        .await
+                        .map(|()| None),
                 };
                 if let Err(error) = queued {
                     return finish_prepared_session_rpc(
@@ -1585,6 +1590,7 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
+                reply.attachment = queued.ok().flatten();
                 match acknowledging_take(
                     reply_within_state(reply.get_mut(), stop),
                     taken,

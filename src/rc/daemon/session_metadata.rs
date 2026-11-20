@@ -43,7 +43,7 @@ impl Daemon {
             generation: live.generation,
             tx: driving.tx,
             command,
-            reply: SessionReceipt(receipt),
+            reply: SessionReceipt::new(receipt),
         })
     }
 }

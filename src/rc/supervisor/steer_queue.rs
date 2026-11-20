@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 /// request that brought them.
 pub(super) struct QueuedTurn {
     message: String,
+    attachments: Vec<crate::rc::input_attachments::Reference>,
     attribution: MessageAttribution,
     authority: crate::rc::authority::Guard,
     owner: bool,
@@ -41,6 +42,7 @@ impl QueuedTurn {
     fn stored(&self) -> waiting_messages::Stored {
         waiting_messages::Stored {
             message: self.message.clone(),
+            attachments: self.attachments.clone(),
             client_msg_id: self.attribution.client_msg_id.clone(),
             sender: self.attribution.sender.clone(),
             by: self.attribution.by.clone(),
@@ -174,6 +176,7 @@ impl Session {
     pub(super) async fn steer_at_step(&mut self, message: String, pending: PendingSteerCommand) {
         let queued = QueuedTurn {
             message,
+            attachments: pending.reply.attachments().to_vec(),
             attribution: pending.attribution.clone(),
             authority: pending.reply.authority(),
             owner: pending.reply.owner_control(),
@@ -277,6 +280,7 @@ impl Session {
         }
         let queued = QueuedTurn {
             message,
+            attachments: Vec::new(),
             attribution,
             authority,
             owner,
@@ -521,6 +525,7 @@ impl Session {
                 owner,
             },
             message: restored.stored.message,
+            attachments: restored.stored.attachments,
             authority: authority.clone(),
             owner,
             arrived: tokio::time::Instant::now(),
@@ -556,6 +561,7 @@ impl Session {
                     .clone()
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 self.steer_queue.waiting.push_back(QueuedTurn {
+                    attachments: reply.attachments().to_vec(),
                     message,
                     attribution,
                     authority,
@@ -600,6 +606,7 @@ impl Session {
         self.alert_registered(shown.registered_ids, "turn_steer")
             .await;
         self.steer_queue.waiting.push_front(QueuedTurn {
+            attachments: reply.attachments().to_vec(),
             message,
             attribution: attribution.clone(),
             authority: reply.authority(),
@@ -654,11 +661,35 @@ impl Session {
                 return None;
             }
             let queued = self.steer_queue.waiting.pop_front()?;
-            self.persist_waiting();
             if let Some(reason) = self.refused_at_delivery(&queued) {
+                self.persist_waiting();
                 self.report_steer_dropped(&queued.attribution, reason).await;
                 continue;
             }
+            if !queued.attachments.is_empty() {
+                let protected = (|| -> anyhow::Result<()> {
+                    let owner = queued
+                        .authority
+                        .turn_files_owner(queued.owner, &self.info.session_id)
+                        .map_err(|_| anyhow::anyhow!("attachment authority is unavailable"))?;
+                    crate::rc::input_attachments::protect_waiting(
+                        &crate::rc::rc_dir()?.join("task-attachments"),
+                        &owner,
+                        &self.info.session_id,
+                        self.generation,
+                        &self.driver.runtime_thread_id().ok_or_else(|| {
+                            anyhow::anyhow!("conversation identity is unavailable")
+                        })?,
+                        &queued.attachments,
+                    )
+                })();
+                if protected.is_err() {
+                    self.steer_queue.waiting.push_front(queued);
+                    tracing_note("attachment recovery is incomplete; the waiting message was kept");
+                    return None;
+                }
+            }
+            self.persist_waiting();
             let (ticket, mut receipt) = crate::rc::ticket::ticket_authorized(queued.authority);
             let attribution = queued.attribution.clone();
             let outcomes = self.steer_queue.outcomes.0.clone();
@@ -670,7 +701,9 @@ impl Session {
                 message: queued.message,
                 attribution: queued.attribution,
                 guard_attempt: None,
-                reply: ticket.with_control_ceiling(queued.owner),
+                reply: ticket
+                    .with_control_ceiling(queued.owner)
+                    .with_attachments(queued.attachments),
             });
         }
     }
@@ -756,6 +789,7 @@ mod tests {
     fn queued(message: &str, owner: bool, authority: crate::rc::authority::Guard) -> QueuedTurn {
         QueuedTurn {
             message: message.into(),
+            attachments: Vec::new(),
             attribution: MessageAttribution {
                 client_msg_id: Some(message.into()),
                 ..Default::default()
@@ -1042,8 +1076,23 @@ mod tests {
             );
             before.driver.shutdown().await.unwrap();
 
+            let waiting_path = crate::rc::rc_dir()
+                .unwrap()
+                .join("waiting-messages")
+                .join(format!("{conversation}.json"));
+            let mut legacy: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&waiting_path).unwrap()).unwrap();
+            legacy["version"] = serde_json::json!(1);
+            std::fs::write(&waiting_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
             let (mut after, mut out) = idle_session();
             after.restore_waiting().await;
+            let migrated: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&waiting_path).unwrap()).unwrap();
+            assert_eq!(
+                migrated["version"], 2,
+                "legacy queues migrate durably before their messages can run"
+            );
+            assert_eq!(migrated["waiting"], legacy["waiting"]);
             assert!(
                 after.next_queued_turn().await.is_none(),
                 "nothing goes by itself"
@@ -1084,6 +1133,17 @@ mod tests {
             assert!(after.release_restored(steer(Some(MEMBER))).await.is_some());
             assert_eq!(turn_message(after.next_queued_turn().await), "member-1");
             assert!(waiting_on_device(&conversation).is_empty());
+            assert!(
+                !waiting_path.exists(),
+                "delivering the migrated queue durably drains it"
+            );
+            let (mut again, _) = idle_session();
+            again.restore_waiting().await;
+            assert!(
+                again.steer_queue.restored.is_empty(),
+                "the next restart cannot replay the legacy queue"
+            );
+            again.driver.shutdown().await.unwrap();
             assert!(dropped(&mut out).is_empty());
             after.driver.shutdown().await.unwrap();
         });

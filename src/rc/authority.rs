@@ -7,6 +7,9 @@ pub(crate) trait Authority: Send + Sync {
     fn permits_turn_files(&self, _session: &str) -> bool {
         false
     }
+    fn turn_files_owner(&self) -> Option<super::input_attachments::Owner> {
+        None
+    }
     /// Hold the authority's read lease while invoking the nonblocking acceptance step.
     fn admit(&self, accept: &mut dyn FnMut() -> bool) -> bool;
 
@@ -52,6 +55,23 @@ impl std::fmt::Debug for Guard {
 }
 
 impl Guard {
+    pub(crate) fn turn_files_owner(
+        &self,
+        owner: bool,
+        session: &str,
+    ) -> Result<super::input_attachments::Owner, RpcError> {
+        let mut identity = None;
+        self.admit_turn_files(owner, session, || {
+            identity = match &self.authority {
+                Some(authority) => authority.turn_files_owner(),
+                None if owner => Some(super::input_attachments::Owner::Local),
+                None => None,
+            };
+        })?;
+        identity.ok_or_else(|| {
+            RpcError::new(ErrorCode::Forbidden, "attachment ownership is unavailable")
+        })
+    }
     #[cfg(test)]
     pub(crate) fn permits_turn_files(&self, session: &str) -> bool {
         self.admit_turn_files(false, session, || ()).is_ok()

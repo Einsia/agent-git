@@ -130,7 +130,32 @@ fn sign_out_here() -> crate::Result<(ExitCode, Vec<HubOutcome>)> {
 /// `agit logout --local-only`: delete the current Hub's credentials without asking it anything.
 fn delete_here() -> crate::Result<(ExitCode, Vec<HubOutcome>)> {
     let hub = config::hub_url();
+    let attachments = credentials::bound_records(&hub)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|credential| {
+            credential
+                .account_id
+                .clone()
+                .map(|account| (credential, account))
+        })
+        .map(|(credential, account)| {
+            (
+                credential,
+                crate::rc::input_attachments::snapshot_account(&hub, &account),
+            )
+        })
+        .collect::<Vec<_>>();
     let removed = credentials::remove(&hub)?;
+    for (credential, attachment) in attachments {
+        if removed
+            .bound
+            .iter()
+            .any(|removed| same_attachment_owner_session(removed, &credential))
+        {
+            attachment.finish();
+        }
+    }
     if removed.records == 0 {
         not_signed_in(&hub);
         return Ok((ExitCode::Ok, vec![]));
@@ -245,7 +270,29 @@ fn combined(failure: Option<ExitCode>, other: Option<ExitCode>) -> Option<ExitCo
 /// `agit logout --all --local-only`: delete every credential record without asking any Hub.
 fn delete_everywhere() -> crate::Result<(ExitCode, Vec<HubOutcome>)> {
     let forgot = credentials::forget_pending()?;
+    let attachments = credentials::all_checked()?
+        .into_iter()
+        .filter_map(|(_, credential)| credential)
+        .filter_map(|credential| {
+            Some((credential.clone(), credential.hub?, credential.account_id?))
+        })
+        .map(|(credential, hub, account)| {
+            (
+                credential,
+                crate::rc::input_attachments::snapshot_account(&hub, &account),
+            )
+        })
+        .collect::<Vec<_>>();
     let removed = credentials::remove_all()?;
+    for (credential, attachment) in attachments {
+        if removed
+            .bound
+            .iter()
+            .any(|removed| same_attachment_owner_session(removed, &credential))
+        {
+            attachment.finish();
+        }
+    }
     if removed.records == 0 {
         if forgot {
             ui::info("forgot the sign-in requests waiting for approval.");
@@ -318,6 +365,19 @@ fn sign_out_found(hub: &str, found: crate::Result<Vec<HubCredential>>) -> Option
     };
     // The pairs this sign-out found, and those its renewals got in their place: a renewed pair
     // holds the same session, so it is no more settled than the one it replaced.
+    let mut attachments = found
+        .iter()
+        .filter_map(|credential| {
+            Some((
+                credential.account_id.clone()?,
+                crate::rc::input_attachments::snapshot_account(
+                    hub,
+                    credential.account_id.as_deref()?,
+                ),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let mut removed_accounts = HashSet::new();
     let mut ours = found.clone();
     let mut revocation = Revocation::NotAttempted;
     let mut failure = None;
@@ -371,10 +431,18 @@ fn sign_out_found(hub: &str, found: crate::Result<Vec<HubCredential>>) -> Option
         }
         // The found pair goes with its session: a renewal that got the settled pair spent it.
         for pair in [cred, &session] {
-            if let Err(e) = credentials::remove_session(hub, pair) {
-                ui::warning(&format!("{label}: couldn’t delete the credentials: {e:#}"));
-                failure = Some(super::terminal_error_code(&e, ExitCode::Failure));
-                break 'found;
+            match credentials::remove_session(hub, pair) {
+                Ok(count) if count > 0 => {
+                    if let Some(account) = &pair.account_id {
+                        removed_accounts.insert(account.clone());
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    ui::warning(&format!("{label}: couldn’t delete the credentials: {e:#}"));
+                    failure = Some(super::terminal_error_code(&e, ExitCode::Failure));
+                    break 'found;
+                }
             }
         }
     }
@@ -405,6 +473,13 @@ fn sign_out_found(hub: &str, found: crate::Result<Vec<HubCredential>>) -> Option
         ));
         failure = Some(ExitCode::Precondition);
     }
+    if credentials_removed && failure.is_none() {
+        for (account, attachment) in attachments.drain(..) {
+            if removed_accounts.contains(&account) {
+                attachment.finish();
+            }
+        }
+    }
     Some(HubSignOut {
         outcome: HubOutcome {
             hub: Some(label),
@@ -414,6 +489,26 @@ fn sign_out_found(hub: &str, found: crate::Result<Vec<HubCredential>>) -> Option
         failure,
         signed_in_meanwhile,
     })
+}
+
+/// Token equality alone cannot identify the account whose attachment snapshot may retire.
+fn same_attachment_owner_session(left: &HubCredential, right: &HubCredential) -> bool {
+    left.account_id
+        .as_ref()
+        .is_some_and(|account| !account.is_empty())
+        && left.account_id == right.account_id
+        && left
+            .hub
+            .as_deref()
+            .and_then(|hub| HubAuthority::parse(hub).ok())
+            .zip(
+                right
+                    .hub
+                    .as_deref()
+                    .and_then(|hub| HubAuthority::parse(hub).ok()),
+            )
+            .is_some_and(|(left, right)| left == right)
+        && credentials::same_session(left, right)
 }
 
 /// Whether `cred` holds one of `sessions`.
@@ -779,6 +874,41 @@ mod tests {
     /// are kept: the sign-out fails with that local failure instead of saying they are or aren't.
     #[test]
     fn a_credential_goes_only_once_the_hub_settles_its_session() {
+        let original = credential("https://synthetic.invalid");
+        let canonical = HubCredential {
+            hub: Some("https://SYNTHETIC.invalid/".into()),
+            ..original.clone()
+        };
+        assert!(same_attachment_owner_session(&original, &canonical));
+        let empty = HubCredential {
+            account_id: Some(String::new()),
+            ..original.clone()
+        };
+        assert!(!same_attachment_owner_session(&empty, &empty));
+        for unrelated in [
+            HubCredential {
+                account_id: Some("another-owner".into()),
+                ..original.clone()
+            },
+            HubCredential {
+                hub: Some("https://another.invalid".into()),
+                ..original.clone()
+            },
+            HubCredential {
+                hub: Some("https://synthetic.invalid:443".into()),
+                ..original.clone()
+            },
+            HubCredential {
+                account_id: None,
+                ..original.clone()
+            },
+        ] {
+            assert!(credentials::same_session(&original, &unrelated));
+            assert!(
+                !same_attachment_owner_session(&original, &unrelated),
+                "a matching pair cannot retire another Hub or account's snapshot"
+            );
+        }
         const REFUSED: &str =
             r#"{"error":"sign in again","kind":"unauthorized","fix":[{"kind":"authenticate"}]}"#;
         const GATEWAY: &str = r#"{"error":"synthetic gateway refusal"}"#;

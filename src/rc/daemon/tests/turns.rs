@@ -12,6 +12,9 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
         fn permits_turn_files(&self, session: &str) -> bool {
             session == "session-a"
         }
+        fn turn_files_owner(&self) -> Option<crate::rc::input_attachments::Owner> {
+            Some(crate::rc::input_attachments::Owner::Local)
+        }
     }
     if crate::rc::in_isolated_test(
         "rc::daemon::tests::turns::an_operator_can_deliver_files_only_to_the_admitted_session",
@@ -59,37 +62,38 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
             "preparing a turn under the daemon lock must not stage files"
         );
         drop(state);
-        let (executed, ()) = tokio::join!(prepared.execute(daemon.clone(), &mut stop), async {
-            let Some(Command::Turn { message, reply, .. }) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
-                    .await
-                    .expect("attachment delivery timed out")
-            else {
-                panic!("expected an attachment turn")
-            };
-            assert!(message.contains("notes.txt"));
-            assert!(reply.accept());
-            reply.finish(Ok(TurnStartOutcome::Accepted {
-                turn_id: "turn-a".into(),
-                still_running: false,
-                consumed_mode: None,
-                confirmation: TurnStartConfirmation::Exact,
-            }));
-        });
+        let (executed, first_file) =
+            tokio::join!(prepared.execute(daemon.clone(), &mut stop), async {
+                let Some(Command::Turn { message, reply, .. }) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                        .await
+                        .expect("attachment delivery timed out")
+                else {
+                    panic!("expected an attachment turn")
+                };
+                assert!(message.contains("notes.txt"));
+                let references: serde_json::Value =
+                    serde_json::from_str(message.lines().last().unwrap()).unwrap();
+                let file = std::path::PathBuf::from(references[0]["path"].as_str().unwrap());
+                assert_eq!(reply.attachments().len(), 1);
+                assert!(reply.accept());
+                reply.finish(Ok(TurnStartOutcome::Accepted {
+                    turn_id: "turn-a".into(),
+                    still_running: false,
+                    consumed_mode: None,
+                    confirmation: TurnStartConfirmation::Exact,
+                }));
+                file
+            });
         executed.response.unwrap();
-        let session = std::fs::read_dir(root)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let file = std::fs::read_dir(session.join(input))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert_eq!(std::fs::read(file).unwrap(), b"OK");
+        assert_eq!(std::fs::read(&first_file).unwrap(), b"OK");
+        let sets = || {
+            std::fs::read_dir(root.join("owned-v1"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>()
+        };
 
         let mut steer = frame.clone();
         steer.method = Some(method::TURN_STEER.into());
@@ -115,9 +119,8 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
         let mut state = daemon.lock().await;
         let revoked = state.prepare_session_rpc(&frame).unwrap();
         let (result, ()) = tokio::join!(revoked.execute(daemon.clone(), &mut stop), async {
-            let published = session.join(next_input);
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !published.is_dir() {
+                while sets().len() != 3 {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             })
@@ -129,6 +132,11 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
         let error = result.response.unwrap_err();
         assert_eq!(error.code, ErrorCode::Forbidden as i32);
         assert_eq!(error.data.unwrap()["outcome"], "not_sent");
+        assert_eq!(sets().len(), 2, "revocation reclaims only its unqueued set");
+        assert!(
+            first_file.is_file(),
+            "accepted attachment bytes remain available"
+        );
         authorized.store(true, Ordering::Release);
 
         let stale = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
@@ -139,13 +147,56 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
             .get_mut("session-a")
             .unwrap()
             .generation += 1;
-        let error = stale.execute(daemon, &mut stop).await.response.unwrap_err();
+        let error = stale
+            .execute(daemon.clone(), &mut stop)
+            .await
+            .response
+            .unwrap_err();
+        assert_eq!(
+            sets().len(),
+            2,
+            "a replaced generation cannot leave an unqueued set"
+        );
         assert_eq!(error.code, ErrorCode::SessionNotFound as i32);
         assert_eq!(error.data.unwrap()["outcome"], "not_sent");
         assert!(
             rx.try_recv().is_err(),
             "neither rejected turn may reach the supervisor"
         );
+        for taken in [false, true] {
+            frame.params.as_mut().unwrap()["client_msg_id"] =
+                serde_json::json!(uuid::Uuid::new_v4().to_string());
+            let prepared = daemon.lock().await.prepare_session_rpc(&frame).unwrap();
+            let worker_daemon = daemon.clone();
+            let mut worker_stop = stop.clone();
+            let worker =
+                tokio::spawn(
+                    async move { prepared.execute(worker_daemon, &mut worker_stop).await },
+                );
+            let Some(Command::Turn { message, reply, .. }) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected queued attachment input");
+            };
+            let references: serde_json::Value =
+                serde_json::from_str(message.lines().last().unwrap()).unwrap();
+            let payload = std::path::PathBuf::from(references[0]["path"].as_str().unwrap());
+            if taken {
+                assert!(reply.accept());
+            }
+            worker.abort();
+            assert!(worker.await.is_err_and(|error| error.is_cancelled()));
+            if !taken {
+                assert!(!reply.accept(), "cancelled queued input cannot run later");
+            }
+            assert_eq!(
+                payload.exists(),
+                taken,
+                "cancellation reclaims NeverRan custody and preserves AlreadyTaken custody"
+            );
+        }
     });
 }
 

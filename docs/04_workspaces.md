@@ -227,3 +227,21 @@ current one.
 | the page says the machine is offline, but local RPC is ready | Cloud registration or presence has not completed | check the selected Hub, peer registration, and timestamped Cloud logs |
 | taking over a session is refused with still open in a terminal | that session is open right now, and taking it over destroys both histories | quit in that terminal, then take over |
 | binding a folder is refused | the path does not exist, or it is a system root | use a real project directory |
+
+### Input attachment lifetime
+
+Files sent with a remote-control message stay on the device while an admitted consumer or
+recoverable waiting message may use them. A definitely unqueued input is removed immediately.
+After the last protected reference is proven released, a delivered set remains reusable for one
+day. That deadline is fixed: retrying or restarting does not extend it. An active consumer can
+outlive the deadline; its proven release then permits removal. Expired input IDs are refused
+rather than silently recreating historical file paths.
+
+Changing account or enrollment retires only identified sets belonging to the successful old
+transition. Unknown delivery, failed process cleanup, shared-runtime disconnection and unreadable
+custody or waiting records retain their files with an incomplete-cleanup diagnostic. A stored
+waiting reference does not authorize delivery after a restart.
+
+This applies to newly managed sets. Historical attachment directories without custody records
+are neither adopted nor deleted. Retrying such an input asks for a new input ID; existing raw
+files can remain. Attachment paths in old messages are not a promise of permanent availability.

@@ -368,8 +368,19 @@ pub fn commit(
     recorded: bool,
     credential: &HubCredential,
 ) -> Result<Option<Withdrawal>> {
+    commit_with_previous_account(hub, request, recorded, credential)
+        .map(|(withdrawal, _)| withdrawal)
+}
+
+/// A withdrawn or failed commit never supplies authority to retire an account's local inputs.
+pub(crate) fn commit_with_previous_account(
+    hub: &str,
+    request: &PendingLogin,
+    recorded: bool,
+    credential: &HubCredential,
+) -> Result<(Option<Withdrawal>, Option<String>)> {
     let (path, credential) = super::bound_for_saving(hub, credential)?;
-    commit_in(
+    commit_in_with_previous_account(
         path.parent().context("credential directory is missing")?,
         &path,
         &HubAuthority::parse(hub)?,
@@ -379,6 +390,7 @@ pub fn commit(
     )
 }
 
+#[cfg(test)]
 fn commit_in(
     dir: &Path,
     path: &Path,
@@ -387,11 +399,27 @@ fn commit_in(
     recorded: bool,
     credential: &HubCredential,
 ) -> Result<Option<Withdrawal>> {
+    commit_in_with_previous_account(dir, path, authority, request, recorded, credential)
+        .map(|(withdrawal, _)| withdrawal)
+}
+
+fn commit_in_with_previous_account(
+    dir: &Path,
+    path: &Path,
+    authority: &HubAuthority,
+    request: &PendingLogin,
+    recorded: bool,
+    credential: &HubCredential,
+) -> Result<(Option<Withdrawal>, Option<String>)> {
     let _guard = mutation_guard(dir)?;
     let withdrawal = Withdrawal::of(request, load_from(dir, authority)?.as_ref());
     if recorded && withdrawal.is_some() {
-        return Ok(withdrawal);
+        return Ok((withdrawal, None));
     }
+    let previous = super::load_from(dir, authority)
+        .ok()
+        .flatten()
+        .and_then(|previous| previous.account_id);
     super::save_at(path, credential)?;
     let marker = Claimed {
         digest: digest(&request.secret),
@@ -409,7 +437,7 @@ fn commit_in(
     if withdrawal.is_none() {
         let _ = std::fs::remove_file(record_path(dir, authority));
     }
-    Ok(None)
+    Ok((None, previous))
 }
 
 /// Serialize finishing one Hub's sign-in requests, from the poll that can consume an approval
@@ -552,5 +580,31 @@ mod tests {
         std::fs::remove_file(&saved).unwrap();
         assert_eq!(commit(&newer, true), Some(Withdrawal::Forgotten));
         assert!(!saved.exists());
+
+        let previous = HubCredential {
+            account_id: Some("previous-owner".into()),
+            ..credential.clone()
+        };
+        super::super::save_at(&saved, &previous).unwrap();
+        let refused = commit_in_with_previous_account(
+            dir.path(),
+            &saved,
+            &authority,
+            &newer,
+            true,
+            &credential,
+        )
+        .unwrap();
+        assert_eq!(refused, (Some(Withdrawal::Forgotten), None));
+        let committed = commit_in_with_previous_account(
+            dir.path(),
+            &saved,
+            &authority,
+            &newer,
+            false,
+            &credential,
+        )
+        .unwrap();
+        assert_eq!(committed, (None, Some("previous-owner".into())));
     }
 }

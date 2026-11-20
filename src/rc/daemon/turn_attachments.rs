@@ -16,7 +16,8 @@ impl TurnAttachments {
         tx: &mpsc::Sender<Command>,
         mut command: Command,
         stop: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<(), RpcError> {
+    ) -> Result<Option<crate::rc::input_attachments::Attempt>, RpcError> {
+        let permit = reserve_within(tx, SESSION_REPLY_TIMEOUT, stop).await?;
         let input = command.client_msg_id().unwrap_or_default().to_owned();
         let message = match &mut command {
             Command::Turn { message, .. }
@@ -28,36 +29,53 @@ impl TurnAttachments {
         let target = session.to_owned();
         let authority = self.authority.clone();
         let owner = self.caller.is_owner();
-        *message = tokio::task::spawn_blocking(move || {
+        let (caption, mut staged) = tokio::task::spawn_blocking(move || {
             authority.admit_turn_files(owner, &target, || ())?;
             let root = crate::rc::rc_dir().map_err(|_| {
                 RpcError::new(ErrorCode::Internal, "attachment directory unavailable")
             })?;
-            let caption = if self.files.is_null() {
-                caption
+            if self.files.is_null() {
+                Ok::<_, RpcError>((caption, None))
             } else {
-                crate::rc::input_attachments::stage(
+                let custody = authority.turn_files_owner(owner, &target)?;
+                let staged = crate::rc::input_attachments::stage(
                     &root.join("task-attachments"),
+                    custody,
                     &target,
                     &input,
+                    generation,
                     &self.files,
                     &caption,
                 )
-                .map_err(|_| {
-                    RpcError::new(
-                        ErrorCode::MalformedFrame,
-                        "could not verify or store turn attachments",
-                    )
-                })?
-            };
-            Ok::<_, RpcError>(caption)
+                .map_err(|error| {
+                    let message = error
+                        .downcast_ref::<crate::rc::input_attachments::Unavailable>()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "could not verify or store turn attachments".to_owned());
+                    RpcError::new(ErrorCode::MalformedFrame, message)
+                })?;
+                staged.attempt.prepare_delivery().map_err(|_| {
+                    RpcError::new(ErrorCode::Internal, "attachment custody is unavailable")
+                })?;
+                Ok((staged.message, Some(staged.attempt)))
+            }
         })
         .await
         .map_err(|_| RpcError::new(ErrorCode::Internal, "attachment worker stopped"))??;
+        *message = caption;
+        if let Some(attempt) = &staged {
+            let references = vec![attempt.reference()];
+            match &mut command {
+                Command::Turn { reply, .. } => reply.set_attachments(references),
+                Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => {
+                    reply.set_attachments(references)
+                }
+                _ => unreachable!("only session input carries attachments"),
+            }
+        }
 
         // A reserved slot makes the final send nonblocking. Neither disk I/O nor
         // backpressure can hold the daemon lock or extend a grant across revocation.
-        let permit = reserve_within(tx, SESSION_REPLY_TIMEOUT, stop).await?;
         let state = daemon.lock().await;
         if *stop.borrow() || stop.has_changed().is_err() {
             return Err(RpcError::new(
@@ -82,7 +100,12 @@ impl TurnAttachments {
         if let Some(error) = state.lease_refusal(session) {
             return Err(error);
         }
-        self.authority
-            .admit_turn_files(owner, session, || permit.send(command))
+        self.authority.admit_turn_files(owner, session, || {
+            if let Some(attempt) = &mut staged {
+                attempt.queued();
+            }
+            permit.send(command);
+        })?;
+        Ok(staged)
     }
 }

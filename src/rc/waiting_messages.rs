@@ -46,8 +46,11 @@ pub const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// One waiting message as the file keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Stored {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) attachments: Vec<super::input_attachments::Reference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,12 +68,13 @@ impl Stored {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct File {
     version: u32,
     waiting: Vec<Stored>,
 }
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// A conversation id is a file name here only when it is a plain id.
 fn file(directory: PathBuf, conversation: &str) -> Option<PathBuf> {
@@ -88,6 +92,22 @@ pub fn save(conversation: &str, waiting: &[Stored]) -> crate::Result<()> {
 }
 
 fn save_in(daemon: &str, conversation: &str, waiting: &[Stored]) -> crate::Result<()> {
+    migrate_legacy_in(daemon, conversation)?;
+    let root = super::namespace_dir(daemon)?.join("task-attachments");
+    let references: Vec<_> = waiting
+        .iter()
+        .flat_map(|item| item.attachments.iter().cloned())
+        .collect();
+    super::input_attachments::update_waiting(&root, conversation, &references, || {
+        persist_in(daemon, conversation, waiting)
+    })
+}
+
+pub(super) fn persist_in(
+    daemon: &str,
+    conversation: &str,
+    waiting: &[Stored],
+) -> crate::Result<()> {
     if waiting.is_empty() {
         return forget_in(daemon, conversation);
     }
@@ -109,6 +129,8 @@ fn save_in(daemon: &str, conversation: &str, waiting: &[Stored]) -> crate::Resul
     temporary.flush()?;
     temporary.as_file().sync_data()?;
     temporary.persist(&path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
 
@@ -119,36 +141,99 @@ pub fn load(conversation: &str) -> Vec<Stored> {
 }
 
 fn load_in(daemon: &str, conversation: &str) -> Vec<Stored> {
-    let Some(path) = super::namespace_dir(&store(daemon))
-        .ok()
-        .and_then(|directory| file(directory, conversation))
-    else {
-        return Vec::new();
-    };
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<File>(&bytes).ok())
-        .filter(|file| file.version == VERSION)
-        .map(|file| file.waiting)
+    migrate_legacy_in(daemon, conversation)
+        .and_then(|()| load_checked_in(daemon, conversation))
         .unwrap_or_default()
+}
+
+fn migrate_legacy_in(daemon: &str, conversation: &str) -> crate::Result<()> {
+    if !read_record(daemon, conversation)?.is_some_and(|record| record.version == 1) {
+        return Ok(());
+    }
+    let root = super::namespace_dir(daemon)?.join("task-attachments");
+    super::input_attachments::migrate_legacy_waiting(&root, conversation, || {
+        let Some(record) = read_record(daemon, conversation)? else {
+            return Ok(());
+        };
+        if record.version == VERSION {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            record.version == 1
+                && record
+                    .waiting
+                    .iter()
+                    .all(|stored| stored.attachments.is_empty()
+                        && !stored.message.contains("owned-v1")),
+            "legacy waiting record has uncertain managed references"
+        );
+        persist_in(daemon, conversation, &record.waiting)
+    })
+}
+
+fn read_record(daemon: &str, conversation: &str) -> crate::Result<Option<File>> {
+    let path = file(super::namespace_dir(&store(daemon))?, conversation)
+        .ok_or_else(|| anyhow::anyhow!("invalid waiting conversation identity"))?;
+    super::cloud::store::read(&path, 8 * 1024 * 1024)
+}
+
+/// An unreadable or legacy waiting record cannot prove that managed references are gone.
+pub(super) fn load_checked_in(daemon: &str, conversation: &str) -> crate::Result<Vec<Stored>> {
+    let Some(record) = read_record(daemon, conversation)? else {
+        return Ok(Vec::new());
+    };
+    anyhow::ensure!(
+        record.version == VERSION,
+        "unsupported attachment reference version"
+    );
+    for reference in record.waiting.iter().flat_map(|item| &item.attachments) {
+        reference.validate()?;
+    }
+    Ok(record.waiting)
 }
 
 fn forget_in(daemon: &str, conversation: &str) -> crate::Result<()> {
     let Some(path) = file(super::namespace_dir(&store(daemon))?, conversation) else {
         return Ok(());
     };
-    match std::fs::remove_file(path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-        _ => Ok(()),
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => return Ok(()),
+        Ok(()) => {}
     }
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(())
 }
 
 /// Removes every file, every daemon's: the account the messages came under is leaving this
 /// device.
 pub fn forget_all() {
     for daemon in DAEMONS {
-        if let Ok(directory) = super::namespace_dir(&store(daemon)) {
-            let _ = std::fs::remove_dir_all(directory);
+        let Ok(directory) = super::namespace_dir(&store(daemon)) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(conversation) = name.to_str().and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let root = match super::namespace_dir(daemon) {
+                Ok(directory) => directory.join("task-attachments"),
+                Err(_) => continue,
+            };
+            let result = if root.join("owned-v1").try_exists().unwrap_or(true) {
+                super::input_attachments::forget_unowned_waiting(&root, daemon, conversation)
+            } else {
+                forget_in(daemon, conversation)
+            };
+            if result.is_err() {
+                eprintln!("agit: waiting-message cleanup is incomplete");
+            }
         }
     }
 }
@@ -168,14 +253,16 @@ fn sweep_in(daemon: &str, runs: impl Fn(&str) -> bool, now_ms: i64) {
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name();
         let conversation = name.to_str().and_then(|name| name.strip_suffix(".json"));
-        let keep = conversation.is_some_and(|conversation| {
-            runs(conversation)
-                && load_in(daemon, conversation)
-                    .iter()
-                    .any(|stored| !stored.expired(now_ms))
-        });
+        let Some(conversation) = conversation else {
+            continue;
+        };
+        let Ok(waiting) = load_checked_in(daemon, conversation) else {
+            // Keep uncertain references until an explicit durable transition retires them.
+            continue;
+        };
+        let keep = runs(conversation) && waiting.iter().any(|stored| !stored.expired(now_ms));
         if !keep {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = save_in(daemon, conversation, &[]);
         }
     }
 }
@@ -189,6 +276,7 @@ mod tests {
     fn stored(message: &str, arrived_ms: i64) -> Stored {
         Stored {
             message: message.into(),
+            attachments: Vec::new(),
             client_msg_id: Some(message.into()),
             sender: Some(crate::protocol::MessageSender {
                 account_id: "member".into(),
@@ -245,6 +333,23 @@ mod tests {
             sweep_in(crate::rc::LOCAL_NAMESPACE, |_| false, now);
             assert_eq!(load_in("rc", CONVERSATION), list);
 
+            let path = file(super::super::namespace_dir(&store("rc")).unwrap(), gone).unwrap();
+            std::fs::write(&path, b"{broken").unwrap();
+            assert!(load_checked_in("rc", gone).is_err());
+            sweep(|_| false, now);
+            assert!(
+                path.is_file(),
+                "an incomplete reference read must not authorize removal"
+            );
+            std::fs::write(&path, br#"{"version":999,"waiting":[]}"#).unwrap();
+            assert!(load_checked_in("rc", gone).is_err());
+            sweep(|_| false, now);
+            assert!(path.is_file());
+            assert!(save(gone, &[]).is_err());
+            persist_in("rc", gone, &[]).unwrap();
+            assert!(load_checked_in("rc", gone).unwrap().is_empty());
+
+            save(CONVERSATION, &list).unwrap();
             save_in(crate::rc::LOCAL_NAMESPACE, CONVERSATION, &list).unwrap();
             forget_all();
             assert!(load_in("rc", CONVERSATION).is_empty());
