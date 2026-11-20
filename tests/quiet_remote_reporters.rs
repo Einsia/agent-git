@@ -117,6 +117,9 @@ impl Hub {
                 assert_eq!(request.method, reply.method);
                 assert_eq!(request.path, reply.path);
                 seen.push(request);
+                if reply.status == 0 {
+                    continue;
+                }
                 let body = reply.body.to_string();
                 write!(socket, "HTTP/1.1 {} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", reply.status, body.len()).unwrap();
                 socket.flush().unwrap();
@@ -318,6 +321,110 @@ fn success(output: Output) -> Output {
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
     }
     output
+}
+
+/// Invitation output distinguishes a pending request from membership, and a lost answer never
+/// replays a mutation or falls back to the member-role endpoint.
+#[test]
+fn org_invites_report_pending_and_preserve_refused_or_unknown_outcomes() {
+    let pending = |created: bool| {
+        json!({"created": created, "invitation": {
+            "org": "acme", "username": "carol", "role": "member", "expires_at": "2099-01-01T00:00:00Z",
+        }})
+    };
+    let reply = |status, body| Reply {
+        method: "POST",
+        path: "/api/orgs/acme/invitations",
+        status,
+        body,
+    };
+    let hub = Hub::new(vec![
+        reply(202, pending(true)),
+        reply(200, pending(false)),
+        reply(
+            409,
+            json!({"kind":"conflict", "error":"account is already an organization member; its role was not changed"}),
+        ),
+        reply(
+            403,
+            json!({"kind":"forbidden", "error":"token cannot invite"}),
+        ),
+        reply(405, json!({})),
+        reply(404, json!({"kind":"not_found", "error":"org not found"})),
+        reply(0, json!({})),
+        reply(
+            200,
+            json!({"created": true, "invitation": {
+                "org":"another-org", "username":"carol", "role":"member", "expires_at":"2099-01-01T00:00:00Z"
+            }}),
+        ),
+    ]);
+    let lab = Lab::new();
+    lab.signed_in(&hub.base);
+    let command = |args: &[&str]| {
+        let mut command = lab.command(&hub.base, args, "ordinary");
+        command.env("AGIT_SKIP_SETUP", "1");
+        command
+    };
+    let args = ["org", "invite", "acme", "--user", "carol"];
+    let created = success(command(&args).output().unwrap());
+    let text = String::from_utf8(created.stdout).unwrap();
+    for expected in [
+        hub.base.as_str(),
+        "Account: me",
+        "Organization: acme",
+        "Recipient: carol",
+        "New invitation pending acceptance",
+        "(member)",
+        "2099-01-01T00:00:00Z",
+        "/settings/organizations?org=acme",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    let repeated = success(
+        command(&["org", "invite", "acme", "--user", "carol", "--json"])
+            .output()
+            .unwrap(),
+    );
+    let document: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    let result = &document["result"]["value"];
+    assert_eq!(result["hub"], hub.base);
+    assert_eq!(result["account"], "me");
+    assert_eq!(result["status"], "pending");
+    assert_eq!(result["created"], false);
+    assert_eq!(result["invitation"], pending(false)["invitation"]);
+    for (code, expected) in [
+        (4, "already an organization member"),
+        (7, "personal access tokens cannot invite"),
+        (4, "does not support CLI organization invitations"),
+        (4, "organization or recipient is unavailable"),
+        (6, "invitation outcome is unconfirmed"),
+        (6, "invitation outcome is unconfirmed"),
+    ] {
+        let output = command(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{output:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("pending acceptance"));
+        for secret in [ACCESS, REFRESH, PAT] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        }
+    }
+    let requests = hub.finish();
+    assert_eq!(requests.len(), 8);
+    for request in requests {
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {ACCESS}").as_str())
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).unwrap(),
+            json!({"username":"carol", "role":"member"})
+        );
+    }
 }
 
 #[test]

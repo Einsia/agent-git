@@ -91,6 +91,21 @@ impl OrgView {
     }
 }
 
+/// A pending username invitation grants membership only after the recipient accepts it.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OrgInvitation {
+    pub org: String,
+    pub username: String,
+    pub role: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct OrgInvitationResult {
+    pub invitation: OrgInvitation,
+    pub created: bool,
+}
+
 /// A team in an organization, as `GET /api/orgs/{org}/teams` shows it to a member.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamView {

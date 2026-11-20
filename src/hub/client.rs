@@ -1559,6 +1559,36 @@ impl Client {
         self.get(&format!("api/orgs/{name}"))
     }
 
+    /// The invitation-only endpoint cannot change an existing member's role. Redirects and
+    /// member-PUT fallbacks would lose that contract; transport failures must not replay it.
+    pub fn invite_org_member(
+        &self,
+        org: &str,
+        username: &str,
+    ) -> Result<super::OrgInvitationResult> {
+        let path = format!("api/orgs/{}/invitations", urlencode(org));
+        let result: super::OrgInvitationResult = self.with_retry(&path, |token| {
+            let mut request = self
+                .agent
+                .post(self.url(&path))
+                .config()
+                .max_redirects(0)
+                .build();
+            if let Some(token) = token {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            request.send_json(serde_json::json!({ "username": username, "role": "member" }))
+        })?;
+        anyhow::ensure!(
+            result.invitation.org.eq_ignore_ascii_case(org)
+                && result.invitation.username.eq_ignore_ascii_case(username)
+                && result.invitation.role == "member"
+                && chrono::DateTime::parse_from_rfc3339(&result.invitation.expires_at).is_ok(),
+            "the Hub returned an invitation receipt that does not match the requested member invitation"
+        );
+        Ok(result)
+    }
+
     /// The organization's teams and their members; only members may list them.
     pub fn org_teams(&self, org: &str) -> Result<Vec<super::TeamView>> {
         self.get(&format!("api/orgs/{}/teams", urlencode(org)))
