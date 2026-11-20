@@ -585,10 +585,20 @@ impl Attempt<'_> {
             project.record_upload(&self.request.payload, &tip, failure)?;
         }
         match output {
-            Ok(output) if output.status.success() => self.update(Phase::Published {
-                tip: tip.clone(),
-                memory,
-            }),
+            Ok(output) if output.status.success() => {
+                self.update(Phase::Published {
+                    tip: tip.clone(),
+                    memory,
+                })?;
+                if self.request.payload.project.is_some() {
+                    super::project::refresh_published_branch(
+                        &repository,
+                        &branch,
+                        &self.request.payload.cwd,
+                    );
+                }
+                Ok(())
+            }
             _ => self.block(BlockedBy::PublicationFailed, Some(tip)),
         }
     }

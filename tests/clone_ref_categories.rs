@@ -702,8 +702,10 @@ fn me_alias_preserves_authenticated_remote_failures_without_anonymous_fallback()
 
 /// Explicit session pickup works after a default-only clone on a Hub without scoped fetching;
 /// the selected line and its continuation hint must not depend on the initial fetch mapping.
+/// A subsequent repository-wide fetch also discovers untagged branches without changing that
+/// mapping or local branches; inheriting the clone's narrow mapping would silently omit them.
 #[test]
-fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
+fn own_clone_pickup_keeps_continuation_hints_and_allows_full_fetch() {
     for frozen in [false, true] {
         let mut lab = Lab::new(200);
         lab.sign_in("alice");
@@ -779,6 +781,52 @@ fn own_clone_hints_retain_the_selected_session_or_frozen_commit() {
             assert_eq!(
                 lab.git(&lab.destination(), &["rev-parse", "topic^"]),
                 lab.head
+            );
+            let tree = lab.git(&lab.source, &["rev-parse", "main^{tree}"]);
+            let other = lab.git(
+                &lab.source,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &lab.head,
+                    "-m",
+                    "Other file line",
+                ],
+            );
+            lab.git(&lab.source, &["update-ref", "refs/heads/other", &other]);
+            let repo = Repo::at(lab.destination());
+            assert!(!repo.has_ref("refs/remotes/origin/other"));
+            assert!(repo.git_opt(&["cat-file", "-e", &other]).is_none());
+            lab.hub.metadata_budget.store(3, Ordering::Release);
+            let fetched = lab
+                .command(env!("CARGO_BIN_EXE_agit"))
+                .args(["fetch", "alice/paper"])
+                .output()
+                .unwrap();
+            assert_output(&fetched, "human", 0, None);
+            assert_eq!(
+                lab.git(
+                    &lab.destination(),
+                    &["rev-parse", "refs/remotes/origin/other"]
+                ),
+                other
+            );
+            assert!(!repo.has_ref("refs/heads/other"));
+            assert_eq!(
+                lab.git(&lab.destination(), &["rev-parse", "HEAD"]),
+                lab.head
+            );
+            assert_eq!(
+                lab.git(&lab.destination(), &["rev-parse", "topic"]),
+                session_sha
+            );
+            assert_eq!(
+                lab.git(
+                    &lab.destination(),
+                    &["config", "--get-all", "remote.origin.fetch"]
+                ),
+                "+refs/heads/main:refs/remotes/origin/main"
             );
         }
         lab.hub.finish();

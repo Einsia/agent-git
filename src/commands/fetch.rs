@@ -30,18 +30,30 @@ use std::path::Path;
 pub struct Args {
     /// Peer repo to pull (owner/repo). Default: the context repo’s origin.
     pub repo: Option<String>,
+    /// Fetch only this branch's complete history and remote-tracking ref, without tags.
+    #[arg(long, requires = "repo", conflicts_with = "all")]
+    pub branch: Option<String>,
     /// Fetch every bound repo.
     #[arg(long, conflicts_with = "repo")]
     pub all: bool,
 }
 
 pub fn run(args: Args) -> CmdResult {
+    if let Some(branch) = &args.branch {
+        crate::input_argument(crate::domain::repo::valid_branch_name(branch))?;
+        let checked = crate::infra::git_runtime::command()
+            .args(["check-ref-format", &format!("refs/heads/{branch}")])
+            .output()?;
+        if !checked.status.success() {
+            return crate::input_argument(Err(anyhow::anyhow!("invalid branch name")));
+        }
+    }
     crate::domain::privacy::service::schedule_sync(&crate::infra::config::hub_url());
     if args.all {
         return fetch_all();
     }
     match args.repo {
-        Some(slug) => fetch_slug(&slug),
+        Some(slug) => fetch_slug(&slug, args.branch.as_deref()),
         None => fetch_context(),
     }
 }
@@ -91,7 +103,7 @@ fn fetch_all() -> CmdResult {
                 );
                 let owner = o.file_name().to_string_lossy().to_string();
                 let name = r.file_name().to_string_lossy().to_string();
-                match do_fetch(&client, &repo, &owner, &name) {
+                match do_fetch(&client, &repo, &owner, &name, None) {
                     Ok(()) => {
                         n += 1;
                         ui::info(format_args!("{slug} fetched"));
@@ -105,7 +117,7 @@ fn fetch_all() -> CmdResult {
     Ok(ExitCode::Ok)
 }
 
-fn fetch_slug(slug: &str) -> CmdResult {
+fn fetch_slug(slug: &str, branch: Option<&str>) -> CmdResult {
     let (owner, name) = match super::parse_slug(slug) {
         Ok(v) => v,
         Err(e) => {
@@ -148,7 +160,7 @@ fn fetch_slug(slug: &str) -> CmdResult {
             }
         },
     };
-    match do_fetch(&client, &repo, &owner, &name) {
+    match do_fetch(&client, &repo, &owner, &name, branch) {
         Ok(()) => {
             ui::success(&format!(
                 "{slug} fetched (objects and remote refs; local branches untouched)"
@@ -262,7 +274,7 @@ fn fetch_context() -> CmdResult {
     let Some(client) = hub_client() else {
         return Ok(asked_nothing());
     };
-    match do_fetch(&client, &repo, &owner, &name) {
+    match do_fetch(&client, &repo, &owner, &name, None) {
         Ok(()) => {
             ui::success("fetched (objects and remote refs; local branches untouched)");
             Ok(ExitCode::Ok)
@@ -275,11 +287,48 @@ fn fetch_context() -> CmdResult {
     }
 }
 
-fn do_fetch(client: &Client, repo: &Repo, owner: &str, name: &str) -> crate::Result<()> {
+fn do_fetch(
+    client: &Client,
+    repo: &Repo,
+    owner: &str,
+    name: &str,
+    branch: Option<&str>,
+) -> crate::Result<()> {
     let identity = identity::resolve_transport_target(repo, client, owner, name)?;
-    let fetch = crate::hub::git::TagFetch::prepare(repo, &["fetch", "origin", "--prune", "--tags"]);
-    let out = crate::hub::git::run_for_remote(repo, &fetch.args(), &identity)?;
-    fetch.report();
+    let out = if let Some(branch) = branch {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+        crate::hub::git::run_for_remote(
+            repo,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-prune",
+                "--no-prune-tags",
+                "--refmap=",
+                "--recurse-submodules=no",
+                "origin",
+                &refspec,
+            ],
+            &identity,
+        )?
+    } else {
+        // A repository-wide fetch covers branches omitted by a default clone. The invocation-local
+        // mapping keeps stored mappings and TagFetch's configured tag exclusions intact.
+        let fetch = crate::hub::git::TagFetch::prepare(
+            repo,
+            &[
+                "-c",
+                "remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*",
+                "fetch",
+                "origin",
+                "--prune",
+                "--tags",
+            ],
+        );
+        let out = crate::hub::git::run_for_remote(repo, &fetch.args(), &identity)?;
+        fetch.report();
+        out
+    };
     if !out.ok() {
         if crate::domain::repo::integrity::reports_damage(&out.stderr) {
             anyhow::bail!(
