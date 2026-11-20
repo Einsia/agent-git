@@ -23,7 +23,9 @@ agit hooks settle < hook.json    # Stop
 | Subcommand | Event | Meaning |
 |---|---|---|
 | `ingest` | SessionStart | Register the current session according to the payload's `source`: `startup` with `AGIT_SESSION` claims that branch; `resume`, `clear`, and Claude `fork` register unmanaged sessions for explicit adoption; `compact` leaves the binding alone. Existing bindings win over inherited environment values. Claude Code, Codex and WorkBuddy receive the native session ID with the explicit destination and its `agit commit`/`agit push` commands, or the adoption command. Claude gets a default title only when its payload has no title, on events that support titles. |
-| `settle` | Stop | Settle the turn that just ended. The target branch is resolved from the payload's `session_id` through the store link — **never from the environment**. A session that was never adopted is not settled. When Claude Code has not yet written the stopped turn's reply, the hook returns at once and a detached `agit hooks settle` settles the turn after the reply is written, so the last turn before `/exit` is saved too. |
+| `settle` | Stop | Save an eligible completed turn. The hook uses the payload's native session identity and validates its explicit claim or enrolled project capture; inherited `AGIT_SESSION` does not override that identity. Eligible project capture can handle sessions without a prior explicit import. A managed link can settle directly. Claude's missing-reply path can detach a settlement process when that launch succeeds. |
+| `native-permission` | Claude on Unix: PermissionRequest | Relay a permission request to an authorized remote controller while Claude's native prompt remains available |
+| `relay` | Claude on Unix: SessionStart | Receive remote-control inbox messages asynchronously, with output redirected away from model context |
 
 ## Options
 
@@ -34,13 +36,39 @@ agit hooks settle < hook.json    # Stop
 
 ## Notes
 
-Both actions **always exit 0** — a failing hook must not disturb the session. `settle` is silent, except that a Claude Code Stop returns one `systemMessage` for the person when the newest automatic upload of the conversation's branch didn't go through, with its reason from a fixed set; a Claude Code or Codex SessionStart tells it the same way, and each upload is told once. SessionStart tells the model nothing: an agent that needs the conversation's state runs `agit`, which names it from the runtime's own session variable. In a folder that uploads by itself, every start (`agit resume` and `agit run` included) returns one `systemMessage` for the person, naming the destination, who can read it there, and `agit project drop`. Resuming a conversation the folder holds back (from before the folder was on, or before agit covered its git worktree) returns one telling the person it is not uploaded and how to upload it alone. Otherwise SessionStart prints nothing, except to give a Claude Code conversation that an earlier agit renamed its own title back. To turn automatic settlement off:
+Ordinary hook errors are generally contained so they do not disturb the runtime;
+Archive settlement can return a nonzero failure. Exit zero alone does not prove
+that a turn was saved or uploaded. A failed automatic upload can produce a
+person-facing `systemMessage` at Stop or the next SessionStart, with a fixed
+reason. SessionStart also reports applicable capture destinations and held
+history, and managed Codex startup can receive its team-memory index as context.
+
+Stop can wait on synchronous local work or automatic upload. The detached
+Claude reply wait bounds only that wait, not the whole hook. The relay's async
+setting and the permission hook's timeout do not apply to Stop.
+
+Hooks are normally installed by global npm/create-agit setup or an explicit
+`agit setup --hooks`. The setup reference explains all installation routes and
+the selected profile files. Open those files' hook entries to inspect them;
+Claude's `agit doctor` check establishes configuration presence, not effective
+execution or save results. Codex provides `/hooks` for trust and control.
+
+To stop automatic turn saving for this AgentGit user configuration:
 
 ```bash
-agit config commit.auto false
+agit config --global commit.auto false
 ```
 
-No worktree scan runs in this hook, and no code files are restored. New conversations stay unnamed until the user selects their repo and branch through `agit import` or the TUI naming inbox.
+Restore it with `true`. This setting leaves hooks installed, does not disable
+SessionStart or every operation before settlement, and does not undo queued
+work. Explicit commits remain available. `agit off [DIR]` pauses that folder's
+automatic capture; explicitly linked sessions can still save locally.
+
+To stop an invocation, disable/remove only that AgentGit hook entry in the
+runtime configuration, keeping other hooks and settings. Full setup can add it
+again. `AGIT_SKIP_SETUP=1` and `--remove-skill` do not disable installed
+Claude/Codex hooks; there is no `--remove-hooks` command. These hooks save
+conversation history and do not restore code files or create a code commit.
 
 Hook contracts: [Claude Code](https://code.claude.com/docs/en/hooks) and [Codex](https://learn.chatgpt.com/docs/hooks). Installed Codex hooks must be enabled and trusted in the runtime before they run.
 

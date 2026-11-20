@@ -138,10 +138,18 @@ fn approved_codex_hooks_survive_setup_and_unapproved_ones_are_reported() {
     assert_eq!(std::fs::read_to_string(&hooks_file).unwrap(), approved);
     let said = String::from_utf8_lossy(&setup.stderr).into_owned()
         + &String::from_utf8_lossy(&setup.stdout);
-    for expected in ["SessionStart", "Stop", "/hooks"] {
+    for expected in [
+        "Codex hooks already configured in ~/.codex/hooks.json",
+        "SessionStart: hooks ingest --runtime codex",
+        "Stop: hooks settle --runtime codex",
+        "/hooks",
+    ] {
         assert!(said.contains(expected), "{expected}: {said}");
     }
     assert!(!said.contains("other-tool"), "{said}");
+    assert!(!said.contains("hooks native-permission"), "{said}");
+    assert!(!said.contains("hooks relay"), "{said}");
+    assert!(!said.contains("Updating Codex"), "{said}");
 
     let doctor = agit(home, &path, &["doctor"]);
     let said = String::from_utf8_lossy(&doctor.stdout).into_owned()

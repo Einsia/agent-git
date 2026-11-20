@@ -20,7 +20,7 @@ agit setup [options]
 | `--remove-skill` | Remove agit's Skill from `--runtime`'s runtime, or from every runtime, and keep it off; later setups and upgrades leave it out until `agit setup --skill --runtime <runtime>` |
 | `--hooks` | Install or update runtime hooks |
 | `--skill` | Install the progressive-disclosure AgentGit Skill bundle (`SKILL.md`, `VERSION`, and command references) in the selected runtime's native global Skill directory; does not expand the full guide into `AGENTS.md` |
-| `--installed-only` | With `--skill`, refresh only existing native or legacy Skill installations; does not change hooks, MCP, project integration, or auto-push preferences |
+| `--installed-only` | With `--skill`, refresh existing native or legacy Skill installations; with `--hooks`, repair existing hooks naming this executable without installing new ones. Does not change MCP, project integration, or auto-push preferences |
 | `--mcp` | Configure the MCP server |
 | `--agents-md` | Write/update the AGENTS.md integration block at the top of the current Git repository; plain `agit setup` writes none, and outside a repository or in the home folder nothing is written |
 | `--remove-agents-md [DIR]` | Remove agit's section from the `AGENTS.md` and `CLAUDE.md` of `DIR` (default: the current folder), keeping a backup beside each; writes nothing else |
@@ -45,7 +45,8 @@ explicit analytics destination. See `docs/telemetry.md` and
 `src/telemetry/registry.json` for the collection policy and field inventory.
 `--yes` skips the automatic-push question without changing that separate preference.
 
-Claude hooks are merged into `~/.claude/settings.json`. Codex hooks are merged into
+Claude hooks are merged into the selected profile's `settings.json` (`CLAUDE_CONFIG_DIR`,
+normally `~/.claude`). Codex hooks are merged into
 `$CODEX_HOME/hooks.json` (default `~/.codex/hooks.json`) only when `codex features list` reports the
 hooks capability. Codex runs a hook only after the user approves its exact command, and nothing
 from Codex is saved until then; agit does not grant that approval on the user's behalf. Setup leaves
@@ -53,6 +54,55 @@ an existing hook that runs the `agit` on `PATH` unchanged, so an approval surviv
 agit running setup. Setup, `agit doctor` and `agit project status` ask Codex (`codex app-server`,
 `hooks/list`) and name the AgentGit hooks it will not run: not yet approved, changed since approval,
 or disabled. The user approves them in Codex's startup hooks review or in `/hooks`.
+
+## Hook installation and controls
+
+The global npm installer and create-agit normally run setup after installing
+the executable. npm may hide setup's output or block its install script. A local
+npm dependency/prefix installation or npm exec does not run the global setup
+path. `AGIT_SKIP_SETUP=1` skips setup and its reminders; it does not disable an
+already-installed hook or skip other installation work.
+
+Bare setup selects hooks, Skill and MCP for installed runtimes. An ordinary
+setup reminder previews changes and asks before installing; an unattended
+reminder only reports what is missing. `agit upgrade` refreshes installed Skills
+and can set up newly installed runtimes after an earlier setup, respecting
+declined setup and Skill opt-outs. Existing Claude RC integration may separately
+receive the SessionStart inbox relay during ordinary startup; that migration
+does not add Stop and respects Claude's global hook-disable setting.
+
+Setup names the hook configuration before writing and reports `updated` or
+`already configured`, with the selected file and applicable actions:
+
+| Event | AgentGit action | Purpose |
+|---|---|---|
+| SessionStart | `hooks ingest` | Connect session state and show capture/upload notices |
+| Stop | `hooks settle` | Save eligible completed turns; upload follows folder/repository settings |
+| Claude on Unix: PermissionRequest | `hooks native-permission` | Relay remote-control permission requests while the native prompt remains available |
+| Claude on Unix: SessionStart | `hooks relay` | Receive remote-control messages asynchronously |
+
+Codex commands include `--runtime codex` and still need your approval. WorkBuddy
+uses the common SessionStart/Stop actions; Gemini uses SessionStart, AfterAgent
+and SessionEnd. Other runtimes use their native plugin/extension integration.
+The output lists configured actions, not proof that the runtime executed them.
+
+| Intent | Action | Scope |
+|---|---|---|
+| Inspect configured hooks | Open only the hook entries in the reported file; use Codex's `/hooks` for its review and controls | Claude's `agit doctor` row checks configuration presence only, not whether hooks are enabled, executed or saved successfully |
+| Pause this folder's automatic capture | `agit off [DIR]` | Keeps hooks/history; explicitly linked sessions can still save locally |
+| Stop automatic turn saving | `agit config --global commit.auto false` (restore with `true`) | Keeps hooks, SessionStart and explicit commits; does not undo queued work or prevent every hook operation |
+| Stop a hook invocation | Disable/remove only that AgentGit entry in the runtime's hook configuration | Preserve other hooks and surrounding configuration; a later full setup can add the entry again |
+
+There is no `agit setup --remove-hooks` option. `--remove-skill` does not remove
+Claude/Codex hooks. Do not share the whole runtime configuration to troubleshoot
+a hook. Installing hooks does not enroll an arbitrary folder for upload.
+
+Stop saves conversation history, not a code commit. It can wait on local work
+or upload in synchronous paths; its detached Claude reply wait is not a deadline
+for the whole hook. The relay's async setting and permission timeout are separate
+from Stop. See the hooks reference for event and failure behavior.
+
+## Other integrations
 
 Claude Code's MCP server is registered at user scope (`claude mcp add --scope user`), so every
 folder sees it. A project-local `agit` entry is removed only when the user entry fully replaces it;

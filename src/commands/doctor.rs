@@ -1090,10 +1090,13 @@ fn setup_warning(runtimes: &[&str], declined_at: Option<chrono::DateTime<chrono:
 fn claude_hooks_check() -> Option<(String, Check)> {
     let missing = super::setup::claude_hooks_missing()?;
     let row = if missing.is_empty() {
-        Check::Ok("SessionStart and Stop".into())
+        Check::Ok(
+            "configured: SessionStart and Stop; runtime execution and save results not checked"
+                .into(),
+        )
     } else {
         Check::Warn(format!(
-            "{} not installed, so Claude Code conversations are not captured. `agit setup --runtime claude-code --hooks` installs them; an agent asks the person before running it",
+            "not configured: {}; runtime execution and save results not checked. `agit setup --runtime claude-code --hooks` installs them; an agent asks the person before running it",
             missing.join(" and ")
         ))
     };

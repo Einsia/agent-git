@@ -542,13 +542,16 @@ fn codex_mcp_setup_preserves_invalid_files_and_installs_a_literal_executable() {
 /// A non-array hook event refuses the Claude settings item without editing that file or any other
 /// configuration, and setup reports itself incomplete. The native control plugin is an independent
 /// item and may install alongside the refusal. An install that does edit the file keeps the file it
-/// read beside it.
+/// read beside it. Its output names the target and configured actions without implying execution;
+/// an unchanged setup preserves user hooks and reports the same target without another update.
 #[test]
 fn hook_setup_refuses_non_array_events_before_editing_configuration() {
     for mode in ["ordinary", "quiet", "1", "2"] {
         let lab = Lab::new();
         success(lab.run(&["setup", "--completions", "bash"]));
         let path = lab.home.join(".claude/settings.json");
+        let shown_path = PathBuf::from("~").join(".claude/settings.json");
+        let shown_path = shown_path.to_string_lossy();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let args = ["setup", "--hooks", "--runtime", "claude-code"];
         for event in ["SessionStart", "Stop"] {
@@ -578,7 +581,33 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
         });
         std::fs::write(&path, original.to_string()).unwrap();
         let mut expected_files = setup_files(&lab);
-        success(setup_config_command(&lab, &args, mode).output().unwrap());
+        let output = success(setup_config_command(&lab, &args, mode).output().unwrap());
+        let said = String::from_utf8_lossy(&output.stdout);
+        if mode == "ordinary" {
+            let updating = said.find("Updating Claude Code hooks in ").unwrap();
+            let updated = said.find("Claude Code hooks updated in ").unwrap();
+            assert!(updating < updated, "{said}");
+            assert!(said.matches(shown_path.as_ref()).count() >= 2, "{said}");
+            for expected in [
+                "SessionStart: hooks ingest",
+                "Stop: hooks settle",
+                "upload follows your settings",
+                "agit off (explicitly linked sessions can still save locally)",
+                "agit config --global commit.auto false",
+                "leave hooks installed",
+            ] {
+                assert!(said.contains(expected), "{expected}: {said}");
+            }
+            assert_eq!(
+                said.contains("PermissionRequest: hooks native-permission"),
+                cfg!(unix)
+            );
+            assert_eq!(said.contains("SessionStart: hooks relay"), cfg!(unix));
+            assert!(!said.contains("user-hook"), "{said}");
+            assert!(!said.contains("Codex"), "{said}");
+        } else if mode == "quiet" {
+            assert!(said.is_empty(), "{said}");
+        }
         let installed = std::fs::read(&path).unwrap();
         let doc: serde_json::Value = serde_json::from_slice(&installed).unwrap();
         assert_eq!(doc["userPreference"], original["userPreference"]);
@@ -607,7 +636,18 @@ fn hook_setup_refuses_non_array_events_before_editing_configuration() {
         backup.push(".agit-backup");
         expected_files.insert(backup.into(), original.to_string().into_bytes());
         assert_eq!(setup_files(&lab), expected_files);
-        success(setup_config_command(&lab, &args, mode).output().unwrap());
+        let unchanged = success(setup_config_command(&lab, &args, mode).output().unwrap());
+        if mode == "ordinary" {
+            let said = String::from_utf8_lossy(&unchanged.stdout);
+            assert!(
+                said.contains(&format!(
+                    "Claude Code hooks already configured in {shown_path}"
+                )),
+                "{said}"
+            );
+            assert!(!said.contains("Updating Claude Code"), "{said}");
+            assert!(!said.contains("hooks updated in"), "{said}");
+        }
         assert_eq!(setup_files(&lab), expected_files);
     }
 }
