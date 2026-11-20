@@ -83,6 +83,7 @@ impl Lab {
             .env("USERPROFILE", self.root.path())
             .env("AGIT_HOME", &self.home)
             .env("AGIT_HUB_URL", &self.base)
+            .env("AGIT_SKIP_SETUP", "1")
             .env("TMP", self.root.path().join("tmp"))
             .env("TEMP", self.root.path().join("tmp"))
             .env("TMPDIR", self.root.path().join("tmp"))
@@ -262,5 +263,126 @@ fn local_push_refusals_keep_identity_credentials_and_repository_bytes() {
         );
         assert_eq!(logged_out.state(), before);
         logged_out.no_requests();
+
+        // An unreadable native header must refuse publication without claiming a parent denied it.
+        let refused = lab.seed("alice", "refused", true);
+        lab.git(&refused, &["checkout", "-b", "work"]);
+        let native = "aaaaaaaa-0000-4000-8000-000000000001";
+        let session = format!("agit-{}", "a".repeat(40));
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":lab.root.path().join("work")}});
+        let log = agit::domain::transcript::wrap_lines(&format!("{header}\n"), "codex", &session);
+        agit::domain::storage::write_snapshot(&refused, &log, &log).unwrap();
+        meta::write(
+            &refused,
+            &meta::Meta::new(session, "codex".into(), String::new()),
+        )
+        .unwrap();
+        lab.git(&refused, &["add", "."]);
+        lab.git(&refused, &["commit", "-m", "Save synthetic session"]);
+        let store = agit::domain::store::Store::at(lab.home.join("store"));
+        let mut claim = agit::domain::link::Link::new("codex", native, None);
+        claim.owner = Some("alice".into());
+        claim.agent = Some("refused".into());
+        claim.branch = Some("work".into());
+        claim.claimed_by = Some(agit::domain::link::launch::CONFIRMED.into());
+        agit::domain::link::write(&store, &claim).unwrap();
+        let directory = lab.root.path().join(".codex/sessions/2026/11/01");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!("rollout-2026-11-01T00-00-00-{native}.jsonl")),
+            "{\n",
+        )
+        .unwrap();
+        let before = lab.state();
+        let mut command = lab.command(env!("CARGO_BIN_EXE_agit"));
+        if mode == "quiet" {
+            command.arg("--quiet");
+        }
+        if let Some(version) = mode.strip_prefix("json") {
+            command.args(["--json", "--json-version", version]);
+        }
+        command.args(["push", "alice/refused@work"]);
+        let output = lab.push_output(&mut command);
+        assert_output(&output, mode, 7, "could not verify this session");
+        assert_output(&output, mode, 7, "retry `agit push alice/refused@work`");
+        assert_output(
+            &output,
+            mode,
+            7,
+            "no command to reconstruct missing source facts",
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("it is a delegated session"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("it is a delegated session"));
+        assert_eq!(lab.state(), before, "{mode}: unreadable session");
+        lab.no_requests();
+
+        // Undoing a restorable parent drop clears the inherited hold, not other publication gates.
+        let parent = "bbbbbbbb-0000-4000-8000-000000000002";
+        let cwd = lab.root.path().join("work");
+        let parent_header =
+            serde_json::json!({"type":"session_meta","payload":{"id":parent,"cwd":cwd}});
+        let parent_session = format!("agit-{}", "b".repeat(40));
+        let parent_log = agit::domain::transcript::wrap_lines(
+            &format!("{parent_header}\n"),
+            "codex",
+            &parent_session,
+        );
+        lab.git(&refused, &["checkout", "-b", "parent", "main"]);
+        agit::domain::storage::write_snapshot(&refused, &parent_log, &parent_log).unwrap();
+        meta::write(
+            &refused,
+            &meta::Meta::new(parent_session, "codex".into(), cwd.display().to_string()),
+        )
+        .unwrap();
+        lab.git(&refused, &["add", "."]);
+        lab.git(&refused, &["commit", "-m", "Save synthetic parent"]);
+        lab.git(&refused, &["checkout", "work"]);
+        let parent_refs = lab.git(&refused, &["show-ref"]);
+        let mut parent_claim = agit::domain::link::Link::new("codex", parent, Some(&cwd));
+        parent_claim.owner = Some("alice".into());
+        parent_claim.agent = Some("refused".into());
+        parent_claim.branch = Some("parent".into());
+        parent_claim.claimed_by = Some(agit::domain::link::launch::CONFIRMED.into());
+        agit::domain::link::write(&store, &parent_claim).unwrap();
+        fs::write(
+            directory.join(format!("rollout-2026-11-01T00-00-00-{parent}.jsonl")),
+            format!("{parent_header}\n"),
+        )
+        .unwrap();
+        let child_header = serde_json::json!({"type":"session_meta","payload":{"id":native,"cwd":cwd,"thread_source":"subagent","parent_thread_id":parent}});
+        fs::write(
+            directory.join(format!("rollout-2026-11-01T00-00-00-{native}.jsonl")),
+            format!("{child_header}\n"),
+        )
+        .unwrap();
+        // Let drop finish startup bookkeeping before the refusal's immutable-state snapshot.
+        fs::create_dir_all(lab.home.join("projects")).unwrap();
+        let dropped = lab
+            .command(env!("CARGO_BIN_EXE_agit"))
+            .args(["project", "drop", "alice/refused@parent"])
+            .output()
+            .unwrap();
+        assert!(dropped.status.success(), "{dropped:?}");
+        let before = lab.state();
+        let output = lab.push_output(&mut command);
+        assert_output(&output, mode, 7, "agit project undrop alice/refused@parent");
+        assert_eq!(lab.state(), before, "{mode}: parent held");
+        lab.no_requests();
+        let restored = lab
+            .command(env!("CARGO_BIN_EXE_agit"))
+            .args(["project", "undrop", "alice/refused@parent"])
+            .output()
+            .unwrap();
+        assert!(restored.status.success(), "{restored:?}");
+        command.arg("--dry-run");
+        let released = lab.push_output(&mut command);
+        assert_output(
+            &released,
+            mode,
+            1,
+            "new destination needs an immutable repository identity",
+        );
+        assert_eq!(lab.git(&refused, &["show-ref"]), parent_refs);
+        lab.no_requests();
     }
 }

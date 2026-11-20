@@ -120,6 +120,38 @@ at the terminal, and `--yes` cannot replace its review or final confirmation.
 
 ## Session authority and first publication
 
+If push cannot verify a Codex conversation's upload permissions, restore readable original
+conversation records, any required parent conversations, and local project settings on the
+computer that holds them, then retry the same explicit `agit push owner/repo@branch`.
+An incomplete export cannot supply missing source facts, and there is no command to override
+this refusal. Do not invent origin markers or delete claims to get past it.
+
+When the original native conversation is available but needs a new import, inspect its choices
+with `agit import <native-id> --from codex --into owner/repo@<new-branch> --propose-lineage --json`.
+Run this on the computer holding verifiable original records, with an explicit destination branch.
+Follow the actual returned lineage choice; use `--independent` only for an independent history.
+Then push the imported branch. Import still preserves source ownership, and publication rechecks
+parent permissions. A new branch or independent import is not an override for a true delegate.
+
+For a confirmed delegated conversation, the refusal names the parent's restriction and the
+applicable next step:
+
+- A dropped parent branch can be restored with `agit project undrop owner/repo@parent-branch`
+  when the user wants its recording and uploads restored. Undo refuses if the original claim or
+  branch can no longer be restored safely; it does not manufacture a replacement parent.
+- An off parent folder can be enabled with `agit on <parent-folder>` only when the user wants
+  automatic saving and uploading for that folder. Earlier parent history can remain excluded.
+- To include excluded parent history, run `agit save <parent-native-id>` in its folder only if
+  the user also wants that parent's conversation uploaded. This can save it into a new branch.
+- A parent belonging to another repository or outside the allowed folder scope cannot authorize
+  this branch's current destination. Use the parent's permitted repository and explicitly chosen
+  folder scope. The refusal provides a status or import-inspection entry; neither changes policy.
+- A different recorded parent hold must be resolved according to the parent's own refusal,
+  visible through `agit push owner/repo@parent-branch --dry-run`.
+
+After resolving the parent's restriction, retry the child's explicit push. Other source, privacy
+and destination checks still apply. There is no child-only override of a parent's restriction.
+
 New sessions record their creator and default to plain publication. Existing plain sessions
 retain their registered plain mode. Unknown local sessions require registration before a dry run;
 only the Hub's explicit unregistered-session response permits registration. Missing permissions,
