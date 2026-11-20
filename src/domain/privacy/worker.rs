@@ -95,9 +95,43 @@ struct Loaded {
     /// The other journals on the device, as of this load; their blocks are part of the policy.
     device: Option<DeviceStamp>,
     cursor: i64,
+    /// Journal progress cannot clear a failed adoption or an unreadable inherited policy.
+    policy_complete: bool,
+    inherited_blocks: Vec<(Zeroizing<String>, policy::Source)>,
+    inherited_allows: Vec<Zeroizing<String>>,
     policy_generation: i64,
     portable_scope: Option<String>,
     projector: Projector,
+}
+
+impl Loaded {
+    fn compile_policy(&mut self) -> crate::Result<()> {
+        self.projector
+            .store
+            .resolve_policy(&self.projector.dictionary)?;
+        let blocks: Vec<_> = self
+            .inherited_blocks
+            .iter()
+            .map(|(value, source)| policy::Literal {
+                value: value.as_str(),
+                source: *source,
+            })
+            .collect();
+        let allows: Vec<_> = self
+            .inherited_allows
+            .iter()
+            .map(|value| value.as_str())
+            .collect();
+        self.projector.policy =
+            management::compile(&self.projector, self.repo.as_deref(), &blocks, &allows)?
+                .with_entropy(if crate::infra::config::privacy_entropy_replace() {
+                    super::detector::Entropy::Include
+                } else {
+                    super::detector::Entropy::Exclude
+                });
+        self.policy_generation = self.projector.store.policy_generation()?;
+        Ok(())
+    }
 }
 
 pub(crate) fn read_frame(reader: &mut impl Read) -> crate::Result<Zeroizing<Vec<u8>>> {
@@ -885,6 +919,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
     if !loaded.as_ref().is_some_and(|loaded| {
         loaded.repo == request.repo
             && loaded.route == route
+            && loaded.policy_complete
             && loaded.stamp == stamp
             && device.is_some()
             && loaded.device == device
@@ -903,13 +938,14 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             let _ = super::association::remember(&mut store, repo);
         }
         let mut dictionary = Dictionary::default();
-        let (cursor, mut complete) = store.load_since(&mut dictionary, 0, |version| {
+        let (cursor, journal_complete) = store.load_since(&mut dictionary, 0, |version| {
             keys::cached(
                 &root,
                 owner.as_ref().context("privacy owner is not available")?,
                 Some(version),
             )
         })?;
+        let mut policy_complete = true;
         if let Some(owner) = &owner {
             let adopted = credential
                 .as_ref()
@@ -924,7 +960,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                     }
                     .adopt(&mut store, &mut dictionary, None)
                 });
-            complete &= adopted.unwrap_or(false);
+            policy_complete &= adopted.unwrap_or(false);
         }
         lap("journal_ms", &mut phases);
         let global = (|| -> crate::Result<crate::domain::secret_filter::Matcher> {
@@ -934,7 +970,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             crate::domain::secret_filter::VaultStore::open_default()?.matcher()
         })();
         let global_whole = global.is_ok();
-        complete &= global_whole;
+        policy_complete &= global_whole;
         let global = global.unwrap_or_default();
         let legacy = request
             .repo
@@ -956,7 +992,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
                     legacy_whole &= dictionary.accept(record).is_ok();
                 }
             } else {
-                complete = false;
+                policy_complete = false;
             }
         }
         for (id, value) in global.patterns() {
@@ -1010,7 +1046,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
         let device_whole = device_rules
             .as_ref()
             .is_ok_and(|rules| rules.unreadable.is_empty());
-        complete &= device_whole && legacy_whole;
+        policy_complete &= device_whole && legacy_whole;
         let device_rules = device_rules.unwrap_or_default();
         blocks.extend(
             device_rules
@@ -1038,7 +1074,7 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             dictionary,
             policy: policy::Snapshot::compile(&[], &[], true)?,
             key,
-            complete,
+            complete: journal_complete && policy_complete,
             missing: (!device_whole)
                 .then_some(super::projector::Reason::DeviceRules)
                 .or((!legacy_whole || !global_whole)
@@ -1060,6 +1096,15 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             stamp,
             device,
             cursor,
+            policy_complete,
+            inherited_blocks: blocks
+                .iter()
+                .map(|rule| (Zeroizing::new(rule.value.to_owned()), rule.source))
+                .collect(),
+            inherited_allows: allows
+                .iter()
+                .map(|value| Zeroizing::new((*value).to_owned()))
+                .collect(),
             policy_generation,
             portable_scope,
             projector,
@@ -1092,8 +1137,13 @@ fn execute(request: &Request, loaded: &mut Option<Loaded>) -> crate::Result<Outc
             )
         },
     )?;
+    // A newly readable dictionary may supply values for rules absent from the compiled policy.
+    // Publish completeness only after those rules have been compiled successfully.
+    if complete && !loaded.projector.complete {
+        loaded.compile_policy()?;
+    }
     loaded.cursor = cursor;
-    loaded.projector.complete &= complete;
+    loaded.projector.complete = loaded.policy_complete && complete;
     loaded.projector.key = owner
         .as_ref()
         .and_then(|owner| keys::cached(&root, owner, None).ok());

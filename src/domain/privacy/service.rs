@@ -545,6 +545,13 @@ impl std::fmt::Display for Pending {
                 "privacy check refused: a record exceeds the supported size; reduce the record before trying again; nothing was committed"
             );
         }
+        if self.reason == Some(Reason::SourceIncomplete) {
+            return write!(
+                f,
+                "privacy check pending (source_incomplete); nothing was committed; {}",
+                super::pending::SOURCE_INCOMPLETE_STEP
+            );
+        }
         write!(
             f,
             "privacy check pending ({}); nothing was committed, and the next attempt tries again",
@@ -584,10 +591,9 @@ pub fn reason_name(reason: Option<Reason>) -> &'static str {
     }
 }
 
-/// Whether a wait reported under `reason` (a [`reason_name`]) can pass when the worker is asked
-/// again shortly: it was busy, starting, backing off, out of budget, garbled its reply, or could
-/// not load the whole policy yet. The other reasons, and one this build doesn't know, name
-/// something the person has to change.
+/// Whether a wait reported under `reason` (a [`reason_name`]) is eligible for bounded retries.
+/// Incomplete loading can make progress, but an unavailable dependency can keep it incomplete;
+/// retry eligibility does not promise recovery without repair.
 pub fn transient(reason: &str) -> bool {
     matches!(
         reason,
