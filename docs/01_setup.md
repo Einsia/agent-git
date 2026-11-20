@@ -21,6 +21,47 @@ script did not run, run `agit setup` once yourself. It sets up the runtimes inst
 so run it again after installing another. What the npm package itself does is in
 [`../npm/README.md`](../npm/README.md).
 
+### Hook installation and controls
+
+Global npm installation and create-agit normally invoke `agit setup`; local npm
+dependencies/prefix installs and npm exec do not use the global setup path.
+`AGIT_SKIP_SETUP=1` skips setup and reminders, not invocation of hooks already
+installed or other installer work. An ordinary setup reminder previews changes
+and asks before installing. Upgrade refreshes installed Skills and can configure
+new runtimes after an earlier setup, respecting a declined setup and Skill opt-outs.
+
+Setup prints the target before writing and distinguishes `updated` from
+`already configured`. Claude uses the selected profile's `settings.json`
+(`CLAUDE_CONFIG_DIR`, normally `~/.claude`); Codex uses `$CODEX_HOME/hooks.json`
+(normally `~/.codex/hooks.json`). npm may hide setup's output. Open the hook
+entries in those files to inspect them; avoid sharing the whole configuration.
+
+| Configured action | Purpose |
+| --- | --- |
+| SessionStart: `agit hooks ingest` | Connect session state and show capture/upload notices |
+| Stop: `agit hooks settle` | Save eligible conversation turns; upload follows the folder/repository settings |
+| Claude on Unix, PermissionRequest: `agit hooks native-permission` | Relay remote-control permission requests while the native prompt stays available |
+| Claude on Unix, SessionStart: `agit hooks relay` | Receive remote-control messages asynchronously |
+
+Codex commands include `--runtime codex`. It requires approval of the exact
+command and enabled hooks; use its `/hooks` review and controls. Claude's
+`agit doctor` row checks configuration presence only, not effective execution
+or save/upload results. Other runtimes use their own events or native plugins.
+An existing Claude RC integration may also receive the SessionStart relay during
+ordinary startup; that migration respects `disableAllHooks` and does not add Stop.
+
+| To do this | Use | Boundary |
+| --- | --- | --- |
+| Pause a folder's automatic capture | `agit off [DIR]` | Hooks/history remain; explicitly linked sessions can still save locally |
+| Stop automatic turn saving | `agit config --global commit.auto false` | Hooks and SessionStart remain; queued work is not undone. Restore with `true`; explicit commits remain available |
+| Stop a hook's invocation | Disable/remove only that AgentGit hook entry in the runtime configuration | Keep other hooks and settings. A later full setup can add the entry again |
+
+There is no `agit setup --remove-hooks` option; removing the Skill does not remove
+Claude/Codex hooks. Hook installation alone does not enroll an arbitrary folder
+for upload, and Stop saves conversation history rather than a code commit.
+Synchronous Stop paths can wait on local saving or upload. The separate Claude
+reply-wait timeout and relay's async setting do not bound the whole Stop hook.
+
 Do not install `@einsia/agentgit` (no hyphen) — that is a different CLI from
 before the rewrite, and its protocol does not match this branch.
 

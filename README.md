@@ -81,6 +81,11 @@ pnpm (`pnpm add -g @einsia/agent-git`) the install script configures nothing. If
 script did not run, run `agit setup` once yourself. It sets up the runtimes installed at the time,
 so run it again after installing another.
 
+Setup lists the hook configuration files, events and purposes it installs.
+See [hook installation and controls](docs/01_setup.md#hook-installation-and-controls)
+for installation timing, inspection and the different scopes of pausing capture,
+stopping automatic saving and disabling a runtime hook.
+
 The Linux artifact is **musl static-linked**, so no minimum glibc — the
 release pipeline runs every Linux binary inside an Alpine / Amazon Linux /
 Debian / Ubuntu container matrix before publishing.

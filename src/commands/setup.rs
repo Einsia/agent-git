@@ -2,7 +2,7 @@
 //! default except the project `AGENTS.md` section, which only `--agents-md` writes; without it
 //! everything still works, at the manual pace.
 //!
-//! * `--hooks`: settle automatically at the end of a turn (silent; a failure never blocks) +
+//! * `--hooks`: settle eligible turns automatically at turn end +
 //!   `AGIT_SESSION` injection + registering a newly opened unadopted session inside a bound
 //!   workspace as pending adoption. Discovery answers only "which ones exist". Claude Code,
 //!   hook-capable Codex and WorkBuddy receive `agit hooks` commands in their hook settings, one
@@ -617,17 +617,16 @@ fn hook_arguments(argv: &[&str], runtime: Option<&str>) -> String {
 /// never written twice, including when agit now runs from another executable path.
 fn install_hooks(runtime: Targets<'_>) -> SetupReport {
     let mut report = SetupReport::default();
+    let mut configured_files = false;
     let exe = exe_str();
 
     if runtime.wants("claude-code") {
         match claude_settings() {
-            Some(path) => report.merge(install_hook_file(
-                &path,
-                "Claude Code",
-                &exe,
-                None,
-                CLAUDE_HOOKS,
-            )),
+            Some(path) => {
+                let installed = install_hook_file(&path, "Claude Code", &exe, None, CLAUDE_HOOKS);
+                configured_files |= installed.items > 0;
+                report.merge(installed);
+            }
             None => {
                 ui::warning("cannot install Claude Code hooks: HOME is not set");
                 report.merge(SetupReport::failure());
@@ -643,8 +642,12 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
             Some(capability) => match codex_home_path().map(|h| h.join("hooks.json")) {
                 Some(path) => {
                     let installed = install_hook_file(&path, "Codex", &exe, Some("codex"), &[]);
+                    configured_files |= installed.items > 0;
                     report.merge(installed);
                     if installed.succeeded() {
+                        ui::info(
+                            "  Review and control AgentGit's Codex hooks in Codex's /hooks menu.",
+                        );
                         if capability.enabled {
                             report_codex_review(installed.changed > 0);
                         } else {
@@ -672,27 +675,35 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
 
     if runtime.wants("workbuddy") {
         match crate::adapter::workbuddy::home() {
-            Ok(root) => report.merge(install_hook_file(
-                &root.join("settings.json"),
-                "WorkBuddy",
-                &exe,
-                Some("workbuddy"),
-                &[],
-            )),
+            Ok(root) => {
+                let installed = install_hook_file(
+                    &root.join("settings.json"),
+                    "WorkBuddy",
+                    &exe,
+                    Some("workbuddy"),
+                    &[],
+                );
+                configured_files |= installed.items > 0;
+                report.merge(installed);
+            }
             Err(_) => report.merge(SetupReport::failure()),
         }
     }
     // The user's own settings: Gemini does not run AfterAgent from a project's settings.
     if runtime.wants("gemini-cli") {
         match crate::adapter::gemini_cli::home() {
-            Ok(root) => report.merge(install_hook_events(
-                &root.join("settings.json"),
-                "Gemini CLI",
-                &exe,
-                Some("gemini-cli"),
-                GEMINI_HOOKS,
-                &[],
-            )),
+            Ok(root) => {
+                let installed = install_hook_events(
+                    &root.join("settings.json"),
+                    "Gemini CLI",
+                    &exe,
+                    Some("gemini-cli"),
+                    GEMINI_HOOKS,
+                    &[],
+                );
+                configured_files |= installed.items > 0;
+                report.merge(installed);
+            }
             Err(_) => report.merge(SetupReport::failure()),
         }
     }
@@ -721,6 +732,16 @@ fn install_hooks(runtime: Targets<'_>) -> SetupReport {
         report.merge(native::pi(&exe));
     }
 
+    if configured_files {
+        ui::info("  Inspect: open the hook entries in the files above.");
+        ui::info(
+            "  Pause this folder's automatic capture: agit off (explicitly linked sessions can still save locally).",
+        );
+        ui::info("  Stop automatic turn saving: agit config --global commit.auto false");
+        ui::info(
+            "  These controls leave hooks installed and do not undo queued work. To stop an invocation, disable/remove only that AgentGit hook entry in the runtime.",
+        );
+    }
     report
 }
 
@@ -1290,7 +1311,11 @@ fn install_hook_events(
     }
 
     let added = add_hooks(&mut doc, exe, runtime_flag, events, extra);
-    if added > 0 {
+    let result = if added > 0 {
+        ui::info(format_args!(
+            "  Updating {label} hooks in {}",
+            ui::tilde(path)
+        ));
         let text = match &original {
             None => serde_json::to_string_pretty(&doc).unwrap(),
             Some(text) => {
@@ -1318,18 +1343,37 @@ fn install_hook_events(
             return SetupReport::failure();
         }
         ui::info(format_args!(
-            "  {} {label} hooks → {}",
+            "  {} {label} hooks updated in {}",
             ui::ok(ui::theme::symbols().check),
             ui::tilde(path)
         ));
         SetupReport::changed_item()
     } else {
         ui::info(format_args!(
-            "  {} {label} hooks already in place",
-            ui::dim("·")
+            "  {} {label} hooks already configured in {}",
+            ui::dim("·"),
+            ui::tilde(path)
         ));
         SetupReport::item()
+    };
+    for (event, argv) in events
+        .iter()
+        .copied()
+        .chain(extra.iter().map(|(event, argv, _)| (*event, *argv)))
+    {
+        let purpose = match argv {
+            ["hooks", "ingest"] => "connect session state and show capture/upload notices",
+            ["hooks", "settle"] => "save eligible turns; upload follows your settings",
+            ["hooks", "native-permission"] => "relay remote-control permission requests",
+            ["hooks", "relay"] => "receive remote-control messages",
+            _ => "run the configured AgentGit integration",
+        };
+        ui::info(format_args!(
+            "    {event}: {} — {purpose}",
+            hook_arguments(argv, runtime_flag)
+        ));
     }
+    result
 }
 
 /// Retires the hooks agit no longer installs and puts in agit's current ones, in `doc`, an object
