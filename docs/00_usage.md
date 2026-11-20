@@ -991,6 +991,7 @@ agit branch --repo alice/payments
 | ---------------------- | --------------------------------------------------------- |
 | Sign in / identity     | `login` `logout` `whoami` `config`                        |
 | Create / fetch repos   | `init` `clone` `repo` (create/list/info/visibility/collab/invite/rename/delete/path) |
+| Invite an org member   | [`org invite <org> --user <username>`](commands/org.md) |
 | Adopt / status         | `import` `status` `switch` `branch` (rename/rm/seal)      |
 | Record                 | `commit` `tag` `memory` (status/diff/distill/sync) `distill` |
 | Inspect                | `log` `show` `diff` `view`                                |

@@ -342,6 +342,7 @@ fn prepare_startup(
         | Startup::ScopedImport
         | Startup::ScopedReview
         | Startup::RemoteSearch
+        | Startup::RemoteOrganization
         | Startup::LocalSearch
         | Startup::ScopedActivity
         | Startup::OfflineListing
@@ -427,6 +428,8 @@ enum Startup {
     ScopedReview,
     /// Search queries the Hub without inspecting or migrating local repositories.
     RemoteSearch,
+    /// Organization invitations use explicit Hub targets and do not inspect local repositories.
+    RemoteOrganization,
     /// Offline search must not run update checks or create migration/cache state.
     LocalSearch,
     /// Activity checks recovery only for the repository it reads locally; a Hub query reads none.
@@ -469,6 +472,7 @@ impl Startup {
                 | Self::Finish
                 | Self::ScopedReview
                 | Self::RemoteSearch
+                | Self::RemoteOrganization
                 | Self::LocalSearch
                 | Self::ScopedActivity
                 | Self::OfflineListing
@@ -504,6 +508,7 @@ fn startup_for(command: &Commands) -> Startup {
         Commands::Project(_) => Startup::ScopedImport,
         Commands::Search(args) if args.local => Startup::LocalSearch,
         Commands::Search(_) => Startup::RemoteSearch,
+        Commands::Org(_) => Startup::RemoteOrganization,
         Commands::Activity(_) => Startup::ScopedActivity,
         Commands::Remote(_) => Startup::OfflineListing,
         Commands::Mcp(_) => Startup::ToolDispatcher,
@@ -641,6 +646,7 @@ fn dispatch(cmd: Commands, json: bool) -> i32 {
         Commands::Clone(a) => commands::clone::run(a),
         Commands::Run(a) => commands::run::run(a),
         Commands::Repo(a) => commands::repo::run(a),
+        Commands::Org(a) => commands::org::run(a, json),
 
         Commands::Import(a) => commands::import::run_with_output(a, json),
         Commands::Project(a) => commands::project::run(a),

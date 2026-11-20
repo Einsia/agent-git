@@ -431,6 +431,14 @@ mod tests {
                 "/private-canary/state",
             ],
             vec!["agit", "doctor", "--storage", "/private-canary/state"],
+            vec![
+                "agit",
+                "org",
+                "invite",
+                "private-owner",
+                "--user",
+                "private-canary",
+            ],
         ] {
             let output = capture(&argv).to_string();
             for canary in [

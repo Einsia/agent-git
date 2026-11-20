@@ -30,6 +30,7 @@ pub mod whoami;
 // Repositories
 pub mod clone;
 pub mod init;
+pub mod org;
 pub mod repo;
 pub mod run;
 
@@ -1465,6 +1466,8 @@ pub enum Commands {
     Run(run::Args),
     /// Repo administration: create/list/info/visibility/collab/invite/rename/delete/path
     Repo(repo::Args),
+    /// Organization membership invitations (owners only)
+    Org(org::Args),
 
     // ── Adoption and status ─────────────────────────────────────────
     /// Adopt a running session; import settles immediately (cursor picker; --link-only works offline)
@@ -1593,6 +1596,7 @@ pub fn command_name(command: &Commands) -> &'static str {
         Commands::Clone(_) => "clone",
         Commands::Run(_) => "run",
         Commands::Repo(_) => "repo",
+        Commands::Org(_) => "org",
         Commands::Import(_) => "import",
         Commands::Project(_) => "project",
         Commands::Status(_) => "status",
