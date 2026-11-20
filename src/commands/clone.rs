@@ -40,8 +40,8 @@
 //! local path and git hard-links the objects, so copying a very large agent costs almost no extra
 //! space.
 //!
-//! The read-only tier does not need this step: clone the other side's repo directly, with the same
-//! full history.
+//! The read-only tier clones the source directly. With no explicit branch or version, a fresh
+//! checkout takes the remote default branch's complete history without other branches or tags.
 //!
 //! When the source is an agent already under your own name both steps are skipped: there is
 //! nothing to copy, and this route is "carry on from another machine".
@@ -297,6 +297,19 @@ impl ProgressOutput {
 }
 
 fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
+    if let Some(Ref::Branch(branch)) = args
+        .target
+        .as_deref()
+        .and_then(|target| split_ref(target).1)
+    {
+        crate::input_argument(crate::domain::repo::valid_branch_name(&branch))?;
+        let checked = crate::infra::git_runtime::command()
+            .args(["check-ref-format", &format!("refs/heads/{branch}")])
+            .output()?;
+        if !checked.status.success() {
+            return crate::input_argument(Err(anyhow::anyhow!("invalid branch name")));
+        }
+    }
     if let Some(supplied) = &args.adopt_legacy_agent_id {
         crate::input_argument(
             uuid::Uuid::parse_str(supplied.trim()).context("invalid --adopt-legacy-agent-id"),
@@ -412,12 +425,15 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
     // Whether the refs under `origin/` are what the Hub holds now rather than a stale copy.
     let mut remote_current = true;
     let mut resolved_version = None;
+    let acquisition_progress =
+        ui::publication::Progress::start_with_summary("Repository acquisition time");
     if existed {
         progress.notice(format_args!("updating {}…", ui::bold(&slug)));
         let store = Repo::at(&dest);
         // Align the remotes before fetching: the hub address changes, and a read-only checkout's
         // origin is the very source to fetch from.
         plan.apply_remotes(&store, true, args.adopt_legacy_agent_id.as_deref())?;
+        let phase = ui::publication::stage("Updating repository history");
         // Fast-forward only. Divergence does no text merge — that interleaves two sessions' lines
         // and breaks the message chain, producing a syntactically valid but semantically corrupt
         // transcript.
@@ -451,8 +467,20 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                 Ok(outcome)
             }
             Ok(None) => {
-                let fetch =
-                    crate::hub::git::TagFetch::prepare(&store, &["fetch", "origin", "--tags"]);
+                let branch_mapping = match &want {
+                    Some(Ref::Branch(branch)) => Some(format!(
+                        "remote.origin.fetch=+refs/heads/{branch}:refs/remotes/origin/{branch}"
+                    )),
+                    _ => None,
+                };
+                let mut args = Vec::new();
+                if let Some(mapping) = &branch_mapping {
+                    // A default clone's mapping omits other branches. An invocation-local
+                    // mapping also preserves TagFetch's configured tag exclusions.
+                    args.extend(["-c", mapping.as_str()]);
+                }
+                args.extend(["fetch", "origin", "--tags"]);
+                let fetch = crate::hub::git::TagFetch::prepare(&store, &args);
                 let fetched =
                     crate::hub::git::run_for_remote(&store, &fetch.args(), &plan.identity);
                 fetch.report();
@@ -464,6 +492,11 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Ok(out) => out,
             Err(error) => return local_transport_failure(error),
         };
+        if out.ok() {
+            phase.finish();
+        } else {
+            drop(phase);
+        }
         let updates_current = !selected_only
             || matches!(
                 &want,
@@ -498,6 +531,11 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Some(Ref::Branch(branch)) => Some(branch.as_str()),
             _ => None,
         };
+        let phase = ui::publication::stage(match &want {
+            Some(Ref::Version(_)) => "Fetching selected version history",
+            Some(Ref::Branch(_)) => "Fetching selected branch history",
+            None => "Fetching default branch history",
+        });
         let scoped_version = match &want {
             Some(Ref::Version(version)) => {
                 crate::hub::git::clone_version(&clone_url, &dest, &plan.identity, version)
@@ -508,6 +546,10 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
             Some(transfer) => {
                 resolved_version = transfer.commit;
                 Ok(transfer.outcome)
+            }
+            None if matches!(&want, Some(Ref::Version(_))) => {
+                // A legacy server cannot locate a version's carrier; it may exist only under a tag.
+                crate::hub::git::clone(&clone_url, &dest, &plan.identity)
             }
             None => crate::hub::git::clone_selected(&clone_url, &dest, &plan.identity, selected),
         });
@@ -543,8 +585,10 @@ fn run_with_progress(args: Args, progress: ProgressOutput) -> CmdResult {
                 ExitCode::Network
             });
         }
+        phase.finish();
         plan.apply_remotes(&Repo::at(&dest), false, None)?;
     }
+    drop(acquisition_progress);
 
     let store = Repo::at(&dest);
     plan.report(&src_owner, &src_name, progress);

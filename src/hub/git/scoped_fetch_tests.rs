@@ -1,3 +1,85 @@
+/// A default pickup keeps complete remote-HEAD ancestry without downloading unrelated histories.
+/// An old Hub without scoped-fetch support must retain the same transfer boundary.
+#[test]
+fn default_clone_uses_remote_head_full_history_without_other_branches_or_tags() {
+    use crate::domain::repo::Repo;
+    let home = IsolatedHome::new();
+    let source = Repo::init(&home.workspace().join("default-source")).unwrap();
+    source
+        .git(&["config", "user.name", "Synthetic Reader"])
+        .unwrap();
+    source
+        .git(&["config", "user.email", "reader@example.invalid"])
+        .unwrap();
+    source
+        .git(&["symbolic-ref", "HEAD", "refs/heads/develop"])
+        .unwrap();
+    source
+        .git(&["commit", "--allow-empty", "-m", "default root"])
+        .unwrap();
+    let root = source.git(&["rev-parse", "HEAD"]).unwrap();
+    source
+        .git(&["commit", "--allow-empty", "-m", "default child"])
+        .unwrap();
+    let head = source.git(&["rev-parse", "HEAD"]).unwrap();
+    let tree = source.git(&["rev-parse", "HEAD^{tree}"]).unwrap();
+    let unrelated = source
+        .git(&["commit-tree", &tree, "-m", "unrelated history"])
+        .unwrap();
+    source
+        .git(&["update-ref", "refs/heads/main", &unrelated])
+        .unwrap();
+    source.git(&["tag", "unrelated-tag", &unrelated]).unwrap();
+    source.git(&["tag", "default-tag", &head]).unwrap();
+    let source_path = source.root().to_owned();
+    let hub = FakeHub::with_config(serde_json::json!({}), move |request| {
+        assert_eq!(
+            request.header("X-AgentGit-Expected-Agent-Id"),
+            Some(AGENT_ID)
+        );
+        assert_eq!(request.header(super::scoped_fetch::HEADER), None);
+        scoped_git_reply(&source_path, request)
+    });
+    config::set_global("hub.url", Some(&hub.base)).unwrap();
+    credentials::save(&hub.base, &pair(&hub.base, "alice")).unwrap();
+    let identity = RemoteIdentity::new(&hub.base, AGENT_ID).unwrap();
+    let dest = home.workspace().join("default-clone");
+    assert!(
+        super::clone_selected(
+            &format!("{}/alice/example.git", hub.base),
+            &dest,
+            &identity,
+            None,
+        )
+        .unwrap()
+        .ok()
+    );
+    let repo = Repo::at(&dest);
+    assert_eq!(
+        repo.git(&["symbolic-ref", "HEAD"]).unwrap().trim(),
+        "refs/heads/develop"
+    );
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), head);
+    assert_eq!(repo.git(&["rev-parse", "HEAD^"]).unwrap(), root);
+    assert_eq!(
+        repo.git(&["rev-parse", "--is-shallow-repository"])
+            .unwrap()
+            .trim(),
+        "false"
+    );
+    assert!(!repo.has_ref("refs/remotes/origin/main"));
+    assert!(repo.git_opt(&["cat-file", "-e", &unrelated]).is_none());
+    assert!(repo.git(&["tag", "--list"]).unwrap().trim().is_empty());
+    assert_eq!(
+        repo.git(&["config", "--get-all", "remote.origin.fetch"])
+            .unwrap()
+            .trim(),
+        "+refs/heads/develop:refs/remotes/origin/develop"
+    );
+    assert_eq!(super::super::identity::read(&repo).unwrap(), Some(identity));
+    hub.finish();
+}
+
 /// A credential retry rediscovers its scope, and unavailable selected refs cannot reuse local state.
 #[test]
 fn scoped_branch_pickup_binds_discovery_and_git_retries_to_one_reader() {

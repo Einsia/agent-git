@@ -7123,7 +7123,10 @@ fn an_encrypted_session_continues_as_plain_and_keeps_its_published_turns() {
         },
     )
     .unwrap();
-    assert_success(&run_home(&["clone", "alice/app", "--no-bind"], &grantee));
+    assert_success(&run_home(
+        &["clone", "alice/app@work", "--no-bind"],
+        &grantee,
+    ));
     let theirs = Repo::at(grantee.join("repos/alice/app"));
     theirs
         .git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
@@ -8179,7 +8182,7 @@ fn records_from_an_encrypted_session_go_up_as_published_or_are_refused() {
             .output()
             .unwrap()
     };
-    assert_success(&run_other(&["clone", "alice/app", "--no-bind"]));
+    assert_success(&run_other(&["clone", "alice/app@secret", "--no-bind"]));
     let theirs = Repo::at(other_home.join("repos/alice/app"));
     theirs
         .git(&["config", "http.userAgent", TRANSPORT_USER_AGENT])
@@ -9954,17 +9957,13 @@ fn diverged_session_branch_names_the_divergence_and_next_commands() {
     ));
     assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@main"]));
     assert_success(&run_in(&desktop, &["--yes", "push", "alice/app@work"]));
-    assert_success(&run_in(&laptop, &["clone", "alice/app", "--no-bind"]));
+    assert_success(&run_in(&laptop, &["clone", "alice/app@work", "--no-bind"]));
     let laptop_repo = laptop.join("repos/alice/app");
     git(
         &laptop_repo,
         &["config", "http.userAgent", TRANSPORT_USER_AGENT],
     );
-    let laptop_work = temp.path().join("laptop-work");
-    git(
-        &laptop_repo,
-        &["worktree", "add", laptop_work.to_str().unwrap(), "work"],
-    );
+    let laptop_work = laptop.join("worktrees/alice/app/work");
 
     let desktop_work = desktop.join("worktrees/alice/app/work");
     fs::write(desktop_work.join("README.md"), "Desktop turn").unwrap();

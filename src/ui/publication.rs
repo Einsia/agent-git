@@ -1,4 +1,4 @@
-//! Progress belongs to one push invocation and ends before its output capture closes.
+//! Progress belongs to one operation and ends before its output capture closes.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,12 +31,16 @@ pub(crate) struct Progress {
 
 impl Progress {
     pub(crate) fn start() -> Self {
+        Self::start_with_summary("Publication processing time")
+    }
+
+    pub(crate) fn start_with_summary(summary: &'static str) -> Self {
         let enabled = !super::quiet() && !crate::commands::json::is_capturing();
         let (sender, worker) = if enabled {
             let (sender, receiver) = mpsc::channel();
             match std::thread::Builder::new()
-                .name("push-progress".into())
-                .spawn(move || render(receiver))
+                .name("operation-progress".into())
+                .spawn(move || render(receiver, summary))
             {
                 Ok(worker) => (Some(sender), Some(worker)),
                 Err(_) => (None, None),
@@ -147,7 +151,7 @@ impl Active {
     }
 }
 
-fn render(receiver: Receiver<Event>) {
+fn render(receiver: Receiver<Event>, summary: &str) {
     let bar = indicatif::ProgressBar::new_spinner();
     // The draw target owns visibility; stdout may have a different terminal than stderr.
     let spinner = if bar.is_hidden() {
@@ -249,10 +253,7 @@ fn render(receiver: Receiver<Event>) {
         elapsed += current.started.elapsed();
         emit(current.ended(false));
     }
-    emit(format!(
-        "Publication processing time: {:.1}s",
-        elapsed.as_secs_f64()
-    ));
+    emit(format!("{summary}: {:.1}s", elapsed.as_secs_f64()));
 }
 
 #[cfg(all(test, unix))]

@@ -171,7 +171,7 @@ mod unix {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(
             value["fix"][0]["argv"],
-            serde_json::json!(["agit", "clone", "--no-bind", "--", "alice/research"])
+            serde_json::json!(["agit", "clone", "--no-bind", "--", "alice/research@work"])
         );
         assert!(!lab.store.join("repos/alice/research").exists());
         assert_eq!(value["fix"][0]["requires_interaction"], false);
