@@ -513,7 +513,7 @@ fn upload_wait(lab: &Lab, targets: &[&str]) {
         .map(|target| {
             (
                 (*target).to_owned(),
-                serde_json::json!({"reason": "worker_unavailable", "since": 1_700_000_000}),
+                serde_json::json!({"reason": "source_incomplete", "since": 1_700_000_000}),
             )
         })
         .collect();
@@ -544,6 +544,8 @@ fn save_wait(lab: &Lab, targets: &[&str]) {
 /// `--repo` reports that repository alone: its sessions, its checkout and what waits in it, in
 /// text and JSON. The page counts the sessions it covers, not every claim. A report that took the
 /// claims in their own order, or listed every waiting upload or save, shows the other repository's.
+/// An incomplete check includes diagnostic steps: retry eligibility alone cannot tell a person
+/// how to investigate a persistent privacy dependency failure.
 #[test]
 fn a_repository_scope_reports_that_repository_only() {
     let lab = Lab::new();
@@ -588,6 +590,9 @@ fn a_repository_scope_reports_that_repository_only() {
         .map(|wait| wait["target"].as_str().unwrap())
         .collect();
     assert_eq!(waits, ["alice/notes@b-one"], "{status}");
+    let steps = value["upload_waits"][0]["steps"].to_string();
+    assert!(steps.contains("agit doctor"), "{status}");
+    assert!(steps.contains("agit secrets status --json"), "{status}");
     let saves: Vec<_> = value["save_waits"]
         .as_array()
         .unwrap()
@@ -617,6 +622,9 @@ fn a_repository_scope_reports_that_repository_only() {
     assert!(said.contains(ours[0]) && said.contains(ours[1]), "{said}");
     assert!(said.contains("alice/notes@b-one"), "{said}");
     assert!(said.contains("alice/notes@b-three"), "{said}");
+    assert!(said.contains("agit doctor"), "{said}");
+    assert!(said.contains("agit secrets status --json"), "{said}");
+    assert!(!said.contains("the next upload tries again"), "{said}");
     assert!(
         !said.contains("bob/wiki") && !said.contains(theirs),
         "{said}"

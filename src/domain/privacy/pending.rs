@@ -83,10 +83,6 @@ fn now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// The steps that end a wait for `reason`, worded for the person who reads it, or `None` when the
-/// wait ends by itself. A reason about this device's rules or about the content does not end by
-/// waiting, so it names what the person can do; any other reason is the worker's state, and the
-/// next attempt retries.
 /// Whether a wait's reason says the privacy worker could not run at all: it did not start, broke,
 /// or is held back after either. Such a wait ends by itself on a later attempt; one that keeps
 /// recurring points at a fault `agit doctor` names.
@@ -97,8 +93,13 @@ pub fn worker_unavailable(reason: &str) -> bool {
 /// What to do when a [`worker_unavailable`] wait keeps recurring.
 pub const WORKER_UNAVAILABLE_STEP: &str = "if it keeps failing, run `agit doctor`";
 
+/// Generic incompleteness can be bounded progress or a dependency no retry repairs.
+pub const SOURCE_INCOMPLETE_STEP: &str = "the local privacy check is incomplete; if this keeps recurring, run `agit doctor` and `agit secrets status --json` on this computer and resolve any reported account, key or rule problem before retrying. These checks may not identify every cause; waiting or restarting alone may not resolve it";
+
+/// Diagnostic or repair steps for a wait, including failures that can also recover on retry.
 pub fn steps(reason: &str) -> Option<Vec<String>> {
     match reason {
+        "source_incomplete" => Some(vec![SOURCE_INCOMPLETE_STEP.into()]),
         "device_rules" => Some(super::service::unreadable_rule_hints().unwrap_or_else(|_| {
             vec!["run `agit doctor` to see which privacy rules cannot be read".into()]
         })),

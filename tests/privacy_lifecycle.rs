@@ -668,7 +668,9 @@ fn a_rule_registered_on_this_device_protects_under_any_sign_in() {
 /// warns instead of reporting every rule readable. A worker that skipped the unreadable journal
 /// would pass the value it blocks through as Complete; one that reported the generic reason would
 /// leave the user no way to tell what to fix; a doctor that read a failed listing as an empty one
-/// would contradict the withheld content.
+/// would contradict the withheld content. The current journal also withholds while its key is
+/// absent, then resumes in the same worker with the restored rule enforced. Clearing completeness
+/// without rebuilding the policy would release the blocked value after the key returns.
 #[test]
 fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
     // Each step says when it finishes, so a run that waits names the step it waits in.
@@ -700,8 +702,26 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
     // Synchronization encrypts the rule under the account's key and caches the key.
     device.sync();
     step("sync");
-    device.sign_in(Some("another-account"));
     let text = format!("the value is {value}");
+    let owner = agit::domain::privacy::keys::owner(&hub.url, "fixture-account").unwrap();
+    let keys = agit::domain::privacy::keys::owner_directory(&device.home.join("privacy"), &owner)
+        .join("keys");
+    let saved_keys = device._root.path().join("saved-keys");
+    std::fs::rename(&keys, &saved_keys).unwrap();
+    let mut recovering = device.worker();
+    for _ in 0..2 {
+        let unavailable = recovering.protect(&text);
+        assert_ne!(unavailable["status"], "complete", "{unavailable}");
+        assert_eq!(unavailable["reason"], "source_incomplete", "{unavailable}");
+    }
+    std::fs::rename(&saved_keys, &keys).unwrap();
+    let recovered = recovering.protect(&text);
+    assert_eq!(recovered["status"], "complete", "{recovered}");
+    assert!(!recovered["content"].as_str().unwrap().contains(value));
+    drop(recovering);
+    step("current journal recovered");
+
+    device.sign_in(Some("another-account"));
     let readable = device.worker().protect(&text);
     step("readable protect");
     assert_eq!(readable["status"], "complete");
@@ -715,10 +735,18 @@ fn an_unreadable_journal_of_rules_withholds_and_names_its_account() {
         }
     }
     step("keys removed");
-    let unreadable = device.worker().protect(&text);
+    let mut withholding = device.worker();
+    let unreadable = withholding.protect(&text);
     step("unreadable protect");
     assert_ne!(unreadable["status"], "complete", "{unreadable}");
     assert_eq!(unreadable["reason"], "device_rules", "{unreadable}");
+    let still_unreadable = withholding.protect(&text);
+    assert_ne!(still_unreadable["status"], "complete", "{still_unreadable}");
+    assert_eq!(
+        still_unreadable["reason"], "device_rules",
+        "{still_unreadable}"
+    );
+    drop(withholding);
     let doctor = device.doctor();
     step("doctor");
     assert!(doctor.contains("fixture-account"), "{doctor}");
