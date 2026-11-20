@@ -2545,7 +2545,11 @@ fn assignable(
         super::fix::register(|| super::fix::FixCommand::current(&args, requires_interaction));
         anyhow::Error::new(super::Hinted {
             message: text,
-            hint: format!("to move it to {repository}, run this again with `--rebind`"),
+            hint: format!(
+                "to move this folder's future saving and uploads to {repository}, run this again \
+                 with `--rebind`; {}",
+                super::push::one_time_destination_hint(repository)
+            ),
         })
     };
     if let Some(binding) = workspace::read(root)
@@ -9807,12 +9811,22 @@ mod tests {
             format!("{error:#}").ends_with("already saves to alice/other."),
             "{error:#}"
         );
-        assert_eq!(
-            error
-                .downcast_ref::<crate::commands::Hinted>()
-                .unwrap()
-                .hint,
-            "to move it to alice/app, run this again with `--rebind`"
+        let hint = &error
+            .downcast_ref::<crate::commands::Hinted>()
+            .unwrap()
+            .hint;
+        assert!(
+            hint.contains("future saving and uploads to alice/app"),
+            "{hint}"
+        );
+        assert!(hint.contains("--rebind"), "{hint}");
+        assert!(
+            hint.contains("SOURCE_OWNER/SOURCE_REPO@SESSION_BRANCH --to 'alice/app'"),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("same Hub") && hint.contains("device-local RC"),
+            "{hint}"
         );
         let refusal = recovery.refusal.unwrap();
         assert_eq!(refusal["code"], "folder_bound_elsewhere");

@@ -205,6 +205,9 @@ pub fn run(args: Args) -> CmdResult {
         ui::hint(&format!(
             "to bind this directory to {owner}/{name} instead: `agit init {as_given} --rebind`"
         ));
+        ui::hint(&super::push::one_time_destination_hint(&format!(
+            "{owner}/{name}"
+        )));
         return Ok(ExitCode::Precondition);
     }
     let dir = crate::infra::config::repo_dir(&owner, &name)?;
