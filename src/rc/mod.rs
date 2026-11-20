@@ -88,7 +88,7 @@ pub mod grants;
 pub mod harness;
 pub mod identity;
 pub(crate) mod images;
-mod input_attachments;
+pub(crate) mod input_attachments;
 pub mod journal;
 pub(crate) mod lease;
 pub mod lifecycle;

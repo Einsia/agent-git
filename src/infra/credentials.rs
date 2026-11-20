@@ -250,9 +250,23 @@ pub fn load_at(path: &Path) -> Option<HubCredential> {
 
 /// Saving cannot transfer a credential between authorities.
 pub fn save(hub: &str, cred: &HubCredential) -> Result<()> {
+    save_with_previous_account(hub, cred).map(|_| ())
+}
+
+/// The previous account is evidence only after replacement succeeds under the mutation lock.
+pub(crate) fn save_with_previous_account(
+    hub: &str,
+    cred: &HubCredential,
+) -> Result<Option<String>> {
     let (path, cred) = bound_for_saving(hub, cred)?;
-    let _guard = mutation_guard(path.parent().context("credential directory is missing")?)?;
-    save_at(&path, &cred)
+    let directory = path.parent().context("credential directory is missing")?;
+    let _guard = mutation_guard(directory)?;
+    let previous = load_from(directory, &HubAuthority::parse(hub)?)
+        .ok()
+        .flatten()
+        .and_then(|previous| previous.account_id);
+    save_at(&path, &cred)?;
+    Ok(previous)
 }
 
 /// `cred` bound to `hub`, and the path it is saved at; a credential bound to another authority

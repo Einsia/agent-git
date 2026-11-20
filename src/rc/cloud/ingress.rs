@@ -295,6 +295,17 @@ struct ExecutionAuthority {
 }
 
 impl crate::rc::authority::Authority for ExecutionAuthority {
+    fn turn_files_owner(&self) -> Option<crate::rc::input_attachments::Owner> {
+        let grant = self.grant.as_ref()?;
+        if grant.session_controller.is_some()
+            || grant.project_controller.is_some()
+            || grant.caller != grant.target.owner
+            || grant.source.owner != grant.target.owner
+        {
+            return None;
+        }
+        Some(crate::rc::input_attachments::Owner::device(&grant.target))
+    }
     fn permits_turn_files(&self, session: &str) -> bool {
         self.role == "operator"
             && self.permit.is_controlled_turn_for(session)

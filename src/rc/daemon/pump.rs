@@ -58,6 +58,14 @@ impl Daemon {
             },
             chrono::Utc::now().timestamp_millis(),
         );
+        if crate::rc::input_attachments::sweep(
+            &crate::rc::rc_dir()?.join("task-attachments"),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .is_err()
+        {
+            eprintln!("agitd: attachment cleanup is incomplete");
+        }
         // Privacy dependencies are opened only by the isolated worker after daemon startup.
         let d = Arc::new(Mutex::new(Daemon {
             identity: identity.clone(),
@@ -283,6 +291,7 @@ impl Daemon {
         // The seq watermark persists periodically: a hard kill loses at most one
         // `WATERMARK_DEBOUNCE_MS` window of counting, and on reconnect the hub's
         // `persisted_seq` pushes it back up, so that loss is safe.
+        let mut attachment_sweep = std::time::Instant::now();
         let mut flush = tokio::time::interval(std::time::Duration::from_millis(
             crate::rc::journal::WATERMARK_DEBOUNCE_MS,
         ));
@@ -942,6 +951,18 @@ impl Daemon {
                     g.reload_grants();
                     // After the projections above, so a status reconciled on this tick is in it.
                     g.send_list_changes();
+                    drop(g);
+                    if attachment_sweep.elapsed() >= std::time::Duration::from_secs(60) {
+                        attachment_sweep = std::time::Instant::now();
+                        let result = tokio::task::spawn_blocking(|| -> crate::Result<()> {
+                            crate::rc::input_attachments::sweep(
+                                &crate::rc::rc_dir()?.join("task-attachments"), chrono::Utc::now().timestamp_millis(),
+                            )
+                        }).await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            eprintln!("agitd: attachment cleanup is incomplete");
+                        }
+                    }
                 }
                 Some(changes) = catalog_rx.recv() => {
                     // Rows the catalog found, changed or dropped: they are the local rows of

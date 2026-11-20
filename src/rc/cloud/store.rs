@@ -181,6 +181,11 @@ pub(crate) fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Resul
         enrollment.credential.device.certificate == *enrollment.identity.certificate(),
         "cloud enrollment certificate does not match its identity"
     );
+    let previous =
+        load_in(directory, &enrollment.credential.device.owner.issuer).unwrap_or_else(|_| {
+            eprintln!("agit: attachment cleanup is incomplete; previous enrollment is unknown");
+            None
+        });
     write(
         &directory.join(filename(&enrollment.credential.device.owner.issuer)?),
         &Stored {
@@ -189,7 +194,21 @@ pub(crate) fn save_in(directory: &Path, enrollment: &Enrollment) -> crate::Resul
             private_key: enrollment.identity.private_key_der().to_vec(),
             inbound_enabled: Some(enrollment.inbound_enabled),
         },
-    )
+    )?;
+    if let Some(previous) = previous {
+        let previous = previous.credential.device;
+        if crate::rc::input_attachments::Owner::device(&previous)
+            != crate::rc::input_attachments::Owner::device(&enrollment.credential.device)
+            && crate::rc::input_attachments::retire_device(
+                &directory.join("task-attachments"),
+                &previous,
+            )
+            .is_err()
+        {
+            eprintln!("agit: attachment cleanup is incomplete");
+        }
+    }
+    Ok(())
 }
 
 fn intent_path(hub: &str) -> crate::Result<PathBuf> {
