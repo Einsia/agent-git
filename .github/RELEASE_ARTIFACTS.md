@@ -72,7 +72,7 @@ covers both architectures at once.
 
 **Windows uses the native MSVC toolchain and NASM**, with the C runtime linked
 statically. GitLab validates the Windows artifact on a Windows x64 runner and
-packages both dev and staging channels. GitHub builds the production target on
+packages the dev channel. GitHub builds the production target on
 `windows-latest`; the artifact check verifies its PE machine type and runs the
 CLI with an isolated home before packaging.
 

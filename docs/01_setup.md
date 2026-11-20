@@ -194,11 +194,11 @@ one you started yourself first:
 export AGIT_HUB_URL=http://127.0.0.1:8177
 ```
 
-For an acceptance binary that defaults to staging without depending on a runtime
+For an acceptance binary that defaults to development without depending on a runtime
 environment variable:
 
 ```bash
-AGIT_DEFAULT_HUB_URL=https://staging.agent-git.com cargo build --release --locked
+AGIT_DEFAULT_HUB_URL=https://dev.agent-git.com cargo build --release --locked
 ```
 
 Credentials are stored per address, so the public hub and a self-hosted instance
