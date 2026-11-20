@@ -1789,7 +1789,14 @@ pub(crate) fn classify_response_message_for(
         )),
         "agent_message" => {
             let text = extract_content_text(message.get("content"))?;
-            let body = text.split_once("\nPayload:\n").map(|(_, body)| body.trim());
+            let body = text
+                .match_indices("\nPayload:")
+                .find_map(|(at, delimiter)| {
+                    let rest = &text[at + delimiter.len()..];
+                    rest.strip_prefix("\r\n")
+                        .or_else(|| rest.strip_prefix('\n'))
+                        .map(str::trim)
+                });
             match text.lines().next() {
                 Some("Message Type: NEW_TASK") => {
                     let task = text
@@ -3770,16 +3777,24 @@ mod tests {
             .collect();
         let task = captured[2]["payload"].clone();
         let mut records = vec![captured[0].clone(), captured[2].clone()];
-        for kind in ["MESSAGE", "FINAL_ANSWER", "NEW_TASK_EXTRA"] {
+        let final_body = "review complete\r\nPayload:\nquoted body marker";
+        for (kind, newline, body) in [
+            ("MESSAGE", "\n", "progress"),
+            ("FINAL_ANSWER", "\r\n", final_body),
+            ("NEW_TASK_EXTRA", "\n", "unrecognized"),
+        ] {
             records.push(serde_json::json!({"type":"response_item", "payload":{
                 "type":"agent_message", "author":"/root/peer", "recipient":"/root/worker",
-                "content":[{"type":"input_text", "text":format!("Message Type: {kind}\nPayload:\nprogress") }]
+                "content":[{"type":"input_text", "text":format!("Message Type: {kind}{newline}Payload:{newline}{body}") }]
             }}));
         }
         records.push(serde_json::json!({"type":"event_msg", "payload":{"type":"task_complete"}}));
         let session = parse_records(records.iter().enumerate());
         assert_eq!(session.counts().prompts, 1);
         assert_eq!(session.counts().interjections, 2);
+        // Routing lines may use either newline convention; the body keeps its own bytes.
+        assert_eq!(session.events[1].text.as_deref(), Some("progress"));
+        assert_eq!(session.events[2].text.as_deref(), Some(final_body));
         assert_eq!(crate::domain::turn::completed_count(&session), 1);
         assert_eq!(crate::domain::turn::chain_of(&session).len(), 1);
         assert_eq!(session.events[0].line, Some(1));
