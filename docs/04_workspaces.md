@@ -230,18 +230,11 @@ current one.
 
 ### Input attachment lifetime
 
-Files sent with a remote-control message stay on the device while an admitted consumer or
-recoverable waiting message may use them. A definitely unqueued input is removed immediately.
-After the last protected reference is proven released, a delivered set remains reusable for one
-day. That deadline is fixed: retrying or restarting does not extend it. An active consumer can
-outlive the deadline; its proven release then permits removal. Expired input IDs are refused
-rather than silently recreating historical file paths.
+Files saved from remote-control messages stay at their original device paths until the user
+removes them. This includes files from earlier versions, files whose delivery failed, and
+files with no remaining queue or session reference. Resuming a conversation uses the paths
+already in its history. Upgrading or restarting the daemon preserves these files, including
+copies previously recorded with an expiry date.
 
-Changing account or enrollment retires only identified sets belonging to the successful old
-transition. Unknown delivery, failed process cleanup, shared-runtime disconnection and unreadable
-custody or waiting records retain their files with an incomplete-cleanup diagnostic. A stored
-waiting reference does not authorize delivery after a restart.
-
-This applies to newly managed sets. Historical attachment directories without custody records
-are neither adopted nor deleted. Retrying such an input asks for a new input ID; existing raw
-files can remain. Attachment paths in old messages are not a promise of permanent availability.
+Changing accounts or enrollment retires the old account's waiting input and retry authority.
+Local filesystem access follows the operating system user's permissions.

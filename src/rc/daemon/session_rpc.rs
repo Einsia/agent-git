@@ -1370,9 +1370,7 @@ impl PreparedSessionRpc {
                         .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
                         .await
                         .map_err(instruction_not_sent),
-                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop)
-                        .await
-                        .map(|()| None),
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
                 };
                 if let Err(error) = queued {
                     turn(
@@ -1395,7 +1393,6 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
-                reply.attachment = queued.ok().flatten();
                 match acknowledging_take(
                     reply_within_state(reply.get_mut(), stop),
                     taken,
@@ -1575,9 +1572,7 @@ impl PreparedSessionRpc {
                         .stage_and_enqueue(&daemon, &session_id, generation, &tx, command, stop)
                         .await
                         .map_err(instruction_not_sent),
-                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop)
-                        .await
-                        .map(|()| None),
+                    None => enqueue_within(&tx, command, SESSION_REPLY_TIMEOUT, stop).await,
                 };
                 if let Err(error) = queued {
                     return finish_prepared_session_rpc(
@@ -1590,7 +1585,6 @@ impl PreparedSessionRpc {
                     )
                     .await;
                 }
-                reply.attachment = queued.ok().flatten();
                 match acknowledging_take(
                     reply_within_state(reply.get_mut(), stop),
                     taken,

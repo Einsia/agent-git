@@ -263,6 +263,10 @@ fn sweep_in(daemon: &str, runs: impl Fn(&str) -> bool, now_ms: i64) {
         let keep = runs(conversation) && waiting.iter().any(|stored| !stored.expired(now_ms));
         if !keep {
             let _ = save_in(daemon, conversation, &[]);
+        } else if waiting.iter().any(|item| !item.attachments.is_empty())
+            && super::input_attachments::recover_retired_waiting(daemon, conversation).is_err()
+        {
+            eprintln!("agit: waiting-message revocation recovery is incomplete");
         }
     }
 }

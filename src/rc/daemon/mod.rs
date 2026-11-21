@@ -683,15 +683,11 @@ struct PreparedSessionRpc {
 /// commands remain taken.
 struct SessionReceipt<T> {
     receipt: crate::rc::ticket::Receipt<T>,
-    attachment: Option<crate::rc::input_attachments::Attempt>,
 }
 
 impl<T> SessionReceipt<T> {
     fn new(receipt: crate::rc::ticket::Receipt<T>) -> Self {
-        Self {
-            receipt,
-            attachment: None,
-        }
+        Self { receipt }
     }
 
     fn get_mut(&mut self) -> &mut crate::rc::ticket::Receipt<T> {
@@ -711,11 +707,7 @@ impl<T> SessionReceipt<T> {
 
 impl<T> Drop for SessionReceipt<T> {
     fn drop(&mut self) {
-        if self.receipt.abandon() == crate::rc::ticket::Abandon::NeverRan
-            && let Some(attachment) = self.attachment.take()
-        {
-            attachment.never_ran();
-        }
+        self.receipt.abandon();
     }
 }
 

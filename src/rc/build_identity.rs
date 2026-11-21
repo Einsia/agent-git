@@ -18,6 +18,7 @@ pub const RPC_FEATURES: &[&str] = &[
     "turn-input-attachments-v1",
     "personal-turn-input-attachments-v1",
     "personal-steer-input-attachments-v1",
+    "personal-input-attachment-persistent-paths",
     "session-start-effort-v1",
     "session-start-lookup-v1",
     "session-permission-capabilities-v1",
