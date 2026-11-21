@@ -1752,12 +1752,12 @@ impl Session {
                     .source
                     .native()
                     .map_err(crate::rc::harness::proc::LaunchError::not_spawned)?;
-                AnyDriver::Codex(Box::new(
-                    crate::rc::harness::codex::CodexDriver::launch_shared(spec, &source).await?,
-                ))
+                crate::rc::harness::codex::CodexDriver::launch_shared(spec, &source)
+                    .await
+                    .map(|driver| AnyDriver::Codex(Box::new(driver)))
             }
-            None => AnyDriver::launch(&info.runtime, spec).await?,
-        };
+            None => AnyDriver::launch(&info.runtime, spec).await,
+        }?;
         trace_phase(&info.session_id, "native.launch", launching);
         if let AnyDriver::Codex(codex) = &mut driver {
             let opening = std::time::Instant::now();
@@ -2668,25 +2668,6 @@ impl Session {
             "supervisor.harness_shutdown",
             serde_json::json!({"ok": shutdown.is_ok()}),
         );
-        let session = id.clone();
-        let released = shutdown.is_ok() && !self.driver.shared_executor();
-        let custody = tokio::task::spawn_blocking(move || -> crate::Result<()> {
-            let root = crate::rc::rc_dir()?.join("task-attachments");
-            if released {
-                crate::rc::input_attachments::release_generation(
-                    &root,
-                    &session,
-                    generation,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-            } else {
-                crate::rc::input_attachments::retain_generation(&root, &session, generation)
-            }
-        })
-        .await;
-        if !matches!(custody, Ok(Ok(()))) {
-            tracing_note("attachment cleanup is incomplete after writer release");
-        }
         match shutdown {
             Ok(()) => {
                 self.record_writer_release(&id);

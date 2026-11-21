@@ -7,15 +7,17 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 mod custody;
-pub(super) use custody::{
-    Attempt, forget_unowned_waiting, migrate_legacy_waiting, protect_waiting, release_generation,
-    retain_generation, sweep, update_waiting,
-};
+#[cfg(test)]
+pub(super) use custody::MANAGED;
 pub(crate) use custody::{Owner, Reference, retire_device, snapshot_account};
+pub(super) use custody::{
+    authorize_waiting, forget_unowned_waiting, migrate_legacy_waiting, recover_retired_waiting,
+    update_waiting,
+};
 
 pub(super) struct Staged {
     pub message: String,
-    pub attempt: Attempt,
+    pub reference: Reference,
 }
 
 #[derive(Debug)]
@@ -28,7 +30,7 @@ impl std::fmt::Display for Unavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Legacy => "this input has unmanaged legacy attachments; send a new input",
-            Self::Expired => "this input's attachments have expired or retired; send a new input",
+            Self::Expired => "this input's attachments were cleared or retired; send a new input",
         })
     }
 }
@@ -49,7 +51,6 @@ pub(super) fn stage(
     owner: Owner,
     session: &str,
     input: &str,
-    generation: u64,
     parts: &Value,
     text: &str,
 ) -> anyhow::Result<Staged> {
@@ -90,7 +91,7 @@ pub(super) fn stage(
         let filename = format!("{}-{digest}.{extension}", prepared.len());
         prepared.push((file.name, filename, bytes));
     }
-    let (attempt, target) = custody::publish(root, owner, session, &input, generation, &prepared)?;
+    let (reference, target) = custody::publish(root, owner, session, &input, &prepared)?;
     let mut references = Vec::new();
     for (name, filename, _) in &prepared {
         references.push(serde_json::json!({"name":name,"path":target.join(filename)}));
@@ -99,7 +100,7 @@ pub(super) fn stage(
         "{text}\n\nAttached files on this device:\n{}",
         serde_json::to_string(&references)?
     );
-    Ok(Staged { message, attempt })
+    Ok(Staged { message, reference })
 }
 
 #[cfg(test)]
@@ -128,7 +129,6 @@ mod tests {
                 Owner::Local,
                 "alice",
                 &id,
-                1,
                 &serde_json::json!([file(b"first"), invalid]),
                 "read"
             )
@@ -140,7 +140,6 @@ mod tests {
             Owner::Local,
             "alice",
             &id,
-            1,
             &serde_json::json!([file(b"first")]),
             "read",
         )?;
@@ -149,7 +148,6 @@ mod tests {
             Owner::Local,
             "bob",
             &id,
-            1,
             &serde_json::json!([file(b"other")]),
             "read",
         )?;
@@ -158,7 +156,7 @@ mod tests {
         assert_eq!(std::fs::read(path(&bob))?, b"other");
         let refused = path(&alice);
         drop(alice);
-        assert!(!refused.exists(), "an unqueued set has no consumer");
+        assert_eq!(std::fs::read(refused)?, b"first");
         assert!(path(&bob).is_file());
         Ok(())
     }
@@ -168,10 +166,8 @@ mod tests {
         let root = tempfile::tempdir()?;
         let id = uuid::Uuid::new_v4().to_string();
         let data = serde_json::json!([file(b"abc")]);
-        let mut first = stage(root.path(), Owner::Local, "session", &id, 1, &data, "read")?;
-        first.attempt.prepare_delivery()?;
-        first.attempt.queued();
-        let retry = stage(root.path(), Owner::Local, "session", &id, 1, &data, "read")?;
+        let first = stage(root.path(), Owner::Local, "session", &id, &data, "read")?;
+        let retry = stage(root.path(), Owner::Local, "session", &id, &data, "read")?;
         assert_eq!(first.message, retry.message);
         drop(retry);
         assert!(
@@ -180,7 +176,6 @@ mod tests {
                 Owner::Local,
                 "session",
                 &id,
-                1,
                 &serde_json::json!([file(b"different")]),
                 "read"
             )
@@ -192,7 +187,6 @@ mod tests {
                 Owner::Local,
                 "session",
                 "../escape",
-                1,
                 &data,
                 "read"
             )
@@ -201,20 +195,13 @@ mod tests {
         let payload = path(&first);
         assert!(payload.starts_with(root.path()));
         assert_eq!(std::fs::read(&payload)?, b"abc");
-        release_generation(root.path(), "session", 1, 1)?;
+        let resumed = stage(root.path(), Owner::Local, "session", &id, &data, "read")?;
+        assert_eq!(path(&resumed), payload);
+        assert_eq!(std::fs::read(&payload)?, b"abc");
+        drop(resumed);
         assert!(
             payload.is_file(),
-            "a delivered set keeps its retry interval"
-        );
-        assert!(
-            stage(root.path(), Owner::Local, "session", &id, 1, &data, "read").is_err(),
-            "an elapsed inactive deadline refuses reuse before maintenance runs"
-        );
-        sweep(root.path(), 1 + crate::rc::waiting_messages::MAX_AGE_MS)?;
-        assert!(!payload.exists());
-        assert!(
-            stage(root.path(), Owner::Local, "session", &id, 1, &data, "read").is_err(),
-            "retrying an expired input must not recreate its historical path"
+            "a failed retry cannot clear the transcript path"
         );
         Ok(())
     }

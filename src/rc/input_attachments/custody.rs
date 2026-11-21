@@ -1,18 +1,18 @@
-//! Managed input sets keep identity and consumer proofs beside their immutable payloads.
+//! Managed inputs keep their immutable payloads and owner-scoped delivery references.
 
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 const VERSION: u32 = 1;
-const MANAGED: &str = "owned-v1";
+const LEGACY_MANAGED: &str = "owned-v1";
+pub(in crate::rc) const MANAGED: &str = "owned-v2";
 const RECORD_LIMIT: u64 = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,76 +58,21 @@ impl Reference {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Consumer {
-    daemon: String,
-    generation: u64,
-    session: String,
-    process: u32,
-    process_start: Option<i64>,
-    possible_delivery: bool,
-    incomplete_release: bool,
-}
-
+// Older custody records include expiry and reader fields. Only delivery and owner
+// metadata participates in the current format.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Record {
     version: u32,
     reference: Reference,
     owner: Owner,
     session: String,
     input: String,
-    created_ms: i64,
-    delivered: bool,
-    retry_deadline: Option<i64>,
     retired: bool,
     reclaimed: bool,
     conversation: Option<String>,
-    consumers: BTreeMap<String, Consumer>,
     waiting: BTreeSet<String>,
-}
-
-/// Custody remains with the staging worker even if its async caller is cancelled.
-pub(crate) struct Attempt {
-    root: PathBuf,
-    reference: Reference,
-    token: String,
-    queued: bool,
-}
-
-fn incarnation() -> &'static str {
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
-}
-
-fn process_start() -> Option<i64> {
-    #[cfg(unix)]
-    {
-        crate::rc::native_claude::started_ms(std::process::id())
-    }
-    #[cfg(not(unix))]
-    {
-        None
-    }
-}
-
-fn process_gone(consumer: &Consumer) -> bool {
-    #[cfg(unix)]
-    {
-        if let Some(started) = consumer.process_start {
-            if let Some(current) = crate::rc::native_claude::started_ms(consumer.process) {
-                return current != started;
-            }
-            if let Ok(pid) = i32::try_from(consumer.process) {
-                return pid > 0
-                    && unsafe { libc::kill(pid, 0) } != 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            }
-        }
-    }
-    let _ = consumer;
-    false
+    #[serde(default)]
+    revision: Option<uuid::Uuid>,
 }
 
 fn valid_key(key: &str) -> bool {
@@ -137,16 +82,33 @@ fn valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+fn ordinary(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        !metadata.file_type().is_symlink()
+    }
+}
+
 fn directory(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => ensure!(metadata.is_dir(), "invalid attachment directory"),
+        Ok(metadata) => ensure!(
+            metadata.is_dir() && ordinary(&metadata),
+            "invalid attachment directory"
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             crate::infra::config::create_state_dir(path)?;
         }
         Err(error) => return Err(error.into()),
     }
+    let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
-        std::fs::symlink_metadata(path)?.is_dir(),
+        metadata.is_dir() && ordinary(&metadata),
         "invalid attachment directory"
     );
     Ok(())
@@ -154,8 +116,14 @@ fn directory(path: &Path) -> anyhow::Result<()> {
 
 fn lock(root: &Path) -> anyhow::Result<File> {
     directory(root)?;
-    directory(&root.join(MANAGED))?;
-    let path = root.join(MANAGED).join("custody.lock");
+    directory(&root.join(LEGACY_MANAGED))?;
+    let path = root.join(LEGACY_MANAGED).join("custody.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.is_file() && ordinary(&metadata),
+            "invalid attachment coordination file"
+        );
+    }
     let mut options = crate::infra::config::state_file_options();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -174,18 +142,39 @@ fn lock(root: &Path) -> anyhow::Result<File> {
 
 fn set_path(root: &Path, reference: &Reference) -> anyhow::Result<PathBuf> {
     reference.validate()?;
+    for managed in [MANAGED, LEGACY_MANAGED] {
+        let directory = root.join(managed);
+        if !directory.try_exists()? {
+            continue;
+        }
+        verify_managed_directory(&directory)?;
+        let path = directory.join(&reference.key);
+        if path.try_exists()? && read_record(&path)?.reference == *reference {
+            return Ok(path);
+        }
+    }
     Ok(root.join(MANAGED).join(&reference.key))
 }
 
-fn read_record(path: &Path) -> anyhow::Result<Record> {
+fn verify_managed_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
-        std::fs::symlink_metadata(path)?.is_dir(),
+        metadata.is_dir() && ordinary(&metadata),
+        "invalid attachment directory"
+    );
+    Ok(())
+}
+
+fn read_record(path: &Path) -> anyhow::Result<Record> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_dir() && ordinary(&metadata),
         "invalid attachment set"
     );
     let file = path.join("custody.json");
     let metadata = std::fs::symlink_metadata(&file)?;
     ensure!(
-        metadata.is_file() && metadata.len() <= RECORD_LIMIT,
+        metadata.is_file() && ordinary(&metadata) && metadata.len() <= RECORD_LIMIT,
         "invalid attachment custody"
     );
     let mut options = std::fs::OpenOptions::new();
@@ -208,7 +197,7 @@ fn read_record(path: &Path) -> anyhow::Result<Record> {
     ensure!(
         path.file_name()
             .and_then(|s| s.to_str())
-            .is_some_and(|name| name == record.reference.key || name.starts_with(".incoming-")),
+            .is_some_and(|name| name == record.reference.key),
         "attachment custody identity changed"
     );
     Ok(record)
@@ -232,23 +221,6 @@ fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn change<T>(
-    root: &Path,
-    reference: &Reference,
-    operation: impl FnOnce(&mut Record) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let _lock = lock(root)?;
-    let path = set_path(root, reference)?;
-    let mut record = read_record(&path)?;
-    ensure!(
-        &record.reference == reference,
-        "attachment set was replaced"
-    );
-    let result = operation(&mut record)?;
-    write_record(&path, &record)?;
-    Ok(result)
-}
-
 fn sync_directory(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
@@ -257,66 +229,13 @@ fn sync_directory(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn expire(path: &Path, record: &mut Record, now: i64) -> anyhow::Result<bool> {
-    if record.reclaimed {
-        return Ok(true);
-    }
-    if path
-        .parent()
-        .context("attachment parent is missing")?
-        .join(format!("retired-{}", owner_key(&record.owner)?))
-        .try_exists()?
-    {
-        record.retired = true;
-        write_record(path, record)?;
-    }
-    if !record.consumers.is_empty() || !record.waiting.is_empty() {
-        return Ok(false);
-    }
-    if record.delivered && record.retry_deadline.is_none() {
-        record.retry_deadline = Some(now.saturating_add(crate::rc::waiting_messages::MAX_AGE_MS));
-        write_record(path, record)?;
-    }
-    if record.retired
-        || !record.delivered
-        || record.retry_deadline.is_some_and(|until| now >= until)
-    {
-        if !record.delivered && !record.retired {
-            std::fs::remove_dir_all(path)?;
-        } else {
-            // Keep an identity tombstone so a retry cannot silently recreate expired inputs.
-            record.reclaimed = true;
-            write_record(path, record)?;
-            remove_payload(path)?;
-        }
-        sync_directory(path.parent().context("attachment parent is missing")?)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn remove_payload(path: &Path) -> anyhow::Result<()> {
-    let payload = path.join("files");
-    match std::fs::symlink_metadata(&payload) {
-        Ok(metadata) => {
-            ensure!(metadata.is_dir(), "invalid attachment payload");
-            std::fs::remove_dir_all(payload)?;
-            sync_directory(path)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    Ok(())
-}
-
 pub(crate) fn publish(
     root: &Path,
     owner: Owner,
     session: &str,
     input: &str,
-    generation: u64,
     prepared: &[(String, String, Vec<u8>)],
-) -> anyhow::Result<(Attempt, PathBuf)> {
+) -> anyhow::Result<(Reference, PathBuf)> {
     let legacy = root
         .join(hex::encode(Sha256::digest(session.as_bytes())))
         .join(input);
@@ -328,19 +247,16 @@ pub(crate) fn publish(
     ))?));
     let _lock = lock(root)?;
     owner_current(root, &owner)?;
-    let path = root.join(MANAGED).join(&key);
-    let token = uuid::Uuid::new_v4().to_string();
-    let consumer = Consumer {
-        daemon: incarnation().to_owned(),
-        generation,
-        session: session.to_owned(),
-        process: std::process::id(),
-        process_start: process_start(),
-        possible_delivery: false,
-        incomplete_release: false,
+    let managed = root.join(MANAGED);
+    directory(&managed)?;
+    let current = managed.join(&key);
+    let previous = root.join(LEGACY_MANAGED).join(&key);
+    let path = if !current.try_exists()? && previous.try_exists()? {
+        previous
+    } else {
+        current
     };
-    let now = chrono::Utc::now().timestamp_millis();
-    let (mut record, created) = match std::fs::symlink_metadata(&path) {
+    let record = match std::fs::symlink_metadata(&path) {
         Ok(metadata) => {
             ensure!(metadata.is_dir(), "invalid attachment set");
             let mut record = read_record(&path)?;
@@ -351,18 +267,10 @@ pub(crate) fn publish(
             if record.retired || record.reclaimed {
                 return Err(super::Unavailable::Expired.into());
             }
-            if record.consumers.is_empty()
-                && record.waiting.is_empty()
-                && record
-                    .retry_deadline
-                    .is_some_and(|deadline| now >= deadline)
-            {
-                expire(&path, &mut record, now)?;
-                return Err(super::Unavailable::Expired.into());
-            }
             let payload = path.join("files");
+            let payload_metadata = std::fs::symlink_metadata(&payload)?;
             ensure!(
-                std::fs::symlink_metadata(&payload)?.is_dir(),
+                payload_metadata.is_dir() && ordinary(&payload_metadata),
                 "invalid attachment payload"
             );
             ensure!(
@@ -377,12 +285,15 @@ pub(crate) fn publish(
                 let metadata = std::fs::symlink_metadata(&file)?;
                 ensure!(
                     metadata.is_file()
+                        && ordinary(&metadata)
                         && metadata.len() == bytes.len() as u64
                         && std::fs::read(file)? == *bytes,
                     "attachment content changed"
                 );
             }
-            (record, false)
+            record.revision = Some(uuid::Uuid::new_v4());
+            write_record(&path, &record)?;
+            record
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let temporary = tempfile::Builder::new()
@@ -397,13 +308,10 @@ pub(crate) fn publish(
                 owner,
                 session: session.to_owned(),
                 input: input.to_owned(),
-                created_ms: now,
-                delivered: false,
-                retry_deadline: None,
+                revision: Some(uuid::Uuid::new_v4()),
                 retired: false,
                 reclaimed: false,
                 conversation: None,
-                consumers: BTreeMap::from([(token.clone(), consumer.clone())]),
                 waiting: BTreeSet::new(),
             };
             write_record(temporary.path(), &record)?;
@@ -419,77 +327,21 @@ pub(crate) fn publish(
             }
             std::fs::rename(temporary.path(), &path)?;
             sync_directory(&root.join(MANAGED))?;
-            (record, true)
+            record
         }
         Err(error) => return Err(error.into()),
     };
-    record.consumers.insert(token.clone(), consumer);
-    if !created {
-        write_record(&path, &record)?;
-    }
-    Ok((
-        Attempt {
-            root: root.to_owned(),
-            reference: record.reference,
-            token,
-            queued: false,
-        },
-        path.join("files"),
-    ))
+    Ok((record.reference, path.join("files")))
 }
 
-impl Attempt {
-    pub(crate) fn reference(&self) -> Reference {
-        self.reference.clone()
+fn entries(root: &Path, managed: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let directory = root.join(managed);
+    if !directory.try_exists()? {
+        return Ok(Vec::new());
     }
-
-    /// Persist uncertainty before a command can become visible to its executor.
-    pub(crate) fn prepare_delivery(&self) -> anyhow::Result<()> {
-        change(&self.root, &self.reference, |record| {
-            ensure!(!record.retired, "attachment owner has retired");
-            record
-                .consumers
-                .get_mut(&self.token)
-                .context("attachment consumer disappeared")?
-                .possible_delivery = true;
-            Ok(())
-        })
-    }
-
-    pub(crate) fn queued(&mut self) {
-        self.queued = true;
-    }
-
-    pub(crate) fn never_ran(mut self) {
-        self.queued = false;
-    }
-
-    fn refuse(&self) -> anyhow::Result<()> {
-        let _lock = lock(&self.root)?;
-        let path = set_path(&self.root, &self.reference)?;
-        let mut record = read_record(&path)?;
-        ensure!(
-            record.reference == self.reference,
-            "attachment set was replaced"
-        );
-        record.consumers.remove(&self.token);
-        write_record(&path, &record)?;
-        expire(&path, &mut record, chrono::Utc::now().timestamp_millis())?;
-        Ok(())
-    }
-}
-
-impl Drop for Attempt {
-    fn drop(&mut self) {
-        if !self.queued && self.refuse().is_err() {
-            eprintln!("agitd: attachment cleanup is incomplete");
-        }
-    }
-}
-
-fn records(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    verify_managed_directory(&directory)?;
     let mut paths = Vec::new();
-    for entry in std::fs::read_dir(root.join(MANAGED))? {
+    for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_name().to_str().is_some_and(valid_key) {
             ensure!(
@@ -502,56 +354,10 @@ fn records(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub(crate) fn release_generation(
-    root: &Path,
-    session: &str,
-    generation: u64,
-    now: i64,
-) -> anyhow::Result<()> {
-    if !root.join(MANAGED).try_exists()? {
-        return Ok(());
-    }
-    let _lock = lock(root)?;
-    for path in records(root)? {
-        let mut record = read_record(&path)?;
-        let released = |consumer: &Consumer| {
-            consumer.daemon == incarnation()
-                && consumer.session == session
-                && consumer.generation == generation
-        };
-        record.delivered |= record
-            .consumers
-            .values()
-            .any(|c| released(c) && c.possible_delivery);
-        record.consumers.retain(|_, consumer| !released(consumer));
-        write_record(&path, &record)?;
-        expire(&path, &mut record, now)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn retain_generation(root: &Path, session: &str, generation: u64) -> anyhow::Result<()> {
-    if !root.join(MANAGED).try_exists()? {
-        return Ok(());
-    }
-    let _lock = lock(root)?;
-    for path in records(root)? {
-        let mut record = read_record(&path)?;
-        let mut changed = false;
-        for consumer in record.consumers.values_mut() {
-            if consumer.daemon == incarnation()
-                && consumer.session == session
-                && consumer.generation == generation
-            {
-                consumer.incomplete_release = true;
-                changed = true;
-            }
-        }
-        if changed {
-            write_record(&path, &record)?;
-        }
-    }
-    Ok(())
+fn records(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = entries(root, MANAGED)?;
+    paths.extend(entries(root, LEGACY_MANAGED)?);
+    Ok(paths)
 }
 
 /// A legacy queue can be rewritten only while no managed set can claim its old record.
@@ -622,117 +428,15 @@ pub(crate) fn update_waiting<T>(
         );
         if record.waiting.remove(conversation) {
             write_record(&path, &record)?;
-            expire(&path, &mut record, chrono::Utc::now().timestamp_millis())?;
         }
     }
     Ok(result)
 }
 
-pub(crate) fn sweep(root: &Path, now: i64) -> anyhow::Result<()> {
-    if !root.join(MANAGED).try_exists()? {
-        return Ok(());
-    }
-    let _lock = lock(root)?;
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(root.join(MANAGED))? {
-        let entry = entry?;
-        if entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| valid_key(name) || name.starts_with(".incoming-"))
-        {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    static CURSORS: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, PathBuf>>> = OnceLock::new();
-    let mut cursors = CURSORS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let start = cursors
-        .get(root)
-        .map(|cursor| paths.partition_point(|path| path <= cursor))
-        .unwrap_or(0);
-    let batch: Vec<_> = paths[start..]
-        .iter()
-        .chain(paths[..start].iter())
-        .take(64)
-        .cloned()
-        .collect();
-    if let Some(last) = batch.last() {
-        cursors.insert(root.to_owned(), last.clone());
-    }
-    drop(cursors);
-    let mut incomplete = false;
-    for path in batch {
-        let result = (|| -> anyhow::Result<()> {
-            let mut record = read_record(&path)?;
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".incoming-"))
-            {
-                if record
-                    .consumers
-                    .values()
-                    .all(|consumer| !consumer.possible_delivery && process_gone(consumer))
-                {
-                    std::fs::remove_dir_all(&path)?;
-                } else if record
-                    .consumers
-                    .values()
-                    .any(|consumer| consumer.daemon != incarnation())
-                {
-                    incomplete = true;
-                }
-                return Ok(());
-            }
-            if record.reclaimed {
-                return remove_payload(&path);
-            }
-            if record.retired {
-                remove_retired_waiting(root, &record.reference, &record.waiting)?;
-                record.waiting.clear();
-            }
-            let daemon = root
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                .context("invalid attachment namespace")?;
-            for conversation in record.waiting.clone() {
-                let waiting = crate::rc::waiting_messages::load_checked_in(daemon, &conversation)?;
-                if !waiting
-                    .iter()
-                    .flat_map(|item| &item.attachments)
-                    .any(|reference| reference == &record.reference)
-                {
-                    record.waiting.remove(&conversation);
-                }
-            }
-            record
-                .consumers
-                .retain(|_, consumer| consumer.possible_delivery || !process_gone(consumer));
-            incomplete |= record
-                .consumers
-                .values()
-                .any(|consumer| consumer.daemon != incarnation() || consumer.incomplete_release);
-            write_record(&path, &record)?;
-            expire(&path, &mut record, now)?;
-            Ok(())
-        })();
-        incomplete |= result.is_err();
-    }
-    ensure!(!incomplete, "attachment cleanup is incomplete");
-    Ok(())
-}
-
-/// A restored message gains a live consumer before its durable waiting reference is removed.
-pub(crate) fn protect_waiting(
+/// Recheck ownership before a queued input is handed to a resumed conversation.
+pub(crate) fn authorize_waiting(
     root: &Path,
     owner: &Owner,
-    session: &str,
-    generation: u64,
     conversation: &str,
     references: &[Reference],
 ) -> anyhow::Result<()> {
@@ -749,19 +453,7 @@ pub(crate) fn protect_waiting(
                 && record.conversation.as_deref() == Some(conversation),
             "attachment reference is unavailable"
         );
-        let token = format!("{}:{session}:{generation}", incarnation());
-        record.consumers.insert(
-            token,
-            Consumer {
-                daemon: incarnation().to_owned(),
-                session: session.to_owned(),
-                generation,
-                process: std::process::id(),
-                process_start: process_start(),
-                possible_delivery: true,
-                incomplete_release: false,
-            },
-        );
+        record.revision = Some(uuid::Uuid::new_v4());
         write_record(&path, &record)?;
     }
     Ok(())
@@ -777,7 +469,7 @@ pub(crate) fn snapshot_account(hub: &str, account: &str) -> Retirement {
         let mut found = Vec::new();
         for daemon in ["rc", crate::rc::LOCAL_NAMESPACE] {
             let root = crate::rc::namespace_dir(daemon)?.join("task-attachments");
-            if !root.join(MANAGED).try_exists()? {
+            if !root.join(LEGACY_MANAGED).try_exists()? {
                 continue;
             }
             let _lock = lock(&root)?;
@@ -835,6 +527,40 @@ fn remove_retired_waiting(
     Ok(())
 }
 
+/// Finish a revoked delivery that was still queued when retirement was interrupted.
+/// The queue itself identifies the records to inspect; payload files are never opened here.
+pub(crate) fn recover_retired_waiting(daemon: &str, conversation: &str) -> anyhow::Result<()> {
+    let root = crate::rc::namespace_dir(daemon)?.join("task-attachments");
+    let _lock = lock(&root)?;
+    let mut waiting = crate::rc::waiting_messages::load_checked_in(daemon, conversation)?;
+    let references: BTreeSet<_> = waiting.iter().flat_map(|item| &item.attachments).collect();
+    let mut retired = BTreeSet::new();
+    for reference in references {
+        let path = set_path(&root, reference)?;
+        let mut record = read_record(&path)?;
+        ensure!(
+            record.reference == *reference,
+            "attachment identity changed"
+        );
+        if !record.retired && !retired_marker(&root, &record.owner)?.try_exists()? {
+            continue;
+        }
+        // If the queue write fails, the durable retirement still identifies this input
+        // on the next start, even after its waiting membership has been removed.
+        let was_waiting = record.waiting.remove(conversation);
+        if !record.retired || was_waiting {
+            record.retired = true;
+            write_record(&path, &record)?;
+        }
+        retired.insert(reference.clone());
+    }
+    if !retired.is_empty() {
+        waiting.retain(|item| item.attachments.iter().all(|r| !retired.contains(r)));
+        crate::rc::waiting_messages::persist_in(daemon, conversation, &waiting)?;
+    }
+    Ok(())
+}
+
 impl Retirement {
     pub(crate) fn finish(self) {
         for (root, reference, owner, revision) in self.0 {
@@ -858,7 +584,6 @@ impl Retirement {
                 remove_retired_waiting(&root, &reference, &record.waiting)?;
                 record.waiting.clear();
                 write_record(&path, &record)?;
-                expire(&path, &mut record, chrono::Utc::now().timestamp_millis())?;
                 Ok(())
             })();
             if result.is_err() {
@@ -871,13 +596,11 @@ impl Retirement {
 /// Only a committed replacement of the exact enrollment retires its attachment ownership.
 pub(crate) fn retire_device(root: &Path, device: &agit_peer::cloud::Device) -> anyhow::Result<()> {
     let owner = Owner::device(device);
-    if !root.join(MANAGED).try_exists()? {
+    if !root.join(LEGACY_MANAGED).try_exists()? {
         return Ok(());
     }
     let _lock = lock(root)?;
-    let marker = root
-        .join(MANAGED)
-        .join(format!("retired-{}", owner_key(&owner)?));
+    let marker = retired_marker(root, &owner)?;
     let mut options = crate::infra::config::state_file_options();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -888,7 +611,7 @@ pub(crate) fn retire_device(root: &Path, device: &agit_peer::cloud::Device) -> a
     let mut file = options.open(marker)?;
     file.write_all(b"retired\n")?;
     file.sync_all()?;
-    sync_directory(&root.join(MANAGED))?;
+    sync_directory(&root.join(LEGACY_MANAGED))?;
     for path in records(root)? {
         let mut record = read_record(&path)?;
         if record.owner != owner {
@@ -899,7 +622,6 @@ pub(crate) fn retire_device(root: &Path, device: &agit_peer::cloud::Device) -> a
         remove_retired_waiting(root, &record.reference, &record.waiting)?;
         record.waiting.clear();
         write_record(&path, &record)?;
-        expire(&path, &mut record, chrono::Utc::now().timestamp_millis())?;
     }
     Ok(())
 }
@@ -908,12 +630,15 @@ fn owner_key(owner: &Owner) -> anyhow::Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(owner)?)))
 }
 
+fn retired_marker(root: &Path, owner: &Owner) -> anyhow::Result<PathBuf> {
+    Ok(root
+        .join(LEGACY_MANAGED)
+        .join(format!("retired-{}", owner_key(owner)?)))
+}
+
 fn owner_current(root: &Path, owner: &Owner) -> anyhow::Result<()> {
     ensure!(
-        !root
-            .join(MANAGED)
-            .join(format!("retired-{}", owner_key(owner)?))
-            .try_exists()?,
+        !retired_marker(root, owner)?.try_exists()?,
         "attachment enrollment has retired"
     );
     Ok(())
@@ -923,10 +648,10 @@ fn owner_current(root: &Path, owner: &Owner) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // A missing or failed waiting-store transition cannot release an input, and neither a
-    // new consumer nor a scan grants another retry interval after the first proven release.
+    // Waiting input stays protected and account retirement drops the queue without breaking
+    // paths already handed to a session.
     #[test]
-    fn durable_references_and_exact_owner_retirement_bound_input_lifetime() {
+    fn retiring_an_owner_revokes_delivery_and_preserves_its_files() {
         let home = tempfile::tempdir().unwrap();
         crate::rc::with_agit_home(home.path(), || -> anyhow::Result<()> {
             let root = crate::rc::rc_dir()?.join("task-attachments");
@@ -945,14 +670,11 @@ mod tests {
                     owner,
                     session,
                     &uuid::Uuid::new_v4().to_string(),
-                    1,
                     &files,
                 )
             };
-            let (mut attempt, payload) = make(owner.clone(), "session")?;
-            attempt.prepare_delivery()?;
-            attempt.queued();
-            let reference = attempt.reference();
+            let (reference, payload) = make(owner.clone(), "session")?;
+
             let conversation = "conversation";
             let stored = crate::rc::waiting_messages::Stored {
                 message: "synthetic attachment".into(),
@@ -963,13 +685,10 @@ mod tests {
                 arrived_ms: 1,
             };
             crate::rc::waiting_messages::save(conversation, std::slice::from_ref(&stored))?;
-            release_generation(&root, "session", 1, 10)?;
             let path = set_path(&root, &reference)?;
-            assert_eq!(read_record(&path)?.retry_deadline, None);
             let waiting_path =
                 crate::rc::namespace_dir("rc/waiting-messages")?.join("conversation.json");
             std::fs::write(&waiting_path, b"{broken")?;
-            assert!(sweep(&root, i64::MAX).is_err());
             assert!(crate::rc::waiting_messages::save(conversation, &[]).is_err());
             assert_eq!(std::fs::read(&waiting_path)?, b"{broken");
             assert!(payload.join("file.txt").is_file());
@@ -985,11 +704,9 @@ mod tests {
                 conversation,
                 std::slice::from_ref(&stored),
             )?;
-            protect_waiting(
+            authorize_waiting(
                 &root,
                 &owner,
-                "session",
-                2,
                 conversation,
                 std::slice::from_ref(&reference),
             )?;
@@ -999,50 +716,20 @@ mod tests {
             crate::rc::waiting_messages::save(conversation, &[])?;
             assert!(!read_record(&path)?.waiting.contains(conversation));
             std::fs::remove_dir(unrelated)?;
-            release_generation(&root, "session", 1, 10)?;
-            assert!(
-                payload.is_dir(),
-                "an older generation cannot release the new consumer"
-            );
-            release_generation(&root, "session", 2, 20)?;
-            let deadline = read_record(&path)?.retry_deadline.unwrap();
-            assert_eq!(deadline, 20 + crate::rc::waiting_messages::MAX_AGE_MS);
-            protect_waiting(
-                &root,
-                &owner,
-                "session",
-                3,
-                conversation,
-                std::slice::from_ref(&reference),
-            )?;
-            sweep(&root, deadline + 1)?;
-            assert!(payload.is_dir());
-            release_generation(&root, "session", 3, deadline + 2)?;
-            assert!(!payload.exists());
-            assert_eq!(read_record(&path)?.retry_deadline, Some(deadline));
+            let (inactive, inactive_files) = make(owner.clone(), "inactive")?;
 
-            let (mut inactive, inactive_files) = make(owner.clone(), "inactive")?;
-            inactive.prepare_delivery()?;
-            inactive.queued();
-            release_generation(&root, "inactive", 1, chrono::Utc::now().timestamp_millis())?;
-            let (mut uncertain, uncertain_files) = make(owner.clone(), "uncertain")?;
-            uncertain.prepare_delivery()?;
-            uncertain.queued();
-            let (mut local, local_files) = make(Owner::Local, "local")?;
-            local.prepare_delivery()?;
-            local.queued();
-            let (mut reused, reused_files) = make(owner.clone(), "reused")?;
-            reused.prepare_delivery()?;
-            reused.queued();
-            let reused_reference = reused.reference();
+            let (local, local_files) = make(Owner::Local, "local")?;
+
+            let (reused_reference, reused_files) = make(owner.clone(), "reused")?;
+
             let reused_path = set_path(&root, &reused_reference)?;
             let reused_input = read_record(&reused_path)?.input;
             let retired_waiting = crate::rc::waiting_messages::Stored {
-                attachments: vec![inactive.reference()],
+                attachments: vec![inactive],
                 ..stored.clone()
             };
             let local_waiting = crate::rc::waiting_messages::Stored {
-                attachments: vec![local.reference()],
+                attachments: vec![local],
                 ..stored.clone()
             };
             crate::rc::waiting_messages::save(
@@ -1063,19 +750,17 @@ mod tests {
                 vec![local_waiting.clone()]
             );
             let retirement = snapshot_account("https://synthetic.invalid", "owner");
-            let (mut retry, _) = publish(&root, owner.clone(), "reused", &reused_input, 2, &files)?;
-            retry.prepare_delivery()?;
-            retry.queued();
-            let (mut concurrent, concurrent_files) = make(owner, "concurrent")?;
-            concurrent.prepare_delivery()?;
-            concurrent.queued();
+            publish(&root, owner.clone(), "reused", &reused_input, &files)?;
+
+            let (_, concurrent_files) = make(owner, "concurrent")?;
+
             retirement.finish();
             assert!(reused_files.is_dir());
             assert!(
                 !read_record(&reused_path)?.retired,
                 "a concurrent consumer changes the snapshot's retirement authority"
             );
-            assert!(!inactive_files.exists());
+            assert!(inactive_files.is_dir());
             assert!(crate::rc::waiting_messages::load("retired-waiting").is_empty());
             assert_eq!(
                 crate::rc::waiting_messages::load("local-waiting"),
@@ -1084,24 +769,38 @@ mod tests {
             assert!(
                 crate::rc::waiting_messages::save("retired-waiting", &[retired_waiting]).is_err()
             );
-            assert!(
-                uncertain_files.is_dir(),
-                "uncertain process cleanup retains the input"
-            );
             assert!(local_files.is_dir());
             assert!(
                 concurrent_files.is_dir(),
                 "a later login's new set is outside the snapshot"
             );
-            release_generation(&root, "uncertain", 1, chrono::Utc::now().timestamp_millis())?;
-            assert!(
-                !uncertain_files.exists(),
-                "retired ownership cancels the retry interval"
-            );
-            assert!(local_files.is_dir());
-            assert!(concurrent_files.is_dir());
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn retry_after_upgrade_keeps_a_past_deadline_file_at_its_original_path() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let root = home.path();
+        let input = uuid::Uuid::new_v4().to_string();
+        let files = [("photo.jpg".into(), "photo.jpg".into(), vec![1, 2, 3])];
+        let (reference, payload) = publish(root, Owner::Local, "session", &input, &files)?;
+        let current = payload.parent().unwrap();
+        let legacy = root.join(LEGACY_MANAGED).join(&reference.key);
+        std::fs::rename(current, &legacy)?;
+        let metadata = legacy.join("custody.json");
+        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata)?)?;
+        record.as_object_mut().unwrap().remove("revision");
+        record["delivered"] = true.into();
+        record["retry_deadline"] = 1.into();
+        record["consumers"] = serde_json::json!({});
+        std::fs::write(metadata, serde_json::to_vec(&record)?)?;
+
+        let (retry, path) = publish(root, Owner::Local, "session", &input, &files)?;
+        assert_eq!(retry, reference);
+        assert_eq!(path, legacy.join("files"));
+        assert_eq!(std::fs::read(path.join("photo.jpg"))?, [1, 2, 3]);
+        Ok(())
     }
 }

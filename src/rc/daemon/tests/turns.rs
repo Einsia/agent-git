@@ -88,7 +88,7 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
         executed.response.unwrap();
         assert_eq!(std::fs::read(&first_file).unwrap(), b"OK");
         let sets = || {
-            std::fs::read_dir(root.join("owned-v1"))
+            std::fs::read_dir(root.join(crate::rc::input_attachments::MANAGED))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .filter(|path| path.is_dir())
@@ -132,7 +132,7 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
         let error = result.response.unwrap_err();
         assert_eq!(error.code, ErrorCode::Forbidden as i32);
         assert_eq!(error.data.unwrap()["outcome"], "not_sent");
-        assert_eq!(sets().len(), 2, "revocation reclaims only its unqueued set");
+        assert_eq!(sets().len(), 3, "revocation preserves the staged files");
         assert!(
             first_file.is_file(),
             "accepted attachment bytes remain available"
@@ -152,11 +152,7 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
             .await
             .response
             .unwrap_err();
-        assert_eq!(
-            sets().len(),
-            2,
-            "a replaced generation cannot leave an unqueued set"
-        );
+        assert_eq!(sets().len(), 3, "a retry retains the original staged set");
         assert_eq!(error.code, ErrorCode::SessionNotFound as i32);
         assert_eq!(error.data.unwrap()["outcome"], "not_sent");
         assert!(
@@ -192,9 +188,9 @@ fn an_operator_can_deliver_files_only_to_the_admitted_session() {
                 assert!(!reply.accept(), "cancelled queued input cannot run later");
             }
             assert_eq!(
-                payload.exists(),
-                taken,
-                "cancellation reclaims NeverRan custody and preserves AlreadyTaken custody"
+                std::fs::read(payload).unwrap(),
+                b"OK",
+                "cancellation preserves the published bytes"
             );
         }
     });

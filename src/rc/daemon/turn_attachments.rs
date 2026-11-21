@@ -16,7 +16,7 @@ impl TurnAttachments {
         tx: &mpsc::Sender<Command>,
         mut command: Command,
         stop: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> Result<Option<crate::rc::input_attachments::Attempt>, RpcError> {
+    ) -> Result<(), RpcError> {
         let permit = reserve_within(tx, SESSION_REPLY_TIMEOUT, stop).await?;
         let input = command.client_msg_id().unwrap_or_default().to_owned();
         let message = match &mut command {
@@ -29,7 +29,7 @@ impl TurnAttachments {
         let target = session.to_owned();
         let authority = self.authority.clone();
         let owner = self.caller.is_owner();
-        let (caption, mut staged) = tokio::task::spawn_blocking(move || {
+        let (caption, reference) = tokio::task::spawn_blocking(move || {
             authority.admit_turn_files(owner, &target, || ())?;
             let root = crate::rc::rc_dir().map_err(|_| {
                 RpcError::new(ErrorCode::Internal, "attachment directory unavailable")
@@ -43,7 +43,6 @@ impl TurnAttachments {
                     custody,
                     &target,
                     &input,
-                    generation,
                     &self.files,
                     &caption,
                 )
@@ -54,17 +53,14 @@ impl TurnAttachments {
                         .unwrap_or_else(|| "could not verify or store turn attachments".to_owned());
                     RpcError::new(ErrorCode::MalformedFrame, message)
                 })?;
-                staged.attempt.prepare_delivery().map_err(|_| {
-                    RpcError::new(ErrorCode::Internal, "attachment custody is unavailable")
-                })?;
-                Ok((staged.message, Some(staged.attempt)))
+                Ok((staged.message, Some(staged.reference)))
             }
         })
         .await
         .map_err(|_| RpcError::new(ErrorCode::Internal, "attachment worker stopped"))??;
         *message = caption;
-        if let Some(attempt) = &staged {
-            let references = vec![attempt.reference()];
+        if let Some(reference) = reference {
+            let references = vec![reference];
             match &mut command {
                 Command::Turn { reply, .. } => reply.set_attachments(references),
                 Command::Steer { reply, .. } | Command::StopAndSend { reply, .. } => {
@@ -101,11 +97,8 @@ impl TurnAttachments {
             return Err(error);
         }
         self.authority.admit_turn_files(owner, session, || {
-            if let Some(attempt) = &mut staged {
-                attempt.queued();
-            }
             permit.send(command);
         })?;
-        Ok(staged)
+        Ok(())
     }
 }

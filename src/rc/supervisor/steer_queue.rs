@@ -672,11 +672,9 @@ impl Session {
                         .authority
                         .turn_files_owner(queued.owner, &self.info.session_id)
                         .map_err(|_| anyhow::anyhow!("attachment authority is unavailable"))?;
-                    crate::rc::input_attachments::protect_waiting(
+                    crate::rc::input_attachments::authorize_waiting(
                         &crate::rc::rc_dir()?.join("task-attachments"),
                         &owner,
-                        &self.info.session_id,
-                        self.generation,
                         &self.driver.runtime_thread_id().ok_or_else(|| {
                             anyhow::anyhow!("conversation identity is unavailable")
                         })?,
@@ -1145,6 +1143,71 @@ mod tests {
             );
             again.driver.shutdown().await.unwrap();
             assert!(dropped(&mut out).is_empty());
+            after.driver.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn restart_finishes_interrupted_revocation_before_the_sender_returns() {
+        with_home(|| async {
+            use crate::rc::input_attachments::{Owner, snapshot_account, stage};
+            let (mut before, _) = idle_session();
+            let conversation = before.driver.runtime_thread_id().unwrap();
+            let directory = crate::rc::rc_dir().unwrap();
+            let input = stage(
+                &directory.join("task-attachments"),
+                Owner::Cloud {
+                    hub: "https://cloud.example".into(),
+                    account: "owner".into(),
+                    device: "device".into(),
+                    enrollment: 1,
+                    machine: "machine".into(),
+                    certificate_sha256: "synthetic".into(),
+                },
+                &conversation,
+                &uuid::Uuid::new_v4().to_string(),
+                &serde_json::json!([{"name": "image.png", "data": "YWJj",
+                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}]),
+                "revoked",
+            )
+            .unwrap();
+            let files: serde_json::Value =
+                serde_json::from_str(input.message.lines().last().unwrap()).unwrap();
+            let payload = files[0]["path"].as_str().unwrap();
+            let mut revoked = waiting_from(OWNER, &input.message);
+            revoked.attachments = vec![input.reference];
+            before.steer_queue.waiting.push_back(revoked);
+            before
+                .steer_queue
+                .waiting
+                .push_back(waiting_from(OWNER, "keep"));
+            before.persist_waiting();
+            before.driver.shutdown().await.unwrap();
+            drop(before);
+
+            // Fail the queue step of real account retirement after its durable marker.
+            let queue = directory
+                .join("waiting-messages")
+                .join(format!("{conversation}.json"));
+            let bytes = std::fs::read(&queue).unwrap();
+            std::fs::write(&queue, b"{").unwrap();
+            snapshot_account("https://cloud.example", "owner").finish();
+            std::fs::write(&queue, bytes).unwrap();
+            assert_eq!(waiting_messages::load(&conversation).len(), 2);
+
+            for _ in 0..2 {
+                waiting_messages::sweep(|id| id == conversation, now_ms());
+                assert_eq!(waiting_on_device(&conversation), ["keep"]);
+                assert_eq!(std::fs::read(payload).unwrap(), b"abc");
+            }
+            let (mut after, _) = idle_session();
+            after.restore_waiting().await;
+            assert!(after.next_queued_turn().await.is_none());
+            let (turn, _receipt) = turn_from(OWNER, "new");
+            assert!(after.release_restored(turn).await.is_none());
+            assert_eq!(turn_message(after.next_queued_turn().await), "keep");
+            assert_eq!(turn_message(after.next_queued_turn().await), "new");
+            assert!(after.next_queued_turn().await.is_none());
             after.driver.shutdown().await.unwrap();
         });
     }
