@@ -35,6 +35,11 @@ pub enum Action {
     Cloud(crate::rc::cloud::Args),
     /// Connection state, uptime and live sessions.
     Status,
+    /// Allow your own device connection to preview this image in this conversation for an hour.
+    AllowImage {
+        session: String,
+        file: std::path::PathBuf,
+    },
     /// Stop the daemon. Sessions running under it end with it.
     Stop,
     /// Machines registered to your account.
@@ -238,6 +243,11 @@ pub fn run(args: Args) -> CmdResult {
         Action::Local(a) => crate::rc::local::run(a),
         Action::Cloud(a) => crate::rc::cloud::run(a),
         Action::Status => status(),
+        Action::AllowImage { session, file } => {
+            crate::rc::local_history::session_image::allow(&session, &file)?;
+            println!("Image preview authorized for this conversation for one hour.");
+            Ok(ExitCode::Ok)
+        }
         Action::Stop => stop(),
         Action::List => list(),
         Action::Revoke(a) => revoke(a),

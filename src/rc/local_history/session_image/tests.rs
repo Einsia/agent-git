@@ -204,7 +204,8 @@ fn a_session_image_is_read_only_as_an_agent_reply_of_the_session_shows_it() {
             rows.push((absolute(root.join("alias/shot.png")), Ok("image/png")));
         }
         for (path, expected) in rows {
-            let result = read_with_roster(&json!({"session_id":"image","path":path}), &roster);
+            let result =
+                read_with_roster(&json!({"session_id":"image","path":path}), &roster, false);
             match expected {
                 Ok(mime) => {
                     use base64::Engine as _;
@@ -235,5 +236,21 @@ fn a_session_image_is_read_only_as_an_agent_reply_of_the_session_shows_it() {
                 }
             }
         }
+        let request = json!({"session_id":"image","path":away,"owner":true});
+        let refused = |owner| {
+            rpc_error(read_with_roster(&request, &roster, owner).unwrap_err())
+                .data
+                .unwrap()["kind"]
+                .clone()
+        };
+        assert_eq!(refused(true), "outside_folder");
+        allow_with_roster("image", &away, &roster).unwrap();
+        assert_eq!(
+            read_with_roster(&request, &roster, true).unwrap()["mime"],
+            "image/png"
+        );
+        assert_eq!(refused(false), "outside_folder");
+        std::fs::write(&away, [PNG, b"replacement"].concat()).unwrap();
+        assert_eq!(refused(true), "outside_folder");
     });
 }

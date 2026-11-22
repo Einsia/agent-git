@@ -759,6 +759,8 @@ async fn serve_described(
                         // the conversation's, and the bytes never pass through the daemon.
                         Ok(frame) if frame.method() == super::local_history::session_image::METHOD => {
                             use super::local_history::{Failure, session_image};
+                            let owner = frame.caller.as_ref().is_some_and(CallerClaim::is_owner)
+                                && peer.cloud.as_ref().is_none_or(|peer| peer.direct_device_owner());
                             let Ok(permit) = history_slots.clone().try_acquire_owned() else {
                                 let response = Frame::error_response(original_id, session_image::rpc_error(Failure::Busy.into()));
                                 let _ = peer.output.send_work(response.to_json(), work);
@@ -773,7 +775,7 @@ async fn serve_described(
                                         return Err(session_image::rpc_error(Failure::Busy.into()));
                                     }
                                     frame.authority.check()?;
-                                    let image = session_image::read(frame.params.unwrap_or_default()).map_err(session_image::rpc_error)?;
+                                    let image = session_image::read(frame.params.unwrap_or_default(), owner).map_err(session_image::rpc_error)?;
                                     frame.authority.check()?;
                                     Ok(image)
                                 }).await;

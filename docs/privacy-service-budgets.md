@@ -126,7 +126,11 @@ commit or a publication.
 client that may read the conversation it names, viewers included, as `session.history` admits
 them. It reads only what that conversation already shows: a path an agent reply of the session
 names as an image (a CommonMark image, or a CodeLark `clk-send` image tag), never one named only
-by a prompt or a tool's output; after links are resolved, inside the session's own folder; a PNG,
+by a prompt or a tool's output; after links are resolved, inside the session's own folder by
+default. For a private conversation the device owner can run `agit rc allow-image SESSION FILE`
+on that device. For one hour their own direct owner connection can preview that exact file in
+that session even outside the folder, as long as the contents are unchanged. Shared readers
+remain confined to the session folder. In both cases the image must be a PNG,
 JPEG, GIF or WebP whose name and header agree, never SVG; and no larger than the file preview cap,
 refused rather than cut. Neither the path nor the bytes are logged, and it never reaches a commit
 or a publication. A tag or image quoted in code names nothing, as the page shows it as text.
