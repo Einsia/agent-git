@@ -420,6 +420,15 @@ fn delivery_only(grant: &agit_peer::cloud::ConnectionGrant) -> bool {
 }
 
 impl Client {
+    pub(crate) fn direct_device_owner(&self) -> bool {
+        self.grant.as_ref().is_some_and(|grant| {
+            grant.session_controller.is_none()
+                && grant.project_controller.is_none()
+                && grant.caller == grant.target.owner
+                && grant.source.owner == grant.target.owner
+        })
+    }
+
     fn delivery_only(&self) -> bool {
         self.grant.as_ref().is_some_and(delivery_only)
     }

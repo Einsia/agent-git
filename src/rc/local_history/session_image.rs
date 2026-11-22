@@ -1,9 +1,8 @@
 //! `fs.readSessionImage`: the bytes of an image an agent reply shows, for anyone who may read the
 //! conversation.
 //!
-//! Reading the conversation is the whole authority, so what the call reaches is held to what the
-//! conversation already shows: a file that an agent reply of this session names as an image,
-//! inside the session's own folder, whose name and header both say it is a raster image. A user
+//! An agent reply of this session must name the raster image. Outside the session folder only
+//! the device owner can read it, with local consent for that session and those exact bytes. A user
 //! prompt or tool output names nothing; otherwise a `find` or `ls` the agent ran would make every
 //! image it listed readable to every viewer.
 //!
@@ -47,12 +46,16 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
     result
 }
 
-pub fn read(params: Value) -> crate::Result<Value> {
+pub fn read(params: Value, owner: bool) -> crate::Result<Value> {
     let roster = super::super::roster::Roster::read_only()?;
-    read_with_roster(&params, &roster)
+    read_with_roster(&params, &roster, owner)
 }
 
-fn read_with_roster(params: &Value, roster: &super::super::roster::Roster) -> crate::Result<Value> {
+fn read_with_roster(
+    params: &Value,
+    roster: &super::super::roster::Roster,
+    owner: bool,
+) -> crate::Result<Value> {
     let requested = params["path"]
         .as_str()
         .filter(|path| !path.is_empty())
@@ -72,11 +75,75 @@ fn read_with_roster(params: &Value, roster: &super::super::roster::Roster) -> cr
         })?;
         ensure!(named, Refused::NotNamed);
         let canonical = canonical.ok_or(Refused::Missing)?;
+        if std::fs::canonicalize(folder).is_ok_and(|folder| canonical.starts_with(folder)) {
+            return read_image(&canonical);
+        }
+        ensure!(owner && private_session(target), Refused::OutsideFolder);
+        let name = consent_name(target, &canonical).ok_or(Refused::OutsideFolder)?;
+        let grant: Option<(i64, String)> = crate::rc::load_json(&name);
+        let (expiry, digest) = grant
+            .filter(|(expiry, _)| *expiry > chrono::Utc::now().timestamp())
+            .ok_or(Refused::OutsideFolder)?;
+        let image = read_image(&canonical)?;
         ensure!(
-            std::fs::canonicalize(folder).is_ok_and(|folder| canonical.starts_with(folder)),
+            expiry > chrono::Utc::now().timestamp() && image_digest(&image) == digest,
             Refused::OutsideFolder
         );
-        read_image(&canonical)
+        Ok(image)
+    })
+}
+
+fn private_session(target: &Target<'_>) -> bool {
+    target.entry.is_none_or(|entry| {
+        entry.workspace_id == crate::rc::endpoint::WORKSPACE && !entry.project_share
+    })
+}
+
+fn consent_name(target: &Target<'_>, path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let identity = json!([
+        target.session,
+        target.runtime,
+        target.native,
+        target.source,
+        target.cwd,
+        path.to_str()?
+    ]);
+    Some(format!(
+        "image-consent-{}.json",
+        hex::encode(Sha256::digest(identity.to_string()))
+    ))
+}
+
+fn image_digest(image: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        image["base64"].as_str().expect("validated image"),
+    ))
+}
+
+pub(crate) fn allow(session: &str, file: &Path) -> crate::Result<()> {
+    let roster = crate::rc::roster::Roster::read_only()?;
+    allow_with_roster(session, file, &roster)
+}
+
+fn allow_with_roster(
+    session: &str,
+    file: &Path,
+    roster: &crate::rc::roster::Roster,
+) -> crate::Result<()> {
+    let path = file.canonicalize().map_err(|_| Refused::Missing)?;
+    with_target(&json!({"session_id":session}), roster, |target| {
+        ensure!(
+            private_session(target),
+            "Choose a private device conversation"
+        );
+        let name = consent_name(target, &path).context("The selected file needs a Unicode name")?;
+        let image = read_image(&path)?;
+        crate::rc::save_json(
+            &name,
+            &(chrono::Utc::now().timestamp() + 3600, image_digest(&image)),
+        )
     })
 }
 
