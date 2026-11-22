@@ -1,9 +1,11 @@
 # Windows CLI validation and packaging
 
-GitLab runs native Windows tests in the validation stage for merge requests,
-the default branch, and explicitly requested branch pipelines. The
-`rust:test:windows` job builds the native regression selection together and must
-pass before default-branch packaging begins.
+GitLab runs native Windows validation for `release/*` merge requests targeting
+the default branch and for the release merge on `main`. Ordinary merge requests,
+main pushes, and schedules do not use the Windows runner. To check a branch on
+demand, start a web or API branch pipeline with `AGIT_CHECK_WINDOWS=1` and the
+default benchmark settings. `rust:test:windows` must pass before Windows
+packaging starts. A branch pipeline can also run its usual delivery jobs.
 
 Run the job locally on a Windows x64 host with the Rust native build
 prerequisites, Node.js, Git, and curl available:
