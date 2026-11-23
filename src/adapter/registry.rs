@@ -38,6 +38,7 @@ runtimes! {
     ("workbuddy", "WorkBuddy", ["workbuddy-ai"], super::workbuddy::WorkBuddy, Some(|| Ok(super::workbuddy::home()?.join("skills/agit")))),
     ("gemini-cli", "Gemini CLI", ["gemini"], super::gemini_cli::GeminiCli, Some(|| Ok(super::gemini_cli::home()?.join("skills/agit")))),
     ("pi", "Pi", [], super::pi::Pi, Some(|| Ok(super::pi::home()?.join("skills/agit")))),
+    ("antigravity-cli", "Antigravity CLI", [], super::antigravity_cli::AntigravityCli, None),
 }
 
 pub fn registration(runtime: &str) -> Option<&'static RuntimeRegistration> {

@@ -1574,6 +1574,39 @@ fn cancelling_the_bare_picker_creates_no_store_or_rc_directory() {
 }
 
 #[test]
+fn selected_antigravity_text_capture_records_the_prompts_as_separate_turns() {
+    let lab = Lab::new();
+    lab.save_credential();
+    let (repo, _) = lab.repository(false);
+    let captures = lab.agit.join("captures/antigravity-cli");
+    fs::create_dir_all(&captures).unwrap();
+    let path = captures.join(format!("{NATIVE_ID}.jsonl"));
+    let capture = ["first", "second"].into_iter().enumerate().map(|(index, label)| {
+        serde_json::json!({"format": "antigravity-cli-text-turn-v1", "conversation_id": NATIVE_ID,
+            "turn": index + 1, "prompt": format!("{label} question"), "reply": format!("{label} answer")}).to_string() + "\n"
+    }).collect::<String>();
+    fs::write(&path, &capture).unwrap();
+    let output = lab
+        .command()
+        .args([
+            "import",
+            NATIVE_ID,
+            "--from=antigravity-cli",
+            "--independent",
+            "--into=me/repo@selected",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let tip = "refs/heads/selected";
+    let first = storage::materialize_at(repo.root(), &format!("{tip}^"), meta::LOG_FILE).unwrap();
+    let both = storage::materialize_at(repo.root(), tip, meta::LOG_FILE).unwrap();
+    assert!(first.contains("first answer") && !first.contains("second question"));
+    assert!(both.contains("first question") && both.contains("second answer"));
+    assert_eq!(fs::read_to_string(path).unwrap(), capture);
+}
+
+#[test]
 fn link_only_import_records_unresolved_ownership_without_a_repository() {
     let lab = Lab::new();
     let original = fs::read(&lab.native).unwrap();

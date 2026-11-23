@@ -24,6 +24,7 @@
 //! — "any compression or distillation loses the part that is hardest to rebuild, namely 'why not
 //! that way'" — is about exactly this.
 
+mod antigravity_cli;
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod codex;
@@ -1171,6 +1172,9 @@ pub fn infer_runtime(text: &str) -> Option<&'static str> {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if v["format"] == "antigravity-cli-text-turn-v1" {
+            return Some("antigravity-cli");
+        }
         if matches!(
             v["type"].as_str(),
             Some("hermes_session" | "hermes_message")
@@ -1348,6 +1352,11 @@ mod tests {
             ("workbuddy", Capability::Resumable, "workbuddy"),
             ("gemini-cli", Capability::Resumable, "gemini-cli"),
             ("pi", Capability::Resumable, "pi"),
+            (
+                "antigravity-cli",
+                Capability::ImportOnly,
+                "antigravity-cli-text-turn-v1",
+            ),
         ];
         let got: Vec<_> = all()
             .iter()
@@ -1386,7 +1395,7 @@ mod tests {
         );
         let mut rest: Vec<_> = non_default_targets().iter().map(|(id, _)| *id).collect();
         rest.sort();
-        assert_eq!(rest, ["claude-desktop", "cursor"]);
+        assert_eq!(rest, ["antigravity-cli", "claude-desktop", "cursor"]);
         // The union == every registered adapter, none missing.
         assert_eq!(defaults.len() + rest.len(), all().len());
     }
@@ -1509,21 +1518,6 @@ mod tests {
         let s = get("claude-code").unwrap().parse_at(&f).unwrap();
         assert_eq!(s.id, "s1");
         assert_eq!(s.cwd.as_deref(), Some("/repo"));
-    }
-
-    /// Cursor alone refuses installation — this pins the direction of
-    /// [`Capability::ImportOnly`]: a new adapter that forgets to implement `capability()` does
-    /// not compile (the trait has no default).
-    #[test]
-    fn only_cursor_refuses_installation() {
-        for a in all() {
-            assert_eq!(
-                a.installable(),
-                a.id() != "cursor",
-                "{} is installable exactly when it is not cursor",
-                a.id()
-            );
-        }
     }
 
     #[test]
