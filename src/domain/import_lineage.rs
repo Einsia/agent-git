@@ -115,29 +115,6 @@ pub fn discover(
     )
 }
 
-/// Recheck a selected immutable proposal without resolving its former display references again.
-pub(crate) fn candidate_still_matches(
-    repo: &Repo,
-    slug: &str,
-    selected: &Link,
-    native: &[u8],
-    expected: &Candidate,
-) -> Result<bool> {
-    let result = inspect_with_hydrator(
-        repo,
-        slug,
-        selected,
-        native,
-        Limits::default(),
-        &|inputs, limit| hydrate(repo, inputs, limit),
-        Some(expected),
-    )?;
-    Ok(result
-        .candidates
-        .iter()
-        .any(|candidate| candidate == expected))
-}
-
 fn validate_selection(repo: &Repo, slug: &str, selected: &Link) -> Result<()> {
     ensure!(
         Repo::open(repo.root()).is_some(),
@@ -236,6 +213,41 @@ fn inspect_with_hydrator(
     limits: Limits,
     hydrate: &Hydrator<'_>,
     frozen: Option<&Candidate>,
+) -> Result<Proposals> {
+    inspect_with_suffix(repo, slug, selected, native, limits, hydrate, frozen, &[])
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn inspect_streamed(
+    repo: &Repo,
+    slug: &str,
+    selected: &Link,
+    prefix: &[u8],
+    suffix_hashes: &[String],
+    frozen: Option<&Candidate>,
+) -> Result<Proposals> {
+    inspect_with_suffix(
+        repo,
+        slug,
+        selected,
+        prefix,
+        Limits::default(),
+        &|inputs, limit| hydrate(repo, inputs, limit),
+        frozen,
+        suffix_hashes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_with_suffix(
+    repo: &Repo,
+    slug: &str,
+    selected: &Link,
+    native: &[u8],
+    limits: Limits,
+    hydrate: &Hydrator<'_>,
+    frozen: Option<&Candidate>,
+    suffix_hashes: &[String],
 ) -> Result<Proposals> {
     validate_selection(repo, slug, selected)?;
     let mut proposals = Proposals::default();
@@ -357,11 +369,20 @@ fn inspect_with_hydrator(
         proposals.unavailable(None, UnavailableReason::SecretMapping);
         return Ok(proposals);
     }
-    let live_hashes = transcript::live_hashes(&live.text);
+    let mut live_hashes = transcript::live_hashes(&live.text);
     if live_hashes.len() != native_records {
         proposals.unavailable(None, UnavailableReason::NativeRecords);
         return Ok(proposals);
     }
+    if !suffix_hashes.is_empty()
+        && selected
+            .baseline_bytes
+            .is_some_and(|end| end > native.len() as u64)
+    {
+        proposals.unavailable(None, UnavailableReason::ScanBudget);
+        return Ok(proposals);
+    }
+    live_hashes.extend_from_slice(suffix_hashes);
     for (snapshot, stored) in snapshots.into_iter().zip(reports) {
         let stored = match stored {
             Ok(stored) => stored,

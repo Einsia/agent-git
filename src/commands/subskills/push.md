@@ -120,6 +120,8 @@ at the terminal, and `--yes` cannot replace its review or final confirmation.
 
 ## Session authority and first publication
 
+For a local Codex branch, `agit project diagnose-source owner/repo@branch` reports only a source verdict and reason. `parent_policy_denied` identifies a confirmed parent restriction; `unverified` means local evidence could not establish the source. A finding of no parent block is not permission to publish. The diagnostic does not prepare a push or change policy.
+
 If push cannot verify a Codex conversation's upload permissions, restore readable original
 conversation records, any required parent conversations, and local project settings on the
 computer that holds them, then retry the same explicit `agit push owner/repo@branch`.

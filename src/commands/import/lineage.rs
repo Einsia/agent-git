@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 mod acceptance;
+mod observed;
 pub(super) use acceptance::{Accepted, PathIdentity, verify_git_routing};
 
 const MAX_LINK_BYTES: u64 = 64 * 1024;
@@ -339,6 +340,11 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
                     .downcast_ref::<native_snapshot::Unavailable>()
                     .copied()
                     .map(native_reason)
+                    .or_else(|| {
+                        error
+                            .downcast_ref::<observed::StreamGap>()
+                            .map(observed::StreamGap::reason)
+                    })
                     .unwrap_or_else(|| repository_reason(&error, "stored_evidence")),
             );
             return Ok(Some(Prepared {
@@ -348,13 +354,7 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
         }
     };
     if let Some(repo) = snapshot.repo() {
-        match import_lineage::discover(
-            &repo,
-            &destination.slug,
-            &snapshot.selected_link(),
-            snapshot.native(),
-            import_lineage::Limits::default(),
-        ) {
+        match snapshot.discover(&repo, None) {
             Ok(proposals) => report.include(proposals),
             Err(_) => report.unavailable(None, "stored_evidence"),
         }

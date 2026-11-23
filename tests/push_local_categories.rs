@@ -295,6 +295,24 @@ fn local_push_refusals_keep_identity_credentials_and_repository_bytes() {
         .unwrap();
         let before = lab.state();
         let mut command = lab.command(env!("CARGO_BIN_EXE_agit"));
+        let diagnose = |verdict, reason| {
+            let result = lab
+                .command(env!("CARGO_BIN_EXE_agit"))
+                .args(["project", "diagnose-source", "alice/refused@work"])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success() && result.stderr.is_empty(),
+                "{result:?}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap(),
+                serde_json::json!({"verdict":verdict, "reason":reason})
+            );
+        };
+        if mode == "human" {
+            diagnose("unverified", "source_or_parent_unavailable");
+        }
         if mode == "quiet" {
             command.arg("--quiet");
         }
@@ -364,6 +382,9 @@ fn local_push_refusals_keep_identity_credentials_and_repository_bytes() {
             .unwrap();
         assert!(dropped.status.success(), "{dropped:?}");
         let before = lab.state();
+        if mode == "human" {
+            diagnose("parent_policy_denied", "parent_recorded_hold");
+        }
         let output = lab.push_output(&mut command);
         assert_output(&output, mode, 7, "agit project undrop alice/refused@parent");
         assert_eq!(lab.state(), before, "{mode}: parent held");

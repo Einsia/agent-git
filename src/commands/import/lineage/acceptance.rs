@@ -412,7 +412,7 @@ pub(super) struct Snapshot {
     hub: String,
     source: native_snapshot::Source,
     native_identity: PathIdentity,
-    native: Vec<u8>,
+    native: super::observed::Observed,
     native_cwd: Option<String>,
     link: Option<link::Link>,
     link_image: Option<Vec<u8>>,
@@ -428,12 +428,7 @@ impl Snapshot {
         adapter: &dyn adapter::Adapter,
     ) -> crate::Result<Self> {
         let native_identity = PathIdentity::capture(&source.path, false)?;
-        let native =
-            adapter.snapshot_native_readonly(&source, native_snapshot::Limits::default())?;
-        ensure!(
-            native.source == source,
-            "the native provider returned another source"
-        );
+        let native = super::observed::Observed::read(&source, adapter)?;
         native_identity.verify()?;
         let native_cwd = if selected
             .as_ref()
@@ -441,7 +436,7 @@ impl Snapshot {
         {
             None
         } else {
-            native_cwd(&source, &native.bytes)?
+            native_cwd(&source, &native.prefix)?
         };
         let repository = if let Some(repo) = Repo::open(&destination.directory) {
             crate::commands::migration::check_readonly_repo_startup_local(&repo)?;
@@ -470,7 +465,7 @@ impl Snapshot {
             hub: config::hub_url(),
             source,
             native_identity,
-            native: native.bytes,
+            native,
             native_cwd,
             link,
             link_image,
@@ -495,8 +490,19 @@ impl Snapshot {
         selected
     }
 
-    pub(super) fn native(&self) -> &[u8] {
-        &self.native
+    pub(super) fn discover(
+        &self,
+        repo: &Repo,
+        candidate: Option<&import_lineage::Candidate>,
+    ) -> crate::Result<import_lineage::Proposals> {
+        import_lineage::inspect_streamed(
+            repo,
+            &self.destination.slug,
+            &self.selected_link(),
+            &self.native.prefix,
+            &self.native.suffix_hashes,
+            candidate,
+        )
     }
 
     fn verify(&self, candidate: Option<&import_lineage::Candidate>) -> crate::Result<()> {
@@ -526,10 +532,9 @@ impl Snapshot {
             "the selected native provider identity changed"
         );
         self.native_identity.verify()?;
-        let current = adapter
-            .snapshot_native_readonly(&current_source, native_snapshot::Limits::default())?;
+        let current = super::observed::Observed::read(&current_source, adapter.as_ref())?;
         ensure!(
-            current.source == self.source && current.bytes == self.native,
+            current == self.native,
             "the native transcript changed after the choice was prepared"
         );
         self.native_identity.verify()?;
@@ -570,13 +575,9 @@ impl Snapshot {
             );
             if let Some(candidate) = candidate {
                 ensure!(
-                    import_lineage::candidate_still_matches(
-                        &repo,
-                        &self.destination.slug,
-                        &self.selected_link(),
-                        &self.native,
-                        candidate
-                    )?,
+                    self.discover(&repo, Some(candidate))?
+                        .candidates
+                        .contains(candidate),
                     "the selected candidate no longer matches its observed evidence"
                 );
             }
@@ -785,14 +786,18 @@ mod tests {
     #[test]
     fn selected_claim_preserves_existing_directory_and_fills_only_its_absence() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("native");
-        std::fs::write(&path, b"{}\n").unwrap();
+        let id = "aaaaaaaa-0000-4000-8000-000000000001";
+        let path = directory.path().join(format!("rollout-{id}.jsonl"));
+        let header = serde_json::json!({"type": "session_meta", "payload": {"id": id}});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
         let source = native_snapshot::Source {
             runtime: "codex",
-            session_id: "selected".into(),
+            session_id: id.into(),
             path: path.clone(),
             database: false,
         };
+        let native =
+            super::super::observed::Observed::read(&source, &adapter::codex::Codex).unwrap();
         let mut snapshot = Snapshot {
             destination: Destination {
                 slug: "me/repo".into(),
@@ -804,7 +809,7 @@ mod tests {
             hub: "http://127.0.0.1:1".into(),
             source,
             native_identity: PathIdentity::capture(&path, false).unwrap(),
-            native: b"{}\n".to_vec(),
+            native,
             native_cwd: Some("native-directory".into()),
             link: None,
             link_image: None,
@@ -814,7 +819,7 @@ mod tests {
             snapshot.selected_link().cwd.as_deref(),
             Some("native-directory")
         );
-        snapshot.link = Some(link::Link::new("codex", "selected", None));
+        snapshot.link = Some(link::Link::new("codex", id, None));
         assert_eq!(
             snapshot.selected_link().cwd.as_deref(),
             Some("native-directory")

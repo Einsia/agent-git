@@ -52,6 +52,7 @@ fn main() {
     // valid command does not select the inspection path.
     if raw_args.iter().any(|arg| {
         arg == "--storage"
+            || arg == "diagnose-source"
             || arg
                 .to_str()
                 .is_some_and(|arg| arg.starts_with("--storage="))
@@ -61,6 +62,20 @@ fn main() {
                 command: Some(Commands::Doctor(args)),
                 ..
             }) if args.storage.is_some() => exit(run(raw_args)),
+            Ok(Cli {
+                command:
+                    Some(Commands::Project(commands::project::Args {
+                        action: commands::project::Action::DiagnoseSource { .. },
+                    })),
+                ..
+            }) => {
+                unsafe {
+                    std::env::set_var("GIT_NO_LAZY_FETCH", "1");
+                    std::env::set_var("GIT_ALLOW_PROTOCOL", "");
+                    std::env::set_var("GIT_OPTIONAL_LOCKS", "0");
+                }
+                exit(run(raw_args));
+            }
             Err(_) => exit(run(raw_args)),
             _ => {}
         }
@@ -613,7 +628,13 @@ fn bare_help(verdict: agit::tui::Verdict, json: bool, version: commands::json::V
 /// The dispatch table. Deliberately too boring to get wrong — every change lives in the file
 /// being called.
 fn dispatch(cmd: Commands, json: bool) -> i32 {
-    let metadata_only = matches!(&cmd, Commands::Doctor(args) if args.storage.is_some());
+    let metadata_only = matches!(&cmd, Commands::Doctor(args) if args.storage.is_some())
+        || matches!(
+            &cmd,
+            Commands::Project(commands::project::Args {
+                action: commands::project::Action::DiagnoseSource { .. }
+            })
+        );
     if !metadata_only && !matches!(cmd, Commands::Hooks(_) | Commands::Setup(_)) {
         commands::setup::refresh_claude_relay();
     }
