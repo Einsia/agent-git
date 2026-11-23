@@ -196,3 +196,9 @@ Import cannot change the calling process's environment. Keep using the selected
 `AGIT_SESSION` to each invocation. To inspect saved context without preparing a
 runtime, use `show` or `view`. `resume --no-launch --json` prepares a runtime
 session and records its claim; it is not a read-only preview.
+
+### New Antigravity CLI text conversations
+
+From a checkout of the AgentGit source, run `python3 scripts/capture-antigravity-cli.py --prompts /path/to/prompts.ndjson` in the intended workspace (use an absolute script path when running elsewhere). This starts a **new** signed-in `agy` process and sends each supplied prompt to Antigravity. It never searches existing conversations. The input file contains one JSON object per line, for example `{"event":"user","message":{"content":"Reply with the word amber."}}`. The helper requires Python 3 and Antigravity CLI with headless streaming input/output (verified with CLI 1.5.14).
+
+On success it prints the full conversation ID and stores a text-only projection in `$AGIT_HOME/captures/antigravity-cli/` (default `~/.agit/captures/antigravity-cli/`). Use `agit import <full-id> --from antigravity-cli --independent --into owner/repo@branch` to record it. The capture deliberately omits runtime configuration, internal steps, attachments and usage; tool conversations and unfinished streams are not supported. Neither old histories, App/IDE exports, nor native resume are supported. The helper does not publish to the Hub; import uses the destination's ordinary push policy.
