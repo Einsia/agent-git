@@ -53,11 +53,11 @@
       },
       {
         "name": "libcrypto3",
-        "version": "3.5.9-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r0.apk",
-        "sha256": "6632d758d8f5e9ea3b650fe966f23bbf9a202f8b8dceecac93da135dec5e3689",
+        "version": "3.5.9-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcrypto3-3.5.9-r1.apk",
+        "sha256": "042026082cc9bc7872d1baa81755c50efa70b05f03b5369fdc5f0a1303009720",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0f4c7e8d0f5f7cebbdc2156eca4391080b732bf2/main/openssl"
       },
       {
         "name": "libcurl",
@@ -93,11 +93,11 @@
       },
       {
         "name": "libssl3",
-        "version": "3.5.9-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r0.apk",
-        "sha256": "05e3393fb95aa5751ca2f9d242f659f6cff82c1cc7767cc2df4a086f7ad01877",
+        "version": "3.5.9-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libssl3-3.5.9-r1.apk",
+        "sha256": "18c5778cbe52e1991303f8531970b05d4e6e036ea08349322f7422f42a689dc7",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0f4c7e8d0f5f7cebbdc2156eca4391080b732bf2/main/openssl"
       },
       {
         "name": "libunistring",
@@ -183,11 +183,11 @@
       },
       {
         "name": "libcrypto3",
-        "version": "3.5.9-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcrypto3-3.5.9-r0.apk",
-        "sha256": "2676a2b0b6e23ea2edccf3ee982b9842a665d52603d047de3d0a185dc316d983",
+        "version": "3.5.9-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcrypto3-3.5.9-r1.apk",
+        "sha256": "58ea027d8bd64fffac7d2106a9034341d6735387298a5e01b551429c73a13c71",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0f4c7e8d0f5f7cebbdc2156eca4391080b732bf2/main/openssl"
       },
       {
         "name": "libcurl",
@@ -223,11 +223,11 @@
       },
       {
         "name": "libssl3",
-        "version": "3.5.9-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libssl3-3.5.9-r0.apk",
-        "sha256": "20ac252b276d73f2c69c1d25f84537c7fba81caefc026c6be1094b394af2082e",
+        "version": "3.5.9-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libssl3-3.5.9-r1.apk",
+        "sha256": "4aff30f84e7ac922b026f8b2dd574d91bb3bb01d22767a8a9a0a10c5ef64a44b",
         "license": "Apache-2.0",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/0f4c7e8d0f5f7cebbdc2156eca4391080b732bf2/main/openssl"
       },
       {
         "name": "libunistring",
