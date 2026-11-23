@@ -253,6 +253,13 @@ enum SplitFailure {
     Incomplete,
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn standalone_header(source: &super::native_snapshot::Source, header: &[u8]) -> bool {
+    id_from_filename(&source.path).is_some()
+        && split_rollout(header.to_vec(), Some(&source.session_id))
+            .is_ok_and(|(_, history)| history.is_none())
+}
+
 fn recognized_rollout(bytes: &[u8], expected_thread_id: &str) -> bool {
     let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
         return false;

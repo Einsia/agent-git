@@ -31,6 +31,11 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Action {
+    /// Explain local Codex source evidence for one saved branch without publishing it.
+    DiagnoseSource {
+        #[arg(value_name = "OWNER/REPO@BRANCH")]
+        target: String,
+    },
     /// Enroll a directory and its subdirectories into an existing repository.
     Bind {
         path: PathBuf,
@@ -2386,6 +2391,15 @@ fn confirm(message: &str) -> Result<()> {
 
 pub fn run(args: Args) -> CmdResult {
     match args.action {
+        Action::DiagnoseSource { target } => {
+            let (verdict, reason) =
+                diagnose_source(&target).unwrap_or(("unverified", "local_check_failed"));
+            println!(
+                "{}",
+                serde_json::json!({"verdict": verdict, "reason": reason})
+            );
+            Ok(ExitCode::Ok)
+        }
         Action::Bind {
             path,
             repo,
@@ -3601,6 +3615,16 @@ fn delegation_block(
     fallback: Option<&Project>,
     adopt: bool,
 ) -> Result<Option<DelegationBlock>> {
+    delegation_block_observed(repository, candidate, fallback, adopt, |_| {})
+}
+
+fn delegation_block_observed(
+    repository: &str,
+    candidate: &Candidate,
+    fallback: Option<&Project>,
+    adopt: bool,
+    mut observe_leaf: impl FnMut(bool),
+) -> Result<Option<DelegationBlock>> {
     if candidate.runtime != "codex" {
         return Ok(None);
     }
@@ -3618,7 +3642,11 @@ fn delegation_block(
         };
         let payload = &header["payload"];
         let spawn = &payload["source"]["subagent"]["thread_spawn"];
-        if !crate::adapter::codex::delegated_header(&header) {
+        let delegated = crate::adapter::codex::delegated_header(&header);
+        if seen.len() == 1 && payload["id"].as_str() == Some(session.as_str()) {
+            observe_leaf(delegated);
+        }
+        if !delegated {
             return Ok(None);
         }
         ensure!(payload["id"] == session, "delegated identity changed");
@@ -6060,6 +6088,81 @@ fn split_target(target: &str) -> Result<(&str, &str)> {
         .split_once('@')
         .filter(|(_, branch)| !branch.is_empty())
         .context("name the conversation as OWNER/REPO@BRANCH")
+}
+
+fn diagnose_source(target: &str) -> Result<(&'static str, &'static str)> {
+    let (repository, branch) = split_target(target)?;
+    let (owner, agent) = super::parse_slug(repository)?;
+    crate::domain::repo::valid_name(&owner)?;
+    crate::domain::repo::valid_name(&agent)?;
+    let Some(repo) = Repo::open(config::repo_dir(&owner, &agent)?) else {
+        return Ok(("unverified", "local_repository_missing"));
+    };
+    let reference = format!("refs/heads/{branch}");
+    if repo.git_status_local(&["check-ref-format", &reference])?.0 != Some(0) {
+        return Ok(("unverified", "invalid_branch"));
+    }
+    match repo
+        .git_status_local(&["show-ref", "--verify", "--quiet", &reference])?
+        .0
+    {
+        Some(0) => (),
+        Some(1) => return Ok(("unverified", "local_branch_missing")),
+        _ => return Ok(("unverified", "local_check_failed")),
+    }
+    let (links, issues) =
+        link::list_checked_with_limits(&Store::at(config::store_root()?), 262_144, 64 << 20);
+    let claims = recording_into(&links, &owner, &agent, branch);
+    let mut unknown = !issues.is_empty();
+    let mut delegated = false;
+    if claims.is_empty() {
+        return Ok((
+            "unverified",
+            if unknown {
+                "claim_read_failed"
+            } else {
+                "no_source_claim"
+            },
+        ));
+    }
+    for claim in claims {
+        if claim.source != "codex" {
+            unknown = true;
+            continue;
+        }
+        let candidate = Candidate {
+            runtime: claim.source,
+            session_id: claim.session_id,
+            cwd: claim.cwd.map(PathBuf::from).unwrap_or_default(),
+        };
+        let mut leaf = None;
+        match delegation_block_observed(repository, &candidate, None, false, |value| {
+            leaf = Some(value)
+        }) {
+            Ok(Some(block)) => {
+                let reason = match block {
+                    DelegationBlock::Recorded { .. } => "parent_recorded_hold",
+                    DelegationBlock::FolderOff { .. } => "parent_folder_off",
+                    DelegationBlock::History { .. } => "parent_history_excluded",
+                    DelegationBlock::OutsideFolder { .. } => "parent_outside_folder",
+                    DelegationBlock::Repository { .. } => "parent_other_repository",
+                };
+                return Ok(("parent_policy_denied", reason));
+            }
+            Err(_) => unknown = true,
+            Ok(None) => match leaf {
+                Some(value) => delegated |= value,
+                None => unknown = true,
+            },
+        }
+    }
+    Ok(if unknown {
+        ("unverified", "source_or_parent_unavailable")
+    } else if delegated {
+        ("delegated", "no_parent_block_observed")
+    } else {
+        ("not_delegated", "no_parent_block_observed")
+    })
 }
 
 /// The locks a drop or an undrop of `repository@branch` holds, in the one order every path that

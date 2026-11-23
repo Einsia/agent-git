@@ -109,6 +109,8 @@ requires PowerShell 7.3 or newer. The child preserves literal arguments and leav
 the parent shell's routing unchanged. Use `--json` when an argument contains a
 terminal control character that cannot be displayed as a safe command.
 
+For an explicit, self-contained Codex rollout larger than 64 MiB, the report streams the complete file. The limits are 512 MiB per file, 8 MiB per record and 262,144 records. It retains at most 16 MiB of complete records plus record hashes. Paginated histories requiring a parent, materialized baselines outside that prefix and suffix records requiring secret mapping can still return incomplete. An incomplete scan never proves the absence of earlier history.
+
 `--propose-lineage` conflicts with `--onto`, `--independent`, `--link-only`,
 `--privacy`, and `--name`. `--independent` conflicts with `--onto` and `--link-only`.
 Versioned `--privacy` also requires `--onto` or `--independent`, so a preview cannot

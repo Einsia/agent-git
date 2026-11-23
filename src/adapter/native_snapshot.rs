@@ -457,7 +457,7 @@ pub(crate) fn read_file_after(
 
 /// Opens `path` as the same regular file its name showed before the open, once `admit` accepts
 /// its length.
-fn open_unchanged(
+pub(crate) fn open_unchanged(
     path: &Path,
     admit: impl FnOnce(usize) -> Result<()>,
 ) -> Result<(std::fs::File, std::fs::Metadata)> {
@@ -538,7 +538,7 @@ fn read_bounded_until(
 }
 
 /// The file read through `file` is still the one `opened` described, all `read` bytes of it.
-fn finish_unchanged(
+pub(crate) fn finish_unchanged(
     file: &std::fs::File,
     path: &Path,
     opened: &std::fs::Metadata,
