@@ -809,7 +809,12 @@ mod tests {
         };
         let result = run(&fixture.json);
         let marker = std::env::var_os("AGIT_FILE_OPENCODE_IMPORT_MARKER").unwrap();
-        let imported = std::fs::read_to_string(&marker).unwrap();
+        let imported = std::fs::read_to_string(&marker).unwrap_or_else(|error| {
+            panic!(
+                "import marker unavailable: {error}; preparation error: {:?}",
+                result.as_ref().err()
+            );
+        });
         assert_eq!(
             imported.lines().count(),
             1,

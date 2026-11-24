@@ -1222,7 +1222,7 @@ fn render_export(
 ) -> Result<serde_json::Value> {
     let cwd_s = cwd.to_string_lossy().to_string();
     let mut messages: Vec<serde_json::Value> = vec![];
-    let mut prev_msg: Option<String> = None;
+    let mut current_user: Option<String> = None;
     let mut first_ms: Option<i64> = None;
     let mut last_ms: Option<i64> = None;
 
@@ -1239,9 +1239,9 @@ fn render_export(
                     continue;
                 };
                 if e.kind == EventKind::UserPrompt {
-                    user_msg(new_id, created, t, &mut prev_msg)
+                    user_msg(new_id, created, t, &mut current_user)
                 } else {
-                    assistant_msg(new_id, created, t, &cwd_s, &mut prev_msg, None)
+                    assistant_msg(new_id, created, t, &cwd_s, &current_user, None)
                 }
             }
             // The compact boundary **is emitted** (the same rendering policy as the other two
@@ -1254,7 +1254,7 @@ fn render_export(
                 let Some(t) = e.text.as_deref().filter(|t| !t.trim().is_empty()) else {
                     continue;
                 };
-                user_msg(new_id, created, t, &mut prev_msg)
+                user_msg(new_id, created, t, &mut current_user)
             }
             EventKind::CompactFiltered => user_msg(
                 new_id,
@@ -1266,14 +1266,14 @@ fn render_export(
                         .filter(|t| !t.trim().is_empty())
                         .unwrap_or("window / kept-count unknown")
                 ),
-                &mut prev_msg,
+                &mut current_user,
             ),
             EventKind::ToolUse => assistant_msg(
                 new_id,
                 created,
                 "",
                 &cwd_s,
-                &mut prev_msg,
+                &current_user,
                 Some((e, details.get(ei))),
             ),
             // A receipt-shaped edit (marked by the source extractor, see
@@ -1288,7 +1288,7 @@ fn render_export(
                     created,
                     "",
                     &cwd_s,
-                    &mut prev_msg,
+                    &current_user,
                     Some((e, details.get(ei))),
                 )
             }
@@ -1301,11 +1301,53 @@ fn render_export(
         messages.push(msg);
     }
 
+    let provenance = serde_json::json!({
+        "sourceRuntime": session.runtime,
+        "sourceSessionID": session.id,
+        "sourceDirectory": session.cwd,
+        "targetDirectory": cwd_s,
+    });
+    if let Some(first_user) = messages.iter_mut().find(|m| m["info"]["role"] == "user") {
+        let note = format!(
+            "[AgentGit migration context] This history was imported from {} (session {}). Original working directory: {}. Current working directory: {}. Historical tool paths and outputs describe the source session; use the current directory for new work. Historical model attribution is unavailable in this conversion; the restore model is selected locally and does not identify the model that produced these replies.",
+            session.runtime,
+            session.id,
+            session.cwd.as_deref().unwrap_or("unknown"),
+            cwd_s
+        );
+        let user_id = first_user["info"]["id"].clone();
+        first_user["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": mint_key("prt_"), "sessionID": new_id,
+                "messageID": user_id,
+                "type":"text", "text":note, "synthetic":true,
+            }));
+    }
+
+    // OpenCode breaks timestamp ties by ID; assign ascending IDs in source order and
+    // remap references so storage reads preserve the conversation.
+    let mut ordered_ids: Vec<String> = messages
+        .iter()
+        .map(|m| m["info"]["id"].as_str().unwrap().to_owned())
+        .collect();
+    ordered_ids.sort();
+    let id_map = messages
+        .iter()
+        .map(|m| m["info"]["id"].as_str().unwrap().to_owned())
+        .zip(ordered_ids)
+        .collect();
+    for message in &mut messages {
+        remap_ids(message, &id_map);
+    }
+
     let created = first_ms.unwrap_or(FIXED_MS);
     let updated = last_ms.unwrap_or(created);
     Ok(serde_json::json!({
         "info": {
             "id": new_id,
+            "agit": provenance,
             // slug is a required key (omitting it is rejected); an exported copy has no real
             // slug to use, so one is derived from the new id and the listing shows it was
             // installed by agit.
@@ -1322,6 +1364,207 @@ fn render_export(
         },
         "messages": messages,
     }))
+}
+
+/// A restore choice belongs to the destination, while historical assistant attribution stays
+/// marked as imported. Native OpenCode copies carry no migration marker and remain unchanged.
+fn set_restore_model(payload: &mut serde_json::Value, model: &serde_json::Value) {
+    if payload.pointer("/info/agit/sourceRuntime").is_none() {
+        return;
+    }
+    if let Some(messages) = payload["messages"].as_array_mut() {
+        for message in messages {
+            if message["info"]["role"] == "user" {
+                message["info"]["model"] = model.clone();
+            }
+        }
+    }
+}
+
+/// The installed runtime owns configuration merging, provider order and model ranking.
+/// A private loopback instance exposes those choices without creating a model request.
+fn local_model_configuration(
+    cli: &Path,
+    cwd: &Path,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    use base64::Engine as _;
+    use std::time::{Duration, Instant};
+    let password = uuid::Uuid::new_v4().to_string();
+    let authorization =
+        base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let address = listener.local_addr()?;
+    drop(listener);
+    let mut command = std::process::Command::new(cli);
+    command
+        .args([
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            &address.port().to_string(),
+        ])
+        .current_dir(cwd)
+        .env("OPENCODE_SERVER_USERNAME", "opencode")
+        .env("OPENCODE_SERVER_PASSWORD", &password)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut server = super::probe::Asked::start(command)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = server.child().try_wait()? {
+            bail!("OpenCode model configuration service exited ({status})");
+        }
+        let error = match local_model_json(address, "/config", &authorization, deadline) {
+            Ok(config) => {
+                let catalog =
+                    local_model_json(address, "/config/providers", &authorization, deadline)
+                        .context("cannot read OpenCode native model defaults")?;
+                return Ok((config, catalog));
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(error.context("OpenCode model configuration service timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn local_model_json(
+    address: std::net::SocketAddr,
+    route: &str,
+    authorization: &str,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value> {
+    use std::io::{Read, Write};
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    anyhow::ensure!(
+        !remaining.is_zero(),
+        "OpenCode model configuration request timed out"
+    );
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &address,
+        remaining.min(std::time::Duration::from_millis(250)),
+    )?;
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
+    write!(
+        stream,
+        "GET {route} HTTP/1.0\r\nHost: {address}\r\nAuthorization: Basic {authorization}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "OpenCode model configuration request timed out"
+        );
+        stream.set_read_timeout(Some(remaining))?;
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            bytes.len() + count <= 8 * 1024 * 1024,
+            "OpenCode model configuration response exceeds limit"
+        );
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(boundary) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&bytes[..boundary])?;
+            if let Some(length) = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            {
+                anyhow::ensure!(
+                    length <= 8 * 1024 * 1024 - boundary - 4,
+                    "OpenCode model configuration response exceeds limit"
+                );
+                if bytes.len() >= boundary + 4 + length {
+                    bytes.truncate(boundary + 4 + length);
+                    break;
+                }
+            }
+        }
+    }
+    let boundary = bytes
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .context("invalid OpenCode model configuration response")?;
+    let headers = std::str::from_utf8(&bytes[..boundary])?;
+    anyhow::ensure!(
+        headers
+            .lines()
+            .next()
+            .is_some_and(|line| line.split_whitespace().nth(1) == Some("200")),
+        "OpenCode model configuration request failed"
+    );
+    serde_json::from_slice(&bytes[boundary + 4..])
+        .context("invalid OpenCode model configuration JSON")
+}
+
+fn select_restore_model(
+    config: &serde_json::Value,
+    catalog: &serde_json::Value,
+    recent: Option<&serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let providers = catalog["providers"]
+        .as_array()
+        .context("OpenCode returned no provider catalog")?;
+    let available = |provider: &str, model: &str| {
+        providers
+            .iter()
+            .any(|item| item["id"] == provider && item["models"].get(model).is_some())
+    };
+    if let Some(model) = config["model"].as_str() {
+        let (provider, model) = model
+            .split_once('/')
+            .context("invalid configured OpenCode model")?;
+        anyhow::ensure!(
+            available(provider, model),
+            "configured OpenCode model is unavailable; update the project model before importing"
+        );
+        return Ok(serde_json::json!({"providerID":provider,"modelID":model}));
+    }
+    if let Some(items) = recent.and_then(|value| value["recent"].as_array()) {
+        for item in items {
+            if let (Some(provider), Some(model)) =
+                (item["providerID"].as_str(), item["modelID"].as_str())
+                && available(provider, model)
+            {
+                return Ok(serde_json::json!({"providerID":provider,"modelID":model}));
+            }
+        }
+    }
+    let configured = config["provider"].as_object();
+    let provider = providers
+        .iter()
+        .find(|item| {
+            item["id"].as_str().is_some_and(|id| {
+                configured.is_none_or(|keys| keys.is_empty() || keys.contains_key(id))
+            })
+        })
+        .and_then(|item| item["id"].as_str())
+        .context("OpenCode has no available provider; configure one before importing")?;
+    let model = catalog["default"][provider]
+        .as_str()
+        .filter(|model| available(provider, model))
+        .context("OpenCode has no available default model; configure one before importing")?;
+    Ok(serde_json::json!({"providerID":provider,"modelID":model}))
+}
+
+fn local_restore_model(cli: &Path, cwd: &Path) -> Result<serde_json::Value> {
+    let (config, catalog) = local_model_configuration(cli, cwd)?;
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    let recent = state
+        .and_then(|p| std::fs::read(p.join("opencode/model.json")).ok())
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok());
+    select_restore_model(&config, &catalog, recent.as_ref())
 }
 
 /// Event timestamp (an RFC3339 string) → epoch milliseconds; None when there is none, and the
@@ -1386,7 +1629,7 @@ fn assistant_msg(
     created: i64,
     text: &str,
     cwd: &str,
-    prev: &mut Option<String>,
+    current_user: &Option<String>,
     tool_event: Option<(&Event, Option<&super::ToolDetail>)>,
 ) -> serde_json::Value {
     let mid = mint_key("msg_");
@@ -1405,7 +1648,7 @@ fn assistant_msg(
         "time": { "created": created, "completed": created },
         "finish": "stop",
     });
-    if let Some(p) = prev.as_ref() {
+    if let Some(p) = current_user.as_ref() {
         info["parentID"] = serde_json::Value::String(p.clone());
     }
     let mut parts: Vec<serde_json::Value> = vec![];
@@ -1421,7 +1664,6 @@ fn assistant_msg(
     if let Some((te, td)) = tool_event {
         parts.push(tool_part(te, sid, &mid, created, td));
     }
-    *prev = Some(mid);
     serde_json::json!({ "info": info, "parts": parts })
 }
 
@@ -1444,13 +1686,41 @@ fn tool_part(
             Some(p) => serde_json::json!({ "filePath": p }),
             None => serde_json::json!({}),
         });
-    let input = match input {
+    let mut input = match input {
         value @ serde_json::Value::Object(_) => value,
         serde_json::Value::String(patch) if name == "apply_patch" => {
             serde_json::json!({ "patchText": patch })
         }
         value => serde_json::json!({ "input": value }),
     };
+    let native = match name.as_str() {
+        "Write" => Some(("write", &[("file_path", "filePath")][..])),
+        "Read" => Some(("read", &[("file_path", "filePath")][..])),
+        "Edit" => Some((
+            "edit",
+            &[
+                ("file_path", "filePath"),
+                ("old_string", "oldString"),
+                ("new_string", "newString"),
+                ("replace_all", "replaceAll"),
+            ][..],
+        )),
+        "Bash" => Some(("bash", &[][..])),
+        _ => None,
+    };
+    let original_input = input.clone();
+    if let Some((_, fields)) = native
+        && let Some(object) = input.as_object_mut()
+    {
+        for (source, target) in fields {
+            if !object.contains_key(*target)
+                && let Some(value) = object.remove(*source)
+            {
+                object.insert((*target).into(), value);
+            }
+        }
+    }
+    let native_name = native.map_or(name.as_str(), |(target, _)| target);
     let output = detail.and_then(|d| d.output.clone()).unwrap_or_default();
     let failed = detail.is_some_and(|d| d.error);
     let mut part = serde_json::json!({
@@ -1458,7 +1728,7 @@ fn tool_part(
         "sessionID": sid,
         "messageID": mid,
         "type": "tool",
-        "tool": name,
+        "tool": native_name,
         "callID": mint_key("call_"),
         "state": {
             // A failure is written as it happened: the text goes in the error key (OpenCode's
@@ -1472,6 +1742,12 @@ fn tool_part(
             "time": { "start": ms, "end": ms },
         },
     });
+    if native.is_some() {
+        part["state"]["metadata"]["agit"] = serde_json::json!({
+            "sourceTool": name,
+            "sourceInput": original_input,
+        });
+    }
     if failed {
         part["state"]["error"] = serde_json::Value::String(output);
     }
@@ -2185,6 +2461,22 @@ impl Adapter for OpenCode {
              Install the CLI before restoring a session.",
         )?;
         let v2 = transfer::is_v2(&cli)?;
+        let mut cross_runtime = serde_json::from_str::<serde_json::Value>(content).ok();
+        let prepared = if let Some(value) = cross_runtime.as_mut().filter(|v| {
+            v.pointer("/info/agit/sourceRuntime").is_some()
+                && v["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["info"]["role"] == "user")
+                })
+        }) {
+            let model = local_restore_model(&cli, cwd)?;
+            set_restore_model(value, &model);
+            Some(serde_json::to_string_pretty(value)?)
+        } else {
+            None
+        };
+        let content = prepared.as_deref().unwrap_or(content);
         let payload = if v2 {
             transfer::payload(content, new_id, cwd)?
         } else {
@@ -3739,11 +4031,246 @@ mod tests {
         );
     }
 
-    /// Shaped by role, the tool part's state.metadata, and the key dropped when there is no
-    /// parent.
+    /// Restoring imported history uses a runnable local model without attributing historical
+    /// assistant replies to that model; same-family exports keep their original model choices.
+    #[test]
+    fn imported_restore_model_does_not_relabel_historical_assistants() {
+        let session = Session {
+            id: "source".into(),
+            runtime: "claude-code".into(),
+            cwd: Some("/source".into()),
+            events: vec![
+                Event::text(EventKind::UserPrompt, "hello", None),
+                Event::text(EventKind::AssistantReply, "hi", None),
+            ],
+        };
+        let mut payload =
+            render_export(&session, "ses_t", Path::new("/target"), &Default::default()).unwrap();
+        let model = serde_json::json!({"providerID":"local", "modelID":"available"});
+        set_restore_model(&mut payload, &model);
+        assert_eq!(payload["messages"][0]["info"]["model"], model);
+        assert_eq!(payload["messages"][1]["info"]["providerID"], "agit");
+        let note = &payload["messages"][0]["parts"][1];
+        assert_eq!(note["synthetic"], true);
+        assert!(note["text"].as_str().unwrap().contains("/source"));
+        let mut native = serde_json::json!({"messages":[{"info":{"role":"user","model":{"providerID":"original","modelID":"original"}}}]});
+        let original = native.clone();
+        set_restore_model(&mut native, &model);
+        assert_eq!(native, original);
+    }
+
+    /// Project configuration outranks recent sessions, and native defaults must not be
+    /// replaced by the alphabetic model listing when recent state is absent.
+    #[test]
+    fn restore_model_obeys_project_configuration_and_native_defaults() {
+        let catalog = serde_json::json!({
+            "providers":[
+                {"id":"opencode","models":{"aaa":{},"native":{}}},
+                {"id":"local","models":{"preferred":{},"recent":{}}}
+            ],
+            "default":{"opencode":"native","local":"preferred"}
+        });
+        let config = serde_json::json!({"model":"local/preferred"});
+        let recent = serde_json::json!({"recent":[{"providerID":"local","modelID":"recent"}]});
+        let preferred = serde_json::json!({"providerID":"local","modelID":"preferred"});
+        for history in [Some(&recent), None] {
+            assert_eq!(
+                select_restore_model(&config, &catalog, history).unwrap(),
+                preferred
+            );
+        }
+        assert_eq!(
+            select_restore_model(&serde_json::json!({}), &catalog, Some(&recent)).unwrap(),
+            recent["recent"][0]
+        );
+        assert_eq!(
+            select_restore_model(&serde_json::json!({}), &catalog, None).unwrap(),
+            serde_json::json!({"providerID":"opencode","modelID":"native"})
+        );
+        assert_eq!(
+            select_restore_model(
+                &serde_json::json!({"provider":{"local":{}}}),
+                &catalog,
+                None
+            )
+            .unwrap(),
+            preferred
+        );
+        let stale = serde_json::json!({"recent":[{"providerID":"missing","modelID":"missing"}]});
+        assert_eq!(
+            select_restore_model(&serde_json::json!({}), &catalog, Some(&stale)).unwrap(),
+            serde_json::json!({"providerID":"opencode","modelID":"native"})
+        );
+        assert!(
+            select_restore_model(
+                &serde_json::json!({"model":"local/missing"}),
+                &catalog,
+                Some(&recent)
+            )
+            .is_err()
+        );
+    }
+
+    /// A complete length-delimited response must finish while the server keeps its socket
+    /// open; otherwise a successful configuration read turns into a startup timeout.
+    #[test]
+    fn model_configuration_response_does_not_wait_for_connection_close() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, waiting) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = vec![];
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .contains("Authorization: Basic probe")
+            );
+            let body = br#"{"model":"local/preferred"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            let _ = waiting.recv_timeout(std::time::Duration::from_secs(3));
+        });
+        let result = local_model_json(
+            address,
+            "/config",
+            "probe",
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
+        done.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(result.unwrap()["model"], "local/preferred");
+    }
+
+    /// The installed runtime must expose merged project configuration and native defaults
+    /// through the authenticated probe, and the probe must stop its server after reading.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires OPENCODE_TEST_BINARY pointing to an installed CLI"]
+    fn installed_restore_model_respects_project_choice_without_inference() {
+        use std::os::unix::fs::PermissionsExt;
+        let cli = std::env::var("OPENCODE_TEST_BINARY").expect("OPENCODE_TEST_BINARY");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let wrapper = root.join("opencode-probe");
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let mut script = String::from("#!/bin/sh\n");
+        for (key, folder) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_CACHE_HOME", "cache"),
+        ] {
+            let path = root.join(folder);
+            std::fs::create_dir_all(&path).unwrap();
+            script.push_str(&format!("export {key}={}\n", quote(path.to_str().unwrap())));
+        }
+        script.push_str("unset OPENCODE_CONFIG OPENCODE_CONFIG_CONTENT OPENCODE_CONFIG_DIR OPENCODE_DB\nexport OPENCODE_DISABLE_MODELS_FETCH=true\n");
+        script.push_str(&format!(
+            "echo $$ > {}\n",
+            quote(root.join("server.pid").to_str().unwrap())
+        ));
+        script.push_str(&format!("exec {} \"$@\"\n", quote(&cli)));
+        std::fs::write(&wrapper, script).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{"model":"opencode/big-pickle","plugin":[]}"#,
+        )
+        .unwrap();
+        let (config, catalog) = local_model_configuration(&wrapper, &root).unwrap();
+        let pid: libc::pid_t = std::fs::read_to_string(root.join("server.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let recent = serde_json::json!({"recent":[{"providerID":"opencode","modelID":"other"}]});
+        for history in [Some(&recent), None] {
+            assert_eq!(
+                select_restore_model(&config, &catalog, history).unwrap(),
+                serde_json::json!({"providerID":"opencode","modelID":"big-pickle"})
+            );
+        }
+        let native = select_restore_model(&serde_json::json!({}), &catalog, None).unwrap();
+        let provider = catalog["providers"][0]["id"].as_str().unwrap();
+        assert_eq!(native["modelID"], catalog["default"][provider]);
+    }
+
+    /// Native tool dispatch depends on exact names and argument keys; unknown tools must
+    /// retain their source contract instead of being guessed into an unrelated tool.
+    #[test]
+    fn cross_runtime_tools_use_native_contracts_without_changing_unknown_tools() {
+        for (source, target, input, expected) in [
+            (
+                "Write",
+                "write",
+                serde_json::json!({"file_path":"/old/a", "content":"hi"}),
+                serde_json::json!({"filePath":"/old/a", "content":"hi"}),
+            ),
+            (
+                "Edit",
+                "edit",
+                serde_json::json!({"file_path":"/old/a", "old_string":"a", "new_string":"b", "replace_all":true}),
+                serde_json::json!({"filePath":"/old/a", "oldString":"a", "newString":"b", "replaceAll":true}),
+            ),
+            (
+                "Read",
+                "read",
+                serde_json::json!({"file_path":"/old/a", "offset":1}),
+                serde_json::json!({"filePath":"/old/a", "offset":1}),
+            ),
+            (
+                "Bash",
+                "bash",
+                serde_json::json!({"command":"pwd"}),
+                serde_json::json!({"command":"pwd"}),
+            ),
+            (
+                "VendorWrite",
+                "VendorWrite",
+                serde_json::json!({"file_path":"/old/a"}),
+                serde_json::json!({"file_path":"/old/a"}),
+            ),
+        ] {
+            let mut event = Event::text(EventKind::ToolUse, source, None);
+            event.tool = Some(source.into());
+            let detail = super::super::ToolDetail {
+                input: Some(input),
+                output: Some("original output".into()),
+                error: false,
+            };
+            let part = tool_part(&event, "ses_t", "msg_t", 0, Some(&detail));
+            assert_eq!(part["tool"], target);
+            assert_eq!(part["state"]["input"], expected);
+            assert_eq!(part["state"]["output"], "original output");
+        }
+    }
+
+    /// Imported messages preserve source order under OpenCode sorting and associate every
+    /// assistant with its turn's user, including tools between the prompt and final reply.
     #[test]
     fn render_satisfies_the_imported_shape() {
-        let s = Session {
+        let mut s = Session {
             id: "src".into(),
             runtime: "claude-code".into(),
             cwd: None,
@@ -3760,6 +4287,11 @@ mod tests {
                 Event::text(EventKind::AssistantReply, "done", None),
             ],
         };
+        let mut next_turn = s.events.clone();
+        for event in &mut next_turn {
+            event.timestamp = Some("2026-11-24T00:00:00.000Z".into());
+        }
+        s.events.extend(next_turn);
         let out = OpenCode.render(&s, "ses_r1", Path::new("/repo")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let info = &v["info"];
@@ -3775,7 +4307,7 @@ mod tests {
             "with no parent the key is dropped, not set to null"
         );
         let msgs = v["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 6);
         assert!(
             msgs[0]["info"]["model"]["providerID"].is_string(),
             "a user message carries the model object"
@@ -3792,10 +4324,24 @@ mod tests {
             tp["state"]["metadata"].is_object(),
             "the metadata key must be present"
         );
-        // The parentID chain steps over the message in between.
+        for (prompt, replies) in [(0, 1..3), (3, 4..6)] {
+            for reply in replies {
+                assert_eq!(
+                    msgs[reply]["info"]["parentID"], msgs[prompt]["info"]["id"],
+                    "assistant must belong to the current user prompt"
+                );
+            }
+        }
+        let mut stored = msgs.clone();
+        stored.sort_by(|a, b| {
+            a["info"]["time"]["created"]
+                .as_i64()
+                .cmp(&b["info"]["time"]["created"].as_i64())
+                .then_with(|| a["info"]["id"].as_str().cmp(&b["info"]["id"].as_str()))
+        });
         assert_eq!(
-            msgs[2]["info"]["parentID"].as_str().unwrap(),
-            msgs[1]["info"]["id"].as_str().unwrap()
+            &stored, msgs,
+            "OpenCode storage sorting must preserve conversation order"
         );
     }
 
