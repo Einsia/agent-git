@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.56] - 2026-11-26
+
+### Fixed
+
+- Sessions can be imported and uploaded automatically or manually when the runtime injects
+  only `color.ui=false` Git settings. Other injected settings remain unsupported.
+
 ## [0.2.55] - 2026-11-25
 
 ### Added
