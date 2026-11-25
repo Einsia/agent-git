@@ -26,11 +26,22 @@ struct Destination {
 pub(super) fn check_environment(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<()> {
-    for (name, _) in environment {
+    let mut count = 0;
+    let mut numbered = std::collections::HashMap::new();
+    for (name, value) in environment {
         let name = name.to_string_lossy();
         #[cfg(windows)]
         let name = name.to_ascii_uppercase();
         let key: &str = name.as_ref();
+        if key == "GIT_CONFIG_COUNT" {
+            count = crate::infra::git_runtime::config_count(&value)
+                .context("push cannot inherit invalid GIT_CONFIG_COUNT")?;
+            continue;
+        }
+        if key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_") {
+            numbered.insert(key.to_owned(), value);
+            continue;
+        }
         ensure!(
             !matches!(
                 key,
@@ -46,10 +57,23 @@ pub(super) fn check_environment(
                     | "GIT_PREFIX"
                     | "GIT_CONFIG"
                     | "GIT_CONFIG_PARAMETERS"
-                    | "GIT_CONFIG_COUNT"
-            ) && !key.starts_with("GIT_CONFIG_KEY_")
-                && !key.starts_with("GIT_CONFIG_VALUE_"),
+            ),
             "push cannot inherit {key}; clear Git routing and injected configuration before retrying"
+        );
+    }
+    ensure!(
+        numbered.len() as u64 == 2 * u64::from(count),
+        "push cannot inherit incomplete or unexpected numbered Git configuration"
+    );
+    for index in 0..count {
+        ensure!(
+            numbered
+                .get(&format!("GIT_CONFIG_KEY_{index}"))
+                .zip(numbered.get(&format!("GIT_CONFIG_VALUE_{index}")))
+                .is_some_and(
+                    |(key, value)| crate::infra::git_runtime::display_only_config(key, value)
+                ),
+            "push cannot inherit unsupported runtime Git configuration at index {index}"
         );
     }
     Ok(())

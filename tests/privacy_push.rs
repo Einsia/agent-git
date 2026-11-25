@@ -5558,9 +5558,9 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
             command.env(format!("GIT_CONFIG_KEY_{index}"), "color.ui");
             command.env(format!("GIT_CONFIG_VALUE_{index}"), "false");
         }
-        command.output().unwrap()
+        command
     };
-    let imported = runtime_command(&import);
+    let imported = runtime_command(&import).output().unwrap();
     assert_success(&imported);
     let said = format!(
         "{}{}",
@@ -5575,10 +5575,14 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     let laptop_repo = laptop.join("repos/alice/app");
     let saved = storage::materialize_at(&laptop_repo, "refs/heads/talk", meta::LOG_FILE).unwrap();
     assert!(saved.contains("Check the shared file"));
-    let refused = runtime_command(&["--yes", "push", "alice/app@talk"]);
+    let refused = runtime_command(&["--yes", "push", "alice/app@talk"])
+        .env("GIT_CONFIG_KEY_9", "agit.autoPush")
+        .output()
+        .unwrap();
     assert!(!refused.status.success());
     assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("push cannot inherit GIT_CONFIG_COUNT")
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("unsupported runtime Git configuration at index 9")
     );
     assert_eq!(git(&remote, &["for-each-ref", "refs/heads/talk"]), "");
     assert_eq!(
@@ -5608,7 +5612,9 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(said.contains("main is on the Hub"), "{said}");
-    let uploaded = run_in(&laptop, &["--yes", "push", "alice/app@talk"]);
+    let uploaded = runtime_command(&["--yes", "push", "alice/app@talk"])
+        .output()
+        .unwrap();
     assert_success(&uploaded);
     let received: meta::Meta = serde_json::from_str(&git(
         &remote,
