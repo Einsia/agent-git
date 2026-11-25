@@ -241,6 +241,9 @@ pub fn run_with_output(mut args: Args, json: bool) -> CmdResult {
             lineage::Decision::Apply(selected) => accepted = Some(*selected),
         }
     }
+    if !args.link_only && accepted.is_none() {
+        lineage::verify_git_routing()?;
+    }
 
     // ── 1. Ask the preconditions first, then touch the disk ──
     //
@@ -921,7 +924,6 @@ fn prepare_target(
     let repository = if accepted.is_some() {
         None
     } else {
-        lineage::verify_git_routing()?;
         if Repo::open(&repo_dir).is_some() {
             Some((
                 lineage::PathIdentity::capture(&repo_dir, true)?,

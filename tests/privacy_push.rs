@@ -5551,7 +5551,16 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         hub_main
     );
 
-    let imported = run_in(&laptop, &import);
+    let runtime_command = |args: &[&str]| {
+        let mut command = command_in(&laptop, args);
+        command.env("GIT_CONFIG_COUNT", "10");
+        for index in 0..10 {
+            command.env(format!("GIT_CONFIG_KEY_{index}"), "color.ui");
+            command.env(format!("GIT_CONFIG_VALUE_{index}"), "false");
+        }
+        command.output().unwrap()
+    };
+    let imported = runtime_command(&import);
     assert_success(&imported);
     let said = format!(
         "{}{}",
@@ -5564,6 +5573,14 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     );
     assert!(!said.contains("couldn't"), "{said}");
     let laptop_repo = laptop.join("repos/alice/app");
+    let saved = storage::materialize_at(&laptop_repo, "refs/heads/talk", meta::LOG_FILE).unwrap();
+    assert!(saved.contains("Check the shared file"));
+    let refused = runtime_command(&["--yes", "push", "alice/app@talk"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("push cannot inherit GIT_CONFIG_COUNT")
+    );
+    assert_eq!(git(&remote, &["for-each-ref", "refs/heads/talk"]), "");
     assert_eq!(
         git(&laptop_repo, &["rev-parse", "refs/heads/main"]),
         hub_main
@@ -5591,7 +5608,15 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(said.contains("main is on the Hub"), "{said}");
-    assert_success(&run_in(&laptop, &["--yes", "push", "alice/app@talk"]));
+    let uploaded = run_in(&laptop, &["--yes", "push", "alice/app@talk"]);
+    assert_success(&uploaded);
+    let received: meta::Meta = serde_json::from_str(&git(
+        &remote,
+        &["show", &format!("refs/heads/talk:{}", meta::FILE)],
+    ))
+    .unwrap();
+    assert!(meta::is_bare_id(&received.session));
+    assert!(String::from_utf8_lossy(&uploaded.stdout).contains(&received.session));
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
     git(
         &remote,

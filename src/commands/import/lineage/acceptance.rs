@@ -391,8 +391,6 @@ pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_NAMESPACE",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS",
         "GIT_REPLACE_REF_BASE",
         "GIT_SHALLOW_FILE",
         "GIT_GRAFT_FILE",
@@ -400,6 +398,30 @@ pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
         ensure!(
             std::env::var_os(key).is_none(),
             "unset {key} before applying a lineage choice"
+        );
+    }
+    ensure!(
+        std::env::var_os("GIT_CONFIG_PARAMETERS").is_none(),
+        "cannot apply a lineage choice with opaque GIT_CONFIG_PARAMETERS"
+    );
+    let Some(count) = std::env::var_os("GIT_CONFIG_COUNT") else {
+        return Ok(());
+    };
+    let count = count
+        .to_str()
+        .and_then(|text| {
+            text.parse::<u32>()
+                .ok()
+                .filter(|number| number.to_string() == text)
+        })
+        .context("invalid GIT_CONFIG_COUNT for a lineage choice")?;
+    for index in 0..count {
+        ensure!(
+            std::env::var(format!("GIT_CONFIG_KEY_{index}"))
+                .is_ok_and(|key| key.eq_ignore_ascii_case("color.ui"))
+                && std::env::var(format!("GIT_CONFIG_VALUE_{index}"))
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("false")),
+            "cannot apply a lineage choice with unsupported runtime Git configuration at index {index}"
         );
     }
     Ok(())
