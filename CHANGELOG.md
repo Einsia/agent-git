@@ -8,7 +8,7 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
-## [0.2.55] - 2026-11-21
+## [0.2.55] - 2026-11-25
 
 ### Added
 
@@ -18,6 +18,9 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - `agit org invite` lets an organization owner invite an existing account as a member using the selected Hub login.
 - Remote Control devices can verify and stage attachments for authorized turns on Hubs that support turn input
   attachments. Feishu attachment delivery also requires the corresponding Hub support.
+- Device owners can approve an image outside a conversation folder for preview in that conversation.
+- Antigravity CLI users can import a text conversation they explicitly captured, without scanning their history.
+- Users can verify large, self-contained Codex rollouts and check a branch's local source without publishing it.
 
 ### Changed
 
@@ -44,6 +47,15 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 - A recorded version can be cloned by its commit ID even when no generated version tag exists.
 - Push progress stays visible when output streams use different destinations and while preparing the next part.
 - Completed multipart uploads finish without an unnecessary final repository check.
+- Codex agent messages remain readable when their routing headers use Windows line endings. Activity counts
+  include trailing Codex requests in merge archives without counting a mirrored request twice.
+- When a session upload is refused, the CLI distinguishes unverified permissions from a confirmed parent
+  restriction and explains how to proceed.
+- Remote Control reclaims undelivered attachment files when they are no longer needed. Attachments delivered
+  to a session, or whose delivery is uncertain, remain available when the session resumes.
+- Conversations remixed into OpenCode preserve message order and tool inputs. Restoring a conversation uses
+  the target project's configured model rather than silently substituting another for an invalid selection.
+- Bundled Git on Linux uses refreshed Alpine OpenSSL packages on both supported architectures.
 
 ## [0.2.54] - 2026-11-19
 
