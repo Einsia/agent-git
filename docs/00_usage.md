@@ -235,11 +235,10 @@ line. `--propose-lineage` prints the same local evidence without applying a choi
 comparison is unavailable, so a missing verified prefix does not prove unrelated history.
 
 A runtime can inject Git settings for a command using `GIT_CONFIG_COUNT` and numbered
-key/value pairs. Applying an import choice accepts an empty list or a list containing only
+key/value pairs. Import and push accept an empty list or a list containing only
 `color.ui=false`. Other entries, incomplete lists, and opaque `GIT_CONFIG_PARAMETERS` are
-refused: they may change the repository, visible objects, or execution policy. Import does
-not clear these settings or display their contents. This allowance is for local import only;
-`agit push` still refuses inherited runtime Git configuration.
+refused: they may change the repository, visible objects, or execution policy. Automatic
+uploads follow the same push checks. Neither command clears these settings or displays their contents.
 
 After accepting an independent import, the session's turns are recorded:
 

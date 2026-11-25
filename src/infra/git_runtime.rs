@@ -3,6 +3,19 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(feature = "cli")]
+pub(crate) fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
+    let text = value.to_str()?;
+    text.parse::<u32>()
+        .ok()
+        .filter(|count| count.to_string() == text)
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn display_only_config(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
+    key.eq_ignore_ascii_case("color.ui") && value.eq_ignore_ascii_case("false")
+}
+
 #[cfg(feature = "bundled-git")]
 mod bundled;
 

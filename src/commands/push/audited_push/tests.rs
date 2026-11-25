@@ -611,9 +611,6 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         "GIT_PREFIX",
         "GIT_CONFIG",
         "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_KEY_0",
-        "GIT_CONFIG_VALUE_0",
     ] {
         let error = check_environment([(key.into(), "PRIVATE_ROUTING_VALUE".into())]).unwrap_err();
         assert_eq!(
@@ -624,7 +621,22 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         );
         assert!(!error.to_string().contains("PRIVATE_ROUTING_VALUE"));
     }
-    assert!(check_environment([("GIT_CONFIG_COUNT".into(), "0".into())]).is_err());
+    assert!(check_environment([("GIT_CONFIG_COUNT".into(), "0".into())]).is_ok());
+    for (count, key_name, value_name) in [
+        ("01", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"),
+        ("2", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"),
+        ("0", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"),
+        ("1", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_1"),
+    ] {
+        assert!(
+            check_environment([
+                ("GIT_CONFIG_COUNT".into(), count.into()),
+                (key_name.into(), "color.ui".into()),
+                (value_name.into(), "false".into()),
+            ])
+            .is_err()
+        );
+    }
     assert!(
         check_environment([
             ("GIT_CONFIG_GLOBAL".into(), "retained-config".into()),

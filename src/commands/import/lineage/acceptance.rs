@@ -407,20 +407,15 @@ pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
     let Some(count) = std::env::var_os("GIT_CONFIG_COUNT") else {
         return Ok(());
     };
-    let count = count
-        .to_str()
-        .and_then(|text| {
-            text.parse::<u32>()
-                .ok()
-                .filter(|number| number.to_string() == text)
-        })
+    let count = crate::infra::git_runtime::config_count(&count)
         .context("invalid GIT_CONFIG_COUNT for a lineage choice")?;
     for index in 0..count {
         ensure!(
-            std::env::var(format!("GIT_CONFIG_KEY_{index}"))
-                .is_ok_and(|key| key.eq_ignore_ascii_case("color.ui"))
-                && std::env::var(format!("GIT_CONFIG_VALUE_{index}"))
-                    .is_ok_and(|value| value.eq_ignore_ascii_case("false")),
+            std::env::var_os(format!("GIT_CONFIG_KEY_{index}"))
+                .zip(std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")))
+                .is_some_and(
+                    |(key, value)| crate::infra::git_runtime::display_only_config(&key, &value)
+                ),
             "cannot apply a lineage choice with unsupported runtime Git configuration at index {index}"
         );
     }
