@@ -915,6 +915,46 @@ mod tests {
     }
 
     #[test]
+    fn archive_activity_credits_the_first_saved_copy_of_a_codex_prompt() {
+        let item = |role: &str, kind: &str, text: &str| serde_json::json!({"type":"response_item", "payload":{"type":"message","role":role,"content":[{"type":kind,"text":text}]}});
+        let end = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}});
+        let text = "synthetic follow-up";
+        let prompt = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":text}});
+        for mirrored in [false, true] {
+            let fixture = Fixture::new();
+            let publish = |records: &[serde_json::Value]| {
+                for record in records {
+                    fixture.append(format!("{record}\n").as_bytes());
+                }
+                let TailOutcome::Published { commit, .. } = fixture.settle().unwrap() else {
+                    panic!("expected an archive publication")
+                };
+                commit
+            };
+            let first = publish(&[
+                item("assistant", "output_text", "previous answer"),
+                end.clone(),
+                prompt.clone(),
+            ]);
+            let expected = [(first, text.to_owned())];
+            assert_eq!(
+                crate::domain::activity::tests::saved_user_messages(&fixture.repo),
+                expected
+            );
+            let mut answer = Vec::new();
+            if mirrored {
+                answer.push(item("user", "input_text", text));
+            }
+            answer.extend([item("assistant", "output_text", "next answer"), end.clone()]);
+            publish(&answer);
+            assert_eq!(
+                crate::domain::activity::tests::saved_user_messages(&fixture.repo),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn tail_publishes_only_log_and_preserves_native_link_and_exact_metadata() {
         let fixture = Fixture::new();
         let inherited_view = fixture

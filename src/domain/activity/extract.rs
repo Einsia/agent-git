@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod codex;
+
 const MAX_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WINDOW_RECORDS: usize = 1024;
 /// Windows smaller than this are validated on the calling thread; more threads would only add
@@ -37,6 +39,7 @@ pub(super) struct Meta {
     pub turn: Option<u32>,
     pub contribution: bool,
     pub account_id: Option<String>,
+    archive: bool,
     runtime: String,
     file_line: bool,
     legacy: bool,
@@ -48,6 +51,7 @@ pub(super) fn parse_meta(raw: &[u8], commit: &str) -> Result<Meta> {
         file_line: metadata.is_file_line(),
         legacy: matches!(metadata.layout, meta::LayoutVersion::V0),
         contribution: matches!(metadata.kind, meta::Kind::Turn | meta::Kind::Archive),
+        archive: metadata.kind == meta::Kind::Archive,
         account_id: metadata.committer_account.map(|account| account.account_id),
         session: metadata.session,
         turn: metadata.turn,
@@ -339,11 +343,13 @@ impl<'s, S: Store> Extractor<'s, S> {
     fn read_window(&mut self, candidate: &Candidate, record: usize) -> Result<Window> {
         let commit = candidate.key.commit.as_str();
         let current = self.sequence(commit, &candidate.meta)?;
+        let mut archive = candidate.meta.archive;
         let previous = match &candidate.parent {
             Some(parent) => match self.meta(parent)? {
                 Some(metadata)
                     if metadata.session == candidate.meta.session && !metadata.file_line =>
                 {
+                    archive |= metadata.archive;
                     let previous = self.sequence(parent, &metadata)?;
                     ensure!(
                         current.log.starts_with(&previous.log),
@@ -392,7 +398,10 @@ impl<'s, S: Store> Extractor<'s, S> {
             .is_none()
             .then(|| current.ids(offset, next_record).collect::<Vec<_>>());
         let envelopes = authenticate(text, ids.as_deref())?;
-        let session = transcript::display::parse_validated(&envelopes)?;
+        let mut session = transcript::display::parse_validated(&envelopes)?;
+        if archive && candidate.meta.runtime == "codex" {
+            self.archive_prompts(candidate, &current, offset, &envelopes, &mut session)?;
+        }
         let mut texts = Vec::new();
         for event in session.events {
             let role = match event.kind {

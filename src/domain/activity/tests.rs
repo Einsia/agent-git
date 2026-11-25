@@ -143,6 +143,38 @@ fn read(repo: &Repo, attribution: &mut Fixed, query: &Query) -> Result<Page> {
     )
 }
 
+pub(crate) fn saved_user_messages(repo: &Repo) -> Vec<(String, String)> {
+    let mut query = query();
+    query.author = repo
+        .git(&["show", "-s", "--format=%ae", "HEAD"])
+        .unwrap()
+        .trim()
+        .into();
+    let saved = repo.git(&["show", "-s", "--format=%ct", "HEAD"]).unwrap();
+    let saved = chrono::DateTime::from_timestamp(saved.trim().parse().unwrap(), 0).unwrap();
+    query.since = (saved - chrono::Duration::hours(1)).to_rfc3339();
+    query.before = (saved + chrono::Duration::hours(1)).to_rfc3339();
+    let mut result = Vec::new();
+    loop {
+        let page = read(repo, &mut Fixed::default(), &query).unwrap();
+        assert!(!page.incomplete, "{:?}", page.reasons);
+        for entry in page.contributions {
+            for message in entry
+                .messages
+                .into_iter()
+                .filter(|message| message.role == "user")
+            {
+                result.push((entry.commit.clone(), message.text));
+            }
+        }
+        query.cursor = page.next_cursor;
+        if !page.has_more {
+            return result;
+        }
+        assert!(query.cursor.is_some());
+    }
+}
+
 /// Every page of a query; `between` runs after the first page.
 fn pages(
     repo: &Repo,
