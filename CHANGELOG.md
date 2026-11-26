@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.59] - 2026-11-27
+
+### Fixed
+
+- Session imports and uploads now preserve the order of URL-specific Git authentication
+  settings supplied by the desktop runtime, so you can use them without changing your Git configuration.
+
 ## [0.2.58] - 2026-11-26
 
 ### Fixed
