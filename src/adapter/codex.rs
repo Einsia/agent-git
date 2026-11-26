@@ -254,16 +254,7 @@ enum SplitFailure {
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn standalone_header(
-    source: &super::native_snapshot::Source,
-    header: &[u8],
-) -> super::native_snapshot::Result<bool> {
-    use super::native_snapshot::Unavailable;
-    id_from_filename(&source.path).ok_or(Unavailable::Incomplete)?;
-    split_rollout(header.to_vec(), Some(&source.session_id))
-        .map(|(_, history)| history.is_none())
-        .map_err(|_| Unavailable::Incomplete)
-}
+pub(crate) mod lineage_stream;
 
 fn recognized_rollout(bytes: &[u8], expected_thread_id: &str) -> bool {
     let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
@@ -370,21 +361,23 @@ fn validated_prefix_end(
                 .checked_sub(1)
                 .ok_or(Unavailable::BudgetExceeded)?;
         }
-        let record: serde_json::Value =
-            serde_json::from_slice(&line[..line.len() - 1]).map_err(|_| Unavailable::Incomplete)?;
-        let ordinal = record
-            .get("ordinal")
-            .and_then(|value| value.as_u64())
-            .ok_or(Unavailable::Incomplete)?;
-        if ordinal <= previous {
-            return Err(Unavailable::Incomplete);
-        }
-        previous = ordinal;
+        previous = next_parent_ordinal(previous, line)?;
     }
     if previous.checked_add(1) != Some(history.ordinal_exclusive) {
         return Err(Unavailable::Incomplete);
     }
     Ok(prefix_end)
+}
+
+fn next_parent_ordinal(previous: u64, line: &[u8]) -> super::native_snapshot::Result<u64> {
+    use super::native_snapshot::Unavailable;
+    let record: serde_json::Value =
+        serde_json::from_slice(line).map_err(|_| Unavailable::Incomplete)?;
+    record
+        .get("ordinal")
+        .and_then(|value| value.as_u64())
+        .filter(|ordinal| *ordinal > previous)
+        .ok_or(Unavailable::Incomplete)
 }
 
 fn append_bounded(

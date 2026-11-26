@@ -613,7 +613,11 @@ pub(crate) fn finish_unchanged(
     verify_unchanged(file, path, opened)
 }
 
-fn verify_unchanged(file: &std::fs::File, path: &Path, opened: &std::fs::Metadata) -> Result<()> {
+pub(super) fn verify_unchanged(
+    file: &std::fs::File,
+    path: &Path,
+    opened: &std::fs::Metadata,
+) -> Result<()> {
     #[cfg(test)]
     read_observation::notify(read_observation::Stage::BeforeVerify);
     let after = file.metadata().map_err(|_| Unavailable::Read)?;

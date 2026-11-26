@@ -1,10 +1,8 @@
 use crate::adapter::{Adapter, codex, native_snapshot};
 use crate::domain::{native_archive, privacy::projector, transcript};
-use native_snapshot::{Limit, Limits, Source, Stage, Unavailable};
+use native_snapshot::{BudgetHit, Limit, Limits, Source, Unavailable};
 use sha2::{Digest, Sha256};
-use std::io::{BufRead, BufReader, Read};
 
-const RECORD_BYTES: usize = 8 * 1024 * 1024;
 const PREFIX_BYTES: usize = 16 * 1024 * 1024;
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -17,13 +15,13 @@ pub(super) struct Observed {
 
 impl Observed {
     pub(super) fn read(source: &Source, adapter: &dyn Adapter) -> crate::Result<Self> {
-        if source.runtime == "codex"
-            && std::fs::symlink_metadata(&source.path)?.len()
-                > native_snapshot::MAX_NATIVE_BYTES as u64
-        {
-            return Self::stream(source, PREFIX_BYTES);
-        }
-        let snapshot = adapter.snapshot_native_readonly(source, Limits::default())?;
+        let snapshot = match adapter.snapshot_native_readonly(source, Limits::default()) {
+            Err(Unavailable::Limit(BudgetHit {
+                limit: Limit::Bytes | Limit::WorkingBytes | Limit::Records,
+                ..
+            })) if source.runtime == "codex" => return Self::stream(source, PREFIX_BYTES),
+            result => result?,
+        };
         anyhow::ensure!(
             snapshot.source == *source,
             "the native provider returned another source"
@@ -36,69 +34,17 @@ impl Observed {
     }
 
     fn stream(source: &Source, prefix_limit: usize) -> crate::Result<Self> {
-        let cap = native_snapshot::MAX_CAPTURE_BYTES;
-        let (file, opened) = native_snapshot::open_unchanged(&source.path, |len| {
-            if len > cap {
-                Err(Unavailable::hit(Stage::Stream, Limit::Bytes, len, cap))
-            } else {
-                Ok(())
-            }
-        })?;
-        let mut reader = BufReader::new(&file);
         let mut digest = Sha256::new();
         let mut prefix = Vec::new();
         let mut suffix_hashes = Vec::new();
-        let mut line = Vec::new();
-        let mut total = 0;
-        let mut records = 0;
-        loop {
-            line.clear();
-            let count = (&mut reader)
-                .take(RECORD_BYTES as u64 + 1)
-                .read_until(b'\n', &mut line)
-                .map_err(|_| Unavailable::Read)?;
-            if count == 0 {
-                break;
-            }
-            total += count;
-            records += 1;
-            if count > RECORD_BYTES {
-                return Err(Unavailable::hit(
-                    Stage::Stream,
-                    Limit::RecordBytes,
-                    count,
-                    RECORD_BYTES,
-                )
-                .into());
-            }
-            if total > cap {
-                return Err(Unavailable::hit(Stage::Stream, Limit::Bytes, total, cap).into());
-            }
-            if records > native_snapshot::MAX_NATIVE_RECORDS {
-                return Err(Unavailable::hit(
-                    Stage::Stream,
-                    Limit::Records,
-                    records,
-                    native_snapshot::MAX_NATIVE_RECORDS,
-                )
-                .into());
-            }
-            if line.last() != Some(&b'\n') {
-                return Err(Unavailable::Incomplete.into());
-            }
-            if records == 1 && !codex::standalone_header(source, &line)? {
-                native_snapshot::admit_bytes(
-                    Stage::Reconstruct,
-                    opened.len() as usize,
-                    Limits::default(),
-                )?;
-                return Err(Unavailable::Incomplete.into());
-            }
-            digest.update(&line);
-            if suffix_hashes.is_empty() && prefix.len() + count <= prefix_limit {
-                prefix.extend_from_slice(&line);
+        let mut candidate_hash_bytes =
+            crate::domain::import_lineage::Limits::default().snapshot_bytes;
+        codex::lineage_stream::visit(source, |line| {
+            digest.update(line);
+            if suffix_hashes.is_empty() && prefix.len() + line.len() <= prefix_limit {
+                prefix.extend_from_slice(line);
             } else {
-                let checked = native_archive::capture(&line, 0, EMPTY_SHA256)
+                let checked = native_archive::capture(line, 0, EMPTY_SHA256)
                     .map_err(|_| Unavailable::Incomplete)?;
                 let value: serde_json::Value =
                     serde_json::from_str(checked.records).map_err(|_| Unavailable::Incomplete)?;
@@ -108,14 +54,21 @@ impl Observed {
                 if projector::tokens(&value.to_string()).next().is_some() {
                     return Err(StreamGap::SecretMapping.into());
                 }
-                suffix_hashes.push(transcript::object_hash(&value));
+                if candidate_hash_bytes != 0 {
+                    let hash = transcript::object_hash(&value);
+                    // Every verified stored envelope contains its content hash literally.
+                    // No admissible candidate can reach records past this comparison window.
+                    if hash.len() <= candidate_hash_bytes {
+                        candidate_hash_bytes -= hash.len();
+                        suffix_hashes.push(hash);
+                    } else {
+                        candidate_hash_bytes = 0;
+                    }
+                }
             }
-        }
-        if records == 0 {
-            return Err(Unavailable::Incomplete.into());
-        }
+            Ok(())
+        })?;
         native_archive::capture(&prefix, 0, EMPTY_SHA256).map_err(|_| Unavailable::Incomplete)?;
-        native_snapshot::finish_unchanged(&file, &source.path, &opened, total)?;
         Ok(Self {
             prefix,
             suffix_hashes,

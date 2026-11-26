@@ -234,6 +234,12 @@ without adopting; `--onto <ref>` selects a base and `--independent` explicitly s
 line. `--propose-lineage` prints the same local evidence without applying a choice. Semantic
 comparison is unavailable, so a missing verified prefix does not prove unrelated history.
 
+Codex preview can stream large local rollouts, including paginated history. A child inherits
+only the part of its parent named by the byte and ordinal coordinates in its header. There
+is no total transcript size or record-count ceiling on this stream. An oversized individual
+record, an ambiguous parent, or an invalid boundary still prevents a verified proposal.
+See [CLI inspection limits](cli-inspection-limits.md) for the other resource limits.
+
 A runtime can inject Git settings for a command using `GIT_CONFIG_COUNT` and numbered
 key/value pairs. Import and push accept `color.ui=false`, URL-scoped `credential.<url>.*`
 settings, `http.<url>.proactiveAuth=auto`, and `http.<url>.followRedirects=false`.
