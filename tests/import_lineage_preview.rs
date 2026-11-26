@@ -207,7 +207,23 @@ fn codex_preview_bounds_parent_reads_and_reports_stream_limits() {
     let reply = serde_json::json!({"ordinal":2,"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Synthetic answer"}});
     let body = format!("{prompt}\n{reply}\n");
     let inherited = format!("{parent_header}\n{body}");
-    let leaf_header = serde_json::json!({"ordinal":2,"type":"session_meta","payload":{"id":NATIVE_ID,"history_mode":"paginated","history_base":{"thread_id":parent,"end_ordinal_exclusive":3,"end_byte_offset":inherited.len()}}});
+    let mut parent_file = std::io::BufWriter::new(fs::File::create(path(parent)).unwrap());
+    parent_file.write_all(inherited.as_bytes()).unwrap();
+    let mut inherited_bytes = inherited.len();
+    let mut exclusive = 3;
+    while inherited_bytes <= 64 * 1024 * 1024 {
+        let mut row = format!("{{\"ordinal\":{exclusive},\"type\":\"event_msg\"}}").into_bytes();
+        row.resize(1024 * 1024 - 1, b' ');
+        row.push(b'\n');
+        parent_file.write_all(&row).unwrap();
+        inherited_bytes += row.len();
+        exclusive += 1;
+    }
+    parent_file
+        .write_all(&vec![b' '; 8 * 1024 * 1024 + 1])
+        .unwrap();
+    drop(parent_file);
+    let leaf_header = serde_json::json!({"ordinal":2,"type":"session_meta","payload":{"id":NATIVE_ID,"history_mode":"paginated","history_base":{"thread_id":parent,"end_ordinal_exclusive":exclusive,"end_byte_offset":inherited_bytes}}});
     let prefix = format!("{leaf_header}\n{body}");
     let fill = |id, first: &str, size: usize, row_size: usize| {
         let mut file = std::io::BufWriter::new(fs::File::create(path(id)).unwrap());
@@ -225,7 +241,6 @@ fn codex_preview_bounds_parent_reads_and_reports_stream_limits() {
         }
         file.flush().unwrap();
     };
-    fill(parent, &inherited, 320_444_826, 8 * 1024 * 1024 + 1);
     fill(
         NATIVE_ID,
         &format!("{leaf_header}\n"),
@@ -281,26 +296,12 @@ fn codex_preview_bounds_parent_reads_and_reports_stream_limits() {
             .contains("stage=stream limit=record_bytes observed=8388609 limit_value=8388608")
     );
 
-    let header = serde_json::json!({"ordinal":0,"type":"session_meta","payload":{"id":NATIVE_ID}});
-    fill(NATIVE_ID, &format!("{header}\n"), 60_607_693, 230);
+    fill(NATIVE_ID, &format!("{leaf_header}\n"), 320_444_826, 1200);
     let result = document(&preview(NATIVE_ID, true), 2);
-    let report = &result["result"]["value"];
-    assert_eq!(report["scan_state"], "incomplete", "{report}");
-    assert_eq!(
-        report["unavailable"][0],
-        serde_json::json!({"commit":null,"reason":"native_budget","stage":"count","limit":"records","observed":263513,"limit_value":262144})
-    );
-
-    fill(parent, &inherited, 320_444_826, 64 * 1024);
-    let log = transcript::wrap_lines(&inherited, "codex", &metadata.session);
-    storage::write_snapshot(repo.root(), &log, &log).unwrap();
-    repo.add_all().unwrap();
-    repo.commit("synthetic standalone prefix").unwrap();
-    let expected = repo.git(&["rev-parse", "HEAD"]).unwrap();
-    let result = document(&preview(parent, true), 2);
     let report = &result["result"]["value"];
     assert_eq!(report["scan_state"], "complete", "{report}");
     assert_eq!(report["candidates"][0]["commit"], expected, "{report}");
+    assert_eq!(report["candidates"][0]["evidence"], "exact_native_records");
 }
 
 #[test]

@@ -1,0 +1,105 @@
+use super::{HistoryPoint, MAX_FORK_DEPTH, id_from_filename, next_parent_ordinal, split_rollout};
+use crate::adapter::native_snapshot::{self, Limit, Limits, Source, Stage, Unavailable};
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
+
+const RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_record(reader: &mut impl BufRead, line: &mut Vec<u8>) -> native_snapshot::Result<usize> {
+    line.clear();
+    let count = reader
+        .take(RECORD_BYTES as u64 + 1)
+        .read_until(b'\n', line)
+        .map_err(|_| Unavailable::Read)?;
+    if count > RECORD_BYTES {
+        return Err(Unavailable::hit(
+            Stage::Stream,
+            Limit::RecordBytes,
+            count,
+            RECORD_BYTES,
+        ));
+    }
+    if count != 0 && line.last() != Some(&b'\n') {
+        return Err(Unavailable::Incomplete);
+    }
+    Ok(count)
+}
+
+pub(crate) fn visit(
+    source: &Source,
+    mut emit: impl FnMut(&[u8]) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let mut current = source.clone();
+    let mut cut: Option<HistoryPoint> = None;
+    let mut nodes = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        if nodes.len() >= MAX_FORK_DEPTH {
+            return Err(Unavailable::hit(
+                Stage::Reconstruct,
+                Limit::Depth,
+                nodes.len() + 1,
+                MAX_FORK_DEPTH,
+            )
+            .into());
+        }
+        if !visited.insert(id_from_filename(&current.path).ok_or(Unavailable::Incomplete)?) {
+            return Err(Unavailable::Incomplete.into());
+        }
+        let (file, opened) = native_snapshot::open_unchanged(&current.path, |_| Ok(()))?;
+        let end = cut.as_ref().map_or(opened.len(), |point| point.byte_offset);
+        if end > opened.len() {
+            return Err(Unavailable::Incomplete.into());
+        }
+        let mut reader = BufReader::new(file.take(end));
+        let mut header = Vec::new();
+        let consumed = read_record(&mut reader, &mut header)? as u64;
+        let (parts, history) =
+            split_rollout(header, nodes.is_empty().then_some(&source.session_id))
+                .map_err(|_| Unavailable::Incomplete)?;
+        if nodes.is_empty() {
+            emit(&parts.header)?;
+        }
+        let boundary = cut
+            .map(|point| {
+                Ok::<_, Unavailable>((
+                    parts.header_ordinal.ok_or(Unavailable::Incomplete)?,
+                    point.ordinal_exclusive,
+                ))
+            })
+            .transpose()?;
+        nodes.push((reader, current.path, opened, end - consumed, boundary));
+        let Some(point) = history else {
+            break;
+        };
+        current = native_snapshot::lookup_codex_rollout(
+            &point.source_id,
+            Limits {
+                lookup_entries: Limits::default().lookup_entries.saturating_sub(nodes.len()),
+                ..Limits::default()
+            },
+        )?;
+        cut = Some(point);
+    }
+    let mut line = Vec::new();
+    for (mut reader, path, opened, mut remaining, mut boundary) in nodes.into_iter().rev() {
+        while remaining != 0 {
+            let count = read_record(&mut reader, &mut line)?;
+            if count == 0 {
+                return Err(Unavailable::Changed.into());
+            }
+            remaining -= count as u64;
+            if let Some((previous, _)) = &mut boundary
+                && line != b"\n"
+            {
+                *previous = next_parent_ordinal(*previous, &line)?;
+            }
+            emit(&line)?;
+        }
+        if boundary.is_some_and(|(last, exclusive)| last.checked_add(1) != Some(exclusive)) {
+            return Err(Unavailable::Incomplete.into());
+        }
+        native_snapshot::verify_unchanged(reader.get_ref().get_ref(), &path, &opened)?;
+    }
+    Ok(())
+}
