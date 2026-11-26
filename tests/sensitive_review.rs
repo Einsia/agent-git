@@ -840,11 +840,6 @@ fn guarded_reverts_refuse_inherited_git_routing_before_touching_any_repository()
             ("GIT_OBJECT_DIRECTORY", "synthetic-objects"),
             ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "synthetic-alternates"),
             ("GIT_NAMESPACE", "synthetic-namespace"),
-            ("GIT_CONFIG_COUNT", "1"),
-            (
-                "GIT_CONFIG_PARAMETERS",
-                "'core.worktree=synthetic-worktree'",
-            ),
             ("GIT_REPLACE_REF_BASE", "refs/synthetic-replace/"),
             ("GIT_SHALLOW_FILE", "synthetic-shallow"),
             ("GIT_GRAFT_FILE", "synthetic-grafts"),
@@ -859,11 +854,6 @@ fn guarded_reverts_refuse_inherited_git_routing_before_touching_any_repository()
                 let json = format.contains(&"--json");
                 let mut command = fixture.command(&args);
                 command.args(format).env(key, value);
-                if key == "GIT_CONFIG_COUNT" {
-                    command
-                        .env("GIT_CONFIG_KEY_0", "core.worktree")
-                        .env("GIT_CONFIG_VALUE_0", &foreign_path);
-                }
                 let output = command.output().unwrap();
                 assert_eq!(output.status.code(), Some(4), "{key}: {output:?}");
                 let diagnostic = if json {
@@ -883,7 +873,13 @@ fn guarded_reverts_refuse_inherited_git_routing_before_touching_any_repository()
             }
         }
 
-        let output = fixture.run(&args);
+        let output = fixture
+            .command(&args)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", &foreign_path)
+            .output()
+            .unwrap();
         assert!(output.status.success(), "{output:?}");
         let landed = fixture.head();
         assert_ne!(landed, reviewed);

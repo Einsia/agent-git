@@ -205,7 +205,6 @@ impl Lab {
                 "AGIT_SECRETS_KEYSTORE",
                 if cfg!(windows) { "os" } else { "file" },
             )
-            .env("GIT_CONFIG_GLOBAL", self.home.join("empty-gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(&self.work)
             .stdin(Stdio::null());
@@ -464,7 +463,8 @@ fn git(lab: &Lab, args: &[&str]) -> String {
     command
         .env_clear_local()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GIT_CONFIG_GLOBAL", lab.home.join("empty-gitconfig"))
+        .env("HOME", &lab.home)
+        .env("USERPROFILE", &lab.home)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(["-C", lab.work.to_str().unwrap()])
         .args(args);
@@ -1153,7 +1153,7 @@ fn here_config_fifo_refuses_within_deadline_and_restored_origin_still_searches()
                 &[
                     "config",
                     "--file",
-                    lab.home.join("empty-gitconfig").to_str().unwrap(),
+                    lab.home.join(".gitconfig").to_str().unwrap(),
                     "include.path",
                     fifo.to_str().unwrap(),
                 ],

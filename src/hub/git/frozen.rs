@@ -1665,19 +1665,7 @@ impl Source {
         command.env_clear().envs(self.process_environment());
         for (key, value) in &self.environment {
             let Some(name) = key.to_str() else { continue };
-            if matches!(
-                name,
-                "HOME"
-                    | "USERPROFILE"
-                    | "XDG_CONFIG_HOME"
-                    | "GIT_CONFIG_NOSYSTEM"
-                    | "GIT_CONFIG_SYSTEM"
-                    | "GIT_CONFIG_GLOBAL"
-                    | "GIT_CONFIG_COUNT"
-                    | "GIT_CONFIG_PARAMETERS"
-            ) || name.starts_with("GIT_CONFIG_KEY_")
-                || name.starts_with("GIT_CONFIG_VALUE_")
-            {
+            if matches!(name, "HOME" | "USERPROFILE" | "XDG_CONFIG_HOME") {
                 command.env(key, value);
             }
         }

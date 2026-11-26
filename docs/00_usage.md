@@ -240,16 +240,12 @@ is no total transcript size or record-count ceiling on this stream. An oversized
 record, an ambiguous parent, or an invalid boundary still prevents a verified proposal.
 See [CLI inspection limits](cli-inspection-limits.md) for the other resource limits.
 
-A runtime can inject Git settings for a command using `GIT_CONFIG_COUNT` and numbered
-key/value pairs. Import and push accept `color.ui=false`, URL-scoped `credential.<url>.*`
-settings, `http.<url>.proactiveAuth=auto`, and `http.<url>.followRedirects=false`.
-The URL must be a concrete HTTP(S) address without embedded credentials, wildcards,
-queries, or fragments. Git receives the settings in their original order, including
-empty helper resets and path-specific credential lookups. Transports that already have
-a Hub bearer token do not call Git credential helpers. Other settings, incomplete lists,
-and opaque `GIT_CONFIG_PARAMETERS` are refused. The diagnostic identifies the affected
-indices and reasons without displaying URLs, helper commands, or values. Automatic uploads
-follow the same push checks; no changes to your credential configuration are needed.
+Settings injected by a desktop runtime belong to its own Git invocation. AGit removes
+them before starting Git, without parsing key names, values or list order. Import,
+manual push and automatic upload therefore work with new runtime settings without
+changing your credentials. AGit uses its own scoped bearer token for Hub requests.
+An explicit repository override such as `GIT_DIR` still stops lineage selection and
+publication so they cannot act on a different repository from the one you selected.
 
 After accepting an independent import, the session's turns are recorded:
 

@@ -3606,9 +3606,8 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
             return;
         };
         let expected = std::env::var("AGIT_TEST_INSPECTION_SELECTED_HEAD").unwrap();
-        let redirected = std::env::var("AGIT_TEST_INSPECTION_FOREIGN_HEAD").unwrap();
         let repo = Repo::at(PathBuf::from(root));
-        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), redirected);
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]).unwrap(), expected);
         let inspected = repo.local_objects_only();
         assert_eq!(inspected.git(&["rev-parse", "HEAD"]).unwrap(), expected);
         assert_eq!(
@@ -3656,7 +3655,6 @@ exec "$AGIT_TEST_LEGACY_REAL_GIT" "$@"
             ])
             .env("AGIT_TEST_INSPECTION_SELECTED_ROOT", selected.root())
             .env("AGIT_TEST_INSPECTION_SELECTED_HEAD", &selected_head)
-            .env("AGIT_TEST_INSPECTION_FOREIGN_HEAD", &foreign_head)
             .env("GIT_DIR", foreign.root().join(".git"))
             .env("GIT_COMMON_DIR", foreign.root().join(".git"))
             .env("GIT_WORK_TREE", foreign.root())

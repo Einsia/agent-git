@@ -249,7 +249,7 @@ fn readers_of(client: &crate::hub::Client, repository: &str) -> Option<String> {
 
 /// Publication rejects inherited Git routing before storage preparation or native review.
 pub fn check_audit_environment() -> crate::Result<()> {
-    audited_push::check_environment(std::env::vars_os())
+    crate::infra::git_runtime::check_routing("cannot push")
 }
 
 /// The entry point of `agit __push-automatic`, which background spawners run through

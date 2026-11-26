@@ -17,7 +17,11 @@ on the user's machine.
 Git subprocesses select the private executable and helpers. Their PATH includes
 the private runtime ahead of the inherited PATH, and their `GIT_EXEC_PATH` selects
 the matching helpers. The parent shell environment is unchanged. Global and
-repository configuration continue to apply; the existing isolated publication
+repository configuration at their normal locations continue to apply. AGit ignores
+the caller's `GIT_CONFIG`, `GIT_CONFIG_*` and repository-routing overrides when
+starting Git. Desktop helpers and headers therefore apply only to the desktop's
+own Git operations. Hub transport adds its own scoped authentication after this
+isolation; it needs no change to the user's credentials. The isolated publication
 commands retain their restricted configuration environment. LFS configuration
 is installed locally in AgentGit repositories.
 
