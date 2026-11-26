@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.58] - 2026-11-26
+
+### Fixed
+
+- Codex import previews read only the history inherited from a parent session. If a native
+  lineage scan stops at a limit, the preview identifies the stage and resource and shows the
+  observed value alongside the limit.
+
 ## [0.2.57] - 2026-11-26
 
 ### Fixed
