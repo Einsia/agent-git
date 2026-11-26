@@ -58,7 +58,7 @@ fn pending_failure(error: &anyhow::Error) -> &'static str {
     }
     match error.downcast_ref::<Unavailable>() {
         Some(Unavailable::NotFound) => "unavailable: native session missing",
-        Some(Unavailable::BudgetExceeded) => TOO_LARGE,
+        Some(error) if error.is_budget() => TOO_LARGE,
         Some(Unavailable::Changed) => "unavailable: native source changed",
         Some(Unavailable::Unsupported) => "unavailable: no read-only native provider",
         Some(Unavailable::Database) => "unavailable: native database evidence is invalid",

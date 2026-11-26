@@ -1265,7 +1265,7 @@ fn status_observes_codex_fork_history_without_opening_indexes_or_changing_carrie
         lab.check_status(&[], &[("AGIT_SESSION", "alice/notes@topic")], |text| {
             assert!(text.contains("alice/notes @ topic"), "{text}");
             let row = native_session_row(text, "codex", SID);
-            assert!(row.contains(expected), "{text}");
+            assert!(row.contains(expected), "expected {expected}: {text}");
             assert!(row.contains("current claim; process unverified"), "{text}");
             if expected.starts_with("unavailable:") || expected.starts_with("not checked:") {
                 assert!(!row.contains(pending), "{text}");
@@ -1283,9 +1283,13 @@ fn status_observes_codex_fork_history_without_opening_indexes_or_changing_carrie
     check("unavailable: native session missing");
     fs::write(&parent_path, &parent_header).unwrap();
     check("unavailable: incomplete or inaccessible native evidence");
-    fs::write(&parent_path, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
-    check("not checked: too large to read quickly");
     fs::write(&parent_path, &parent_full).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&parent_path)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 + 1)
+        .unwrap();
     check(pending);
     fs::write(&lab.native, format!("{child_full}{{\"type\":")).unwrap();
     check("an incomplete trailing record is still being written");

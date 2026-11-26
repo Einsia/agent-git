@@ -43,6 +43,51 @@ impl Limits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    Lookup,
+    Count,
+    Read,
+    Reconstruct,
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Limit {
+    Entries,
+    Records,
+    Bytes,
+    WorkingBytes,
+    RecordBytes,
+    Depth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BudgetHit {
+    pub stage: Stage,
+    pub limit: Limit,
+    pub observed: usize,
+    pub limit_value: usize,
+}
+
+impl Unavailable {
+    pub(crate) fn hit(stage: Stage, limit: Limit, observed: usize, limit_value: usize) -> Self {
+        Self::Limit(BudgetHit {
+            stage,
+            limit,
+            observed,
+            limit_value,
+        })
+    }
+
+    #[cfg(any(feature = "secret-vault", test))]
+    pub(crate) fn is_budget(&self) -> bool {
+        matches!(self, Self::BudgetExceeded | Self::Limit(_))
+    }
+}
+
 /// Missing or incomplete evidence never establishes an empty native history.
 #[derive(
     Clone, Copy, Debug, Eq, PartialEq, thiserror::Error, serde::Serialize, serde::Deserialize,
@@ -56,6 +101,8 @@ pub enum Unavailable {
     Unsupported,
     #[error("the native inspection budget was exhausted")]
     BudgetExceeded,
+    #[error("the native inspection reached its {0:?} limit")]
+    Limit(BudgetHit),
     #[error("the native source could not be read completely")]
     Read,
     #[error("the native database schema or row is unavailable")]
@@ -196,7 +243,12 @@ pub(crate) fn codex_carrier_in(home: &Path, id: &str, limits: Limits) -> Result<
         }
         for entry in walkdir::WalkDir::new(root) {
             if visited >= limits.lookup_entries {
-                return Err(Unavailable::BudgetExceeded);
+                return Err(Unavailable::hit(
+                    Stage::Reconstruct,
+                    Limit::Entries,
+                    visited + 1,
+                    limits.lookup_entries,
+                ));
             }
             visited += 1;
             let entry = entry.map_err(|_| Unavailable::Read)?;
@@ -252,7 +304,12 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
     let mut selected = None;
     for (visited, entry) in walkdir::WalkDir::new(root).into_iter().enumerate() {
         if visited >= limits.lookup_entries {
-            return Err(Unavailable::BudgetExceeded);
+            return Err(Unavailable::hit(
+                Stage::Lookup,
+                Limit::Entries,
+                visited + 1,
+                limits.lookup_entries,
+            ));
         }
         let entry = entry.map_err(|_| Unavailable::Read)?;
         let path = entry.path();
@@ -302,8 +359,21 @@ fn lookup_files_at(runtime: &'static str, id: &str, root: &Path, limits: Limits)
 
 pub(crate) fn finish(source: Source, bytes: Vec<u8>, limits: Limits) -> Result<Snapshot> {
     let records = bytes.iter().filter(|byte| **byte == b'\n').count();
-    if bytes.len() > limits.bytes || records > limits.records {
-        return Err(Unavailable::BudgetExceeded);
+    if bytes.len() > limits.bytes {
+        return Err(Unavailable::hit(
+            Stage::Read,
+            Limit::Bytes,
+            bytes.len(),
+            limits.bytes,
+        ));
+    }
+    if records > limits.records {
+        return Err(Unavailable::hit(
+            Stage::Count,
+            Limit::Records,
+            records,
+            limits.records,
+        ));
     }
     if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
         return Err(Unavailable::Incomplete);
@@ -337,12 +407,7 @@ pub(crate) fn read_file_bytes_until(
     deadline: Option<std::time::Instant>,
 ) -> Result<Vec<u8>> {
     check_deadline(deadline)?;
-    let (file, opened) = open_unchanged(path, |len| {
-        if len > limits.bytes || len > limits.working_bytes {
-            return Err(Unavailable::BudgetExceeded);
-        }
-        Ok(())
-    })?;
+    let (file, opened) = open_unchanged(path, |len| admit_bytes(Stage::Read, len, limits))?;
     let capacity = usize::try_from(opened.len()).map_err(|_| Unavailable::BudgetExceeded)?;
     let mut bytes = Vec::new();
     bytes
@@ -525,9 +590,7 @@ fn read_bounded_until(
         let next = (bytes.len() - start)
             .checked_add(read)
             .ok_or(Unavailable::BudgetExceeded)?;
-        if next > limits.bytes || next > limits.working_bytes {
-            return Err(Unavailable::BudgetExceeded);
-        }
+        admit_bytes(Stage::Read, next, limits)?;
         if bytes.len() + read > bytes.capacity() {
             bytes
                 .try_reserve_exact(read)
@@ -544,18 +607,67 @@ pub(crate) fn finish_unchanged(
     opened: &std::fs::Metadata,
     read: usize,
 ) -> Result<()> {
+    if u64::try_from(read).ok() != Some(opened.len()) {
+        return Err(Unavailable::Changed);
+    }
+    verify_unchanged(file, path, opened)
+}
+
+fn verify_unchanged(file: &std::fs::File, path: &Path, opened: &std::fs::Metadata) -> Result<()> {
     #[cfg(test)]
     read_observation::notify(read_observation::Stage::BeforeVerify);
     let after = file.metadata().map_err(|_| Unavailable::Read)?;
     let current = std::fs::symlink_metadata(path).map_err(|_| Unavailable::Changed)?;
-    if u64::try_from(read).ok() != Some(opened.len())
-        || !same_file(opened, &after)
-        || !same_file(opened, &current)
-        || !is_current_file(file, path)?
-    {
+    if !same_file(opened, &after) || !same_file(opened, &current) || !is_current_file(file, path)? {
         return Err(Unavailable::Changed);
     }
     Ok(())
+}
+
+pub(crate) fn admit_bytes(stage: Stage, len: usize, limits: Limits) -> Result<()> {
+    if len > limits.bytes {
+        return Err(Unavailable::hit(stage, Limit::Bytes, len, limits.bytes));
+    }
+    if len > limits.working_bytes {
+        return Err(Unavailable::hit(
+            stage,
+            Limit::WorkingBytes,
+            len,
+            limits.working_bytes,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_parent_prefix(
+    path: &Path,
+    end: u64,
+    limits: Limits,
+    deadline: Option<std::time::Instant>,
+) -> Result<Vec<u8>> {
+    check_deadline(deadline)?;
+    let (file, opened) = open_unchanged(path, |len| {
+        if end > len as u64 {
+            return Err(Unavailable::Incomplete);
+        }
+        admit_bytes(Stage::Reconstruct, end as usize, limits)
+    })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(end as usize)
+        .map_err(|_| Unavailable::BudgetExceeded)?;
+    let mut reader = (&file).take(end);
+    let mut chunk = [0; 8192];
+    while reader.limit() > 0 {
+        check_deadline(deadline)?;
+        let count = reader.read(&mut chunk).map_err(|_| Unavailable::Read)?;
+        if count == 0 {
+            return Err(Unavailable::Changed);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    verify_unchanged(&file, path, &opened)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -911,10 +1023,7 @@ mod tests {
                 ..exact
             },
         ] {
-            assert_eq!(
-                read_file(&source, limits).unwrap_err(),
-                Unavailable::BudgetExceeded
-            );
+            assert!(read_file(&source, limits).unwrap_err().is_budget());
         }
         std::fs::write(&path, b"{\"type\":\"pending\"}").unwrap();
         assert_eq!(
@@ -989,7 +1098,7 @@ mod tests {
                 }
             )
             .unwrap_err(),
-            Unavailable::BudgetExceeded
+            Unavailable::hit(Stage::Lookup, Limit::Entries, 2, 1)
         );
         std::fs::create_dir(root.path().join("second")).unwrap();
         std::fs::write(root.path().join("second/native.jsonl"), b"different").unwrap();

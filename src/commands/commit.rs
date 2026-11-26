@@ -241,8 +241,9 @@ pub fn run(args: Args) -> CmdResult {
             ui::error(&super::terminal_error_message(&e));
             // A capture over its budget stays over it; retrying cannot settle it.
             let over_budget = e.chain().any(|cause| {
-                cause.downcast_ref::<crate::adapter::native_snapshot::Unavailable>()
-                    == Some(&crate::adapter::native_snapshot::Unavailable::BudgetExceeded)
+                cause
+                    .downcast_ref::<crate::adapter::native_snapshot::Unavailable>()
+                    .is_some_and(|error| error.is_budget())
             });
             let fallback = if e.is::<ImplicitClaimRefusal>() || over_budget {
                 ExitCode::Policy

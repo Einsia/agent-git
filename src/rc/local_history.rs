@@ -292,7 +292,7 @@ pub(crate) fn rpc_error(error: anyhow::Error) -> crate::protocol::RpcError {
             match error.downcast_ref::<Unavailable>().unwrap() {
                 Unavailable::NotFound => ("source_missing", false, true),
                 Unavailable::Unsupported => ("unsupported", false, false),
-                Unavailable::BudgetExceeded => ("resource_limit", false, false),
+                error if error.is_budget() => ("resource_limit", false, false),
                 Unavailable::Incomplete => ("incomplete_record", true, false),
                 Unavailable::Changed => ("source_changed", false, true),
                 _ => ("read_failed", true, false),

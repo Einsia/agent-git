@@ -427,7 +427,12 @@ pub(super) fn native_path_readonly(
     let mut selected: Option<(u32, PathBuf)> = None;
     for (visited, entry) in entries.enumerate() {
         if visited >= limits.lookup_entries {
-            return Err(Unavailable::BudgetExceeded);
+            return Err(Unavailable::hit(
+                super::native_snapshot::Stage::Lookup,
+                super::native_snapshot::Limit::Entries,
+                visited + 1,
+                limits.lookup_entries,
+            ));
         }
         let entry = entry.map_err(|_| Unavailable::Read)?;
         let name = entry.file_name();
@@ -457,7 +462,12 @@ fn native_path_at(
 ) -> super::native_snapshot::Result<Option<PathBuf>> {
     use super::native_snapshot::Unavailable;
     if limits.lookup_entries == 0 {
-        return Err(Unavailable::BudgetExceeded);
+        return Err(Unavailable::hit(
+            super::native_snapshot::Stage::Lookup,
+            super::native_snapshot::Limit::Entries,
+            1,
+            0,
+        ));
     }
     let metadata = std::fs::symlink_metadata(database).map_err(|_| Unavailable::Read)?;
     if !metadata.file_type().is_file() {
@@ -484,9 +494,7 @@ fn native_path_at(
         .map_err(|_| Unavailable::Database)?
         .as_str()
         .map_err(|_| Unavailable::Database)?;
-    if path.len() > limits.bytes.min(limits.working_bytes) {
-        return Err(Unavailable::BudgetExceeded);
-    }
+    super::native_snapshot::admit_bytes(super::native_snapshot::Stage::Lookup, path.len(), limits)?;
     let path = PathBuf::from(path);
     if !path.is_absolute() {
         return Err(Unavailable::Database);
@@ -581,7 +589,7 @@ mod tests {
         let before = std::fs::read(&database).unwrap();
         assert_eq!(
             native_path_at(&database, "selected", Limits::default()).unwrap(),
-            Some(path)
+            Some(path.clone())
         );
         assert_eq!(
             native_path_at(&database, "select", Limits::default()).unwrap(),
@@ -597,7 +605,12 @@ mod tests {
                 }
             )
             .unwrap_err(),
-            Unavailable::BudgetExceeded
+            Unavailable::hit(
+                super::super::native_snapshot::Stage::Lookup,
+                super::super::native_snapshot::Limit::WorkingBytes,
+                path.to_str().unwrap().len(),
+                0
+            )
         );
         assert_eq!(std::fs::read(&database).unwrap(), before);
         connection

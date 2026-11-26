@@ -824,7 +824,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
     }
 
     fn unlock_readonly_bounded(&self, limits: ReadonlyDictionaryLimits) -> crate::Result<Unlocked> {
-        use crate::adapter::native_snapshot::{self, Limits, Unavailable};
+        use crate::adapter::native_snapshot::{self, Limits};
         let cap = limits.vault_bytes;
         // The pinned reader bounds growth after stat and rejects special or substituted carriers.
         let bytes = native_snapshot::read_file_bytes(
@@ -836,7 +836,7 @@ impl<K: KeyStore> RepositoryDictionary<K> {
             },
         )
         .map_err(|error| match error {
-            Unavailable::BudgetExceeded => anyhow::Error::from(HydrationBudgetExceeded),
+            error if error.is_budget() => anyhow::Error::from(HydrationBudgetExceeded),
             other => anyhow::Error::from(other),
         })?;
         let file: super::VaultFile = serde_json::from_slice(&bytes)

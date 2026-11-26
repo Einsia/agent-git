@@ -136,6 +136,10 @@
               }
             ]
           },
+          "stage": {"enum": ["lookup", "read", "count", "reconstruct", "stream"]},
+          "limit": {"enum": ["entries", "records", "bytes", "working_bytes", "record_bytes", "depth"]},
+          "observed": {"type": "integer", "minimum": 0, "description": "Amount observed at refusal; a bounded reader stops at the first excess rather than reading the remainder."},
+          "limit_value": {"type": "integer", "minimum": 0},
           "reason": {
             "description": "git_worktree_format means the selected Git cannot provide NUL-framed worktree output, normally available in Git 2.36 or newer. Other Git or recovery failures retain their own reason.",
             "enum": [
