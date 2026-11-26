@@ -69,11 +69,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.10.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.10.0-r0.apk",
-        "sha256": "e7e7408ea787ed06d00159b0ff1f9b65a63cf634f36d9e0fa7512ce2c489a503",
+        "version": "2.11.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libexpat-2.11.0-r0.apk",
+        "sha256": "3779d8b0dfac33f82fd4ca0749318066e6beabe77cd788aa2d9f502e74a87b07",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/af0fa42036cd6e626768c0d65fddaa1d1b30cf21/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e3335f476c69ffe92817447e265ce2f18323e4ae/main/expat"
       },
       {
         "name": "libidn2",
@@ -141,11 +141,11 @@
       },
       {
         "name": "zstd-libs",
-        "version": "1.5.7-r2",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zstd-libs-1.5.7-r2.apk",
-        "sha256": "23c6065b0049b2406441564bcf0032515a43f78e80d76fcb85535a3803ef5d4e",
+        "version": "1.6.0-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/zstd-libs-1.6.0-r1.apk",
+        "sha256": "69243fd7b0633f20fee47ccf566ecfe2802a7a9d18700f10abc54aa8060774ab",
         "license": "BSD-3-Clause OR GPL-2.0-or-later",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3c6e2ee2b16f403d53eab39c4426eb61f003c322/main/zstd"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8875de0237da8c118a74218f07ab60adf722e419/main/zstd"
       }
     ],
     "aarch64": [
@@ -199,11 +199,11 @@
       },
       {
         "name": "libexpat",
-        "version": "2.10.0-r0",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.10.0-r0.apk",
-        "sha256": "99144fe0b1bb9316a3bc30c38707996767806661f4a0456fcf4565ac92e79b0f",
+        "version": "2.11.0-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libexpat-2.11.0-r0.apk",
+        "sha256": "cf19455af9c5c9dcd3915294d299f743553855519431bba38577b8c4a23c4373",
         "license": "MIT",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/af0fa42036cd6e626768c0d65fddaa1d1b30cf21/main/expat"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/e3335f476c69ffe92817447e265ce2f18323e4ae/main/expat"
       },
       {
         "name": "libidn2",
@@ -271,11 +271,11 @@
       },
       {
         "name": "zstd-libs",
-        "version": "1.5.7-r2",
-        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk",
-        "sha256": "2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818",
+        "version": "1.6.0-r1",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/zstd-libs-1.6.0-r1.apk",
+        "sha256": "923a9b5fffbc8272ce65b67fa7f768a9e3ea55c395b36030dc11635f29645eae",
         "license": "BSD-3-Clause OR GPL-2.0-or-later",
-        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/3c6e2ee2b16f403d53eab39c4426eb61f003c322/main/zstd"
+        "source_recipe": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/8875de0237da8c118a74218f07ab60adf722e419/main/zstd"
       }
     ]
   },
