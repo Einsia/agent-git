@@ -236,8 +236,11 @@ comparison is unavailable, so a missing verified prefix does not prove unrelated
 
 A runtime can inject Git settings for a command using `GIT_CONFIG_COUNT` and numbered
 key/value pairs. Import and push accept an empty list or a list containing only
-`color.ui=false`. Other entries, incomplete lists, and opaque `GIT_CONFIG_PARAMETERS` are
-refused: they may change the repository, visible objects, or execution policy. Automatic
+`color.ui=false` and `credential.<url>.helper` for concrete HTTP(S) addresses without
+embedded credentials, wildcards, queries, or fragments. The unscoped `credential.helper`
+is not accepted. Git retains the caller's helper configuration; transports that already
+have a Hub bearer token do not call Git credential helpers. Other entries, incomplete lists,
+and opaque `GIT_CONFIG_PARAMETERS` are refused: they may change the repository, visible objects, or execution policy. Automatic
 uploads follow the same push checks. Neither command clears these settings or displays their contents.
 
 After accepting an independent import, the session's turns are recorded:

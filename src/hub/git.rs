@@ -237,6 +237,9 @@ fn transport_env_after(
 ) -> Vec<(String, OsString)> {
     let invocation = invocation_headers();
     let mut settings = vec![("http.extraHeader".to_string(), String::new())];
+    if token.is_some() {
+        settings.push(("credential.helper".into(), String::new()));
+    }
     for url in urls {
         let key = format!("http.{url}.extraHeader");
         settings.push((key.clone(), String::new()));
@@ -3971,6 +3974,38 @@ mod git_credential_lifecycle_tests {
             .collect::<Vec<_>>()
             .join(" ")
             .into()
+    }
+
+    #[test]
+    fn scoped_git_helper_answers_only_without_a_hub_bearer() {
+        let home = IsolatedHome::new();
+        let url = "https://hub.example.test/repo.git";
+        for token in [Some("test-token"), None] {
+            let mut child = std::process::Command::new("git")
+                .args(["credential", "fill"])
+                .current_dir(home.workspace())
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", format!("credential.{url}.helper"))
+                .env("GIT_CONFIG_VALUE_0", "!f() { echo invoked > helper-called; echo username=test; echo password=synthetic; }; f")
+                .envs(super::transport_env_after(None, token, None, &[url.into()], false))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            writeln!(child.stdin.take().unwrap(), "url={url}\n").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert_eq!(output.status.success(), token.is_none());
+            assert_eq!(
+                home.workspace().join("helper-called").exists(),
+                token.is_none()
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == "password=synthetic"),
+                token.is_none()
+            );
+        }
     }
 
     fn configuration_values(

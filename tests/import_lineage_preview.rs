@@ -1524,6 +1524,7 @@ fn unsupported_runtime_configuration_refuses_import_without_disclosing_or_writin
     let marker = "private-synthetic-setting";
     for (name, value) in [
         ("GIT_CONFIG_KEY_1", "core.worktree"),
+        ("GIT_CONFIG_KEY_1", "credential.helper"),
         ("GIT_CONFIG_KEY_1", "core.useReplaceRefs"),
         ("GIT_CONFIG_KEY_1", "protocol.file.allow"),
         ("GIT_CONFIG_KEY_1", "color.ui"),

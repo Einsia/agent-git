@@ -12,8 +12,32 @@ pub(crate) fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn display_only_config(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
-    key.eq_ignore_ascii_case("color.ui") && value.eq_ignore_ascii_case("false")
+pub(crate) fn supported_runtime_config(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
+    if key.eq_ignore_ascii_case("color.ui") {
+        return value.eq_ignore_ascii_case("false");
+    }
+    let Some((section, rest)) = key.to_str().and_then(|key| key.split_once('.')) else {
+        return false;
+    };
+    let Some((address, field)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    section.eq_ignore_ascii_case("credential")
+        && field.eq_ignore_ascii_case("helper")
+        && address.split_once("://").is_some_and(|(scheme, rest)| {
+            (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+                && !rest.is_empty()
+                && !rest.starts_with('/')
+        })
+        && !address.contains(['\\', '*', '?', '#'])
+        && !address
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        && url::Url::parse(address).is_ok_and(|url| {
+            url.host_str().is_some_and(|host| !host.contains('*'))
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
 }
 
 #[cfg(feature = "bundled-git")]

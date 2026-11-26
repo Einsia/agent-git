@@ -71,7 +71,7 @@ pub(super) fn check_environment(
                 .get(&format!("GIT_CONFIG_KEY_{index}"))
                 .zip(numbered.get(&format!("GIT_CONFIG_VALUE_{index}")))
                 .is_some_and(
-                    |(key, value)| crate::infra::git_runtime::display_only_config(key, value)
+                    |(key, value)| crate::infra::git_runtime::supported_runtime_config(key, value)
                 ),
             "push cannot inherit unsupported runtime Git configuration at index {index}"
         );

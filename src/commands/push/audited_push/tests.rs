@@ -622,6 +622,23 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         assert!(!error.to_string().contains("PRIVATE_ROUTING_VALUE"));
     }
     assert!(check_environment([("GIT_CONFIG_COUNT".into(), "0".into())]).is_ok());
+    for (setting, supported) in [
+        ("Credential.https://example.test:443/team.repo.Helper", true),
+        ("credential.helper", false),
+        ("credential.https://*.example.test.helper", false),
+        ("credential.https://example.test.username", false),
+        ("credential.https:///example.test.helper", false),
+    ] {
+        assert_eq!(
+            check_environment([
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                ("GIT_CONFIG_KEY_0".into(), setting.into()),
+                ("GIT_CONFIG_VALUE_0".into(), "synthetic-helper".into()),
+            ])
+            .is_ok(),
+            supported
+        );
+    }
     for (count, key_name, value_name) in [
         ("01", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"),
         ("2", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"),
