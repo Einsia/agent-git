@@ -1,8 +1,9 @@
 # Windows CLI validation and packaging
 
 GitLab runs native Windows validation for `release/*` merge requests targeting
-the default branch and for the release merge on `main`. Ordinary merge requests,
-main pushes, and schedules do not use the Windows runner. To check a branch on
+the default branch. The release merge on `main` packages and smoke-tests the
+merged binary without repeating the native test suite. Ordinary merge requests,
+non-release main pushes, and schedules do not use the Windows runner. To check a non-default branch on
 demand, start a web or API branch pipeline with `AGIT_CHECK_WINDOWS=1` and the
 default benchmark settings. `rust:test:windows` must pass before Windows
 packaging starts. A branch pipeline can also run its usual delivery jobs.

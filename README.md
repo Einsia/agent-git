@@ -183,8 +183,8 @@ The release branch collects those lines into the version's section. CI's
 under `## [Unreleased]` can merge into a released section without a conflict.
 
 After the release merge request passes CI and review, merge it cleanly into GitLab
-`main`. Wait for the actual release commit's pipeline, including `dev:windows-x64`
-packaging and `mirror:github`, then run its manual `release:github-tag` job. The tag
+`main` with the standard `Merge branch 'release/<version>' into 'main'` title.
+After the release commit's required jobs succeed, `release:github-tag` runs automatically. The tag
 job requires that commit's Linux, macOS and Windows builds and its verified
 source-to-mirror receipt. It creates `agit-v<version>` on the recorded public
 projection, even if a later commit has advanced either main branch. It never
