@@ -414,7 +414,9 @@ pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
             std::env::var_os(format!("GIT_CONFIG_KEY_{index}"))
                 .zip(std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")))
                 .is_some_and(
-                    |(key, value)| crate::infra::git_runtime::display_only_config(&key, &value)
+                    |(key, value)| crate::infra::git_runtime::supported_runtime_config(
+                        &key, &value
+                    )
                 ),
             "cannot apply a lineage choice with unsupported runtime Git configuration at index {index}"
         );

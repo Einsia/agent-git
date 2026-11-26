@@ -5554,7 +5554,12 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     let runtime_command = |args: &[&str]| {
         let mut command = command_in(&laptop, args);
         command.env("GIT_CONFIG_COUNT", "10");
-        for index in 0..10 {
+        command.env(
+            "GIT_CONFIG_KEY_0",
+            format!("credential.{}.helper", hub.base),
+        );
+        command.env("GIT_CONFIG_VALUE_0", "synthetic-scoped-helper");
+        for index in 1..10 {
             command.env(format!("GIT_CONFIG_KEY_{index}"), "color.ui");
             command.env(format!("GIT_CONFIG_VALUE_{index}"), "false");
         }
