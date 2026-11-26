@@ -38,6 +38,8 @@ struct Candidate {
 struct Unavailable {
     commit: Option<String>,
     reason: &'static str,
+    #[serde(flatten)]
+    budget: Option<native_snapshot::BudgetHit>,
 }
 
 #[derive(Serialize)]
@@ -158,7 +160,23 @@ impl Report {
 
     fn unavailable(&mut self, commit: Option<String>, reason: &'static str) {
         self.scan_state = "incomplete";
-        self.unavailable.push(Unavailable { commit, reason });
+        self.unavailable.push(Unavailable {
+            commit,
+            reason,
+            budget: None,
+        });
+    }
+
+    fn native_unavailable(&mut self, error: native_snapshot::Unavailable) {
+        self.scan_state = "incomplete";
+        self.unavailable.push(Unavailable {
+            commit: None,
+            reason: native_reason(error),
+            budget: match error {
+                native_snapshot::Unavailable::Limit(hit) => Some(hit),
+                _ => None,
+            },
+        });
     }
 
     fn include(&mut self, proposals: import_lineage::Proposals) {
@@ -288,7 +306,7 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
             return Ok(None);
         }
         Err(error) => {
-            report.unavailable(None, native_reason(error));
+            report.native_unavailable(error);
             return Ok(Some(Prepared {
                 report,
                 snapshot: None,
@@ -334,19 +352,17 @@ fn prepare(args: &Args) -> crate::Result<Option<Prepared>> {
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            report.unavailable(
-                None,
-                error
-                    .downcast_ref::<native_snapshot::Unavailable>()
-                    .copied()
-                    .map(native_reason)
-                    .or_else(|| {
-                        error
-                            .downcast_ref::<observed::StreamGap>()
-                            .map(observed::StreamGap::reason)
-                    })
-                    .unwrap_or_else(|| repository_reason(&error, "stored_evidence")),
-            );
+            if let Some(error) = error.downcast_ref::<native_snapshot::Unavailable>() {
+                report.native_unavailable(*error);
+            } else {
+                report.unavailable(
+                    None,
+                    error
+                        .downcast_ref::<observed::StreamGap>()
+                        .map(observed::StreamGap::reason)
+                        .unwrap_or_else(|| repository_reason(&error, "stored_evidence")),
+                );
+            }
             return Ok(Some(Prepared {
                 report,
                 snapshot: None,
@@ -490,6 +506,18 @@ fn native_reason(error: native_snapshot::Unavailable) -> &'static str {
         Reason::Ambiguous => "native_ambiguous",
         Reason::Unsupported => "native_unsupported",
         Reason::BudgetExceeded => "native_budget",
+        Reason::Limit(hit) => match (hit.stage, hit.limit) {
+            (native_snapshot::Stage::Stream, native_snapshot::Limit::Bytes) => {
+                "native_stream_bytes"
+            }
+            (native_snapshot::Stage::Stream, native_snapshot::Limit::RecordBytes) => {
+                "native_stream_record_bytes"
+            }
+            (native_snapshot::Stage::Stream, native_snapshot::Limit::Records) => {
+                "native_stream_records"
+            }
+            _ => "native_budget",
+        },
         Reason::Read => "native_read",
         Reason::Database => "native_database",
         Reason::Incomplete => "native_incomplete",
@@ -598,6 +626,16 @@ fn print_report(report: &Report) {
         );
         if unavailable.reason == "git_worktree_format" {
             eprintln!("  {}", repo::GitWorktreeFormatUnavailable);
+        }
+        if let Some(hit) = unavailable.budget {
+            let labels = serde_json::json!(hit);
+            eprintln!(
+                "    stage={} limit={} observed={} limit_value={}",
+                labels["stage"].as_str().unwrap(),
+                labels["limit"].as_str().unwrap(),
+                hit.observed,
+                hit.limit_value
+            );
         }
     }
     if let Some(action) = &report.independent {

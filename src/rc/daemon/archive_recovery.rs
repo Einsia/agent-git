@@ -375,7 +375,9 @@ impl Class {
         use crate::adapter::native_snapshot::Unavailable;
         for cause in error.chain() {
             if cause.is::<crate::rc::archive_jobs::Unrecoverable>()
-                || cause.downcast_ref::<Unavailable>() == Some(&Unavailable::BudgetExceeded)
+                || cause
+                    .downcast_ref::<Unavailable>()
+                    .is_some_and(Unavailable::is_budget)
             {
                 return Self::Permanent;
             }

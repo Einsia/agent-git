@@ -1,6 +1,6 @@
 use crate::adapter::{Adapter, codex, native_snapshot};
 use crate::domain::{native_archive, privacy::projector, transcript};
-use native_snapshot::{Limits, Source, Unavailable};
+use native_snapshot::{Limit, Limits, Source, Stage, Unavailable};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};
 
@@ -39,16 +39,9 @@ impl Observed {
         let cap = native_snapshot::MAX_CAPTURE_BYTES;
         let (file, opened) = native_snapshot::open_unchanged(&source.path, |len| {
             if len > cap {
-                Err(Unavailable::BudgetExceeded)
+                Err(Unavailable::hit(Stage::Stream, Limit::Bytes, len, cap))
             } else {
                 Ok(())
-            }
-        })
-        .map_err(|error| {
-            if error == Unavailable::BudgetExceeded {
-                anyhow::Error::new(StreamGap::Bytes)
-            } else {
-                anyhow::Error::new(error)
             }
         })?;
         let mut reader = BufReader::new(&file);
@@ -70,18 +63,35 @@ impl Observed {
             total += count;
             records += 1;
             if count > RECORD_BYTES {
-                return Err(StreamGap::RecordBytes.into());
+                return Err(Unavailable::hit(
+                    Stage::Stream,
+                    Limit::RecordBytes,
+                    count,
+                    RECORD_BYTES,
+                )
+                .into());
             }
             if total > cap {
-                return Err(StreamGap::Bytes.into());
+                return Err(Unavailable::hit(Stage::Stream, Limit::Bytes, total, cap).into());
             }
             if records > native_snapshot::MAX_NATIVE_RECORDS {
-                return Err(StreamGap::Records.into());
+                return Err(Unavailable::hit(
+                    Stage::Stream,
+                    Limit::Records,
+                    records,
+                    native_snapshot::MAX_NATIVE_RECORDS,
+                )
+                .into());
             }
             if line.last() != Some(&b'\n') {
                 return Err(Unavailable::Incomplete.into());
             }
-            if records == 1 && !codex::standalone_header(source, &line) {
+            if records == 1 && !codex::standalone_header(source, &line)? {
+                native_snapshot::admit_bytes(
+                    Stage::Reconstruct,
+                    opened.len() as usize,
+                    Limits::default(),
+                )?;
                 return Err(Unavailable::Incomplete.into());
             }
             digest.update(&line);
@@ -116,12 +126,6 @@ impl Observed {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum StreamGap {
-    #[error("native_stream_bytes")]
-    Bytes,
-    #[error("native_stream_record_bytes")]
-    RecordBytes,
-    #[error("native_stream_records")]
-    Records,
     #[error("secret_mapping")]
     SecretMapping,
 }
@@ -129,9 +133,6 @@ pub(super) enum StreamGap {
 impl StreamGap {
     pub(super) fn reason(&self) -> &'static str {
         match self {
-            Self::Bytes => "native_stream_bytes",
-            Self::RecordBytes => "native_stream_record_bytes",
-            Self::Records => "native_stream_records",
             Self::SecretMapping => "secret_mapping",
         }
     }

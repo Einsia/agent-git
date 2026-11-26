@@ -32,7 +32,8 @@ if ($Suite -ne 'unit') {
     foreach ($test in $suites.integration) {
         $cargoArgs += @('--test', $test)
     }
-    $filters += 'kind(test)'
+    $cargoArgs += @('--test', 'import_lineage_preview')
+    $filters += '(kind(test) & (not binary(=import_lineage_preview) | test(=codex_preview_bounds_parent_reads_and_reports_stream_limits)))'
 }
 $cargoArgs += @('-E', ($filters -join ' | '))
 if ($Suite -ne 'integration') {

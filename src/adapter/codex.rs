@@ -254,10 +254,15 @@ enum SplitFailure {
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn standalone_header(source: &super::native_snapshot::Source, header: &[u8]) -> bool {
-    id_from_filename(&source.path).is_some()
-        && split_rollout(header.to_vec(), Some(&source.session_id))
-            .is_ok_and(|(_, history)| history.is_none())
+pub(crate) fn standalone_header(
+    source: &super::native_snapshot::Source,
+    header: &[u8],
+) -> super::native_snapshot::Result<bool> {
+    use super::native_snapshot::Unavailable;
+    id_from_filename(&source.path).ok_or(Unavailable::Incomplete)?;
+    split_rollout(header.to_vec(), Some(&source.session_id))
+        .map(|(_, history)| history.is_none())
+        .map_err(|_| Unavailable::Incomplete)
 }
 
 fn recognized_rollout(bytes: &[u8], expected_thread_id: &str) -> bool {
@@ -393,9 +398,11 @@ fn append_bounded(
         .len()
         .checked_add(bytes.len())
         .ok_or(Unavailable::BudgetExceeded)?;
-    if length > limits.bytes || length > limits.working_bytes {
-        return Err(Unavailable::BudgetExceeded);
-    }
+    super::native_snapshot::admit_bytes(
+        super::native_snapshot::Stage::Reconstruct,
+        length,
+        limits,
+    )?;
     target.extend_from_slice(bytes);
     Ok(())
 }
@@ -454,20 +461,41 @@ fn lineage_bytes_with_lookup_until(
     use super::native_snapshot::Unavailable;
 
     let mut visited = HashSet::new();
-    let mut nodes = Vec::new();
+    let mut nodes = Vec::<LineageNode>::new();
     let mut current = source.clone();
     let mut retained = 0usize;
     loop {
         let rollout_id = id_from_filename(&current.path).ok_or(Unavailable::Incomplete)?;
-        if nodes.len() >= MAX_FORK_DEPTH || !visited.insert(rollout_id) {
+        if nodes.len() >= MAX_FORK_DEPTH {
+            return Err(Unavailable::hit(
+                super::native_snapshot::Stage::Reconstruct,
+                super::native_snapshot::Limit::Depth,
+                nodes.len() + 1,
+                MAX_FORK_DEPTH,
+            ));
+        }
+        if !visited.insert(rollout_id) {
             return Err(Unavailable::Incomplete);
         }
-        let bytes = super::native_snapshot::read_file_bytes_until(&current.path, limits, deadline)?;
+        let bytes = match nodes.last().and_then(|node| node.history.as_ref()) {
+            Some(history) => super::native_snapshot::read_parent_prefix(
+                &current.path,
+                history.byte_offset,
+                limits,
+                deadline,
+            )?,
+            None => super::native_snapshot::read_file_bytes_until(&current.path, limits, deadline)?,
+        };
         retained = retained
             .checked_add(bytes.len())
             .ok_or(Unavailable::BudgetExceeded)?;
         if retained > limits.working_bytes {
-            return Err(Unavailable::BudgetExceeded);
+            return Err(Unavailable::hit(
+                super::native_snapshot::Stage::Reconstruct,
+                super::native_snapshot::Limit::WorkingBytes,
+                retained,
+                limits.working_bytes,
+            ));
         }
         let expected_thread_id = nodes.is_empty().then_some(source.session_id.as_str());
         if allow_unrecognized_leaf
@@ -2141,7 +2169,12 @@ mod tests {
             Codex
                 .snapshot_native_readonly(&source, Limits::default())
                 .unwrap_err(),
-            Unavailable::BudgetExceeded
+            Unavailable::hit(
+                super::super::native_snapshot::Stage::Read,
+                super::super::native_snapshot::Limit::Bytes,
+                length as usize,
+                MAX_NATIVE_BYTES
+            )
         );
         let exported = Codex.read_native_bytes_at(native, &path).unwrap();
         assert_eq!(exported.len() as u64, length);
@@ -2442,7 +2475,12 @@ mod tests {
         );
         assert_eq!(
             lineage_snapshot(&source, limits(3)).unwrap_err(),
-            Unavailable::BudgetExceeded
+            Unavailable::hit(
+                super::super::native_snapshot::Stage::Count,
+                super::super::native_snapshot::Limit::Records,
+                expected.lines().count(),
+                3
+            )
         );
     }
 
