@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.57] - 2026-11-26
+
+### Fixed
+
+- Automatic session uploads now work when the runtime configures a Git credential helper for
+  a specific HTTP or HTTPS URL, including alongside `color.ui=false`. No change to your Git
+  credentials is needed.
+
 ## [0.2.56] - 2026-11-26
 
 ### Fixed
