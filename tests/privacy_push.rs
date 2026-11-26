@@ -327,6 +327,10 @@ impl Hub {
                         break;
                     }
                     let lower = line.to_ascii_lowercase();
+                    assert_ne!(lower.trim(), "x-desktop-fixture: external");
+                    if lower.starts_with("authorization:") {
+                        assert!(!authenticated && !collaborator_account);
+                    }
                     if let Some(value) = lower.strip_prefix("content-length:") {
                         length = value.trim().parse().unwrap();
                     }
@@ -929,6 +933,36 @@ impl Drop for Hub {
         let result = publication_http::join(self.worker.take().unwrap());
         if !thread::panicking() {
             result.unwrap();
+        }
+    }
+}
+
+fn desktop_settings(command: &mut Command, base: &str) {
+    command.env("GIT_CONFIG_COUNT", "11");
+    command.env("GIT_CONFIG_KEY_5", format!("http.{base}.extraHeader"));
+    command.env("GIT_CONFIG_VALUE_5", "X-Desktop-Fixture: external");
+    let scopes = [
+        "https://desktop.example.test",
+        "https://staging.example.test",
+    ];
+    for (group, host) in scopes.iter().enumerate() {
+        let scope = format!("{host}/backend-api/codex/sites/git/");
+        for (offset, (section, field, value)) in [
+            ("credential", "helper", ""),
+            ("credential", "helper", "synthetic-scoped-helper"),
+            ("credential", "useHttpPath", "true"),
+            ("http", "proactiveAuth", "auto"),
+            ("http", "followRedirects", "false"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let index = [8, 2, 10, 4, 0, 3, 9, 1, 7, 6][5 * group + offset];
+            command.env(
+                format!("GIT_CONFIG_KEY_{index}"),
+                format!("{section}.{scope}.{field}"),
+            );
+            command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
         }
     }
 }
@@ -5551,39 +5585,12 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         hub_main
     );
 
-    let runtime_command = |args: &[&str], swap_scopes: bool| {
+    let runtime_command = |args: &[&str]| {
         let mut command = command_in(&laptop, args);
-        command.env("GIT_CONFIG_COUNT", "10");
-        let mut scopes = [
-            "https://desktop.example.test",
-            "https://staging.example.test",
-        ];
-        if swap_scopes {
-            scopes.reverse();
-        }
-        for (group, host) in scopes.iter().enumerate() {
-            let scope = format!("{host}/backend-api/codex/sites/git/");
-            for (offset, (section, field, value)) in [
-                ("credential", "helper", ""),
-                ("credential", "helper", "synthetic-scoped-helper"),
-                ("credential", "useHttpPath", "true"),
-                ("http", "proactiveAuth", "auto"),
-                ("http", "followRedirects", "false"),
-            ]
-            .iter()
-            .enumerate()
-            {
-                let index = 5 * group + offset;
-                command.env(
-                    format!("GIT_CONFIG_KEY_{index}"),
-                    format!("{section}.{scope}.{field}"),
-                );
-                command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
-            }
-        }
+        desktop_settings(&mut command, &hub.base);
         command
     };
-    let imported = runtime_command(&import, false).output().unwrap();
+    let imported = runtime_command(&import).output().unwrap();
     assert_success(&imported);
     let said = format!(
         "{}{}",
@@ -5598,21 +5605,22 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     let laptop_repo = laptop.join("repos/alice/app");
     let saved = storage::materialize_at(&laptop_repo, "refs/heads/talk", meta::LOG_FILE).unwrap();
     assert!(saved.contains("Check the shared file"));
-    let refused = runtime_command(&["--yes", "push", "alice/app@talk"], true)
-        .env("GIT_CONFIG_VALUE_4", "true")
-        .env("GIT_CONFIG_KEY_9", "agit.autoPush")
-        .output()
-        .unwrap();
-    assert!(!refused.status.success());
-    let diagnostic = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        diagnostic.contains("index 4: HTTP redirects must stay disabled"),
-        "{diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("index 9: setting is outside"),
-        "{diagnostic}"
-    );
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+    ] {
+        let refused = runtime_command(&["--yes", "push", "alice/app@talk"])
+            .env(key, "fixture-route")
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains(key),
+            "{refused:?}"
+        );
+    }
     assert_eq!(git(&remote, &["for-each-ref", "refs/heads/talk"]), "");
     assert_eq!(
         git(&laptop_repo, &["rev-parse", "refs/heads/main"]),
@@ -5641,7 +5649,7 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(said.contains("main is on the Hub"), "{said}");
-    let uploaded = runtime_command(&["--yes", "push", "alice/app@talk"], true)
+    let uploaded = runtime_command(&["--yes", "push", "alice/app@talk"])
         .output()
         .unwrap();
     assert_success(&uploaded);
@@ -5651,7 +5659,9 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     ))
     .unwrap();
     assert!(meta::is_bare_id(&received.session));
-    assert!(String::from_utf8_lossy(&uploaded.stdout).contains(&received.session));
+    let published = storage::materialize_at(&remote, "refs/heads/talk", meta::LOG_FILE).unwrap();
+    assert!(published.contains("It is there."));
+    assert!(published.contains(&received.session));
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), hub_main);
     git(
         &remote,
@@ -16348,6 +16358,9 @@ impl UndropLab {
             if let Some(value) = value {
                 command.env(name, value);
             }
+        }
+        if args.starts_with(&["hooks", "settle"]) || args.contains(&"save") {
+            desktop_settings(&mut command, &self.hub.base);
         }
         command
             .current_dir(&self.work)

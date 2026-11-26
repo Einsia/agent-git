@@ -1,151 +1,30 @@
-//! Private Git executables use child-local search paths and retain the caller's Git configuration.
+//! Git subprocesses select their own repository and invocation settings.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-#[cfg(feature = "cli")]
-fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
-    let text = value.to_str()?;
-    text.parse::<u32>()
-        .ok()
-        .filter(|count| count.to_string() == text)
-}
+pub(crate) const ROUTING: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+];
 
 #[cfg(feature = "cli")]
-fn concrete_http_scope(address: &str) -> bool {
-    address.split_once("://").is_some_and(|(scheme, rest)| {
-        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-            && !rest.is_empty()
-            && !rest.starts_with('/')
-            && !rest.split('/').next().unwrap_or_default().contains('@')
-    }) && !address.contains(['\\', '*', '?', '#'])
-        && !address
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-        && url::Url::parse(address).is_ok_and(|url| {
-            url.host_str().is_some_and(|host| !host.contains('*'))
-                && url.username().is_empty()
-                && url.password().is_none()
-        })
-}
-
-#[cfg(feature = "cli")]
-fn check_setting(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> Result<(), &'static str> {
-    if key.eq_ignore_ascii_case("color.ui") {
-        return value
-            .eq_ignore_ascii_case("false")
-            .then_some(())
-            .ok_or("color.ui must disable color");
+pub(crate) fn check_routing(action: &str) -> anyhow::Result<()> {
+    for &name in ROUTING {
+        anyhow::ensure!(
+            std::env::var_os(name).is_none(),
+            "{action}: unset {name}: it can override Git routing"
+        );
     }
-    let (section, rest) = key
-        .to_str()
-        .and_then(|key| key.split_once('.'))
-        .ok_or("invalid Git setting name")?;
-    if !section.eq_ignore_ascii_case("credential") && !section.eq_ignore_ascii_case("http") {
-        return Err("setting is outside the credential, transport and display policy");
-    }
-    let (_, field) = rest.rsplit_once('.').filter(|(scope, _)| concrete_http_scope(scope))
-        .ok_or("authentication and HTTP settings require a concrete HTTP(S) URL without user information")?;
-    if section.eq_ignore_ascii_case("credential") {
-        return (field.starts_with(|ch: char| ch.is_ascii_alphabetic())
-            && field
-                .bytes()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
-        .then_some(())
-        .ok_or("invalid credential field name");
-    }
-    if field.eq_ignore_ascii_case("followRedirects") {
-        return value
-            .eq_ignore_ascii_case("false")
-            .then_some(())
-            .ok_or("HTTP redirects must stay disabled");
-    }
-    if field.eq_ignore_ascii_case("proactiveAuth") {
-        return value
-            .eq_ignore_ascii_case("auto")
-            .then_some(())
-            .ok_or("HTTP proactive authentication must use auto");
-    }
-    Err("HTTP setting may override transport routing or security")
-}
-
-#[cfg(feature = "cli")]
-pub(crate) fn check_runtime_environment(
-    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    routing: &[&str],
-    action: &str,
-) -> anyhow::Result<()> {
-    let mut count = Some(0);
-    let mut entries = std::collections::BTreeMap::new();
-    let mut problems = Vec::new();
-    for (name, value) in environment {
-        let name = name.to_string_lossy();
-        #[cfg(windows)]
-        let name = name.to_ascii_uppercase();
-        let name: &str = name.as_ref();
-        if name == "GIT_CONFIG_COUNT" {
-            count = config_count(&value);
-            if count.is_none() {
-                problems.push("invalid GIT_CONFIG_COUNT".into());
-            }
-        } else if let Some(suffix) = name
-            .strip_prefix("GIT_CONFIG_KEY_")
-            .or_else(|| name.strip_prefix("GIT_CONFIG_VALUE_"))
-        {
-            if let Some(index) = config_count(suffix.as_ref()) {
-                let (key, setting) = entries.entry(index).or_insert((None, None));
-                if name.starts_with("GIT_CONFIG_KEY_") {
-                    *key = Some(value);
-                } else {
-                    *setting = Some(value);
-                }
-            } else {
-                problems.push("noncanonical numbered Git configuration index".into());
-            }
-        } else if name == "GIT_CONFIG_PARAMETERS" {
-            problems.push("opaque GIT_CONFIG_PARAMETERS cannot be validated".into());
-        } else if routing.contains(&name) {
-            problems.push(format!("unset {name}: it can override Git routing"));
-        }
-    }
-    let mut next = 0;
-    let missing = |first, end| {
-        format!(
-            "missing numbered Git configuration at indices {first}..={}",
-            end - 1
-        )
-    };
-    for (index, (key, value)) in entries {
-        if let Some(count) = count {
-            let end = index.min(count);
-            if next < end {
-                problems.push(missing(next, end));
-            }
-            next = end.saturating_add(1);
-            if index >= count {
-                problems.push(format!("index {index}: outside GIT_CONFIG_COUNT"));
-                continue;
-            }
-        }
-        let result = match (key, value) {
-            (Some(key), Some(value)) => check_setting(&key, &value),
-            (None, _) => Err("missing key"),
-            (_, None) => Err("missing value"),
-        };
-        if let Err(reason) = result {
-            problems.push(format!("index {index}: {reason}"));
-        }
-    }
-    if let Some(count) = count
-        && next < count
-    {
-        problems.push(missing(next, count));
-    }
-    anyhow::ensure!(
-        problems.is_empty(),
-        "{action}: unsupported runtime Git configuration: {}",
-        problems.join("; ")
-    );
     Ok(())
 }
 
@@ -167,19 +46,29 @@ pub fn is_bundled() -> bool {
 }
 
 pub fn command() -> Command {
+    let program = std::ffi::OsString::from("git");
+    #[cfg(feature = "bundled-git")]
+    let program = bundled::runtime().map_or(program, |runtime| runtime.git().into_os_string());
+    let mut command = super::background::command(program);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        #[cfg(windows)]
+        let name = name.to_ascii_uppercase();
+        if name == "GIT_CONFIG"
+            || name.starts_with("GIT_CONFIG_")
+            || ROUTING.contains(&name.as_ref())
+        {
+            command.env_remove(key);
+        }
+    }
     #[cfg(feature = "bundled-git")]
     if let Some(runtime) = bundled::runtime() {
-        let mut command = super::background::command(runtime.git());
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
-        if let Some(config) = std::env::var_os("GIT_CONFIG_SYSTEM") {
-            command.env("GIT_CONFIG_SYSTEM", config);
-        }
         runtime.configure(&mut command);
-        return command;
     }
-    super::background::command("git")
+    command
 }
 
 /// Repository writes use a child-local umask without forking the daemon's address space.

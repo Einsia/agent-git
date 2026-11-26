@@ -22,29 +22,6 @@ struct Destination {
     local_target: Option<crate::rc::local_repository::publication::Selection>,
 }
 
-/// Publication cannot inherit routing overrides from an unrelated Git operation.
-pub(super) fn check_environment(
-    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Result<()> {
-    crate::infra::git_runtime::check_runtime_environment(
-        environment,
-        &[
-            "GIT_DIR",
-            "GIT_COMMON_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_SHALLOW_FILE",
-            "GIT_GRAFT_FILE",
-            "GIT_PREFIX",
-            "GIT_CONFIG",
-        ],
-        "cannot push",
-    )
-}
-
 /// Whether a publication may still be run again from its preview when the Hub refuses its receipt
 /// because the repository's refs moved meanwhile.
 #[derive(Debug)]

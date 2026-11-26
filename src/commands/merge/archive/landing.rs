@@ -3427,12 +3427,13 @@ mod tests {
             "[remote \"probe\"]\nurl = probe::fixture\npromisor = true\n",
         )
         .unwrap();
-        let global = directory.path().join("global.gitconfig");
-        let empty = directory.path().join("empty.gitconfig");
-        std::fs::write(&empty, "").unwrap();
+        let global_home = directory.path().join("global-home");
+        let local_home = directory.path().join("local-home");
+        std::fs::create_dir(&global_home).unwrap();
+        std::fs::create_dir(&local_home).unwrap();
         let status = std::process::Command::new("git")
             .args(["config", "--file"])
-            .arg(&global)
+            .arg(global_home.join(".gitconfig"))
             .arg("include.path")
             .arg(&included)
             .status()
@@ -3453,9 +3454,15 @@ mod tests {
                 .env("AGIT_LANDING_PROMISOR_MARKER", &marker)
                 .env("PATH", &paths)
                 .env(
-                    "GIT_CONFIG_GLOBAL",
-                    if mode == "global" { &global } else { &empty },
+                    "HOME",
+                    if mode == "global" {
+                        &global_home
+                    } else {
+                        &local_home
+                    },
                 )
+                .env("XDG_CONFIG_HOME", directory.path().join("xdg"))
+                .env_remove("GIT_CONFIG_GLOBAL")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .unwrap();

@@ -287,7 +287,7 @@ impl Runtime {
         #[cfg(target_os = "linux")]
         if !command
             .get_envs()
-            .any(|(key, _)| key == "GIT_CONFIG_SYSTEM")
+            .any(|(key, value)| key == "GIT_CONFIG_SYSTEM" && value.is_some())
         {
             command.env("GIT_CONFIG_SYSTEM", self.root.join("gitconfig"));
         }

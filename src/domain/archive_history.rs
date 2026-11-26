@@ -26,20 +26,7 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_DEPTH: usize = 128;
 
 /// Proof and publication cannot select different repositories or object stores through ambient Git.
-pub(crate) const GIT_ROUTING_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_GRAFT_FILE",
-    "GIT_SHALLOW_FILE",
-];
+pub(crate) use crate::infra::git_runtime::ROUTING as GIT_ROUTING_ENV;
 
 /// A successfully verified immutable parent-to-archive edge.
 #[derive(Clone, Debug, Eq, PartialEq)]

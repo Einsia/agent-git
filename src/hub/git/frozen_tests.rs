@@ -33,7 +33,7 @@ fn isolated(name: &str) -> Option<PathBuf> {
         .env("USERPROFILE", home.path().join("home"))
         .env("AGIT_HOME", home.path().join("agit"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", home.path().join("empty-config"))
+        .env("GIT_CONFIG_GLOBAL", home.path().join("home/.gitconfig"))
         .env("GIT_TEMPLATE_DIR", home.path().join("templates"))
         .env("GIT_AUTHOR_NAME", "Frozen publication fixture")
         .env("GIT_AUTHOR_EMAIL", "publication@example.invalid")
@@ -1285,7 +1285,7 @@ fn lfs_cache_capture_uses_raw_config_and_captured_environment_without_initializa
     let before = cache_disk_snapshot(repo.root());
     assert_eq!(
         lfs_cache::capture(&snapshot).unwrap(),
-        gitdir.join("captured-cache/objects")
+        gitdir.join("included-cache/objects")
     );
     assert_eq!(cache_disk_snapshot(repo.root()), before);
     assert!(!gitdir.join("lfs").exists());

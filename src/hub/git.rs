@@ -140,23 +140,6 @@ fn transport_command() -> Command {
     command
 }
 
-/// Inherited Git parameters retain their bytes and precedence; transport guards follow them.
-fn transport_env(
-    token: Option<&str>,
-    expected_agent_id: Option<&str>,
-    urls: &[String],
-    accept_secret_findings: bool,
-) -> Vec<(String, OsString)> {
-    let inherited = std::env::var_os("GIT_CONFIG_PARAMETERS");
-    transport_env_after(
-        inherited.as_deref(),
-        token,
-        expected_agent_id,
-        urls,
-        accept_secret_findings,
-    )
-}
-
 fn quote_git_parameter(value: &str) -> String {
     let mut quoted = String::from("'");
     for character in value.chars() {
@@ -229,7 +212,7 @@ fn invocation_headers() -> Vec<(&'static str, &'static str)> {
 }
 
 fn transport_env_after(
-    inherited: Option<&OsStr>,
+    prepared: Option<&OsStr>,
     token: Option<&str>,
     expected_agent_id: Option<&str>,
     urls: &[String],
@@ -264,7 +247,7 @@ fn transport_env_after(
         }
         settings.push((format!("http.{url}.followRedirects"), "false".into()));
     }
-    let mut parameters = inherited.unwrap_or_default().to_os_string();
+    let mut parameters = prepared.unwrap_or_default().to_os_string();
     for (key, value) in settings {
         if !parameters.is_empty() {
             parameters.push(" ");
@@ -488,22 +471,13 @@ impl TransportIdentity {
         } else {
             &self.urls
         };
-        let mut environment = if let Some(execution) = execution {
-            transport_env_after(
-                Some(&execution.parameters),
-                self.token()?.as_deref(),
-                self.agent_id.as_deref(),
-                urls,
-                self.accept_secret_findings,
-            )
-        } else {
-            transport_env(
-                self.token()?.as_deref(),
-                self.agent_id.as_deref(),
-                urls,
-                self.accept_secret_findings,
-            )
-        };
+        let mut environment = transport_env_after(
+            execution.map(|execution| execution.parameters.as_os_str()),
+            self.token()?.as_deref(),
+            self.agent_id.as_deref(),
+            urls,
+            self.accept_secret_findings,
+        );
         if let Some(scope) = scope {
             let parameters = &mut environment[0].1;
             parameters.push(" ");
@@ -1877,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_guards_follow_the_unmodified_inherited_parameters() {
+    fn transport_guards_follow_prepared_execution_parameters() {
         let inherited = OsStr::new("'fixture.keep'='unchanged' 'http.extraHeader'='inherited'");
         let environment = transport_env_after(
             Some(inherited),
@@ -2479,6 +2453,14 @@ mod git_credential_lifecycle_tests {
             .map(|name| (name.to_string(), None))
             .collect();
             settings.extend([
+                (
+                    "HOME".into(),
+                    Some(empty_config.parent().unwrap().as_os_str().into()),
+                ),
+                (
+                    "USERPROFILE".into(),
+                    Some(empty_config.parent().unwrap().as_os_str().into()),
+                ),
                 ("AGIT_HOME".into(), Some(home.path().as_os_str().into())),
                 ("GIT_CONFIG_NOSYSTEM".into(), Some("1".into())),
                 (
@@ -4016,21 +3998,15 @@ mod git_credential_lifecycle_tests {
 
     fn configuration_values(
         home: &IsolatedHome,
-        inherited: &std::ffi::OsStr,
         token: &str,
         url: &str,
         key: &str,
     ) -> std::process::Output {
-        std::process::Command::new("git")
+        super::transport_command()
             .args(["config", "--null", "--get-all", key])
             .current_dir(home.workspace())
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "fixture.keep")
-            .env("GIT_CONFIG_VALUE_0", "from-count")
-            .env("GIT_CONFIG_KEY_1", "fixture.countonly")
-            .env("GIT_CONFIG_VALUE_1", "count-only")
             .envs(super::transport_env_after(
-                Some(inherited),
+                None,
                 Some(token),
                 Some(AGENT_ID),
                 &[url.into()],
@@ -4041,15 +4017,10 @@ mod git_credential_lifecycle_tests {
     }
 
     #[test]
-    fn git_parameters_preserve_count_and_roundtrip_quoted_keys_and_values() {
+    fn transport_parameters_roundtrip_quoted_keys_and_values() {
         let home = IsolatedHome::new();
         let url = "https://hub.example.test/mount=one's!/alice/example.git";
         let key = format!("http.{url}.extraHeader");
-        let mut inherited = OsString::from("'fixture.keep=legacy=value' ");
-        inherited.push(inherited_parameters(&[
-            ("fixture.keep", "modern's ! value"),
-            ("fixture.empty", ""),
-        ]));
         for token in [
             "",
             "plain",
@@ -4058,7 +4029,7 @@ mod git_credential_lifecycle_tests {
             r#"equals=quote"dollar$backtick`"#,
             "nonascii-ä-λ",
         ] {
-            let output = configuration_values(&home, &inherited, token, url, &key);
+            let output = configuration_values(&home, token, url, &key);
             assert!(
                 output.status.success(),
                 "Git must parse each quoted key and value"
@@ -4068,49 +4039,12 @@ mod git_credential_lifecycle_tests {
                 super::operation_id()
             );
             assert_eq!(output.stdout, expected.as_bytes());
-            assert_eq!(
-                configuration_values(&home, &inherited, token, url, "fixture.keep").stdout,
-                b"from-count\0legacy=value\0modern's ! value\0"
-            );
-            assert_eq!(
-                configuration_values(&home, &inherited, token, url, "fixture.countonly").stdout,
-                b"count-only\0"
-            );
-            assert_eq!(
-                configuration_values(&home, &inherited, token, url, "fixture.empty").stdout,
-                b"\0"
-            );
             let redirect = format!("http.{url}.followRedirects");
             assert_eq!(
-                configuration_values(&home, &inherited, token, url, &redirect).stdout,
+                configuration_values(&home, token, url, &redirect).stdout,
                 b"false\0"
             );
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn inherited_git_parameter_bytes_are_not_lossily_reencoded() {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        let home = IsolatedHome::new();
-        let inherited = OsString::from_vec(b"'fixture.raw'='opaque-\xff-\xfe' ".to_vec());
-        let url = "https://hub.example.test/alice/example.git";
-        let environment = super::transport_env_after(
-            Some(&inherited),
-            Some("synthetic"),
-            Some(AGENT_ID),
-            &[url.into()],
-            false,
-        );
-        assert!(
-            environment[0]
-                .1
-                .as_bytes()
-                .starts_with(inherited.as_bytes())
-        );
-        let output = configuration_values(&home, &inherited, "synthetic", url, "fixture.raw");
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"opaque-\xff-\xfe\0");
     }
 
     #[test]
@@ -4149,14 +4083,14 @@ mod git_credential_lifecycle_tests {
         assert_eq!(requests.len(), 1);
         assert_git_request(&requests[0], Some("fake-alice-access"), true);
         assert_eq!(requests[0].header("X-Inherited"), None);
-        assert_eq!(
+        assert_ne!(
             requests[0].header("User-Agent"),
             Some("preserved inherited agent")
         );
     }
 
     #[test]
-    fn inherited_parameter_rewrites_and_quoted_mounts_keep_their_wire_target() {
+    fn injected_rewrites_do_not_change_the_requested_quoted_mount() {
         let home = IsolatedHome::new();
         let hub = FakeHub::new(|_| advertisement());
         let mount = format!("{}/mount=one's!", hub.base);
@@ -4173,7 +4107,6 @@ mod git_credential_lifecycle_tests {
             (&redirect, "true"),
             ("http.userAgent", "preserved inherited agent"),
         ]);
-        // URL expansion and transport observe the same inherited non-security configuration.
         unsafe { std::env::set_var("GIT_CONFIG_PARAMETERS", parameters) };
         assert!(execute(
             EntryPoint::Capture,
@@ -4185,7 +4118,7 @@ mod git_credential_lifecycle_tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].path,
-            "/mount=one's!/alice/example.git/info/refs?service=git-upload-pack"
+            "/mount=one's!/alice/requested.git/info/refs?service=git-upload-pack"
         );
         assert_eq!(
             requests[0].header("Authorization"),
@@ -4196,7 +4129,7 @@ mod git_credential_lifecycle_tests {
             Some(AGENT_ID)
         );
         assert_eq!(requests[0].header("X-Inherited"), None);
-        assert_eq!(
+        assert_ne!(
             requests[0].header("User-Agent"),
             Some("preserved inherited agent")
         );

@@ -1628,51 +1628,6 @@ fn accepted_choice_is_revalidated_inside_the_branch_and_claim_locks() {
 }
 
 #[test]
-fn unsupported_runtime_configuration_refuses_import_without_disclosing_or_writing() {
-    let lab = Lab::new();
-    lab.save_credential();
-    lab.repository(false);
-    let before = lab.state();
-    let marker = "private-synthetic-setting";
-    for (name, value) in [
-        ("GIT_CONFIG_KEY_1", "core.worktree"),
-        ("GIT_CONFIG_KEY_1", "credential.helper"),
-        ("GIT_CONFIG_KEY_1", "core.useReplaceRefs"),
-        ("GIT_CONFIG_KEY_1", "protocol.file.allow"),
-        ("GIT_CONFIG_KEY_1", "color.ui"),
-        ("GIT_CONFIG_COUNT", "2"),
-        ("GIT_CONFIG_COUNT", marker),
-        ("GIT_CONFIG_PARAMETERS", marker),
-    ] {
-        let output = lab
-            .command()
-            .args([
-                "import",
-                NATIVE_ID,
-                "--from=claude-code",
-                "--into=me/repo@imported",
-                "--independent",
-            ])
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "color.ui")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .env("GIT_CONFIG_VALUE_1", marker)
-            .env(name, value)
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        let diagnostic = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(diagnostic.contains("lineage choice"), "{diagnostic}");
-        assert!(!diagnostic.contains(marker));
-        assert_eq!(lab.state(), before);
-    }
-}
-
-#[test]
 fn inherited_git_routing_cannot_redirect_an_accepted_choice() {
     let lab = Lab::new();
     lab.save_credential();

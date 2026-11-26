@@ -382,23 +382,7 @@ fn branch_tip(repo: &Repo, branch: &str) -> crate::Result<Option<String>> {
 }
 
 pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
-    // Observation ignores inherited Git overrides; ordinary application must target the same repository.
-    crate::infra::git_runtime::check_runtime_environment(
-        std::env::vars_os(),
-        &[
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_REPLACE_REF_BASE",
-            "GIT_SHALLOW_FILE",
-            "GIT_GRAFT_FILE",
-        ],
-        "cannot apply a lineage choice",
-    )
+    crate::infra::git_runtime::check_routing("cannot apply a lineage choice")
 }
 
 pub(super) struct Snapshot {
