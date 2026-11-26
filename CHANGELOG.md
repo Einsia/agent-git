@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.60] - 2026-11-27
+
+### Fixed
+
+- `agit import --propose-lineage` can now find parent candidates when a Codex session's
+  paginated history is too large to fit in a single snapshot. Individual records still have a size limit.
+
 ## [0.2.59] - 2026-11-27
 
 ### Fixed
