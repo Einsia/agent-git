@@ -235,13 +235,15 @@ line. `--propose-lineage` prints the same local evidence without applying a choi
 comparison is unavailable, so a missing verified prefix does not prove unrelated history.
 
 A runtime can inject Git settings for a command using `GIT_CONFIG_COUNT` and numbered
-key/value pairs. Import and push accept an empty list or a list containing only
-`color.ui=false` and `credential.<url>.helper` for concrete HTTP(S) addresses without
-embedded credentials, wildcards, queries, or fragments. The unscoped `credential.helper`
-is not accepted. Git retains the caller's helper configuration; transports that already
-have a Hub bearer token do not call Git credential helpers. Other entries, incomplete lists,
-and opaque `GIT_CONFIG_PARAMETERS` are refused: they may change the repository, visible objects, or execution policy. Automatic
-uploads follow the same push checks. Neither command clears these settings or displays their contents.
+key/value pairs. Import and push accept `color.ui=false`, URL-scoped `credential.<url>.*`
+settings, `http.<url>.proactiveAuth=auto`, and `http.<url>.followRedirects=false`.
+The URL must be a concrete HTTP(S) address without embedded credentials, wildcards,
+queries, or fragments. Git receives the settings in their original order, including
+empty helper resets and path-specific credential lookups. Transports that already have
+a Hub bearer token do not call Git credential helpers. Other settings, incomplete lists,
+and opaque `GIT_CONFIG_PARAMETERS` are refused. The diagnostic identifies the affected
+indices and reasons without displaying URLs, helper commands, or values. Automatic uploads
+follow the same push checks; no changes to your credential configuration are needed.
 
 After accepting an independent import, the session's turns are recorded:
 

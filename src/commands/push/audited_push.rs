@@ -26,57 +26,23 @@ struct Destination {
 pub(super) fn check_environment(
     environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Result<()> {
-    let mut count = 0;
-    let mut numbered = std::collections::HashMap::new();
-    for (name, value) in environment {
-        let name = name.to_string_lossy();
-        #[cfg(windows)]
-        let name = name.to_ascii_uppercase();
-        let key: &str = name.as_ref();
-        if key == "GIT_CONFIG_COUNT" {
-            count = crate::infra::git_runtime::config_count(&value)
-                .context("push cannot inherit invalid GIT_CONFIG_COUNT")?;
-            continue;
-        }
-        if key.starts_with("GIT_CONFIG_KEY_") || key.starts_with("GIT_CONFIG_VALUE_") {
-            numbered.insert(key.to_owned(), value);
-            continue;
-        }
-        ensure!(
-            !matches!(
-                key,
-                "GIT_DIR"
-                    | "GIT_COMMON_DIR"
-                    | "GIT_WORK_TREE"
-                    | "GIT_INDEX_FILE"
-                    | "GIT_OBJECT_DIRECTORY"
-                    | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
-                    | "GIT_NAMESPACE"
-                    | "GIT_SHALLOW_FILE"
-                    | "GIT_GRAFT_FILE"
-                    | "GIT_PREFIX"
-                    | "GIT_CONFIG"
-                    | "GIT_CONFIG_PARAMETERS"
-            ),
-            "push cannot inherit {key}; clear Git routing and injected configuration before retrying"
-        );
-    }
-    ensure!(
-        numbered.len() as u64 == 2 * u64::from(count),
-        "push cannot inherit incomplete or unexpected numbered Git configuration"
-    );
-    for index in 0..count {
-        ensure!(
-            numbered
-                .get(&format!("GIT_CONFIG_KEY_{index}"))
-                .zip(numbered.get(&format!("GIT_CONFIG_VALUE_{index}")))
-                .is_some_and(
-                    |(key, value)| crate::infra::git_runtime::supported_runtime_config(key, value)
-                ),
-            "push cannot inherit unsupported runtime Git configuration at index {index}"
-        );
-    }
-    Ok(())
+    crate::infra::git_runtime::check_runtime_environment(
+        environment,
+        &[
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_SHALLOW_FILE",
+            "GIT_GRAFT_FILE",
+            "GIT_PREFIX",
+            "GIT_CONFIG",
+        ],
+        "cannot push",
+    )
 }
 
 /// Whether a publication may still be run again from its preview when the Hub refuses its receipt
