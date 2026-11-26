@@ -383,45 +383,22 @@ fn branch_tip(repo: &Repo, branch: &str) -> crate::Result<Option<String>> {
 
 pub(in crate::commands::import) fn verify_git_routing() -> crate::Result<()> {
     // Observation ignores inherited Git overrides; ordinary application must target the same repository.
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_SHALLOW_FILE",
-        "GIT_GRAFT_FILE",
-    ] {
-        ensure!(
-            std::env::var_os(key).is_none(),
-            "unset {key} before applying a lineage choice"
-        );
-    }
-    ensure!(
-        std::env::var_os("GIT_CONFIG_PARAMETERS").is_none(),
-        "cannot apply a lineage choice with opaque GIT_CONFIG_PARAMETERS"
-    );
-    let Some(count) = std::env::var_os("GIT_CONFIG_COUNT") else {
-        return Ok(());
-    };
-    let count = crate::infra::git_runtime::config_count(&count)
-        .context("invalid GIT_CONFIG_COUNT for a lineage choice")?;
-    for index in 0..count {
-        ensure!(
-            std::env::var_os(format!("GIT_CONFIG_KEY_{index}"))
-                .zip(std::env::var_os(format!("GIT_CONFIG_VALUE_{index}")))
-                .is_some_and(
-                    |(key, value)| crate::infra::git_runtime::supported_runtime_config(
-                        &key, &value
-                    )
-                ),
-            "cannot apply a lineage choice with unsupported runtime Git configuration at index {index}"
-        );
-    }
-    Ok(())
+    crate::infra::git_runtime::check_runtime_environment(
+        std::env::vars_os(),
+        &[
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_REPLACE_REF_BASE",
+            "GIT_SHALLOW_FILE",
+            "GIT_GRAFT_FILE",
+        ],
+        "cannot apply a lineage choice",
+    )
 }
 
 pub(super) struct Snapshot {

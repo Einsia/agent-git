@@ -5551,21 +5551,39 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         hub_main
     );
 
-    let runtime_command = |args: &[&str]| {
+    let runtime_command = |args: &[&str], swap_scopes: bool| {
         let mut command = command_in(&laptop, args);
         command.env("GIT_CONFIG_COUNT", "10");
-        command.env(
-            "GIT_CONFIG_KEY_0",
-            format!("credential.{}.helper", hub.base),
-        );
-        command.env("GIT_CONFIG_VALUE_0", "synthetic-scoped-helper");
-        for index in 1..10 {
-            command.env(format!("GIT_CONFIG_KEY_{index}"), "color.ui");
-            command.env(format!("GIT_CONFIG_VALUE_{index}"), "false");
+        let mut scopes = [
+            "https://desktop.example.test",
+            "https://staging.example.test",
+        ];
+        if swap_scopes {
+            scopes.reverse();
+        }
+        for (group, host) in scopes.iter().enumerate() {
+            let scope = format!("{host}/backend-api/codex/sites/git/");
+            for (offset, (section, field, value)) in [
+                ("credential", "helper", ""),
+                ("credential", "helper", "synthetic-scoped-helper"),
+                ("credential", "useHttpPath", "true"),
+                ("http", "proactiveAuth", "auto"),
+                ("http", "followRedirects", "false"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let index = 5 * group + offset;
+                command.env(
+                    format!("GIT_CONFIG_KEY_{index}"),
+                    format!("{section}.{scope}.{field}"),
+                );
+                command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+            }
         }
         command
     };
-    let imported = runtime_command(&import).output().unwrap();
+    let imported = runtime_command(&import, false).output().unwrap();
     assert_success(&imported);
     let said = format!(
         "{}{}",
@@ -5580,14 +5598,20 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
     let laptop_repo = laptop.join("repos/alice/app");
     let saved = storage::materialize_at(&laptop_repo, "refs/heads/talk", meta::LOG_FILE).unwrap();
     assert!(saved.contains("Check the shared file"));
-    let refused = runtime_command(&["--yes", "push", "alice/app@talk"])
+    let refused = runtime_command(&["--yes", "push", "alice/app@talk"], true)
+        .env("GIT_CONFIG_VALUE_4", "true")
         .env("GIT_CONFIG_KEY_9", "agit.autoPush")
         .output()
         .unwrap();
     assert!(!refused.status.success());
+    let diagnostic = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("unsupported runtime Git configuration at index 9")
+        diagnostic.contains("index 4: HTTP redirects must stay disabled"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("index 9: setting is outside"),
+        "{diagnostic}"
     );
     assert_eq!(git(&remote, &["for-each-ref", "refs/heads/talk"]), "");
     assert_eq!(
@@ -5617,7 +5641,7 @@ fn a_first_save_into_a_repository_on_the_hub_starts_from_its_main() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(said.contains("main is on the Hub"), "{said}");
-    let uploaded = runtime_command(&["--yes", "push", "alice/app@talk"])
+    let uploaded = runtime_command(&["--yes", "push", "alice/app@talk"], true)
         .output()
         .unwrap();
     assert_success(&uploaded);

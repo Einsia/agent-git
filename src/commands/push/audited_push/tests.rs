@@ -613,12 +613,7 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         "GIT_CONFIG_PARAMETERS",
     ] {
         let error = check_environment([(key.into(), "PRIVATE_ROUTING_VALUE".into())]).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "push cannot inherit {key}; clear Git routing and injected configuration before retrying"
-            )
-        );
+        assert!(error.to_string().contains(key));
         assert!(!error.to_string().contains("PRIVATE_ROUTING_VALUE"));
     }
     assert!(check_environment([("GIT_CONFIG_COUNT".into(), "0".into())]).is_ok());
@@ -626,7 +621,8 @@ fn inherited_git_routing_is_refused_without_reporting_its_value() {
         ("Credential.https://example.test:443/team.repo.Helper", true),
         ("credential.helper", false),
         ("credential.https://*.example.test.helper", false),
-        ("credential.https://example.test.username", false),
+        ("credential.https://example.test.username", true),
+        ("credential.https://example.test.bad_field", false),
         ("credential.https:///example.test.helper", false),
     ] {
         assert_eq!(

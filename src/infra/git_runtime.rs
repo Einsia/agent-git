@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(feature = "cli")]
-pub(crate) fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
+fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
     let text = value.to_str()?;
     text.parse::<u32>()
         .ok()
@@ -12,24 +12,13 @@ pub(crate) fn config_count(value: &std::ffi::OsStr) -> Option<u32> {
 }
 
 #[cfg(feature = "cli")]
-pub(crate) fn supported_runtime_config(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
-    if key.eq_ignore_ascii_case("color.ui") {
-        return value.eq_ignore_ascii_case("false");
-    }
-    let Some((section, rest)) = key.to_str().and_then(|key| key.split_once('.')) else {
-        return false;
-    };
-    let Some((address, field)) = rest.rsplit_once('.') else {
-        return false;
-    };
-    section.eq_ignore_ascii_case("credential")
-        && field.eq_ignore_ascii_case("helper")
-        && address.split_once("://").is_some_and(|(scheme, rest)| {
-            (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-                && !rest.is_empty()
-                && !rest.starts_with('/')
-        })
-        && !address.contains(['\\', '*', '?', '#'])
+fn concrete_http_scope(address: &str) -> bool {
+    address.split_once("://").is_some_and(|(scheme, rest)| {
+        (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
+            && !rest.is_empty()
+            && !rest.starts_with('/')
+            && !rest.split('/').next().unwrap_or_default().contains('@')
+    }) && !address.contains(['\\', '*', '?', '#'])
         && !address
             .chars()
             .any(|ch| ch.is_control() || ch.is_whitespace())
@@ -38,6 +27,126 @@ pub(crate) fn supported_runtime_config(key: &std::ffi::OsStr, value: &std::ffi::
                 && url.username().is_empty()
                 && url.password().is_none()
         })
+}
+
+#[cfg(feature = "cli")]
+fn check_setting(key: &std::ffi::OsStr, value: &std::ffi::OsStr) -> Result<(), &'static str> {
+    if key.eq_ignore_ascii_case("color.ui") {
+        return value
+            .eq_ignore_ascii_case("false")
+            .then_some(())
+            .ok_or("color.ui must disable color");
+    }
+    let (section, rest) = key
+        .to_str()
+        .and_then(|key| key.split_once('.'))
+        .ok_or("invalid Git setting name")?;
+    if !section.eq_ignore_ascii_case("credential") && !section.eq_ignore_ascii_case("http") {
+        return Err("setting is outside the credential, transport and display policy");
+    }
+    let (_, field) = rest.rsplit_once('.').filter(|(scope, _)| concrete_http_scope(scope))
+        .ok_or("authentication and HTTP settings require a concrete HTTP(S) URL without user information")?;
+    if section.eq_ignore_ascii_case("credential") {
+        return (field.starts_with(|ch: char| ch.is_ascii_alphabetic())
+            && field
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+        .then_some(())
+        .ok_or("invalid credential field name");
+    }
+    if field.eq_ignore_ascii_case("followRedirects") {
+        return value
+            .eq_ignore_ascii_case("false")
+            .then_some(())
+            .ok_or("HTTP redirects must stay disabled");
+    }
+    if field.eq_ignore_ascii_case("proactiveAuth") {
+        return value
+            .eq_ignore_ascii_case("auto")
+            .then_some(())
+            .ok_or("HTTP proactive authentication must use auto");
+    }
+    Err("HTTP setting may override transport routing or security")
+}
+
+#[cfg(feature = "cli")]
+pub(crate) fn check_runtime_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    routing: &[&str],
+    action: &str,
+) -> anyhow::Result<()> {
+    let mut count = Some(0);
+    let mut entries = std::collections::BTreeMap::new();
+    let mut problems = Vec::new();
+    for (name, value) in environment {
+        let name = name.to_string_lossy();
+        #[cfg(windows)]
+        let name = name.to_ascii_uppercase();
+        let name: &str = name.as_ref();
+        if name == "GIT_CONFIG_COUNT" {
+            count = config_count(&value);
+            if count.is_none() {
+                problems.push("invalid GIT_CONFIG_COUNT".into());
+            }
+        } else if let Some(suffix) = name
+            .strip_prefix("GIT_CONFIG_KEY_")
+            .or_else(|| name.strip_prefix("GIT_CONFIG_VALUE_"))
+        {
+            if let Some(index) = config_count(suffix.as_ref()) {
+                let (key, setting) = entries.entry(index).or_insert((None, None));
+                if name.starts_with("GIT_CONFIG_KEY_") {
+                    *key = Some(value);
+                } else {
+                    *setting = Some(value);
+                }
+            } else {
+                problems.push("noncanonical numbered Git configuration index".into());
+            }
+        } else if name == "GIT_CONFIG_PARAMETERS" {
+            problems.push("opaque GIT_CONFIG_PARAMETERS cannot be validated".into());
+        } else if routing.contains(&name) {
+            problems.push(format!("unset {name}: it can override Git routing"));
+        }
+    }
+    let mut next = 0;
+    let missing = |first, end| {
+        format!(
+            "missing numbered Git configuration at indices {first}..={}",
+            end - 1
+        )
+    };
+    for (index, (key, value)) in entries {
+        if let Some(count) = count {
+            let end = index.min(count);
+            if next < end {
+                problems.push(missing(next, end));
+            }
+            next = end.saturating_add(1);
+            if index >= count {
+                problems.push(format!("index {index}: outside GIT_CONFIG_COUNT"));
+                continue;
+            }
+        }
+        let result = match (key, value) {
+            (Some(key), Some(value)) => check_setting(&key, &value),
+            (None, _) => Err("missing key"),
+            (_, None) => Err("missing value"),
+        };
+        if let Err(reason) = result {
+            problems.push(format!("index {index}: {reason}"));
+        }
+    }
+    if let Some(count) = count
+        && next < count
+    {
+        problems.push(missing(next, count));
+    }
+    anyhow::ensure!(
+        problems.is_empty(),
+        "{action}: unsupported runtime Git configuration: {}",
+        problems.join("; ")
+    );
+    Ok(())
 }
 
 #[cfg(feature = "bundled-git")]
