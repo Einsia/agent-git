@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.61] - 2026-11-27
+
+### Fixed
+
+- Git settings injected by the desktop app no longer block session imports, manual pushes,
+  or automatic uploads at sign-off. AGit uses its own Hub credentials for uploads.
+
 ## [0.2.60] - 2026-11-27
 
 ### Fixed
