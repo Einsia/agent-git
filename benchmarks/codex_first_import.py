@@ -109,8 +109,9 @@ def main():
         print(f"Source: {source.stat().st_size} bytes, session {session}", flush=True)
         env = {**os.environ, "CODEX_HOME": str(runtime), "CODEX_THREAD_ID": session}
         exported = work / "export.jsonl"
-        measure_import([args.agit, "import", session, "--from", "codex", "--independent",
-                        "--into", args.into, "--yes"], work, env)
+        command = [args.agit, "import", session, "--from", "codex", "--independent",
+                   "--into", args.into, "--yes"]
+        measure_import(command, work, env)
         usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         print(f"Import peak RSS: {usage * (1 if sys.platform == 'darwin' else 1024)} bytes", flush=True)
         slug, branch = args.into.rsplit("@", 1)
@@ -135,6 +136,11 @@ def main():
         checkpoint = json.loads(link.read_bytes())["native_checkpoint"]
         if (checkpoint["tip"], checkpoint["bytes"], checkpoint["sha256"]) != (git("rev-parse", branch), settled, digest):
             raise ValueError("Checkpoint does not identify the exported prefix")
+        if args.tail == "none":
+            refs = git("show-ref", "--heads")
+            subprocess.run(command, check=True, cwd=work, env=env)
+            if git("show-ref", "--heads") != refs or json.loads(link.read_bytes())["native_checkpoint"] != checkpoint:
+                raise ValueError("Repeated import changed the saved history or checkpoint")
         print(f"Verified {turns} turns, {count} ordered records, {settled} settled bytes, claim {claim}")
 
 

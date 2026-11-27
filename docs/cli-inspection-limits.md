@@ -49,6 +49,8 @@ The branch tip and the local source checkpoint stop at the last verified complet
 bookkeeping or an unfinished execution stays in the native file, outside the saved prefix.
 This path still requires explicit completion markers and applies the per-record, per-execution
 and v1 sequence budgets. It does not change the limits of subsequent live settlement.
+Repeating an import of a fully settled rollout is a no-op when the saved tip, reconstructed
+byte count and SHA-256 still match. A changed rollout is not acknowledged as already saved.
 
 `benchmarks/codex_first_import.py` exercises first settlement against an explicitly configured
 test account and a fresh destination. It generates complete user turns with distinct records,
