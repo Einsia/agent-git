@@ -60,4 +60,9 @@ $hash = (Get-FileHash "$package/agit.exe" -Algorithm SHA256).Hash.ToLowerInvaria
 $archive = "dist/agit-$env:AGIT_RELEASE_CHANNEL-$shortSha-$target.tar.gz"
 & tar -C $package -czf $archive agit.exe BUILD-INFO.txt INSTALL.txt SHA256SUMS
 if ($LASTEXITCODE -ne 0) { throw 'Windows artifact packaging failed' }
+$receipt = & tar -xzOf $archive BUILD-INFO.txt
+if ($LASTEXITCODE -ne 0 -or $receipt -cnotcontains "commit=$env:CI_COMMIT_SHA" -or
+    $receipt -cnotcontains "tree=$tree" -or $receipt -cnotcontains "target=$target") {
+    throw 'Archived Windows package does not match the validated checkout and target'
+}
 Write-Output "built $archive"
