@@ -2604,7 +2604,6 @@ fn settle_local_telemetry_inner(
         if lk.source == "codex"
             && opts.historical
             && lk.native_binding.is_none()
-            && lk.native_checkpoint.is_none()
             && lk.baseline_bytes.is_none()
             && requested.is_none()
         {

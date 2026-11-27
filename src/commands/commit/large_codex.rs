@@ -16,6 +16,40 @@ pub(super) fn import(
     let tip = optional_branch_commit(repo, &format!("refs/heads/{branch}"))?
         .context("large Codex import needs a declared session branch")?;
     let mut snapshot = meta::read_at_ref_result(repo, &tip)?.context("missing branch metadata")?;
+    let path = link.resolve().context("cannot locate the Codex rollout")?;
+    let source = native_snapshot::source_at("codex", &link.session_id, path)?;
+    ensure!(
+        opts.milestone.is_none() && link.pending_milestone.is_none(),
+        "large Codex import cannot assign a pending milestone"
+    );
+    if let Some(checkpoint) = &link.native_checkpoint {
+        ensure!(
+            checkpoint.tip == tip
+                && snapshot.runtime == "codex"
+                && snapshot.runtime_instances.contains(&link.session_id)
+                && snapshot.baseline_bytes == Some(checkpoint.bytes),
+            "large Codex checkpoint does not match the saved turn"
+        );
+        let mut digest = Sha256::new();
+        let mut bytes = 0u64;
+        codex::lineage_stream::visit(&source, |line| {
+            bytes = bytes
+                .checked_add(line.len() as u64)
+                .context("rollout size overflow")?;
+            ensure!(
+                bytes <= checkpoint.bytes,
+                "large Codex rollout extends beyond the saved checkpoint"
+            );
+            digest.update(line);
+            Ok(())
+        })?;
+        ensure!(
+            bytes == checkpoint.bytes && hex::encode(digest.finalize()) == checkpoint.sha256,
+            "large Codex rollout differs from the saved checkpoint"
+        );
+        ui::success(&format!("already saved on {branch}; no new turns"));
+        return Ok(ExitCode::Ok);
+    }
     ensure!(
         snapshot.is_session_line()
             && snapshot.turn.is_none()
@@ -39,13 +73,7 @@ pub(super) fn import(
                 .is_empty(),
         "large Codex import cannot replace existing session evidence"
     );
-    ensure!(
-        opts.milestone.is_none() && link.pending_milestone.is_none(),
-        "large Codex import cannot assign a pending milestone"
-    );
     super::super::plumbing::ensure_v1_upgrade_preflight(repo, &tip)?;
-    let path = link.resolve().context("cannot locate the Codex rollout")?;
-    let source = native_snapshot::source_at("codex", &link.session_id, path)?;
     let (author, email) = commit_author(repo, owner)?;
     snapshot.committer_account = credentials::current_account()?;
     snapshot.kind = Kind::Turn;
