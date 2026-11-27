@@ -56,8 +56,32 @@ permissions:
   contents: read
 
 jobs:
+  source:
+    name: Resolve production tag
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - name: Validate production tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            agit-v*) ;;
+            *) echo "::error::production release requires an agit-v* tag"; exit 1 ;;
+          esac
+          test "$(git tag --points-at HEAD | grep -Fx "$RELEASE_TAG")" = "$RELEASE_TAG"
+          commit=$(git rev-parse HEAD)
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then test "$commit" = "$GITHUB_SHA"; fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
   build:
-    name: build ${{ matrix.target }}
+    name: ${{ matrix.task || 'build' }} ${{ matrix.target }}
+    needs: source
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout || 45 }}
     env:
@@ -77,20 +101,14 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             timeout: 75
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            timeout: 75
+            task: test
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Validate production tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$RELEASE_TAG" in
-            agit-v*) ;;
-            *) echo "::error::production release requires an agit-v* tag"; exit 1 ;;
-          esac
-          test "$(git tag --points-at HEAD | grep -Fx "$RELEASE_TAG")" = "$RELEASE_TAG"
+          ref: ${{ needs.source.outputs.commit }}
 
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
@@ -150,7 +168,7 @@ jobs:
       # therefore runs before "Build agit (release)": if one ran after it, the checks below would
       # verify one file and Package would archive another.
       - name: Verify native bundled CLI
-        if: matrix.target == 'aarch64-apple-darwin' || runner.os == 'Windows' || matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.task == 'test' || matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -161,6 +179,7 @@ jobs:
           esac
 
       - name: Build agit (release)
+        if: matrix.task != 'test'
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
@@ -210,7 +229,7 @@ jobs:
           esac
 
       - name: Verify Windows executable
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.task != 'test'
         shell: pwsh
         run: |
           node scripts/verify-windows-cli.mjs "target/${{ matrix.target }}/release/agit.exe"
@@ -250,6 +269,7 @@ jobs:
           done
 
       - name: Package
+        if: matrix.task != 'test'
         shell: bash
         run: |
           set -euo pipefail
@@ -264,6 +284,7 @@ jobs:
           ls -l "$ARCHIVE"
 
       - name: Upload build artifact
+        if: matrix.task != 'test'
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
@@ -272,7 +293,7 @@ jobs:
 
   release:
     name: publish release
-    needs: build
+    needs: [source, build]
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
@@ -281,7 +302,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.source.outputs.commit }}
 
       # A tag that disagrees with Cargo.toml/package.json sends npm to a version
       # directory that does not exist. Failing before the Release is created is
