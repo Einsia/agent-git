@@ -1,0 +1,47 @@
+name: Warm Windows release dependencies
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - 'crates/**/Cargo.toml'
+      - rust-toolchain.toml
+      - '.cargo/**'
+      - scripts/git-runtime-lock.json
+      - .github/workflows/windows-release-cache.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-cache-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -Ctarget-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        id: rust-cache
+        with:
+          key: x86_64-pc-windows-msvc
+          shared-key: release-windows
+      - name: Compile bundled release dependencies
+        if: steps.rust-cache.outputs.cache-hit != 'true'
+        env:
+          AGIT_RUNTIME_INPUTS_BASE: ${{ github.server_url }}/${{ github.repository }}/releases/download
+        run: |
+          python scripts/prepare-git-runtime.py x86_64-pc-windows-msvc .cache/git-runtime/payload.tar.gz
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime preparation failed' }
+          $env:AGIT_GIT_RUNTIME_ARCHIVE = (Resolve-Path '.cache/git-runtime/payload.tar.gz').Path
+          cargo build --locked --release --features bundled-git --target x86_64-pc-windows-msvc --bin agit
