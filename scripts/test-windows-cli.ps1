@@ -8,6 +8,17 @@ $ErrorActionPreference = 'Stop'
 foreach ($tool in @('cargo', 'node', 'git', 'curl.exe')) {
     Get-Command $tool -ErrorAction Stop | Out-Null
 }
+if (-not (Get-Command sh.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+    $gitRoot = Split-Path (Split-Path (Get-Command git.exe -CommandType Application).Source)
+    foreach ($relative in @('bin', 'usr\bin')) {
+        $directory = Join-Path $gitRoot $relative
+        if (Test-Path -LiteralPath (Join-Path $directory 'sh.exe') -PathType Leaf) {
+            $env:PATH = "$env:PATH;$directory"
+            break
+        }
+    }
+    Get-Command sh.exe -CommandType Application -ErrorAction Stop | Out-Null
+}
 & node scripts/verify-windows-powershell.mjs
 if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell host verification failed' }
 $target = 'x86_64-pc-windows-msvc'
