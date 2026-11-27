@@ -1403,8 +1403,12 @@ fn repository_blocks_follow_verified_selectors_and_recreated_identities() {
         .unwrap();
     let linked = Repo::at(&linked_root);
     assert_eq!(
-        linked.common_dir().unwrap(),
-        repositories[1].common_dir().unwrap()
+        linked.common_dir().unwrap().canonicalize().unwrap(),
+        repositories[1]
+            .common_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
     );
     worker.call_repo("protect_text", value, "", Some(&linked_root));
     b.sync();

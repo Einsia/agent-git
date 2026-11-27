@@ -8,6 +8,14 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.62] - 2026-11-27
+
+### Changed
+
+- Windows release candidates now run native tests and package checks before merge.
+  The release uses those checks without rebuilding the same Windows dev package.
+  This release does not change CLI commands or behavior.
+
 ## [0.2.61] - 2026-11-27
 
 ### Fixed
