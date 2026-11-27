@@ -36,10 +36,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Windows npm installation smoke test failed' }
 $package = 'dist/package'
 New-Item -ItemType Directory -Force $package | Out-Null
 Copy-Item $binary "$package/agit.exe"
+$tree = & git rev-parse 'HEAD^{tree}'
+if ($LASTEXITCODE -ne 0 -or $tree -notmatch '^[0-9a-f]{40}$') { throw 'Cannot identify the packaged tree' }
 @"
 channel=$env:AGIT_RELEASE_CHANNEL
 version=$env:AGIT_BUILD_VERSION
 commit=$env:AGIT_BUILD_SHA
+tree=$tree
 hub=$env:AGIT_DEFAULT_HUB_URL
 target=$target
 "@ | Set-Content "$package/BUILD-INFO.txt" -Encoding utf8

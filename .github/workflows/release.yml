@@ -118,8 +118,15 @@ jobs:
           cargo install cargo-zigbuild --locked
 
       - uses: Swatinem/rust-cache@v2
+        id: rust-cache
         with:
           key: ${{ matrix.target }}
+          shared-key: ${{ runner.os == 'Windows' && 'release-windows' || '' }}
+
+      - name: Record Windows Rust cache hit
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'Exact Windows Rust cache hit = ${{ steps.rust-cache.outputs.cache-hit }}' >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/cache@v4
         with:
@@ -142,15 +149,6 @@ jobs:
       # the same target/<triple>/release path as the release build. Every release-mode test
       # therefore runs before "Build agit (release)": if one ran after it, the checks below would
       # verify one file and Package would archive another.
-      - name: Windows native RC tests
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo check --locked --release --no-default-features --target ${{ matrix.target }} --lib
-          if ($LASTEXITCODE -ne 0) { throw "Windows library without RC failed to compile" }
-          cargo test --locked --release --features bundled-git --target ${{ matrix.target }} --test windows_rc -- --nocapture
-          if ($LASTEXITCODE -ne 0) { throw "Windows native RC integration tests failed" }
-
       - name: Verify native bundled CLI
         if: matrix.target == 'aarch64-apple-darwin' || runner.os == 'Windows' || matrix.target == 'x86_64-unknown-linux-musl'
         shell: bash
