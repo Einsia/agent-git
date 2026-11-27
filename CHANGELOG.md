@@ -8,6 +8,16 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.63] - 2026-11-27
+
+### Fixed
+
+- Completed Codex conversations too large to load in one snapshot can now be imported
+  as a single session. Exporting that session to a JSONL file writes the full history in order.
+  Importing the same unchanged conversation again succeeds without adding duplicate turns.
+- Windows package checks now verify the build record alongside the archive, so tagging a
+  release does not require downloading that record from another pipeline.
+
 ## [0.2.62] - 2026-11-27
 
 ### Changed
