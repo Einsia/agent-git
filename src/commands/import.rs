@@ -1820,6 +1820,9 @@ fn session_folder(known: Option<&str>, runtime: &str, session_id: &str) -> Strin
         .or_else(|| {
             let adapter = adapter::get(runtime).ok()?;
             let path = adapter.resolve(session_id, None)?;
+            if runtime == "codex" {
+                return crate::adapter::codex::rollout_cwd(&path, session_id);
+            }
             adapter
                 .parse_at(&path)
                 .ok()?

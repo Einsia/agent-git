@@ -22,6 +22,7 @@ use crate::domain::repo::Repo;
 use crate::domain::transcript;
 use crate::{ExitCode, adapter, ui};
 use clap::Args as ClapArgs;
+use std::io::Write as _;
 
 #[derive(ClapArgs)]
 pub struct Args {
@@ -131,6 +132,33 @@ pub fn run(args: Args) -> CmdResult {
     ) {
         Ok(text) => text,
         Err(error) => {
+            if error.is::<crate::domain::storage::ReadLimitExceeded>()
+                && !args.privacy
+                && !args.redact
+                && args.format == "jsonl"
+                && spec_turn_range(&spec).is_none()
+                && let Some(path) = args.out.as_deref().filter(|path| *path != "-")
+            {
+                match stream_file(&repo, &sha, which, std::path::Path::new(path)) {
+                    Ok(Some(size)) => {
+                        report_file(
+                            path,
+                            size,
+                            &slug,
+                            &spec,
+                            resolved.branch.as_deref(),
+                            &sha,
+                            source,
+                        );
+                        return Ok(ExitCode::Ok);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        ui::error(&format!("cannot write export to {path}: {error:#}"));
+                        return Ok(ExitCode::Precondition);
+                    }
+                }
+            }
             // `--view-only` is a security/selection boundary: a broken or missing VIEW must
             // never silently widen the export to the complete LOG.  In particular, v1
             // materialization also checks object identity, size limits, and LOG reachability;
@@ -226,19 +254,15 @@ pub fn run(args: Args) -> CmdResult {
                 ui::error(&format!("cannot write export to {p}: {error}"));
                 return Ok(ExitCode::Precondition);
             }
-            let selected_ref = if spec.tail == refs::Tail::None {
-                resolved.branch.as_deref().unwrap_or(&sha)
-            } else {
-                &sha
-            };
-            super::echo::emit(
-                "export",
-                &[super::echo::Selection::new(
-                    format!("{slug}@{selected_ref}"),
-                    source,
-                )],
+            report_file(
+                p,
+                out.len() as u64,
+                &slug,
+                &spec,
+                resolved.branch.as_deref(),
+                &sha,
+                source,
             );
-            ui::success(&format!("exported to {p} ({} bytes)", out.len()));
         }
         _ => {
             if let Err(error) = write_output(&mut std::io::stdout().lock(), out.as_bytes()) {
@@ -248,6 +272,81 @@ pub fn run(args: Args) -> CmdResult {
         }
     }
     Ok(ExitCode::Ok)
+}
+
+fn report_file(
+    path: &str,
+    size: u64,
+    slug: &str,
+    spec: &refs::RefSpec,
+    branch: Option<&str>,
+    sha: &str,
+    source: super::echo::Source,
+) {
+    let selected_ref = if spec.tail == refs::Tail::None {
+        branch.unwrap_or(sha)
+    } else {
+        sha
+    };
+    super::echo::emit(
+        "export",
+        &[super::echo::Selection::new(
+            format!("{slug}@{selected_ref}"),
+            source,
+        )],
+    );
+    ui::success(&format!("exported to {path} ({size} bytes)"));
+}
+
+fn stream_file(
+    repo: &Repo,
+    sha: &str,
+    which: &str,
+    path: &std::path::Path,
+) -> crate::Result<Option<u64>> {
+    use crate::domain::{privacy, storage};
+    let Some((log, view)) = storage::local_v1_sequences(repo.root(), sha)? else {
+        return Ok(None);
+    };
+    let selected = if which == meta::VIEW_FILE { view } else { log };
+    let ids = selected.iter().map(String::as_str).collect::<Vec<_>>();
+    let sizes = storage::local_event_sizes(repo.root(), sha, &ids)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    if let Ok(metadata) = path.symlink_metadata() {
+        anyhow::ensure!(
+            metadata.is_file(),
+            "streamed output requires a regular file"
+        );
+    }
+    let mut output = tempfile::NamedTempFile::new_in(parent)?;
+    let mut batch = String::new();
+    let mut flush = |batch: &mut String| -> crate::Result<()> {
+        if !batch.is_empty() {
+            let protected = privacy::service::protect_for_commit(
+                Some(repo.root()),
+                batch,
+                privacy::projector::Mode::ProtectEnvelopes,
+            )?;
+            output.write_all(transcript::unwrap_strict(&protected)?.as_bytes())?;
+            batch.clear();
+        }
+        Ok(())
+    };
+    storage::for_each_local_event(repo.root(), sha, &ids, &sizes, |_, line| {
+        if batch.len() + line.len() > 1024 * 1024 {
+            flush(&mut batch)?;
+        }
+        batch.push_str(line);
+        Ok(())
+    })?;
+    flush(&mut batch)?;
+    output.flush()?;
+    let size = output.as_file().metadata()?.len();
+    output.persist(path)?;
+    Ok(Some(size))
 }
 
 fn write_output(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {

@@ -184,6 +184,13 @@ fn primary_meta(path: &Path, choices_only: bool) -> Option<(String, String)> {
     Some((id, cwd.to_string()))
 }
 
+#[cfg(feature = "cli")]
+pub(crate) fn rollout_cwd(path: &Path, session_id: &str) -> Option<String> {
+    primary_meta(path, false)
+        .filter(|(id, _)| id == session_id)
+        .map(|(_, cwd)| cwd)
+}
+
 /// Take the rollout id out of `rollout-2026-07-25T18-20-01-<uuid>.jsonl`.
 ///
 /// The uuid is the last five `-`-separated segments (8-4-4-4-12); the timestamp is in front of it.
@@ -256,24 +263,10 @@ enum SplitFailure {
 #[cfg(feature = "cli")]
 pub(crate) mod lineage_stream;
 
-fn recognized_rollout(bytes: &[u8], expected_thread_id: &str) -> bool {
-    let Some(header_end) = bytes.iter().position(|byte| *byte == b'\n') else {
-        return false;
-    };
-    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&bytes[..header_end]) else {
-        return false;
-    };
-    header.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-        && header
-            .pointer("/payload/id")
-            .and_then(|value| value.as_str())
-            == Some(expected_thread_id)
-}
-
-fn split_rollout(
-    mut bytes: Vec<u8>,
+fn rollout_header(
+    bytes: &[u8],
     expected_thread_id: Option<&str>,
-) -> std::result::Result<(RolloutParts, Option<HistoryPoint>), SplitFailure> {
+) -> std::result::Result<(usize, Option<u64>, Option<HistoryPoint>), SplitFailure> {
     let header_end = bytes
         .iter()
         .position(|byte| *byte == b'\n')
@@ -324,11 +317,20 @@ fn split_rollout(
     } else {
         None
     };
-    let body = bytes.split_off(header_end);
+    Ok((header_end, header_ordinal, history))
+}
+
+fn split_rollout(
+    mut bytes: Vec<u8>,
+    expected_thread_id: Option<&str>,
+) -> std::result::Result<(RolloutParts, Option<HistoryPoint>), SplitFailure> {
+    let (header_end, header_ordinal, history) = rollout_header(&bytes, expected_thread_id)?;
+    let header = bytes[..header_end].to_vec();
+    bytes.drain(..header_end);
     Ok((
         RolloutParts {
-            header: bytes,
-            body,
+            header,
+            body: bytes,
             header_ordinal,
         },
         history,
@@ -491,19 +493,16 @@ fn lineage_bytes_with_lookup_until(
             ));
         }
         let expected_thread_id = nodes.is_empty().then_some(source.session_id.as_str());
-        if allow_unrecognized_leaf
-            && nodes.is_empty()
-            && !recognized_rollout(&bytes, source.session_id.as_str())
-        {
-            return Ok(bytes);
+        if nodes.is_empty() {
+            match rollout_header(&bytes, expected_thread_id) {
+                Ok((_, _, None)) => return Ok(bytes),
+                Err(SplitFailure::Unrecognized) if allow_unrecognized_leaf => return Ok(bytes),
+                Err(_) => return Err(Unavailable::Incomplete),
+                Ok(_) => {}
+            }
         }
         let (parts, history) =
             split_rollout(bytes, expected_thread_id).map_err(|_| Unavailable::Incomplete)?;
-        if nodes.is_empty() && history.is_none() {
-            let mut bytes = parts.header;
-            bytes.extend_from_slice(&parts.body);
-            return Ok(bytes);
-        }
         let next = history.as_ref().map(|point| point.source_id.clone());
         nodes.push(LineageNode { parts, history });
         let Some(next) = next else {

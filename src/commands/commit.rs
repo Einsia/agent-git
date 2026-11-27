@@ -45,6 +45,7 @@
 
 pub(crate) mod archive;
 mod continuation;
+mod large_codex;
 mod native;
 
 use super::CmdResult;
@@ -2600,6 +2601,15 @@ fn settle_local_telemetry_inner(
         .map(|metadata| metadata.len())
         .filter(|size| *size > cap)
     {
+        if lk.source == "codex"
+            && opts.historical
+            && lk.native_binding.is_none()
+            && lk.native_checkpoint.is_none()
+            && lk.baseline_bytes.is_none()
+            && requested.is_none()
+        {
+            return large_codex::import(store, &repo, branch, lk, owner, &opts);
+        }
         ui::error(&format!(
             "this conversation's transcript is {} MB, more than the {} MB agit saves as one conversation, so it wasn't saved",
             size >> 20,

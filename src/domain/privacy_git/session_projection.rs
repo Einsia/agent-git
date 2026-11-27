@@ -258,7 +258,15 @@ impl Projector {
                 .checked_add(size(id)?)
                 .context("materialized size overflow")?;
         }
-        storage::check_materialized_bounds(unique_bytes, log_bytes, view_bytes)?;
+        if continues && log.ends_with(&view) {
+            storage::check_materialized_bounds(
+                unique_bytes - self.unique_bytes,
+                log_bytes - self.log_bytes,
+                view_bytes.min(log_bytes - self.log_bytes),
+            )?;
+        } else {
+            storage::check_materialized_bounds(unique_bytes, log_bytes, view_bytes)?;
+        }
 
         // The records this snapshot shares with the source parent whose LOG its own extends go
         // out as that parent's public commit published them. A projector that continues from
@@ -666,6 +674,11 @@ impl Projector {
     pub(super) fn finish(&mut self, source: &Repo) -> Result<()> {
         let at = self.at.clone();
         self.check(source, at.as_deref())
+    }
+
+    #[cfg(debug_assertions)]
+    pub(super) fn fits_whole_log(&self) -> bool {
+        self.log_bytes <= storage::MAX_MATERIALIZED_BYTES
     }
 }
 
