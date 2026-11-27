@@ -2696,6 +2696,7 @@ fn with_event_batch<T>(
         // second heap buffer. The writer must run concurrently because Git may fill stdout before
         // the request pipe accepts the complete sequence.
         let writer = scope.spawn(move || -> Result<()> {
+            crate::domain::repo::suppress_pipe_signal(&stdin)?;
             for id in ids {
                 let spec = format!("{git_ref}:{}", meta::event_path(id)?);
                 stdin

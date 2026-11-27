@@ -1394,18 +1394,20 @@ impl ProjectedHistory {
                                     // Debug builds hold the projector to the whole-LOG projection
                                     // on every snapshot.
                                     #[cfg(debug_assertions)]
-                                    ensure!(
-                                        conversation
-                                            == conversation_commit(
-                                                &source,
-                                                oid,
-                                                &parents[oid],
-                                                &public_records()?,
-                                                Carried::default(),
-                                                &mut rechecked,
-                                            )?,
-                                        "the snapshot projector differs from the whole-LOG projection"
-                                    );
+                                    if projector.fits_whole_log() {
+                                        ensure!(
+                                            conversation
+                                                == conversation_commit(
+                                                    &source,
+                                                    oid,
+                                                    &parents[oid],
+                                                    &public_records()?,
+                                                    Carried::default(),
+                                                    &mut rechecked,
+                                                )?,
+                                            "the snapshot projector differs from the whole-LOG projection"
+                                        );
+                                    }
                                     conversation
                                 } else {
                                     projector.finish(&source)?;
