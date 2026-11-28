@@ -10,16 +10,21 @@ import resource
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
 import uuid
 
 
-def generate(path, session, work, target_bytes, tail="none"):
+def generate(path, session, work, target_bytes, tail="none", exact=False):
     timestamp = "2026-01-01T00:00:00Z"
     padding = "ordinary conversation text " * 2000
     with path.open("xb") as stream:
-        def record(kind, **payload):
+        def encode(kind, **payload):
             value = {"timestamp": timestamp, "type": kind, "payload": payload}
-            stream.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
+            return json.dumps(value, separators=(",", ":")).encode() + b"\n"
+
+        def record(kind, **payload):
+            stream.write(encode(kind, **payload))
 
         record("session_meta", id=session, cwd=str(work), timestamp=timestamp, source="cli")
         for turn in itertools.count(1):
@@ -27,11 +32,22 @@ def generate(path, session, work, target_bytes, tail="none"):
             record("event_msg", type="task_started", turn_id=turn_id)
             record("response_item", type="message", role="user", internal_chat_message_metadata_passthrough={"content_item_kinds": ["user.text"]}, content=[
                 {"type": "input_text", "text": f"Question {turn}"}])
+            completion = encode('event_msg', type='task_complete', turn_id=turn_id)
             for index in range(128):
+                if exact:
+                    space = target_bytes - stream.tell() - len(completion)
+                    empty = encode('response_item', type='message', role='assistant',
+                                   content=[{'type': 'output_text', 'text': ''}])
+                    if space < len(empty):
+                        raise ValueError('Exact target cannot fit a complete execution')
+                    if space <= len(padding) * 2:
+                        record('response_item', type='message', role='assistant',
+                               content=[{'type': 'output_text', 'text': 'x' * (space - len(empty))}])
+                        break
                 record("response_item", type="message", role="assistant", content=[
                     {"type": "output_text", "text": f"Answer {turn}.{index}: {padding}"}])
-            record("event_msg", type="task_complete", turn_id=turn_id)
-            if turn == 1:
+            stream.write(completion)
+            if turn == 1 and not exact:
                 record("event_msg", type="task_started", turn_id="wake")
                 record("response_item", type="message", role="assistant", content=[
                     {"type": "output_text", "text": "Continuation without a prompt"}])
@@ -59,6 +75,57 @@ def compare(original, exported, settled):
         if source.tell() != settled:
             raise ValueError("Export does not end at the last completed execution")
     return count, digest.hexdigest()
+
+
+def verify_publication(source, home, slug, branch, claim):
+    hub = 'https://dev.agent-git.com'
+    credentials, = [value for path in (home / 'credentials').glob('*.json')
+                    if (value := json.loads(path.read_bytes()))['hub'].rstrip('/') == hub]
+    def get(suffix):
+        request = urllib.request.Request(f'{hub}/api/agents/{slug}/sessions{suffix}', headers={
+            'Authorization': 'Bearer ' + credentials['access_token'], 'User-Agent': 'agentgit-fleet-check/1'})
+        with urllib.request.urlopen(request, timeout=90) as response:
+            return json.load(response)
+    listing = get('?ref=' + urllib.parse.quote(branch, safe=''))
+    if listing['total'] != 1 or listing['items'][0]['session_id'] != claim:
+        raise ValueError('Publication did not preserve the session identity')
+    commit = listing['ref']['commit']
+    cursor = pages = 0
+    digest = hashlib.sha256()
+    with source.open('rb') as stream:
+        expected = (record for record in map(json.loads, stream) if record['type'] != 'session_meta'
+                    and record['payload']['type'] != 'task_started')
+        while True:
+            page = get(f'/{claim}?ref={commit}&detail=records&from={cursor}')
+            if page['commit'] != commit or page['from'] != cursor or not page['records']:
+                raise ValueError(f'Unexpected page at {commit}:{cursor}')
+            for record in page['records']:
+                if record != next(expected, None):
+                    raise ValueError(f'Published record differs at {commit}:{cursor}')
+                digest.update(json.dumps(record, sort_keys=True, separators=(',', ':')).encode() + b'\n')
+                cursor += 1
+            pages += 1
+            if page['next'] != cursor or cursor > page['total']:
+                raise ValueError('Invalid publication cursor')
+            if cursor == page['total']:
+                if next(expected, None) is not None:
+                    raise ValueError('Publication omitted the end of the transcript')
+                break
+    print(f'Hub {commit}: {pages} pages, {cursor} ordered records, SHA-256 {digest.hexdigest()}', flush=True)
+
+
+def append_turns(source, start, count):
+    with source.open('ab') as stream:
+        for turn in range(start, start + count):
+            marker = f'growth-{turn}'
+            for kind, payload in [
+                ('event_msg', {'type': 'task_started', 'turn_id': marker}),
+                ('response_item', {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': marker}],
+                                   'internal_chat_message_metadata_passthrough': {'content_item_kinds': ['user.text']}}),
+                ('response_item', {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': marker}]}),
+                ('event_msg', {'type': 'task_complete', 'turn_id': marker}),
+            ]:
+                stream.write(json.dumps({'timestamp': '2026-01-02T00:00:00Z', 'type': kind, 'payload': payload}).encode() + b'\n')
 
 
 def measure_import(command, work, env):
@@ -92,24 +159,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agit", default="agit")
     parser.add_argument("--seed-agit", help="Use a previous release to publish the seed and check its refusal before appending")
-    parser.add_argument("--mib", default=600, type=int)
+    size = parser.add_mutually_exclusive_group()
+    size.add_argument("--mib", default=600, type=int)
+    size.add_argument('--bytes', type=int, help='Generate exactly this many completed source bytes')
     parser.add_argument("--tail", choices=("none", "bookkeeping", "incomplete"), default="none")
+    parser.add_argument('--growth', action='store_true', help='Publish and verify a seed and successive batches on fleet dev')
+    parser.add_argument('--cold', action='store_true', help='Start with only a compressed carrier; requires zstd')
     parser.add_argument("--into", required=True, help="A fresh owner/repo@branch in the test account")
     args = parser.parse_args()
     if not os.environ.get("AGIT_HOME") or not os.environ.get("AGIT_HUB_URL"):
         parser.error("Set AGIT_HOME and AGIT_HUB_URL for an isolated test account")
-    if args.mib <= 0:
+    target_bytes = args.mib * 1024**2 if args.bytes is None else args.bytes
+    if target_bytes <= 0:
         parser.error("--mib must be positive")
     if args.seed_agit and args.tail != "none":
         parser.error("The append comparison requires a completed seed")
+    if args.growth and (args.seed_agit or args.tail != 'none' or target_bytes <= 512 * 1024**2 or
+                        os.environ['AGIT_HUB_URL'].rstrip('/') != 'https://dev.agent-git.com' or
+                        not args.into.startswith('fleet-dev-test/')):
+        parser.error('Growth requires a large completed seed and a fleet-dev-test destination on dev')
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory).resolve()
         runtime = work / "codex"
         session = str(uuid.uuid4())
         source = runtime / "sessions/2026/01/01" / f"rollout-2026-01-01T00-00-00-{session}.jsonl"
         source.parent.mkdir(parents=True)
-        turns, settled = generate(source, session, work, args.mib * 1024**2, args.tail)
+        turns, settled = generate(source, session, work, target_bytes, args.tail, exact=args.bytes is not None)
+        if args.bytes is not None and settled != target_bytes:
+            raise ValueError('Generated prefix does not match the requested boundary')
         print(f"Source: {source.stat().st_size} bytes, session {session}", flush=True)
+        if args.cold:
+            subprocess.run(['zstd', '-q', '--rm', str(source)], check=True)
         env = {**os.environ, "CODEX_HOME": str(runtime), "CODEX_THREAD_ID": session}
         exported = work / "export.jsonl"
         command = [args.agit, "import", session, "--from", "codex", "--independent",
@@ -145,6 +225,36 @@ def main():
             subprocess.run(command, check=True, cwd=work, env=env)
             if git("show-ref", "--heads") != refs or json.loads(link.read_bytes())["native_checkpoint"] != checkpoint:
                 raise ValueError("Repeated import changed the saved history or checkpoint")
+        if args.growth:
+            def publish():
+                subprocess.run([args.agit, 'push', args.into, '--yes'], check=True, cwd=work, env=env)
+                verify_publication(source, Path(env['AGIT_HOME']), slug, branch, claim)
+            publish()
+            for batch in (1, 32, 2):
+                old_tip = git('rev-parse', branch)
+                append_turns(source, turns + 1, batch)
+                if batch == 32:
+                    boundary = source.stat().st_size
+                    with source.open('ab') as stream:
+                        stream.write(b'{"type":')
+                    before = link.read_bytes()
+                    rejected = subprocess.run(command, cwd=work, env=env)
+                    if not rejected.returncode or git('rev-parse', branch) != old_tip or link.read_bytes() != before:
+                        raise ValueError('Incomplete input advanced or changed saved history')
+                    with source.open('r+b') as stream:
+                        stream.truncate(boundary)
+                measure_import(command, work, env)
+                turns += batch
+                if git('rev-parse', f'{branch}~{batch}') != old_tip:
+                    raise ValueError('Append did not preserve the previous tip')
+                exported.unlink()
+                subprocess.run([args.agit, 'export', args.into, '-o', exported], check=True, cwd=work, env=env)
+                settled = source.stat().st_size
+                count, digest = compare(source, exported, settled)
+                latest = json.loads(link.read_bytes())['native_checkpoint']
+                if (latest['tip'], latest['bytes'], latest['sha256']) != (git('rev-parse', branch), settled, digest):
+                    raise ValueError('Appended checkpoint differs from export')
+                publish()
         if args.seed_agit:
             push = ["push", args.into, "--yes"]
             subprocess.run([seed, *push], check=True, cwd=work, env=env)

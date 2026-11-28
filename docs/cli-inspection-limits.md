@@ -82,3 +82,40 @@ export and checkpoint agree on the completed prefix. Local readback is not Hub p
 On macOS and Linux the benchmark also samples the importing process and its descendants with
 `ps`. The sampled sum includes shared resident pages in each process that maps them and can miss
 peaks between samples. It excludes the generator and the subsequent export and comparison.
+
+## Where growth still stops
+
+For an independent historical Codex import, the three reported sizes measure the same
+failure shape: a reader tries to admit a whole history as one allocation. They do not
+describe three Hub quotas. The ordinary read-only snapshot allows 64 MiB; capture allows
+512 MiB. For capture the effective output limit is
+`min(512 MiB, 1024 MiB - retained carrier bytes)`. For example, retaining 601 MiB leaves
+423 MiB for reconstruction, even on a host with abundant free memory. The eligible import
+falls back to streaming when byte admission fails. Live settlement, encrypted evidence,
+and a populated branch without a verified checkpoint are not interchangeable with this path.
+
+| Resource | Source and unit | What happens as the session grows |
+| --- | --- | --- |
+| Cold carrier | `adapter/codex_rollout.rs`: header inspection up to 1 MiB; restoration decodes to a temporary file beside the carrier | The compressed file size is not a decoded transcript budget. Allow disk space for the plain copy; publication of the restored file must succeed before the cold copy is retired. |
+| Historical import | `adapter/codex/lineage_stream.rs`, `commands/commit/large_codex.rs`: 8 MiB per record including newline, 64 MiB accumulated through one execution completion, 64 ancestor/leaf segments | Many ordinary turns stream. A single long line, one long execution, or deep pagination can still stop import. A partial final record is not a completed turn. Do not truncate the source to make it fit. |
+| Privacy and storage | `privacy/projector.rs`: 8 MiB per worker unit including context; `storage.rs`: 64 MiB per wrapped event, 1,000,000 occurrences per LOG or VIEW | Raw record bytes are not wrapped event bytes. Transformation must preserve record boundaries. Repeated IDs still consume occurrences and the importer retains the sequence and per-ID metadata. No amount of Git compression extends the count limit; start another session before reaching it. |
+| Repeat and append | `commands/commit/large_codex.rs`: checkpoint byte count, digest, runtime identity and branch tip; same per-execution and sequence limits | Repeat verifies the old prefix; a completed suffix is committed on top of it. A retry cannot treat an unverified prefix as saved. Runtime, disk usage and cumulative sequence copying can grow even when the event bodies stream. |
+| Projection and transport | `hub/git/frozen.rs`: per-push advertised new commits and packed bytes; pack planner reserves 1/16 of the byte budget | Dev advertises 4,096 commits and 2 GiB per request. The planner can split a long history at successive fast-forwards; it cannot split an indivisible commit. Check the remote tip before retrying a multi-request push. |
+| Hub admission | Hub `infra/config.rs`, `HistoryLimits` defaults: 512 MiB cumulative inspection per push, 16,384 first-parent binding steps, 50,000 whole-history commits | Inspection charges the bytes inspected, not the raw input length or the compressed pack size. The two advertised transport limits do not expose the other deployment overrides. |
+| Plain publication VIEW verification | Hub `privacy/session/manifest.rs` calls `gitsync/routes.rs::check_view_consistency_with_budget`. It uses `DEFAULT_PAIR_BUDGET_BYTES` (1 GiB) for the request and overrides the materializer's expanded-size limit to that value | A private plain session can pass local settlement and export yet receive HTTP 422 when its published sequence expands past 1 GiB. Repacking, splitting transport, or retrying the same tip does not shrink that sequence. Keep the native source, local branch and verified file export; continue new work in a separate session until the receiver can verify the original. Do not publish an incomplete prefix as the whole session. |
+| Repository capacity | Hub `Quota` defaults: private account 10 GiB total, organization 30 GiB total; public repository soft/hard 10/12 GiB | Usage across private repositories matters. Splitting transport does not increase quota. Check actual account usage before retrying; do not delete evidence to make a benchmark pass. |
+| Hub readback | Hub `gitsync/materialize.rs`, `record_page`: at most 64 occurrences and a 4 MiB page target; first event may occupy up to the 64 MiB event cap | Page at an immutable commit and compare through EOF. Each call still reads sequence IDs (up to 41,000,000 bytes on Hub). Whole-sequence readers keep their 512 MiB expanded limit. Hub process admission is separately configurable: by default it uses the cgroup limit less cache and reserve (defaults 512 and 1,536 MiB). This is not the CLI reconstruction formula. |
+
+To exercise growth on a fresh private `fleet-dev-test` destination, use the opt-in
+benchmark with `--mib 600 --cold --growth`. It requires `zstd` and an isolated dev
+login. It checks the local export and unchanged duplicate before publication, compares
+each published snapshot at its own commit, and retries a rejected incomplete input.
+Use a separate fresh destination with `--mib 1024 --cold --growth` to probe the
+receiver's expanded-size boundary. If the first push is rejected, local checks have
+passed but no remote readback or append has been verified by that run.
+For an exact byte boundary, use `--bytes` instead of `--mib`; the boundary is the end
+of a complete execution, not the size of a truncated file. The wrapped LOG and the Git
+request differ in size from this native JSONL input.
+This workload grows the transcript and turn count, not every individual protocol unit:
+passing it does not establish that an oversized event, a full account or a million-entry
+sequence can be published.
