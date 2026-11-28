@@ -25,7 +25,7 @@ def generate(path, session, work, target_bytes, tail="none"):
         for turn in itertools.count(1):
             turn_id = f"turn-{turn}"
             record("event_msg", type="task_started", turn_id=turn_id)
-            record("response_item", type="message", role="user", content=[
+            record("response_item", type="message", role="user", internal_chat_message_metadata_passthrough={"content_item_kinds": ["user.text"]}, content=[
                 {"type": "input_text", "text": f"Question {turn}"}])
             for index in range(128):
                 record("response_item", type="message", role="assistant", content=[
@@ -91,6 +91,7 @@ def measure_import(command, work, env):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--agit", default="agit")
+    parser.add_argument("--seed-agit", help="Use a previous release to publish the seed and check its refusal before appending")
     parser.add_argument("--mib", default=600, type=int)
     parser.add_argument("--tail", choices=("none", "bookkeeping", "incomplete"), default="none")
     parser.add_argument("--into", required=True, help="A fresh owner/repo@branch in the test account")
@@ -99,6 +100,8 @@ def main():
         parser.error("Set AGIT_HOME and AGIT_HUB_URL for an isolated test account")
     if args.mib <= 0:
         parser.error("--mib must be positive")
+    if args.seed_agit and args.tail != "none":
+        parser.error("The append comparison requires a completed seed")
     with tempfile.TemporaryDirectory() as directory:
         work = Path(directory).resolve()
         runtime = work / "codex"
@@ -111,7 +114,8 @@ def main():
         exported = work / "export.jsonl"
         command = [args.agit, "import", session, "--from", "codex", "--independent",
                    "--into", args.into, "--yes"]
-        measure_import(command, work, env)
+        seed = args.seed_agit or args.agit
+        measure_import([seed, *command[1:]], work, env)
         usage = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         print(f"Import peak RSS: {usage * (1 if sys.platform == 'darwin' else 1024)} bytes", flush=True)
         slug, branch = args.into.rsplit("@", 1)
@@ -130,7 +134,7 @@ def main():
                 ordinals.append(meta["turn"])
         if not claim or ordinals != list(range(1, turns + 1)):
             raise ValueError("Expected one session with one commit per user turn")
-        subprocess.run([args.agit, "export", args.into, "-o", exported], check=True, cwd=work, env=env)
+        subprocess.run([seed, "export", args.into, "-o", exported], check=True, cwd=work, env=env)
         count, digest = compare(source, exported, settled)
         link = Path(env["AGIT_HOME"]) / "store/codex" / f"{session}.json"
         checkpoint = json.loads(link.read_bytes())["native_checkpoint"]
@@ -141,6 +145,35 @@ def main():
             subprocess.run(command, check=True, cwd=work, env=env)
             if git("show-ref", "--heads") != refs or json.loads(link.read_bytes())["native_checkpoint"] != checkpoint:
                 raise ValueError("Repeated import changed the saved history or checkpoint")
+        if args.seed_agit:
+            push = ["push", args.into, "--yes"]
+            subprocess.run([seed, *push], check=True, cwd=work, env=env)
+            old_tip = git("rev-parse", branch)
+            marker = f"Append proof {session}"
+            with source.open("ab") as stream:
+                for kind, payload in [
+                    ("event_msg", {"type": "task_started", "turn_id": "next"}),
+                    ("response_item", {"type": "message", "role": "user", "content": [{"type": "input_text", "text": marker}], "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["user.text"]}}),
+                    ("response_item", {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": marker}]}),
+                    ("event_msg", {"type": "task_complete", "turn_id": "next"}),
+                ]:
+                    stream.write(json.dumps({"timestamp": "2026-01-02T00:00:00Z", "type": kind, "payload": payload}).encode() + b"\n")
+            result = subprocess.run([seed, *command[1:]], cwd=work, env=env)
+            if result.returncode == 0 or git("rev-parse", branch) != old_tip or json.loads(link.read_bytes())["native_checkpoint"] != checkpoint:
+                raise ValueError("Expected the seed release to refuse the extension without advancing history")
+            measure_import(command, work, env)
+            if git("rev-parse", f"{branch}^") != old_tip:
+                raise ValueError("Appended turn is not a child of the published seed")
+            exported = work / "extended.jsonl"
+            subprocess.run([seed, "export", args.into, "-o", exported], check=True, cwd=work, env=env)
+            settled = source.stat().st_size
+            count, digest = compare(source, exported, settled)
+            latest = json.loads(link.read_bytes())["native_checkpoint"]
+            if (latest["tip"], latest["bytes"], latest["sha256"]) != (git("rev-parse", branch), settled, digest):
+                raise ValueError("Appended checkpoint differs from export")
+            subprocess.run([args.agit, *push], check=True, cwd=work, env=env)
+            turns += 1
+            print(f"Appended {old_tip} -> {latest['tip']}; marker {marker}; SHA-256 {digest}", flush=True)
         print(f"Verified {turns} turns, {count} ordered records, {settled} settled bytes, claim {claim}")
 
 

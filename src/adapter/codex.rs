@@ -631,7 +631,12 @@ pub(crate) fn capture_lineage_with_lookup_until(
             .checked_add(bytes.len())
             .ok_or(Unavailable::BudgetExceeded)?;
         if retained > limits.working_bytes {
-            return Err(Unavailable::BudgetExceeded);
+            return Err(Unavailable::hit(
+                super::native_snapshot::Stage::Reconstruct,
+                super::native_snapshot::Limit::WorkingBytes,
+                retained,
+                limits.working_bytes,
+            ));
         }
         let expected_thread_id = nodes.is_empty().then_some(source.session_id.as_str());
         let (parts, history) =
@@ -2590,6 +2595,44 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(stopped, captured);
+                #[cfg(feature = "cli")]
+                {
+                    let mut streamed = Vec::new();
+                    lineage_stream::visit_with_lookup(
+                        &source,
+                        true,
+                        |id, limits| lookup_codex_rollout_in(home.path(), id, limits),
+                        |line| {
+                            streamed.extend_from_slice(line);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(streamed, captured.0);
+                    let retained = std::fs::metadata(path).unwrap().len() as usize
+                        + std::fs::metadata(&root_path).unwrap().len() as usize;
+                    let remaining = streamed.len() - 1;
+                    let refused = capture_lineage_with_lookup(
+                        &source,
+                        Limits {
+                            working_bytes: retained + remaining,
+                            ..Limits::default()
+                        },
+                        true,
+                        |id, limits| lookup_codex_rollout_in(home.path(), id, limits),
+                    )
+                    .unwrap_err();
+                    use crate::adapter::native_snapshot::{Limit, Stage, Unavailable};
+                    assert_eq!(
+                        refused,
+                        Unavailable::hit(
+                            Stage::Reconstruct,
+                            Limit::WorkingBytes,
+                            streamed.len(),
+                            remaining
+                        )
+                    );
+                }
             }
             captured
         };
@@ -2619,6 +2662,11 @@ mod tests {
             Some(bytes.len() as u64)
         );
         assert_eq!(capture_offset(&spans, &root_path, root_len), None);
+        std::fs::write(&root_path, format!("{root_header}{kept}{rewound}partial")).unwrap();
+        assert_eq!(
+            capture(thread, &segment_path, true).0,
+            format!("{root_header}{kept}{rewound}{replacement}").as_bytes()
+        );
     }
 
     #[test]

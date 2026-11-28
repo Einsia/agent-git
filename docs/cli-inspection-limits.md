@@ -49,8 +49,29 @@ The branch tip and the local source checkpoint stop at the last verified complet
 bookkeeping or an unfinished execution stays in the native file, outside the saved prefix.
 This path still requires explicit completion markers and applies the per-record, per-execution
 and v1 sequence budgets. It does not change the limits of subsequent live settlement.
-Repeating an import of a fully settled rollout is a no-op when the saved tip, reconstructed
-byte count and SHA-256 still match. A changed rollout is not acknowledged as already saved.
+For a subsequent historical import, the physical leaf length is not the reconstructed
+length. `Limits::capture()` allows 512 MiB of output and 1 GiB of working buffers.
+`lineage_bytes_with_lookup_until` charges the leaf and inherited ranges; the bound-source
+`capture_lineage_with_lookup_until` charges the full carriers it retains. `append_bounded`
+admits output against both 512 MiB and the working budget minus those retained bytes.
+The remaining allowance depends on the carriers, not free system RAM or Hub quota.
+
+When capture hits a byte limit, an eligible historical Codex import streams the lineage.
+For a saved v1 turn, its tip, runtime instance, source byte boundary and prefix SHA-256
+must agree with the local checkpoint. The importer inherits the existing event objects
+and LOG/VIEW IDs, then protects and records only completed new executions. Reading the
+old source still costs I/O to verify the digest; it does not require a second full LOG.
+A shorter or rewritten prefix cannot advance the ref. The first appended execution must
+introduce a user prompt: an already published turn is not amended. Pull is fast-forward
+only; a divergent history still requires explicit reconciliation. A different tip or a
+missing checkpoint on a populated line is not proof of continuity. This is not an
+unbounded archive merge or full-session restore.
+
+On Hub versions with paged transcript support, receive and ordered record pages do not
+require a complete inline rendering. Clients must follow the cursor at one immutable
+commit through EOF. Event, sequence, Git request, commit-count and repository quota
+limits still apply; exceeding them is not a successful partial upload. Publication
+retains only records allowed by the existing publication policy.
 
 `benchmarks/codex_first_import.py` exercises first settlement against an explicitly configured
 test account and a fresh destination. It generates complete user turns with distinct records,
