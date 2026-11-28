@@ -33,9 +33,21 @@ A Release is only buildable when the tag agrees with the version in
 
 When the tag already exists but the production Release workflow fails on the
 runner or the network, re-select the same `agit-v*` tag from the manual entry
-point of the **Release** workflow in GitHub Actions. The manual entry point takes
-no branch and no bare SHA, and creates no second release identity; it retries the
-same tag, safely.
+point of the **Release** workflow in GitHub Actions. With `build_only` off, supply
+the reviewed production tag; only that tag can be published.
+
+To rehearse, run **Release** on the mirrored `main` with `build_only=true` and
+leave `tag` empty. The Windows build and bundled CLI test use the dispatch
+commit, release runners and cache keys. Neither job packages or uploads a
+binary. The production job is skipped, and a manual run is ineligible for
+automatic npm publication.
+
+For a timing estimate, measure from run creation to the last successful matrix
+job's completion (include queue time; do not add parallel job durations). Add
+the baseline interval from matrix completion to Release publication for the
+unexecuted tail, then add the baseline merge-to-tag interval. Report the result
+as a Windows-based estimate: it does not measure other platforms, artifact
+uploads or actual publication.
 
 ## Targets and file names
 

@@ -40,12 +40,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'An existing, reviewed production tag (for example, agit-v0.1.0)'
-        required: true
+        description: 'An existing, reviewed production tag; leave empty for a build-only run'
+        required: false
         type: string
+      build_only:
+        description: 'Test and build Windows on the selected ref without packaging or publishing'
+        type: boolean
+        default: false
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ inputs.build_only && github.run_id || inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -57,27 +61,51 @@ permissions:
 
 jobs:
   source:
-    name: Resolve production tag
+    name: Resolve build source
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.tag.outputs.commit }}
+      matrix: ${{ steps.targets.outputs.matrix }}
     steps:
+      - name: Check manual inputs
+        if: github.event_name == 'workflow_dispatch' && ((inputs.build_only && inputs.tag != '') || (!inputs.build_only && inputs.tag == ''))
+        run: echo 'Supply either a production tag or build_only, not both.' >&2; exit 1
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-      - name: Validate production tag
+          ref: ${{ inputs.build_only && github.sha || format('refs/tags/{0}', env.RELEASE_TAG) }}
+      - name: Resolve commit
         id: tag
         shell: bash
         run: |
           set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          if [[ '${{ inputs.build_only }}' == 'true' ]]; then
+            test "$commit" = "$GITHUB_SHA"
+            exit 0
+          fi
           case "$RELEASE_TAG" in
             agit-v*) ;;
             *) echo "::error::production release requires an agit-v* tag"; exit 1 ;;
           esac
           test "$(git tag --points-at HEAD | grep -Fx "$RELEASE_TAG")" = "$RELEASE_TAG"
-          commit=$(git rev-parse HEAD)
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then test "$commit" = "$GITHUB_SHA"; fi
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Select build targets
+        id: targets
+        env:
+          TARGETS: |
+            [
+              {"target":"x86_64-unknown-linux-musl","os":"ubuntu-latest"},
+              {"target":"aarch64-unknown-linux-musl","os":"ubuntu-latest"},
+              {"target":"x86_64-apple-darwin","os":"macos-latest"},
+              {"target":"aarch64-apple-darwin","os":"macos-latest"},
+              {"target":"x86_64-pc-windows-msvc","os":"windows-latest","timeout":75},
+              {"target":"x86_64-pc-windows-msvc","os":"windows-latest","timeout":75,"task":"test"}
+            ]
+          BUILD_ONLY: ${{ inputs.build_only || false }}
+        run: |
+          matrix=$(jq -c '{include: map(select(env.BUILD_ONLY != "true" or .os == "windows-latest"))}' <<< "$TARGETS")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.task || 'build' }} ${{ matrix.target }}
@@ -88,23 +116,7 @@ jobs:
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -Ctarget-feature=+crt-static
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            timeout: 75
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            timeout: 75
-            task: test
+      matrix: ${{ fromJSON(needs.source.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -269,7 +281,7 @@ jobs:
           done
 
       - name: Package
-        if: matrix.task != 'test'
+        if: "!inputs.build_only && matrix.task != 'test'"
         shell: bash
         run: |
           set -euo pipefail
@@ -284,7 +296,7 @@ jobs:
           ls -l "$ARCHIVE"
 
       - name: Upload build artifact
-        if: matrix.task != 'test'
+        if: "!inputs.build_only && matrix.task != 'test'"
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
@@ -293,6 +305,7 @@ jobs:
 
   release:
     name: publish release
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.build_only && inputs.tag != '')
     needs: [source, build]
     runs-on: ubuntu-latest
     environment: production
