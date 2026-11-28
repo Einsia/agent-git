@@ -8,6 +8,13 @@ its [GitHub Release](https://github.com/Einsia/agent-git/releases), and the
 
 ## [Unreleased]
 
+## [0.2.64] - 2026-11-28
+
+### Fixed
+
+- Re-importing a large, previously published Codex session now appends new turns
+  without rebuilding the full history, so you can push them to the existing branch.
+
 ## [0.2.63] - 2026-11-27
 
 ### Fixed
