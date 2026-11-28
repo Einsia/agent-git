@@ -2595,18 +2595,25 @@ fn settle_local_telemetry_inner(
     // reads it several times over, so one left for the snapshot limit to refuse at the end runs
     // the computer out of memory first, with nothing said.
     let cap = crate::domain::storage::MAX_MATERIALIZED_BYTES as u64;
+    let streamable = lk.source == "codex"
+        && opts.historical
+        && lk.baseline_bytes.is_none()
+        && requested.is_none();
+    if streamable
+        && lk
+            .native_checkpoint
+            .as_ref()
+            .is_some_and(|checkpoint| checkpoint.bytes >= cap)
+    {
+        return large_codex::import(store, &repo, branch, lk, owner, &opts);
+    }
     if let Some(size) = lk
         .resolve()
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .filter(|size| *size > cap)
     {
-        if lk.source == "codex"
-            && opts.historical
-            && lk.native_binding.is_none()
-            && lk.baseline_bytes.is_none()
-            && requested.is_none()
-        {
+        if streamable {
             return large_codex::import(store, &repo, branch, lk, owner, &opts);
         }
         ui::error(&format!(
@@ -2642,7 +2649,24 @@ fn settle_local_telemetry_inner(
     let bytes = if let Some(prepared) = &prepared {
         prepared.bytes.as_slice()
     } else {
-        whole = lk.read_bytes().map_err(|e| {
+        let read = lk.read_bytes();
+        if streamable
+            && read.as_ref().is_err_and(|error| {
+                matches!(
+                    error.downcast_ref::<crate::adapter::native_snapshot::Unavailable>(),
+                    Some(crate::adapter::native_snapshot::Unavailable::Limit(
+                        crate::adapter::native_snapshot::BudgetHit {
+                            limit: crate::adapter::native_snapshot::Limit::Bytes
+                                | crate::adapter::native_snapshot::Limit::WorkingBytes,
+                            ..
+                        }
+                    ))
+                )
+            })
+        {
+            return large_codex::import(store, &repo, branch, lk, owner, &opts);
+        }
+        whole = read.map_err(|e| {
             if requested.is_some() {
                 e.context(QueuedInputUnavailable)
             } else if quiet {

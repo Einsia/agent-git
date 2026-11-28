@@ -142,6 +142,38 @@ impl Link {
         Ok(self.capture(true)?.0)
     }
 
+    #[cfg(all(feature = "rc", feature = "cli"))]
+    pub(crate) fn visit_bound_rollout(
+        &self,
+        emit: impl FnMut(&[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let (context, roots) = self.source_context()?;
+        let source = crate::adapter::native_snapshot::source_at(
+            "codex",
+            self.native_thread_id(),
+            self.resolve_source()?,
+        )?;
+        let parent_roots = crate::rc::policy::CanonicalRoots::from_untrusted(
+            roots
+                .iter()
+                .cloned()
+                .chain(crate::rc::mirror::Mirror::load().all_roots()),
+        );
+        crate::adapter::codex::lineage_stream::visit_with_lookup(
+            &source,
+            true,
+            |id, limits| {
+                let path = context
+                    .history_parent(id, &parent_roots, limits)
+                    .map_err(|error| parent_failure(&error))?;
+                crate::adapter::native_snapshot::source_at("codex", id, path)
+            },
+            emit,
+        )?;
+        context.validate()?;
+        Ok(())
+    }
+
     /// Where each carrier of this conversation sits in its capture stream, from headers alone.
     #[cfg(feature = "rc")]
     pub(crate) fn capture_spans(&self) -> crate::Result<Vec<crate::adapter::codex::CaptureSpan>> {

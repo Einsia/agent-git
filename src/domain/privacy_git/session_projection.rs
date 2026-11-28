@@ -258,12 +258,25 @@ impl Projector {
                 .checked_add(size(id)?)
                 .context("materialized size overflow")?;
         }
+        let prefix = published
+            .and_then(|published| published.prefix.as_ref())
+            .filter(|_| start == 0);
         if continues && log.ends_with(&view) {
             storage::check_materialized_bounds(
                 unique_bytes - self.unique_bytes,
                 log_bytes - self.log_bytes,
                 view_bytes.min(log_bytes - self.log_bytes),
             )?;
+        } else if let Some(prefix) = prefix.filter(|_| log.ends_with(&view)) {
+            let tail_bytes =
+                sizes[prefix.source_lines..]
+                    .iter()
+                    .try_fold(0usize, |total, bytes| {
+                        total
+                            .checked_add(*bytes)
+                            .context("appended LOG size overflow")
+                    })?;
+            storage::check_materialized_bounds(tail_bytes, tail_bytes, view_bytes.min(tail_bytes))?;
         } else {
             storage::check_materialized_bounds(unique_bytes, log_bytes, view_bytes)?;
         }
@@ -272,9 +285,6 @@ impl Projector {
         // out as that parent's public commit published them. A projector that continues from
         // that parent holds those lines already; one that starts here takes them from the public
         // parent, and the whole-LOG projection decides when one applies.
-        let prefix = published
-            .and_then(|published| published.prefix.as_ref())
-            .filter(|_| start == 0);
         let writer = BlobWriter::open(source)?;
         let mut sequence = std::mem::take(&mut self.sequence);
         let mut deliveries = std::mem::take(&mut self.deliveries);
